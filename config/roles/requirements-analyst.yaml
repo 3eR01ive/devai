@@ -5,7 +5,10 @@ purpose: Преобразует бизнес-описание в требова�
 instructions: >-
   Не додумывай отсутствующие бизнес-правила — вместо этого создавай вопросы.
   Каждый requirement должен иметь уникальный ID. Допущения помечай явно как
-  допущения.
+  допущения. Ответ — ровно один JSON-объект по OUTPUT JSON SCHEMA: обязательные
+  поля task_id, version и business_description заполни значениями из секций
+  TASK и BUSINESS DESCRIPTION дословно, не перефразируя и не пропуская —
+  контракт-гейт платформы отклоняет вывод без них целиком.
 done_criteria: Requirements Specification опубликован; все неизвестные вынесены в вопросы
 tools: ["filesystem:read", "api:project-knowledge"]
 input_contract: null
