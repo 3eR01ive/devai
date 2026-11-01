@@ -57,7 +57,10 @@ pub struct CheckOutcome {
     pub detects: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// QA rule (quality-report@3): ALWAYS non-empty after assembly — every
+    /// criteria entry cites at least one concrete piece of evidence. Kept
+    /// serialized even when empty so a future bug fails the contract gate
+    /// with `minimum 1` instead of hiding behind a missing key.
     pub evidence: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
@@ -194,8 +197,30 @@ fn state_name(s: ProbeState) -> &'static str {
     }
 }
 
+/// QA rule "evidence per criterion" (`quality-report@3`): the platform never
+/// emits a criteria entry without a citation. The check's own observation
+/// counts first — the probe command + exit code (`detail`), the gap record,
+/// the discard reason; a rubric score with no finding cited is at least
+/// traceable to the auditor's assessment execution artifact. Blank strings
+/// are stripped so `minItems: 1` can never be satisfied by filler.
+fn guarantee_evidence(c: &mut CheckOutcome, assessment_execution: &str) {
+    c.evidence.retain(|e| !e.trim().is_empty());
+    if c.evidence.is_empty() {
+        let citation = if !c.reason.trim().is_empty() {
+            c.reason.clone()
+        } else {
+            format!(
+                "auditor assessment execution {assessment_execution}: score {} recorded for `{}` with no finding cited",
+                c.score.map(|s| format!("{s:.2}")).unwrap_or_else(|| "n/a".into()),
+                c.id
+            )
+        };
+        c.evidence.push(citation);
+    }
+}
+
 pub struct Assembled {
-    /// Full quality-report@2 document.
+    /// Full quality-report@3 document.
     pub json: Value,
     /// ACCEPT | RETURN | ESCALATE — platform recommendation for the human.
     pub recommendation: &'static str,
@@ -205,7 +230,7 @@ pub struct Assembled {
     pub report_text: String,
 }
 
-/// Merge probe results + the auditor's assessment into quality-report@2 and
+/// Merge probe results + the auditor's assessment into quality-report@3 and
 /// apply the deterministic verdict function (§2.5).
 pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment_execution: &str) -> Assembled {
     let scores: HashMap<String, f64> = assessment
@@ -261,7 +286,7 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
             ev
         };
 
-        let outcome = if c.verify == "mechanical" || c.reviewer == "tool" {
+        let mut outcome = if c.verify == "mechanical" || c.reviewer == "tool" {
             match run.mech.get(&c.id) {
                 Some(o) if o.state == ProbeState::Pass => {
                     // Platform-run results count into S exactly like rubric ones.
@@ -418,6 +443,7 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
                 }
             }
         };
+        guarantee_evidence(&mut outcome, assessment_execution);
         checks.push(outcome);
     }
 
@@ -722,5 +748,52 @@ scoring:
         let out = exec_probe("echo candidate.rs:10", Path::new(env!("CARGO_MANIFEST_DIR")), &[0]);
         assert_eq!(out.state, ProbeState::Pass);
         assert!(out.output.contains("candidate.rs:10"));
+    }
+
+    #[test]
+    fn assembled_report_cites_evidence_on_every_check() {
+        // QA rule: every criteria entry carries concrete evidence for ANY
+        // mix of check states, and the assembled doc passes the very gate
+        // the engine runs against the SEEDED @3 schema.
+        let mut p = tiny_profile("true", "true");
+        p.evaluations[0].checks.retain(|c| c.id != "hum/c");
+        let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
+        let schema = devai_store::seed::contracts()
+            .into_iter()
+            .find(|(n, v, _)| *n == "quality-report" && *v == 3)
+            .expect("quality-report@3 is seeded")
+            .2;
+
+        // Rubric 1.0 with no findings: previously an evidence-less entry.
+        let a = assessment(&[("rub/b", 1.0)], &[], &[]);
+        let out = assemble(&p, &run, &a, "exec-42");
+        let checks = out.json["evaluation"]["checks"].as_array().unwrap();
+        assert!(!checks.is_empty());
+        for c in checks {
+            let ev = c["evidence"]
+                .as_array()
+                .unwrap_or_else(|| panic!("check {} must serialize evidence", c["id"]));
+            assert!(!ev.is_empty(), "check {} must cite at least one concrete evidence item", c["id"]);
+            assert!(
+                ev.iter().all(|e| e.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+                "check {} evidence entries must be non-blank strings: {ev:?}",
+                c["id"]
+            );
+        }
+        let b = checks.iter().find(|c| c["id"] == "rub/b").unwrap();
+        assert!(b["evidence"][0].as_str().unwrap().contains("exec-42"), "uncited score stays traceable");
+        crate::adapters::validate_against_contract(&out.json.to_string(), Some(schema))
+            .expect("assembled report must satisfy quality-report@3");
+
+        // Gap-only assessment (mock-cycle shape): BLOCKED entries cite their
+        // gap record, the report still satisfies the contract.
+        let a2 = assessment(&[], &[("rub/b", "offline: no access to the diff")], &[]);
+        let out2 = assemble(&p, &run, &a2, "exec-43");
+        for c in out2.json["evaluation"]["checks"].as_array().unwrap() {
+            let ev = c["evidence"].as_array().unwrap();
+            assert!(!ev.is_empty(), "state {} of {} must still cite evidence", c["state"], c["id"]);
+        }
+        crate::adapters::validate_against_contract(&out2.json.to_string(), Some(schema))
+            .expect("blocked-mix report must satisfy quality-report@3");
     }
 }

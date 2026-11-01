@@ -197,6 +197,72 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
         (
+            "quality-report",
+            3,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Quality Report v3 — machine-assembled by the platform; every check cites evidence",
+  "description": "Assembled by devai-runtime from the evaluation profile: platform-run gates and mechanical probes merged with the auditor's rubric scores. The verdict is computed by the deterministic function of docs/evaluation-schema.md 2.5, never by a model. report_text is the 2.6 human rendering. v3 QA rule: every criteria entry in evaluation.checks must cite at least one concrete evidence item (test output, artifact id, build log); a missing or empty evidence array is contract-invalid — no check may be recorded as a pass on model judgment alone.",
+  "type": "object",
+  "required": ["verdict", "recommendation_basis", "report_text", "profile", "evaluation"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["ACCEPT", "RETURN", "ESCALATE"] },
+    "recommendation_basis": { "type": "string" },
+    "report_text": { "type": "string" },
+    "profile": {
+      "type": "object",
+      "required": ["project", "version"],
+      "properties": { "project": { "type": "string" }, "version": { "type": "integer" } }
+    },
+    "assessment_execution": { "type": "string", "description": "role execution id of the auditor run" },
+    "evaluation": {
+      "type": "object",
+      "required": ["verdict", "score", "theta", "gates", "checks"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "score": { "type": "number" },
+        "theta": { "type": "number" },
+        "blocked_weight": { "type": "number" },
+        "max_blocked_weight": { "type": "number" },
+        "floors_breached": { "type": "array", "items": { "type": "string" } },
+        "pending_human": { "type": "array", "items": { "type": "string" } },
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "state"],
+            "properties": {
+              "id": { "type": "string" },
+              "state": { "type": "string", "enum": ["PASS", "FAIL", "BLOCKED"] },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "verify", "state", "weight", "detects", "evidence"],
+            "properties": {
+              "id": { "type": "string" },
+              "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
+              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "score": { "type": "number" },
+              "floor": { "type": "number" },
+              "weight": { "type": "number" },
+              "detects": { "type": "array", "items": { "type": "string" } },
+              "violations": { "type": "array", "items": { "type": "string" } },
+              "evidence": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "concrete citations: test output excerpt, artifact id, build log reference — at least one per check entry" },
+              "reason": { "type": "string", "description": "why BLOCKED / unscored" }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#,
+        ),
+        (
             "evaluation-assessment",
             1,
             r#"{
@@ -249,7 +315,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
         "properties": {
           "requirement_id": { "type": "string" },
           "status": { "type": "string", "enum": ["PASS", "FAIL", "NOT_CHECKED"] },
-          "evidence": { "type": "array", "items": { "type": "string" }, "description": "artifact ids / test outputs / build logs" }
+          "evidence": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "artifact ids / test outputs / build logs — every criteria_results entry must cite at least one concrete piece of evidence" }
         }
       }
     },
