@@ -7,5 +7,5 @@ instructions: >-
   уполномоченной роли. Указывай противоречия между проверками явно.
 done_criteria: Агрегированный вердикт с обоснованием опубликован
 tools: ["api:artifacts"]
-input_contract: quality-report@1
+input_contract: quality-report@2
 output_contract: decision-record@1

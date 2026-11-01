@@ -24,6 +24,8 @@ pub struct ExecRequest {
     pub inputs: Vec<(String, String)>,
     /// JSON Schema text of the role's output contract, when defined.
     pub contract_schema: Option<String>,
+    /// Directory the agent process runs in (project workspace), if any.
+    pub workspace: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,16 +67,23 @@ impl AgentRuntime {
         let contract = req.role.output_contract.as_ref().map(|c| (c.name.as_str(), c.version));
         let user = build_user_prompt(&req.title, &req.business, &req.inputs, contract, req.contract_schema.as_deref());
 
+        // The role's declarative `tools` (config/roles/*.yaml) decide what the
+        // provider process may touch. No tools declared == pure text answer.
+        let tools = claude_tools_for(&req.role);
         let mut cmd = std::process::Command::new("claude");
         cmd.arg("-p")
             .arg(&user)
             .arg("--output-format")
             .arg("json")
-            .arg("--no-session-persistence")
-            // Roles produce formal artifacts from given inputs; they get no
-            // tools. File/shell work is a later, explicit capability.
-            .arg("--allowedTools")
-            .arg("");
+            .arg("--no-session-persistence");
+        if tools.is_empty() {
+            cmd.arg("--allowedTools").arg("");
+        } else {
+            cmd.arg("--allowedTools").args(&tools);
+        }
+        if let Some(ws) = &req.workspace {
+            cmd.current_dir(ws);
+        }
         if !system.is_empty() {
             cmd.arg("--append-system-prompt").arg(system);
         }
@@ -140,35 +149,14 @@ impl AgentRuntime {
                 "test_results": { "status": "PASSED", "detail": "mock runtime executed no real tests" },
                 "notes": format!("mock implementation of {}", one_line(&req.title)),
             }),
-            "quality-report" => {
-                // Mirror requirement ids from the spec we were given as input.
-                let crit = req
-                    .inputs
-                    .iter()
-                    .filter(|(l, _)| l.contains("REQUIREMENTS_SPEC"))
-                    .find_map(|(_, c)| serde_json::from_str::<Value>(c).ok())
-                    .map(|spec| {
-                        spec.get("requirements")
-                            .and_then(|r| r.as_array())
-                            .map(|rs| {
-                                rs.iter()
-                                    .filter_map(|r| r.get("id").and_then(|i| i.as_str()))
-                                    .map(|id| serde_json::json!({
-                                        "requirement_id": id,
-                                        "status": "PASS",
-                                        "evidence": ["mock runtime"],
-                                    }))
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
+            "quality-report" | "evaluation-assessment" => {
+                // The QA agent answers with an evaluation-assessment; the
+                // platform (engine) assembles the machine quality-report@2.
+                // The mock never fabricates rubric scores offline.
                 serde_json::json!({
-                    "verdict": "ACCEPT",
-                    "criteria_results": if crit.is_empty() {
-                        vec![serde_json::json!({"requirement_id": "R1", "status": "PASS", "evidence": ["mock runtime"]})]
-                    } else { crit },
-                    "objective_checks": { "build": "n/a (mock)", "tests": "n/a (mock)" },
+                    "scores": {},
+                    "findings": [],
+                    "gaps": [{ "check": "*", "reason": "mock runtime: offline assessment performs no rubric scoring" }],
                 })
             }
             "decision-record" => serde_json::json!({
@@ -184,10 +172,41 @@ impl AgentRuntime {
     }
 }
 
-/// Light contract gate: every key in the schema's top-level `required` list
-/// must appear in the output. Full JSON-Schema validation is a later step;
-/// this keeps garbage from silently entering the artifact store.
-fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<(), AdapterError> {
+/// Translate a role's declarative capability list (`tools:` in
+/// `config/roles/<slug>.yaml`) into `claude` CLI tool syntax. This is the
+/// provider DRIVER translation, not policy: which capabilities a role has is
+/// config; how `claude` spells them is here. Unknown capabilities are ignored
+/// — least privilege by construction.
+fn claude_tools_for(role: &RoleDefinition) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cap in &role.tools {
+        match cap.as_str() {
+            "filesystem:read" => out.extend(["Read", "Grep", "Glob"].iter().map(|s| s.to_string())),
+            "filesystem:read-write" => out.extend(
+                ["Read", "Grep", "Glob", "Edit", "Write"].iter().map(|s| s.to_string()),
+            ),
+            "git" => out.extend(
+                ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            ),
+            "shell:build" => out.push("Bash(cargo build:*)".into()),
+            "shell:test" => out.push("Bash(cargo test:*)".into()),
+            "shell:lint" => out.push("Bash(cargo clippy:*)".into()),
+            _ => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Contract gate: a JSON-Schema draft-07 subset enforced RECURSIVELY —
+/// `required` at every object level, `items` schemas through arrays, `enum`
+/// membership and primitive type checks, with a json path on each violation.
+/// Full JSON-Schema is still out of scope, but garbage cannot silently enter
+/// the artifact store any more (defect R2 of the dogfood task).
+pub fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<(), AdapterError> {
     let Some(schema) = schema else { return Ok(()); };
     let value: Value = serde_json::from_str(content)
         .map_err(|e| AdapterError::BadOutput(format!("output is not valid JSON: {e}")))?;
@@ -196,17 +215,90 @@ fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<(), 
     }
     let schema_v: Value = serde_json::from_str(schema)
         .map_err(|e| AdapterError::BadOutput(format!("stored contract schema is broken: {e}")))?;
-    let Some(required) = schema_v.get("required").and_then(|r| r.as_array()) else { return Ok(()); };
-    let obj = value.as_object().unwrap();
-    let missing: Vec<&str> = required
-        .iter()
-        .filter_map(|r| r.as_str())
-        .filter(|k| !obj.contains_key(*k))
-        .collect();
-    if !missing.is_empty() {
-        return Err(AdapterError::BadOutput(format!("missing required keys: {}", missing.join(", "))));
+    let mut errs = Vec::new();
+    validate_node(&schema_v, &value, "$", &mut errs);
+    if !errs.is_empty() {
+        return Err(AdapterError::BadOutput(errs.join("; ")));
     }
     Ok(())
+}
+
+fn validate_node(schema: &Value, value: &Value, path: &str, errs: &mut Vec<String>) {
+    let Some(s) = schema.get("type").and_then(|t| t.as_str()) else { return; };
+    let Some(obj) = schema.as_object() else { return; };
+    match s {
+        "object" => {
+            let Some(map) = value.as_object() else {
+                errs.push(format!("{path}: expected object, got {}", json_kind(value)));
+                return;
+            };
+            if let Some(required) = obj.get("required").and_then(|r| r.as_array()) {
+                for k in required.iter().filter_map(|r| r.as_str()) {
+                    if !map.contains_key(k) {
+                        errs.push(format!("{path}.{k}: missing required key"));
+                    }
+                }
+            }
+            if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
+                for (k, v) in map {
+                    if let Some(sub) = props.get(k) {
+                        validate_node(sub, v, &format!("{path}.{k}"), errs);
+                    }
+                }
+            }
+        }
+        "array" => {
+            let Some(items) = value.as_array() else {
+                errs.push(format!("{path}: expected array, got {}", json_kind(value)));
+                return;
+            };
+            if let Some(sub) = obj.get("items") {
+                if sub.get("type").is_some() {
+                    for (i, it) in items.iter().enumerate() {
+                        validate_node(sub, it, &format!("{path}[{i}]"), errs);
+                    }
+                }
+            }
+        }
+        "string" => {
+            let Some(v) = value.as_str() else {
+                errs.push(format!("{path}: expected string, got {}", json_kind(value)));
+                return;
+            };
+            if let Some(en) = obj.get("enum").and_then(|e| e.as_array()) {
+                if !en.iter().any(|x| x.as_str() == Some(v)) {
+                    errs.push(format!("{path}: `{v}` not in enum {en:?}"));
+                }
+            }
+        }
+        "integer" => {
+            if value.as_i64().is_none() {
+                errs.push(format!("{path}: expected integer, got {}", json_kind(value)));
+            }
+        }
+        "number" => {
+            if value.as_f64().is_none() {
+                errs.push(format!("{path}: expected number, got {}", json_kind(value)));
+            }
+        }
+        "boolean" => {
+            if value.as_bool().is_none() {
+                errs.push(format!("{path}: expected boolean, got {}", json_kind(value)));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn summarize(name: Option<&str>, json: &Value) -> Option<String> {
@@ -219,10 +311,19 @@ fn summarize(name: Option<&str>, json: &Value) -> Option<String> {
         )),
         "review-report" => Some(format!("verdict {verdict}: {}", json.get("summary").and_then(|s| s.as_str()).unwrap_or(""))),
         "implementation-report" => Some(format!("branch {}", json.get("branch").and_then(|b| b.as_str()).unwrap_or("?"))),
-        "quality-report" => Some(format!(
-            "verdict {verdict}, {} criteria checked",
-            json.get("criteria_results").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0)
-        )),
+        "quality-report" => match json.get("evaluation") {
+            Some(ev) => Some(format!(
+                "{verdict} (evaluation {}, S={:.3})",
+                ev.get("verdict").and_then(|v| v.as_str()).unwrap_or("?"),
+                ev.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0),
+            )),
+            None => Some(format!(
+                "assessment: {} score(s), {} finding(s), {} gap(s)",
+                json.get("scores").and_then(|s| s.as_object()).map(|o| o.len()).unwrap_or(0),
+                json.get("findings").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0),
+                json.get("gaps").and_then(|g| g.as_array()).map(|a| a.len()).unwrap_or(0),
+            )),
+        },
         _ => json.get("summary").and_then(|s| s.as_str()).map(|s| s.to_string()),
     }
 }
@@ -263,7 +364,27 @@ mod tests {
             model: "".into(),
             inputs: vec![],
             contract_schema: None,
+            workspace: None,
         }
+    }
+
+    #[test]
+    fn declarative_role_tools_map_to_provider_syntax() {
+        let mut r = role("quality-auditor", "quality-report");
+        r.tools = vec!["git".into(), "shell:test".into(), "filesystem:read".into(), "api:whatever".into()];
+        let t = claude_tools_for(&r);
+        assert!(t.contains(&"Bash(cargo test:*)".to_string()));
+        assert!(t.contains(&"Bash(git diff:*)".to_string()));
+        assert!(t.contains(&"Grep".to_string()));
+        // Unknown capability grants nothing; no write/edit tools ever leak in.
+        assert!(!t.iter().any(|x| x.contains("Write") || x.contains("Edit") || x.contains("whatever")));
+        // Empty declaration == fully closed, as before.
+        assert!(claude_tools_for(&role("x", "review-report")).is_empty());
+        // read-write capability: the implementer must be able to edit at all.
+        r.tools = vec!["filesystem:read-write".into(), "shell:build".into()];
+        let t = claude_tools_for(&r);
+        assert!(t.contains(&"Edit".to_string()) && t.contains(&"Write".to_string()));
+        assert!(t.contains(&"Bash(cargo build:*)".to_string()));
     }
 
     #[test]
@@ -293,14 +414,46 @@ mod tests {
     }
 
     #[test]
-    fn mock_quality_mirrors_spec_inputs() {
-        let mut r = req("mock", "quality-report");
-        r.inputs = vec![(
-            "REQUIREMENTS_SPEC v1".to_string(),
-            r#"{"requirements":[{"id":"R1"},{"id":"R2"}]}"#.to_string(),
-        )];
-        let out = AgentRuntime::run(&r).unwrap();
+    fn mock_quality_emits_honest_assessment() {
+        let out = AgentRuntime::run(&req("mock", "quality-report")).unwrap();
         let v: Value = serde_json::from_slice(&out.content).unwrap();
-        assert_eq!(v["criteria_results"].as_array().unwrap().len(), 2);
+        // Mock never fabricates rubric scores offline.
+        assert!(v["scores"].as_object().unwrap().is_empty());
+        assert_eq!(v["gaps"].as_array().unwrap().len(), 1);
+        assert_eq!(v["findings"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn validator_enforces_nested_required_and_types() {
+        let schema = r#"{
+            "type": "object",
+            "required": ["verdict", "evaluation"],
+            "properties": {
+                "verdict": { "type": "string", "enum": ["ACCEPT", "RETURN"] },
+                "evaluation": {
+                    "type": "object",
+                    "required": ["score", "gates"],
+                    "properties": {
+                        "score": { "type": "number" },
+                        "gates": { "type": "array", "items": { "type": "object", "required": ["id", "state"] } }
+                    }
+                }
+            }
+        }"#;
+        // Deeply valid.
+        let good = r#"{"verdict":"ACCEPT","evaluation":{"score":0.9,"gates":[{"id":"build-green","state":"PASS"}]}}"#;
+        assert!(validate_against_contract(good, Some(schema)).is_ok());
+        // Missing key TWO levels down.
+        let shallow_missing = r#"{"verdict":"ACCEPT","evaluation":{"score":0.9,"gates":[{"id":"build-green"}]}}"#;
+        let e = validate_against_contract(shallow_missing, Some(schema)).unwrap_err().to_string();
+        assert!(e.contains("gates[0].state"), "{e}");
+        // Enum violated at the top.
+        let bad_enum = r#"{"verdict":"MAYBE","evaluation":{"score":0.9,"gates":[]}}"#;
+        let e = validate_against_contract(bad_enum, Some(schema)).unwrap_err().to_string();
+        assert!(e.contains("not in enum"), "{e}");
+        // Type washed away.
+        let bad_type = r#"{"verdict":"ACCEPT","evaluation":{"score":"0.9","gates":[]}}"#;
+        let e = validate_against_contract(bad_type, Some(schema)).unwrap_err().to_string();
+        assert!(e.contains("$.evaluation.score: expected number"), "{e}");
     }
 }

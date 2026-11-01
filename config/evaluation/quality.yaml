@@ -1,0 +1,321 @@
+# Профиль оценки качества (docs/evaluation-schema.md v0.2), порт devai.yaml.
+# Декларативные QA-правила: правь этот YAML -> `devai init` -> роль
+# quality-auditor получает новую версию, следующий execution идёт по новым
+# правилам; провенанс в истории говорит, по какой версии судили.
+#
+# Разделение ответственности (суверенность):
+#   - gates и mechanical-пробы исполняет ПЛАТФОРМА (devai-runtime), не модель;
+#   - агент-аудитор выставляет баллы только по rubric/hybrid-проверкам,
+#     которые ему разрешает поле reviewer, и обязан приложить evidence;
+#   - вердикт (PASS/FAIL/INCONCLUSIVE, S, полы, blocked) считает платформа
+#     по §2.5: pending_human проверяется ДО сравнения S с порогом — черновик
+#     человеческой оценки не превращается в финальный FAIL.
+#
+# Калибровки после прогона 2026-11-01 (ревью кода движка):
+#   - layer-boundaries: слой runtime теперь в формулировке (cli->runtime->store->core);
+#   - no-magic: grep по 3+ цифрам слеп к двухзначным доменным лимитам (max_steps:16) —
+#     проверка стала hybrid: probe даёт кандидатов, рубрика подтверждает;
+#   - pending-семантика — см. вердикт-функцию выше.
+# v2 (после живого аудита 01a198a4-62c): guard на отсутствие cargo-llvm-cov
+# (нет инструмента = НЕ ПРОВЕРЕНО, не fake-FAIL); новое семейство проверок
+# logic/ — логическая полнота ветвлений и логические/цикломатические тупики.
+
+version: 2
+project: devai
+applies_to_roles: [quality-auditor]
+
+error_types:
+  architecture/idiom-misuse:
+    desc: Принятая для слоя идиома применена вне её контекста или с искажением.
+    severity: major
+  architecture/idiom-inapplicable:
+    desc: Идиома выбрана неверно для задачи (например Mutation там, где нужен query).
+    severity: major
+  architecture/layer-leak:
+    desc: Зависимость/ответственность протекла через границу crate (IO в core и т.п.).
+    severity: catastrophic
+  architecture/magic:
+    desc: Немотивированное значение (в т.ч. двухзначные доменные лимиты) без именованной константы и обоснования.
+    severity: minor
+  architecture/principle-violation:
+    desc: Нарушение заявленного принципа (SRP, DIP, CQS, Law of Demeter…).
+    severity: minor
+  reliability/panic-path:
+    desc: Паника достижима из library-кода на валидных, но редких данных.
+    severity: major
+  reliability/error-wash:
+    desc: Потеря контекста ошибки (глотание, stringly-typed, одинаковый текст на разных причинах).
+    severity: minor
+  correctness/state-transition:
+    desc: Поведение transition-функции расходится с workflow-спекой.
+    severity: catastrophic
+  correctness/concurrency:
+    desc: Нарушен optimistic-locking / идемпотентность событий.
+    severity: major
+  data/immutability-breach:
+    desc: Удалено/изменено вместо append-only (события, артефакты).
+    severity: catastrophic
+  ux/cli-contract-break:
+    desc: Сломан существующий флаг/формат вывода CLI без версионирования.
+    severity: major
+  process/untested-branch:
+    desc: Новая ветка логики без теста, её накрывающего.
+    severity: minor
+  process/no-evidence:
+    desc: Rubric-нарушение выставлено без обязательного evidence.
+    severity: minor
+  logic/dead-end:
+    desc: "Логический или циклический тупик: состоянию/пути некуда выйти, цикл возврата не ограничен, обработка ошибки возвращается в породившую её точку."
+    severity: major
+  logic/unhandled-case:
+    desc: "Неполное ветвление: `_ =>` молча глотает доменные значения, достижимая ветка без семантики, unknown трактуется как успех."
+    severity: minor
+
+gates:
+  - id: build-green
+    desc: cargo build --workspace завершается успешно
+    probes:
+      - { cmd: "cargo build --workspace", pass_exit: [0] }
+  - id: tests-green
+    desc: cargo test --workspace завершается успешно
+    probes:
+      - { cmd: "cargo test --workspace", pass_exit: [0] }
+  - id: no-network
+    desc: Никаких сетевых путей в коде (local-first суверенность)
+    probes:
+      - { cmd: "test -z \"$(grep -RIlE 'reqwest|hyper|ureq|TcpStream|UdpSocket' crates 2>/dev/null)\"", pass_exit: [0] }
+  - id: no-secrets
+    desc: Секретов в репозитории нет
+    # --exclude: сам профиль хранит regex-паттерны — не даём шлюзу матчиться на себя
+    probes:
+      - { cmd: "test -z \"$(grep -RIlE 'api[_-]?key|BEGIN.*PRIVATE KEY' crates config --exclude=quality.yaml 2>/dev/null)\"", pass_exit: [0] }
+
+evaluations:
+  - id: architecture
+    title: Архитектурная оценка
+    checks:
+      - id: arch/idiom-consistency
+        statement: >
+          Каждый crate соблюдает свою идиому: core — чистые функции-трансформеры
+          (Task + данные -> Mutation), store — сериализация/SQL без бизнес-правил,
+          runtime — адаптеры/движок без решений об истории, cli — ввод/вывод без
+          решений о домене.
+        detects: [architecture/idiom-misuse, architecture/idiom-inapplicable]
+        verify: rubric
+        anchors:
+          "1.0": "все модули в своих идиомах"
+          "0.7": "единичные отклонения стиля, роль модуля ясна"
+          "0.4": "идиома нарушена системно, но локализовано"
+          "0.1": "идеома слоя подменена другой, читатель вводится в заблуждение"
+          "0.0": "границы как классы ответственности не соблюдаются"
+        evidence: required
+        reviewer: either
+
+      - id: arch/layer-boundaries
+        statement: >
+          Зависимости идут только cli -> runtime -> store -> core; core не знает
+          о SQLite/файлах/времени-как-IO; runtime не заводит собственных правил
+          переходов, когда они уже есть в ядре.
+        detects: [architecture/layer-leak]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -RIn 'rusqlite\\|std::fs\\|std::process' crates/devai-core/src", pass_exit: [0, 1] }
+        anchors:
+          "1.0": "проба чиста, ревью подтверждает"
+          "0.4": "проба бьёт на ложные — гибрид снимает ложняк"
+          "0.1": "реальная протечка IO/правил в core"
+          "0.0": "множественные протечки"
+        evidence: required
+        reviewer: either
+        suppression: "// eval-ignore: arch/layer-boundaries — <обоснование>"
+
+      - id: arch/no-magic
+        statement: >
+          Литералы, несущие доменный смысл (лимиты, пороги, состояния-строки,
+          включая двухзначные числа вроде max_steps), вынесены в const с
+          обоснованием. Числа в тестах не считаются.
+        detects: [architecture/magic]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -RInE '(const|static) [A-Z_0-9]+(: [A-Za-z0-9<>_]+)? = [0-9]+;' crates/devai-core/src crates/devai-runtime/src crates/devai-store/src", pass_exit: [0, 1] }
+        anchors:
+          "1.0": "кандидатов нет, либо все обоснованы константами"
+          "0.7": "не более 2 незначительных"
+          "0.4": "magic во второстепенном пути"
+          "0.1": "magic в workflow-правилах (лимит состояний без const)"
+          "0.0": "игнорирование по всему диффу"
+        evidence: required
+        reviewer: either
+
+      - id: arch/principles
+        statement: >
+          SOLID/CQS/Composed Method не нарушены в новом коде; transition-функции
+          core — Command, возвращающий Mutation (CQS), без скрытых сайд-эффектов.
+        detects: [architecture/principle-violation]
+        verify: rubric
+        anchors:
+          "1.0": "чисто"
+          "0.7": "спорные мелочи"
+          "0.4": "нарушение одного принципа, исправимо без переделки"
+          "0.1": "нарушение порождает каскад"
+          "0.0": "архитектура отсутствует как решение"
+        evidence: required
+        reviewer: human
+
+  - id: reliability
+    title: Надёжность и ошибки
+    checks:
+      - id: rel/no-panic
+        statement: Library-код (core/store) не паникует на валидных данных; unwrap/expect допустимы только на инвариантах с комментарием "// invariant:".
+        detects: [reliability/panic-path]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -RIn '\\.unwrap()\\|\\.expect(' crates/devai-core/src crates/devai-store/src crates/devai-runtime/src", pass_exit: [0, 1] }
+        anchors:
+          "1.0": "ноль неквалифицированных"
+          "0.7": "недостижимые ветки без invariant-комментария"
+          "0.4": "есть, но на физически невозможных ветвях с комментарием"
+          "0.1": "достижимая panic-тропа на валидных данных"
+          "0.0": "unwrap в основном потоке ошибок"
+        evidence: required
+        reviewer: either
+
+      - id: rel/error-context
+        statement: Все ошибки типизированы thiserror и несут контекст; нет String-ошибок на границах; .ok().flatten() не прячет реальный сбой загрузки.
+        detects: [reliability/error-wash]
+        verify: rubric
+        anchors:
+          "1.0": "сообщения различимы, контекст сохранён"
+          "0.4": "один потерянный контекст"
+          "0.1": "ошибка глотается/превращается в generic"
+          "0.0": "систематически"
+        evidence: required
+        reviewer: either
+
+  - id: correctness
+    title: Корректность против спеки workflow
+    checks:
+      - id: corr/transitions
+        statement: Каждая transition-функция возвращает допустимые переходы из всех состояний, запрещённые дают InvalidTransition.
+        detects: [correctness/state-transition]
+        verify: mechanical
+        probes:
+          - { cmd: "cargo test -p devai-core --test workflow", pass_exit: [0] }
+        reviewer: tool
+
+      - id: corr/concurrency
+        statement: Повторный mutation на устаревшем lock_version отклоняется; события идемпотентны.
+        detects: [correctness/concurrency]
+        verify: mechanical
+        probes:
+          - { cmd: "cargo test -p devai-store --test store", pass_exit: [0] }
+        reviewer: tool
+
+      - id: corr/data-immutability
+        statement: События и артефакты не удаляются; статус меняется на STALE/SUPERSEDED.
+        detects: [data/immutability-breach]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -RIn 'DELETE FROM events\\|DELETE FROM artifacts' crates/devai-store/src", pass_exit: [0, 1] }
+        anchors:
+          "1.0": "чисто"
+          "0.1": "DELETE есть, но в тесте-отрицании/seed-утилите"
+          "0.0": "удаление истории в основном пути"
+        evidence: required
+        reviewer: either
+
+  - id: ux
+    title: CLI-контракт и пользовательский опыт
+    applies_to:
+      paths: ["crates/devai-cli/**"]
+    checks:
+      - id: ux/json-stability
+        statement: --json вывод парсится; help описывает флаги подкоманд; существующие флаги не сломаны.
+        detects: [ux/cli-contract-break]
+        verify: mechanical
+        probes:
+          - { cmd: "./target/debug/devai task --help >/dev/null", pass_exit: [0] }
+        reviewer: tool
+
+  - id: process
+    title: Процесс (тесты и evidence)
+    checks:
+      - id: proc/diff-coverage
+        statement: Новые ветки покрыты тестами (ориентир 80% diff-coverage); negative-кейсы переходов присутствуют.
+        detects: [process/untested-branch]
+        verify: mechanical
+        probes:
+          # Отсутствие cargo-llvm-cov даёт exit 101 — неотличимо от честного
+          # провала. Preflight относит неподключённый инструмент к сентинелу
+          # BLOCKED: НЕ ПРОВЕРЕНО, никогда не fake FAIL и не fake PASS.
+          - { cmd: "cargo llvm-cov --version >/dev/null 2>&1 || exit 127; cargo llvm-cov --workspace --diff", pass_exit: [0] }
+        reviewer: tool
+
+  - id: logic
+    title: Логическая полнота и тупики
+    checks:
+      - id: log/dead-ends
+        statement: >
+          Из каждого не-терминального состояния/пути есть выход; циклы переходов
+          (QA -> REWORK -> QA, retry-петли) ограничены явного (max_steps, счётчик,
+          явный выход из loop); обработка ошибки не возвращает управление в
+          породившую её точку бесконечно; у каждого loop/while — достижимый
+          условие выхода, а не только break «на всякий случай».
+        detects: [logic/dead-end]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -RInE 'loop \\{|while true|break|return' crates/*/src", pass_exit: [0, 1] }
+        anchors:
+          "1.0": "кандидаты проверены: все циклы/циклы переходов ограничены или терминальны по замыслу"
+          "0.7": "ограниченность не эксплицирована, но выход очевиден из структуры кода"
+          "0.4": "потенциальный цикл ре-входа без явного выхода"
+          "0.0": "достижимый тупик: состояние/путь без выхода или неограниченный возврат"
+        evidence: required
+        reviewer: either
+
+      - id: log/completeness
+        statement: >
+          Ветвление полное: каждый match по enum/доменной лексике покрыт явными
+          ветками; `_ =>` допустим только fail-closed с обоснованием (не «тихое
+          swallow»); вердикт-функции и валидаторы покрывают все значения своих
+          словарей; unknown не трактуется как успех/пропуск.
+        detects: [logic/unhandled-case]
+        verify: rubric
+        anchors:
+          "1.0": "все ветки явные, catch-all'ов нет или каждый обоснован"
+          "0.7": "1–2 fail-closed catch-all с ясной семантикой"
+          "0.4": "catch-all молча глотает доменное значение"
+          "0.0": "отсутствующая ветка достижима на валидных данных"
+        evidence: required
+        reviewer: either
+
+# proc/evidence-completeness (meta-проверка веса 0.0) исполняется не shell-пробой,
+# а платформой при сборке отчёта: rubric/hybrid-оценка < 1.0 без evidence
+# превращается в BLOCKED (gap), а не в балл. process/no-evidence остаётся в
+# таксономии как зарезервированный тип.
+
+scoring:
+  aggregation: per-check
+  theta: 0.80
+  floors:
+    catastrophic: 0.7
+    major: 0.4
+    minor: null
+  blocked_policy:
+    max_blocked_weight: 0.20
+  weights:
+    # v2: сумма 1.00 покрывает ровно 13 проверок; место уступили новому
+    # семейству logic (0.10 + 0.06) — лёгкое смещение, иерархия смыслов та же.
+    corr/transitions: 0.12
+    corr/data-immutability: 0.10
+    corr/concurrency: 0.08
+    arch/layer-boundaries: 0.10
+    arch/idiom-consistency: 0.06
+    arch/principles: 0.07
+    arch/no-magic: 0.02
+    rel/no-panic: 0.08
+    rel/error-context: 0.06
+    ux/json-stability: 0.07
+    proc/diff-coverage: 0.08
+    log/dead-ends: 0.10
+    log/completeness: 0.06

@@ -5,8 +5,8 @@ purpose: "Независимо проверяет результат: соотв
 instructions: >-
   Опирайся на доказательства: реальные результаты сборки, тестов, линтеров,
   coverage, анализ diff. Различай выполненную проверку и рекомендацию модели.
-  Каждый вывод accompany ссылкой на артефакт-доказательство.
-done_criteria: Quality Report опубликован с доказательствами по каждому acceptance criteria
+  Каждый вывод — со ссылкой на артефакт-доказательство.
+done_criteria: "evaluation-assessment опубликован: баллы по rubric/hybrid-проверкам профиля, findings с evidence, честные gaps"
 tools: ["git", "shell:test", "shell:lint", "filesystem:read"]
 input_contract: requirements-specification@1
-output_contract: quality-report@1
+output_contract: quality-report@2
