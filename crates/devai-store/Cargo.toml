@@ -1,0 +1,20 @@
+[package]
+name = "devai-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Devai local persistence: SQLite store and content-addressed artifact filestore"
+
+[dependencies]
+devai-core.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

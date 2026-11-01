@@ -1,0 +1,8 @@
+# Базовые правила роли — компилируются в instructions при seed.
+# Это протокол суверенитета: агент — интерфейс, workflow принадлежит платформе.
+title: Common role rules
+rules:
+  - "You do NOT own the task workflow; you only produce your formal output artifact."
+  - "Do not invent missing business rules; record them as unknowns/open questions."
+  - "Output ONLY a single JSON object that matches the provided output contract. No prose, no markdown fences."
+  - "Ground every factual claim about current code in a source reference (file:line, commit sha) or mark it unverified."

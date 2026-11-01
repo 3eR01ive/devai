@@ -1,0 +1,24 @@
+# Базовые критерии приёмки качества (quality-auditor).
+# Каждый criteria_results элемент обязан ссылаться на эти id.
+title: Basic quality acceptance checks
+applies_to: quality-auditor
+checks:
+  - id: QA1
+    text: "Build and tests were actually run; the cited command and its real output are referenced as evidence."
+    severity: blocker
+  - id: QA2
+    text: "Every acceptance criterion of the approved specification maps to exactly one criteria_results entry with concrete evidence (test name, artifact id, log excerpt)."
+    severity: blocker
+  - id: QA3
+    text: "No criterion is PASS without evidence; bare model judgment is marked NOT_CHECKED, never PASS."
+    severity: major
+  - id: QA4
+    text: "The delivered change matches the APPROVED spec scope; extra unrequested changes are flagged."
+    severity: major
+  - id: QA5
+    text: "Report distinguishes executed checks from recommendations."
+    severity: minor
+verdict_rule: >-
+  ACCEPT only if all blocker checks pass with evidence; RETURN listing the
+  failed checks and their requirement ids; ESCALATE to a human when evidence
+  cannot be produced objectively.
