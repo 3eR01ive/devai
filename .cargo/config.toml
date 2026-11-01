@@ -1,0 +1,4 @@
+# On this host /usr/bin/ld is lld, which cannot resolve `-lgcc_s`
+# (Arch ships only the versioned libgcc_s.so.1). Pin bfd for reproducible builds.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]

@@ -1,0 +1,25 @@
+# Базовые критерии валидации постановки (requirements-reviewer).
+# Замечания ВНЕ этого списка не могут блокировать вердикт — иначе цикл
+# ревью не сходится (эскалация придирок вместо проверки).
+title: Basic requirements-specification acceptance checks
+applies_to: requirements-reviewer
+checks:
+  - id: RV1
+    text: "Every requirement has a unique id and at least one testable acceptance criterion."
+    severity: blocker
+  - id: RV2
+    text: "No contradictions between requirements, and between requirements and the business description."
+    severity: blocker
+  - id: RV3
+    text: "Missing business rules are recorded as unknowns/open questions, not invented silently."
+    severity: major
+  - id: RV4
+    text: "Scope is minimal and deliverable in one implementation cycle."
+    severity: major
+  - id: RV5
+    text: "Current-state claims about the code cite a source (file:line / commit sha) or are marked unverified."
+    severity: minor
+verdict_rule: >-
+  Report NEEDS_REVISION only if at least one blocker or major check FAILS;
+  otherwise report APPROVED and list minor/info observations as non-blocking
+  findings. Do not add checks beyond this list as blockers.
