@@ -2,6 +2,8 @@
 //! through every autonomous stage with role executions, stops at both human
 //! gates, and cannot pass them — offline, deterministically, on `mock`.
 
+use std::path::PathBuf;
+
 use chrono::Utc;
 use devai_core::types::*;
 use devai_core::workflow;
@@ -13,6 +15,67 @@ fn store() -> (tempfile::TempDir, Store) {
     let store = Store::open(dir.path()).unwrap();
     seed::seed_defaults(&store, Utc::now()).unwrap();
     (dir, store)
+}
+
+/// Probes must run against the real workspace, not the crate dir.
+fn workspace() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// A tiny offline profile. We must NOT run the factory profile inside tests:
+/// its `cargo test --workspace` gate would spawn this very test again — an
+/// evaluation harness that recurses is a harness bug, not evidence.
+fn tiny_profile() -> devai_store::config::Profile {
+    let yaml = r#"
+version: 1
+project: devai
+applies_to_roles: [quality-auditor]
+error_types:
+  process/untested-branch: { desc: d, severity: minor }
+  data/immutability-breach: { desc: d, severity: catastrophic }
+gates:
+  - id: always-green
+    desc: trivial gate
+    probes: [ { cmd: "true", pass_exit: [0] } ]
+  - id: honesty-check
+    desc: a failing probe must surface, not vanish
+    probes: [ { cmd: "exit 127", pass_exit: [0] } ]
+evaluations:
+  - id: correctness
+    title: T
+    checks:
+      - id: mech/a
+        statement: mechanical
+        detects: [process/untested-branch]
+        verify: mechanical
+        probes: [ { cmd: "true", pass_exit: [0] } ]
+        reviewer: tool
+      - id: rub/b
+        statement: rubric
+        detects: [process/untested-branch]
+        verify: rubric
+        anchors: { "1.0": ok, "0.4": mid, "0.0": bad }
+        reviewer: either
+      - id: hum/c
+        statement: human only
+        detects: [data/immutability-breach]
+        verify: rubric
+        anchors: { "1.0": ok, "0.4": mid, "0.0": bad }
+        reviewer: human
+scoring:
+  theta: 0.8
+  floors: { catastrophic: 0.7 }
+  blocked_policy: { max_blocked_weight: 0.2 }
+  weights:
+    mech/a: 0.5
+    rub/b: 0.3
+    hum/c: 0.2
+"#;
+    serde_yaml::from_str(yaml).unwrap()
+}
+
+fn mk_engine(store: &Store) -> Engine<'_> {
+    Engine::new(store).with_workspace(workspace()).with_profile(tiny_profile())
 }
 
 fn approved(store: &Store, id: &str) {
@@ -33,7 +96,7 @@ fn full_cycle_through_both_human_gates() {
     let (_d, store) = store();
     let t = Task::new("Minimal process", "Run devai's own roles end to end", None, Utc::now());
     store.create_task(&t).unwrap();
-    let engine = Engine::new(&store);
+    let engine = mk_engine(&store);
 
     // 1) DRAFT → ... → APPROVAL, stopping exactly at the first human gate.
     let r1 = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -56,6 +119,35 @@ fn full_cycle_through_both_human_gates() {
     assert_eq!(r2.steps.len(), 2, "implementation + quality auditor run");
     assert_eq!(r2.steps[0].role, "implementation-agent");
     assert_eq!(r2.steps[1].role, "quality-auditor");
+
+    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@2: probes ran
+    // in code, the mock auditor contributed no fabricated scores, and the
+    // verdict function stayed "not ready" because a human check is unsigned.
+    let qa = {
+        let arts = store.artifacts(t.id).unwrap();
+        let a = arts.iter().find(|a| a.kind == ArtifactKind::QualityReport).unwrap();
+        store.read_blob(&a.sha256).unwrap()
+    };
+    let rep: serde_json::Value = serde_json::from_slice(&qa).unwrap();
+    assert_eq!(rep["verdict"], "ESCALATE");
+    assert_eq!(rep["profile"]["project"], "devai");
+    assert_eq!(rep["evaluation"]["verdict"], "INCONCLUSIVE");
+    assert_eq!(rep["evaluation"]["gates"].as_array().unwrap().len(), 2);
+    let states: Vec<&str> = rep["evaluation"]["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["PASS", "BLOCKED"], "blocked probe never folds into PASS");
+    assert!(rep["evaluation"]["pending_human"].as_array().unwrap().contains(&serde_json::json!("hum/c")));
+    let checks = rep["evaluation"]["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 3);
+    assert!(checks.iter().any(|c| c["id"] == "mech/a" && c["state"] == "MECHANICAL_PASS"));
+    assert!(checks.iter().any(|c| c["id"] == "rub/b" && c["state"] == "BLOCKED"));
+    assert!(checks.iter().any(|c| c["id"] == "hum/c" && c["state"] == "PENDING_HUMAN"));
+    assert!(rep["report_text"].as_str().unwrap().starts_with("ВЕРДИКТ: ВЕРДИКТ НЕ ГОТОВ"));
+    assert!(r2.steps[1].summary.as_deref().unwrap_or_default().contains("ESCALATE"));
 
     // 3) human acceptance closes the task.
     accepted(&store, &t.id.to_string());
@@ -109,7 +201,7 @@ fn rejection_loops_back_through_a_new_spec_version() {
     let (_d, store) = store();
     let t = Task::new("Loop", "Reviewer rejects once, second spec passes", None, Utc::now());
     store.create_task(&t).unwrap();
-    let engine = Engine::new(&store);
+    let engine = mk_engine(&store);
     engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
 
     // human REJECT in APPROVAL → back to ANALYSIS
@@ -147,7 +239,7 @@ fn failed_adapter_leaves_workflow_untouched() {
             created_at: Utc::now(),
         })
         .unwrap();
-    let engine = Engine::new(&store);
+    let engine = mk_engine(&store);
     let err = engine.advance(&t.id.to_string(), "broken", "tester").unwrap_err();
     assert!(err.to_string().contains("telepathy"), "{err}");
 
@@ -167,7 +259,7 @@ fn holds_and_terminals_stop_the_engine() {
     let (_d, store) = store();
     let t = Task::new("Paused", "Engine must not run roles on a held task", None, Utc::now());
     store.create_task(&t).unwrap();
-    let engine = Engine::new(&store);
+    let engine = mk_engine(&store);
     // start, then pause
     let m = workflow::start(&store.get_task(&t.id.to_string()).unwrap(), "tester", Utc::now()).unwrap();
     store.commit(t.lock_version, &m).unwrap();

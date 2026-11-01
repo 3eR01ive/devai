@@ -8,6 +8,7 @@
 
 mod adapters;
 mod engine;
+pub mod evaluation;
 mod prompt;
 
 pub use adapters::{AdapterError, AgentRuntime, ExecOutput, ExecRequest};

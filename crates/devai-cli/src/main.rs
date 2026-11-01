@@ -107,6 +107,11 @@ enum TaskCmd {
     Status {
         id: String,
     },
+    /// Show the CURRENT quality report — the rendering a human signs at the
+    /// QA gate (with --json: the full machine report).
+    Report {
+        id: String,
+    },
     /// DRAFT → ANALYSIS: start the workflow
     Start {
         id: String,
@@ -118,6 +123,9 @@ enum TaskCmd {
         /// Agent name from `devai agent list` (builtin: mock, claude)
         #[arg(long, default_value = "mock")]
         agent: String,
+        /// Workspace where QA gates and mechanical probes execute (default: cwd).
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
     },
     /// Publish/replace a REQUIREMENTS_SPEC and move to REVIEW
     Revise {

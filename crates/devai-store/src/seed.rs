@@ -132,6 +132,107 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
         ),
         (
             "quality-report",
+            2,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Quality Report v2 — machine-assembled by the platform",
+  "description": "Assembled by devai-runtime from the evaluation profile: platform-run gates and mechanical probes merged with the auditor's rubric scores. The verdict is computed by the deterministic function of docs/evaluation-schema.md 2.5, never by a model. report_text is the 2.6 human rendering.",
+  "type": "object",
+  "required": ["verdict", "recommendation_basis", "report_text", "profile", "evaluation"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["ACCEPT", "RETURN", "ESCALATE"] },
+    "recommendation_basis": { "type": "string" },
+    "report_text": { "type": "string" },
+    "profile": {
+      "type": "object",
+      "required": ["project", "version"],
+      "properties": { "project": { "type": "string" }, "version": { "type": "integer" } }
+    },
+    "assessment_execution": { "type": "string", "description": "role execution id of the auditor run" },
+    "evaluation": {
+      "type": "object",
+      "required": ["verdict", "score", "theta", "gates", "checks"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "score": { "type": "number" },
+        "theta": { "type": "number" },
+        "blocked_weight": { "type": "number" },
+        "max_blocked_weight": { "type": "number" },
+        "floors_breached": { "type": "array", "items": { "type": "string" } },
+        "pending_human": { "type": "array", "items": { "type": "string" } },
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "state"],
+            "properties": {
+              "id": { "type": "string" },
+              "state": { "type": "string", "enum": ["PASS", "FAIL", "BLOCKED"] },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "verify", "state", "weight", "detects"],
+            "properties": {
+              "id": { "type": "string" },
+              "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
+              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "score": { "type": "number" },
+              "floor": { "type": "number" },
+              "weight": { "type": "number" },
+              "detects": { "type": "array", "items": { "type": "string" } },
+              "violations": { "type": "array", "items": { "type": "string" } },
+              "evidence": { "type": "array", "items": { "type": "string" } },
+              "reason": { "type": "string", "description": "why BLOCKED / unscored" }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#,
+        ),
+        (
+            "evaluation-assessment",
+            1,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Evaluation Assessment v1 — auditor's raw rubric reply",
+  "description": "What the quality-auditor agent emits. Scores only for checks it is allowed to score; no verdict (the platform computes it). Every score below 1.0 must carry evidence or appear in gaps.",
+  "type": "object",
+  "required": ["scores", "findings", "gaps"],
+  "properties": {
+    "scores": { "type": "object", "description": "check-id -> anchor score in [0,1]" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check", "text", "evidence"],
+        "properties": {
+          "check": { "type": "string" },
+          "text": { "type": "string", "description": "what + file:line + what it leads to" },
+          "evidence": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["check", "reason"],
+        "properties": { "check": { "type": "string" }, "reason": { "type": "string" } }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}"#,
+        ),
+        (
+            "quality-report",
             1,
             r#"{
   "$schema": "http://json-schema.org/draft-07/schema#",

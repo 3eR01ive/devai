@@ -71,7 +71,13 @@ fn init(ctx: &Ctx, config_dir: Option<&Path>, json: bool) -> Result<()> {
         println!("config tree: {}", cfg_path.display());
         if seeded > 0 {
             println!("seeded/updated {seeded} role version(s) from config");
-            println!("edit {}/criteria/*.yaml or roles/*.yaml and re-run `devai init` to bump versions", cfg_path.display());
+            println!(
+                "edit {}/criteria/*.yaml, evaluation/*.yaml or roles/*.yaml and re-run `devai init` to bump versions",
+                cfg_path.display()
+            );
+            if config_dir.is_some() {
+                println!("the engine reads evaluation profiles from $DEVAI_CONFIG — export DEVAI_CONFIG={}", cfg_path.display());
+            }
         } else {
             println!("store already initialized (config unchanged)");
         }
@@ -166,8 +172,9 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             }
         }
         TaskCmd::Status { id } => status(ctx, &id, json)?,
+        TaskCmd::Report { id } => show_report(ctx, &id, json)?,
         TaskCmd::Start { id } => op(ctx, &id, |t, _a| workflow::start(t, &ctx.actor, ctx.now()))?,
-        TaskCmd::Run { id, agent } => task_run(ctx, &id, &agent, json)?,
+        TaskCmd::Run { id, agent, workspace } => task_run(ctx, &id, &agent, workspace.as_deref(), json)?,
         TaskCmd::Revise { id, file, reason } => revise(ctx, &id, &file, reason.as_deref())?,
         TaskCmd::Review { id, verdict, summary } => {
             let v = parse_verdict(&verdict)?;
@@ -236,8 +243,11 @@ where
 
 /// Drive the task through every AUTONOMOUS stage with a real role
 /// execution. Stops at human gates (APPROVAL, acceptance) — never past them.
-fn task_run(ctx: &Ctx, id: &str, agent: &str, json: bool) -> Result<()> {
-    let engine = Engine::new(&ctx.store);
+fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path>, json: bool) -> Result<()> {
+    let mut engine = Engine::new(&ctx.store);
+    if let Some(w) = workspace {
+        engine = engine.with_workspace(w);
+    }
     let report = engine.advance(id, agent, &ctx.actor).map_err(anyhow::Error::new)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -259,7 +269,14 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, json: bool) -> Result<()> {
     }
     match report.gate {
         Gate::WaitingApproval => println!("⏸ APPROVAL is a human gate — approve or reject the requirements"),
-        Gate::WaitingAccept => println!("⏸ acceptance is a human gate — accept or return the result"),
+        Gate::WaitingAccept => {
+            // The §2.6 rendering is for the human at the gate.
+            if let Some(text) = latest_quality_report_text(&ctx.store, report.task_id) {
+                println!("── quality report (platform-assembled) ──");
+                println!("{text}");
+            }
+            println!("⏸ acceptance is a human gate — accept or return the result");
+        }
         Gate::Terminal(st) => println!("task finished: {}", st.as_str()),
         Gate::Hold(st) => println!("task held in {} — release it first", st.as_str()),
     }
@@ -269,6 +286,69 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, json: bool) -> Result<()> {
         println!("next: {}", ops.join(" | "));
     }
     Ok(())
+}
+
+/// The human gate's viewing channel: the CURRENT quality report. A verdict
+/// that must be signed must also be readable — after the run printed it, on
+/// demand, forever (history is never deleted; only CURRENT is shown).
+fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    let t = ctx.store.resolve_task(id)?;
+    let arts = ctx.store.artifacts(t.id)?;
+    let a = arts
+        .iter()
+        .filter(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
+        .max_by_key(|x| x.seq)
+        .with_context(|| format!("no quality report for {} yet — QA has not run", short(&t.id)))?;
+    let blob = ctx.store.read_blob(&a.sha256)?;
+    let contract = a
+        .contract
+        .as_ref()
+        .map(|c| format!("{}@{}", c.name, c.version))
+        .unwrap_or_else(|| "—".into());
+    let value: serde_json::Value = serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "task": t.id.to_string(),
+                "artifact": a.id.to_string(),
+                "seq": a.seq,
+                "contract": contract,
+                "created_at": a.created_at,
+                "execution": a.execution_id.map(|e| e.to_string()),
+                "report": value,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "quality report v{}  artifact {}  contract {contract}  execution {}",
+        a.seq,
+        short(&a.id),
+        a.execution_id.map(|e| short(&e)).unwrap_or_else(|| "-".into())
+    );
+    println!("---");
+    match value.get("report_text").and_then(|s| s.as_str()) {
+        Some(text) => println!("{text}"),
+        // Reports assembled before @2 carry no rendering: show the machine
+        // JSON rather than pretend there is nothing to read.
+        None => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_else(|_| String::from_utf8_lossy(&blob).into_owned())),
+    }
+    Ok(())
+}
+
+fn latest_quality_report_text(store: &devai_store::Store, task_id: devai_core::types::Id) -> Option<String> {
+    let arts = store.artifacts(task_id).ok()?;
+    let a = arts
+        .iter()
+        .filter(|a| a.kind == devai_core::types::ArtifactKind::QualityReport && a.status == devai_core::types::ArtifactStatus::Current)
+        .max_by_key(|a| a.seq)?;
+    let blob = store.read_blob(&a.sha256).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&blob).ok()?;
+    v.get("report_text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| Some("(report assembled before @2 — no rendering)".into()))
 }
 
 fn revise(ctx: &Ctx, id: &str, file: &Path, reason: Option<&str>) -> Result<()> {
