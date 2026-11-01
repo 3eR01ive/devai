@@ -347,7 +347,7 @@ impl Config {
         use std::fmt::Write as _;
         let _ = writeln!(
             ins,
-            "\n\nEvaluation profile `{}` v{}: the PLATFORM runs gates and mechanical probes, computes S, floors and the verdict — you never emit a verdict. Your reply is an evaluation-assessment JSON: `scores` ({{check-id: number}} for the rubric/hybrid checks below), `findings` ([{{check, text, evidence[]}}] — text = what + file:line + what it leads to), `gaps` ([{{check, reason}}] when you could not verify something honestly — an unperformed check is never a fake score).",
+            "\n\nEvaluation profile `{}` v{}: the PLATFORM runs gates and mechanical probes, computes S, floors and the verdict — you never emit a verdict. Your reply is an evaluation-assessment JSON: `scores` ({{check-id: number}} for the rubric/hybrid checks below), `findings` ([{{check, text, evidence[]}}] — text = what + file:line + what it leads to; `evidence` is a NON-EMPTY array of concrete citations: test output, artifact id, build log), `gaps` ([{{check, reason}}] when you could not verify something honestly — an unperformed check is never a fake score). The platform assembles the quality-report@3, and the contract gate rejects any criteria entry whose evidence array is missing or empty — no criterion is ever recorded as a pass without evidence.",
             profile.project, profile.version
         );
         let mut human_only: Vec<&str> = Vec::new();
@@ -379,7 +379,7 @@ impl Config {
             if c.evidence == "required" {
                 let _ = writeln!(
                     ins,
-                    "  evidence: REQUIRED for any score < 1.0 (quotes with file:line); without evidence your score is discarded (proc/evidence-completeness)."
+                    "  evidence: REQUIRED — every criteria entry must cite at least one concrete evidence item (test output, artifact id, build log). A score < 1.0 without evidence is discarded (proc/evidence-completeness); a PASS backed only by your judgment is contract-invalid (quality-report@3: minItems 1 per check)."
                 );
             }
         }

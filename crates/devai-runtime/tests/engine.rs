@@ -120,14 +120,21 @@ fn full_cycle_through_both_human_gates() {
     assert_eq!(r2.steps[0].role, "implementation-agent");
     assert_eq!(r2.steps[1].role, "quality-auditor");
 
-    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@2: probes ran
+    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@3: probes ran
     // in code, the mock auditor contributed no fabricated scores, and the
     // verdict function stayed "not ready" because a human check is unsigned.
-    let qa = {
+    let (qa_artifact, qa) = {
         let arts = store.artifacts(t.id).unwrap();
-        let a = arts.iter().find(|a| a.kind == ArtifactKind::QualityReport).unwrap();
-        store.read_blob(&a.sha256).unwrap()
+        let a = arts.iter().find(|a| a.kind == ArtifactKind::QualityReport).unwrap().clone();
+        let body = store.read_blob(&a.sha256).unwrap();
+        (a, body)
     };
+    // The report is pinned to the strengthened contract version.
+    assert_eq!(
+        qa_artifact.contract.as_ref().map(|c| (c.name.as_str(), c.version)),
+        Some(("quality-report", 3)),
+        "QA artifact must be published under quality-report@3"
+    );
     let rep: serde_json::Value = serde_json::from_slice(&qa).unwrap();
     assert_eq!(rep["verdict"], "ESCALATE");
     assert_eq!(rep["profile"]["project"], "devai");
@@ -146,6 +153,20 @@ fn full_cycle_through_both_human_gates() {
     assert!(checks.iter().any(|c| c["id"] == "mech/a" && c["state"] == "MECHANICAL_PASS"));
     assert!(checks.iter().any(|c| c["id"] == "rub/b" && c["state"] == "BLOCKED"));
     assert!(checks.iter().any(|c| c["id"] == "hum/c" && c["state"] == "PENDING_HUMAN"));
+    // QA rule "evidence per criterion": every criteria entry of the stored
+    // report cites concrete evidence — the probe command+exit for mechanical
+    // results, the auditor's gap record / pending signature marker otherwise.
+    for c in checks.iter() {
+        let ev = c["evidence"]
+            .as_array()
+            .unwrap_or_else(|| panic!("check {} must serialize evidence", c["id"]));
+        assert!(
+            ev.iter().any(|e| e.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+            "check {} ({}) must cite at least one concrete evidence item, got {ev:?}",
+            c["id"],
+            c["state"].as_str().unwrap_or("?"),
+        );
+    }
     assert!(rep["report_text"].as_str().unwrap().starts_with("ВЕРДИКТ: ВЕРДИКТ НЕ ГОТОВ"));
     assert!(r2.steps[1].summary.as_deref().unwrap_or_default().contains("ESCALATE"));
 
@@ -252,6 +273,50 @@ fn failed_adapter_leaves_workflow_untouched() {
     assert_eq!(execs.len(), 1);
     assert_eq!(execs[0].status, ExecutionStatus::Failed);
     assert!(execs[0].error.is_some());
+}
+
+/// The same contract gate `Engine::run_stage` runs on the assembled QA
+/// report (engine.rs) must reject quality reports whose criteria entries
+/// lack concrete evidence — driven through the schema SEEDED into the store,
+/// not a fixture copy of it.
+#[test]
+fn evidenceless_criteria_entries_are_rejected_by_the_contract_gate() {
+    let (_d, store) = store();
+    let schema = store
+        .get_contract("quality-report", 3)
+        .unwrap()
+        .expect("quality-report@3 must be seeded");
+    let good = serde_json::json!({
+        "verdict": "ACCEPT",
+        "recommendation_basis": "шлюзы зелёные, полы целы",
+        "report_text": "ВЕРДИКТ: ПРОШЁЛ",
+        "profile": { "project": "devai", "version": 2 },
+        "evaluation": {
+            "verdict": "PASS", "score": 1.0, "theta": 0.8,
+            "gates": [{ "id": "build-green", "state": "PASS" }],
+            "checks": [
+                { "id": "mech/a", "verify": "mechanical", "state": "MECHANICAL_PASS",
+                  "weight": 0.5, "detects": ["process/untested-branch"],
+                  "evidence": ["`cargo test -p devai-core --test workflow` -> exit 0: 42 passed"] },
+                { "id": "rub/b", "verify": "rubric", "state": "SCORED", "score": 1.0,
+                  "weight": 0.5, "detects": ["process/untested-branch"],
+                  "evidence": ["artifact b16c3e — auditor notes on crates/devai-core/src/workflow.rs:88"] },
+            ]
+        }
+    });
+    assert!(devai_runtime::validate_against_contract(&good.to_string(), Some(&schema)).is_ok());
+
+    // A criteria entry omitting `evidence` is contract-invalid...
+    let mut missing = good.clone();
+    missing["evaluation"]["checks"][1].as_object_mut().unwrap().remove("evidence");
+    let err = devai_runtime::validate_against_contract(&missing.to_string(), Some(&schema)).unwrap_err();
+    assert!(err.to_string().contains("$.evaluation.checks[1].evidence: missing required key"), "{err}");
+
+    // ...and so is an empty evidence array.
+    let mut empty = good.clone();
+    empty["evaluation"]["checks"][0]["evidence"] = serde_json::json!([]);
+    let err = devai_runtime::validate_against_contract(&empty.to_string(), Some(&schema)).unwrap_err();
+    assert!(err.to_string().contains("$.evaluation.checks[0].evidence: array has 0 item(s), minimum 1"), "{err}");
 }
 
 #[test]

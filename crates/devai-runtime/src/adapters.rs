@@ -151,8 +151,9 @@ impl AgentRuntime {
             }),
             "quality-report" | "evaluation-assessment" => {
                 // The QA agent answers with an evaluation-assessment; the
-                // platform (engine) assembles the machine quality-report@2.
-                // The mock never fabricates rubric scores offline.
+                // platform (engine) assembles the machine quality-report@3.
+                // The mock never fabricates rubric scores offline — its gap
+                // record becomes the cited evidence on the assembled checks.
                 serde_json::json!({
                     "scores": {},
                     "findings": [],
@@ -202,10 +203,13 @@ fn claude_tools_for(role: &RoleDefinition) -> Vec<String> {
 }
 
 /// Contract gate: a JSON-Schema draft-07 subset enforced RECURSIVELY —
-/// `required` at every object level, `items` schemas through arrays, `enum`
-/// membership and primitive type checks, with a json path on each violation.
-/// Full JSON-Schema is still out of scope, but garbage cannot silently enter
-/// the artifact store any more (defect R2 of the dogfood task).
+/// `required` at every object level, `items` schemas through arrays,
+/// `minItems` cardinality on arrays, `enum` membership and primitive type
+/// checks, with a json path on each violation. Full JSON-Schema is still out
+/// of scope, but garbage cannot silently enter the artifact store any more
+/// (defect R2 of the dogfood task). `minItems` is what makes the QA rule
+/// "every criteria entry cites concrete evidence" (`quality-report@3`)
+/// mechanically enforced, not just declared in the schema text.
 pub fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<(), AdapterError> {
     let Some(schema) = schema else { return Ok(()); };
     let value: Value = serde_json::from_str(content)
@@ -252,6 +256,11 @@ fn validate_node(schema: &Value, value: &Value, path: &str, errs: &mut Vec<Strin
                 errs.push(format!("{path}: expected array, got {}", json_kind(value)));
                 return;
             };
+            if let Some(min) = obj.get("minItems").and_then(|m| m.as_u64()) {
+                if (items.len() as u64) < min {
+                    errs.push(format!("{path}: array has {} item(s), minimum {min}", items.len()));
+                }
+            }
             if let Some(sub) = obj.get("items") {
                 if sub.get("type").is_some() {
                     for (i, it) in items.iter().enumerate() {
@@ -455,5 +464,71 @@ mod tests {
         let bad_type = r#"{"verdict":"ACCEPT","evaluation":{"score":"0.9","gates":[]}}"#;
         let e = validate_against_contract(bad_type, Some(schema)).unwrap_err().to_string();
         assert!(e.contains("$.evaluation.score: expected number"), "{e}");
+    }
+
+    /// QA rule "evidence per criterion", enforced on the SEEDED schema texts:
+    /// every `evaluation.checks` entry must carry a non-empty evidence array.
+    #[test]
+    fn quality_report_gate_requires_evidence_on_every_check() {
+        let schema_v3 = devai_store::seed::contracts()
+            .into_iter()
+            .find(|(name, ver, _)| *name == "quality-report" && *ver == 3)
+            .expect("quality-report@3 is seeded")
+            .2
+            .to_string();
+        let good = serde_json::json!({
+            "verdict": "ACCEPT",
+            "recommendation_basis": "шлюзы зелёные, полы целы",
+            "report_text": "ВЕРДИКТ: ПРОШЁЛ",
+            "profile": { "project": "devai", "version": 2 },
+            "evaluation": {
+                "verdict": "PASS", "score": 0.93, "theta": 0.8,
+                "gates": [{ "id": "build-green", "state": "PASS", "detail": "`cargo build --workspace` -> exit 0" }],
+                "checks": [{
+                    "id": "corr/transitions", "verify": "mechanical", "state": "MECHANICAL_PASS",
+                    "score": 1.0, "weight": 0.12, "detects": ["correctness/state-transition"],
+                    "evidence": ["`cargo test -p devai-core --test workflow` -> exit 0: 14 passed"]
+                }]
+            }
+        });
+        assert!(validate_against_contract(&good.to_string(), Some(&schema_v3)).is_ok(), "report citing evidence on every check passes the gate");
+
+        // Missing `evidence` key on a check entry.
+        let mut missing = good.clone();
+        missing["evaluation"]["checks"][0].as_object_mut().unwrap().remove("evidence");
+        let e = validate_against_contract(&missing.to_string(), Some(&schema_v3)).unwrap_err().to_string();
+        assert!(e.contains("$.evaluation.checks[0].evidence: missing required key"), "{e}");
+
+        // Empty evidence array — the core of the rule.
+        let mut empty = good.clone();
+        empty["evaluation"]["checks"][0]["evidence"] = serde_json::json!([]);
+        let e = validate_against_contract(&empty.to_string(), Some(&schema_v3)).unwrap_err().to_string();
+        assert!(e.contains("$.evaluation.checks[0].evidence: array has 0 item(s), minimum 1"), "{e}");
+    }
+
+    /// Legacy wording of the same rule: `criteria_results` under @1.
+    #[test]
+    fn legacy_quality_report_v1_gate_requires_evidence_per_criterion() {
+        let schema_v1 = devai_store::seed::contracts()
+            .into_iter()
+            .find(|(name, ver, _)| *name == "quality-report" && *ver == 1)
+            .expect("quality-report@1 stays seeded for history")
+            .2
+            .to_string();
+        let good = serde_json::json!({
+            "verdict": "ACCEPT",
+            "criteria_results": [{ "requirement_id": "R1", "status": "PASS", "evidence": ["artifact a1b2c3 — test output excerpt"] }]
+        });
+        assert!(validate_against_contract(&good.to_string(), Some(&schema_v1)).is_ok());
+
+        let mut empty = good.clone();
+        empty["criteria_results"][0]["evidence"] = serde_json::json!([]);
+        let e = validate_against_contract(&empty.to_string(), Some(&schema_v1)).unwrap_err().to_string();
+        assert!(e.contains("$.criteria_results[0].evidence: array has 0 item(s), minimum 1"), "{e}");
+
+        let mut missing = good.clone();
+        missing["criteria_results"][0].as_object_mut().unwrap().remove("evidence");
+        let e = validate_against_contract(&missing.to_string(), Some(&schema_v1)).unwrap_err().to_string();
+        assert!(e.contains("$.criteria_results[0].evidence: missing required key"), "{e}");
     }
 }

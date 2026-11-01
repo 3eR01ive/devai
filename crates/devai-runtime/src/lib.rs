@@ -11,6 +11,8 @@ mod engine;
 pub mod evaluation;
 mod prompt;
 
-pub use adapters::{AdapterError, AgentRuntime, ExecOutput, ExecRequest};
+pub use adapters::{
+    validate_against_contract, AdapterError, AgentRuntime, ExecOutput, ExecRequest,
+};
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};
 pub use prompt::{build_system_prompt, build_user_prompt, extract_json_object};
