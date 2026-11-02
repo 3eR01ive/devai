@@ -384,6 +384,12 @@ pub fn allowed_ops(task: &Task) -> Vec<&'static str> {
         TaskState::WaitingForInput => vec!["answer"],
         TaskState::Paused | TaskState::Failed => vec!["resume"],
         TaskState::Blocked => vec!["resume"],
+        // The merge gate (REQ-WT-07) is deliberately NOT a workflow
+        // operation: merging the task's `rework/<task-id>` branch into the
+        // baseline is a repository act performed by the human `devai task
+        // merge` command — available via the CLI at any time, recorded as a
+        // decision + event, and moving no task state. An ACCEPTED task
+        // awaits nothing from it, and no state "passes" by merging.
         TaskState::Accepted => vec![],
         TaskState::Cancelled => vec![],
     };

@@ -11,6 +11,7 @@ mod engine;
 pub mod evaluation;
 mod prompt;
 pub mod revision;
+pub mod worktree;
 
 pub use adapters::{
     validate_against_contract, AdapterError, AgentRuntime, ExecOutput, ExecRequest,

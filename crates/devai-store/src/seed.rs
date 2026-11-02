@@ -166,6 +166,26 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
         (
+            "implementation-report",
+            2,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Implementation Report v2 — the platform names branch, worktree and commit",
+  "description": "Same required set as @1. `worktree` and `commit` are added for REQ-WT-04: after a writing execution the engine STAMPS `branch` (the platform-created rework branch), `worktree` (the isolation directory the agent worked in) and `commit` (the SHA of the platform commit capturing the work) with ground-truth repository state, then validates the published body. Optional on the agent-reply shape because a read-only-git agent can never know the commit before the platform creates it; the mechanical guarantee is the engine-side stamp + re-validation, pinned in code.",
+  "type": "object",
+  "required": ["branch", "patch", "test_results"],
+  "properties": {
+    "branch": { "type": "string", "description": "the platform-created `rework/<task-id>` branch (stamped)" },
+    "worktree": { "type": "string", "description": "the isolation worktree directory under DEVAI_HOME the execution ran in (stamped)" },
+    "commit": { "type": "string", "description": "full SHA of the resulting platform commit on that branch (stamped)" },
+    "patch": { "type": "string", "description": "artifact id or reference to diff" },
+    "test_results": { "type": "object", "description": "real outcomes of build/tests" },
+    "requirement_coverage": { "type": "array", "items": { "type": "object" } },
+    "notes": { "type": "string" }
+  }
+}"#,
+        ),
+        (
             "quality-report",
             2,
             r#"{

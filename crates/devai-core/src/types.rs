@@ -285,6 +285,22 @@ pub struct RoleDefinition {
     pub created_at: Timestamp,
 }
 
+/// Capability name for a role that MUTATES workspace files. Declared in
+/// `config/roles/*.yaml` `tools:` — the vocabulary entry lives here, in core,
+/// next to the rest of the domain vocabulary.
+pub const CAP_FILESYSTEM_READ_WRITE: &str = "filesystem:read-write";
+
+impl RoleDefinition {
+    /// A WRITING role, decided from the role's declarative capability list —
+    /// never from which artifact kind it happens to output. Which roles write
+    /// is configuration (the same idiom as `rework-context.yaml`: WHICH role
+    /// acts is data, not code); when a second writing role is declared it
+    /// inherits workspace isolation with no engine edit.
+    pub fn writes_workspace(&self) -> bool {
+        self.tools.iter().any(|t| t == CAP_FILESYSTEM_READ_WRITE)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AgentInstance {
     pub id: Id,
@@ -450,6 +466,14 @@ pub struct EventDraft {
     pub payload: serde_json::Value,
 }
 
+pub mod decision_kind {
+    /// The human merge gate (REQ-WT-07): an explicit human decision that the
+    /// task's platform-created `rework/<task-id>` branch is merged into the
+    /// baseline. Recorded ONLY by the human-invoked CLI command — no
+    /// engine/runtime/agent path performs or records a merge.
+    pub const REWORK_MERGE: &str = "rework_merge";
+}
+
 pub mod event_kind {
     pub const TASK_CREATED: &str = "task.created";
     pub const WORKFLOW_STARTED: &str = "workflow.started";
@@ -484,4 +508,12 @@ pub mod event_kind {
     pub const QA_FRESH_AWAITING_DECISION: &str = "qa.fresh_awaiting_decision";
     /// A human explicitly overrode the freshness gate and demanded a re-audit.
     pub const QA_REAUDIT_FORCED: &str = "qa.reaudit_forced";
+    /// The human merge gate ran (REQ-WT-07): the task's `rework/<task-id>`
+    /// branch was merged into the baseline by an explicit human command.
+    pub const REWORK_MERGED: &str = "rework.merged";
+    /// A writing stage was isolated: the platform created/reused the task's
+    /// git worktree (REQ-WT-01) and/or committed the agent's work to the
+    /// task's own branch (REQ-WT-06). Platform repository facts, not judgment.
+    pub const WORKTREE_PREPARED: &str = "worktree.prepared";
+    pub const WORKTREE_COMMITTED: &str = "worktree.committed";
 }

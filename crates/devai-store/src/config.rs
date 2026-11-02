@@ -663,18 +663,23 @@ mod tests {
         assert_eq!(seed_roles(&store, &cfg, now).unwrap(), 6);
         assert_eq!(seed_roles(&store, &cfg, now).unwrap(), 0, "idempotent re-seed");
 
+        // The factory YAML declares its own role version (71d416b moved
+        // quality-auditor to @2): the assertions track THAT declared number,
+        // never a hardcoded literal that rots on the next declarative bump.
+        let declared = cfg.roles.iter().find(|r| r.slug == "quality-auditor").unwrap().version;
+
         // Edit the evaluation profile (raise theta) → next seed bumps just the auditor.
         let mut cfg2 = cfg.clone();
         cfg2.profiles.first_mut().unwrap().scoring.theta = 0.85;
         assert_eq!(seed_roles(&store, &cfg2, now).unwrap(), 1);
 
         let q = store.get_role("quality-auditor").unwrap().unwrap();
-        assert_eq!(q.version, 2, "latest version wins for new executions");
+        assert_eq!(q.version, declared + 1, "latest version wins for new executions");
         assert!(q.instructions.contains("theta 0.85"), "{}", q.instructions);
-        // v1 remains in the table — history is never overwritten.
+        // The factory-declared row remains in the table — history is never overwritten.
         let all = store.list_roles().unwrap();
-        assert!(all.iter().any(|r| r.slug == "quality-auditor" && r.version == 1));
-        assert!(all.iter().any(|r| r.slug == "quality-auditor" && r.version == 2));
+        assert!(all.iter().any(|r| r.slug == "quality-auditor" && r.version == declared));
+        assert!(all.iter().any(|r| r.slug == "quality-auditor" && r.version == declared + 1));
     }
 
     #[test]
