@@ -126,6 +126,11 @@ enum TaskCmd {
         /// Workspace where QA gates and mechanical probes execute (default: cwd).
         #[arg(long)]
         workspace: Option<std::path::PathBuf>,
+        /// Explicit human decision to re-audit despite a FRESH quality
+        /// report (the report is bound to exactly the current workspace
+        /// revision). Persists an override decision + event; never implied.
+        #[arg(long)]
+        force_reaudit: bool,
     },
     /// Publish/replace a REQUIREMENTS_SPEC and move to REVIEW
     Revise {

@@ -151,7 +151,7 @@ impl AgentRuntime {
             }),
             "quality-report" | "evaluation-assessment" => {
                 // The QA agent answers with an evaluation-assessment; the
-                // platform (engine) assembles the machine quality-report@3.
+                // platform (engine) assembles the machine quality-report@4.
                 // The mock never fabricates rubric scores offline — its gap
                 // record becomes the cited evidence on the assembled checks.
                 serde_json::json!({
@@ -208,8 +208,8 @@ fn claude_tools_for(role: &RoleDefinition) -> Vec<String> {
 /// checks, with a json path on each violation. Full JSON-Schema is still out
 /// of scope, but garbage cannot silently enter the artifact store any more
 /// (defect R2 of the dogfood task). `minItems` is what makes the QA rule
-/// "every criteria entry cites concrete evidence" (`quality-report@3`)
-/// mechanically enforced, not just declared in the schema text.
+/// "every criteria entry cites concrete evidence" (born in `quality-report@3`,
+/// carried unchanged into @4) mechanically enforced, not just declared.
 pub fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<(), AdapterError> {
     let Some(schema) = schema else { return Ok(()); };
     let value: Value = serde_json::from_str(content)

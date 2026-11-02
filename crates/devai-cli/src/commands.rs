@@ -174,7 +174,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Status { id } => status(ctx, &id, json)?,
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
         TaskCmd::Start { id } => op(ctx, &id, |t, _a| workflow::start(t, &ctx.actor, ctx.now()))?,
-        TaskCmd::Run { id, agent, workspace } => task_run(ctx, &id, &agent, workspace.as_deref(), json)?,
+        TaskCmd::Run { id, agent, workspace, force_reaudit } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
         TaskCmd::Revise { id, file, reason } => revise(ctx, &id, &file, reason.as_deref())?,
         TaskCmd::Review { id, verdict, summary } => {
             let v = parse_verdict(&verdict)?;
@@ -243,8 +243,8 @@ where
 
 /// Drive the task through every AUTONOMOUS stage with a real role
 /// execution. Stops at human gates (APPROVAL, acceptance) — never past them.
-fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path>, json: bool) -> Result<()> {
-    let mut engine = Engine::new(&ctx.store);
+fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path>, force_reaudit: bool, json: bool) -> Result<()> {
+    let mut engine = Engine::new(&ctx.store).with_force_reaudit(force_reaudit);
     if let Some(w) = workspace {
         engine = engine.with_workspace(w);
     }
@@ -276,6 +276,32 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
                 println!("{text}");
             }
             println!("⏸ acceptance is a human gate — accept or return the result");
+        }
+        Gate::ReportFresh => {
+            // The freshness gate stopped the run: no auditor execution was
+            // started, no artifact was published. The human decides.
+            let arts = ctx.store.artifacts(report.task_id)?;
+            if let Some(a) = arts
+                .iter()
+                .filter(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
+                .max_by_key(|x| x.seq)
+            {
+                println!(
+                    "⏸ quality report v{} ({}) is FRESH — it is bound to exactly the recomputed workspace revision; the auditor was NOT re-run",
+                    a.seq,
+                    short(&a.id)
+                );
+            } else {
+                println!("⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run");
+            }
+            if let Some(text) = latest_quality_report_text(&ctx.store, report.task_id) {
+                println!("── quality report (platform-assembled) ──");
+                println!("{text}");
+            }
+            println!(
+                "   decide explicitly: accept/return this report, or re-audit an unchanged workspace with `devai task run {} --force-reaudit`",
+                short(&report.task_id)
+            );
         }
         Gate::Terminal(st) => println!("task finished: {}", st.as_str()),
         Gate::Hold(st) => println!("task held in {} — release it first", st.as_str()),
@@ -702,6 +728,10 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
             let rd = ctx.store.get_role(&role)?;
             let version = rd.as_ref().map(|r| r.version).unwrap_or(1);
             let inputs_str: Vec<String> = resolve_ids(ctx, &inputs)?.iter().map(|i| i.to_string()).collect();
+            // REQ-001/REQ-006: even a manually started execution binds to the
+            // workspace state the platform can observe right now (cwd),
+            // computed platform-side — never supplied by the caller.
+            let revision = Engine::new(&ctx.store).current_revision().map_err(anyhow::Error::new)?;
             let e = RoleExecution {
                 id: new_id(),
                 task_id: task.id,
@@ -714,6 +744,7 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 error: None,
                 started_at: ctx.now(),
                 finished_at: None,
+                workspace_revision: Some(revision),
             };
             ctx.store.start_execution(&e)?;
             println!("execution {} for role {role}@{version} started in state {}", short(&e.id), task.state.as_str());

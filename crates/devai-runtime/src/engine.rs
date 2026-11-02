@@ -20,14 +20,17 @@ use crate::adapters::{self, AdapterError, AgentRuntime, ExecRequest};
 use crate::evaluation;
 
 /// Stage the auditor answers in: the agent emits an
-/// evaluation-assessment; the PLATFORM assembles the quality-report@3.
+/// evaluation-assessment; the PLATFORM assembles the quality-report@4.
 const ASSESSMENT_CONTRACT: (&str, u32) = ("evaluation-assessment", 1);
-/// @3 extends @2 with the QA rule "every criteria entry cites concrete
-/// evidence": `evaluation.checks[].evidence` is required, `minItems: 1`.
-/// The version is pinned HERE (code), so the mechanical gate cannot be
-/// bypassed by an old schema text lingering in a home's contract table
-/// (seeding is insert-only; @2 stays in the store untouched as history).
-const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 3);
+/// @4 extends @3 (QA rule "every criteria entry cites concrete evidence":
+/// `evaluation.checks[].evidence` required, `minItems: 1`) with the required
+/// embedded `workspace_revision` the platform captured at execution start —
+/// a report is now traceable to the exact HEAD + dirty-tree digest + profile
+/// name@version + roles slug@version it was written against. The version is
+/// pinned HERE (code), so the mechanical gate cannot be bypassed by an old
+/// schema text lingering in a home's contract table (seeding is insert-only;
+/// @1..@3 stay in the store untouched as history).
+const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 4);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -59,6 +62,10 @@ pub enum Gate {
     WaitingApproval,
     /// A quality report exists; awaiting a human `accept`/`return` in QA.
     WaitingAccept,
+    /// The CURRENT quality report is bound to exactly the workspace revision
+    /// recomputed now: the auditor was NOT run. Accept/return the report, or
+    /// re-audit explicitly (`--force-reaudit`) — never silently.
+    ReportFresh,
     /// Task finished (ACCEPTED / CANCELLED).
     Terminal(TaskState),
     /// Task is parked (WAITING_FOR_INPUT / PAUSED / BLOCKED / FAILED).
@@ -70,6 +77,9 @@ impl std::fmt::Display for Gate {
         match self {
             Gate::WaitingApproval => f.write_str("human gate: approve or reject the requirements"),
             Gate::WaitingAccept => f.write_str("human gate: accept or return the result"),
+            Gate::ReportFresh => {
+                f.write_str("report is FRESH for this workspace revision — accept/return it, or re-audit explicitly (--force-reaudit); the auditor does not re-run on unchanged code")
+            }
             Gate::Terminal(s) => write!(f, "task is {}", s.as_str()),
             Gate::Hold(s) => write!(f, "task is held in {}", s.as_str()),
         }
@@ -105,6 +115,9 @@ pub struct Engine<'a> {
     profile: Option<Profile>,
     /// Directory where the platform executes probes (the project workspace).
     workspace: PathBuf,
+    /// Explicit human override of the QA freshness gate: re-audit despite a
+    /// fresh CURRENT report. Never set implicitly — the gate only stops.
+    force_reaudit: bool,
 }
 
 impl<'a> Engine<'a> {
@@ -118,7 +131,7 @@ impl<'a> Engine<'a> {
         let profiles = devai_store::config::load_profiles(&cfg_dir.join("evaluation")).unwrap_or_default();
         let profile = profiles.into_iter().find(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"));
         let workspace = std::env::current_dir().unwrap_or_else(|_| store.root().to_path_buf());
-        Engine { store, max_steps: 16, profile, workspace }
+        Engine { store, max_steps: 16, profile, workspace, force_reaudit: false }
     }
 
     /// Override the probe workspace (tests, monorepo subdirs).
@@ -131,6 +144,35 @@ impl<'a> Engine<'a> {
     pub fn with_profile(mut self, profile: Profile) -> Self {
         self.profile = Some(profile);
         self
+    }
+
+    /// Explicit human decision to re-audit an unchanged workspace. The flag
+    /// persists an override record (decision + event) — it is never implied.
+    pub fn with_force_reaudit(mut self, force: bool) -> Self {
+        self.force_reaudit = force;
+        self
+    }
+
+    /// The workspace revision a NEW execution would be bound to, computed
+    /// platform-side right now: git HEAD + dirty-tree digest of the probe
+    /// workspace, the loaded evaluation profile `name@version`, and every
+    /// current role definition `slug@version` from the store.
+    pub fn current_revision(&self) -> RuntimeResult<WorkspaceRevision> {
+        let roles = self.current_roles()?;
+        Ok(crate::revision::compute(&self.workspace, self.profile.as_ref(), &roles))
+    }
+
+    /// Latest stored version per role slug, as sorted `slug@version` — the
+    /// role configuration in force for new executions.
+    pub fn current_roles(&self) -> RuntimeResult<Vec<String>> {
+        let mut latest: std::collections::BTreeMap<String, u32> = Default::default();
+        for r in self.store.list_roles()? {
+            let e = latest.entry(r.slug).or_insert(0);
+            if r.version > *e {
+                *e = r.version;
+            }
+        }
+        Ok(latest.iter().map(|(slug, v)| format!("{slug}@{v}")).collect())
     }
 
     /// Advance the task through every autonomous stage until a human gate,
@@ -162,6 +204,56 @@ impl<'a> Engine<'a> {
                 return Err(RuntimeError::StepLimit(self.max_steps, task.state.as_str()));
             }
 
+            // QA freshness gate (REQ-005): BEFORE launching any auditor run,
+            // compare the freshly computed workspace revision with the one
+            // embedded in the CURRENT quality report. If the workspace is
+            // provably unchanged, the report is still valid — STOP and ask
+            // for an explicit human decision instead of silently re-running
+            // the auditor (the 2026-11-01/02 double-audit dogfood failure).
+            // An unbound report (@1..@3, or a non-git workspace) can never be
+            // proven fresh: the gate is inert and the audit proceeds.
+            if kind == ArtifactKind::QualityReport {
+                if let Some((report, revision)) = self.fresh_bound_report(&task)? {
+                    if self.force_reaudit {
+                        // Explicit human override: honor it, persist the
+                        // decision + event so the re-audit is attributable.
+                        self.store.record_decision(&Decision {
+                            id: new_id(),
+                            task_id: task.id,
+                            kind: "qa_reaudit_override".into(),
+                            verdict: Verdict::Approved,
+                            actor: actor.to_string(),
+                            rationale: Some(format!("workspace is fresh for quality-report v{}; explicit --force-reaudit", report.seq)),
+                            refs: vec![report.id.to_string()],
+                            created_at: Utc::now(),
+                        })?;
+                        self.store.insert_event(
+                            Some(task.id),
+                            event_kind::QA_REAUDIT_FORCED,
+                            actor,
+                            serde_json::json!({
+                                "current_report": report.id.to_string(),
+                                "report_seq": report.seq,
+                                "workspace_revision": revision,
+                            }),
+                        )?;
+                    } else {
+                        self.store.insert_event(
+                            Some(task.id),
+                            event_kind::QA_FRESH_AWAITING_DECISION,
+                            actor,
+                            serde_json::json!({
+                                "current_report": report.id.to_string(),
+                                "report_seq": report.seq,
+                                "workspace_revision": revision,
+                                "ask": "accept/return the fresh report, or re-audit explicitly (--force-reaudit)",
+                            }),
+                        )?;
+                        return Ok(self.report(&task, steps, Gate::ReportFresh));
+                    }
+                }
+            }
+
             let step = self.run_stage(&task, role_slug, kind, agent_name, actor)?;
             let gated = step.artifact_kind == ArtifactKind::QualityReport;
             steps.push(step);
@@ -175,6 +267,45 @@ impl<'a> Engine<'a> {
 
     fn report(&self, task: &Task, steps: Vec<StepOutcome>, gate: Gate) -> RunReport {
         RunReport { task_id: task.id, now: task.state, steps, gate }
+    }
+
+    /// Returns `Some((current_report_artifact, embedded_revision))` when the
+    /// CURRENT quality report is bound to a comparable workspace revision
+    /// that EQUALS the one recomputed right now — i.e. the report is FRESH
+    /// and the auditor must not silently re-run. `None` means "run the audit":
+    /// no current report (first QA), an unbound report (@1..@3, whose findings
+    /// are bound to no recorded state), a non-comparable revision (no git), or
+    /// a genuine mismatch. Freshness requires ALL FOUR components to match
+    /// (A-002): a profile or role version bump alone is stale, forcing re-audit.
+    fn fresh_bound_report(&self, task: &Task) -> RuntimeResult<Option<(Artifact, WorkspaceRevision)>> {
+        let artifacts = self.store.artifacts(task.id)?;
+        let Some(report) = artifacts
+            .iter()
+            .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
+            .max_by_key(|a| a.seq)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let body = self.store.read_blob(&report.sha256)?;
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return Ok(None);
+        };
+        let Some(embedded) = value.get("workspace_revision").cloned() else {
+            return Ok(None); // unbound (pre-@4) report: freshness cannot be claimed
+        };
+        let Ok(bound) = serde_json::from_value::<WorkspaceRevision>(embedded) else {
+            return Ok(None);
+        };
+        if !bound.is_comparable() {
+            return Ok(None); // no git HEAD/digest: never report fresh
+        }
+        let fresh = self.current_revision()?;
+        if fresh == bound {
+            Ok(Some((report, bound)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Run exactly one stage end-to-end: guard, execute, publish, commit.
@@ -234,7 +365,7 @@ impl<'a> Engine<'a> {
             None
         };
 
-        // In QA the AGENT answers in assessment shape; the quality-report@3
+        // In QA the AGENT answers in assessment shape; the quality-report@4
         // artifact is assembled by the platform afterwards.
         let contract_schema: Option<String> = if is_qa {
             Some(
@@ -252,6 +383,12 @@ impl<'a> Engine<'a> {
         };
 
         let now = Utc::now();
+        // Capture the workspace revision at execution START (A-004): the
+        // recorded value freezes what the result is about; edits DURING the
+        // run do not rewrite history but will make a later recomputation
+        // differ — marking the report stale-after-the-fact, exactly as they
+        // should. Observation only: nothing here can fail or mutate the run.
+        let revision = self.current_revision()?;
         let execution = RoleExecution {
             id: new_id(),
             task_id: task.id,
@@ -264,10 +401,11 @@ impl<'a> Engine<'a> {
             error: None,
             started_at: now,
             finished_at: None,
+            workspace_revision: Some(revision.clone()),
         };
         self.store.start_execution(&execution)?;
 
-        // The auditor ANSWERS in assessment shape; quality-report@3 describes
+        // The auditor ANSWERS in assessment shape; quality-report@4 describes
         // the artifact the platform assembles afterwards. The prompt must not
         // ask for a shape the agent cannot honestly produce.
         let mut exec_role = role.clone();
@@ -301,15 +439,17 @@ impl<'a> Engine<'a> {
         };
 
         // QA: merge the platform's probe results with the auditor's
-        // assessment into the machine quality-report@3 and run the
+        // assessment into the machine quality-report@4 and run the
         // deterministic verdict function. Assembly happens BEFORE the
         // execution is closed, so a broken assembly is honestly FAILED.
+        // The SAME revision recorded on the execution row is embedded in the
+        // artifact — no recomputation drift between row and report.
         let (content, exec_summary, report_contract) = match (&eval_run, is_qa) {
             (Some(run), true) => {
                 let profile = self.profile.as_ref().expect("eval_run implies profile present");
                 let assessment: serde_json::Value = serde_json::from_slice(&out.content)
                     .map_err(|e| AdapterError::BadOutput(format!("assessment reply is not valid JSON: {e}")))?;
-                let assembled = evaluation::assemble(profile, run, &assessment, &execution.id.to_string());
+                let assembled = evaluation::assemble(profile, run, &assessment, &execution.id.to_string(), &revision);
                 let text = serde_json::to_string_pretty(&assembled.json)
                     .map_err(|e| AdapterError::Agent(format!("cannot serialize assembled report: {e}")))?;
                 let schema = self

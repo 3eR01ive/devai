@@ -160,6 +160,12 @@ fn per_check() -> String {
 pub struct Profile {
     pub version: u32,
     pub project: String,
+    /// Profile identity for provenance (`name@version` recorded in every
+    /// workspace revision). Optional in the YAML: when absent the loader
+    /// fills it from the config file stem (`evaluation/quality.yaml` →
+    /// `quality`), so an existing profile file needs no edit.
+    #[serde(default)]
+    pub name: Option<String>,
     /// devai extension binding the grammar to role compilation.
     #[serde(default)]
     pub applies_to_roles: Vec<String>,
@@ -176,6 +182,12 @@ const REVIEWERS: [&str; 4] = ["human", "agent", "either", "tool"];
 impl Profile {
     pub fn checks(&self) -> Vec<&CheckDef> {
         self.evaluations.iter().flat_map(|e| e.checks.iter()).collect()
+    }
+
+    /// Provenance identity `name@version` recorded in every workspace
+    /// revision. Falls back to `project` when no name is declared anywhere.
+    pub fn identity(&self) -> String {
+        format!("{}@{}", self.name.as_deref().unwrap_or(&self.project), self.version)
     }
 
     /// Highest severity among the check's detectable error types (V8 source).
@@ -347,7 +359,7 @@ impl Config {
         use std::fmt::Write as _;
         let _ = writeln!(
             ins,
-            "\n\nEvaluation profile `{}` v{}: the PLATFORM runs gates and mechanical probes, computes S, floors and the verdict — you never emit a verdict. Your reply is an evaluation-assessment JSON: `scores` ({{check-id: number}} for the rubric/hybrid checks below), `findings` ([{{check, text, evidence[]}}] — text = what + file:line + what it leads to; `evidence` is a NON-EMPTY array of concrete citations: test output, artifact id, build log), `gaps` ([{{check, reason}}] when you could not verify something honestly — an unperformed check is never a fake score). The platform assembles the quality-report@3, and the contract gate rejects any criteria entry whose evidence array is missing or empty — no criterion is ever recorded as a pass without evidence.",
+            "\n\nEvaluation profile `{}` v{}: the PLATFORM runs gates and mechanical probes, computes S, floors and the verdict — you never emit a verdict. Your reply is an evaluation-assessment JSON: `scores` ({{check-id: number}} for the rubric/hybrid checks below), `findings` ([{{check, text, evidence[]}}] — text = what + file:line + what it leads to; `evidence` is a NON-EMPTY array of concrete citations: test output, artifact id, build log), `gaps` ([{{check, reason}}] when you could not verify something honestly — an unperformed check is never a fake score). The platform assembles the quality-report@4 (bound to the workspace revision captured at execution start), and the contract gate rejects any criteria entry whose evidence array is missing or empty — no criterion is ever recorded as a pass without evidence.",
             profile.project, profile.version
         );
         let mut human_only: Vec<&str> = Vec::new();
@@ -379,7 +391,7 @@ impl Config {
             if c.evidence == "required" {
                 let _ = writeln!(
                     ins,
-                    "  evidence: REQUIRED — every criteria entry must cite at least one concrete evidence item (test output, artifact id, build log). A score < 1.0 without evidence is discarded (proc/evidence-completeness); a PASS backed only by your judgment is contract-invalid (quality-report@3: minItems 1 per check)."
+                    "  evidence: REQUIRED — every criteria entry must cite at least one concrete evidence item (test output, artifact id, build log). A score < 1.0 without evidence is discarded (proc/evidence-completeness); a PASS backed only by your judgment is contract-invalid (quality-report@4: minItems 1 per check)."
                 );
             }
         }
@@ -482,7 +494,12 @@ pub fn load_profiles(dir: &Path) -> StoreResult<Vec<Profile>> {
     paths.sort();
     let mut profiles = Vec::new();
     for p in &paths {
-        let profile: Profile = parse_yaml(p)?;
+        let mut profile: Profile = parse_yaml(p)?;
+        // Identity fallback: the file stem is the profile name unless the
+        // YAML declares one explicitly.
+        if profile.name.is_none() {
+            profile.name = p.file_stem().map(|s| s.to_string_lossy().into_owned());
+        }
         profile.validate().map_err(|e| cfg_err(format!("{}: {e}", p.display())))?;
         profiles.push(profile);
     }

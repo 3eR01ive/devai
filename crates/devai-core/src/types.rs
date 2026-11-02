@@ -311,6 +311,45 @@ str_enum!(ExecutionStatus,
     Cancelled => "CANCELLED",
 );
 
+/// The workspace state an execution was bound to, captured PLATFORM-side at
+/// execution start (never supplied by a model): git HEAD, a canonical digest
+/// of the dirty working tree, the evaluation profile identity, and the set of
+/// current role definitions. Every field is required to be PRESENT; values
+/// are NULL where the workspace cannot answer (no git repo / no commits →
+/// head+digest NULL; no profile loaded → profile NULL) — such a revision is
+/// NOT comparable, and freshness must not be claimed from it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceRevision {
+    /// `git rev-parse HEAD` of the probe workspace; NULL outside a git repo
+    /// or in a repo without commits.
+    pub git_head: Option<String>,
+    /// SHA-256 hex over the canonical dirty-tree line sequence: for every
+    /// path `git status --porcelain -z --no-renames --untracked-files=all`
+    /// reports, one TAB-separated line `XY<TAB>worktree-oid<TAB>index-oid
+    ///<TAB>path` (worktree-oid from read-only `git hash-object`, index-oid
+    /// from `git ls-files -s`, `-` when absent) — capturing tracked
+    /// modifications, staged content, and untracked non-ignored files; lines
+    /// sorted lexicographically, joined by newlines. A clean tree hashes the
+    /// EMPTY sequence (the canonical empty-SHA256 constant). NULL when the
+    /// workspace is not a git repo or the computation could not complete.
+    pub dirty_digest: Option<String>,
+    /// Evaluation profile identity `name@version` (name = declared `name:`
+    /// or the config file stem); NULL when no profile is loaded.
+    pub profile: Option<String>,
+    /// Participating role definitions as sorted `slug@version` (the latest
+    /// stored version of every role at execution time).
+    pub roles: Vec<String>,
+}
+
+impl WorkspaceRevision {
+    /// True when the revision can support a freshness claim: HEAD and the
+    /// dirty digest are both recorded (a non-git workspace has no comparable
+    /// tree state and must never be reported fresh).
+    pub fn is_comparable(&self) -> bool {
+        self.git_head.is_some() && self.dirty_digest.is_some()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RoleExecution {
     pub id: Id,
@@ -325,6 +364,10 @@ pub struct RoleExecution {
     pub error: Option<String>,
     pub started_at: Timestamp,
     pub finished_at: Option<Timestamp>,
+    /// Workspace provenance recorded at execution start. Append-only: rows
+    /// written before this field existed deserialize/round-trip as NULL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<WorkspaceRevision>,
 }
 
 // ---------------------------------------------------------------------------
@@ -435,4 +478,10 @@ pub mod event_kind {
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     pub const EXPORTED: &str = "task.exported";
     pub const IMPORTED: &str = "task.imported";
+    /// QA freshness gate: the recomputed workspace revision equals the one
+    /// embedded in the CURRENT quality report — the auditor is NOT run; an
+    /// explicit human decision (or `--force-reaudit`) is required.
+    pub const QA_FRESH_AWAITING_DECISION: &str = "qa.fresh_awaiting_decision";
+    /// A human explicitly overrode the freshness gate and demanded a re-audit.
+    pub const QA_REAUDIT_FORCED: &str = "qa.reaudit_forced";
 }

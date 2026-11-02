@@ -120,7 +120,7 @@ fn full_cycle_through_both_human_gates() {
     assert_eq!(r2.steps[0].role, "implementation-agent");
     assert_eq!(r2.steps[1].role, "quality-auditor");
 
-    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@3: probes ran
+    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@4: probes ran
     // in code, the mock auditor contributed no fabricated scores, and the
     // verdict function stayed "not ready" because a human check is unsigned.
     let (qa_artifact, qa) = {
@@ -132,12 +132,37 @@ fn full_cycle_through_both_human_gates() {
     // The report is pinned to the strengthened contract version.
     assert_eq!(
         qa_artifact.contract.as_ref().map(|c| (c.name.as_str(), c.version)),
-        Some(("quality-report", 3)),
-        "QA artifact must be published under quality-report@3"
+        Some(("quality-report", 4)),
+        "QA artifact must be published under quality-report@4"
     );
     let rep: serde_json::Value = serde_json::from_slice(&qa).unwrap();
     assert_eq!(rep["verdict"], "ESCALATE");
     assert_eq!(rep["profile"]["project"], "devai");
+
+    // REQ-001/REQ-004: EVERY engine stage records a workspace revision with
+    // all four components, and the assembled @4 report embeds EXACTLY the
+    // revision stored on the auditor's execution row — no drift.
+    {
+        use devai_runtime::revision;
+        let execs = store.list_executions(Some(t.id)).unwrap();
+        assert_eq!(execs.len(), 4, "analyst, reviewer, implementer, auditor");
+        for e in &execs {
+            let r = e
+                .workspace_revision
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} execution must record a workspace_revision", e.role_slug));
+            assert!(r.git_head.is_some(), "{}: git HEAD component", e.role_slug);
+            assert!(r.dirty_digest.is_some(), "{}: dirty digest component", e.role_slug);
+            assert!(r.profile.as_deref().is_some_and(|p| p.contains('@')), "{}: profile name@version", e.role_slug);
+            assert!(!r.roles.is_empty(), "{}: roles slug@version list", e.role_slug);
+            assert!(r.is_comparable(), "{}: git workspace → comparable", e.role_slug);
+        }
+        let qa_exec = execs.iter().find(|e| e.role_slug == "quality-auditor").unwrap();
+        let embedded: devai_core::types::WorkspaceRevision =
+            serde_json::from_value(rep["workspace_revision"].clone()).expect("@4 embeds workspace_revision");
+        assert_eq!(embedded, qa_exec.workspace_revision.clone().unwrap(), "artifact revision == execution row revision");
+        assert_eq!(embedded.git_head.as_deref(), revision::git_head(&workspace()).as_deref(), "HEAD == git rev-parse HEAD of the probe workspace");
+    }
     assert_eq!(rep["evaluation"]["verdict"], "INCONCLUSIVE");
     assert_eq!(rep["evaluation"]["gates"].as_array().unwrap().len(), 2);
     let states: Vec<&str> = rep["evaluation"]["gates"]
@@ -277,20 +302,30 @@ fn failed_adapter_leaves_workflow_untouched() {
 
 /// The same contract gate `Engine::run_stage` runs on the assembled QA
 /// report (engine.rs) must reject quality reports whose criteria entries
-/// lack concrete evidence — driven through the schema SEEDED into the store,
-/// not a fixture copy of it.
+/// lack concrete evidence (rule from @3) and reports that carry no workspace
+/// binding (the new @4 rule) — driven through the schema SEEDED into the
+/// store, not a fixture copy of it.
 #[test]
 fn evidenceless_criteria_entries_are_rejected_by_the_contract_gate() {
     let (_d, store) = store();
     let schema = store
-        .get_contract("quality-report", 3)
+        .get_contract("quality-report", 4)
         .unwrap()
-        .expect("quality-report@3 must be seeded");
+        .expect("quality-report@4 must be seeded");
+    // Append-only contracts: seeding @4 must never remove or rewrite @2/@3.
+    assert!(store.get_contract("quality-report", 2).unwrap().is_some(), "quality-report@2 must stay loadable");
+    assert!(store.get_contract("quality-report", 3).unwrap().is_some(), "quality-report@3 must stay loadable");
     let good = serde_json::json!({
         "verdict": "ACCEPT",
         "recommendation_basis": "шлюзы зелёные, полы целы",
         "report_text": "ВЕРДИКТ: ПРОШЁЛ",
         "profile": { "project": "devai", "version": 2 },
+        "workspace_revision": {
+            "git_head": "a".repeat(40),
+            "dirty_digest": "b".repeat(64),
+            "profile": "devai@2",
+            "roles": ["implementation-agent@1", "quality-auditor@1"],
+        },
         "evaluation": {
             "verdict": "PASS", "score": 1.0, "theta": 0.8,
             "gates": [{ "id": "build-green", "state": "PASS" }],
@@ -317,6 +352,27 @@ fn evidenceless_criteria_entries_are_rejected_by_the_contract_gate() {
     empty["evaluation"]["checks"][0]["evidence"] = serde_json::json!([]);
     let err = devai_runtime::validate_against_contract(&empty.to_string(), Some(&schema)).unwrap_err();
     assert!(err.to_string().contains("$.evaluation.checks[0].evidence: array has 0 item(s), minimum 1"), "{err}");
+
+    // @4 binding: a report without the workspace_revision block is rejected...
+    let mut unbound = good.clone();
+    unbound.as_object_mut().unwrap().remove("workspace_revision");
+    let err = devai_runtime::validate_against_contract(&unbound.to_string(), Some(&schema)).unwrap_err();
+    assert!(err.to_string().contains("$.workspace_revision: missing required key"), "{err}");
+
+    // ...and so is a block missing any of its four components (nulls allowed,
+    // absence not).
+    let mut half = good.clone();
+    half["workspace_revision"].as_object_mut().unwrap().remove("roles");
+    let err = devai_runtime::validate_against_contract(&half.to_string(), Some(&schema)).unwrap_err();
+    assert!(err.to_string().contains("$.workspace_revision.roles: missing required key"), "{err}");
+
+    // Null git components stay schema-valid (non-git workspace) — freshness
+    // logic, not the contract, decides such a revision is not comparable.
+    let mut nullable = good.clone();
+    nullable["workspace_revision"]["git_head"] = serde_json::Value::Null;
+    nullable["workspace_revision"]["dirty_digest"] = serde_json::Value::Null;
+    nullable["workspace_revision"]["profile"] = serde_json::Value::Null;
+    assert!(devai_runtime::validate_against_contract(&nullable.to_string(), Some(&schema)).is_ok());
 }
 
 #[test]
@@ -335,4 +391,260 @@ fn holds_and_terminals_stop_the_engine() {
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
     assert_eq!(r.gate, Gate::Hold(TaskState::Paused));
     assert!(r.steps.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Workspace revision binding + QA freshness gate (REQ-001/005/006/008).
+// Isolated git workspaces so digests are stable; the double-audit dogfood
+// failure (S=0.869 → S=0.908 with NO code change) must be impossible via
+// the normal engine path.
+// ---------------------------------------------------------------------------
+
+fn git_at(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git is available");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A clean, committed, isolated git workspace: HEAD and the dirty digest are
+/// both well-defined and stable across recomputations.
+fn git_workspace() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let p = dir.path().to_path_buf();
+    git_at(&p, &["init", "-q"]);
+    std::fs::write(p.join("tracked.txt"), b"alpha\n").unwrap();
+    git_at(&p, &["add", "tracked.txt"]);
+    git_at(
+        &p,
+        &["-c", "user.email=devai@test.local", "-c", "user.name=devai-test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "bound state"],
+    );
+    (dir, p)
+}
+
+fn engine_in<'s>(store: &'s Store, ws: &std::path::Path, force: bool) -> Engine<'s> {
+    Engine::new(store)
+        .with_workspace(ws.to_path_buf())
+        .with_profile(tiny_profile())
+        .with_force_reaudit(force)
+}
+
+/// Drive DRAFT → … → QA once: a CURRENT @4 report now exists, bound to the
+/// workspace revision captured at execution start.
+fn drive_to_report(store: &Store, t: &Task, ws: &std::path::Path) {
+    let engine = engine_in(store, ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingApproval);
+    approved(store, &t.id.to_string());
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "first QA run: gate is inert (no prior report)");
+    assert_eq!(r.steps.len(), 2, "implementation + auditor");
+}
+
+#[test]
+fn qa_reeval_on_unchanged_workspace_is_asked_not_silently_rerun() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Freshness", "Re-audit needs an explicit decision", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+
+    let execs_before = store.list_executions(Some(t.id)).unwrap().len();
+    let arts_before = store.artifacts(t.id).unwrap().len();
+
+    // REQ-006: even these MOCK executions bind the real git state — mock and
+    // real rows share one shape.
+    for e in store.list_executions(Some(t.id)).unwrap() {
+        let r = e.workspace_revision.expect("every engine execution records a revision");
+        assert!(r.is_comparable(), "{} bound to real git state", e.role_slug);
+    }
+
+    // The exact dogfood failure mode: re-run with NOTHING changed. The gate
+    // must stop — no execution, no artifact, no token spend, state unmoved.
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::ReportFresh, "fresh workspace: auditor must not silently re-run");
+    assert!(r.steps.is_empty(), "no stage ran");
+    assert_eq!(store.list_executions(Some(t.id)).unwrap().len(), execs_before, "no execution started");
+    assert_eq!(store.artifacts(t.id).unwrap().len(), arts_before, "no artifact published");
+    assert_eq!(store.get_task(&t.id.to_string()).unwrap().state, TaskState::Qa, "workflow did not move");
+    let kinds: Vec<String> = store.all_events_for_task(t.id).unwrap().into_iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&event_kind::QA_FRESH_AWAITING_DECISION.to_string()), "the ask is recorded: {kinds:?}");
+}
+
+#[test]
+fn explicit_force_reaudit_overrides_freshness_and_is_attributable() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Forced", "explicit decision re-audits", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+    let execs_before = store.list_executions(Some(t.id)).unwrap().len();
+
+    let engine = engine_in(&store, &ws, true);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept);
+    assert_eq!(r.steps.len(), 1, "auditor ran on the explicit override");
+    assert_eq!(r.steps[0].role, "quality-auditor");
+    assert_eq!(store.list_executions(Some(t.id)).unwrap().len(), execs_before + 1);
+    // The override is persisted, never silent: a decision row + an event.
+    let decs = store.list_decisions(t.id).unwrap();
+    assert!(decs.iter().any(|d| d.kind == "qa_reaudit_override"), "override decision recorded");
+    let kinds: Vec<String> = store.all_events_for_task(t.id).unwrap().into_iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&event_kind::QA_REAUDIT_FORCED.to_string()), "forced re-audit event: {kinds:?}");
+}
+
+#[test]
+fn any_workspace_change_marks_the_report_stale_and_reaudit_proceeds() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Stale", "changed workspace re-audits without asking", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+
+    // A tracked edit changes the dirty digest → the report no longer binds
+    // the current state → the audit runs normally.
+    std::fs::write(ws.join("tracked.txt"), b"beta\n").unwrap();
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "stale report: auditor re-runs without an override");
+    assert_eq!(r.steps.len(), 1);
+
+    // A NEW untracked (non-ignored) file changes the digest too: the report
+    // just published binds the pre-scratch state, so this run is stale again.
+    std::fs::write(ws.join("scratch.txt"), b"untracked\n").unwrap();
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "untracked addition invalidates freshness");
+    assert_eq!(r.steps.len(), 1);
+}
+
+#[test]
+fn non_git_workspace_never_claims_freshness() {
+    let (_d, store) = store();
+    let nongit = tempfile::TempDir::new().unwrap();
+    let ws = nongit.path().to_path_buf();
+    let t = Task::new("NoGit", "unbound tree cannot be proven fresh", None, Utc::now());
+    store.create_task(&t).unwrap();
+
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingApproval);
+    approved(&store, &t.id.to_string());
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept);
+
+    // The revision IS recorded (all four components present), but git fields
+    // are NULL: recorded, not comparable — such a report is never fresh.
+    let execs = store.list_executions(Some(t.id)).unwrap();
+    let qa = execs.iter().find(|e| e.role_slug == "quality-auditor").unwrap();
+    let rev = qa.workspace_revision.as_ref().expect("non-git executions still record a revision");
+    assert!(rev.git_head.is_none() && rev.dirty_digest.is_none(), "no git → NULL head+digest");
+    assert!(!rev.is_comparable());
+
+    // Re-run: the auditor runs again (gate inert), it never claims freshness.
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept);
+    assert_eq!(r.steps.len(), 1, "non-git workspace: re-audit proceeds, never blocked as fresh");
+}
+
+#[test]
+fn report_and_execution_rows_never_drift_and_bumps_mark_stale() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Drift", "artifact embeds the execution row's revision", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+
+    // REQ-004: the embedded object equals the stored execution row verbatim.
+    let arts = store.artifacts(t.id).unwrap();
+    let a = arts.iter().filter(|x| x.kind == ArtifactKind::QualityReport).max_by_key(|x| x.seq).unwrap().clone();
+    let rep: serde_json::Value = serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+    let qa = store
+        .list_executions(Some(t.id))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.role_slug == "quality-auditor")
+        .unwrap();
+    let embedded: devai_core::types::WorkspaceRevision = serde_json::from_value(rep["workspace_revision"].clone()).unwrap();
+    assert_eq!(embedded, qa.workspace_revision.clone().unwrap());
+
+    // A role definition bump changes the roles component → stale (A-002:
+    // ALL four components must match for fresh). Simulate the init diff-bump:
+    // insert a new role version (history row stays).
+    let roles = store.list_roles().unwrap();
+    let impl_role = roles.iter().find(|r| r.slug == "implementation-agent").cloned().unwrap();
+    let mut bumped = impl_role.clone();
+    bumped.id = new_id();
+    bumped.version = impl_role.version + 1;
+    store.put_role(&bumped).unwrap();
+
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "role version bump alone invalidates freshness");
+    assert_eq!(r.steps.len(), 1);
+}
+
+#[test]
+fn profile_version_bump_marks_report_stale() {
+    // Freshness compares ALL FOUR components: an evaluation-profile bump
+    // (the QA rules themselves changed) invalidates even a bit-identical
+    // git tree — the old verdict was rendered under different rules.
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Profile bump", "new rules force a fresh audit", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+
+    let mut p = tiny_profile();
+    p.version = 2;
+    let engine = Engine::new(&store).with_workspace(&ws).with_profile(p);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "profile identity changed: not fresh");
+    assert_eq!(r.steps.len(), 1);
+    // The new report binds the NEW profile identity.
+    let arts = store.artifacts(t.id).unwrap();
+    let a = arts.iter().filter(|x| x.kind == ArtifactKind::QualityReport).max_by_key(|x| x.seq).unwrap();
+    let rep: serde_json::Value = serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+    assert_eq!(rep["workspace_revision"]["profile"], "devai@2");
+}
+
+#[test]
+fn legacy_unbound_report_leaves_the_gate_inert() {
+    // @1..@3 reports carry no binding: freshness cannot be CLAIMED for them
+    // and must not be DENIED either — the audit simply proceeds, so an
+    // existing install upgrades without getting stuck behind a fake ask.
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Legacy", "pre-@4 CURRENT report: gate inert", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+
+    // Re-publish the CURRENT report as a @3-shaped doc WITHOUT the revision
+    // block (the highest seq among CURRENT wins the freshness check).
+    let arts = store.artifacts(t.id).unwrap();
+    let a = arts.iter().filter(|x| x.kind == ArtifactKind::QualityReport).max_by_key(|x| x.seq).unwrap().clone();
+    let mut rep: serde_json::Value = serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+    rep.as_object_mut().unwrap().remove("workspace_revision");
+    store
+        .publish_artifact(devai_store::ArtifactDraft {
+            task_id: t.id,
+            kind: ArtifactKind::QualityReport,
+            name: "quality-report (legacy @3 shape)".into(),
+            category: DataCategory::Artifact,
+            content: rep.to_string().into_bytes(),
+            media_type: "application/json".into(),
+            contract: Some(ContractRef { name: "quality-report".into(), version: 3 }),
+            created_by: "user".into(),
+            execution_id: None,
+            depends_on: vec![],
+        })
+        .unwrap();
+
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "unbound report: audit proceeds, never a freshness ask");
+    assert_eq!(r.steps.len(), 1);
 }
