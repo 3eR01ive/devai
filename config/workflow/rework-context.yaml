@@ -1,0 +1,36 @@
+# REWORK CONTEXT delivery policy — platform-owned workflow data.
+#
+# Which recorded decision events feed the `REWORK CONTEXT` prompt section of
+# the next execution of each role, and what delivery does with them. This is
+# workflow knowledge: it lives in the platform config tree and the runtime is
+# a generic executor of it. Role YAML (`roles/*.yaml`) never sees any of this
+# — role configs stay generic (REQ-006 sovereignty).
+#
+# Fields:
+# * `event` — the workflow_events kind that triggers delivery for this role.
+# * `rationale_field` — the event payload field carrying the rejection text
+#   exactly as the transition persisted it (delivery reads; never rewrites).
+# * `verdict_field` (default `verdict`) + `only_if_verdict_not` — a verdict
+#   filter: the event counts as a rejection only when that payload field
+#   differs from the given value. The value is validated against the
+#   platform's Verdict vocabulary at load time.
+# * `attach_findings` — additionally quote the failing / sub-threshold items
+#   of the CURRENT quality report as data (the QA→REWORK flow only).
+#
+# Policies from multiple files in this directory merge. When the directory
+# is absent (a home not yet re-`init`ed), the platform falls back to these
+# same factory bytes — never to a code copy of the map.
+- role: implementation-agent
+  triggers:
+    - event: quality.returned
+      rationale_field: rationale
+      attach_findings: true
+- role: requirements-analyst
+  triggers:
+    - event: requirements.rejected
+      rationale_field: rationale
+    - event: review.recorded
+      rationale_field: summary
+      # `record-review` persists the reviewer's text as `summary` (OQ-2),
+      # and only a NON-approved verdict is a rejection.
+      only_if_verdict_not: APPROVED

@@ -1,0 +1,12 @@
+# Workspace facts: how to BUILD, TEST and LINT this project. The runtime
+# must not know the workspace is Rust — the provider driver only wraps the
+# command configured here into the provider's tool syntax.
+#
+# Keys are the capability names used by role YAML `tools:` lists (the
+# `shell:*` namespace). A `shell:*` capability with no command configured
+# here grants NOTHING — least privilege by construction. Commands with no
+# allowlist meaning (full probe commands) belong to the evaluation profile
+# (`evaluation/*.yaml` gates), not here.
+"shell:build": "cargo build"
+"shell:test": "cargo test"
+"shell:lint": "cargo clippy"
