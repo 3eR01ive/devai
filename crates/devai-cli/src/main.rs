@@ -172,6 +172,20 @@ enum TaskCmd {
         #[arg(long)]
         rationale: Option<String>,
     },
+    /// The MERGE GATE (human-only): merge the task's platform-created
+    /// `rework/<task-id>` branch into the workspace's current baseline
+    /// branch. The platform never merges by itself — this command is the
+    /// single merge path, records a `rework_merge` decision + event, and
+    /// moves no task state. Conflicts stay with the human who invoked it.
+    Merge {
+        id: String,
+        /// Repository whose checked-out branch is the merge baseline
+        /// (default: current directory).
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+        #[arg(long)]
+        rationale: Option<String>,
+    },
     Pause {
         id: String,
         #[arg(long)]

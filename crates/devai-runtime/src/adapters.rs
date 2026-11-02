@@ -24,8 +24,16 @@ pub struct ExecRequest {
     pub inputs: Vec<(String, String)>,
     /// JSON Schema text of the role's output contract, when defined.
     pub contract_schema: Option<String>,
-    /// Directory the agent process runs in (project workspace), if any.
+    /// Directory the agent process runs in. For a writing role this is the
+    /// platform-created isolation WORKTREE, never the main checkout
+    /// (REQ-WT-02 AC1); for read-only roles the declared project workspace.
     pub workspace: Option<std::path::PathBuf>,
+    /// Platform-declared run-artifact directory for this execution
+    /// (`DEVAI_HOME/evidence/<task>/<execution>`), exported to the agent
+    /// process as `DEVAI_EVIDENCE_DIR`. Run artifacts (logs, evidence files)
+    /// go here and never into the source tree (REQ-WT-05). Location is
+    /// platform-owned, not agent-chosen.
+    pub evidence: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +91,11 @@ impl AgentRuntime {
         }
         if let Some(ws) = &req.workspace {
             cmd.current_dir(ws);
+        }
+        // REQ-WT-05: the run-artifact sink is platform-declared and exported
+        // to the process; the agent never chooses where its logs go.
+        if let Some(ev) = &req.evidence {
+            cmd.env("DEVAI_EVIDENCE_DIR", ev);
         }
         if !system.is_empty() {
             cmd.arg("--append-system-prompt").arg(system);
@@ -374,6 +387,7 @@ mod tests {
             inputs: vec![],
             contract_schema: None,
             workspace: None,
+            evidence: None,
         }
     }
 

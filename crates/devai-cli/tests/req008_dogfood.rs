@@ -15,9 +15,11 @@
 //! The workspace is an isolated git+cargo repo in a tempdir: nothing else
 //! on the machine can perturb its digest between the two runs, so the
 //! freshness equality is proven, not assumed. Probes inside it are the
-//! real factory `quality@3` profile (build/tests gates pass; devai-repo-
-//! specific checks honestly FAIL — the verdict is irrelevant, the binding
-//! and the gate behavior are what this dogfood certifies).
+//! real factory evaluation profile (its identity is DERIVED from the seeded
+//! YAML, not hardcoded — config is declarative and bumps independently of
+//! this test). Devai-repo-specific checks honestly FAIL in this workspace —
+//! the verdict is irrelevant; the binding, the isolation and the gate
+//! behavior are what this dogfood certifies.
 
 use std::path::Path;
 use std::process::Command;
@@ -103,9 +105,30 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
 
     // REQ-001/006/003: EVERY role execution — mock roles included — carries a
     // real, comparable revision of the same shape (no model involvement).
+    // The profile identity is the seeded evaluation file's stem@version:
+    // derived from the declarative config, so a factory bump never rots it.
+    let qyaml = std::fs::read_to_string(home.path().join("config").join("evaluation").join("quality.yaml"))
+        .expect("`devai init` materializes the factory evaluation profile into the home");
+    let prof_ver = qyaml
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("version:"))
+        .expect("the profile declares its version")
+        .trim()
+        .to_string();
+    let want_profile = format!("quality@{prof_ver}");
+
     let execs = devai_json(home.path(), &["exec", "list", "--task", &id]);
     let execs = execs.as_array().unwrap();
     assert!(execs.len() >= 3, "analyst + implementation + QA ran: {execs:?}");
+    // The main checkout's state: baseline commit + untracked `loose.txt`.
+    let main_dirty = execs
+        .iter()
+        .find(|e| e["role_slug"] == "requirements-analyst")
+        .and_then(|e| e["workspace_revision"]["dirty_digest"].as_str())
+        .expect("analyst execution records a digest")
+        .to_string();
+    assert_ne!(main_dirty, CLEAN_TREE_DIGEST, "untracked non-ignored file must move the digest (REQ-003)");
     for e in execs {
         let rev = &e["workspace_revision"];
         assert!(
@@ -115,10 +138,41 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
         );
         let digest = rev["dirty_digest"].as_str().unwrap();
         assert_eq!(digest.len(), 64, "dirty digest is a SHA-256 hex");
-        assert_ne!(digest, CLEAN_TREE_DIGEST, "untracked non-ignored file must move the digest (REQ-003)");
-        assert_eq!(rev["profile"].as_str(), Some("quality@3"), "evaluation profile identity name@version");
+        if e["role_slug"] == "quality-auditor" {
+            // REQ-WT-02/03: once the task branch is live, the audit measures
+            // the PLATFORM WORKTREE: same bound commit, but the main
+            // checkout's `loose.txt` is NOT in the audited tree (and the
+            // worktree's own probe side effects are not in main) — the
+            // auditor's digest provably differs from the main checkout's.
+            assert_ne!(digest, main_dirty, "audit binds the isolated worktree, not the dirty main checkout");
+        } else {
+            assert_eq!(digest, main_dirty, "pre-worktree executions bind the main checkout's state");
+        }
+        assert_eq!(rev["profile"].as_str(), Some(want_profile.as_str()), "evaluation profile identity name@version");
         assert!(!rev["roles"].as_array().unwrap().is_empty(), "participating roles slug@version");
     }
+
+    // REQ-WT-01/04/06 through the human CLI surface: the writing stage ran
+    // inside a platform-created worktree on the task's own branch, and the
+    // published implementation report names ground truth STAMPED by the
+    // platform — branch, worktree, commit.
+    let branch = format!("rework/{id}");
+    let wt = home.path().join("worktrees").join(&id);
+    assert!(wt.is_dir(), "REQ-WT-01: the platform created the isolation worktree under the data home (REQ-WT-05/OQ-8)");
+    assert_eq!(git(ws.path(), &["rev-parse", &branch]), head, "REQ-WT-01 AC1: the task branch points at exactly the bound commit");
+    let arts = devai_json(home.path(), &["artifact", "list", &id]);
+    let impl_a = arts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["kind"] == "IMPLEMENTATION_REPORT")
+        .expect("the writing stage published an implementation report");
+    let body_s = devai(home.path(), &["artifact", "cat", impl_a["id"].as_str().unwrap()]);
+    let body: serde_json::Value = serde_json::from_str(body_s.trim()).expect("stamped report is one JSON object");
+    assert_eq!(body["branch"], branch, "REQ-WT-04: stamped branch (the agent's own claim is overwritten)");
+    assert_eq!(body["worktree"], wt.display().to_string(), "REQ-WT-04: stamped worktree directory");
+    assert_eq!(body["commit"], head, "REQ-WT-04 AC2: the named commit resolves on the task branch");
+    assert_eq!(impl_a["contract"]["version"].as_i64(), Some(2), "report published under implementation-report@2: {impl_a}");
 
     // REQ-004 + no-drift: the @4 report embeds the exact revision of its execution row.
     let rep = devai_json(home.path(), &["task", "report", &id]);

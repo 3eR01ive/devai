@@ -7,7 +7,7 @@
 //! do what the workflow already permits. Human gates (APPROVAL, final
 //! acceptance in QA) and holds stop the run; the engine does not "pass" them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use devai_core::error::CoreError;
@@ -16,8 +16,9 @@ use devai_core::workflow;
 use devai_store::config::Profile;
 use devai_store::{ArtifactDraft, Store, StoreError};
 
-use crate::adapters::{self, AdapterError, AgentRuntime, ExecRequest};
+use crate::adapters::{self, AdapterError, AgentRuntime, ExecOutput, ExecRequest};
 use crate::evaluation;
+use crate::worktree;
 
 /// Stage the auditor answers in: the agent emits an
 /// evaluation-assessment; the PLATFORM assembles the quality-report@4.
@@ -31,6 +32,15 @@ const ASSESSMENT_CONTRACT: (&str, u32) = ("evaluation-assessment", 1);
 /// schema text lingering in a home's contract table (seeding is insert-only;
 /// @1..@3 stay in the store untouched as history).
 const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 4);
+
+/// Run-artifact root under the data directory (REQ-WT-05): evidence is
+/// platform-declared — `<home>/evidence/<task>/<execution>` — and agents
+/// receive it as `DEVAI_EVIDENCE_DIR`; nothing of a run may land in the
+/// source tree.
+const EVIDENCE_SUBDIR: &str = "evidence";
+/// Mechanical-probe transcript persisted per QA execution (REQ-WT-05 AC1).
+/// Spelled once; referenced by path, never duplicated as a literal.
+const PROBE_EVIDENCE_FILE: &str = "probes.txt";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -50,6 +60,12 @@ pub enum RuntimeError {
     MissingProfile(String),
     #[error("contract {0}@{1} not found — run `devai init`")]
     MissingContract(String, u32),
+    /// Worktree isolation failed (creation, reuse, or the platform commit).
+    /// The message carries the typed WorktreeError text — which embeds the
+    /// REQ it enforces — because a writing stage without its isolation must
+    /// stop the run, never fall back to the main checkout.
+    #[error(transparent)]
+    Worktree(#[from] worktree::WorktreeError),
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -154,12 +170,41 @@ impl<'a> Engine<'a> {
     }
 
     /// The workspace revision a NEW execution would be bound to, computed
-    /// platform-side right now: git HEAD + dirty-tree digest of the probe
-    /// workspace, the loaded evaluation profile `name@version`, and every
-    /// current role definition `slug@version` from the store.
+    /// platform-side right now against the MAIN workspace: git HEAD +
+    /// dirty-tree digest, the loaded evaluation profile `name@version`, and
+    /// every current role definition `slug@version` from the store.
     pub fn current_revision(&self) -> RuntimeResult<WorkspaceRevision> {
+        self.revision_at(&self.workspace)
+    }
+
+    /// Revision computed against an explicit directory (same four
+    /// components); the engine binds an execution to the revision of the
+    /// workspace that execution actually evaluates.
+    fn revision_at(&self, workspace: &Path) -> RuntimeResult<WorkspaceRevision> {
         let roles = self.current_roles()?;
-        Ok(crate::revision::compute(&self.workspace, self.profile.as_ref(), &roles))
+        Ok(crate::revision::compute(workspace, self.profile.as_ref(), &roles))
+    }
+
+    /// The workspace a stage of THIS task evaluates against: the task's
+    /// platform-created worktree once that branch is live with its directory
+    /// present (REQ-WT-03 — gates and mechanical probes must measure the code
+    /// the writing agent actually changed, not the user's main checkout), the
+    /// main checkout before any writing stage ran. The freshness gate
+    /// recomputes on the SAME basis an audit bound itself to, so isolation
+    /// never silently breaks the @4 comparison.
+    fn eval_workspace(&self, task: &Task) -> PathBuf {
+        let dir = worktree::path_for(self.store.root(), task.id);
+        if worktree::has_branch(&self.workspace, task.id) && dir.is_dir() {
+            dir
+        } else {
+            self.workspace.clone()
+        }
+    }
+
+    /// Platform-declared run-artifact directory for one execution
+    /// (`DEVAI_HOME/evidence/<task>/<execution>`, REQ-WT-05 AC1).
+    fn evidence_dir(&self, task_id: Id, execution_id: Id) -> PathBuf {
+        self.store.root().join(EVIDENCE_SUBDIR).join(task_id.to_string()).join(execution_id.to_string())
     }
 
     /// Latest stored version per role slug, as sorted `slug@version` — the
@@ -300,7 +345,7 @@ impl<'a> Engine<'a> {
         if !bound.is_comparable() {
             return Ok(None); // no git HEAD/digest: never report fresh
         }
-        let fresh = self.current_revision()?;
+        let fresh = self.revision_at(&self.eval_workspace(task))?;
         if fresh == bound {
             Ok(Some((report, bound)))
         } else {
@@ -358,7 +403,9 @@ impl<'a> Engine<'a> {
                     .unwrap_or_else(|| self.store.root().join("config"));
                 RuntimeError::MissingProfile(dir.join("evaluation").display().to_string())
             })?;
-            let run = evaluation::execute(profile, &self.workspace);
+            // REQ-WT-03: probes measure the task's evaluation workspace —
+            // the isolation worktree once one is live for this task.
+            let run = evaluation::execute(profile, &self.eval_workspace(task));
             inputs.push(("MECHANICAL_EVIDENCE (platform-run probes; rubric scores are yours to confirm)".to_string(), run.evidence_text.clone()));
             Some(run)
         } else {
@@ -388,7 +435,10 @@ impl<'a> Engine<'a> {
         // run do not rewrite history but will make a later recomputation
         // differ — marking the report stale-after-the-fact, exactly as they
         // should. Observation only: nothing here can fail or mutate the run.
-        let revision = self.current_revision()?;
+        // The computation targets the task's EVALUATION workspace: main
+        // checkout before any worktree exists, the worktree once one does
+        // (the row then binds exactly what the stage measures, REQ-WT-03).
+        let revision = self.revision_at(&self.eval_workspace(task))?;
         let execution = RoleExecution {
             id: new_id(),
             task_id: task.id,
@@ -404,6 +454,84 @@ impl<'a> Engine<'a> {
             workspace_revision: Some(revision.clone()),
         };
         self.store.start_execution(&execution)?;
+
+        // REQ-WT-01: a writing role runs inside platform isolation. The
+        // worktree is created (or the task's branch re-attached) BEFORE the
+        // agent executes, from the git_head component of the revision bound
+        // to this row — AC1: the branch `rework/<task-id>` points at exactly
+        // that commit. Writing membership is the role's DECLARATIVE `tools:`
+        // capability (`role.writes_workspace()`), never an artifact-kind
+        // guess. A task bound to no revision commit fails the execution
+        // explicitly — there is no silent fallback to the main checkout's
+        // current state (AC2).
+        let writing = role.writes_workspace();
+        let evidence = self.evidence_dir(task.id, execution.id);
+        let mut isolated: Option<worktree::Worktree> = None;
+        if writing {
+            match worktree::prepare(&self.workspace, self.store.root(), task.id, revision.git_head.as_deref()) {
+                Ok(wt) => {
+                    if let Err(e) = std::fs::create_dir_all(&evidence) {
+                        let _ = self.store.finish_execution(
+                            &execution,
+                            ExecutionStatus::Failed,
+                            None,
+                            Some(&format!("cannot create platform evidence dir {}: {e}", evidence.display())),
+                            Utc::now(),
+                        );
+                        return Err(RuntimeError::Store(e.into()));
+                    }
+                    self.store.insert_event(
+                        Some(task.id),
+                        event_kind::WORKTREE_PREPARED,
+                        &execution.role_slug,
+                        serde_json::json!({
+                            "execution": execution.id.to_string(),
+                            "branch": wt.branch,
+                            "worktree": wt.dir.display().to_string(),
+                            "bound_head": revision.git_head,
+                        }),
+                    )?;
+                    isolated = Some(wt);
+                }
+                Err(e) => {
+                    let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Utc::now());
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // REQ-WT-05 AC1: the probe transcript is a run artifact — stored
+        // under the platform-declared evidence root, referenced from the
+        // prompt by path; never written into any checkout.
+        if let Some(run) = &eval_run {
+            if let Err(e) = std::fs::create_dir_all(&evidence)
+                .and_then(|_| std::fs::write(evidence.join(PROBE_EVIDENCE_FILE), &run.evidence_text))
+            {
+                let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store probe evidence in {}: {e}", evidence.display())), Utc::now());
+                return Err(RuntimeError::Store(e.into()));
+            }
+            inputs.push((
+                "MECHANICAL_EVIDENCE_FILE (platform-run probes, persisted copy)".to_string(),
+                evidence.join(PROBE_EVIDENCE_FILE).display().to_string(),
+            ));
+        }
+
+        // Ground truth for the writing agent: it must know its process
+        // directory is the worktree and its artifact sink is the evidence
+        // dir, not the user's checkout (the 2026-11-01 dogfood wrote an
+        // evidence file into the source tree because nothing declared it).
+        if let Some(wt) = &isolated {
+            inputs.push((
+                "PLATFORM WORKTREE FACTS".to_string(),
+                format!(
+                    "Your working directory is the platform-created git worktree `{}` on branch `{}` (created from bound commit `{}`). You do NOT work in the user's main checkout. The platform owns the branch and the commit: do not create branches, do not commit, do not run any git write command — read-only git only. Run artifacts (logs, evidence files) go ONLY into `{}` (environment DEVAI_EVIDENCE_DIR), never into the checkout. The published report's `branch`, `worktree` and `commit` fields are stamped by the platform with these ground-truth values.",
+                    wt.dir.display(),
+                    wt.branch,
+                    revision.git_head.as_deref().unwrap_or("(unbound)"),
+                    evidence.display(),
+                ),
+            ));
+        }
 
         // The auditor ANSWERS in assessment shape; quality-report@4 describes
         // the artifact the platform assembles afterwards. The prompt must not
@@ -424,7 +552,10 @@ impl<'a> Engine<'a> {
             model: agent.model.clone(),
             inputs: inputs.clone(),
             contract_schema: contract_schema.clone(),
-            workspace: Some(self.workspace.clone()),
+            // REQ-WT-02 AC1: a writing role is NEVER handed the main
+            // checkout path — its workspace is the isolation worktree.
+            workspace: Some(isolated.as_ref().map(|w| w.dir.clone()).unwrap_or_else(|| self.workspace.clone())),
+            evidence: if writing { Some(evidence) } else { None },
         };
 
         let out = match AgentRuntime::run(&req) {
@@ -444,7 +575,22 @@ impl<'a> Engine<'a> {
         // execution is closed, so a broken assembly is honestly FAILED.
         // The SAME revision recorded on the execution row is embedded in the
         // artifact — no recomputation drift between row and report.
-        let (content, exec_summary, report_contract) = match (&eval_run, is_qa) {
+        let (content, exec_summary, report_contract) = if let Some(wt) = &isolated {
+            // REQ-WT-06/04: the platform captures the agent's work in a
+            // commit on the task's OWN branch, stamps the report with the
+            // resulting ground truth, and re-validates the stamped body —
+            // a published implementation report cannot name a directory
+            // that holds no committed state. Failure here is an honestly
+            // FAILED execution, never an unstamped artifact.
+            match self.capture_writing_result(task, &execution, wt, contract_schema.as_deref(), &out) {
+                Ok((content, summary)) => (content, Some(summary), role.output_contract.clone()),
+                Err(e) => {
+                    let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Utc::now());
+                    return Err(e);
+                }
+            }
+        } else {
+            match (&eval_run, is_qa) {
             (Some(run), true) => {
                 let profile = self.profile.as_ref().expect("eval_run implies profile present");
                 let assessment: serde_json::Value = serde_json::from_slice(&out.content)
@@ -479,6 +625,7 @@ impl<'a> Engine<'a> {
                 )
             }
             _ => (out.content.clone(), out.summary.clone(), role.output_contract.clone()),
+            }
         };
         self.store.finish_execution(&execution, ExecutionStatus::Completed, exec_summary.as_deref(), None, Utc::now())?;
 
@@ -548,6 +695,54 @@ impl<'a> Engine<'a> {
             artifact_kind: kind,
             summary: exec_summary,
         })
+    }
+
+    /// Commit + stamp for one completed writing execution (REQ-WT-06,
+    /// REQ-WT-04). The commit touches nothing but `refs/heads/rework/<task>`
+    /// — the platform's only ref channel (REQ-WT-08 (ii)) — because every
+    /// git command here runs with the WORKTREE as its directory; the main
+    /// checkout's HEAD, index and working tree are not addressed at all.
+    /// Then the report body is stamped with ground truth — the agent's own
+    /// claims about branch/worktree/commit are overwritten, and the stamped
+    /// body must pass the role's contract again, so the published artifact
+    /// provably names resolvable repository state (the 2026-11-01 "worked
+    /// uncommitted on main" defect becomes structurally unreportable).
+    fn capture_writing_result(
+        &self,
+        task: &Task,
+        execution: &RoleExecution,
+        wt: &worktree::Worktree,
+        contract_schema: Option<&str>,
+        out: &ExecOutput,
+    ) -> Result<(Vec<u8>, String), RuntimeError> {
+        let one_line: String = task.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sha = worktree::commit_platform_work(&wt.dir, &format!("{}: {one_line}", worktree::COMMIT_SUBJECT_PREFIX), task.id, execution.id)?;
+        let mut body: serde_json::Value = serde_json::from_slice(&out.content)
+            .map_err(|e| AdapterError::BadOutput(format!("implementation report is not valid JSON, cannot stamp: {e}")))?;
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| AdapterError::BadOutput("implementation report must be one JSON object — nothing to stamp".to_string()))?;
+        obj.insert("branch".to_string(), serde_json::json!(wt.branch));
+        obj.insert("worktree".to_string(), serde_json::json!(wt.dir.display().to_string()));
+        obj.insert("commit".to_string(), serde_json::json!(sha));
+        let text = serde_json::to_string_pretty(&body)
+            .map_err(|e| AdapterError::BadOutput(format!("cannot serialize stamped report: {e}")))?;
+        // Re-validate the STAMPED body against the role's contract (the
+        // mechanical half of implementation-report@2: the guarantee is
+        // engine-side, not a promise to the model).
+        adapters::validate_against_contract(&text, contract_schema)?;
+        self.store.insert_event(
+            Some(task.id),
+            event_kind::WORKTREE_COMMITTED,
+            &execution.role_slug,
+            serde_json::json!({
+                "execution": execution.id.to_string(),
+                "branch": wt.branch,
+                "worktree": wt.dir.display().to_string(),
+                "commit": sha,
+            }),
+        )?;
+        Ok((text.into_bytes(), format!("branch {} @ {}", wt.branch, sha.chars().take(12).collect::<String>())))
     }
 
     fn content(&self, a: &Artifact) -> RuntimeResult<String> {

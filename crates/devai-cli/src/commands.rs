@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
 use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
-use devai_runtime::{Engine, Gate};
+use devai_runtime::{worktree, Engine, Gate};
 use devai_store::{ArtifactDraft, Store, guess_media_type};
 use uuid::Uuid;
 
@@ -192,6 +192,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Reject { id, rationale } => op(ctx, &id, move |t, _a| workflow::reject_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Accept { id, rationale } => op(ctx, &id, move |t, a| workflow::accept(t, a, rationale.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Return { id, rationale } => op(ctx, &id, move |t, _a| workflow::return_to_rework(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
+        TaskCmd::Merge { id, workspace, rationale } => task_merge(ctx, &id, workspace.as_deref(), rationale.as_deref(), json)?,
         TaskCmd::Pause { id, reason } => op(ctx, &id, move |t, _a| workflow::pause(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Resume { id } => op(ctx, &id, |t, _a| workflow::resume(t, &ctx.actor, ctx.now()))?,
         TaskCmd::Block { id, reason } => op(ctx, &id, move |t, _a| workflow::block(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
@@ -312,6 +313,78 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
         println!("next: {}", ops.join(" | "));
     }
     Ok(())
+}
+
+/// The merge gate (REQ-WT-07): a plain `git merge` of the task's
+/// platform-created `rework/<task-id>` branch into the workspace's current
+/// baseline branch, performed ONLY because a human invoked this command.
+/// This is deliberately the single merge path in the platform — the git
+/// invocation lives in the CLI, behind a human subcommand, so no
+/// engine/runtime code can reach it, and it rewrites nothing: fast-forward
+/// or ordinary merge commit made with the HUMAN's git identity; a conflict
+/// leaves the merge to the human, unrecorded. The target baseline is the
+/// branch checked out when the command runs (OQ-9: the business does not
+/// fix a configured baseline — what the human has checked out is theirs to
+/// merge into). Task state is untouched by design: the merge is a repository
+/// act, recorded as a decision + event, not a workflow transition.
+fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<&str>, json: bool) -> Result<()> {
+    let task = ctx.store.resolve_task(id)?;
+    let repo = match workspace {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("no current directory; pass --workspace")?,
+    };
+    if !worktree::is_git_repo(&repo) {
+        bail!("{} is not a git repository — nothing to merge into", repo.display());
+    }
+    let branch = worktree::branch_name(task.id);
+    if !worktree::has_branch(&repo, task.id) {
+        bail!("task {} has no `{branch}` branch — a writing stage creates it via the platform worktree; there is nothing to merge", short(&task.id));
+    }
+    let head_before = git_in(&repo, &["rev-parse", "--verify", "HEAD"]).context("baseline checkout has no commits to merge into")?;
+    git_in(&repo, &["merge", "--no-edit", &branch])?;
+    let head_after = git_in(&repo, &["rev-parse", "HEAD"])?;
+
+    ctx.store.record_decision(&Decision {
+        id: new_id(),
+        task_id: task.id,
+        kind: decision_kind::REWORK_MERGE.into(),
+        verdict: Verdict::Approved,
+        actor: ctx.actor.clone(),
+        rationale: rationale.map(|s| s.to_string()),
+        refs: vec![branch.clone(), head_after.clone()],
+        created_at: ctx.now(),
+    })?;
+    ctx.store.insert_event(
+        Some(task.id),
+        event_kind::REWORK_MERGED,
+        &ctx.actor,
+        serde_json::json!({
+            "branch": branch,
+            "workspace": repo.display().to_string(),
+            "head_before": head_before,
+            "head_after": head_after,
+        }),
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "task": task.id.to_string(), "branch": branch, "workspace": repo.display().to_string(),
+            "head_before": head_before, "head_after": head_after,
+        }))?);
+    } else {
+        println!("merged `{branch}` into {}  {head_before} → {head_after}", repo.display());
+        println!("branch and worktree persist — their removal is a lifecycle decision the platform does not automate (OQ-1)");
+    }
+    Ok(())
+}
+
+/// Read-only git plumbing for the merge gate: the CLI never grows domain
+/// logic, it only performs exactly the one repository act a human ordered.
+fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git").args(args).current_dir(dir).output().with_context(|| format!("launch git in {}", dir.display()))?;
+    if !out.status.success() {
+        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// The human gate's viewing channel: the CURRENT quality report. A verdict

@@ -17,16 +17,44 @@ fn store() -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
-/// Probes must run against the real workspace, not the crate dir.
+/// Probes must run against a real git workspace, not the crate dir — and
+/// NEVER against the developer's own repository: a writing stage creates
+/// `rework/<task-id>` branch refs and `.git/worktrees/` registrations in
+/// whatever repo it is given (REQ-WT-08 channels (i)/(ii)), so pointing
+/// tests at the source checkout would accumulate branch debris in a human's
+/// history. One committed temp repository serves the whole test binary.
 fn workspace() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    use std::sync::OnceLock;
+    static WS: OnceLock<PathBuf> = OnceLock::new();
+    WS.get_or_init(|| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().to_path_buf();
+        git_at(&p, &["init", "-q"]);
+        std::fs::write(p.join("tracked.txt"), b"alpha\n").unwrap();
+        git_at(&p, &["add", "tracked.txt"]);
+        git_at(
+            &p,
+            &["-c", "user.email=devai@test.local", "-c", "user.name=devai-test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "bound state"],
+        );
+        std::mem::forget(dir); // lives as long as the test binary needs it
+        p
+    })
+    .clone()
 }
 
 /// A tiny offline profile. We must NOT run the factory profile inside tests:
 /// its `cargo test --workspace` gate would spawn this very test again — an
 /// evaluation harness that recurses is a harness bug, not evidence.
 fn tiny_profile() -> devai_store::config::Profile {
-    let yaml = r#"
+    tiny_profile_gate("true")
+}
+
+/// The same profile with the first gate's probe command replaced. Tests that
+/// must prove WHERE the platform ran the probes (REQ-WT-03) pass a
+/// location-sensitive command here — the gate only passes inside the checkout
+/// it targets.
+fn tiny_profile_gate(cmd: &str) -> devai_store::config::Profile {
+    static YAML: &str = r#"
 version: 1
 project: devai
 applies_to_roles: [quality-auditor]
@@ -35,8 +63,8 @@ error_types:
   data/immutability-breach: { desc: d, severity: catastrophic }
 gates:
   - id: always-green
-    desc: trivial gate
-    probes: [ { cmd: "true", pass_exit: [0] } ]
+    desc: location-sensitive gate
+    probes: [ { cmd: "@GATE@", pass_exit: [0] } ]
   - id: honesty-check
     desc: a failing probe must surface, not vanish
     probes: [ { cmd: "exit 127", pass_exit: [0] } ]
@@ -71,7 +99,7 @@ scoring:
     rub/b: 0.3
     hum/c: 0.2
 "#;
-    serde_yaml::from_str(yaml).unwrap()
+    serde_yaml::from_str(&YAML.replace("@GATE@", cmd)).unwrap()
 }
 
 fn mk_engine(store: &Store) -> Engine<'_> {
@@ -409,6 +437,16 @@ fn git_at(dir: &std::path::Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git is available");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// A clean, committed, isolated git workspace: HEAD and the dirty digest are
 /// both well-defined and stable across recomputations.
 fn git_workspace() -> (tempfile::TempDir, PathBuf) {
@@ -504,9 +542,17 @@ fn any_workspace_change_marks_the_report_stale_and_reaudit_proceeds() {
     store.create_task(&t).unwrap();
     drive_to_report(&store, &t, &ws);
 
+    // REQ-WT-02/03: with the task branch live, the audit measures the
+    // PLATFORM WORKTREE — that is the state a report binds, so staleness is
+    // proven by changing the worktree. (Editing the main checkout instead
+    // would now honestly NOT invalidate the report: it measures something
+    // else — see req008_dogfood.)
+    let wt = _d.path().join("worktrees").join(t.id.to_string());
+    assert!(wt.is_dir(), "the writing stage created the worktree under the data home");
+
     // A tracked edit changes the dirty digest → the report no longer binds
     // the current state → the audit runs normally.
-    std::fs::write(ws.join("tracked.txt"), b"beta\n").unwrap();
+    std::fs::write(wt.join("tracked.txt"), b"beta\n").unwrap();
     let engine = engine_in(&store, &ws, false);
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
     assert_eq!(r.gate, Gate::WaitingAccept, "stale report: auditor re-runs without an override");
@@ -514,7 +560,7 @@ fn any_workspace_change_marks_the_report_stale_and_reaudit_proceeds() {
 
     // A NEW untracked (non-ignored) file changes the digest too: the report
     // just published binds the pre-scratch state, so this run is stale again.
-    std::fs::write(ws.join("scratch.txt"), b"untracked\n").unwrap();
+    std::fs::write(wt.join("scratch.txt"), b"untracked\n").unwrap();
     let engine = engine_in(&store, &ws, false);
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
     assert_eq!(r.gate, Gate::WaitingAccept, "untracked addition invalidates freshness");
@@ -522,22 +568,64 @@ fn any_workspace_change_marks_the_report_stale_and_reaudit_proceeds() {
 }
 
 #[test]
-fn non_git_workspace_never_claims_freshness() {
+fn non_git_workspace_fails_the_writing_stage_and_never_claims_freshness() {
+    // The old behavior — "an implementation role runs unisolated in a
+    // non-git tree" — is exactly what REQ-WT-08 forbids. A writing stage
+    // without a commit to branch from must FAIL, not fall back.
     let (_d, store) = store();
     let nongit = tempfile::TempDir::new().unwrap();
     let ws = nongit.path().to_path_buf();
-    let t = Task::new("NoGit", "unbound tree cannot be proven fresh", None, Utc::now());
+    let t = Task::new("NoGit", "unbound tree cannot host a writing stage", None, Utc::now());
     store.create_task(&t).unwrap();
 
     let engine = engine_in(&store, &ws, false);
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
     assert_eq!(r.gate, Gate::WaitingApproval);
     approved(&store, &t.id.to_string());
+
+    // REQ-WT-01 AC2: explicit failure, no silent fallback to the current
+    // directory state. The execution is recorded FAILED and the workflow
+    // does not move. (A non-git tree refuses at the repository check itself;
+    // the sibling rule — a git repo with no bound commit — is
+    // `no_bound_commit_is_an_explicit_failure_not_a_fallback` in worktree.rs.)
+    let err = engine.advance(&t.id.to_string(), "mock", "tester").unwrap_err();
+    assert!(err.to_string().contains("not a git repository"), "the error names the rule it enforces: {err}");
+    let impl_exec = store
+        .list_executions(Some(t.id))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.role_slug == "implementation-agent")
+        .expect("the writing execution is recorded");
+    assert_eq!(impl_exec.status, ExecutionStatus::Failed, "a refused writing stage is honest history");
+    assert_eq!(store.get_task(&t.id.to_string()).unwrap().state, TaskState::Implementation, "the refusal moves no state");
+    assert!(
+        store.artifacts(t.id).unwrap().iter().all(|a| a.kind != ArtifactKind::ImplementationReport),
+        "nothing is published for a failed writing run"
+    );
+
+    // The freshness half of the rule, for a report published by other means:
+    // the revision IS recorded (all four components present), but git fields
+    // are NULL — recorded, not comparable, such a report is never fresh.
+    store
+        .publish_artifact(devai_store::ArtifactDraft {
+            task_id: t.id,
+            kind: ArtifactKind::ImplementationReport,
+            name: "implementation-report (manual)".into(),
+            category: DataCategory::Artifact,
+            content: serde_json::json!({ "branch": "none", "patch": "manually published", "test_results": {} }).to_string().into_bytes(),
+            media_type: "application/json".into(),
+            contract: None,
+            created_by: "user".into(),
+            execution_id: None,
+            depends_on: vec![],
+        })
+        .unwrap();
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::implementation_reported(&cur, Some("manual"), "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
     assert_eq!(r.gate, Gate::WaitingAccept);
-
-    // The revision IS recorded (all four components present), but git fields
-    // are NULL: recorded, not comparable — such a report is never fresh.
     let execs = store.list_executions(Some(t.id)).unwrap();
     let qa = execs.iter().find(|e| e.role_slug == "quality-auditor").unwrap();
     let rev = qa.workspace_revision.as_ref().expect("non-git executions still record a revision");
@@ -647,4 +735,127 @@ fn legacy_unbound_report_leaves_the_gate_inert() {
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
     assert_eq!(r.gate, Gate::WaitingAccept, "unbound report: audit proceeds, never a freshness ask");
     assert_eq!(r.steps.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Worktree isolation for writing roles (REQ-WT-01/02/04/05/08). The unit
+// tests in `worktree.rs` prove the plumbing in isolation; these prove the
+// ENGINE routes a real stage through it — the defect of 2026-11-01 was the
+// agent working uncommitted in the user's checkout, and only the engine can
+// make that impossible.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn writing_stage_is_isolated_in_platform_worktree() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    // An untracked file in the main checkout must NOT travel into the
+    // branch: the worktree is created from the bound COMMIT (REQ-WT-01 AC1;
+    // interim platform answer to OQ-3).
+    std::fs::write(ws.join("main-only.txt"), b"not for the branch\n").unwrap();
+    let head = git_out(&ws, &["rev-parse", "HEAD"]);
+    // REQ-WT-08 AC2 witnesses — the exact state of the main checkout before.
+    let status_before = git_out(&ws, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    let index_before = git_out(&ws, &["ls-files", "-s"]);
+
+    let t = Task::new("Isolation", "writing runs on a platform branch", None, Utc::now());
+    store.create_task(&t).unwrap();
+    let engine = engine_in(&store, &ws, false);
+    engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    approved(&store, &t.id.to_string());
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept);
+
+    let branch = devai_runtime::worktree::branch_name(t.id);
+    let wt = _d.path().join("worktrees").join(t.id.to_string());
+    // REQ-WT-01: the platform created the worktree on the task's branch,
+    // pointing at exactly the bound commit, OUTSIDE the checkout (REQ-WT-05).
+    assert!(wt.is_dir(), "the platform created the isolation worktree under the data home");
+    assert_eq!(git_out(&wt, &["branch", "--show-current"]), branch, "REQ-WT-02: the writing checkout is the task branch");
+    assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), head, "REQ-WT-01 AC1: the branch starts at the bound commit");
+    assert!(!wt.join("main-only.txt").exists(), "OQ-3: the main checkout's dirt is not transported");
+
+    // REQ-WT-08 AC2: after a whole writing stage the main checkout is
+    // byte-identical — only the two enumerated channels were touched.
+    assert_eq!(git_out(&ws, &["rev-parse", "HEAD"]), head, "main HEAD unmoved");
+    assert_eq!(git_out(&ws, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]), status_before, "main working tree unmoved");
+    assert_eq!(git_out(&ws, &["ls-files", "-s"]), index_before, "main index unmoved");
+
+    // REQ-WT-04: the published report names branch+worktree+commit STAMPED
+    // by the platform — the agent's own claims are overwritten with ground
+    // truth and the stamped body must pass implementation-report@2 again.
+    let arts = store.artifacts(t.id).unwrap();
+    let impl_a = arts.iter().find(|a| a.kind == ArtifactKind::ImplementationReport).unwrap();
+    assert_eq!(
+        impl_a.contract.as_ref().map(|c| (c.name.as_str(), c.version)),
+        Some(("implementation-report", 2)),
+        "the role's declared @2 contract is what got published"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&store.read_blob(&impl_a.sha256).unwrap()).unwrap();
+    assert_eq!(body["branch"], branch);
+    assert_eq!(body["worktree"], wt.display().to_string());
+    // The mock changed nothing: the commit that captures the work is the
+    // tip that already equals it — no empty commit is faked (REQ-WT-04 AC3).
+    assert_eq!(body["commit"], head, "the named commit resolves on the task branch");
+    let schema = store.get_contract("implementation-report", 2).unwrap().expect("implementation-report@2 must be seeded");
+    assert!(devai_runtime::validate_against_contract(&body.to_string(), Some(&schema)).is_ok(), "stamped body passes @2");
+
+    // REQ-WT-05: the run's evidence sink lives under the home, declared to
+    // the adapter — created for the writing execution.
+    let impl_exec = store
+        .list_executions(Some(t.id))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.role_slug == "implementation-agent")
+        .unwrap();
+    assert_eq!(impl_exec.status, ExecutionStatus::Completed);
+    let ev = _d.path().join("evidence").join(t.id.to_string()).join(impl_exec.id.to_string());
+    assert!(ev.is_dir(), "platform-declared evidence dir created for the writing execution");
+
+    // The repository facts are immutable history, not just artifact claims.
+    let kinds: Vec<String> = store.all_events_for_task(t.id).unwrap().into_iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&event_kind::WORKTREE_PREPARED.to_string()), "worktree.prepared recorded: {kinds:?}");
+    assert!(kinds.contains(&event_kind::WORKTREE_COMMITTED.to_string()), "worktree.committed recorded: {kinds:?}");
+}
+
+#[test]
+fn qa_probes_measure_the_worktree_not_the_main_checkout() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Probe location", "REQ-WT-03: gates run where the work lives", None, Utc::now());
+    store.create_task(&t).unwrap();
+    let engine = engine_in(&store, &ws, false);
+    engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    approved(&store, &t.id.to_string());
+
+    // A gate that passes ONLY inside the task's branch checkout: run in the
+    // main checkout the same command exits 1. A PASS is proof of location.
+    let branch = devai_runtime::worktree::branch_name(t.id);
+    let engine = Engine::new(&store)
+        .with_workspace(ws.clone())
+        .with_profile(tiny_profile_gate(&format!("git branch --show-current | grep -qx '{branch}'")));
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "implementation ran, then the audit measured its worktree");
+
+    let arts = store.artifacts(t.id).unwrap();
+    let a = arts.iter().find(|x| x.kind == ArtifactKind::QualityReport).unwrap();
+    let rep: serde_json::Value = serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+    let gates = rep["evaluation"]["gates"].as_array().unwrap();
+    assert_eq!(gates[0]["id"], "always-green");
+    assert_eq!(gates[0]["state"], "PASS", "REQ-WT-03: the gate probe ran on the task branch — impossible outside the worktree");
+
+    // REQ-WT-05: the transcript is a run artifact under <home>/evidence,
+    // referenced from the prompt by path; nothing lands in either checkout
+    // (the 2026-11-01 dogfood wrote an evidence file into the source tree).
+    let qa_exec = store
+        .list_executions(Some(t.id))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.role_slug == "quality-auditor")
+        .unwrap();
+    let transcript = _d.path().join("evidence").join(t.id.to_string()).join(qa_exec.id.to_string()).join("probes.txt");
+    let txt = std::fs::read_to_string(&transcript).expect("probe transcript persisted under the evidence root");
+    assert!(txt.contains("git branch --show-current"), "the transcript cites the command: {txt}");
+    assert!(!ws.join("probes.txt").exists(), "no run artifact in the main checkout");
+    assert!(!_d.path().join("worktrees").join(t.id.to_string()).join("probes.txt").exists(), "no run artifact in the worktree");
 }
