@@ -3,11 +3,40 @@
 //! and agents from this module. `devai init` seeds on first run and
 //! version-bumps roles when their YAML changes; nothing is overwritten.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config;
-use crate::{Store, StoreResult};
+use crate::{Store, StoreError, StoreResult};
 use devai_core::types::*;
+
+/// Insert-only snapshot of the evaluation profile YAMLs into the store, so
+/// every recorded `name@version` identity stays resolvable to the exact
+/// definition that was in force at execution time — even after an in-place
+/// edit bumps the version (the first-stored text for a `(name, version)` IS
+/// that version's definition; history is never rewritten).
+fn snapshot_profiles(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize> {
+    let eval_dir = dir.join("evaluation");
+    if !eval_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&eval_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    let mut snapshotted = 0;
+    for p in paths {
+        let body = std::fs::read_to_string(&p).map_err(|e| StoreError::Config(format!("read {}: {e}", p.display())))?;
+        let profile: config::Profile = serde_yaml::from_str(&body).map_err(|e| StoreError::Config(format!("parse {}: {e}", p.display())))?;
+        let name = profile.name.clone().or_else(|| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+        let Some(name) = name else { continue };
+        if store.put_evaluation_profile(&name, profile.version, &profile.project, &body, &now)? {
+            snapshotted += 1;
+        }
+    }
+    Ok(snapshotted)
+}
 
 /// Seed from the home config directory, materializing factory defaults
 /// when the tree is absent.
@@ -27,6 +56,12 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
             store.put_contract(name, version, schema)?;
         }
     }
+
+    // Snapshot every evaluation profile definition into the store (INSERT
+    // OR IGNORE): a profile identity `name@version` recorded in an old
+    // execution must resolve to the exact YAML that was in force then, even
+    // after an in-place edit bumps the version. Old rows are never rewritten.
+    snapshot_profiles(store, dir, now)?;
 
     // Default agents. `mock` runs roles offline with deterministic
     // contract-shaped output; `claude` shells out to the headless CLI.
@@ -213,6 +248,83 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
       "type": "object",
       "required": ["project", "version"],
       "properties": { "project": { "type": "string" }, "version": { "type": "integer" } }
+    },
+    "assessment_execution": { "type": "string", "description": "role execution id of the auditor run" },
+    "evaluation": {
+      "type": "object",
+      "required": ["verdict", "score", "theta", "gates", "checks"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "score": { "type": "number" },
+        "theta": { "type": "number" },
+        "blocked_weight": { "type": "number" },
+        "max_blocked_weight": { "type": "number" },
+        "floors_breached": { "type": "array", "items": { "type": "string" } },
+        "pending_human": { "type": "array", "items": { "type": "string" } },
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "state"],
+            "properties": {
+              "id": { "type": "string" },
+              "state": { "type": "string", "enum": ["PASS", "FAIL", "BLOCKED"] },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "verify", "state", "weight", "detects", "evidence"],
+            "properties": {
+              "id": { "type": "string" },
+              "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
+              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "score": { "type": "number" },
+              "floor": { "type": "number" },
+              "weight": { "type": "number" },
+              "detects": { "type": "array", "items": { "type": "string" } },
+              "violations": { "type": "array", "items": { "type": "string" } },
+              "evidence": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "concrete citations: test output excerpt, artifact id, build log reference — at least one per check entry" },
+              "reason": { "type": "string", "description": "why BLOCKED / unscored" }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#,
+        ),
+        (
+            "quality-report",
+            4,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Quality Report v4 — machine-assembled by the platform; bound to a workspace revision",
+  "description": "Assembled by devai-runtime from the evaluation profile: platform-run gates and mechanical probes merged with the auditor's rubric scores. The verdict is computed by the deterministic function of docs/evaluation-schema.md 2.5, never by a model. v4 = v3 (every criteria entry must cite at least one concrete evidence item) plus the workspace_revision object the platform captured at execution start: the report's findings are traceable to the exact git HEAD + dirty-tree digest + profile name@version + roles slug@version they were made against. A report whose embedded revision equals the freshly recomputed workspace revision is FRESH: re-auditing an unchanged workspace requires an explicit human decision, never a silent second audit.",
+  "type": "object",
+  "required": ["verdict", "recommendation_basis", "report_text", "profile", "workspace_revision", "evaluation"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["ACCEPT", "RETURN", "ESCALATE"] },
+    "recommendation_basis": { "type": "string" },
+    "report_text": { "type": "string" },
+    "profile": {
+      "type": "object",
+      "required": ["project", "version"],
+      "properties": { "project": { "type": "string" }, "version": { "type": "integer" } }
+    },
+    "workspace_revision": {
+      "type": "object",
+      "description": "Workspace provenance captured platform-side (never by a model) at execution start. All four components are required; git_head/dirty_digest are null outside a git repo, profile is null when no evaluation profile is loaded — such a revision is not comparable and freshness is never claimed from it.",
+      "required": ["git_head", "dirty_digest", "profile", "roles"],
+      "properties": {
+        "git_head": { "type": ["string", "null"], "description": "git rev-parse HEAD of the probe workspace" },
+        "dirty_digest": { "type": ["string", "null"], "description": "sha256 hex over the canonical dirty-tree line sequence: one sorted TAB-separated XY/worktree-oid/index-oid/path line per path reported by `git status --porcelain -z --no-renames --untracked-files=all` (read-only plumbing; a clean tree hashes the empty sequence)" },
+        "profile": { "type": ["string", "null"], "description": "evaluation profile identity name@version in force at execution start" },
+        "roles": { "type": "array", "items": { "type": "string" }, "description": "sorted slug@version list of the current role definitions at execution start" }
+      }
     },
     "assessment_execution": { "type": "string", "description": "role execution id of the auditor run" },
     "evaluation": {

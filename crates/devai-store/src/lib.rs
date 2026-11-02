@@ -22,7 +22,7 @@ use devai_core::workflow::Mutation;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
 pub struct Store {
@@ -42,6 +42,11 @@ impl Store {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(include_str!("../schema.sql"))?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        } else if version == 1 {
+            // v1 -> v2: additive migration only — new nullable column and a
+            // new insert-only table; no existing row is touched.
+            conn.execute_batch(include_str!("../migrations/002_workspace_revision.sql"))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::SchemaVersion { found: version, expected: SCHEMA_VERSION });
@@ -462,14 +467,52 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // evaluation profile history (insert-only)
+    // ------------------------------------------------------------------
+
+    /// Snapshot one evaluation profile definition. INSERT-only: the first
+    /// stored text for `(name, version)` IS the definition of that version —
+    /// later in-place edits bump the version and land as a new row, so every
+    /// profile identity recorded in an old execution stays resolvable.
+    pub fn put_evaluation_profile(&self, name: &str, version: u32, project: &str, body: &str, created_at: &Timestamp) -> StoreResult<bool> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO evaluation_profiles(name,version,project,body,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![name, version, project, body, rows::ts(created_at)],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Resolve a recorded `name@version` profile identity to its stored body.
+    pub fn get_evaluation_profile(&self, name: &str, version: u32) -> StoreResult<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT project, body FROM evaluation_profiles WHERE name=?1 AND version=?2", params![name, version], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
+    pub fn list_evaluation_profiles(&self) -> StoreResult<Vec<(String, u32, String)>> {
+        let mut stmt = self.conn.prepare("SELECT name, version, project FROM evaluation_profiles ORDER BY name, version")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push((r.get(0)?, r.get(1)?, r.get(2)?));
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------
     // executions
     // ------------------------------------------------------------------
 
     pub fn start_execution(&self, e: &RoleExecution) -> StoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
+        // The workspace revision is stored as the JSON object the engine
+        // computed at execution start. NULL is reserved for rows written
+        // before provenance existed and for manual rows without one.
+        let revision = e.workspace_revision.as_ref().map(|r| json_string(r));
         tx.execute(
-            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL)",
+            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9)",
             params![
                 e.id.to_string(),
                 e.task_id.to_string(),
@@ -479,6 +522,7 @@ impl Store {
                 e.status.as_str(),
                 json_string(&e.inputs),
                 rows::ts(&e.started_at),
+                revision,
             ],
         )?;
         tx.execute(
@@ -493,6 +537,7 @@ impl Store {
                     "role": e.role_slug,
                     "role_version": e.role_version,
                     "agent": e.agent_name,
+                    "workspace_revision": e.workspace_revision,
                 })),
                 rows::ts(&e.started_at),
             ],
@@ -537,7 +582,7 @@ impl Store {
         rows::unwrap_row(
             self.conn
                 .query_row(
-                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at
+                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision
                  FROM role_executions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 1",
                     params![id.to_lowercase()],
                     |r| rows::r2sql(rows::execution_from_row(r)),
@@ -550,11 +595,11 @@ impl Store {
     pub fn list_executions(&self, task_id: Option<Id>) -> StoreResult<Vec<RoleExecution>> {
         let (sql, args): (&str, Vec<Option<String>>) = match task_id {
             Some(t) => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at FROM role_executions WHERE task_id=?1 ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision FROM role_executions WHERE task_id=?1 ORDER BY started_at",
                 vec![Some(t.to_string())],
             ),
             None => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at FROM role_executions ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision FROM role_executions ORDER BY started_at",
                 vec![],
             ),
         };
@@ -724,5 +769,67 @@ mod trigger_tests {
         let del = store.conn.execute("DELETE FROM workflow_events WHERE task_id=?1", params![t.id.to_string()]);
         assert!(del.is_err(), "events must not be deletable");
         assert_eq!(store.events(t.id, None).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// REQ-002: a v1 database migrates forward ADDITIVELY — the old
+    /// execution row survives untouched with a NULL revision, and nothing
+    /// pre-existing is rewritten or deleted.
+    #[test]
+    fn v1_database_migrates_to_v2_without_touching_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let old_id = new_id().to_string();
+        let new_id_s = new_id().to_string();
+        let task_uuid = new_id().to_string();
+        {
+            // Hand-build a v1-shaped database: role_executions WITHOUT the
+            // workspace_revision column, one historical row.
+            let conn = Connection::open(dir.path().join("devai.db")).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version=1;
+                 CREATE TABLE role_executions(
+                   id TEXT PRIMARY KEY, task_id TEXT NOT NULL, role_slug TEXT NOT NULL,
+                   role_version INTEGER NOT NULL, agent_name TEXT NULL, status TEXT NOT NULL,
+                   inputs TEXT NOT NULL DEFAULT '[]', summary TEXT NULL, error TEXT NULL,
+                   started_at TEXT NOT NULL, finished_at TEXT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at)
+                 VALUES(?1,?2,'requirements-analyst',1,'mock','COMPLETED','[]','was old',NULL,'2026-01-01T00:00:00.000000Z',NULL)",
+                params![old_id, task_uuid],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        let version: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "open must migrate v1 forward");
+
+        let e = store.get_execution(&old_id).unwrap();
+        assert!(e.workspace_revision.is_none(), "history rows keep a NULL revision — never guessed");
+        assert_eq!(e.summary.as_deref(), Some("was old"), "the historical row is byte-intact");
+
+        let count: i64 = store.conn.query_row("SELECT count(*) FROM evaluation_profiles", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "the new table exists and starts empty");
+
+        // The new column accepts v2 writes (a NEW row — history is never
+        // updated): append-only in the literal SQL sense.
+        store
+            .conn
+            .execute(
+                "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision)
+                 VALUES(?1,?2,'quality-auditor',2,'mock','COMPLETED','[]',NULL,NULL,'2026-01-02T00:00:00.000000Z',NULL,?3)",
+                params![new_id_s, task_uuid, json_string(&serde_json::json!({"git_head":null,"dirty_digest":null,"profile":null,"roles":[]}))],
+            )
+            .unwrap();
+        let e = store.get_execution(&new_id_s).unwrap();
+        assert!(e.workspace_revision.is_some(), "v2 rows can carry a revision");
+        let old = store.get_execution(&old_id).unwrap();
+        assert!(old.workspace_revision.is_none(), "the historical row was NOT rewritten by the v2 write");
     }
 }

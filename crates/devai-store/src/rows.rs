@@ -163,6 +163,7 @@ pub fn agent_from_row(r: &Row) -> StoreResult<AgentInstance> {
 }
 
 pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
+    let revision: Option<String> = get(r, 11)?;
     Ok(RoleExecution {
         id: parse_id(get(r, 0)?)?,
         task_id: parse_id(get(r, 1)?)?,
@@ -175,6 +176,11 @@ pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
         error: get(r, 8)?,
         started_at: parse_ts(get(r, 9)?)?,
         finished_at: opt_ts(get(r, 10)?)?,
+        // Pre-v2 rows carry NULL: the revision is absent, never guessed.
+        workspace_revision: revision
+            .as_deref()
+            .map(|s| serde_json::from_str::<WorkspaceRevision>(s).map_err(|e| StoreError::Corrupt(format!("bad workspace_revision: {e}"))))
+            .transpose()?,
     })
 }
 

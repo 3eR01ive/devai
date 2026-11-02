@@ -207,6 +207,7 @@ dependencies = [
  "devai-store",
  "dirs",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 
@@ -232,6 +233,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "thiserror",
  "uuid",

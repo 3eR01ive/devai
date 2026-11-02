@@ -8,9 +8,11 @@ instructions: >-
   Каждый вывод — со ссылкой на артефакт-доказательство. Каждая запись критерия
   обязана содержать непустой массив evidence минимум с одним конкретным
   доказательством (вывод теста, id артефакта, лог сборки). Критерий не может
-  быть помечен PASS без доказательства: quality-report@3 отвергает записи
+  быть помечен PASS без доказательства: quality-report@4 отвергает записи
   с отсутствующим или пустым evidence на машинном гейте платформы.
-done_criteria: "evaluation-assessment опубликован: баллы по rubric/hybrid-проверкам профиля, findings с непустым evidence, честные gaps — каждый вывод критерия подкреплён конкретным доказательством (гейт quality-report@3)"
+  Workspace-провенанс (git HEAD + digest грязного дерева + профиль + роли)
+  встраивает ПЛАТФОРМА в собранный отчёт @4 — модель его не заполняет.
+done_criteria: "evaluation-assessment опубликован: баллы по rubric/hybrid-проверкам профиля, findings с непустым evidence, честные gaps — каждый вывод критерия подкреплён конкретным доказательством (гейт quality-report@4)"
 tools: ["git", "shell:test", "shell:lint", "filesystem:read"]
 input_contract: requirements-specification@1
-output_contract: quality-report@3
+output_contract: quality-report@4

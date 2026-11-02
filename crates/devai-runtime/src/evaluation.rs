@@ -57,10 +57,11 @@ pub struct CheckOutcome {
     pub detects: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<String>,
-    /// QA rule (quality-report@3): ALWAYS non-empty after assembly — every
-    /// criteria entry cites at least one concrete piece of evidence. Kept
-    /// serialized even when empty so a future bug fails the contract gate
-    /// with `minimum 1` instead of hiding behind a missing key.
+    /// QA rule (quality-report@3, carried unchanged into @4): ALWAYS
+    /// non-empty after assembly — every criteria entry cites at least one
+    /// concrete piece of evidence. Kept serialized even when empty so a
+    /// future bug fails the contract gate with `minimum 1` instead of hiding
+    /// behind a missing key.
     pub evidence: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
@@ -197,8 +198,9 @@ fn state_name(s: ProbeState) -> &'static str {
     }
 }
 
-/// QA rule "evidence per criterion" (`quality-report@3`): the platform never
-/// emits a criteria entry without a citation. The check's own observation
+/// QA rule "evidence per criterion" (born in `quality-report@3`, carried
+/// unchanged into @4): the platform never emits a criteria entry without a
+/// citation. The check's own observation
 /// counts first — the probe command + exit code (`detail`), the gap record,
 /// the discard reason; a rubric score with no finding cited is at least
 /// traceable to the auditor's assessment execution artifact. Blank strings
@@ -220,7 +222,8 @@ fn guarantee_evidence(c: &mut CheckOutcome, assessment_execution: &str) {
 }
 
 pub struct Assembled {
-    /// Full quality-report@3 document.
+    /// Full quality-report@4 document (evidence rule from @3 + the
+    /// platform-captured `workspace_revision` block).
     pub json: Value,
     /// ACCEPT | RETURN | ESCALATE — platform recommendation for the human.
     pub recommendation: &'static str,
@@ -230,9 +233,11 @@ pub struct Assembled {
     pub report_text: String,
 }
 
-/// Merge probe results + the auditor's assessment into quality-report@3 and
-/// apply the deterministic verdict function (§2.5).
-pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment_execution: &str) -> Assembled {
+/// Merge probe results + the auditor's assessment into quality-report@4 and
+/// apply the deterministic verdict function (§2.5). `revision` is the
+/// workspace state the PLATFORM captured at execution start — embedded
+/// verbatim so every file:line finding is traceable to a bound workspace.
+pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment_execution: &str, revision: &devai_core::types::WorkspaceRevision) -> Assembled {
     let scores: HashMap<String, f64> = assessment
         .get("scores")
         .and_then(|s| s.as_object())
@@ -492,6 +497,10 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
         "recommendation_basis": basis,
         "report_text": report_text,
         "profile": { "project": profile.project, "version": profile.version },
+        // Workspace provenance: the exact state this report judges. Equal to
+        // the revision on the auditor's execution row — recorded, never
+        // recomputed here.
+        "workspace_revision": revision,
         "assessment_execution": assessment_execution,
         "evaluation": {
             "verdict": verdict,
@@ -642,6 +651,17 @@ scoring:
         execute(profile, Path::new(env!("CARGO_MANIFEST_DIR")))
     }
 
+    /// A stand-in for the platform-captured workspace revision: assemble
+    /// embeds it verbatim; the engine passes the real computed object.
+    fn fixture_revision() -> devai_core::types::WorkspaceRevision {
+        devai_core::types::WorkspaceRevision {
+            git_head: Some("a".repeat(40)),
+            dirty_digest: Some("b".repeat(64)),
+            profile: Some("testproj@1".into()),
+            roles: vec!["quality-auditor@1".into()],
+        }
+    }
+
     #[test]
     fn pending_human_outranks_score_comparison() {
         // The calibration fix: even a perfect S with an unsigned human check
@@ -649,7 +669,7 @@ scoring:
         let p = tiny_profile("true", "true");
         let run = run_ok(&p);
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-1");
+        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         assert_eq!(out.recommendation, "ESCALATE");
         assert!(out.report_text.contains("ЖДЁТ ЧЕЛОВЕКА: hum/c"), "{}", out.report_text);
@@ -661,12 +681,12 @@ scoring:
         let p = tiny_profile("true", "false");
         let run = run_ok(&p);
         let a = assessment(&[], &[("rub/b", "no access")], &[]);
-        let out = assemble(&p, &run, &a, "exec-1");
+        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         // gate ok, but mech FAIL -> S drops; pending human -> inconclusive first.
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         let p2 = tiny_profile("false", "true");
         let run2 = execute(&p2, Path::new(env!("CARGO_MANIFEST_DIR")));
-        let out2 = assemble(&p2, &run2, &a, "exec-2");
+        let out2 = assemble(&p2, &run2, &a, "exec-2", &fixture_revision());
         assert_eq!(out2.evaluation_verdict, "FAIL");
         assert_eq!(out2.recommendation, "RETURN");
         assert!(out2.report_text.contains("ШЛЮЗ: gate-1 — FAIL"));
@@ -678,14 +698,14 @@ scoring:
         let run = run_ok(&p);
         // No assessment at all: mech blocked (127) weight .5 > cap .2.
         let a = assessment(&[], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-0");
+        let _out = assemble(&p, &run, &a, "exec-0", &fixture_revision());
         // pending human fires first here; drop hum/c to test the cap path:
         let mut p2 = p.clone();
         p2.evaluations[0].checks.retain(|c| c.id != "hum/c");
         p2.scoring.weights = vec![("mech/a".into(), 0.5), ("rub/b".into(), 0.3)].into_iter().collect();
         // V7 sum != 1 by design for this check path — validate isn't called here.
         let run2 = execute(&p2, Path::new(env!("CARGO_MANIFEST_DIR")));
-        let out2 = assemble(&p2, &run2, &a, "exec-1");
+        let out2 = assemble(&p2, &run2, &a, "exec-1", &fixture_revision());
         assert_eq!(out2.evaluation_verdict, "INCONCLUSIVE");
         assert!(out2.report_text.contains("НЕ ПРОВЕРЕНО"), "{}", out2.report_text);
     }
@@ -697,7 +717,7 @@ scoring:
         p.evaluations[0].checks.retain(|c| c.id != "hum/c");
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let a = assessment(&[("rub/b", 0.4)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-1");
+        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         let j = &out.json["evaluation"]["checks"];
         let b = j
             .as_array()
@@ -716,7 +736,7 @@ scoring:
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         // 0.9 < 1.0 must carry evidence, or our own meta-check discards it.
         let a = assessment(&[("rub/b", 0.9)], &[], &[("rub/b", "single style drift", &["x.rs:1"])]);
-        let out = assemble(&p, &run, &a, "exec-1");
+        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         assert_eq!(out.evaluation_verdict, "PASS");
         assert_eq!(out.recommendation, "ACCEPT");
         assert!((out.score - (0.5 * 1.0 + 0.3 * 0.9) / 0.8).abs() < 1e-6, "S={}", out.score);
@@ -727,7 +747,7 @@ scoring:
         p.evaluations[0].checks[1].detects = vec!["correctness/state-transition".into()];
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let a = assessment(&[("rub/b", 0.4)], &[], &[("rub/b", "leak", &["x.rs:1"])]);
-        let out = assemble(&p, &run, &a, "exec-1");
+        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         assert_eq!(out.evaluation_verdict, "FAIL");
         assert!(out.report_text.contains("красные линии"), "{}", out.report_text);
         // findings render worst-first with the complaint text.
@@ -736,7 +756,6 @@ scoring:
 
     #[test]
     fn probe_exit_semantics_match_grammar() {
-        let p = tiny_profile("true", "true");
         // 126/127 -> BLOCKED, other codes -> FAIL, listed pass_exit -> PASS.
         let out = exec_probe("exit 127", Path::new(env!("CARGO_MANIFEST_DIR")), &[0]);
         assert_eq!(out.state, ProbeState::Blocked);
@@ -754,19 +773,20 @@ scoring:
     fn assembled_report_cites_evidence_on_every_check() {
         // QA rule: every criteria entry carries concrete evidence for ANY
         // mix of check states, and the assembled doc passes the very gate
-        // the engine runs against the SEEDED @3 schema.
+        // the engine runs against the SEEDED @4 schema (which additionally
+        // requires the platform-captured workspace revision).
         let mut p = tiny_profile("true", "true");
         p.evaluations[0].checks.retain(|c| c.id != "hum/c");
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let schema = devai_store::seed::contracts()
             .into_iter()
-            .find(|(n, v, _)| *n == "quality-report" && *v == 3)
-            .expect("quality-report@3 is seeded")
+            .find(|(n, v, _)| *n == "quality-report" && *v == 4)
+            .expect("quality-report@4 is seeded")
             .2;
 
         // Rubric 1.0 with no findings: previously an evidence-less entry.
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-42");
+        let out = assemble(&p, &run, &a, "exec-42", &fixture_revision());
         let checks = out.json["evaluation"]["checks"].as_array().unwrap();
         assert!(!checks.is_empty());
         for c in checks {
@@ -782,18 +802,22 @@ scoring:
         }
         let b = checks.iter().find(|c| c["id"] == "rub/b").unwrap();
         assert!(b["evidence"][0].as_str().unwrap().contains("exec-42"), "uncited score stays traceable");
+        assert_eq!(
+            out.json["workspace_revision"], serde_json::json!(fixture_revision()),
+            "assemble must embed the platform revision verbatim"
+        );
         crate::adapters::validate_against_contract(&out.json.to_string(), Some(schema))
-            .expect("assembled report must satisfy quality-report@3");
+            .expect("assembled report must satisfy quality-report@4");
 
         // Gap-only assessment (mock-cycle shape): BLOCKED entries cite their
         // gap record, the report still satisfies the contract.
         let a2 = assessment(&[], &[("rub/b", "offline: no access to the diff")], &[]);
-        let out2 = assemble(&p, &run, &a2, "exec-43");
+        let out2 = assemble(&p, &run, &a2, "exec-43", &fixture_revision());
         for c in out2.json["evaluation"]["checks"].as_array().unwrap() {
             let ev = c["evidence"].as_array().unwrap();
             assert!(!ev.is_empty(), "state {} of {} must still cite evidence", c["state"], c["id"]);
         }
         crate::adapters::validate_against_contract(&out2.json.to_string(), Some(schema))
-            .expect("blocked-mix report must satisfy quality-report@3");
+            .expect("blocked-mix report must satisfy quality-report@4");
     }
 }

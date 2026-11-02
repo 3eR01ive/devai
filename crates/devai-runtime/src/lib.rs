@@ -10,6 +10,7 @@ mod adapters;
 mod engine;
 pub mod evaluation;
 mod prompt;
+pub mod revision;
 
 pub use adapters::{
     validate_against_contract, AdapterError, AgentRuntime, ExecOutput, ExecRequest,

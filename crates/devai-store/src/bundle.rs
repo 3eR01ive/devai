@@ -11,11 +11,13 @@
 //! events.jsonl       — immutable workflow history (append-only)
 //! artifacts.jsonl    — artifact metadata rows
 //! blobs/<sha256>     — artifact contents, content-addressed
-//! executions.jsonl
+//! executions.jsonl   — role executions incl. their recorded workspace_revision
 //! questions.jsonl
 //! decisions.jsonl
 //! roles.jsonl        — role definitions referenced by executions
 //! contracts.jsonl    — contracts referenced by artifacts/roles
+//! profiles.jsonl     — evaluation profile definitions referenced by
+//!                      recorded revisions (name@version -> raw YAML body)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -60,6 +62,10 @@ pub struct BundleCounts {
     pub decisions: usize,
     pub roles: usize,
     pub contracts: usize,
+    /// Evaluation profile definitions referenced by recorded revisions.
+    /// `default` keeps pre-v2 manifests readable.
+    #[serde(default)]
+    pub profiles: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +140,23 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
     }
     write_jsonl(out_dir, "contracts.jsonl", &contracts, &mut files)?;
 
+    // Evaluation profile definitions referenced by recorded workspace
+    // revisions: a bundle must re-resolve every `name@version` its history
+    // cites, even where local configs have since advanced.
+    let mut profiles: Vec<ProfileEntry> = Vec::new();
+    for e in &executions {
+        let Some(ident) = e.workspace_revision.as_ref().and_then(|r| r.profile.clone()) else { continue };
+        let Some((name, version)) = ident.rsplit_once('@') else { continue };
+        let Ok(version) = version.parse::<u32>() else { continue };
+        if profiles.iter().any(|p| p.name == name && p.version == version) {
+            continue;
+        }
+        if let Some((project, body)) = store.get_evaluation_profile(name, version)? {
+            profiles.push(ProfileEntry { name: name.into(), version, project, body });
+        }
+    }
+    write_jsonl(out_dir, "profiles.jsonl", &profiles, &mut files)?;
+
     let manifest = BundleManifest {
         format: BUNDLE_FORMAT.into(),
         bundle_version: 1,
@@ -149,6 +172,7 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
             decisions: decisions.len(),
             roles: roles.len(),
             contracts: contracts.len(),
+            profiles: profiles.len(),
         },
         files,
     };
@@ -170,6 +194,16 @@ pub struct ContractEntry {
     pub name: String,
     pub version: u32,
     pub schema: String,
+}
+
+/// One evaluation profile definition, carried so a recorded `name@version`
+/// stays resolvable after import on a machine whose local config advanced.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProfileEntry {
+    pub name: String,
+    pub version: u32,
+    pub project: String,
+    pub body: String,
 }
 
 fn push_role(roles: &mut Vec<RoleDefinition>, r: RoleDefinition, contract_refs: &mut Vec<(String, u32)>) {
@@ -209,7 +243,11 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
     if manifest.format != BUNDLE_FORMAT {
         return Err(StoreError::Corrupt(format!("not a devai bundle: format `{}`", manifest.format)));
     }
-    if manifest.schema_version != SCHEMA_VERSION {
+    // Forward/backward compatibility: a bundle from an OLDER store schema is
+    // acceptable (its rows just lack the nullable workspace_revision; the
+    // new table starts empty), but a bundle from a FUTURE schema may carry
+    // columns we cannot store, so it is refused rather than silently truncated.
+    if manifest.schema_version > SCHEMA_VERSION {
         return Err(StoreError::SchemaVersion { found: manifest.schema_version, expected: SCHEMA_VERSION });
     }
 
@@ -236,6 +274,9 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
     let decisions: Vec<Decision> = read_jsonl(dir, "decisions.jsonl")?;
     let roles: Vec<RoleDefinition> = read_jsonl(dir, "roles.jsonl")?;
     let contracts: Vec<ContractEntry> = read_jsonl(dir, "contracts.jsonl")?;
+    // profiles.jsonl appeared with schema v2: a pre-v2 bundle simply carries
+    // no profile definitions, and its executions carry no recorded revisions.
+    let profiles: Vec<ProfileEntry> = if dir.join("profiles.jsonl").exists() { read_jsonl(dir, "profiles.jsonl")? } else { Vec::new() };
 
     let tx = store.conn.unchecked_transaction()?;
 
@@ -305,14 +346,24 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
         )?;
     }
 
+    // Insert-only, exactly like the local seed: an existing (name, version)
+    // profile definition on this machine is never clobbered by an import.
+    for p in &profiles {
+        tx.execute(
+            "INSERT OR IGNORE INTO evaluation_profiles(name,version,project,body,created_at) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![p.name, p.version, p.project, p.body, rows::ts(&Utc::now())],
+        )?;
+    }
+
     for e in &executions {
         tx.execute(
-            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             rusqlite::params![
                 e.id.to_string(), e.task_id.to_string(), e.role_slug, e.role_version, e.agent_name,
                 e.status.as_str(), json_string(&e.inputs), e.summary, e.error,
                 rows::ts(&e.started_at), e.finished_at.as_ref().map(rows::ts),
+                e.workspace_revision.as_ref().map(|r| json_string(r)),
             ],
         )?;
     }
