@@ -1155,6 +1155,49 @@ mod supersession_tests {
         assert!(superseded_events(&store, t.id).is_empty(), "a rolled-back transaction writes no event");
     }
 
+    /// REQ-001 acceptance (AC2), verbatim: the invariant query itself —
+    /// `SELECT task_id, kind, COUNT(*) FROM artifacts WHERE status='CURRENT'
+    /// GROUP BY 1,2 HAVING COUNT(*)>1` — must be empty after an arbitrary
+    /// (interleaved, multi-kind, multi-task) publication series. The DB-level
+    /// pin (partial unique index, schema v3) makes a violation uncommittable;
+    /// this test runs the literal detection the task text names.
+    #[test]
+    fn invariant_query_finds_no_multi_current_group_after_publish_series() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let t1 = task(&store);
+        let t2 = {
+            let t = Task::new("supersession-2", "fixture", None, Utc::now());
+            store.create_task(&t).unwrap();
+            t
+        };
+        // Interleaved series: first versions AND supersessions of several
+        // kinds across two tasks, in one mixed sequence.
+        for bytes in [b"a", b"b", b"c"] {
+            publish(&store, &t1, ArtifactKind::RequirementsSpec, bytes);
+            publish(&store, &t1, ArtifactKind::ReviewReport, bytes);
+            publish(&store, &t1, ArtifactKind::ImplementationReport, bytes);
+            publish(&store, &t1, ArtifactKind::QualityReport, bytes);
+            publish(&store, &t2, ArtifactKind::QualityReport, bytes);
+            publish(&store, &t2, ArtifactKind::Patch, bytes);
+        }
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT task_id, kind, COUNT(*) FROM artifacts WHERE status='CURRENT' GROUP BY 1,2 HAVING COUNT(*)>1",
+            )
+            .unwrap();
+        let offenders: Vec<(String, String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(offenders.is_empty(), "the single-CURRENT invariant query must be empty, found {offenders:?}");
+        // History is never deleted: all 18 rows remain readable.
+        assert_eq!(store.artifacts(t1.id).unwrap().len(), 12);
+        assert_eq!(store.artifacts(t2.id).unwrap().len(), 6);
+    }
+
     /// REQ-003: the v2→v3 rung repairs the 2026-11-02 precedent shape (three
     /// CURRENT QUALITY_REPORT rows) to exactly one CURRENT per group, keeps
     /// history, and records one event per repaired group — "not silently".

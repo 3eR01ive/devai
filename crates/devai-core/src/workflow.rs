@@ -91,6 +91,12 @@ fn note(task: &Task, kind: &'static str, actor: &str, now: Timestamp, payload: s
     }
 }
 
+/// The CURRENT requirements spec, if any. Since schema v3 the store keeps
+/// at most one CURRENT row per (task_id, kind), so the filter is already
+/// single-valued for every platform caller; the `seq` tie-break stays as a
+/// defensive belt for legacy-shape slices handed to this pure function by
+/// older callers/tests (REQ-005 scoped the workaround removal to the CLI
+/// reads, which now select by status alone).
 fn current_spec(artifacts: &[Artifact]) -> Option<&Artifact> {
     artifacts
         .iter()
