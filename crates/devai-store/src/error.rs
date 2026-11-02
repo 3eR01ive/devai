@@ -23,6 +23,14 @@ pub enum StoreError {
     #[error("corrupt data: {0}")]
     Corrupt(String),
 
+    #[error(
+        "bundle import collides with the single-CURRENT invariant: task `{task_id}` kind `{kind}` \
+         already has CURRENT artifact `{existing_id}` (seq {existing_seq}), the bundle carries \
+         `{seq}` as CURRENT too — re-export the task from a migrated (v3) store instead of \
+         importing a pre-v3 bundle whose multi-CURRENT defect would silently drop a row"
+    )]
+    SingleCurrentCollision { task_id: String, kind: String, seq: u32, existing_id: String, existing_seq: u32 },
+
     #[error("config error: {0}")]
     Config(String),
 }

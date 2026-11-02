@@ -293,3 +293,50 @@ fn allowed_ops_projection() {
     assert!(ops.contains(&"reject"));
     assert!(!ops.contains(&"accept"));
 }
+
+// --- REQ-007: the store already superseded at v3 — the stale closure must
+// still fire, and no row may be flipped twice. ---
+
+#[test]
+fn revise_from_v3_shaped_snapshot_stales_dependents_without_double_flip() {
+    let mut artifacts = vec![];
+    let mut t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
+    let spec1 = artifacts[0].clone();
+
+    let plan = artifact(&t, ArtifactKind::ImplementationPlan, 1, ArtifactStatus::Current, vec![spec1.id]);
+    let report = artifact(&t, ArtifactKind::ImplementationReport, 1, ArtifactStatus::Current, vec![plan.id]);
+    artifacts.extend([plan.clone(), report.clone()]);
+    t = workflow::implementation_reported(&t, None, "impl", now()).unwrap().task; // QA
+
+    // Since REQ-001 the publication flipped v1 to SUPERSEDED in the store
+    // BEFORE this call sees the snapshot — a CURRENT-only filter would
+    // silently empty the predecessor set and kill the stale closure.
+    let mut superseded_v1 = spec1.clone();
+    superseded_v1.status = ArtifactStatus::Superseded;
+    let spec2 = artifact(&t, ArtifactKind::RequirementsSpec, 2, ArtifactStatus::Current, vec![]);
+    let artifacts: Vec<Artifact> = artifacts.iter().map(|a| if a.id == spec1.id { superseded_v1.clone() } else { a.clone() }).chain(std::iter::once(spec2.clone())).collect();
+
+    let m = workflow::requirements_published(&t, &artifacts, Some("scope change"), "u", now()).unwrap();
+    assert_eq!(m.task.state, TaskState::Review);
+    assert_eq!(m.task.requirements_seq, 2);
+
+    // No double flip: the already-SUPERSEDED predecessor is NOT re-flipped.
+    assert!(!m.artifact_status.iter().any(|(id, s)| *id == spec1.id && *s == ArtifactStatus::Superseded), "no competing supersession writes — the store already marked it");
+
+    // The stale closure still propagates over the superseded predecessor.
+    let stale: Vec<Id> = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Stale).map(|(id, _)| *id).collect();
+    assert!(stale.contains(&plan.id), "direct dependent must go STALE");
+    assert!(stale.contains(&report.id), "transitive dependent must go STALE");
+    assert!(m.events.iter().any(|e| e.kind == event_kind::ARTIFACTS_STALED), "the staling is recorded");
+}
+
+// --- QA return7 п.(г): a corrupt JSON array column is a read error. ---
+
+#[test]
+fn json_array_column_fails_loud_instead_of_reading_empty() {
+    assert_eq!(json_array::<Id>(None).unwrap(), Vec::<Id>::new());
+    assert_eq!(json_array::<Id>(Some("")).unwrap(), Vec::<Id>::new());
+    assert!(json_array::<Id>(Some("[\"1b9d6ed4-1c7c-7c3e-9d1e-cd0f0a0b0c0d\"]")).unwrap().len() == 1);
+    let err = json_array::<Id>(Some("{broken")).unwrap_err();
+    assert!(format!("{err}").contains("corrupt JSON array"), "{err}");
+}

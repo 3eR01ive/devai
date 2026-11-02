@@ -42,6 +42,13 @@ const EVIDENCE_SUBDIR: &str = "evidence";
 /// Spelled once; referenced by path, never duplicated as a literal.
 const PROBE_EVIDENCE_FILE: &str = "probes.txt";
 
+/// Upper bound of role executions in one `advance` call (QA return7 п.(г):
+/// this used to be an inline `16` literal in `Engine::new`). It is a
+/// platform run budget — the StepLimit guard stops a misconfigured role
+/// chain from spinning forever — named here once and overridable via
+/// [`Engine::with_max_steps`].
+pub const DEFAULT_MAX_STEPS: usize = 16;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error(transparent)]
@@ -147,12 +154,19 @@ impl<'a> Engine<'a> {
         let profiles = devai_store::config::load_profiles(&cfg_dir.join("evaluation")).unwrap_or_default();
         let profile = profiles.into_iter().find(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"));
         let workspace = std::env::current_dir().unwrap_or_else(|_| store.root().to_path_buf());
-        Engine { store, max_steps: 16, profile, workspace, force_reaudit: false }
+        Engine { store, max_steps: DEFAULT_MAX_STEPS, profile, workspace, force_reaudit: false }
     }
 
     /// Override the probe workspace (tests, monorepo subdirs).
     pub fn with_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
         self.workspace = workspace.into();
+        self
+    }
+
+    /// Override the per-run budget of role executions (default
+    /// [`DEFAULT_MAX_STEPS`]).
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps;
         self
     }
 
