@@ -421,7 +421,11 @@ impl Config {
     /// Compile a role file into a stored RoleDefinition: base instructions
     /// plus the common rules and, when defined, the basic-checks checklist
     /// or the evaluation profile (a profile supersedes flat criteria).
-    pub fn build_role(&self, rf: &RoleFile, now: Timestamp) -> RoleDefinition {
+    /// A malformed `contract:` ref is a LOUD config error (QA return7
+    /// п.(г)): the previous `.ok().flatten()` dropped a typo'd contract
+    /// silently — the role then ran uncontracted and the output gate no
+    /// longer validated it, turning a config mistake into a security hole.
+    pub fn build_role(&self, rf: &RoleFile, now: Timestamp) -> StoreResult<RoleDefinition> {
         let mut ins = rf.instructions.trim().to_string();
         if !self.common.rules.is_empty() {
             ins.push_str("\n\nWorkflow rules:\n");
@@ -439,7 +443,7 @@ impl Config {
             }
             ins.push_str(&format!("\nVerdict rule: {}", c.verdict_rule.trim()));
         }
-        RoleDefinition {
+        Ok(RoleDefinition {
             id: new_id(),
             slug: rf.slug.clone(),
             version: rf.version.max(1),
@@ -447,11 +451,11 @@ impl Config {
             purpose: rf.purpose.clone(),
             instructions: ins,
             tools: rf.tools.clone(),
-            input_contract: parse_contract_ref(rf.input_contract.as_deref()).ok().flatten(),
-            output_contract: parse_contract_ref(rf.output_contract.as_deref()).ok().flatten(),
+            input_contract: parse_contract_ref(rf.input_contract.as_deref())?,
+            output_contract: parse_contract_ref(rf.output_contract.as_deref())?,
             done_criteria: rf.done_criteria.clone(),
             created_at: now,
-        }
+        })
     }
 }
 
@@ -556,7 +560,7 @@ pub fn load(dir: &Path) -> StoreResult<Config> {
 pub fn seed_roles(store: &Store, cfg: &Config, now: Timestamp) -> StoreResult<usize> {
     let mut changed = 0;
     for rf in &cfg.roles {
-        let rendered = cfg.build_role(rf, now);
+        let rendered = cfg.build_role(rf, now)?;
         let latest = store.get_role(&rf.slug)?;
         let version = match &latest {
             None => rendered.version,
@@ -593,16 +597,34 @@ mod tests {
         materialize_if_absent(dir.path()).unwrap();
         let cfg = load(dir.path()).unwrap();
         let rf = cfg.roles.iter().find(|r| r.slug == "requirements-reviewer").unwrap();
-        let role = cfg.build_role(rf, Utc::now());
+        let role = cfg.build_role(rf, Utc::now()).unwrap();
         assert!(role.instructions.contains("[RV1|blocker]"), "{}", role.instructions);
         assert!(role.instructions.contains("Verdict rule:"));
         assert!(role.instructions.contains("Workflow rules:"));
         // Analyst has no criteria — only the common rules block.
         let arf = cfg.roles.iter().find(|r| r.slug == "requirements-analyst").unwrap();
-        let arole = cfg.build_role(arf, Utc::now());
+        let arole = cfg.build_role(arf, Utc::now()).unwrap();
         assert!(!arole.instructions.contains("Verdict rule:"));
         assert!(arole.instructions.contains("Workflow rules:"));
         assert_eq!(arole.output_contract.as_ref().unwrap().name, "requirements-specification");
+    }
+
+    /// QA return7 п.(г): a malformed role `contract:` must surface as a
+    /// config error at seed time — never silently degrade to `None` and
+    /// leave the role running without its output gate.
+    #[test]
+    fn malformed_contract_ref_is_a_loud_config_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        materialize_if_absent(dir.path()).unwrap();
+        let cfg = load(dir.path()).unwrap();
+        let mut rf = cfg.roles.iter().find(|r| r.slug == "requirements-analyst").unwrap().clone();
+        rf.output_contract = Some("requirements-specification@notanumber".into());
+        let err = cfg.build_role(&rf, Utc::now()).unwrap_err();
+        assert!(format!("{err}").contains("contract"), "the error names the field: {err}");
+        // A well-formed ref still compiles.
+        rf.output_contract = Some("requirements-specification@2".into());
+        let role = cfg.build_role(&rf, Utc::now()).unwrap();
+        assert_eq!(role.output_contract.unwrap().version, 2);
     }
 
     #[test]
@@ -622,7 +644,7 @@ mod tests {
         assert_eq!(p.floor_for(lb), Some(0.7));
         // Auditor instructions carry the profile-compiled rubric checklist.
         let rf = cfg.roles.iter().find(|r| r.slug == "quality-auditor").unwrap();
-        let role = cfg.build_role(rf, Utc::now());
+        let role = cfg.build_role(rf, Utc::now()).unwrap();
         assert!(role.instructions.contains("Evaluation profile `devai`"));
         assert!(role.instructions.contains("[arch/idiom-consistency]"), "{}", role.instructions);
         assert!(role.instructions.contains("anchors: 1.0"));

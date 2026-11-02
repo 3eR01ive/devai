@@ -296,3 +296,128 @@ fn profile_history_is_insert_only_and_survives_in_place_edits() {
     assert!(store.get_evaluation_profile(&name, factory_version).unwrap().is_some(), "the old identity still resolves");
     assert!(store.get_evaluation_profile(&name, factory_version + 90).unwrap().is_none(), "unknown identities do not resolve — never fabricated");
 }
+
+// ---------------------------------------------------------------------------
+// REQ-001/REQ-002/REQ-006: artifact supersession — exactly one CURRENT per
+// (task_id, kind), one batched task.artifact.superseded event per publication
+// that superseded something. Explicitly covers the four artifact kinds named
+// by the task (spec/review/implementation/quality-report); the store rule
+// itself is generic over all ArtifactKind.
+// ---------------------------------------------------------------------------
+
+fn supersession_events(store: &Store, task_id: Id) -> Vec<WorkflowEvent> {
+    store
+        .events(task_id, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "task.artifact.superseded")
+        .collect()
+}
+
+#[test]
+fn first_version_of_each_kind_supersedes_nothing() {
+    let (_d, store) = open();
+    let t = draft(&store);
+    for kind in [
+        ArtifactKind::RequirementsSpec,
+        ArtifactKind::ReviewReport,
+        ArtifactKind::ImplementationReport,
+        ArtifactKind::QualityReport,
+    ] {
+        let a = publish(&store, &t, kind, b"v1", vec![]);
+        assert_eq!(a.status, ArtifactStatus::Current);
+        let arts = store.artifacts(t.id).unwrap();
+        assert_eq!(arts.iter().filter(|x| x.kind == kind && x.status == ArtifactStatus::Current).count(), 1);
+        assert!(supersession_events(&store, t.id).is_empty(), "the first version of a kind must produce zero SUPERSEDED rows and zero events");
+    }
+}
+
+#[test]
+fn second_version_supersedes_the_first_for_each_named_kind() {
+    let (_d, store) = open();
+    let t = draft(&store);
+    for kind in [
+        ArtifactKind::RequirementsSpec,
+        ArtifactKind::ReviewReport,
+        ArtifactKind::ImplementationReport,
+        ArtifactKind::QualityReport,
+    ] {
+        let before = supersession_events(&store, t.id).len();
+        let v1 = publish(&store, &t, kind, b"one", vec![]);
+        let v2 = publish(&store, &t, kind, b"two", vec![]);
+
+        let arts = store.artifacts(t.id).unwrap();
+        let group: Vec<_> = arts.iter().filter(|a| a.kind == kind).collect();
+        assert_eq!(group.iter().filter(|a| a.status == ArtifactStatus::Current).count(), 1, "exactly one CURRENT for this kind");
+        assert_eq!(group.iter().filter(|a| a.status == ArtifactStatus::Current).next().unwrap().id, v2.id);
+        assert_eq!(store.get_artifact(&v1.id.to_string()).unwrap().status, ArtifactStatus::Superseded, "the previous version is marked, never deleted");
+        assert_eq!(v2.seq, v1.seq + 1, "per-group seq numbering is unchanged (REQ-001 constraint)");
+
+        // REQ-002: exactly one batched event naming new id, flipped ids, kind, task.
+        let evs = supersession_events(&store, t.id);
+        assert_eq!(evs.len(), before + 1, "one supersession event for this kind");
+        let ev = evs.last().unwrap();
+        assert_eq!(ev.payload[json_field::ARTIFACT_ID], v2.id.to_string());
+        assert_eq!(ev.payload[json_field::KIND], kind.as_str());
+        assert_eq!(ev.payload[json_field::TASK_ID], t.id.to_string());
+        assert_eq!(ev.payload[json_field::SUPERSEDED].as_array().unwrap().len(), 1);
+        assert_eq!(ev.payload[json_field::SUPERSEDED][0], v1.id.to_string());
+    }
+}
+
+#[test]
+fn supersession_is_per_group_and_survives_a_long_series() {
+    let (_d, store) = open();
+    let t1 = draft(&store);
+    let t2 = draft(&store);
+    // Interleave kinds and tasks: each (task, kind) group keeps its own CURRENT.
+    let spec1 = publish(&store, &t1, ArtifactKind::RequirementsSpec, b"s1", vec![]);
+    let patch1 = publish(&store, &t1, ArtifactKind::Patch, b"p1", vec![]);
+    let spec2 = publish(&store, &t1, ArtifactKind::RequirementsSpec, b"s2", vec![]);
+    let _patch2 = publish(&store, &t2, ArtifactKind::Patch, b"p2", vec![]);
+
+    assert_eq!(store.get_artifact(&spec1.id.to_string()).unwrap().status, ArtifactStatus::Superseded);
+    assert_eq!(store.get_artifact(&patch1.id.to_string()).unwrap().status, ArtifactStatus::Current, "another task's publication never touches this group");
+    assert_eq!(store.get_artifact(&spec2.id.to_string()).unwrap().status, ArtifactStatus::Current);
+
+    // REQ-001 AC2: no (task, kind) holds more than one CURRENT row.
+    for task in [t1.id, t2.id] {
+        let arts = store.artifacts(task).unwrap();
+        let mut groups: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for a in arts.iter().filter(|a| a.status == ArtifactStatus::Current) {
+            *groups.entry(a.kind.as_str()).or_default() += 1;
+        }
+        for (kind, n) in groups {
+            assert_eq!(n, 1, "task {task} kind {kind} holds {n} CURRENT rows");
+        }
+    }
+    // The publish path remains the only writer and keeps the invariant.
+    let again = store.publish_artifact(ArtifactDraft {
+        task_id: t1.id,
+        kind: ArtifactKind::RequirementsSpec,
+        name: "again".into(),
+        category: DataCategory::Artifact,
+        content: b"s3".to_vec(),
+        media_type: "text/plain".into(),
+        contract: None,
+        created_by: "user".into(),
+        execution_id: None,
+        depends_on: vec![],
+    });
+    assert!(again.is_ok(), "publication supersedes inside its own transaction");
+}
+
+#[test]
+fn supersession_events_are_batched_per_publication() {
+    let (_d, store) = open();
+    let t = draft(&store);
+    let v1 = publish(&store, &t, ArtifactKind::QualityReport, b"1", vec![]);
+    let v2 = publish(&store, &t, ArtifactKind::QualityReport, b"2", vec![]);
+    let _v3 = publish(&store, &t, ArtifactKind::QualityReport, b"3", vec![]);
+    let evs = supersession_events(&store, t.id);
+    assert_eq!(evs.len(), 2, "one event per superseding publication: versions 2 and 3");
+    assert_eq!(evs[0].payload[json_field::SUPERSEDED].as_array().unwrap()[0], v1.id.to_string());
+    assert_eq!(evs[1].payload[json_field::SUPERSEDED].as_array().unwrap()[0], v2.id.to_string());
+    // Nothing deleted: all three rows still readable, two marked.
+    assert_eq!(store.artifacts(t.id).unwrap().len(), 3);
+}

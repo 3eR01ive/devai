@@ -130,20 +130,29 @@ pub fn requirements_published(
 
     let is_revise = task.requirements_seq > 0;
     let mut m = transition(task, TaskState::Review, if is_revise { event_kind::REQUIREMENTS_REVISED } else { event_kind::REQUIREMENTS_PUBLISHED }, actor, now, json!({
-        "requirements_seq": spec.seq,
-        "spec_id": spec.id.to_string(),
-        "reason": reason,
+        (json_field::REQUIREMENTS_SEQ): spec.seq,
+        (json_field::SPEC_ID): spec.id.to_string(),
+        (json_field::REASON): reason,
     }));
     m.task.requirements_seq = spec.seq;
 
-    // Supersede all older specs.
-    let superseded: Vec<Id> = artifacts
+    // The predecessor specs this publication replaces. The set is keyed on
+    // (kind, older seq), NOT on CURRENT: since the store-level generic
+    // supersession (REQ-001) the publication already flipped prior CURRENT
+    // rows to SUPERSEDED inside its own transaction before this transition
+    // ever sees the snapshot, and a CURRENT-only filter would resolve to an
+    // empty set — silently killing the stale-closure propagation below
+    // (REQ-007). Only rows not yet marked SUPERSEDED get a status flip in
+    // this mutation, so the store event log stays the single source of
+    // supersession events and no already-flipped row is written twice
+    // (REQ-007 acceptance: no double flip, no competing sources).
+    let predecessors: Vec<&Artifact> = artifacts
         .iter()
-        .filter(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current && a.id != spec.id)
-        .map(|a| a.id)
+        .filter(|a| a.kind == ArtifactKind::RequirementsSpec && a.id != spec.id && a.seq < spec.seq)
         .collect();
-    for id in &superseded {
-        m.artifact_status.push((*id, ArtifactStatus::Superseded));
+    let superseded: Vec<Id> = predecessors.iter().map(|a| a.id).collect();
+    for a in predecessors.iter().filter(|a| a.status != ArtifactStatus::Superseded) {
+        m.artifact_status.push((a.id, ArtifactStatus::Superseded));
     }
 
     // Downstream results of the superseded specification become STALE.
@@ -154,7 +163,7 @@ pub fn requirements_published(
             m.events.push(EventDraft {
                 kind: event_kind::ARTIFACTS_STALED,
                 actor: actor.to_string(),
-                payload: json!({ "staled": staled.iter().map(|i| i.to_string()).collect::<Vec<_>>(), "cause": "requirements revision" }),
+                payload: json!({ (json_field::STALED): staled.iter().map(|i| i.to_string()).collect::<Vec<_>>(), (json_field::CAUSE): "requirements revision" }),
             });
         }
     }

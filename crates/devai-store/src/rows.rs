@@ -54,8 +54,11 @@ pub fn unwrap_row<T>(res: Result<Option<T>, rusqlite::Error>) -> StoreResult<Opt
     }
 }
 
-fn arr<T: DeserializeOwned>(s: Option<String>) -> Vec<T> {
-    json_array(s.as_deref())
+/// A JSON array column read FAIL-LOUD (QA return7 п.(г)): NULL/empty is
+/// `[]`, but a non-empty corrupt value is an error — never a silently
+/// emptied `depends_on`/`tools`/`repos` list.
+fn arr<T: DeserializeOwned>(s: Option<String>) -> StoreResult<Vec<T>> {
+    json_array(s.as_deref()).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
 pub fn enum_col<T: Copy>(ty: &'static str, s: String, f: impl Fn(&str) -> Result<T, devai_core::error::CoreError>) -> StoreResult<T> {
@@ -86,7 +89,7 @@ pub fn project_from_row(r: &Row) -> StoreResult<Project> {
         id: parse_id(get(r, 0)?)?,
         name: get(r, 1)?,
         description: get(r, 2)?,
-        repos: arr(get(r, 3)?),
+        repos: arr(get(r, 3)?)?,
         created_at: parse_ts(get(r, 4)?)?,
         updated_at: parse_ts(get(r, 5)?)?,
     })
@@ -112,7 +115,7 @@ pub fn artifact_from_row(r: &Row) -> StoreResult<Artifact> {
         },
         created_by: get(r, 12)?,
         execution_id: opt_id(get(r, 13)?)?,
-        depends_on: arr(get(r, 14)?),
+        depends_on: arr(get(r, 14)?)?,
         created_at: parse_ts(get(r, 15)?)?,
     })
 }
@@ -143,7 +146,7 @@ pub fn role_from_row(r: &Row) -> StoreResult<RoleDefinition> {
         name: get(r, 3)?,
         purpose: get(r, 4)?,
         instructions: get(r, 5)?,
-        tools: arr(get(r, 6)?),
+        tools: arr(get(r, 6)?)?,
         input_contract: c(get(r, 7)?)?,
         output_contract: c(get(r, 8)?)?,
         done_criteria: get(r, 9)?,
@@ -171,7 +174,7 @@ pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
         role_version: get::<i64>(r, 3)? as u32,
         agent_name: get(r, 4)?,
         status: enum_col("ExecutionStatus", get(r, 5)?, ExecutionStatus::parse)?,
-        inputs: arr(get(r, 6)?),
+        inputs: arr(get(r, 6)?)?,
         summary: get(r, 7)?,
         error: get(r, 8)?,
         started_at: parse_ts(get(r, 9)?)?,
@@ -192,7 +195,7 @@ pub fn decision_from_row(r: &Row) -> StoreResult<Decision> {
         verdict: enum_col("Verdict", get(r, 3)?, Verdict::parse)?,
         actor: get(r, 4)?,
         rationale: get(r, 5)?,
-        refs: arr(get(r, 6)?),
+        refs: arr(get(r, 6)?)?,
         created_at: parse_ts(get(r, 7)?)?,
     })
 }
@@ -204,7 +207,7 @@ pub fn question_from_row(r: &Row) -> StoreResult<Question> {
         execution_id: opt_id(get(r, 2)?)?,
         text: get(r, 3)?,
         context: get(r, 4)?,
-        options: arr(get(r, 5)?),
+        options: arr(get(r, 5)?)?,
         blocking: get::<i64>(r, 6)? != 0,
         status: enum_col("QuestionStatus", get(r, 7)?, QuestionStatus::parse)?,
         answer: get(r, 8)?,

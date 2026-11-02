@@ -1,10 +1,13 @@
--- Devai local store schema (v2).
+-- Devai local store schema (v3).
 -- SQLite is the local system of record; everything is domain data so a task
 -- can be restored after a restart and exported for portability.
 -- v2 adds workspace provenance: role_executions.workspace_revision and the
 -- insert-only evaluation_profiles history. Existing v1 databases are
 -- migrated forward by migrations/002_workspace_revision.sql — additive only,
 -- no row is rewritten or deleted.
+-- v3 adds the artifact supersession invariant: exactly one CURRENT row per
+-- (task_id, kind), pinned by the partial unique index below. Existing v2
+-- databases are repaired by migrations/003_artifact_supersession.sql.
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -47,6 +50,13 @@ CREATE TABLE artifacts(
   created_at       TEXT NOT NULL
 );
 CREATE INDEX artifacts_task ON artifacts(task_id);
+-- Exactly one CURRENT row per (task_id, kind): the supersession invariant
+-- pinned at the database level (v3; same index the v2→v3 rung builds).
+-- Publication flips prior CURRENT rows inside its transaction BEFORE the
+-- INSERT, so a second CURRENT row for one group cannot be committed.
+CREATE UNIQUE INDEX artifacts_single_current
+  ON artifacts(task_id, kind)
+  WHERE status = 'CURRENT';
 
 CREATE TABLE contracts(
   name       TEXT NOT NULL,

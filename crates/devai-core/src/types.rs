@@ -21,11 +21,16 @@ pub fn json_parse<T: for<'de> Deserialize<'de>>(s: &str) -> Result<T, serde_json
     serde_json::from_str(s)
 }
 
-/// Parses a JSON array column, tolerating NULL/empty as `[]`.
-pub fn json_array<T: for<'de> Deserialize<'de>>(s: Option<&str>) -> Vec<T> {
+/// Parses a JSON array column, tolerating NULL/empty as `[]`. A NON-empty
+/// column that fails to parse is a loud error, never a silent empty list
+/// (QA return7 п.(г): a corrupt `depends_on` read as `[]` would silently
+/// empty the stale-closure graph — the dependency data itself is intact in
+/// the row, so dropping it on read is data loss by projection).
+pub fn json_array<T: for<'de> Deserialize<'de>>(s: Option<&str>) -> CoreResult<Vec<T>> {
     match s {
-        None | Some("") => Vec::new(),
-        Some(v) => serde_json::from_str(v).unwrap_or_default(),
+        None | Some("") => Ok(Vec::new()),
+        Some(v) => serde_json::from_str(v)
+            .map_err(|e| CoreError::guard(format!("corrupt JSON array column `{v}`: {e}"))),
     }
 }
 
@@ -500,6 +505,14 @@ pub mod event_kind {
     pub const EXECUTION_FAILED: &str = "execution.failed";
     pub const EXECUTION_CANCELLED: &str = "execution.cancelled";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
+    /// Publishing a new artifact version supersedes the previous CURRENT
+    /// row(s) of the same (task_id, kind) group: the status column flips,
+    /// nothing is deleted. One batched event per publication that superseded
+    /// at least one artifact — payload names the new version, the list of
+    /// flipped ids, the kind and the task (REQ-001/REQ-002; the literal is
+    /// exactly the one the task text names, design source
+    /// wip/pre-t2-merge@5db7fb5 types.rs:490).
+    pub const ARTIFACT_SUPERSEDED: &str = "task.artifact.superseded";
     pub const EXPORTED: &str = "task.exported";
     pub const IMPORTED: &str = "task.imported";
     /// QA freshness gate: the recomputed workspace revision equals the one
@@ -516,4 +529,36 @@ pub mod event_kind {
     /// task's own branch (REQ-WT-06). Platform repository facts, not judgment.
     pub const WORKTREE_PREPARED: &str = "worktree.prepared";
     pub const WORKTREE_COMMITTED: &str = "worktree.committed";
+}
+
+/// The single vocabulary of JSON field names the platform WRITES into
+/// persisted structures (workflow event payloads, migration records) and
+/// READS back — the same discipline as `event_kind`, so a producer and a
+/// consumer of one field can never drift into two different literals
+/// (QA return7 п.(г): supersession payloads must not carry raw string keys).
+/// The wire strings are frozen history: changing a value here changes the
+/// interpretation of already-stored records, not just code. New payload
+/// fields written by the platform MUST be added here, not inlined.
+pub mod json_field {
+    // Artifact lifecycle event payloads (store `publish_artifact`,
+    // supersession, migration backfill).
+    pub const ARTIFACT_ID: &str = "artifact_id";
+    pub const CURRENT_ARTIFACT_ID: &str = "current_artifact_id";
+    pub const SUPERSEDED: &str = "superseded";
+    pub const TASK_ID: &str = "task_id";
+    pub const KIND: &str = "kind";
+    pub const NAME: &str = "name";
+    pub const SEQ: &str = "seq";
+    pub const SHA256: &str = "sha256";
+    pub const SIZE: &str = "size";
+    pub const CONTRACT: &str = "contract";
+    // Workflow transition payloads read back by displays and delivery.
+    pub const REQUIREMENTS_SEQ: &str = "requirements_seq";
+    pub const SPEC_ID: &str = "spec_id";
+    pub const REASON: &str = "reason";
+    pub const STALED: &str = "staled";
+    pub const CAUSE: &str = "cause";
+    // Migration (one-time repair) records.
+    pub const BACKFILL: &str = "backfill";
+    pub const SCRIPT_PATH: &str = "script";
 }

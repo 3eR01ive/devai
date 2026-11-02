@@ -282,10 +282,12 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
             // The freshness gate stopped the run: no auditor execution was
             // started, no artifact was published. The human decides.
             let arts = ctx.store.artifacts(report.task_id)?;
+            // REQ-005: selection by status alone — the store guarantees at
+            // most one CURRENT per (task_id, kind) (schema v3 partial
+            // unique index); no seq tie-break workaround here anymore.
             if let Some(a) = arts
                 .iter()
-                .filter(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
-                .max_by_key(|x| x.seq)
+                .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
             {
                 println!(
                     "⏸ quality report v{} ({}) is FRESH — it is bound to exactly the recomputed workspace revision; the auditor was NOT re-run",
@@ -393,10 +395,14 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
 fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     let t = ctx.store.resolve_task(id)?;
     let arts = ctx.store.artifacts(t.id)?;
+    // REQ-005: the CURRENT quality report is found by status alone — the
+    // domain keeps at most one CURRENT per (task_id, kind), so there is no
+    // seq tie-break to do here (the old highest-seq selection masked
+    // multi-CURRENT corruption at the UI instead of letting it surface as
+    // a domain bug).
     let a = arts
         .iter()
-        .filter(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
-        .max_by_key(|x| x.seq)
+        .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
         .with_context(|| format!("no quality report for {} yet — QA has not run", short(&t.id)))?;
     let blob = ctx.store.read_blob(&a.sha256)?;
     let contract = a
@@ -438,10 +444,10 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
 
 fn latest_quality_report_text(store: &devai_store::Store, task_id: devai_core::types::Id) -> Option<String> {
     let arts = store.artifacts(task_id).ok()?;
+    // REQ-005: status-only selection (single CURRENT pinned at v3).
     let a = arts
         .iter()
-        .filter(|a| a.kind == devai_core::types::ArtifactKind::QualityReport && a.status == devai_core::types::ArtifactStatus::Current)
-        .max_by_key(|a| a.seq)?;
+        .find(|a| a.kind == devai_core::types::ArtifactKind::QualityReport && a.status == devai_core::types::ArtifactStatus::Current)?;
     let blob = store.read_blob(&a.sha256).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&blob).ok()?;
     v.get("report_text")
@@ -917,11 +923,11 @@ fn is_downstream_of_spec(kind: ArtifactKind) -> bool {
     )
 }
 
-/// The CURRENT requirements spec with the highest seq, if any.
+/// The CURRENT requirements spec, if any — by status alone (REQ-005: the
+/// store pins at most one CURRENT per (task_id, kind) since schema v3).
 fn current_spec_id(arts: &[Artifact]) -> Option<Id> {
     arts.iter()
-        .filter(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current)
-        .max_by_key(|a| a.seq)
+        .find(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current)
         .map(|a| a.id)
 }
 

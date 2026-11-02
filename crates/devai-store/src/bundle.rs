@@ -311,8 +311,37 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
             return Err(StoreError::Corrupt(format!("blob {} failed verification on import", a.sha256)));
         }
         store.store_blob(&a.sha256, &content)?;
+        // No `INSERT OR IGNORE` on this table: since v3 a second CURRENT
+        // row for one (task_id, kind) is rejected by the single-CURRENT
+        // partial unique index, and OR IGNORE would let it swallow that
+        // collision silently — the losing row would vanish without a trace,
+        // exactly the defect class this repair removes. Detect the
+        // collision explicitly instead (earlier bundle rows AND this
+        // store's own CURRENT row are visible from inside the tx) and fail
+        // loudly with task/kind/seq: the whole import transaction rolls
+        // back, leaving no partial state. A pre-v3 bundle carrying the
+        // multi-CURRENT defect must be re-exported from the migrated store.
+        // Design source: wip/pre-t2-merge@5db7fb5 bundle.rs.
+        if a.status == ArtifactStatus::Current {
+            let clash: Option<(String, u32)> = tx
+                .query_row(
+                    "SELECT id, seq FROM artifacts WHERE task_id=?1 AND kind=?2 AND status='CURRENT'",
+                    rusqlite::params![a.task_id.to_string(), a.kind.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_id, existing_seq)) = clash {
+                return Err(StoreError::SingleCurrentCollision {
+                    task_id: a.task_id.to_string(),
+                    kind: a.kind.as_str().to_string(),
+                    seq: a.seq,
+                    existing_id,
+                    existing_seq,
+                });
+            }
+        }
         tx.execute(
-            "INSERT OR IGNORE INTO artifacts(id,task_id,kind,name,seq,category,status,sha256,size,media_type,contract_name,contract_version,created_by,execution_id,depends_on,created_at)
+            "INSERT INTO artifacts(id,task_id,kind,name,seq,category,status,sha256,size,media_type,contract_name,contract_version,created_by,execution_id,depends_on,created_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             rusqlite::params![
                 a.id.to_string(), a.task_id.to_string(), a.kind.as_str(), a.name, a.seq,
