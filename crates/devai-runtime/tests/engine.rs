@@ -271,6 +271,48 @@ fn full_cycle_through_both_human_gates() {
 }
 
 #[test]
+fn approved_decisions_reach_every_post_approve_role() {
+    // Ratified OQ-RAT-1 (decision of 03.11): stored human decisions reach
+    // EVERY role after the approval gate, not only the auditor — an
+    // implementer who never sees the ratified OQ resolution re-implements
+    // the rejected alternative (precedent 01a1a2cb-cbba itself). The mock
+    // echoes its input-section labels (the OQ-F ratified observation
+    // surface: echo, not prompt persistence), so this asserts the ACTUAL
+    // delivery, end-to-end through the real engine.
+    let (_d, store) = store();
+    let t = Task::new("Delivery", "Ratified decisions must reach the implementer", None, Utc::now());
+    store.create_task(&t).unwrap();
+    let engine = mk_engine(&store);
+    engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    approved(&store, &t.id.to_string());
+    // The human's ratified decision, stored right after approval — exactly
+    // what the CLI `task approve --rationale` persists (REQ-QAD-001 path).
+    store
+        .record_decision(&Decision {
+            id: new_id(),
+            task_id: t.id,
+            kind: decision_kind::REQUIREMENTS_APPROVAL.into(),
+            verdict: Verdict::Approved,
+            actor: "tester".into(),
+            rationale: Some("OQ1=X ratified".into()),
+            refs: vec![],
+            created_at: Utc::now(),
+        })
+        .unwrap();
+    engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+
+    let arts = store.artifacts(t.id).unwrap();
+    let impl_art = arts.iter().find(|a| a.kind == ArtifactKind::ImplementationReport).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&store.read_blob(&impl_art.sha256).unwrap()).unwrap();
+    let notes = body["notes"].as_str().unwrap_or_default();
+    assert!(notes.contains("APPROVED_DECISIONS"), "the implementer's prompt must carry the decisions section, echoed notes: {notes}");
+    let qa_art = arts.iter().find(|a| a.kind == ArtifactKind::QualityReport).unwrap();
+    let qa_body = store.read_blob(&qa_art.sha256).unwrap();
+    let qa: serde_json::Value = serde_json::from_slice(&qa_body).unwrap();
+    assert_eq!(qa["verdict"], "ESCALATE", "auditor still runs after the shared-section change");
+}
+
+#[test]
 fn rejection_loops_back_through_a_new_spec_version() {
     let (_d, store) = store();
     let t = Task::new("Loop", "Reviewer rejects once, second spec passes", None, Utc::now());
