@@ -1,3 +1,8 @@
+# Иерархия авторитетов (постановка 01a1a2cb, REQ-RAT-001/002/005) закреплена
+# в instructions ниже. Итоговый набор ролей, несущих правило, и осознанное
+# НЕвключение ролей до approve-гейта — зафиксированы в комментарии v10
+# config/evaluation/quality.yaml; симметрия config/criteria/review.yaml —
+# отложена по OQ-RAT-5 до явного решения человека.
 slug: implementation-agent
 name: Implementation Agent
 version: 2

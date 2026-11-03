@@ -41,6 +41,18 @@
 # альтернативы OQ и не-ратифицированное отступление — finding. Семантика и веса
 # проверок не менялись (прецедент пересуда ратифицированных OQ-решений —
 # 01a1a14e-2c07).
+#
+# Область действия правила (REQ-RAT-005, итоговый набор ролей зафиксирован
+# здесь и зеркально в config/roles/implementation-agent.yaml): приоритет
+# ратифицированных решений несут роли, действующие ПОСЛЕ approve-гейта и
+# читающие спеку после ратификации — implementation-agent (instructions) и
+# quality-auditor (этот критерий corr/spec-fidelity + секция
+# APPROVED_DECISIONS его промпта). Роли до approve (requirements-analyst;
+# requirements-reviewer первичной ревью-петли) правило НЕ получают: на их
+# этапе ратифицированных решений ещё нет. Их включение и симметричное
+# словарное правило в config/criteria/review.yaml (RV1–RV5) — отложены по
+# OQ-RAT-5 до явного решения человека; в этой таске не добавлены осознанно,
+# не молча.
 version: 10
 project: devai
 applies_to_roles: [quality-auditor]
