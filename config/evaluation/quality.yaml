@@ -35,7 +35,7 @@
 # не if-цепочка по номеру шага. Вес (0.04) уступили arch/idiom-consistency и
 # log/completeness — сумма прежняя, иерархия смыслов та же.
 
-version: 8
+version: 9
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -63,6 +63,12 @@ error_types:
     severity: minor
   reliability/panic-path:
     desc: Паника достижима из library-кода на валидных, но редких данных.
+    severity: major
+  correctness/spec-deviation:
+    desc: Реализация отклоняется от утверждённой спеки — включая зафиксированные
+      в approve-rationale решения открытых вопросов (выбранная поверхность CLI,
+      форматы, границы объёма). Отступление без документированного человеческого
+      решения = нарушение, даже если функционально "то же самое".
     severity: major
   reliability/error-wash:
     desc: Потеря контекста ошибки (глотание, stringly-typed, одинаковый текст на разных причинах).
@@ -306,6 +312,27 @@ evaluations:
         evidence: required
         reviewer: either
 
+      - id: corr/spec-fidelity
+        statement: >
+          Реализация соответствует утверждённой спеке ВКЛЮЧИТЕЛЯ: текущий
+          quality-report@4 задачи (approve-rationale с решениями открытых
+          вопросов входит в принятую спеку), и каждая AC requirements-spec.
+          Реализованная поверхность, форматы и границы объёма сверяются с
+          зафиксированными решениями; функциональный эквивалент при другом
+          имени/форме/месте — отклонение. Аудитор обязан процитировать
+          требование и показать, где реализация ему соответствует; несоответствие
+          без явного человеческой ратификации — finding, не «то же самое».
+        detects: [correctness/spec-deviation]
+        verify: rubric
+        anchors:
+          "1.0": "каждое решение OQ и AC отражено в коде 1:1 (или отклонение ратифицировано человеком в явном виде)"
+          "0.7": "косметическое отклонение вне решений OQ и вне AC (например формулировка help)"
+          "0.4": "реализована отвергнутая альтернатива OQ/локальное отступление от AC, но границы и семантика целы"
+          "0.1": "систематические расхождения с принятой спекой"
+          "0.0": "требование спеки проигнорировано"
+        evidence: required
+        reviewer: either
+
   - id: ux
     title: CLI-контракт и пользовательский опыт
     applies_to:
@@ -380,10 +407,11 @@ scoring:
     # v6: proc/diff-coverage УДАЛЁН по требованию пользователя (2026-11-03):
     # cargo llvm-cov запускает массовый перекомпилятор, который вешает машину
     # через OOM. Освободившийся 0.08 распределён по тяжёлым проверкам.
-    corr/transitions: 0.13
+    corr/transitions: 0.10
     corr/data-immutability: 0.10
     corr/concurrency: 0.08
-    arch/layer-boundaries: 0.12
+    corr/spec-fidelity: 0.05
+    arch/layer-boundaries: 0.11
     arch/idiom-consistency: 0.04
     arch/sequence-as-data: 0.04
     arch/registry-in-data: 0.04
@@ -392,5 +420,5 @@ scoring:
     rel/no-panic: 0.09
     rel/error-context: 0.06
     ux/json-stability: 0.06
-    log/dead-ends: 0.11
+    log/dead-ends: 0.10
     log/completeness: 0.04
