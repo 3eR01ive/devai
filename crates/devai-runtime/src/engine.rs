@@ -464,22 +464,19 @@ impl<'a> Engine<'a> {
             .collect::<RuntimeResult<_>>()?;
 
         let is_qa = kind == ArtifactKind::QualityReport;
-        // REQ-QAD-001/002: the auditor judging spec-fidelity must see the
-        // human's recorded decisions — the approve rationale is where the
-        // open questions got ratified (precedent 01a1a0b5-0fcf: a rejected
-        // OQ alternative was implemented and scored 1.0 because nothing in
-        // the prompt named the human's ruling). Stored rows verbatim via
-        // `list_decisions`; EVERY decision of the task is included (OQ-A —
-        // the verdict field tells the auditor which was an approval), and
-        // the section sits between the implementation report and the
-        // mechanical evidence so the section order is fixed and
-        // deterministic (REQ-QAD-002).
-        if is_qa {
-            inputs.push((
-                "APPROVED_DECISIONS (all stored human decisions for this task, reproduced verbatim; approve rationales are the ratified resolutions of the spec's open questions)".to_string(),
-                decisions_prompt_text(&self.store.list_decisions(task.id)?),
-            ));
-        }
+        // REQ-QAD-001/002 + ratified OQ-RAT-1 (decision of 03.11, actor guerrero):
+        // the human's recorded decisions reach EVERY post-approve role, not only
+        // the auditor — an implementer who never sees the ratified OQ resolution
+        // re-implements the rejected alternative (precedents 01a1a0b5-0fcf,
+        // 01a1a2cb-cbba). Stored rows verbatim via `list_decisions`; every
+        // decision of the task is included (OQ-A — the verdict field tells the
+        // reader which was an approval). Section order stays fixed and
+        // deterministic: spec → impl-report → decisions → mechanical evidence
+        // (REQ-QAD-002).
+        inputs.push((
+            "APPROVED_DECISIONS (all stored human decisions for this task, reproduced verbatim; approve rationales are the ratified resolutions of the spec's open questions)".to_string(),
+            decisions_prompt_text(&self.store.list_decisions(task.id)?),
+        ));
         // QA stage: the platform runs the profile's probes FIRST, so the
         // auditor sees real mechanical evidence and cannot invent any.
         let eval_run = if is_qa {

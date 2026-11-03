@@ -160,7 +160,11 @@ impl AgentRuntime {
                 "branch": "devai/mock",
                 "patch": "mock://no-op",
                 "test_results": { "status": "PASSED", "detail": "mock runtime executed no real tests" },
-                "notes": format!("mock implementation of {}", one_line(&req.title)),
+                // Input-section labels, echoed deterministically: this is the
+                // ratified observation surface (OQ-F precedent) for "the role
+                // actually RECEIVES the stored decisions section" — ratified
+                // OQ-RAT-1 dogfood; the labels, never their contents.
+                "notes": format!("mock implementation of {}; input sections: [{}]", one_line(&req.title), req.inputs.iter().map(|(l, _)| l.split(" (").next().unwrap_or(l)).collect::<Vec<_>>().join(", ")),
             }),
             "quality-report" | "evaluation-assessment" => {
                 // The QA agent answers with an evaluation-assessment; the
