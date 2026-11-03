@@ -5,6 +5,7 @@
 //! through `devai-store`. No workflow logic lives here.
 
 mod commands;
+mod out;
 
 use clap::{Parser, Subcommand};
 use commands::Ctx;
@@ -105,6 +106,12 @@ enum TaskCmd {
     },
     /// Current state + the operations the platform permits next
     Status {
+        id: String,
+    },
+    /// Pipeline position of the task, allowed operations and a snapshot of
+    /// running executions — state at a glance without copy-pasting ids
+    /// (with --json: the same snapshot for machines).
+    Progress {
         id: String,
     },
     /// Show the CURRENT quality report — the rendering a human signs at the
@@ -359,6 +366,24 @@ enum ExecCmd {
 }
 
 fn main() {
+    // REQ-PIPE-01 backstop: all CLI output goes through `out`, which already
+    // dies quietly on a closed reader. This hook covers stdout writes outside
+    // that channel (clap's built-in help/version printing): a panic caused by
+    // EPIPE while printing to stdout exits silently instead of showing panic
+    // text. Any other panic keeps the standard panic report on stderr.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let msg: &str = match payload.downcast_ref::<String>() {
+            Some(s) => s,
+            None => payload.downcast_ref::<&str>().copied().unwrap_or_default(),
+        };
+        if msg.contains("failed printing to stdout") && msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        eprintln!("devai: panic: {info}");
+        std::process::exit(101);
+    }));
+
     let cli = Cli::parse();
     let ctx = match Ctx::new(cli.home.as_deref(), cli.actor.clone()) {
         Ok(c) => c,
