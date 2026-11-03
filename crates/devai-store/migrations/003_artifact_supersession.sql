@@ -12,10 +12,13 @@
 -- changes — no row is deleted, no blob is rewritten (history is never
 -- deleted, only marked).
 --
--- The predicate below must stay byte-identical to MULTI_CURRENT_PREDICATE
+-- The predicate below must stay byte-identical to MULTI_CURRENT_LOSER_PREDICATE
 -- in src/lib.rs: the detection SELECT (run first, inside the same rung
 -- transaction) cites exactly the rows this UPDATE flips, so the repair is
--- recorded in the event log, not performed silently. The deterministic
+-- recorded in the event log, not performed silently. This script is selected,
+-- ordered and baked into the binary by migrations/manifest.json + build.rs
+-- (REQ-004, registry-in-data); its rung apply tag `supersession_backfill`
+-- resolves the observe-before-mutate handler in src/lib.rs. The deterministic
 -- total order makes the repair unconditional — a seeded multi-CURRENT
 -- group always converges to exactly one CURRENT (unlike the earlier WIP
 -- draft 5db7fb5, which aborted on an equal-seq tie).
