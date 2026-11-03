@@ -166,6 +166,93 @@ impl Task {
 }
 
 // ---------------------------------------------------------------------------
+// Task dependency graph (REQ-01/02/07)
+// ---------------------------------------------------------------------------
+
+/// The vocabulary of typed task-to-task dependencies. Required minimum per
+/// the approved spec (REQ-02): `parent` ("породила" — why this task exists,
+/// genealogy only) and `blocks` ("не может продолжиться без той" — resume
+/// and human acceptance are refused while the edge is open). `parent` is
+/// one kind of the same n-ary relation, not a separate mechanism.
+///
+/// Stored as TEXT (`kind` column of `task_dependencies`): adding a new kind
+/// is a new vocabulary entry in this enum — no stored row is ever rewritten
+/// (REQ-02 AC2). RATIFIED DECISION OQ3 (human approval of the spec):
+/// `parent` is purely genealogical and NEVER gates continuation — only an
+/// explicit `blocks` edge does, enforced in `workflow::open_blockers`.
+/// RATIFIED DECISION OQ4: each kind forms a DAG on its own (cycles are
+/// rejected at link time per kind); a MIXED cycle — child `blocks` its
+/// parent while the parent `parent`-links the child, the standard
+/// backfill/gate case — is legal and must stay expressible.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DependencyKind {
+    Parent,
+    Blocks,
+}
+
+str_enum!(DependencyKind,
+    Parent => "parent",
+    Blocks => "blocks",
+);
+
+/// One stored dependency edge (table `task_dependencies`) together with the
+/// read-time projection of BOTH endpoint tasks' state and title. The edge is
+/// the stored fact; the states come from the same query, they are not stored
+/// on the edge (REQ-04 AC1: the whole graph — edges and task states — is
+/// retrieved from the store in one query).
+/// This type describes the LIVE graph: an edge is immutable (ratified OQ7),
+/// removal marks the row SUPERSEDED and the row then leaves every ACTIVE
+/// read, so instances of this type always carry a still-active relation;
+/// the superseded history stays in the table and in the event log.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TaskDependency {
+    pub id: Id,
+    /// The dependent task — the one that "exists because of" / "cannot
+    /// continue without".
+    pub task_id: Id,
+    pub task_state: TaskState,
+    pub task_title: String,
+    /// The depended-on task (parent / blocker).
+    pub depends_on_id: Id,
+    pub depends_on_state: TaskState,
+    pub depends_on_title: String,
+    pub kind: DependencyKind,
+    /// Author of the edge — attributed like `decisions.actor` (REQ-07 AC3).
+    pub actor: String,
+    pub created_at: Timestamp,
+}
+
+/// One task node of the stored dependency graph with its outgoing edges:
+/// the planning-level view (REQ-05) and the roadmap input (REQ-04) — node =
+/// task + state, edge = typed dependency. A task with no stored edges is a
+/// node with an empty `dependencies` set, never a corrupt row (REQ-08 AC2):
+/// rows written before schema v4 simply have no dependency records.
+/// An "epic" is not a separate entity: per the RATIFIED DECISION OQ8 an
+/// epic is a task VERTEX IN THE SAME GRAPH — no outgoing ACTIVE `parent`
+/// edge and at least one incoming one (a root of a derivation tree) — named
+/// by the dependency store read `Store::epic_heads`, no new table (REQ-06).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DependencyNode {
+    pub task: Task,
+    pub dependencies: Vec<TaskDependency>,
+}
+
+/// READ VIEW of the epic registry — explicitly NOT a stored entity (REQ-06
+/// AC1: no epic table or column was introduced). RATIFIED DECISION OQ8: an
+/// epic is a task vertex in the same dependency graph with NO outgoing
+/// ACTIVE `parent` edge and AT LEAST ONE incoming one; the store derives
+/// this view with one query over `task_dependencies` + `tasks`, the very
+/// same relation any other dependency read uses (REQ-06 AC2).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EpicVertex {
+    pub task: Task,
+    /// Direct derived children — tasks carrying an ACTIVE `parent` edge
+    /// into this vertex.
+    pub derived_children: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Artifacts
 // ---------------------------------------------------------------------------
 
@@ -499,6 +586,7 @@ pub mod decision_kind {
     /// auditor scoring spec-fidelity never saw the rejected alternative).
     /// Recorded by the human-invoked CLI `task approve` only.
     pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
+<<<<<<< HEAD
     /// The empty-rework gate (REQ-RG-03): the operator's explicit ratification
     /// that a QA return needed NO new changes — `refs` carry the pair
     /// (previous report id, current report id) of exactly one rework cycle, so
@@ -508,10 +596,29 @@ pub mod decision_kind {
     /// rode into QA on an unchanged commit — that passage is now gated on this
     /// stored decision).
     pub const REWORK_NOOP_RATIFIED: &str = "rework_noop_ratified";
+    /// The human escape of the dependency gate (RATIFIED DECISION OQ2):
+    /// resume/acceptance refusal is unconditional, BUT an operator may
+    /// explicitly ratify "continue despite the open blockers" — recorded as
+    /// a decision row with this kind, `refs` = the full task ids of the
+    /// blockers it covers, rationale = the operator's stated reason. The
+    /// decision is what releases the gate (`workflow::override_covers`),
+    /// never an implicit platform-side assumption. Recorded ONLY by the
+    /// human-invoked CLI `task override`.
+    pub const DEPENDENCY_OVERRIDE: &str = "dependency_override";
 }
 
 pub mod event_kind {
     pub const TASK_CREATED: &str = "task.created";
+    /// A typed task-to-task dependency edge was registered (REQ-07): at
+    /// derivation time or retroactively, attributed and timed.
+    pub const TASK_DEPENDENCY_LINKED: &str = "task.dependency.linked";
+    /// An edge was SUPERSEDED — the approved removal semantics (OQ7): the
+    /// row stays, its ACTIVE status flips, history remains complete.
+    pub const TASK_DEPENDENCY_UNLINKED: &str = "task.dependency.unlinked";
+    /// A human ratified continuing DESPITE open blocking dependencies
+    /// (approved OQ2 human-escape): recorded with the same decisions
+    /// mechanism as every other human gate act.
+    pub const TASK_DEPENDENCY_OVERRIDDEN: &str = "task.dependency.overridden";
     pub const WORKFLOW_STARTED: &str = "workflow.started";
     pub const STATE_CHANGED: &str = "workflow.state_changed";
     pub const REQUIREMENTS_PUBLISHED: &str = "requirements.published";
@@ -618,4 +725,8 @@ pub mod json_field {
     // Migration (one-time repair) records.
     pub const BACKFILL: &str = "backfill";
     pub const SCRIPT_PATH: &str = "script";
+    // Task dependency graph (store `link_task_dependency`, REQ-07).
+    pub const DEPENDENCY_ID: &str = "dependency_id";
+    pub const DEPENDS_ON_ID: &str = "depends_on_id";
+    pub const DEPENDENCY_KIND: &str = "dependency_kind";
 }

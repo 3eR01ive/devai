@@ -112,6 +112,65 @@ fn current_spec(artifacts: &[Artifact]) -> Option<&Artifact> {
 }
 
 // ---------------------------------------------------------------------------
+// dependency gate (REQ-03/04)
+// ---------------------------------------------------------------------------
+
+/// The task ids that still constrain `task` through an OPEN `blocks` edge
+/// (REQ-03: resume and human acceptance are refused while this is non-empty;
+/// REQ-04 AC2: readiness is computable from stored data alone).
+///
+/// RATIFIED DECISION OQ1 defines "closed": a `blocks` edge is CLOSED only
+/// when the depended-on task is ACCEPTED. CANCELLED and FAILED do NOT close
+/// it — a dead dependency means an unresolved problem, and re-tuning the
+/// graph (superseding the edge, OQ7) is a human act, not an implicit
+/// platform release. Every other state — the hold family included — keeps
+/// the edge open: a PAUSED or FAILED blocker may still be resumed and
+/// finish. The deadlock this deliberately accepts (a CANCELLED blocker pins
+/// its dependents until a human unlinks the edge or ratifies the override)
+/// is the ratified trade-off: the platform never decides for the operator.
+///
+/// RATIFIED DECISION OQ3: `parent` edges NEVER gate — pure genealogy.
+pub fn open_blockers(task: &Task, deps: &[TaskDependency]) -> Vec<String> {
+    deps.iter()
+        .filter(|d| d.task_id == task.id && d.kind == DependencyKind::Blocks && d.depends_on_state != TaskState::Accepted)
+        .map(|d| d.depends_on_id.to_string())
+        .collect()
+}
+
+/// RATIFIED DECISION OQ2 — the human-escape of the dependency gate. The
+/// refusal of resume/acceptance is unconditional, BUT an operator may
+/// explicitly ratify "continue despite" through the ordinary decisions
+/// mechanism: a `dependency_override` decision with verdict APPROVED whose
+/// `refs` list every currently-open blocker id. Coverage is EXACT: a
+/// decision made before a NEW blocker appeared does not release the gate
+/// for it, and only verdict APPROVED counts. When it does not cover, the
+/// gate stands exactly as REQ-03 describes.
+pub fn override_covers(task: &Task, blockers: &[String], decisions: &[Decision]) -> bool {
+    if blockers.is_empty() {
+        return false;
+    }
+    decisions.iter().any(|d| {
+        d.task_id == task.id
+            && d.kind == decision_kind::DEPENDENCY_OVERRIDE
+            && d.verdict == Verdict::Approved
+            && blockers.iter().all(|b| d.refs.iter().any(|r| r == b))
+    })
+}
+
+/// The effective blockers of `task`: OPEN `blocks` edges (OQ1/OQ3) minus
+/// those covered by a human override decision (OQ2). An empty result lets
+/// resume/acceptance through; the non-empty result IS the refusal payload —
+/// blocking ids as data (REQ-03 AC1).
+pub fn effective_blockers(task: &Task, deps: &[TaskDependency], decisions: &[Decision]) -> Vec<String> {
+    let open = open_blockers(task, deps);
+    if override_covers(task, &open, decisions) {
+        Vec::new()
+    } else {
+        open
+    }
+}
+
+// ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
 
@@ -424,11 +483,21 @@ fn empty_rework_trip(
 pub fn accept(
     task: &Task,
     artifacts: &[Artifact],
+    deps: &[TaskDependency],
+    decisions: &[Decision],
     rationale: Option<&str>,
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
     require_state(task, &[TaskState::Qa], "accept", CoreError::hint("acceptance applies only in QA"))?;
+    // REQ-03: the human gate cannot pass a task an open blocker still
+    // holds; the refusal enumerates the blocking ids. The only release is
+    // the human's own `dependency_override` decision (ratified OQ2) —
+    // checked here against the same stored decisions the QA auditor reads.
+    let blockers = effective_blockers(task, deps, decisions);
+    if !blockers.is_empty() {
+        return Err(CoreError::OpenBlockers { blockers });
+    }
     let has_quality = artifacts
         .iter()
         .any(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current);
@@ -490,13 +559,25 @@ pub fn cancel(task: &Task, reason: Option<&str>, actor: &str, now: Timestamp) ->
 }
 
 /// Releases a hold state (PAUSED / BLOCKED / FAILED → remembered stage).
-pub fn resume(task: &Task, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
+/// REQ-03: an open `blocks` dependency forbids the release; the refusal
+/// carries the blocking task ids as data. The human-escape of RATIFIED
+/// DECISION OQ2 is the only exception — an explicit `dependency_override`
+/// decision covering every open blocker, read from stored decisions.
+/// RATIFIED DECISION OQ2 also FORBIDS auto-unpause: nothing in this
+/// function (or anywhere else in the platform) releases a hold state when
+/// the last blocker closes — resume stays a human act until a human issues
+/// it, the platform never decides on the operator's behalf.
+pub fn resume(task: &Task, deps: &[TaskDependency], decisions: &[Decision], actor: &str, now: Timestamp) -> CoreResult<Mutation> {
     require_state(
         task,
         &[TaskState::Paused, TaskState::Blocked, TaskState::Failed],
         "resume",
         CoreError::hint("nothing to resume: task is not PAUSED/BLOCKED/FAILED"),
     )?;
+    let blockers = effective_blockers(task, deps, decisions);
+    if !blockers.is_empty() {
+        return Err(CoreError::OpenBlockers { blockers });
+    }
     let to = task.return_state.ok_or_else(|| CoreError::guard("hold state without a remembered stage is a state corruption"))?;
     let mut m = transition(task, to, event_kind::TASK_RESUMED, actor, now, json!({}));
     m.task.return_state = None;

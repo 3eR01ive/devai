@@ -25,6 +25,13 @@
       "to": 3,
       "script": "migrations/003_artifact_supersession.sql",
       "apply": "supersession_backfill"
+    },
+    {
+      "id": "004_task_dependencies",
+      "from": 3,
+      "to": 4,
+      "script": "migrations/004_task_dependencies.sql",
+      "apply": "script"
     }
   ]
 }
