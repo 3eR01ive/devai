@@ -621,7 +621,9 @@ fn non_git_workspace_fails_the_writing_stage_and_never_claims_freshness() {
         })
         .unwrap();
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::implementation_reported(&cur, Some("manual"), "tester", Utc::now()).unwrap();
+    let mut facts = workflow::ImplementationReportFacts::bare(new_id());
+    facts.summary = Some("manual".into());
+    let m = workflow::implementation_reported(&cur, &facts, "tester", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -858,4 +860,125 @@ fn qa_probes_measure_the_worktree_not_the_main_checkout() {
     assert!(txt.contains("git branch --show-current"), "the transcript cites the command: {txt}");
     assert!(!ws.join("probes.txt").exists(), "no run artifact in the main checkout");
     assert!(!_d.path().join("worktrees").join(t.id.to_string()).join("probes.txt").exists(), "no run artifact in the worktree");
+}
+
+// ---------------------------------------------------------------------------
+// Empty-rework gate (REQ-RG-01..06). Regression for the 04.11 precedent
+// (task 01a1a14e-2c07): QA returned three concrete points, the REWORK
+// execution published a report stamped with the SAME commit as the previous
+// one — an empty diff, five minutes — and the platform carried it silently
+// into QA. From now on that passage is loud: it parks on an operator
+// question and only a stored human decision can call it a conscious no-op.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let head = git_out(&ws, &["rev-parse", "HEAD"]);
+    let t = Task::new("Empty rework", "QA return + unchanged rework must be loud", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws); // report R1: mock changed nothing → stamped commit == head
+
+    // QA returns with three concrete points — the precedent's shape.
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::return_to_rework(&cur, Some("п1; п2; п3"), "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+
+    // The rework execution does nothing either: R2 is stamped with the SAME
+    // tip (worktree.rs returns the branch tip, never an empty commit — A1).
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.steps.len(), 1, "the rework stage ran and published");
+    assert_eq!(r.steps[0].to, TaskState::WaitingForInput, "the identical commit parks the task — QA is withheld");
+    assert_eq!(r.gate, Gate::Hold(TaskState::WaitingForInput), "the engine stops LOUD at the hold");
+    let held = store.get_task(&t.id.to_string()).unwrap();
+    assert_eq!(held.state, TaskState::WaitingForInput);
+    assert_eq!(held.return_state, Some(TaskState::Rework), "the re-entry point is REWORK");
+    // progress/status projection convention (REQ-RG-02 AC2): off-spine,
+    // re-entering at REWORK.
+    assert!(workflow::pipeline_off_spine(&held));
+    assert_eq!(workflow::pipeline_position(&held), Some(TaskState::Rework));
+
+    // The trip is an immutable event naming both reports, both shas and the
+    // QA points the skipped rework was supposed to fix (REQ-RG-06 AC2).
+    let events = store.all_events_for_task(t.id).unwrap();
+    let trip = events.iter().rev().find(|e| e.kind == event_kind::QA_REWORK_GATE_TRIPPED).expect("the gate records a trip event");
+    assert_eq!(trip.task_id, Some(t.id), "the event is bound to the task");
+    assert_eq!(trip.payload[json_field::PREV_COMMIT], head);
+    assert_eq!(trip.payload[json_field::CURRENT_COMMIT], head);
+    assert_eq!(trip.payload[json_field::QA_RETURN_RATIONALE], "п1; п2; п3");
+    let prev_id = trip.payload[json_field::PREV_REPORT].as_str().unwrap().to_string();
+    let cur_id = trip.payload[json_field::CURRENT_REPORT].as_str().unwrap().to_string();
+
+    // The parked state carries a real, answerable question (not only a log).
+    let open: Vec<_> = store.list_questions(t.id).unwrap().into_iter().filter(|q| q.status == QuestionStatus::Open).collect();
+    assert_eq!(open.len(), 1, "the gate ships the operator one question");
+    assert!(open[0].blocking && open[0].text.contains("ratify-empty-rework"), "the question names the escape");
+
+    // While unratified, QA is unreachable: the engine holds, nothing runs.
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert!(r.steps.is_empty(), "no stage runs on the gate hold");
+
+    // The human escape mirrors `devai task ratify-empty-rework`: a stored
+    // operator decision for exactly this pair, the question release, then the
+    // SAME core transition admits the passage citing the decision (REQ-RG-03).
+    let d = Decision {
+        id: new_id(),
+        task_id: t.id,
+        kind: decision_kind::REWORK_NOOP_RATIFIED.into(),
+        verdict: Verdict::Approved,
+        actor: "operator".into(),
+        rationale: Some("правок не потребовалось — пункты уже были удовлетворены".into()),
+        refs: vec![prev_id.clone(), cur_id.clone()],
+        created_at: Utc::now(),
+    };
+    store.record_decision(&d).unwrap();
+    store.answer_question(open[0].id, "operator ratified", "operator", Utc::now()).unwrap();
+    let m = workflow::answer_question(&held, open[0].id, "operator", Utc::now()).unwrap();
+    store.commit(held.lock_version, &m).unwrap();
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    assert_eq!(cur.state, TaskState::Rework);
+
+    let arts = store.artifacts(t.id).unwrap();
+    let current = arts.iter().find(|a| a.id.to_string() == cur_id).unwrap().clone();
+    let facts = devai_runtime::gate::collect_implementation_report_facts(&store, t.id, &current, &arts, Some("empty rework ratified".into())).unwrap();
+    assert_eq!(facts.ratifications.len(), 1, "the collector surfaces only the human's ratifications");
+    let m = workflow::implementation_reported(&cur, &facts, "operator", Utc::now()).unwrap();
+    assert_eq!(m.task.state, TaskState::Qa, "the ratified no-op passage reaches QA");
+    assert_eq!(m.events[0].payload[json_field::RATIFIED_BY], d.id.to_string(), "the transition cites the decision (AC3)");
+    store.commit(cur.lock_version, &m).unwrap();
+    assert_eq!(store.get_task(&t.id.to_string()).unwrap().state, TaskState::Qa);
+}
+
+#[test]
+fn rework_with_new_commit_still_reaches_qa() {
+    // REQ-RG-06 green path: a rework that ACTUALLY commits work passes the
+    // gate untouched — the comparison ran and said DISTINCT; no trip, no
+    // hold, no delay.
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let head = git_out(&ws, &["rev-parse", "HEAD"]);
+    let t = Task::new("Real rework", "a rework with new work must pass", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::return_to_rework(&cur, Some("fix the points"), "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+
+    // Real work lands in the task's worktree; the platform commit captures it
+    // on the task branch → the new report names a NEW tip.
+    let wt = _d.path().join("worktrees").join(t.id.to_string());
+    std::fs::write(wt.join("reworked.txt"), b"the fixes QA asked for\n").unwrap();
+
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingAccept, "new work runs through the gate to the auditor");
+    assert_eq!(store.get_task(&t.id.to_string()).unwrap().state, TaskState::Qa);
+    let events = store.all_events_for_task(t.id).unwrap();
+    assert!(events.iter().all(|e| e.kind != event_kind::QA_REWORK_GATE_TRIPPED), "the gate never fired for real work");
+    let reported = events.iter().rev().find(|e| e.kind == event_kind::IMPLEMENTATION_REPORTED).unwrap();
+    assert_eq!(reported.payload[json_field::VERDICT], "DISTINCT", "the gate ran its comparison");
+    assert_ne!(reported.payload[json_field::CURRENT_COMMIT], head, "the new tip is not the bound head");
+    assert_eq!(reported.payload[json_field::PREV_COMMIT], head, "the compared predecessor was the first report's tip");
 }

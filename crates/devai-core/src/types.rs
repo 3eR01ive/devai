@@ -471,6 +471,21 @@ pub struct EventDraft {
     pub payload: serde_json::Value,
 }
 
+/// A blocking question before it is persisted. Like an [`EventDraft`] it is
+/// carried by the [`Mutation`](crate::workflow::Mutation) that raised it, so
+/// the question row and the state change land in ONE transaction — a
+/// producer can commit the parked state without an answerable question just
+/// as little as it can append half an event (the empty-rework gate,
+/// REQ-RG-02: the loud state is only loud if the operator can act on it).
+#[derive(Clone, Debug)]
+pub struct QuestionDraft {
+    pub id: Id,
+    pub text: String,
+    pub context: Option<String>,
+    pub options: Vec<String>,
+    pub blocking: bool,
+}
+
 pub mod decision_kind {
     /// The human merge gate (REQ-WT-07): an explicit human decision that the
     /// task's platform-created `rework/<task-id>` branch is merged into the
@@ -484,6 +499,15 @@ pub mod decision_kind {
     /// auditor scoring spec-fidelity never saw the rejected alternative).
     /// Recorded by the human-invoked CLI `task approve` only.
     pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
+    /// The empty-rework gate (REQ-RG-03): the operator's explicit ratification
+    /// that a QA return needed NO new changes — `refs` carry the pair
+    /// (previous report id, current report id) of exactly one rework cycle, so
+    /// the ratification is never lifetime (AC4). Recorded ONLY by the
+    /// human-invoked CLI `task ratify-empty-rework`; no engine/agent path
+    /// creates it (the 04.11 precedent 01a1a14e-2c07: a silent no-op rework
+    /// rode into QA on an unchanged commit — that passage is now gated on this
+    /// stored decision).
+    pub const REWORK_NOOP_RATIFIED: &str = "rework_noop_ratified";
 }
 
 pub mod event_kind {
@@ -536,6 +560,19 @@ pub mod event_kind {
     /// task's own branch (REQ-WT-06). Platform repository facts, not judgment.
     pub const WORKTREE_PREPARED: &str = "worktree.prepared";
     pub const WORKTREE_COMMITTED: &str = "worktree.committed";
+    /// The empty-rework gate fired (REQ-RG-02): a REWORK publication names the
+    /// SAME platform-stamped commit as the previous implementation report —
+    /// the rework captured no new work. The transition to QA is withheld; the
+    /// task parks in WAITING_FOR_INPUT on a blocking question until the
+    /// operator ratifies (decision `rework_noop_ratified`) or a real re-run
+    /// publishes a new commit. Payload: both report ids, both commit shas and
+    /// the QA-return rationale that opened the cycle.
+    pub const QA_REWORK_GATE_TRIPPED: &str = "qa.rework_gate_tripped";
+    /// The gate could not compare (REQ-RG-04): one side of the pair carries no
+    /// stamped commit, or there is no prior report to compare against. A
+    /// distinguishable outcome — this event, and NEVER a verdict claim: the
+    /// transition proceeds without a "gate passed" verdict in its payload.
+    pub const QA_REWORK_GATE_INCOMPARABLE: &str = "qa.rework_gate_incomparable";
 }
 
 /// The single vocabulary of JSON field names the platform WRITES into
@@ -565,6 +602,19 @@ pub mod json_field {
     pub const REASON: &str = "reason";
     pub const STALED: &str = "staled";
     pub const CAUSE: &str = "cause";
+    // Empty-rework gate (REQ-RG-01/02/04): the producer-written and
+    // operator-read payload keys of the gate events and the ratified
+    // transition. The gate event and the later QA transition it once
+    // withheld speak through these same keys — no producer may rename them.
+    pub const QUESTION_ID: &str = "question_id";
+    pub const GATE: &str = "gate";
+    pub const VERDICT: &str = "verdict";
+    pub const PREV_REPORT: &str = "prev_report";
+    pub const CURRENT_REPORT: &str = "current_report";
+    pub const PREV_COMMIT: &str = "prev_commit";
+    pub const CURRENT_COMMIT: &str = "current_commit";
+    pub const RATIFIED_BY: &str = "ratified_by";
+    pub const QA_RETURN_RATIONALE: &str = "qa_return_rationale";
     // Migration (one-time repair) records.
     pub const BACKFILL: &str = "backfill";
     pub const SCRIPT_PATH: &str = "script";

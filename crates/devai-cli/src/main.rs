@@ -179,6 +179,20 @@ enum TaskCmd {
         #[arg(long)]
         rationale: Option<String>,
     },
+    /// The EMPTY-REWORK GATE escape (human-only, REQ-RG-03): the task sits on
+    /// a `qa.rework_gate_tripped` hold because a REWORK publication named the
+    /// SAME platform-stamped commit as the previous report — the rework
+    /// brought no new work. This command records an explicit
+    /// `rework_noop_ratified` decision for exactly that report pair, releases
+    /// the gate question, and runs the withheld REWORK → QA transition citing the
+    /// decision. Only a human invocation can ratify; no agent or engine path
+    /// can create the decision, and the ratification binds to the one cycle's
+    /// pair — a later identical-commit rework trips the gate again.
+    RatifyEmptyRework {
+        id: String,
+        #[arg(long)]
+        rationale: Option<String>,
+    },
     /// The MERGE GATE (human-only): merge the task's platform-created
     /// `rework/<task-id>` branch into the workspace's current baseline
     /// branch. The platform never merges by itself — this command is the

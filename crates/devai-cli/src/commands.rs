@@ -221,6 +221,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Reject { id, rationale } => op(ctx, &id, move |t, _a| workflow::reject_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Accept { id, rationale } => op(ctx, &id, move |t, a| workflow::accept(t, a, rationale.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Return { id, rationale } => op(ctx, &id, move |t, _a| workflow::return_to_rework(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
+        TaskCmd::RatifyEmptyRework { id, rationale } => ratify_empty_rework(ctx, &id, rationale.as_deref(), json)?,
         TaskCmd::Merge { id, workspace, rationale } => task_merge(ctx, &id, workspace.as_deref(), rationale.as_deref(), json)?,
         TaskCmd::Pause { id, reason } => op(ctx, &id, move |t, _a| workflow::pause(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Resume { id } => op(ctx, &id, |t, _a| workflow::resume(t, &ctx.actor, ctx.now()))?,
@@ -404,6 +405,141 @@ fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<&
     } else {
         outln!("merged `{branch}` into {}  {head_before} → {head_after}", repo.display());
         outln!("branch and worktree persist — their removal is a lifecycle decision the platform does not automate (OQ-1)");
+    }
+    Ok(())
+}
+
+/// The EMPTY-REWORK GATE escape (REQ-RG-03), human-only like the merge gate.
+/// Records (or reuses) a `rework_noop_ratified` Decision for the exact report
+/// pair named by the most recent `qa.rework_gate_tripped` event of the latest
+/// report, releases the gate's blocking question, and runs the withheld
+/// REWORK → QA transition through the same core command
+/// (`implementation_reported`), which now finds the pair-bound ratification
+/// and cites its decision id on the transition event (AC3). No engine or
+/// agent path reaches this handler — the decision can only be created by a
+/// human invoking the CLI (AC2), and there is no timeout auto-pass (AC
+/// constraint): without the explicit act the task simply stays parked.
+fn ratify_empty_rework(ctx: &Ctx, id: &str, rationale: Option<&str>, json: bool) -> Result<()> {
+    let task = ctx.store.resolve_task(id)?;
+    match task.state {
+        // The gate hold is WAITING_FOR_INPUT returning to REWORK. If the
+        // operator answered the question first (back to REWORK, no
+        // ratification) — or a previous run died between the two acts —
+        // ratifying from REWORK converges here too. Never from a hold of a
+        // different question.
+        TaskState::WaitingForInput if task.return_state == Some(TaskState::Rework) => {}
+        TaskState::Rework => {}
+        s => bail!(
+            "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
+            s.as_str()
+        ),
+    }
+    let arts = ctx.store.artifacts(task.id)?;
+    let Some(current) = arts.iter().filter(|a| a.kind == ArtifactKind::ImplementationReport).max_by_key(|a| a.seq) else {
+        bail!("the task has no implementation report — nothing to ratify");
+    };
+    let events = ctx.store.all_events_for_task(task.id)?;
+    let current_id_s = current.id.to_string();
+    // Only the trip of the LATEST report is ratifiable: a newer report
+    // changes the pair, and the older cycle's ratification is not lifetime
+    // (REQ-RG-03 AC4) — the new publication tripped its own gate or passed.
+    let trip = events
+        .iter()
+        .rev()
+        .find(|e| {
+            e.kind == event_kind::QA_REWORK_GATE_TRIPPED
+                && e.payload.get(json_field::CURRENT_REPORT).and_then(|v| v.as_str()) == Some(current_id_s.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!(
+            "no empty-rework gate recorded for report {} — the gate fires when a REWORK publication names the unchanged commit; if the latest report is newer, let the engine publish it from REWORK first",
+            short(&current.id)
+        ))?;
+    let prev_report = trip
+        .payload
+        .get(json_field::PREV_REPORT)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .context("the gate trip event names no previous report — history corruption")?
+        .to_string();
+
+    // The ratification decision for exactly this pair. Recorded once; a retry
+    // reuses the stored row (this command must never double-write a judgment,
+    // and it stays crash-safe between its commits).
+    let decisions = ctx.store.list_decisions(task.id)?;
+    let existing = decisions
+        .iter()
+        .find(|d| {
+            d.kind == decision_kind::REWORK_NOOP_RATIFIED
+                && d.refs.iter().any(|r| r == &prev_report)
+                && d.refs.iter().any(|r| r == &current_id_s)
+        })
+        .cloned();
+    let (decision, recorded_now) = match existing {
+        Some(d) => (d, false),
+        None => {
+            let d = Decision {
+                id: new_id(),
+                task_id: task.id,
+                kind: decision_kind::REWORK_NOOP_RATIFIED.into(),
+                verdict: Verdict::Approved,
+                actor: ctx.actor.clone(),
+                rationale: rationale.map(|s| s.to_string()),
+                refs: vec![prev_report.clone(), current_id_s.clone()],
+                created_at: ctx.now(),
+            };
+            ctx.store.record_decision(&d)?;
+            (d, true)
+        }
+    };
+
+    // Release the blocking gate question while the hold is still up.
+    let mut cur = task.clone();
+    if cur.state == TaskState::WaitingForInput {
+        let q_ref = trip.payload.get(json_field::QUESTION_ID).and_then(|v| v.as_str()).unwrap_or_default();
+        let q = ctx.store.get_question(q_ref)?;
+        if q.status == QuestionStatus::Open {
+            ctx.store.answer_question(q.id, &format!("operator ratified the empty rework (decision {})", decision.id), &ctx.actor, ctx.now())?;
+        }
+        let m = workflow::answer_question(&cur, q.id, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
+        ctx.store.commit(cur.lock_version, &m)?;
+        cur = ctx.store.get_task(&cur.id.to_string())?;
+    }
+
+    // Run the withheld transition through the single serialization point.
+    // With the stored ratification now in the facts, the core command admits
+    // REWORK → QA and puts `ratified_by` on the event (REQ-RG-03 AC3).
+    let arts = ctx.store.artifacts(cur.id)?;
+    let facts = devai_runtime::gate::collect_implementation_report_facts(
+        &ctx.store,
+        cur.id,
+        current,
+        &arts,
+        Some(format!("empty rework ratified by decision {}", decision.id)),
+    )?;
+    let m = workflow::implementation_reported(&cur, &facts, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
+    if m.task.state != TaskState::Qa {
+        bail!(
+            "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
+            m.task.state.as_str(),
+            decision.id,
+            short(&cur.id)
+        );
+    }
+    ctx.store.commit(cur.lock_version, &m)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "task": cur.id.to_string(),
+            "decision": decision.id.to_string(),
+            "recorded_now": recorded_now,
+            "prev_report": prev_report,
+            "current_report": current_id_s,
+            "state": m.task.state.as_str(),
+        }))?);
+    } else {
+        outln!("ratified: decision {} ({}) — the no-op rework is now a conscious operator passage", decision.id, if recorded_now { "recorded" } else { "reused stored" });
+        outln!("pair: report {prev_report} → report {current_id_s} on the same commit");
+        outln!("state: {} → QA; the transition event cites the decision", cur.state.as_str());
+        outln!("next: {}", workflow::allowed_ops(&m.task).join(" | "));
     }
     Ok(())
 }
@@ -724,9 +860,18 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
                     outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
                 }
                 ArtifactKind::ImplementationReport => {
-                    let m = workflow::implementation_reported(&task, None, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
+                    // The manual publication crosses the SAME core command as
+                    // the engine — including the empty-rework gate: no
+                    // producer path may bypass it (REQ-RG-01 constraint).
+                    let arts = ctx.store.artifacts(task.id)?;
+                    let facts = devai_runtime::gate::collect_implementation_report_facts(&ctx.store, task.id, &a, &arts, None)?;
+                    let m = workflow::implementation_reported(&task, &facts, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
                     ctx.store.commit(task.lock_version, &m)?;
                     outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
+                    if m.task.state == TaskState::WaitingForInput {
+                        outln!("⏸ EMPTY-REWORK GATE: report {} names the SAME commit as the previous one — the rework captured no new work; QA is withheld.", short(&a.id));
+                        outln!("   operator: ratify the no-op explicitly with `devai task ratify-empty-rework {} --rationale \"...\"`, or answer the question and re-run the implementation with real fixes", short(&task.id));
+                    }
                 }
                 ArtifactKind::QualityReport => {
                     outln!("quality report recorded; user decides via `devai task accept|return`");
