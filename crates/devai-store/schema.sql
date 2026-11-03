@@ -8,10 +8,12 @@
 -- v3 adds the artifact supersession invariant: exactly one CURRENT row per
 -- (task_id, kind), pinned by the partial unique index below. Existing v2
 -- databases are repaired by migrations/003_artifact_supersession.sql.
--- v4 adds no table shape beyond the read index below: the v3→v4 rung
+-- v4 adds no table shape beyond the two indexes below: the v3→v4 rung
 -- (migrations/004_decisions_backfill.sql) backfills NEW decision rows from
 -- historical approve/reject/return event payloads — a one-time DATA repair,
--- append-only, no column touched.
+-- append-only, no column touched. Fresh homes land the same index set so
+-- migrated and fresh shapes stay identical (the partial unique index is
+-- inert here: fresh rows carry UUIDv7 ids, the predicate selects v5 only).
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -136,11 +138,18 @@ CREATE TABLE decisions(
   refs       TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL
 );
--- The decisions read/disclosure index (v4; same index the v3→v4 rung builds,
--- so fresh and migrated databases keep identical shapes). list_decisions
--- filters by task and reproduces the stored chronology (ORDER BY created_at);
--- the backfill's "already disclosed" predicate scans the same column.
+-- The decisions read/disclosure indexes (v4; the same two the v3→v4 rung
+-- builds, so fresh and migrated databases keep identical shapes).
+-- list_decisions filters by task and reproduces the stored chronology
+-- (ORDER BY created_at); the backfill's "already disclosed" predicate scans
+-- the same column. `decisions_backfill_source_event` pins the ratified
+-- idempotence of rung 004 (spec OQ2/OQ6): it constrains ONLY rows whose id
+-- is the deterministic UUIDv5 derived from a source event id (predicate
+-- '5' = that id space; live rows are v7 and unconstrained), making a second
+-- extraction of the same event impossible at the database level.
 CREATE INDEX decisions_task ON decisions(task_id, created_at);
+CREATE UNIQUE INDEX decisions_backfill_source_event ON decisions(refs)
+WHERE substr(id, 15, 1) = '5';
 
 CREATE TABLE questions(
   id           TEXT PRIMARY KEY,

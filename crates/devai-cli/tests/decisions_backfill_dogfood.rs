@@ -3,24 +3,31 @@
 //! `requirements.approved` / `requirements.rejected` events WITHOUT decision
 //! rows (the pre-REQ-QAD-001 shape — seeded via PRAGMA user_version like the
 //! store migration_tests do), and the next binary invocation opens the store,
-//! which applies the rung. The test then asserts the extracted facts are
-//! VISIBLE exactly where the acceptance names them:
+//! which applies the rung. The assertions follow the ratified acceptance
+//! reading (spec OQ1 = variant (б)): the extracted facts become visible to
+//! the QA auditor through the APPROVED_DECISIONS section of the persisted
+//! auditor prompt — the human `task progress` view gains NO decisions
+//! section. On top of that:
 //!
-//!   1. the DECISIONS section of `devai task progress` shows the stored
-//!      rationale byte-for-byte (REQ-BF-006 acceptance reading (a));
-//!   2. `decisions.backfilled` fact events exist with the migration actor,
-//!      and the null-rationale event was NOT extracted (REQ-BF-002/004);
-//!   3. a re-forced version re-applies the rung as a NO-OP (REQ-BF-005);
-//!   4. end-to-end with the offline mock agent: after the backfill, the
+//!   1. the rung lands on `open()`, rows carry the DETERMINISTIC ids and
+//!      source-event refs of the ratified OQ2/OQ6 mechanism, the
+//!      NULL-rationale event is extracted as a NULL row (OQ4), the modern
+//!      event-and-decision pair is NOT extracted secondarily, `task
+//!      progress` renders no DECISIONS section, fact events exist per
+//!      (task, kind) group, and a re-forced version re-applies as a NO-OP
+//!      (REQ-BF-002/004/005/006);
+//!   2. end-to-end with the offline mock agent: after the backfill, the
 //!      RENDERED auditor prompt (auditor_prompt.txt, REQ-QAD-004 observation
-//!      surface) contains the seeded legacy rationale — the auditor really
-//!      sees what the extraction created (REQ-BF-006).
+//!      surface) contains the seeded legacy rationales and the explicit
+//!      "(none stored)" mark for the NULL one — the auditor really sees
+//!      what the extraction created (REQ-BF-006, ratified OQ1(б)/OQ4).
 
 use std::path::Path;
 use std::process::Command;
 
 use devai_core::types::{event_kind, json_field};
-use rusqlite::params;
+use devai_store::backfill_decision_id;
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 fn devai(home: &Path, args: &[&str]) -> String {
@@ -68,7 +75,7 @@ fn seed_legacy_events(home: &Path, task_id: &str) -> (String, String, String) {
     let e_appr = uuid::Uuid::now_v7().to_string();
     let e_rej = uuid::Uuid::now_v7().to_string();
     let e_null = uuid::Uuid::now_v7().to_string();
-    let conn = rusqlite::Connection::open(home.join("devai.db")).unwrap();
+    let conn = Connection::open(home.join("devai.db")).unwrap();
     conn.execute_batch("PRAGMA user_version=3;").unwrap();
     for (id, kind, payload, ts) in [
         (&e_rej, event_kind::REQUIREMENTS_REJECTED, serde_json::json!({"rationale": "legacy reject: split OQ1 first"}), "2026-09-01T00:00:00.000000Z"),
@@ -81,61 +88,124 @@ fn seed_legacy_events(home: &Path, task_id: &str) -> (String, String, String) {
         )
         .unwrap();
     }
+    drop(conn);
     (e_appr, e_rej, e_null)
 }
 
+/// Seed the MODERN write-path shape (commands.rs `task approve`: event AND
+/// decision side by side, refs = the spec id) directly, while the rung is
+/// still pending — such an event must not be extracted secondarily.
+fn seed_modern_pair(home: &Path, task_id: &str) -> (String, String) {
+    let e_modern = uuid::Uuid::now_v7().to_string();
+    let rationale = "modern approve: already a stored decision";
+    let conn = Connection::open(home.join("devai.db")).unwrap();
+    conn.execute(
+        "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,'human:now',?4,'2026-10-06T00:00:00.000000Z')",
+        params![e_modern, task_id, event_kind::REQUIREMENTS_APPROVED, serde_json::json!({"rationale": rationale}).to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO decisions(id,task_id,kind,verdict,actor,rationale,refs,created_at) VALUES(?1,?2,'requirements_approval','APPROVED','human:now',?3,'[\"spec-id\"]','2026-10-06T00:00:00.000000Z')",
+        params![uuid::Uuid::now_v7().to_string(), task_id, rationale],
+    )
+    .unwrap();
+    drop(conn);
+    (e_modern, rationale.into())
+}
+
+/// Raw decision rows in stored chronology, read straight from the database:
+/// (id, kind, verdict, actor, rationale, refs).
+fn read_decisions(home: &Path, task_id: &str) -> Vec<(String, String, String, String, Option<String>, Vec<String>)> {
+    let conn = Connection::open(home.join("devai.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id,kind,verdict,actor,rationale,refs FROM decisions WHERE task_id=?1 ORDER BY created_at")
+        .unwrap();
+    let rows = stmt
+        .query_map(params![task_id], |r| {
+            let refs_text: String = r.get(5)?;
+            let rationale: Option<String> = r.get(4)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                rationale,
+                serde_json::from_str::<Vec<String>>(&refs_text).unwrap(),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
 fn version_of(home: &Path) -> i64 {
-    let conn = rusqlite::Connection::open(home.join("devai.db")).unwrap();
+    let conn = Connection::open(home.join("devai.db")).unwrap();
     conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
 }
 
 #[test]
-fn backfill_runs_on_open_and_shows_the_ratified_rationale_in_task_progress() {
+fn backfill_runs_on_open_lands_deterministic_rows_and_progress_stays_clean() {
     let home = TempDir::new().unwrap();
     devai(home.path(), &["init"]);
     let created = devai_json(home.path(), &["task", "new", "Backfill dogfood", "--description", "historical verdicts must reach the decisions table"]);
     let id = created["id"].as_str().unwrap().to_string();
     let (e_appr, e_rej, e_null) = seed_legacy_events(home.path(), &id);
+    let (e_modern, modern_rationale) = seed_modern_pair(home.path(), &id);
 
     // Any command opens the store — the rung lands here.
-    let progress = devai(home.path(), &["task", "progress", &id]);
+    devai(home.path(), &["task", "events", &id]);
     assert_eq!(version_of(home.path()), 4, "the ladder walked 3 → 4");
 
-    // 1) DECISIONS section: the stored rationale, reproduced verbatim.
-    assert!(progress.contains("DECISIONS:"), "the progress view must carry a DECISIONS section:\n{progress}");
-    assert!(progress.contains("legacy approve: keep `task active`, do NOT ship `exec list --active`"), "the acceptance string 'task active' must be visible:\n{progress}");
-    assert!(progress.contains("requirements_rejection") && progress.contains("REJECTED"), "the reject event got its own row:\n{progress}");
-
+    // The human view stays exactly as it was (ratified OQ1 variant (б)):
+    // acceptance is the auditor's APPROVED_DECISIONS, not a new progress
+    // section — the absence below is the contract, pinned.
+    let progress = devai(home.path(), &["task", "progress", &id]);
+    assert!(!progress.contains("DECISIONS"), "`task progress` must NOT render a DECISIONS section (ratified OQ1: variant (б), scope creep rejected):\n{progress}");
     let pj = devai_json(home.path(), &["task", "progress", &id]);
-    let decisions = pj["decisions"].as_array().unwrap();
-    assert_eq!(decisions.len(), 2, "approve + reject extracted, the NULL-rationale approve skipped: {decisions:?}");
-    let appr = decisions.iter().find(|d| d["kind"] == "requirements_approval").unwrap();
-    assert_eq!(appr["verdict"], "APPROVED");
-    assert_eq!(appr["actor"], "human:legacy", "actor copied from the event column");
-    assert_eq!(appr["refs"].as_array().unwrap()[0], e_appr.as_str(), "the row cites its source event");
-    assert_eq!(appr["rationale"].as_str().unwrap(), "legacy approve: keep `task active`, do NOT ship `exec list --active`", "byte-identical, never paraphrased");
-    assert!(decisions.iter().all(|d| d["refs"][0] != e_null.as_str()), "the null-rationale event created nothing");
-    assert!(decisions.iter().all(|d| d["refs"][0] != e_rej.as_str() || d["kind"] == "requirements_rejection"));
+    assert!(pj.get("decisions").is_none(), "the progress JSON must not grow a decisions key");
 
-    // 2) one fact event per group, migration actor, citing both sides.
+    // The rows themselves, in stored chronology: reject (Sep), legacy
+    // approve (Oct 1), NULL approve (Oct 2), then the untouched modern row.
+    let rows = read_decisions(home.path(), &id);
+    assert_eq!(rows.len(), 4, "3 extracted (NULL included, ratified OQ4) + the pre-existing modern row: {rows:?}");
+    for (i, event) in [(0, &e_rej), (1, &e_appr), (2, &e_null)] {
+        assert_eq!(rows[i].0, backfill_decision_id(event).to_string(), "the decision id is DETERMINISTICALLY derived from the source event id (ratified OQ2)");
+        assert_eq!(rows[i].5, vec![event.clone()], "refs cite the source event id (ratified OQ6)");
+        assert_eq!(rows[i].3, "human:legacy", "actor copied from the event column");
+    }
+    assert_eq!(rows[2].4, None, "the NULL-rationale approve is a NULL row, not a skip (ratified OQ4)");
+    assert_eq!(rows[0].1, "requirements_rejection", "reject kind per ratified OQ3");
+    assert_eq!(rows[0].2, "REJECTED");
+    assert_eq!(rows[1].1, "requirements_approval");
+    assert_eq!(rows[1].2, "APPROVED");
+    assert_eq!(rows[1].4.as_deref().unwrap(), "legacy approve: keep `task active`, do NOT ship `exec list --active`", "byte-identical, never paraphrased");
+    assert!(rows[1].4.as_deref().unwrap().contains("task active"), "the acceptance string is stored");
+    // The modern event was not extracted secondarily (REQ-BF-005 AC1).
+    assert_eq!(rows.iter().filter(|r| r.4.as_deref() == Some(modern_rationale.as_str())).count(), 1, "the disclosed rationale stays single");
+    assert!(rows.iter().all(|r| !r.5.contains(&e_modern)), "the modern event id appears in nobody's refs");
+
+    // One fact event per (task, source kind) group (ratified OQ5).
     let evs = devai_json(home.path(), &["task", "events", &id]);
     let facts: Vec<&serde_json::Value> = evs.as_array().unwrap().iter().filter(|e| e["kind"] == event_kind::DECISIONS_BACKFILLED).collect();
-    assert_eq!(facts.len(), 2, "one event per (task, source kind) group");
+    assert_eq!(facts.len(), 2, "one event per (task, source kind) group: {facts:?}");
     for f in &facts {
         assert_eq!(f["actor"], "migration:004_decisions_backfill");
         assert_eq!(f["payload"][json_field::BACKFILL], "004_decisions_backfill");
         assert_eq!(f["payload"][json_field::SCRIPT_PATH], "migrations/004_decisions_backfill.sql");
     }
     let appr_fact = facts.iter().find(|f| f["payload"][json_field::KIND] == event_kind::REQUIREMENTS_APPROVED).unwrap();
-    assert_eq!(appr_fact["payload"][json_field::SOURCE_EVENTS].as_array().unwrap().len(), 1, "only e-appr was extracted");
+    assert_eq!(appr_fact["payload"][json_field::SOURCE_EVENTS].as_array().unwrap().len(), 2, "e-appr AND e-null were extracted");
 
-    // 3) idempotence: re-forcing the version and re-opening is a no-op.
+    // Idempotence (REQ-BF-005, ratified OQ2): re-forcing the version makes
+    // the deterministic ids recompute identically and ON CONFLICT DO
+    // NOTHING affect no row — no duplicate decision, no fact event.
     {
-        let conn = rusqlite::Connection::open(home.path().join("devai.db")).unwrap();
+        let conn = Connection::open(home.path().join("devai.db")).unwrap();
         conn.execute_batch("PRAGMA user_version=3;").unwrap();
     }
-    let pj2 = devai_json(home.path(), &["task", "progress", &id]);
-    assert_eq!(pj2["decisions"].as_array().unwrap().len(), 2, "a re-applied rung creates no decision row");
+    devai(home.path(), &["task", "events", &id]);
+    assert_eq!(read_decisions(home.path(), &id).len(), 4, "a re-applied rung creates no decision row");
     let evs2 = devai_json(home.path(), &["task", "events", &id]);
     assert_eq!(evs2.as_array().unwrap().iter().filter(|e| e["kind"] == event_kind::DECISIONS_BACKFILLED).count(), 2, "a re-applied rung creates no fact event");
 }
@@ -181,6 +251,9 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     assert!(section.contains("legacy approve: keep `task active`"), "the seeded historical rationale must reach the auditor:\n{section}");
     assert!(section.contains("legacy reject: split OQ1 first"), "reject rationales are visible too:\n{section}");
     assert!(section.contains("modern approve after backfill"), "live rows are unaffected:\n{section}");
+    // Ratified OQ4: the NULL-rationale act is a STORED fact the auditor
+    // sees marked as such, not a silently skipped event.
+    assert!(section.contains("(none stored)"), "the NULL-rationale backfilled decision renders the explicit mark (ratified OQ4):\n{section}");
     assert_eq!(version_of(home.path()), 4);
     println!("──── dogfood evidence: APPROVED_DECISIONS with backfilled rows ────\n{section}");
 }
