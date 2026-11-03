@@ -477,6 +477,13 @@ pub mod decision_kind {
     /// baseline. Recorded ONLY by the human-invoked CLI command — no
     /// engine/runtime/agent path performs or records a merge.
     pub const REWORK_MERGE: &str = "rework_merge";
+    /// The human approval gate: approve + its rationale (which ratifies the
+    /// open questions the approved spec left) is a STORED decision row, read
+    /// by the QA auditor via `list_decisions` (REQ-QAD-001; precedent
+    /// 01a1a0b5-0fcf — the rationale lived only in the event payload, so the
+    /// auditor scoring spec-fidelity never saw the rejected alternative).
+    /// Recorded by the human-invoked CLI `task approve` only.
+    pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
 }
 
 pub mod event_kind {

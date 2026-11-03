@@ -18,6 +18,7 @@ use devai_store::{ArtifactDraft, Store, StoreError};
 
 use crate::adapters::{self, AdapterError, AgentRuntime, ExecOutput, ExecRequest};
 use crate::evaluation;
+use crate::prompt::build_user_prompt;
 use crate::worktree;
 
 /// Stage the auditor answers in: the agent emits an
@@ -41,6 +42,53 @@ const EVIDENCE_SUBDIR: &str = "evidence";
 /// Mechanical-probe transcript persisted per QA execution (REQ-WT-05 AC1).
 /// Spelled once; referenced by path, never duplicated as a literal.
 const PROBE_EVIDENCE_FILE: &str = "probes.txt";
+/// Rendered auditor prompt persisted per QA execution. This is the
+/// observation surface REQ-QAD-004 needs: the dogfood test asserts on the
+/// ACTUAL text fed to the auditor, and the prompt otherwise exists only
+/// transiently inside the adapter (adapters.rs:76). Same platform-evidence
+/// location and the same write-fails-the-run discipline as probes.txt
+/// (REQ-WT-05) — nothing lands in a checkout.
+const AUDITOR_PROMPT_FILE: &str = "auditor_prompt.txt";
+
+/// Render the `APPROVED_DECISIONS` prompt section from the STORED decision
+/// rows (REQ-QAD-001/003). Pure formatting of already-persisted fields —
+/// no reconstruction from any artifact head, no re-derivation, no re-sorting:
+/// `list_decisions` returns `ORDER BY created_at`, and that stored order is
+/// reproduced verbatim (OQ-D). Multi-line rationales are printed under a
+/// continuation indent so a stored fact stays byte-identical to what the
+/// human wrote. An empty table yields one explicit marker line, so the QA
+/// prompt keeps a constant section structure across runs (OQ-E) and the
+/// auditor can see the ABSENCE of decisions as a fact, not a silent omission.
+fn decisions_prompt_text(decisions: &[Decision]) -> String {
+    if decisions.is_empty() {
+        return "(no decisions recorded for this task)\n".to_string();
+    }
+    let mut out = String::new();
+    for d in decisions {
+        out.push_str(&format!(
+            "- kind: {}\n  verdict: {}\n  actor: {}\n  created_at: {}\n",
+            d.kind,
+            d.verdict.as_str(),
+            d.actor,
+            d.created_at.to_rfc3339(),
+        ));
+        match d.rationale.as_deref() {
+            // OQ-B: a stored rationale is printed as written; a NULL one is
+            // marked explicitly rather than silently dropped.
+            Some(text) => {
+                for (i, line) in text.lines().enumerate() {
+                    if i == 0 {
+                        out.push_str(&format!("  rationale: {line}\n"));
+                    } else {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                }
+            }
+            None => out.push_str("  rationale: (none stored)\n"),
+        }
+    }
+    out
+}
 
 /// Upper bound of role executions in one `advance` call (QA return7 п.(г):
 /// this used to be an inline `16` literal in `Engine::new`). It is a
@@ -415,6 +463,22 @@ impl<'a> Engine<'a> {
             .collect::<RuntimeResult<_>>()?;
 
         let is_qa = kind == ArtifactKind::QualityReport;
+        // REQ-QAD-001/002: the auditor judging spec-fidelity must see the
+        // human's recorded decisions — the approve rationale is where the
+        // open questions got ratified (precedent 01a1a0b5-0fcf: a rejected
+        // OQ alternative was implemented and scored 1.0 because nothing in
+        // the prompt named the human's ruling). Stored rows verbatim via
+        // `list_decisions`; EVERY decision of the task is included (OQ-A —
+        // the verdict field tells the auditor which was an approval), and
+        // the section sits between the implementation report and the
+        // mechanical evidence so the section order is fixed and
+        // deterministic (REQ-QAD-002).
+        if is_qa {
+            inputs.push((
+                "APPROVED_DECISIONS (all stored human decisions for this task, reproduced verbatim; approve rationales are the ratified resolutions of the spec's open questions)".to_string(),
+                decisions_prompt_text(&self.store.list_decisions(task.id)?),
+            ));
+        }
         // QA stage: the platform runs the profile's probes FIRST, so the
         // auditor sees real mechanical evidence and cannot invent any.
         let eval_run = if is_qa {
@@ -564,6 +628,30 @@ impl<'a> Engine<'a> {
                 version: ASSESSMENT_CONTRACT.1,
             });
         }
+        // Observation surface for the QA prompt (REQ-QAD-004, resolves OQ-F):
+        // the rendered auditor prompt is persisted next to the probe
+        // transcript, so a dogfood test — and a human debugging a
+        // spec-fidelity score — can assert on the EXACT text the auditor is
+        // fed. The render uses the same pure `build_user_prompt` with the
+        // same arguments `adapters::claude` will pass for this request
+        // (title, business, ordered inputs, the assessment contract, its
+        // schema). A write failure fails the execution honestly, mirroring
+        // the probes.txt discipline above (REQ-WT-05); the QA branch has
+        // already created this directory.
+        if is_qa {
+            let prompt = build_user_prompt(
+                &task.title,
+                &task.business_description,
+                &inputs,
+                Some((ASSESSMENT_CONTRACT.0, ASSESSMENT_CONTRACT.1)),
+                contract_schema.as_deref(),
+            );
+            if let Err(e) = std::fs::write(evidence.join(AUDITOR_PROMPT_FILE), prompt) {
+                let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store auditor prompt in {}: {e}", evidence.display())), Utc::now());
+                return Err(RuntimeError::Store(e.into()));
+            }
+        }
+
         let req = ExecRequest {
             task_id: task.id,
             title: task.title.clone(),
@@ -787,5 +875,56 @@ impl<'a> Engine<'a> {
             });
         }
         Err(devai_store::StoreError::NotFound("agent".into(), name.to_string()).into())
+    }
+}
+
+#[cfg(test)]
+mod decisions_render_tests {
+    use super::*;
+    use devai_core::types::{new_id, Decision, Verdict};
+
+    fn decision(kind: &str, verdict: Verdict, rationale: Option<&str>) -> Decision {
+        Decision {
+            id: new_id(),
+            task_id: new_id(),
+            kind: kind.into(),
+            verdict,
+            actor: "human".into(),
+            rationale: rationale.map(|s| s.to_string()),
+            refs: vec![],
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn empty_decisions_yield_constant_marker() {
+        assert_eq!(decisions_prompt_text(&[]), "(no decisions recorded for this task)\n");
+    }
+
+    #[test]
+    fn stored_fields_are_reproduced_verbatim_in_stored_order() {
+        let a = decision("requirements_approval", Verdict::Approved, Some("OQ1=X"));
+        let b = decision("rework", Verdict::NeedsRevision, Some("line1\nline2"));
+        let text = decisions_prompt_text(&[a.clone(), b.clone()]);
+        assert!(text.contains(&format!("- kind: {}\n  verdict: APPROVED\n  actor: {}\n", a.kind, a.actor)));
+        assert!(text.contains("  rationale: OQ1=X\n"));
+        assert!(text.contains(&format!("  verdict: {}\n", b.verdict.as_str())));
+        assert!(text.contains("  rationale: line1\n  line2\n"));
+        assert!(text.find(&a.kind).unwrap() < text.find(&b.kind).unwrap());
+    }
+
+    #[test]
+    fn null_rationale_is_marked_not_dropped() {
+        let d = decision("acceptance", Verdict::Approved, None);
+        let text = decisions_prompt_text(&[d]);
+        assert!(text.contains("  rationale: (none stored)\n"), "{text}");
+    }
+
+    #[test]
+    fn render_is_deterministic_for_identical_inputs() {
+        let d = decision("requirements_approval", Verdict::Approved, Some("OQ1=X"));
+        let x = decisions_prompt_text(&[d.clone()]);
+        let y = decisions_prompt_text(&[d]);
+        assert_eq!(x, y, "same stored rows -> byte-identical section text");
     }
 }
