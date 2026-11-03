@@ -234,9 +234,12 @@ enum TaskCmd {
         limit: Option<usize>,
     },
     /// Register a typed task dependency: 'parent' ("породила" — why this
-    /// task exists) or 'blocks' ("не может продолжиться без той" — resume
-    /// and acceptance refused while open). Works at creation (--parent /
-    /// --blocked-by) and retroactively, from either moment (REQ-DEP-07).
+    /// task exists, pure genealogy, never gates — approved OQ3) or 'blocks'
+    /// ("не может продолжиться без той" — resume and acceptance refused
+    /// while open; closed only when the blocker is ACCEPTED, approved OQ1).
+    /// Works at creation (--parent / --blocked-by) and retroactively, from
+    /// either moment (REQ-DEP-07). Cycles are rejected WITHIN each kind
+    /// (approved OQ4); a mixed parent↔blocks cycle is legal.
     Depend {
         /// The dependent task (id or unique prefix)
         id: String,
@@ -248,12 +251,49 @@ enum TaskCmd {
         kind: String,
     },
     /// Typed dependencies of one task: what it depends on (outgoing) and
-    /// what depends on it (incoming). An epic is not a separate entity —
-    /// a task with incoming edges IS the vertex of a plan tree here
-    /// (REQ-DEP-06), named by this ordinary dependency query.
+    /// what depends on it (incoming), ACTIVE edges only. An epic is not a
+    /// separate entity — per the ratified OQ8 the epic VERTEX (no outgoing
+    /// 'parent', incoming ones) reads out of this same dependency view
+    /// (REQ-DEP-06); `task epics` lists the whole registry.
     Dependencies {
         id: String,
     },
+    /// Supersede (the approved removal, OQ7: edges are immutable) an
+    /// ACTIVE dependency edge. The row stays in the store as SUPERSEDED
+    /// history with full attribution; the live graph stops seeing it, so a
+    /// gate it held opens and the same relation may be re-registered fresh.
+    Unlink {
+        /// The dependent task (id or unique prefix)
+        id: String,
+        /// The task it depends on (id or unique prefix)
+        #[arg(long)]
+        on: String,
+        /// Dependency kind to supersede: parent | blocks
+        #[arg(long)]
+        kind: String,
+    },
+    /// Human-escape of the dependency gate (approved OQ2): record an
+    /// explicit ratification to continue DESPITE open 'blocks'
+    /// dependencies. Stored as a `dependency_override` decision (verdict
+    /// APPROVED, refs = the covered blocker ids). The refusal itself stays
+    /// unconditional for anything not covered — a NEW blocker re-opens the
+    /// gate; nothing ever resumes or accepts automatically by itself.
+    Override {
+        /// The task whose gate is ratified (id or unique prefix)
+        id: String,
+        /// Blocker task ids this ratification covers; omit to cover
+        /// exactly the blockers open right now.
+        #[arg(long = "blocker", value_delimiter = ',')]
+        blocker: Vec<String>,
+        /// The operator's stated reason for continuing despite
+        #[arg(long)]
+        rationale: Option<String>,
+    },
+    /// Epic registry as a VIEW over the dependency graph (approved OQ8):
+    /// epic = task vertex with no outgoing ACTIVE 'parent' edge and at
+    /// least one incoming one. No separate epic entity exists — this is the
+    /// same stored dependency data, one query (REQ-DEP-06).
+    Epics,
     /// The task dependency graph with task states — planning-level "what
     /// is happening": every node, its outgoing typed edges and whether an
     /// open 'blocks' edge still holds it. Built purely from stored data

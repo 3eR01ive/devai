@@ -5,9 +5,11 @@
 //! credentials: a task must continue from domain data alone.
 //!
 //! Bundle format v2 (schema v4): adds `dependencies.jsonl` — the task's
-//! OUTGOING typed dependency edges (REQ-01 AC3: dependencies travel with
-//! the bundle like every other table). A v1 bundle simply carries no such
-//! file and imports unchanged. Edges reference the depended-on task BY ID,
+//! ACTIVE OUTGOING typed dependency edges (REQ-01 AC3: dependencies travel
+//! with the bundle like every other table; SUPERSEDED rows are local
+//! history and do not — the live graph restores, the audit trail stays on
+//! its machine). A v1 bundle simply carries no such file and imports
+//! unchanged. Edges reference the depended-on task BY ID,
 //! so importing a bundle whose blocker/parent is not yet in the target
 //! store fails LOUDLY on the FK and rolls the whole import back — import
 //! the blocker's bundle first; a dangling graph is never silently truncated.

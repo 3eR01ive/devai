@@ -13,7 +13,9 @@
 -- typed ('parent' genealogy / 'blocks' continuation gate). Existing v3
 -- databases gain it additively via migrations/004_task_dependencies.sql;
 -- tasks written before v4 simply have no edge rows and read as tasks with an
--- EMPTY dependency set, never as corrupt (REQ-08).
+-- EMPTY dependency set, never as corrupt (REQ-08). Edges are IMMUTABLE:
+-- removal marks the row SUPERSEDED (the artifacts status pattern, OQ7), so
+-- the full edge history stays in the table.
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -46,18 +48,29 @@ CREATE TABLE tasks(
 -- integrity is loud AT WRITE: self-dependency is rejected by the CHECK,
 -- dangling endpoints by the FKs (foreign_keys=ON; REQ-07 AC2). Attribution
 -- and time follow the decisions.actor precedent (REQ-07 AC3).
+-- Edges are IMMUTABLE (approved OQ7): "deleting" a dependency marks the
+-- row SUPERSEDED and never removes history — the artifacts status pattern
+-- (schema v3) applied to this table. Exactly one ACTIVE row per triple is
+-- pinned by the partial unique index below; re-registering a superseded
+-- edge inserts a NEW row, so the whole lineage of one relation stays
+-- readable. Reads of the live graph filter status='ACTIVE'.
 CREATE TABLE task_dependencies(
-  id             TEXT PRIMARY KEY,
-  task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  depends_on_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  kind           TEXT NOT NULL,
-  actor          TEXT NOT NULL,
-  created_at     TEXT NOT NULL,
-  CHECK (task_id <> depends_on_id),
-  UNIQUE (task_id, depends_on_id, kind)
+  id              TEXT PRIMARY KEY,
+  task_id         TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  depends_on_id   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind            TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','SUPERSEDED')),
+  actor           TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  superseded_actor TEXT NULL,
+  superseded_at   TEXT NULL,
+  CHECK (task_id <> depends_on_id)
 );
 CREATE INDEX task_deps_task ON task_dependencies(task_id);
 CREATE INDEX task_deps_depends_on ON task_dependencies(depends_on_id);
+CREATE UNIQUE INDEX task_dependencies_single_active
+  ON task_dependencies(task_id, depends_on_id, kind)
+  WHERE status = 'ACTIVE';
 
 CREATE TABLE artifacts(
   id               TEXT PRIMARY KEY,

@@ -314,21 +314,54 @@ impl Store {
     // task dependency graph (REQ-01/02/07)
     // ------------------------------------------------------------------
 
-    /// Shared projection of one stored edge with the JOINed states/titles of
-    /// both endpoint tasks. The states are a read-time projection, never
-    /// denormalised onto the edge — one query yields dependencies AND task
-    /// states (REQ-04 AC1).
+    /// Shared projection of one ACTIVE stored edge with the JOINed
+    /// states/titles of both endpoint tasks. The states are a read-time
+    /// projection, never denormalised onto the edge — one query yields
+    /// dependencies AND task states (REQ-04 AC1). Callers add their own
+    /// `WHERE d.status='ACTIVE' AND ...`: SUPERSEDED rows are history, they
+    /// leave every live read (ratified OQ7) but stay in the table forever.
     const DEPENDENCY_EDGE_SELECT: &'static str = "SELECT d.id, d.task_id, t.state, t.title, d.depends_on_id, p.state, p.title, d.kind, d.actor, d.created_at \
         FROM task_dependencies d JOIN tasks t ON t.id = d.task_id JOIN tasks p ON p.id = d.depends_on_id";
 
+    /// Is there already an ACTIVE path `from →*→ to` over edges of `kind`?
+    /// Used by `link_task_dependency` to reject cycles WITHIN one kind
+    /// (ratified OQ4: the parent graph and the blocks graph are each a DAG)
+    /// while a MIXED cycle — the standard backfill/gate case, child `blocks`
+    /// its parent while the parent `parent`-links the child — stays legal.
+    /// A one-row SQL constraint cannot express transitive reachability, so
+    /// the walk is code (the documented data/code boundary of the ladder).
+    fn kind_path_exists(&self, from: Id, to: Id, kind: DependencyKind) -> StoreResult<bool> {
+        let mut frontier = vec![from.to_string()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(from.to_string());
+        let target = to.to_string();
+        while let Some(node) = frontier.pop() {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT depends_on_id FROM task_dependencies WHERE task_id=?1 AND kind=?2 AND status='ACTIVE'")?;
+            let mut rows = stmt.query(params![node, kind.as_str()])?;
+            while let Some(r) = rows.next()? {
+                let next: String = r.get(0)?;
+                if next == target {
+                    return Ok(true);
+                }
+                if seen.insert(next.clone()) {
+                    frontier.push(next);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Registers a typed dependency edge `task_id → depends_on_id` (REQ-07).
     /// Integrity is LOUD AT WRITE, never silently ignored on read:
-    /// self-dependency and a duplicate of the same (task, depends-on, kind)
-    /// triple are rejected here (and pinned again by the CHECK/UNIQUE in
-    /// v4 DDL); a dangling endpoint surfaces as `NotFound`. The edge stores
-    /// its author and creation time (the `decisions.actor` precedent) and
-    /// lands in `workflow_events` as `task.dependency.linked` inside ONE
-    /// transaction — the relation and its provenance are never half-written.
+    /// self-dependency, a duplicate ACTIVE edge and — ratified OQ4 — an edge
+    /// closing a cycle inside one kind are rejected here (the self-check and
+    /// the single-ACTIVE partial index pin the shapes again in v4 DDL); a
+    /// dangling endpoint surfaces as `NotFound`. The edge stores its author
+    /// and creation time (the `decisions.actor` precedent) and lands in
+    /// `workflow_events` as `task.dependency.linked` inside ONE transaction
+    /// — the relation and its provenance are never half-written.
     pub fn link_task_dependency(&self, task_id: Id, depends_on_id: Id, kind: DependencyKind, actor: &str, now: Timestamp) -> StoreResult<TaskDependency> {
         if task_id == depends_on_id {
             return Err(StoreError::InvalidDependency(format!(
@@ -342,7 +375,7 @@ impl Store {
         let duplicate: Option<String> = self
             .conn
             .query_row(
-                "SELECT id FROM task_dependencies WHERE task_id=?1 AND depends_on_id=?2 AND kind=?3",
+                "SELECT id FROM task_dependencies WHERE task_id=?1 AND depends_on_id=?2 AND kind=?3 AND status='ACTIVE'",
                 params![task_id.to_string(), depends_on_id.to_string(), kind.as_str()],
                 |r| r.get(0),
             )
@@ -350,6 +383,16 @@ impl Store {
         if duplicate.is_some() {
             return Err(StoreError::InvalidDependency(format!(
                 "dependency `{task_id}` —{}→ `{depends_on_id}` already exists",
+                kind.as_str()
+            )));
+        }
+        // Ratified OQ4: adding `task_id → depends_on_id` would close a cycle
+        // in this kind iff an ACTIVE same-kind path already runs the OTHER
+        // way, `depends_on_id →*→ task_id`. Refused loudly, never stored.
+        if self.kind_path_exists(depends_on_id, task_id, kind)? {
+            return Err(StoreError::InvalidDependency(format!(
+                "dependency `{task_id}` —{}→ `{depends_on_id}` would close a {}-cycle; each kind must stay a DAG (mixed parent/blocks cycles are legal)",
+                kind.as_str(),
                 kind.as_str()
             )));
         }
@@ -367,7 +410,7 @@ impl Store {
         };
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,actor,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,status,actor,created_at) VALUES(?1,?2,?3,?4,'ACTIVE',?5,?6)",
             params![edge.id.to_string(), edge.task_id.to_string(), edge.depends_on_id.to_string(), kind.as_str(), edge.actor, rows::ts(&edge.created_at)],
         )?;
         tx.execute(
@@ -389,14 +432,15 @@ impl Store {
         Ok(edge)
     }
 
-    /// Outgoing edges of one task — what it depends on (the resume/accept
-    /// gate input; REQ-03). A task with no edge rows (every task created
-    /// before v4, or one with nothing registered) returns an EMPTY list,
-    /// never an error (REQ-08 AC2).
+    /// Outgoing ACTIVE edges of one task — what it depends on (the
+    /// resume/accept gate input; REQ-03). A task with no edge rows (every
+    /// task created before v4, or one with nothing registered) returns an
+    /// EMPTY list, never an error (REQ-08 AC2). SUPERSEDED edges are
+    /// history and never appear here (ratified OQ7).
     pub fn task_dependencies(&self, task_id: Id) -> StoreResult<Vec<TaskDependency>> {
         let mut stmt = self
             .conn
-            .prepare(&format!("{} WHERE d.task_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
+            .prepare(&format!("{} WHERE d.status='ACTIVE' AND d.task_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -405,35 +449,119 @@ impl Store {
         Ok(out)
     }
 
-    /// Incoming edges of one task — which tasks depend on it. This is the
-    /// SAME query shape as the outgoing view: an "epic" needs no separate
-    /// entity, the epic role of a task is named by this ordinary dependency
-    /// read (REQ-06 AC2).
+    /// Incoming ACTIVE edges of one task — which tasks depend on it. This
+    /// is the SAME query shape as the outgoing view: an "epic" needs no
+    /// separate entity at all — ratified OQ8 names it by shape over this
+    /// ordinary dependency relation (`epic_heads` below, REQ-06 AC2).
     pub fn incoming_dependencies(&self, task_id: Id) -> StoreResult<Vec<TaskDependency>> {
         let mut stmt = self
             .conn
-            .prepare(&format!("{} WHERE d.depends_on_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
+            .prepare(&format!("{} WHERE d.status='ACTIVE' AND d.depends_on_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(rows::dependency_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    /// The approved removal semantics of an edge (RATIFIED DECISION OQ7):
+    /// "delete" = mark the row SUPERSEDED, never erase. The same-status
+    /// pattern the artifacts table set in v3 — history is COMPLETE: the row
+    /// keeps its author and created_at and gains who and when superseded
+    /// it. Afterwards the live graph no longer sees the edge (a gate it
+    /// held opens), a duplicate re-registration may create a fresh ACTIVE
+    /// row (the partial unique index covers ACTIVE only), and both rows
+    /// stay readable in the table forever. One transaction writes the flip
+    /// and the `task.dependency.unlinked` event.
+    pub fn supersede_task_dependency(&self, task_id: Id, depends_on_id: Id, kind: DependencyKind, actor: &str, now: Timestamp) -> StoreResult<TaskDependency> {
+        let found: Option<TaskDependency> = self
+            .conn
+            .query_row(
+                &format!(
+                    "{} WHERE d.status='ACTIVE' AND d.task_id=?1 AND d.depends_on_id=?2 AND d.kind=?3",
+                    Self::DEPENDENCY_EDGE_SELECT
+                ),
+                params![task_id.to_string(), depends_on_id.to_string(), kind.as_str()],
+                |r| rows::r2sql(rows::dependency_from_row(r)),
+            )
+            .optional()?;
+        let Some(edge) = found else {
+            return Err(StoreError::InvalidDependency(format!(
+                "no active `{task_id}` —{}→ `{depends_on_id}` dependency to supersede",
+                kind.as_str()
+            )));
+        };
+        let edge_id = edge.id.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE task_dependencies SET status='SUPERSEDED', superseded_actor=?2, superseded_at=?3 WHERE id=?1 AND status='ACTIVE'",
+            params![edge_id, actor, rows::ts(&now)],
+        )?;
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                task_id.to_string(),
+                event_kind::TASK_DEPENDENCY_UNLINKED,
+                actor,
+                json_string(&serde_json::json!({
+                    (json_field::DEPENDENCY_ID): edge_id,
+                    (json_field::DEPENDS_ON_ID): depends_on_id.to_string(),
+                    (json_field::DEPENDENCY_KIND): kind.as_str(),
+                })),
+                rows::ts(&now),
+            ],
+        )?;
+        tx.commit()?;
+        // The caller gets back the edge exactly as it was while ACTIVE.
+        Ok(edge)
+    }
+
+    /// The epic registry as a VIEW over the stored graph (REQ-06, RATIFIED
+    /// DECISION OQ8): epic = vertex with NO outgoing ACTIVE `parent` edge
+    /// and AT LEAST ONE incoming one. No epic table, no epic column — the
+    /// SAME `task_dependencies` relation and its ACTIVE rows answer, in one
+    /// query (REQ-06 AC1/AC2). Blocking edges do not make a vertex an epic:
+    /// only the genealogy kind defines the derivation tree.
+    pub fn epic_heads(&self) -> StoreResult<Vec<EpicVertex>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.project_id, t.title, t.business_description, t.state, t.return_state,
+                    t.requirements_seq, t.lock_version, t.created_at, t.updated_at,
+                    (SELECT count(*) FROM task_dependencies c
+                      WHERE c.depends_on_id = t.id AND c.kind = 'parent' AND c.status = 'ACTIVE')
+             FROM tasks t
+             WHERE NOT EXISTS (SELECT 1 FROM task_dependencies p
+                                 WHERE p.task_id = t.id AND p.kind = 'parent' AND p.status = 'ACTIVE')
+               AND EXISTS (SELECT 1 FROM task_dependencies c
+                            WHERE c.depends_on_id = t.id AND c.kind = 'parent' AND c.status = 'ACTIVE')
+             ORDER BY t.updated_at DESC, t.id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(EpicVertex {
+                task: rows::task_from_row(r)?,
+                derived_children: r.get::<_, i64>(10)? as usize,
+            });
         }
         Ok(out)
     }
 
     /// The WHOLE graph in ONE query: every task node with its state and its
-    /// outgoing typed edges (both endpoint states included). This is what
-    /// makes the plan computable from platform data alone — a roadmap
+    /// outgoing ACTIVE typed edges (both endpoint states included). This is
+    /// what makes the plan computable from platform data alone — a roadmap
     /// consumer takes this set, the ready set is `open_blockers` per node
     /// (REQ-04 AC1/AC2) — and the planning-level "what is happening"
-    /// view (REQ-05 AC1). Tasks without edges appear with an empty set.
+    /// view (REQ-05 AC1). Tasks without edges appear with an empty set;
+    /// SUPERSEDED edges join in only as nothing (live graph = ACTIVE).
     pub fn dependency_graph(&self) -> StoreResult<Vec<DependencyNode>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.business_description, t.state, t.return_state,
                     t.requirements_seq, t.lock_version, t.created_at, t.updated_at,
                     d.id, d.kind, d.depends_on_id, d.actor, d.created_at, p.state, p.title
              FROM tasks t
-             LEFT JOIN task_dependencies d ON d.task_id = t.id
+             LEFT JOIN task_dependencies d ON d.task_id = t.id AND d.status = 'ACTIVE'
              LEFT JOIN tasks p ON p.id = d.depends_on_id
              ORDER BY t.updated_at DESC, t.id, d.created_at, d.id",
         )?;

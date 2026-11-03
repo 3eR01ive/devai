@@ -116,10 +116,43 @@ fn cli_links_dependencies_at_creation_and_gates_resume_on_open_blockers() {
     assert!(err.contains("open blocking dependencies") && err.contains(&a_id), "refusal names the blocker: {err}");
     assert_eq!(devai_json(h, &["task", "get", &b_id])["state"], "PAUSED", "the refusal moved nothing");
 
-    // REQ-DEP-03 AC3: once the blocker closes (terminal state), resume passes.
-    devai(h, &["task", "cancel", &a_id, "--reason", "closed by the human"]);
+    // RATIFIED DECISION OQ4 at the CLI: a parent edge the OTHER way would
+    // close a parent cycle — refused loudly, exit nonzero.
+    let err = devai_fails(h, &["task", "depend", &a_id, "--on", &b_id, "--kind", "parent"]);
+    assert!(err.contains("cycle"), "per-kind cycle refused: {err}");
+
+    // RATIFIED DECISION OQ1: cancelling the blocker does NOT close the
+    // edge — a dead dependency is an unresolved problem, resume still fails.
+    devai(h, &["task", "cancel", &a_id, "--reason", "cancelled, not resolved"]);
+    let err = devai_fails(h, &["task", "resume", &b_id]);
+    assert!(err.contains("open blocking dependencies") && err.contains(&a_id), "CANCELLED does not close (OQ1): {err}");
+
+    // RATIFIED DECISION OQ2 — the human escape: `task override` records an
+    // explicit dependency_override decision covering the OPEN blockers.
+    // Recording it changes NOTHING (auto-unpause forbidden) — the task
+    // stays PAUSED until the human himself runs resume.
+    let ovr = devai(h, &["task", "override", &b_id, "--rationale", "proceeding despite the cancelled backfill"]);
+    assert!(ovr.contains("override recorded"), "{ovr}");
+    assert_eq!(devai_json(h, &["task", "get", &b_id])["state"], "PAUSED", "the override alone resumed nothing (OQ2)");
     devai(h, &["task", "resume", &b_id]);
     assert_eq!(devai_json(h, &["task", "get", &b_id])["state"], "DRAFT");
+
+    // The override act is stored history with the covered blockers.
+    let evs = devai_json(h, &["task", "events", &b_id]);
+    let over = evs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "task.dependency.overridden")
+        .expect("override event recorded");
+    assert!(over["payload"]["blockers"].as_array().unwrap().iter().any(|x| x == &a_id), "blocker covered: {over}");
+
+    // REQ-DEP-06 + OQ8: `b` CARRIES a parent edge (to `a`), so it is not a
+    // tree root; `a` is parent-less with an incoming 'parent' edge — the
+    // epic registry names exactly `a`.
+    let epics = devai_json(h, &["task", "epics"]);
+    let ids: Vec<&str> = epics.as_array().unwrap().iter().map(|e| e["task"]["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&a_id.as_str()) && !ids.contains(&b_id.as_str()), "epic = parent-less vertex WITH children: {ids:?}");
 }
 
 #[test]
@@ -164,10 +197,25 @@ fn acceptance_gate_reads_the_graph_and_write_time_integrity_is_loud_via_cli() {
     assert!(err.contains("open blocking dependencies") && err.contains(&d_id), "acceptance names the blocker: {err}");
     assert_eq!(devai_json(h, &["task", "get", &e_id])["state"], "QA", "the refused gate moved nothing");
 
-    // Blocker closed → the same acceptance command now passes.
-    devai(h, &["task", "cancel", &d_id, "--reason", "closed"]);
+    // RATIFIED DECISION OQ1 at the human gate: CANCELLING the blocker does
+    // NOT close the edge — a dead dependency is an unresolved problem, and
+    // re-tuning the graph is the human's own act.
+    devai(h, &["task", "cancel", &d_id, "--reason", "cancelled, not resolved"]);
+    let err = devai_fails(h, &["task", "accept", &e_id]);
+    assert!(err.contains("open blocking dependencies") && err.contains(&d_id), "CANCELLED does not close (OQ1): {err}");
+
+    // RATIFIED DECISION OQ7 at the CLI: removal = SUPERSEDE. The edge leaves
+    // the live graph, its row stays as history — and the same acceptance
+    // command now passes, while `dependencies` shows an empty live set.
+    let un = devai(h, &["task", "unlink", &e_id, "--on", &d_id, "--kind", "blocks"]);
+    assert!(un.contains("superseded"), "edge superseded:\n{un}");
+    let j = devai_json(h, &["task", "dependencies", &e_id]);
+    assert_eq!(j["outgoing"].as_array().unwrap().len(), 0, "superseded edge is not live");
     devai(h, &["task", "accept", &e_id]);
     assert_eq!(devai_json(h, &["task", "get", &e_id])["state"], "ACCEPTED");
+    // The supersede act is stored history.
+    let evs = devai_json(h, &["task", "events", &e_id]);
+    assert!(evs.as_array().unwrap().iter().any(|e| e["kind"] == "task.dependency.unlinked"), "unlinked event recorded");
 }
 
 /// REQ-DEP-07: the linking act is itself recorded as platform history through
