@@ -338,6 +338,10 @@ impl<'a> Engine<'a> {
     /// (A-002): a profile or role version bump alone is stale, forcing re-audit.
     fn fresh_bound_report(&self, task: &Task) -> RuntimeResult<Option<(Artifact, WorkspaceRevision)>> {
         let artifacts = self.store.artifacts(task.id)?;
+        // Selection by status=CURRENT alone (REQ-005): schema v3 keeps at
+        // most one CURRENT per (task_id, kind) — DB-pinned — so the filter
+        // is already single-valued; the `max_by_key(seq)` is a defensive
+        // belt for legacy-shape slices, not a UI-side workaround.
         let Some(report) = artifacts
             .iter()
             .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
@@ -376,6 +380,9 @@ impl<'a> Engine<'a> {
         let agent = self.resolve_agent(agent_name)?;
 
         let artifacts = self.store.artifacts(task.id)?;
+        // Status-only selection, single-valued since schema v3 (REQ-005);
+        // the seq tie-break below is the same defensive belt as in
+        // `fresh_bound_report` — never a substitute for the domain invariant.
         let spec = artifacts
             .iter()
             .filter(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current)

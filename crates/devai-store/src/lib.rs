@@ -22,13 +22,15 @@ use devai_core::workflow::Mutation;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-/// The schema version this build creates and expects. The ladder of schema
-/// versions is DATA (`SCHEMA_STEPS`, REQ-004 / arch-registry-in-data v5):
-/// order, `from`/`to`, id and SQL script path per rung live in the
-/// manifest; `open()` is a generic executor that walks it and never grows
-/// a branch. Bumping this const without registering a matching rung is a
-/// compile-time error (the const assertion below the registry).
-pub const SCHEMA_VERSION: i64 = 3;
+// The schema ladder is DATA (REQ-004 / arch/registry-in-data v5): the
+// catalog — order, `from`/`to`, stable id, SQL script path and apply-handler
+// tag per rung — lives in `migrations/manifest.json`; `build.rs` mirrors it
+// (plus the script contents, single-binary discipline) into the generated
+// file included here, failing the BUILD when the ladder is not continuous
+// 1→N or a cited script is missing. `SCHEMA_VERSION` and `SCHEMA_RUNGS_RAW`
+// below are that generated data, not hand-written code: adding a schema
+// version appends a manifest record + a .sql file and never edits `open()`.
+include!(concat!(env!("OUT_DIR"), "/schema_manifest.rs"));
 
 /// Actor prefix on migration events: `migration:<rung id>` — derived from
 /// the registry record, so renaming a rung relabels its events consistently.
@@ -56,62 +58,41 @@ const MULTI_CURRENT_LOSER_PREDICATE: &str = "status = 'CURRENT' AND EXISTS (\
         OR (b.seq = artifacts.seq AND b.created_at > artifacts.created_at) \
         OR (b.seq = artifacts.seq AND b.created_at = artifacts.created_at AND b.id > artifacts.id)))";
 
-/// One rung of the schema ladder. `apply` is deliberately a function
-/// pointer — the code-vs-data boundary of the registry (REQ-004): pure SQL
-/// can express every rung's DDL/DML verbatim, but two things cannot be
-/// data: (1) observing the pre-repair state BEFORE the mutation so the
-/// repair events can cite it (`supersession_backfill`), and (2) — for
-/// future rungs — shape detection before a rebuild. `apply` therefore
-/// stays code with this justification comment; the rung's identity, order,
-/// version range and script are manifest data read by the executor.
-type RungApply = fn(&Transaction<'_>, &SchemaStep) -> StoreResult<()>;
-
-struct SchemaStep {
-    /// The version this rung upgrades FROM. Its position in SCHEMA_STEPS
-    /// is the execution order (the ladder is continuous: from+1 == to).
-    from: i64,
-    to: i64,
-    /// Stable id: cited in migration events (`backfill`) and errors.
-    id: &'static str,
+/// One rung of the ladder, materialised from the generated manifest data.
+pub struct SchemaRung {
+    /// The version this rung upgrades FROM; execution order is manifest order.
+    pub from: i64,
+    pub to: i64,
+    /// Stable id: cited in migration events (`migration:<id>`) and errors.
+    pub id: &'static str,
     /// Repository-relative path of the shipped SQL, manifest data (cited
-    /// in migration event payloads for auditability).
-    script_path: &'static str,
-    /// The script content itself, baked at compile time from `script_path`
-    /// (the single-binary discipline of `include_str!`).
-    script: &'static str,
-    apply: RungApply,
+    /// in repair-event payloads for auditability).
+    pub script_path: &'static str,
+    /// Apply-handler tag from the manifest, resolved through `RUNG_APPLIERS`.
+    pub apply: &'static str,
+    /// The script content itself, baked from `script_path` at build time
+    /// (the single-binary discipline of `include_str!`, via `build.rs`).
+    pub script: &'static str,
 }
 
-const SCHEMA_STEPS: &[SchemaStep] = &[
-    SchemaStep {
-        from: 1,
-        to: 2,
-        id: "002_workspace_revision",
-        script_path: "migrations/002_workspace_revision.sql",
-        script: include_str!("../migrations/002_workspace_revision.sql"),
-        apply: apply_script,
-    },
-    SchemaStep {
-        from: 2,
-        to: 3,
-        id: "003_artifact_supersession",
-        script_path: "migrations/003_artifact_supersession.sql",
-        script: include_str!("../migrations/003_artifact_supersession.sql"),
-        apply: supersession_backfill,
-    },
-];
+/// Load the ladder as data: one `SchemaRung` per manifest record, in the
+/// manifest's order. The generic executor walks this; it knows no rung name.
+pub(crate) fn schema_rungs() -> Vec<SchemaRung> {
+    SCHEMA_RUNGS_RAW.iter().map(|(id, from, to, script_path, apply, script)| SchemaRung { id, from: *from, to: *to, script_path, apply, script }).collect()
+}
 
-/// The ladder is one rung per step, continuous 1→SCHEMA_VERSION: a version
-/// bump without a registered rung, or a rung whose `to` is not `from+1`,
-/// fails HERE (compile time), not on some user's `open()`.
-const _: () = {
-    let mut i = 0;
-    while i < SCHEMA_STEPS.len() {
-        assert!(SCHEMA_STEPS[i].from + 1 == SCHEMA_STEPS[i].to);
-        i += 1;
-    }
-    assert!(SCHEMA_STEPS.len() as i64 + 1 == SCHEMA_VERSION);
-};
+/// The apply-handler table — the single place where the ladder stays CODE,
+/// and why that is the right boundary (REQ-004 allows `apply` to remain a
+/// function pointer only with this justification): pure SQL expresses every
+/// rung's DDL/DML verbatim (the `"script"` tag), but SQL CANNOT observe the
+/// pre-mutation state BEFORE the UPDATE so the backfill events can cite
+/// exactly the rows the script flips (`supersession_backfill`), nor — for
+/// future rungs — detect table shape before a rebuild. A new pure-SQL rung
+/// appends a manifest record and NO code; only genuinely un-expressible
+/// behavior appends a handler here. The tag NAME is manifest data; this
+/// table maps name → behavior, failing loud on a tag it cannot run.
+type RungApply = fn(&Transaction<'_>, &SchemaRung) -> StoreResult<()>;
+const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill)];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
 pub struct Store {
@@ -136,20 +117,27 @@ impl Store {
         } else if version > SCHEMA_VERSION {
             return Err(StoreError::SchemaVersion { found: version, expected: SCHEMA_VERSION });
         } else {
-            // Generic ladder executor (REQ-004, sequence-as-data): walk the
-            // registry from the stored version up to SCHEMA_VERSION. ONE
-            // `BEGIN IMMEDIATE … COMMIT` per rung: the DDL, the backfill
-            // UPDATEs, the repair events and the `user_version` bump land
-            // atomically together — a crash can never leave a
-            // half-repaired group (REQ-003 acceptance "сбой посреди ранга").
-            // Rungs are additionally idempotent, so a database found in a
-            // hypothetical partial form (index present, version behind) is
-            // carried to completion instead of aborted.
+            // Generic ladder executor (REQ-004, registry-in-data): walk the
+            // manifest rungs from the stored version up to SCHEMA_VERSION.
+            // Which rung runs next, what SQL it ships and which handler
+            // applies it are READ FROM THE MANIFEST DATA — adding a schema
+            // version appends a `migrations/manifest.json` record and never
+            // grows a branch here. ONE `BEGIN IMMEDIATE … COMMIT` per rung:
+            // the DDL, the backfill UPDATEs, the repair events and the
+            // `user_version` bump land atomically together — a crash can
+            // never leave a half-repaired group (REQ-003 acceptance "сбой
+            // посреди ранга"). Rungs are additionally idempotent, so a
+            // database found in a hypothetical partial form (index present,
+            // version behind) is carried to completion instead of aborted.
+            let rungs = schema_rungs();
             let mut from = version;
             while from < SCHEMA_VERSION {
-                let step = SCHEMA_STEPS.iter().find(|s| s.from == from).ok_or(StoreError::SchemaVersion { found: from, expected: SCHEMA_VERSION })?;
+                let step = rungs.iter().find(|s| s.from == from).ok_or(StoreError::SchemaVersion { found: from, expected: SCHEMA_VERSION })?;
+                // Fail loud on a manifest tag with no behavior behind it —
+                // never silently skip a rung the catalog promised to run.
+                let apply = RUNG_APPLIERS.iter().find(|(name, _)| *name == step.apply).map(|(_, f)| *f).ok_or_else(|| StoreError::Corrupt(format!("manifest rung `{}` names unknown apply handler `{}` — refusing to run a migration it cannot describe", step.id, step.apply)))?;
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                (step.apply)(&tx, step)?;
+                apply(&tx, step)?;
                 tx.pragma_update(None, "user_version", step.to)?;
                 tx.commit()?;
                 from = step.to;
@@ -882,7 +870,7 @@ impl Store {
 
 /// The body of a pure-SQL rung: apply the shipped script verbatim. The
 /// executor already wraps it in the rung's transaction.
-fn apply_script(tx: &Transaction<'_>, step: &SchemaStep) -> StoreResult<()> {
+fn apply_script(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
     tx.execute_batch(step.script)?;
     Ok(())
 }
@@ -897,7 +885,7 @@ fn apply_script(tx: &Transaction<'_>, step: &SchemaStep) -> StoreResult<()> {
 /// `task.artifact.superseded` event citing its winner and every flipped id
 /// — the repair lands in the event log, not silently. A group that was
 /// already honest produces zero UPDATEs and zero events.
-fn supersession_backfill(tx: &Transaction<'_>, step: &SchemaStep) -> StoreResult<()> {
+fn supersession_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
     let losers: Vec<(String, String, String)> = {
         let mut stmt = tx.prepare(&format!(
             "SELECT task_id, kind, id FROM artifacts WHERE {MULTI_CURRENT_LOSER_PREDICATE} ORDER BY task_id, kind, seq"
@@ -1365,16 +1353,29 @@ mod supersession_tests {
         assert!(store.artifacts(t.id).is_err());
     }
 
-    /// REQ-004: the ladder is manifest data — continuous 1→SCHEMA_VERSION.
+    /// REQ-004: the ladder is manifest DATA — the generated table mirrors
+    /// `migrations/manifest.json` field-for-field (ids, ranges, script
+    /// paths, apply tags), is continuous 1→SCHEMA_VERSION, and every tag
+    /// resolves to a behavior. `SCHEMA_VERSION` itself is the manifest's
+    /// top rung, not a hand-maintained const.
     #[test]
     fn schema_registry_is_continuous_data() {
-        assert_eq!(SCHEMA_STEPS.first().unwrap().from, 1);
-        assert_eq!(SCHEMA_STEPS.last().unwrap().to, SCHEMA_VERSION);
-        for s in SCHEMA_STEPS {
-            assert_eq!(s.from + 1, s.to);
-            assert!(!s.id.is_empty() && !s.script.is_empty() && !s.script_path.is_empty());
+        let rungs = schema_rungs();
+        let doc: serde_json::Value = serde_json::from_str(include_str!("../migrations/manifest.json")).unwrap();
+        let records = doc["rungs"].as_array().unwrap();
+        assert_eq!(rungs.len(), records.len(), "one generated rung per manifest record, in manifest order");
+        let mut prev_to = 1; // the ladder starts at the fresh-install version (schema.sql)
+        for (rung, r) in rungs.iter().zip(records) {
+            assert_eq!(rung.from, prev_to, "ladder continuous 1→N");
+            assert_eq!(rung.to, rung.from + 1, "one rung advances exactly one version");
+            assert_eq!(rung.id, r["id"].as_str().unwrap(), "id is read from the manifest data");
+            assert_eq!(rung.script_path, r["script"].as_str().unwrap(), "script path is read from the manifest data");
+            assert_eq!(rung.apply, r["apply"].as_str().unwrap(), "apply tag is read from the manifest data");
+            assert!(!rung.script.is_empty() && !rung.id.is_empty());
+            // Fail-loud contract: a tag the executor cannot run must never be reachable.
+            assert!(RUNG_APPLIERS.iter().any(|(name, _)| *name == rung.apply), "apply tag `{}` of rung `{}` has no handler", rung.apply, rung.id);
+            prev_to = rung.to;
         }
-        // Rungs are found by data, not by if/else: an unregistered hole fails.
-        assert!(SCHEMA_STEPS.iter().all(|s| s.from < SCHEMA_VERSION));
+        assert_eq!(prev_to, SCHEMA_VERSION, "SCHEMA_VERSION is derived from the manifest top rung");
     }
 }

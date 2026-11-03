@@ -1,0 +1,30 @@
+{
+  "comment": [
+    "The declarative schema ladder (REQ-004, criterion arch/registry-in-data v5).",
+    "This file is the catalog: order, from/to, stable id, repository-relative SQL",
+    "script path and apply-handler tag of every rung live in DATA. Adding a schema",
+    "version = append a record here plus its .sql file; build.rs bakes the record",
+    "and the script content into the binary and fails the build when the ladder is",
+    "not continuous from 1. `open()` is a generic executor that knows no rung name.",
+    "`apply` selects the rung's BEHAVIOR: \"script\" means run the SQL verbatim and",
+    "needs no code; any other tag resolves at runtime against RUNG_APPLIERS in",
+    "src/lib.rs — the documented code/data boundary for rungs pure SQL cannot",
+    "express (observe pre-mutation state, write repair events)."
+  ],
+  "rungs": [
+    {
+      "id": "002_workspace_revision",
+      "from": 1,
+      "to": 2,
+      "script": "migrations/002_workspace_revision.sql",
+      "apply": "script"
+    },
+    {
+      "id": "003_artifact_supersession",
+      "from": 2,
+      "to": 3,
+      "script": "migrations/003_artifact_supersession.sql",
+      "apply": "supersession_backfill"
+    }
+  ]
+}
