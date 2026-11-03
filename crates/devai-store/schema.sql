@@ -1,4 +1,4 @@
--- Devai local store schema (v3).
+-- Devai local store schema (v4).
 -- SQLite is the local system of record; everything is domain data so a task
 -- can be restored after a restart and exported for portability.
 -- v2 adds workspace provenance: role_executions.workspace_revision and the
@@ -8,6 +8,10 @@
 -- v3 adds the artifact supersession invariant: exactly one CURRENT row per
 -- (task_id, kind), pinned by the partial unique index below. Existing v2
 -- databases are repaired by migrations/003_artifact_supersession.sql.
+-- v4 adds no table shape beyond the read index below: the v3→v4 rung
+-- (migrations/004_decisions_backfill.sql) backfills NEW decision rows from
+-- historical approve/reject/return event payloads — a one-time DATA repair,
+-- append-only, no column touched.
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -132,6 +136,11 @@ CREATE TABLE decisions(
   refs       TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL
 );
+-- The decisions read/disclosure index (v4; same index the v3→v4 rung builds,
+-- so fresh and migrated databases keep identical shapes). list_decisions
+-- filters by task and reproduces the stored chronology (ORDER BY created_at);
+-- the backfill's "already disclosed" predicate scans the same column.
+CREATE INDEX decisions_task ON decisions(task_id, created_at);
 
 CREATE TABLE questions(
   id           TEXT PRIMARY KEY,

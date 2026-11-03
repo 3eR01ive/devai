@@ -25,6 +25,13 @@
       "to": 3,
       "script": "migrations/003_artifact_supersession.sql",
       "apply": "supersession_backfill"
+    },
+    {
+      "id": "004_decisions_backfill",
+      "from": 3,
+      "to": 4,
+      "script": "migrations/004_decisions_backfill.sql",
+      "apply": "decisions_backfill"
     }
   ]
 }
