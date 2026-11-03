@@ -21,7 +21,10 @@ pub enum CoreError {
     /// REQ-03: continuation (resume from a hold state) and human acceptance
     /// are refused while the task has OPEN `blocks` dependencies. The
     /// blocking task ids are carried as structured data — the refusal must
-    /// enumerate them, not merely name one cause.
+    /// enumerate them, not merely name one cause. The only release is the
+    /// operator's own `dependency_override` decision (ratified OQ2), checked
+    /// before this error is produced — reaching it means no ratification
+    /// covers every open blocker.
     #[error("open blocking dependencies: {}", blockers.join(", "))]
     OpenBlockers { blockers: Vec<String> },
 }

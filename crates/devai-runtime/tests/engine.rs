@@ -117,7 +117,7 @@ fn accepted(store: &Store, id: &str) {
     let a = store.artifacts(t.id).unwrap();
     // &[]: this task stores no dependency edges (REQ-08 AC2 — the absence
     // of rows is an empty set, so acceptance is unchanged for old tasks).
-    let m = workflow::accept(&t, &a, &[], Some("test"), "tester", Utc::now()).unwrap();
+    let m = workflow::accept(&t, &a, &[], &[], Some("test"), "tester", Utc::now()).unwrap();
     store.commit(t.lock_version, &m).unwrap();
 }
 
