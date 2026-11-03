@@ -448,9 +448,15 @@ enum ExecCmd {
     Cancel {
         exec_id: String,
     },
+    /// List executions. With --active: a read-only snapshot of RUNNING
+    /// executions across all tasks — task, role@version, elapsed, workflow
+    /// stage, worktree link. Detail of one task stays in `task progress`.
     List {
         #[arg(long)]
         task: Option<String>,
+        /// Only RUNNING executions, enriched with task stage and worktree link
+        #[arg(long)]
+        active: bool,
     },
 }
 

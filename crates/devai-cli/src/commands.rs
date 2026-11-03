@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -1364,11 +1365,17 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
             ctx.store.finish_execution(&e, ExecutionStatus::Cancelled, None, None, ctx.now())?;
             outln!("execution {} cancelled (cooperative stop acknowledged)", short(&e.id));
         }
-        ExecCmd::List { task } => {
+        ExecCmd::List { task, active } => {
             let tid = match task.as_deref() {
                 Some(id) => Some(ctx.store.resolve_task(id)?.id),
                 None => None,
             };
+            if active {
+                // REQ-ACT-01: `--active` replaces the manual chain of
+                // exec list + a python RUNNING filter + pgrep with one
+                // snapshot view. Read-only: nothing here transitions states.
+                return active_overview(ctx, tid, json);
+            }
             let es = ctx.store.list_executions(tid)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&es)?);
@@ -1391,6 +1398,102 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// `devai exec list --active [--json]` — «что сейчас активно» in one view: a
+/// read-only snapshot of every RUNNING execution in the store (REQ-ACT-01).
+/// Like the progress view, the renderer owns no state-machine knowledge: the
+/// stage is the task's live `TaskState::as_str()` read from the store
+/// (REQ-ACT-05), and the worktree link is printed only where the platform
+/// recorded the `worktree.prepared` fact for that task — otherwise a dash,
+/// never an invented directory (REQ-ACT-02). The command waits for nothing
+/// and writes nothing: print the snapshot, exit 0 — an empty list is the
+/// normal idle state, not an error (REQ-ACT-04). It deliberately stops short
+/// of the per-task pipeline: `task progress <id>` stays the single owner of
+/// that detail, so the row carries the task id (REQ-ACT-06).
+fn active_overview(ctx: &Ctx, task_filter: Option<Id>, json: bool) -> Result<()> {
+    let now = ctx.now();
+    let mut running: Vec<RoleExecution> = ctx
+        .store
+        .list_executions(task_filter)?
+        .into_iter()
+        .filter(|e| e.status == ExecutionStatus::Running)
+        .collect();
+    // Interim answer to OQ-3 (business fixed no order): longest-running
+    // first, ties broken by id — deterministic, so two snapshots of an
+    // unchanged state differ at most by the allowed elapsed growth.
+    running.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
+
+    // Engine facts per distinct task, resolved once: the live task row (for
+    // the stage) and whether the platform ever recorded `worktree.prepared`
+    // — the only honest source for the worktree link, since a RUNNING
+    // execution row does not carry it. The OS pid is nowhere in the store
+    // (spec unknowns), so this view reports "what is RUNNING in the store",
+    // not "what process is alive" (OQ-2 stays with the orphan-guard task).
+    let mut facts: HashMap<Id, (Task, bool)> = HashMap::new();
+    for e in &running {
+        if !facts.contains_key(&e.task_id) {
+            let t = ctx.store.get_task(&e.task_id.to_string())?;
+            let prepared = ctx
+                .store
+                .all_events_for_task(t.id)?
+                .iter()
+                .any(|ev| ev.kind == event_kind::WORKTREE_PREPARED);
+            facts.insert(e.task_id, (t, prepared));
+        }
+    }
+
+    let rows: Vec<serde_json::Value> = running
+        .iter()
+        .map(|e| {
+            let (t, prepared) = &facts[&e.task_id];
+            serde_json::json!({
+                "id": e.id.to_string(),
+                "task_id": e.task_id.to_string(),
+                "task_title": t.title,
+                "role": format!("{}@{}", e.role_slug, e.role_version),
+                "role_slug": e.role_slug,
+                "role_version": e.role_version,
+                "agent_name": e.agent_name,
+                "started_at": e.started_at,
+                "elapsed_seconds": (now - e.started_at).num_seconds().max(0),
+                "state": t.state.as_str(),
+                "branch": prepared.then(|| worktree::branch_name(e.task_id)),
+                "worktree": prepared.then(|| worktree::path_for(&ctx.home, e.task_id).display().to_string()),
+            })
+        })
+        .collect();
+
+    if json {
+        // REQ-ACT-03: exactly one JSON object on stdout, nothing before or
+        // after it — early return, the progress-view precedent.
+        outln!("{}", serde_json::json!({"snapshot_at": now, "rows": rows}));
+        return Ok(());
+    }
+    if rows.is_empty() {
+        outln!("(no running executions)");
+        return Ok(());
+    }
+    for e in &running {
+        let (t, prepared) = &facts[&e.task_id];
+        // Interim answer to OQ-6: short ids keep one line per execution
+        // readable on a narrow terminal; the title travels in --json.
+        let link = if *prepared {
+            format!("{}  {}", worktree::branch_name(e.task_id), worktree::path_for(&ctx.home, e.task_id).display())
+        } else {
+            "—".to_string()
+        };
+        outln!(
+            "  {:<12} {:<12} {:<24} {:<16} {:>9}  {}",
+            short(&e.task_id),
+            short(&e.id),
+            format!("{}@{}", e.role_slug, e.role_version),
+            t.state.as_str(),
+            format!("elapsed {}", human_elapsed((now - e.started_at).num_seconds())),
+            link
+        );
     }
     Ok(())
 }
