@@ -134,7 +134,7 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
 
 fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::New { title, project, description, description_file } => {
+        TaskCmd::New { title, project, description, description_file, parent, blocked_by } => {
             let project_id = match project.as_deref() {
                 Some(name) => Some(ctx.store.get_project(name)?.context(format!("project `{name}` not found"))?.id),
                 None => None,
@@ -145,10 +145,26 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             };
             let t = Task::new(title, desc, project_id, ctx.now());
             ctx.store.create_task(&t)?;
+            // REQ-DEP-07: a derived task records WHY it exists at the moment
+            // it is created — the genealogy/blocking never leaves for the
+            // operator chat. Dangling references fail loudly here (resolve),
+            // exactly as they would via `task depend`.
+            let mut linked: Vec<TaskDependency> = Vec::new();
+            for p in &parent {
+                let pt = ctx.store.resolve_task(p)?;
+                linked.push(ctx.store.link_task_dependency(t.id, pt.id, DependencyKind::Parent, &ctx.actor, ctx.now())?);
+            }
+            for b in &blocked_by {
+                let bt = ctx.store.resolve_task(b)?;
+                linked.push(ctx.store.link_task_dependency(t.id, bt.id, DependencyKind::Blocks, &ctx.actor, ctx.now())?);
+            }
             if json {
                 outln!("{}", serde_json::to_string_pretty(&t)?);
             } else {
                 outln!("task {} created in DRAFT — workflow is owned by devai", short(&t.id));
+                for d in &linked {
+                    outln!("  depends {} {} ({} in {})", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title);
+                }
                 outln!("start it with: devai task start {}", short(&t.id));
             }
         }
@@ -219,11 +235,23 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             })?;
         }
         TaskCmd::Reject { id, rationale } => op(ctx, &id, move |t, _a| workflow::reject_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
-        TaskCmd::Accept { id, rationale } => op(ctx, &id, move |t, a| workflow::accept(t, a, rationale.as_deref(), &ctx.actor, ctx.now()))?,
+        TaskCmd::Accept { id, rationale } => {
+            // REQ-DEP-03: the human acceptance gate reads the stored
+            // dependency graph — an open 'blocks' edge refuses the gate and
+            // the refusal enumerates the blocking task ids as data.
+            let deps = ctx.store.task_dependencies(ctx.store.resolve_task(&id)?.id)?;
+            op(ctx, &id, move |t, a| workflow::accept(t, a, &deps, rationale.as_deref(), &ctx.actor, ctx.now()))?;
+        }
         TaskCmd::Return { id, rationale } => op(ctx, &id, move |t, _a| workflow::return_to_rework(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Merge { id, workspace, rationale } => task_merge(ctx, &id, workspace.as_deref(), rationale.as_deref(), json)?,
         TaskCmd::Pause { id, reason } => op(ctx, &id, move |t, _a| workflow::pause(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
-        TaskCmd::Resume { id } => op(ctx, &id, |t, _a| workflow::resume(t, &ctx.actor, ctx.now()))?,
+        TaskCmd::Resume { id } => {
+            // REQ-DEP-03: resume from a hold state consults the stored graph
+            // (open blockers enumerate into the refusal). No override exists:
+            // the spec keeps one an open question, so none is invented.
+            let deps = ctx.store.task_dependencies(ctx.store.resolve_task(&id)?.id)?;
+            op(ctx, &id, |t, _a| workflow::resume(t, &deps, &ctx.actor, ctx.now()))?;
+        }
         TaskCmd::Block { id, reason } => op(ctx, &id, move |t, _a| workflow::block(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Cancel { id, reason } => op(ctx, &id, move |t, _a| workflow::cancel(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Fail { id, reason } => op(ctx, &id, move |t, _a| workflow::fail(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
@@ -235,6 +263,80 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             } else {
                 for e in evs {
                     outln!("{}  {:<28} {:<12} {}", e.created_at.format("%Y-%m-%d %H:%M:%S"), e.kind, e.actor, compact(&e.payload));
+                }
+            }
+        }
+        TaskCmd::Depend { id, on, kind } => {
+            let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
+            let task = ctx.store.resolve_task(&id)?;
+            let depends_on = ctx.store.resolve_task(&on)?;
+            // Registration is LOUD at write (REQ-DEP-07 AC2): self-reference,
+            // a duplicate edge or a dangling id never lands in the store.
+            let d = ctx.store.link_task_dependency(task.id, depends_on.id, kind, &ctx.actor, ctx.now())?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                outln!("task {} —{}→ task {} recorded ({} in {}, by {}, {})",
+                    short(&task.id), kind.as_str(), short(&depends_on.id), depends_on.state.as_str(), depends_on.title, d.actor, d.created_at.format("%Y-%m-%d %H:%M:%S"));
+            }
+        }
+        TaskCmd::Dependencies { id } => {
+            let t = ctx.store.resolve_task(&id)?;
+            let outgoing = ctx.store.task_dependencies(t.id)?;
+            let incoming = ctx.store.incoming_dependencies(t.id)?;
+            if json {
+                outln!("{}", serde_json::json!({"task": t.id.to_string(), "outgoing": outgoing, "incoming": incoming}));
+            } else {
+                print_task(&t);
+                outln!("---");
+                outln!("depends on (outgoing): {}", outgoing.len());
+                for d in &outgoing {
+                    outln!("  {:<7} {}  {:<13} {}  by {}", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title, d.actor);
+                }
+                outln!("dependents (incoming): {}", incoming.len());
+                for d in &incoming {
+                    outln!("  {:<7} {}  {:<13} {}  by {}", d.kind.as_str(), short(&d.task_id), d.task_state.as_str(), d.task_title, d.actor);
+                }
+                // REQ-DEP-06: no epic entity exists — being an epic VERTEX is
+                // exactly this same dependency query read from the other side.
+                let epic_children = incoming.iter().filter(|d| d.kind == DependencyKind::Parent).count();
+                if epic_children > 0 {
+                    outln!("epic role: {epic_children} task(s) carry a 'parent' edge into this vertex (the registry is this view, not a table)");
+                }
+            }
+        }
+        TaskCmd::Graph => {
+            // REQ-DEP-04/05: the planning-level "what is happening" is built
+            // purely from the stored graph in ONE query — node = task +
+            // state, edge = typed dependency; readiness needs no external
+            // information. The exact epic-vertex definition stays an open
+            // question of the approved spec, so no separate epic readout is
+            // invented; the `parent` edges ARE the registry data.
+            let nodes = ctx.store.dependency_graph()?;
+            if json {
+                let ready: Vec<String> = nodes
+                    .iter()
+                    .filter(|n| !n.task.state.is_terminal() && workflow::open_blockers(&n.task, &n.dependencies).is_empty())
+                    .map(|n| n.task.id.to_string())
+                    .collect();
+                outln!("{}", serde_json::json!({"graph": nodes, "ready": ready}));
+            } else {
+                for n in &nodes {
+                    let blockers = workflow::open_blockers(&n.task, &n.dependencies);
+                    let mark = if n.task.state.is_terminal() {
+                        "terminal".to_string()
+                    } else if blockers.is_empty() {
+                        "ready".to_string()
+                    } else {
+                        format!("open blockers: {}", blockers.join(", "))
+                    };
+                    outln!("{}  {:<13} {}  [{mark}]", short(&n.task.id), n.task.state.as_str(), n.task.title);
+                    for d in &n.dependencies {
+                        outln!("    —{:<7}→ {}  {:<13} {}", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title);
+                    }
+                }
+                if nodes.is_empty() {
+                    outln!("(no tasks)");
                 }
             }
         }

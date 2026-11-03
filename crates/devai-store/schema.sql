@@ -1,4 +1,4 @@
--- Devai local store schema (v3).
+-- Devai local store schema (v4).
 -- SQLite is the local system of record; everything is domain data so a task
 -- can be restored after a restart and exported for portability.
 -- v2 adds workspace provenance: role_executions.workspace_revision and the
@@ -8,6 +8,12 @@
 -- v3 adds the artifact supersession invariant: exactly one CURRENT row per
 -- (task_id, kind), pinned by the partial unique index below. Existing v2
 -- databases are repaired by migrations/003_artifact_supersession.sql.
+-- v4 adds the task dependency graph as a stored platform fact (REQ-01/02):
+-- the task_dependencies edge table below — many-to-many in both directions,
+-- typed ('parent' genealogy / 'blocks' continuation gate). Existing v3
+-- databases gain it additively via migrations/004_task_dependencies.sql;
+-- tasks written before v4 simply have no edge rows and read as tasks with an
+-- EMPTY dependency set, never as corrupt (REQ-08).
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -30,6 +36,28 @@ CREATE TABLE tasks(
   created_at           TEXT NOT NULL,
   updated_at           TEXT NOT NULL
 );
+
+-- The stored dependency graph (v4, REQ-01/02): one row per typed edge
+-- "task_id depends on depends_on_id". Many-to-many in BOTH directions —
+-- a task can carry two `parent` edges at once and be blocked by several
+-- tasks; one (task, depends-on) pair may hold both kinds simultaneously
+-- (REQ-01 AC2, REQ-02 AC1). `kind` is TEXT: a new dependency kind is a new
+-- vocabulary entry, no stored row is rewritten (REQ-02 AC2). Link
+-- integrity is loud AT WRITE: self-dependency is rejected by the CHECK,
+-- dangling endpoints by the FKs (foreign_keys=ON; REQ-07 AC2). Attribution
+-- and time follow the decisions.actor precedent (REQ-07 AC3).
+CREATE TABLE task_dependencies(
+  id             TEXT PRIMARY KEY,
+  task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  depends_on_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind           TEXT NOT NULL,
+  actor          TEXT NOT NULL,
+  created_at     TEXT NOT NULL,
+  CHECK (task_id <> depends_on_id),
+  UNIQUE (task_id, depends_on_id, kind)
+);
+CREATE INDEX task_deps_task ON task_dependencies(task_id);
+CREATE INDEX task_deps_depends_on ON task_dependencies(depends_on_id);
 
 CREATE TABLE artifacts(
   id               TEXT PRIMARY KEY,

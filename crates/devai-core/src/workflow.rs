@@ -105,6 +105,35 @@ fn current_spec(artifacts: &[Artifact]) -> Option<&Artifact> {
 }
 
 // ---------------------------------------------------------------------------
+// dependency gate (REQ-03/04)
+// ---------------------------------------------------------------------------
+
+/// The task ids that still constrain `task` through an OPEN `blocks` edge
+/// (REQ-03: resume and human acceptance are refused while this is non-empty;
+/// REQ-04 AC2: readiness is computable from stored data alone).
+///
+/// The spec deliberately leaves "what makes a dependency closed" an open
+/// question and forbids inventing it. The minimal, implementable reading is
+/// used and cited as an assumption: an edge is CLOSED when the depended-on
+/// task reached a terminal state (`is_terminal()` — ACCEPTED or CANCELLED),
+/// i.e. the blocker's own lifecycle has ended; every non-terminal state
+/// (including the hold family — a PAUSED blocker may resume and finish, a
+/// FAILED one may be retried) keeps the edge OPEN. A `blocks` edge to a
+/// CANCELLED blocker is treated as closed because the blocker will never
+/// complete, and keeping the edge open forever would deadlock the dependent
+/// with no platform recourse (edge removal is itself an open question).
+///
+/// `parent` edges NEVER gate: the spec's REQ-03 names only "blocks", and
+/// "is parent genealogical-only?" is an open question — this resolves it in
+/// the direction the requirement text already implies, nothing more.
+pub fn open_blockers(task: &Task, deps: &[TaskDependency]) -> Vec<String> {
+    deps.iter()
+        .filter(|d| d.task_id == task.id && d.kind == DependencyKind::Blocks && !d.depends_on_state.is_terminal())
+        .map(|d| d.depends_on_id.to_string())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
 
@@ -219,11 +248,17 @@ pub fn implementation_reported(task: &Task, summary: Option<&str>, actor: &str, 
 pub fn accept(
     task: &Task,
     artifacts: &[Artifact],
+    deps: &[TaskDependency],
     rationale: Option<&str>,
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
     require_state(task, &[TaskState::Qa], "accept", CoreError::hint("acceptance applies only in QA"))?;
+    // REQ-03: the human gate cannot pass a task an open blocker still holds.
+    let blockers = open_blockers(task, deps);
+    if !blockers.is_empty() {
+        return Err(CoreError::OpenBlockers { blockers });
+    }
     let has_quality = artifacts
         .iter()
         .any(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current);
@@ -285,13 +320,20 @@ pub fn cancel(task: &Task, reason: Option<&str>, actor: &str, now: Timestamp) ->
 }
 
 /// Releases a hold state (PAUSED / BLOCKED / FAILED → remembered stage).
-pub fn resume(task: &Task, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
+/// REQ-03: an open `blocks` dependency forbids the release; the refusal
+/// carries the blocking task ids as data. No human override is invented —
+/// the spec keeps it an open question.
+pub fn resume(task: &Task, deps: &[TaskDependency], actor: &str, now: Timestamp) -> CoreResult<Mutation> {
     require_state(
         task,
         &[TaskState::Paused, TaskState::Blocked, TaskState::Failed],
         "resume",
         CoreError::hint("nothing to resume: task is not PAUSED/BLOCKED/FAILED"),
     )?;
+    let blockers = open_blockers(task, deps);
+    if !blockers.is_empty() {
+        return Err(CoreError::OpenBlockers { blockers });
+    }
     let to = task.return_state.ok_or_else(|| CoreError::guard("hold state without a remembered stage is a state corruption"))?;
     let mut m = transition(task, to, event_kind::TASK_RESUMED, actor, now, json!({}));
     m.task.return_state = None;
