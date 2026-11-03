@@ -35,7 +35,7 @@
 # не if-цепочка по номеру шага. Вес (0.04) уступили arch/idiom-consistency и
 # log/completeness — сумма прежняя, иерархия смыслов та же.
 
-version: 7
+version: 8
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -110,7 +110,9 @@ gates:
       НЕ штрафуется. Грейп смотрит сетевые crate/API в коде, не subprocess.
     blind_spot: subprocess-адаптеры — по дизайну; см. architecture/sovereignty-by-proxy (зарезервирован как наблюдение, не нарушение)
     probes:
-      - { cmd: "test -z \"$(grep -RIlE 'reqwest|hyper|ureq|TcpStream|UdpSocket' crates 2>/dev/null)\"", pass_exit: [0] }
+      # --exclude-dir=tools: probe-скрипты оценщика хранят сетевые regex-паттерны —
+      # не даём шлюзу матчиться на себя (тот же принцип, что --exclude у no-secrets)
+      - { cmd: "test -z \"$(grep -RIlE 'reqwest|hyper|ureq|TcpStream|UdpSocket' crates --exclude-dir=tools 2>/dev/null)\"", pass_exit: [0] }
   - id: no-secrets
     desc: Секретов в репозитории нет
     # --exclude: сам профиль хранит regex-паттерны — не даём шлюзу матчиться на себя
