@@ -8,6 +8,7 @@ use devai_runtime::{worktree, Engine, Gate};
 use devai_store::{ArtifactDraft, Store, guess_media_type};
 use uuid::Uuid;
 
+use crate::outln;
 use crate::{ArtifactCmd, AgentCmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd, TaskCmd, Cmd};
 use devai_store::seed;
 
@@ -65,21 +66,21 @@ fn init(ctx: &Ctx, config_dir: Option<&Path>, json: bool) -> Result<()> {
         }
     };
     if json {
-        println!("{}", serde_json::json!({"home": ctx.home, "config": cfg_path, "roles_seeded": seeded}));
+        outln!("{}", serde_json::json!({"home": ctx.home, "config": cfg_path, "roles_seeded": seeded}));
     } else {
-        println!("devai home: {}", ctx.home.display());
-        println!("config tree: {}", cfg_path.display());
+        outln!("devai home: {}", ctx.home.display());
+        outln!("config tree: {}", cfg_path.display());
         if seeded > 0 {
-            println!("seeded/updated {seeded} role version(s) from config");
-            println!(
+            outln!("seeded/updated {seeded} role version(s) from config");
+            outln!(
                 "edit {}/criteria/*.yaml, evaluation/*.yaml or roles/*.yaml and re-run `devai init` to bump versions",
                 cfg_path.display()
             );
             if config_dir.is_some() {
-                println!("the engine reads evaluation profiles from $DEVAI_CONFIG — export DEVAI_CONFIG={}", cfg_path.display());
+                outln!("the engine reads evaluation profiles from $DEVAI_CONFIG — export DEVAI_CONFIG={}", cfg_path.display());
             }
         } else {
-            println!("store already initialized (config unchanged)");
+            outln!("store already initialized (config unchanged)");
         }
     }
     Ok(())
@@ -94,30 +95,30 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
         ProjectCmd::Add { name, description, repo } => {
             let p = Project::new(name, description, repo, ctx.now());
             ctx.store.create_project(&p)?;
-            println!("project {} ({})", p.name, short(&p.id));
+            outln!("project {} ({})", p.name, short(&p.id));
         }
         ProjectCmd::List => {
             let ps = ctx.store.list_projects()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&ps)?);
+                outln!("{}", serde_json::to_string_pretty(&ps)?);
             } else if ps.is_empty() {
-                println!("(no projects)");
+                outln!("(no projects)");
             } else {
                 for p in ps {
-                    println!("{}  {}  repos={}", short(&p.id), p.name, p.repos.len());
+                    outln!("{}  {}  repos={}", short(&p.id), p.name, p.repos.len());
                 }
             }
         }
         ProjectCmd::Get { id } => match ctx.store.get_project(&id)? {
             Some(p) => {
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&p)?);
+                    outln!("{}", serde_json::to_string_pretty(&p)?);
                 } else {
-                    println!("id:          {}", p.id);
-                    println!("name:        {}", p.name);
-                    println!("description: {}", p.description);
+                    outln!("id:          {}", p.id);
+                    outln!("name:        {}", p.name);
+                    outln!("description: {}", p.description);
                     for r in p.repos {
-                        println!("repo:        {r}");
+                        outln!("repo:        {r}");
                     }
                 }
             }
@@ -145,33 +146,34 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             let t = Task::new(title, desc, project_id, ctx.now());
             ctx.store.create_task(&t)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&t)?);
+                outln!("{}", serde_json::to_string_pretty(&t)?);
             } else {
-                println!("task {} created in DRAFT — workflow is owned by devai", short(&t.id));
-                println!("start it with: devai task start {}", short(&t.id));
+                outln!("task {} created in DRAFT — workflow is owned by devai", short(&t.id));
+                outln!("start it with: devai task start {}", short(&t.id));
             }
         }
         TaskCmd::List => {
             let ts = ctx.store.list_tasks()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&ts)?);
+                outln!("{}", serde_json::to_string_pretty(&ts)?);
             } else if ts.is_empty() {
-                println!("(no tasks)");
+                outln!("(no tasks)");
             } else {
                 for t in ts {
-                    println!("{}  {:<17}  v{:>2}  {}", short(&t.id), t.state.as_str(), t.requirements_seq, t.title);
+                    outln!("{}  {:<17}  v{:>2}  {}", short(&t.id), t.state.as_str(), t.requirements_seq, t.title);
                 }
             }
         }
         TaskCmd::Get { id } => {
             let t = ctx.store.resolve_task(&id)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&t)?);
+                outln!("{}", serde_json::to_string_pretty(&t)?);
             } else {
                 print_task(&t);
             }
         }
         TaskCmd::Status { id } => status(ctx, &id, json)?,
+        TaskCmd::Progress { id } => progress(ctx, &id, json)?,
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
         TaskCmd::Start { id } => op(ctx, &id, |t, _a| workflow::start(t, &ctx.actor, ctx.now()))?,
         TaskCmd::Run { id, agent, workspace, force_reaudit } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
@@ -202,10 +204,10 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             let t = ctx.store.resolve_task(&id)?;
             let evs = ctx.store.events(t.id, limit)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&evs)?);
+                outln!("{}", serde_json::to_string_pretty(&evs)?);
             } else {
                 for e in evs {
-                    println!("{}  {:<28} {:<12} {}", e.created_at.format("%Y-%m-%d %H:%M:%S"), e.kind, e.actor, compact(&e.payload));
+                    outln!("{}  {:<28} {:<12} {}", e.created_at.format("%Y-%m-%d %H:%M:%S"), e.kind, e.actor, compact(&e.payload));
                 }
             }
         }
@@ -225,19 +227,19 @@ where
     let superseded = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Superseded).count();
     ctx.store.commit(task.lock_version, &m)?;
     if m.task.state != task.state {
-        println!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
+        outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
     } else {
-        println!("recorded ({})", m.events[0].kind);
+        outln!("recorded ({})", m.events[0].kind);
     }
     if staled > 0 {
-        println!("marked STALE: {staled} dependent artifact(s) — history preserved");
+        outln!("marked STALE: {staled} dependent artifact(s) — history preserved");
     }
     if superseded > 0 {
-        println!("superseded: {superseded}");
+        outln!("superseded: {superseded}");
     }
     let ops = workflow::allowed_ops(&m.task);
     if !ops.is_empty() {
-        println!("next: {}", ops.join(" | "));
+        outln!("next: {}", ops.join(" | "));
     }
     Ok(())
 }
@@ -251,11 +253,11 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
     }
     let report = engine.advance(id, agent, &ctx.actor).map_err(anyhow::Error::new)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     for s in &report.steps {
-        println!(
+        outln!(
             "{} → {}: `{}` on `{}`  artifact {} ({})",
             s.from.as_str(),
             s.to.as_str(),
@@ -265,18 +267,18 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
             s.artifact_kind.as_str(),
         );
         if let Some(sum) = &s.summary {
-            println!("   ↳ {}", ellipsis(sum, 160));
+            outln!("   ↳ {}", ellipsis(sum, 160));
         }
     }
     match report.gate {
-        Gate::WaitingApproval => println!("⏸ APPROVAL is a human gate — approve or reject the requirements"),
+        Gate::WaitingApproval => outln!("⏸ APPROVAL is a human gate — approve or reject the requirements"),
         Gate::WaitingAccept => {
             // The §2.6 rendering is for the human at the gate.
             if let Some(text) = latest_quality_report_text(&ctx.store, report.task_id) {
-                println!("── quality report (platform-assembled) ──");
-                println!("{text}");
+                outln!("── quality report (platform-assembled) ──");
+                outln!("{text}");
             }
-            println!("⏸ acceptance is a human gate — accept or return the result");
+            outln!("⏸ acceptance is a human gate — accept or return the result");
         }
         Gate::ReportFresh => {
             // The freshness gate stopped the run: no auditor execution was
@@ -289,30 +291,30 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
                 .iter()
                 .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
             {
-                println!(
+                outln!(
                     "⏸ quality report v{} ({}) is FRESH — it is bound to exactly the recomputed workspace revision; the auditor was NOT re-run",
                     a.seq,
                     short(&a.id)
                 );
             } else {
-                println!("⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run");
+                outln!("⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run");
             }
             if let Some(text) = latest_quality_report_text(&ctx.store, report.task_id) {
-                println!("── quality report (platform-assembled) ──");
-                println!("{text}");
+                outln!("── quality report (platform-assembled) ──");
+                outln!("{text}");
             }
-            println!(
+            outln!(
                 "   decide explicitly: accept/return this report, or re-audit an unchanged workspace with `devai task run {} --force-reaudit`",
                 short(&report.task_id)
             );
         }
-        Gate::Terminal(st) => println!("task finished: {}", st.as_str()),
-        Gate::Hold(st) => println!("task held in {} — release it first", st.as_str()),
+        Gate::Terminal(st) => outln!("task finished: {}", st.as_str()),
+        Gate::Hold(st) => outln!("task held in {} — release it first", st.as_str()),
     }
     let t = ctx.store.get_task(&report.task_id.to_string())?;
     let ops = workflow::allowed_ops(&t);
     if !ops.is_empty() {
-        println!("next: {}", ops.join(" | "));
+        outln!("next: {}", ops.join(" | "));
     }
     Ok(())
 }
@@ -368,13 +370,13 @@ fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<&
         }),
     )?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        outln!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "task": task.id.to_string(), "branch": branch, "workspace": repo.display().to_string(),
             "head_before": head_before, "head_after": head_after,
         }))?);
     } else {
-        println!("merged `{branch}` into {}  {head_before} → {head_after}", repo.display());
-        println!("branch and worktree persist — their removal is a lifecycle decision the platform does not automate (OQ-1)");
+        outln!("merged `{branch}` into {}  {head_before} → {head_after}", repo.display());
+        outln!("branch and worktree persist — their removal is a lifecycle decision the platform does not automate (OQ-1)");
     }
     Ok(())
 }
@@ -412,7 +414,7 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         .unwrap_or_else(|| "—".into());
     let value: serde_json::Value = serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "task": t.id.to_string(),
@@ -426,18 +428,18 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!(
+    outln!(
         "quality report v{}  artifact {}  contract {contract}  execution {}",
         a.seq,
         short(&a.id),
         a.execution_id.map(|e| short(&e)).unwrap_or_else(|| "-".into())
     );
-    println!("---");
+    outln!("---");
     match value.get("report_text").and_then(|s| s.as_str()) {
-        Some(text) => println!("{text}"),
+        Some(text) => outln!("{text}"),
         // Reports assembled before @2 carry no rendering: show the machine
         // JSON rather than pretend there is nothing to read.
-        None => println!("{}", serde_json::to_string_pretty(&value).unwrap_or_else(|_| String::from_utf8_lossy(&blob).into_owned())),
+        None => outln!("{}", serde_json::to_string_pretty(&value).unwrap_or_else(|_| String::from_utf8_lossy(&blob).into_owned())),
     }
     Ok(())
 }
@@ -464,16 +466,16 @@ fn revise(ctx: &Ctx, id: &str, file: &Path, reason: Option<&str>) -> Result<()> 
     let after = ctx.store.artifacts(task.id)?;
     let m = workflow::requirements_published(&task, &after, reason, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
     ctx.store.commit(task.lock_version, &m)?;
-    println!("requirements v{} published → REVIEW", m.task.requirements_seq);
+    outln!("requirements v{} published → REVIEW", m.task.requirements_seq);
     let staled: Vec<_> = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Stale).map(|(i, _)| i.to_string()).collect();
     if !staled.is_empty() {
-        println!("consequences: {} artifact(s) marked STALE:", staled.len());
+        outln!("consequences: {} artifact(s) marked STALE:", staled.len());
         for s in &staled {
-            println!("  stale  {s}");
+            outln!("  stale  {s}");
         }
-        println!("old versions are kept in history; nothing was deleted");
+        outln!("old versions are kept in history; nothing was deleted");
     }
-    println!("next: {}", workflow::allowed_ops(&m.task).join(" | "));
+    outln!("next: {}", workflow::allowed_ops(&m.task).join(" | "));
     Ok(())
 }
 
@@ -485,7 +487,7 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     let current: Vec<_> = artifacts.iter().filter(|a| a.status == ArtifactStatus::Current).collect();
     let ops = workflow::allowed_ops(&t);
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "task": t,
@@ -496,15 +498,15 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         );
     } else {
         print_task(&t);
-        println!("---");
-        println!("artifacts (current): {}", current.len());
+        outln!("---");
+        outln!("artifacts (current): {}", current.len());
         for a in &current {
-            println!("  {:<22} v{:<3} {}  {}", a.kind.as_str(), a.seq, short(&a.id), a.name);
+            outln!("  {:<22} v{:<3} {}  {}", a.kind.as_str(), a.seq, short(&a.id), a.name);
         }
         for q in &open_q {
-            println!("open question {}: {}{}", short(&q.id), q.text, if q.blocking { " [BLOCKING]" } else { "" });
+            outln!("open question {}: {}{}", short(&q.id), q.text, if q.blocking { " [BLOCKING]" } else { "" });
         }
-        println!(
+        outln!(
             "allowed operations: {}",
             if ops.is_empty() { "(none — task is terminal)".to_string() } else { ops.join(" | ") }
         );
@@ -513,15 +515,129 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
 }
 
 fn print_task(t: &Task) {
-    println!("id:        {}", t.id);
-    println!("title:     {}", t.title);
-    println!("state:     {}{}", t.state.as_str(), t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default());
-    println!("requirements: v{}", t.requirements_seq);
-    println!("project:   {}", t.project_id.map(|i| short(&i)).unwrap_or_else(|| "-".into()));
-    println!("lock:      {}", t.lock_version);
-    println!("created:   {}  updated: {}", t.created_at.format("%Y-%m-%d %H:%M:%S"), t.updated_at.format("%Y-%m-%d %H:%M:%S"));
+    outln!("id:        {}", t.id);
+    outln!("title:     {}", t.title);
+    outln!("state:     {}{}", t.state.as_str(), t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default());
+    outln!("requirements: v{}", t.requirements_seq);
+    outln!("project:   {}", t.project_id.map(|i| short(&i)).unwrap_or_else(|| "-".into()));
+    outln!("lock:      {}", t.lock_version);
+    outln!("created:   {}  updated: {}", t.created_at.format("%Y-%m-%d %H:%M:%S"), t.updated_at.format("%Y-%m-%d %H:%M:%S"));
     if !t.business_description.is_empty() {
-        println!("business:  {}", ellipsis(&t.business_description, 200));
+        outln!("business:  {}", ellipsis(&t.business_description, 200));
+    }
+}
+
+/// `devai task progress <ID>` — pipeline position at a glance. The view is
+/// drawn purely from engine data (REQ-PROG-03): the spine order and the
+/// position/re-entry come from `workflow::pipeline_*`, the operations from
+/// `workflow::allowed_ops`, the running executions from
+/// `store.list_executions`. The renderer owns no state-machine knowledge of
+/// its own: change the engine's op set and the progress view changes with it.
+fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    let t = ctx.store.resolve_task(id)?;
+    let ops = workflow::allowed_ops(&t);
+    let order = workflow::pipeline_order();
+    let position = workflow::pipeline_position(&t);
+    let pos_idx = position.and_then(|p| order.iter().position(|s| *s == p));
+    let off_spine = workflow::pipeline_off_spine(&t);
+    let now = ctx.now();
+    let running: Vec<_> = ctx
+        .store
+        .list_executions(Some(t.id))?
+        .into_iter()
+        .filter(|e| e.status == ExecutionStatus::Running)
+        .collect();
+
+    if json {
+        outln!(
+            "{}",
+            serde_json::json!({
+                "task": t,
+                "snapshot_at": now,
+                "pipeline": {
+                    "order": order.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    "current": t.state.as_str(),
+                    "position": position.map(|s| s.as_str()),
+                    "position_index": pos_idx,
+                    "off_spine": off_spine,
+                    "terminal": t.state.is_terminal(),
+                },
+                "allowed_operations": ops,
+                "running_executions": running
+                    .iter()
+                    .map(|e| serde_json::json!({
+                        "id": e.id.to_string(),
+                        "role": format!("{}@{}", e.role_slug, e.role_version),
+                        "role_slug": e.role_slug,
+                        "role_version": e.role_version,
+                        "agent_name": e.agent_name,
+                        "started_at": e.started_at,
+                        "elapsed_seconds": (now - e.started_at).num_seconds().max(0),
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    outln!("id:    {}", t.id);
+    outln!("title: {}", t.title);
+    outln!(
+        "state: {}{}",
+        t.state.as_str(),
+        t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default()
+    );
+    let mut nodes = Vec::with_capacity(order.len());
+    for (i, s) in order.iter().enumerate() {
+        let name = s.as_str();
+        if Some(i) == pos_idx && !t.state.is_terminal() {
+            nodes.push(format!("[{name}]"));
+        } else if pos_idx.is_some_and(|p| p > i) {
+            nodes.push(format!("✓ {name}"));
+        } else {
+            nodes.push(name.to_string());
+        }
+    }
+    outln!("pipeline: {}", nodes.join(" → "));
+    if t.state.is_terminal() {
+        outln!("cycle ended in {} — terminal state, no open pipeline step", t.state.as_str());
+    } else if off_spine {
+        // REWORK loop / hold state: the bracket marks where it re-enters.
+        match position {
+            Some(p) => outln!("note:  {} is off the spine — it returns to [{}]", t.state.as_str(), p.as_str()),
+            None => outln!("note:  {} holds no remembered stage (state corruption — check `devai task events`)", t.state.as_str()),
+        }
+    }
+    outln!("---");
+    outln!("running executions:");
+    if running.is_empty() {
+        outln!("  (no running executions)");
+    } else {
+        for e in &running {
+            outln!(
+                "  {:<24} {:<12} elapsed {}",
+                format!("{}@{}", e.role_slug, e.role_version),
+                short(&e.id),
+                human_elapsed((now - e.started_at).num_seconds())
+            );
+        }
+    }
+    outln!(
+        "allowed operations: {}",
+        if ops.is_empty() { "(none — task is terminal)".to_string() } else { ops.join(" | ") }
+    );
+    Ok(())
+}
+
+/// Readable elapsed from a raw seconds count: `42s`, `3m 07s`, `2h 05m`.
+fn human_elapsed(total: i64) -> String {
+    let s = total.max(0);
+    if s >= 3600 {
+        format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -559,9 +675,9 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
             };
             let a = publish_raw(ctx, task.id, kind, &name.unwrap_or_else(|| file.display().to_string()), content, contract_ref, execution_id, depends_ids, Some(&created_by), category)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&a)?);
+                outln!("{}", serde_json::to_string_pretty(&a)?);
             } else {
-                println!("artifact {} {} v{} ({})", a.kind.as_str(), short(&a.id), a.seq, a.name);
+                outln!("artifact {} {} v{} ({})", a.kind.as_str(), short(&a.id), a.seq, a.name);
             }
             // Some kinds carry the workflow forward.
             match kind {
@@ -569,7 +685,7 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
                     let arts = ctx.store.artifacts(task.id)?;
                     let m = workflow::requirements_published(&task, &arts, None, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
                     ctx.store.commit(task.lock_version, &m)?;
-                    println!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
+                    outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
                 }
                 ArtifactKind::ReviewReport => {
                     let v = match verdict.as_deref() {
@@ -578,15 +694,15 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
                     };
                     let m = workflow::review_recorded(&task, v, None, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
                     ctx.store.commit(task.lock_version, &m)?;
-                    println!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
+                    outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
                 }
                 ArtifactKind::ImplementationReport => {
                     let m = workflow::implementation_reported(&task, None, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
                     ctx.store.commit(task.lock_version, &m)?;
-                    println!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
+                    outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
                 }
                 ArtifactKind::QualityReport => {
-                    println!("quality report recorded; user decides via `devai task accept|return`");
+                    outln!("quality report recorded; user decides via `devai task accept|return`");
                 }
                 _ => {}
             }
@@ -595,19 +711,20 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
             let t = ctx.store.resolve_task(&id)?;
             let as_ = ctx.store.artifacts(t.id)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&as_)?);
+                outln!("{}", serde_json::to_string_pretty(&as_)?);
             } else if as_.is_empty() {
-                println!("(no artifacts)");
+                outln!("(no artifacts)");
             } else {
                 for a in as_ {
-                    println!("{}  {:<22} v{:<3} {:<12} {}  {}", short(&a.id), a.kind.as_str(), a.seq, a.status.as_str(), a.created_by, a.name);
+                    outln!("{}  {:<22} v{:<3} {:<12} {}  {}", short(&a.id), a.kind.as_str(), a.seq, a.status.as_str(), a.created_by, a.name);
                 }
             }
         }
         ArtifactCmd::Cat { artifact_id } => {
             let a = ctx.store.get_artifact(&artifact_id)?;
             let bytes = ctx.store.read_blob(&a.sha256)?;
-            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            // Central raw-bytes path: a closed reader dies quietly (REQ-PIPE-01).
+            crate::out::write_bytes_all(&bytes)?;
         }
     }
     Ok(())
@@ -675,10 +792,10 @@ fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
             let m = workflow::raise_question(&task, q.id, blocking, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
             ctx.store.commit(task.lock_version, &m)?;
             if blocking && m.task.state != task.state {
-                println!("question {} raised; task parked in WAITING_FOR_INPUT", short(&q.id));
-                println!("answer with: devai question answer {}", short(&q.id));
+                outln!("question {} raised; task parked in WAITING_FOR_INPUT", short(&q.id));
+                outln!("answer with: devai question answer {}", short(&q.id));
             } else {
-                println!("question {} recorded", short(&q.id));
+                outln!("question {} recorded", short(&q.id));
             }
         }
         QuestionCmd::Answer { question_id, text } => {
@@ -690,18 +807,18 @@ fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
             ctx.store.answer_question(q.id, &text, &ctx.actor, ctx.now())?;
             let m = workflow::answer_question(&task, q.id, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
             ctx.store.commit(task.lock_version, &m)?;
-            println!("answer recorded; state: {} → {}", task.state.as_str(), m.task.state.as_str());
+            outln!("answer recorded; state: {} → {}", task.state.as_str(), m.task.state.as_str());
         }
         QuestionCmd::List { id } => {
             let t = ctx.store.resolve_task(&id)?;
             let qs = ctx.store.list_questions(t.id)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&qs)?);
+                outln!("{}", serde_json::to_string_pretty(&qs)?);
             } else if qs.is_empty() {
-                println!("(no questions)");
+                outln!("(no questions)");
             } else {
                 for q in qs {
-                    println!("{} {:<8} {}{}", short(&q.id), q.status.as_str(), q.text, if q.blocking && q.status == QuestionStatus::Open { " [BLOCKING]" } else { "" });
+                    outln!("{} {:<8} {}{}", short(&q.id), q.status.as_str(), q.text, if q.blocking && q.status == QuestionStatus::Open { " [BLOCKING]" } else { "" });
                 }
             }
         }
@@ -727,24 +844,24 @@ fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
             }
             r.created_at = ctx.now();
             ctx.store.put_role(&r)?;
-            println!("role {}@{} registered", r.slug, r.version);
+            outln!("role {}@{} registered", r.slug, r.version);
         }
         RoleCmd::List => {
             let rs = ctx.store.list_roles()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&rs)?);
+                outln!("{}", serde_json::to_string_pretty(&rs)?);
             } else if rs.is_empty() {
-                println!("(no roles — run `devai init`)");
+                outln!("(no roles — run `devai init`)");
             } else {
                 for r in rs {
-                    println!("{:<24} v{:<3} {}  in={} out={}", r.slug, r.version, r.name,
+                    outln!("{:<24} v{:<3} {}  in={} out={}", r.slug, r.version, r.name,
                         r.input_contract.map(|c| c.to_string()).unwrap_or("-".into()),
                         r.output_contract.map(|c| c.to_string()).unwrap_or("-".into()));
                 }
             }
         }
         RoleCmd::Get { slug } => match ctx.store.get_role(&slug)? {
-            Some(r) => println!("{}", serde_json::to_string_pretty(&r)?),
+            Some(r) => outln!("{}", serde_json::to_string_pretty(&r)?),
             None => bail!("role `{slug}` not found"),
         },
     }
@@ -756,15 +873,15 @@ fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
         AgentCmd::Add { name, provider, model, runtime } => {
             let a = AgentInstance { id: new_id(), name: name.clone(), provider, model, runtime, created_at: ctx.now() };
             ctx.store.put_agent(&a)?;
-            println!("agent {name} registered (credentials stay outside the store)");
+            outln!("agent {name} registered (credentials stay outside the store)");
         }
         AgentCmd::List => {
             let as_ = ctx.store.list_agents()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&as_)?);
+                outln!("{}", serde_json::to_string_pretty(&as_)?);
             } else {
                 for a in as_ {
-                    println!("{}  provider={}  model={}  runtime={}", a.name, a.provider, a.model, a.runtime);
+                    outln!("{}  provider={}  model={}  runtime={}", a.name, a.provider, a.model, a.runtime);
                 }
             }
         }
@@ -778,15 +895,15 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
             let schema = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
             serde_json::from_str::<serde_json::Value>(&schema).context("contract file must be valid JSON")?;
             ctx.store.put_contract(&name, version, &schema)?;
-            println!("contract {name}@{version} registered");
+            outln!("contract {name}@{version} registered");
         }
         ContractCmd::Get { name, version } => match ctx.store.get_contract(&name, version)? {
             Some(s) => {
                 if json {
-                    println!("{s}");
+                    outln!("{s}");
                 } else {
                     let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-                    println!("{}", serde_json::to_string_pretty(&v)?);
+                    outln!("{}", serde_json::to_string_pretty(&v)?);
                 }
             }
             None => bail!("contract {name}@{version} not found"),
@@ -826,8 +943,8 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 workspace_revision: Some(revision),
             };
             ctx.store.start_execution(&e)?;
-            println!("execution {} for role {role}@{version} started in state {}", short(&e.id), task.state.as_str());
-            println!("publish its output artifact with: devai artifact publish {} --execution {}", short(&task.id), short(&e.id));
+            outln!("execution {} for role {role}@{version} started in state {}", short(&e.id), task.state.as_str());
+            outln!("publish its output artifact with: devai artifact publish {} --execution {}", short(&task.id), short(&e.id));
         }
         ExecCmd::Finish { exec_id, summary } => {
             let e = ctx.store.get_execution(&exec_id)?;
@@ -835,7 +952,7 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 bail!("execution {} is {}, not RUNNING", e.id, e.status.as_str());
             }
             ctx.store.finish_execution(&e, ExecutionStatus::Completed, summary.as_deref(), None, ctx.now())?;
-            println!("execution {} completed", short(&e.id));
+            outln!("execution {} completed", short(&e.id));
         }
         ExecCmd::Fail { exec_id, error } => {
             let e = ctx.store.get_execution(&exec_id)?;
@@ -843,7 +960,7 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 bail!("execution {} is {}, not RUNNING", e.id, e.status.as_str());
             }
             ctx.store.finish_execution(&e, ExecutionStatus::Failed, None, Some(&error), ctx.now())?;
-            println!("execution {} failed (task workflow state unchanged; the stage may be retried)", short(&e.id));
+            outln!("execution {} failed (task workflow state unchanged; the stage may be retried)", short(&e.id));
         }
         ExecCmd::Cancel { exec_id } => {
             let e = ctx.store.get_execution(&exec_id)?;
@@ -851,7 +968,7 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 bail!("execution {} is {}, not RUNNING", e.id, e.status.as_str());
             }
             ctx.store.finish_execution(&e, ExecutionStatus::Cancelled, None, None, ctx.now())?;
-            println!("execution {} cancelled (cooperative stop acknowledged)", short(&e.id));
+            outln!("execution {} cancelled (cooperative stop acknowledged)", short(&e.id));
         }
         ExecCmd::List { task } => {
             let tid = match task.as_deref() {
@@ -860,12 +977,12 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
             };
             let es = ctx.store.list_executions(tid)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&es)?);
+                outln!("{}", serde_json::to_string_pretty(&es)?);
             } else if es.is_empty() {
-                println!("(no executions)");
+                outln!("(no executions)");
             } else {
                 for e in es {
-                    println!("{}  {:<22} {:<12} {:<10} {}", short(&e.id), e.role_slug, short(&e.task_id), e.status.as_str(),
+                    outln!("{}  {:<22} {:<12} {:<10} {}", short(&e.id), e.role_slug, short(&e.task_id), e.status.as_str(),
                         e.summary.as_deref().or(e.error.as_deref()).map(|s| ellipsis(s, 60)).unwrap_or_default());
                 }
             }
@@ -882,13 +999,13 @@ fn export(ctx: &Ctx, id: &str, out: &Path, json: bool) -> Result<()> {
     let t = ctx.store.resolve_task(id)?;
     let manifest = devai_store::bundle::export(&ctx.store, &t, out)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        outln!("{}", serde_json::to_string_pretty(&manifest)?);
     } else {
-        println!("bundle exported to {}", out.display());
-        println!("task {} — {} events, {} artifacts, {} executions, {} roles, {} contracts",
+        outln!("bundle exported to {}", out.display());
+        outln!("task {} — {} events, {} artifacts, {} executions, {} roles, {} contracts",
             short(&manifest.task_id), manifest.counts.events, manifest.counts.artifacts,
             manifest.counts.executions, manifest.counts.roles, manifest.counts.contracts);
-        println!("manifest carries sha256 for every file; caches and credentials are never included");
+        outln!("manifest carries sha256 for every file; caches and credentials are never included");
     }
     Ok(())
 }
@@ -896,11 +1013,11 @@ fn export(ctx: &Ctx, id: &str, out: &Path, json: bool) -> Result<()> {
 fn import(ctx: &Ctx, dir: &Path, json: bool) -> Result<()> {
     let o = devai_store::bundle::import(&ctx.store, dir)?;
     if json {
-        println!("{}", serde_json::json!({"task_id": o.task_id.to_string(), "artifacts": o.imported_artifacts, "events": o.imported_events, "skipped_existing": o.skipped_existing}));
+        outln!("{}", serde_json::json!({"task_id": o.task_id.to_string(), "artifacts": o.imported_artifacts, "events": o.imported_events, "skipped_existing": o.skipped_existing}));
     } else if o.skipped_existing {
-        println!("task {} already present — nothing imported", short(&o.task_id));
+        outln!("task {} already present — nothing imported", short(&o.task_id));
     } else {
-        println!("task {} imported: {} artifacts, {} events restored", short(&o.task_id), o.imported_artifacts, o.imported_events);
+        outln!("task {} imported: {} artifacts, {} events restored", short(&o.task_id), o.imported_artifacts, o.imported_events);
     }
     Ok(())
 }

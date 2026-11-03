@@ -340,3 +340,40 @@ fn json_array_column_fails_loud_instead_of_reading_empty() {
     let err = json_array::<Id>(Some("{broken")).unwrap_err();
     assert!(format!("{err}").contains("corrupt JSON array"), "{err}");
 }
+
+// --- REQ-PROG-03: pipeline projection is engine-owned display data. ---
+
+#[test]
+fn pipeline_projection_maps_states_to_their_spine_position() {
+    let order = workflow::pipeline_order();
+    // A1: the spine follows the declared TaskState order up to acceptance.
+    assert_eq!(
+        order.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        vec!["DRAFT", "ANALYSIS", "REVIEW", "APPROVAL", "IMPLEMENTATION", "QA", "ACCEPTED"]
+    );
+    let mut t = draft_task();
+    // on-spine states are their own position
+    t.state = TaskState::Implementation;
+    assert_eq!(workflow::pipeline_position(&t), Some(TaskState::Implementation));
+    assert!(!workflow::pipeline_off_spine(&t));
+    // REWORK is the QA return loop: positioned at QA, off the spine itself
+    t.state = TaskState::Rework;
+    assert_eq!(workflow::pipeline_position(&t), Some(TaskState::Qa));
+    assert!(workflow::pipeline_off_spine(&t));
+    // hold states are positioned at the remembered stage
+    t.state = TaskState::Paused;
+    t.return_state = Some(TaskState::Review);
+    assert_eq!(workflow::pipeline_position(&t), Some(TaskState::Review));
+    // ACCEPTED is the last spine node; CANCELLED ends off-spine with no position
+    t.state = TaskState::Accepted;
+    t.return_state = None;
+    assert_eq!(workflow::pipeline_position(&t), Some(TaskState::Accepted));
+    assert!(!workflow::pipeline_off_spine(&t));
+    t.state = TaskState::Cancelled;
+    assert_eq!(workflow::pipeline_position(&t), None);
+    // every spine node's ops set comes from the same engine (no CLI table):
+    for s in order {
+        t.state = *s;
+        let _ = workflow::allowed_ops(&t);
+    }
+}

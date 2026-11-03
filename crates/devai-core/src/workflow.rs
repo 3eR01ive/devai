@@ -385,6 +385,51 @@ pub fn stale_closure(artifacts: &[Artifact], roots: &[Id]) -> Vec<Id> {
 // status projection
 // ---------------------------------------------------------------------------
 
+/// The forward pipeline spine in domain order (the declared `TaskState`
+/// order, types.rs): the stages a task moves through toward acceptance.
+/// Owned by the engine so display layers draw position from domain data and
+/// never from a CLI-local copy of the sequence (REQ-PROG-03; a step toward
+/// action-discovery in the roadmap API seam). Orthogonal states are not on
+/// the spine: REWORK is the QA return loop, the hold family waits on a
+/// release, CANCELLED ends the cycle off-spine.
+pub fn pipeline_order() -> &'static [TaskState] {
+    &[
+        TaskState::Draft,
+        TaskState::Analysis,
+        TaskState::Review,
+        TaskState::Approval,
+        TaskState::Implementation,
+        TaskState::Qa,
+        TaskState::Accepted,
+    ]
+}
+
+/// The spine state the task is positioned at for display:
+/// - an on-spine state is its own position (ACCEPTED = the final node);
+/// - REWORK sits in the QA return loop: it re-enters QA via an
+///   implementation report (`implementation_reported` accepts Rework → Qa);
+/// - a hold state (WAITING_FOR_INPUT / PAUSED / BLOCKED / FAILED) is
+///   positioned at the stage its `return_state` releases back to;
+/// - CANCELLED ends the cycle off-spine: no position.
+pub fn pipeline_position(task: &Task) -> Option<TaskState> {
+    let order = pipeline_order();
+    if order.contains(&task.state) {
+        return Some(task.state);
+    }
+    match task.state {
+        TaskState::Rework => Some(TaskState::Qa),
+        s if s.is_hold() => task.return_state,
+        _ => None,
+    }
+}
+
+/// True when the task is off the spine but the workflow re-enters it
+/// (REWORK loop or a hold state): the renderer marks the re-entry stage,
+/// not the current state, and must say so (REQ-PROG-02).
+pub fn pipeline_off_spine(task: &Task) -> bool {
+    !pipeline_order().contains(&task.state) && !task.state.is_terminal()
+}
+
 /// Which operations the platform currently permits for the task — the
 /// answer to `GET /tasks/{id}/status`: the next allowed domain operations.
 pub fn allowed_ops(task: &Task) -> Vec<&'static str> {
