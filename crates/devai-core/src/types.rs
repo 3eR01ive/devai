@@ -166,6 +166,69 @@ impl Task {
 }
 
 // ---------------------------------------------------------------------------
+// Task dependency graph (REQ-01/02/07)
+// ---------------------------------------------------------------------------
+
+/// The vocabulary of typed task-to-task dependencies. Required minimum per
+/// the approved spec (REQ-02): `parent` ("породила" — why this task exists,
+/// genealogy only) and `blocks` ("не может продолжиться без той" — resume
+/// and human acceptance are refused while the edge is open). `parent` is
+/// one kind of the same n-ary relation, not a separate mechanism.
+///
+/// Stored as TEXT (`kind` column of `task_dependencies`): adding a new kind
+/// is a new vocabulary entry in this enum — no stored row is ever rewritten
+/// (REQ-02 AC2). Whether `parent` itself gates continuation is an open
+/// question of the spec; the minimal reading (only explicit `blocks` gates)
+/// is implemented in `workflow::open_blockers` and cited there.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DependencyKind {
+    Parent,
+    Blocks,
+}
+
+str_enum!(DependencyKind,
+    Parent => "parent",
+    Blocks => "blocks",
+);
+
+/// One stored dependency edge (table `task_dependencies`) together with the
+/// read-time projection of BOTH endpoint tasks' state and title. The edge is
+/// the stored fact; the states come from the same query, they are not stored
+/// on the edge (REQ-04 AC1: the whole graph — edges and task states — is
+/// retrieved from the store in one query).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TaskDependency {
+    pub id: Id,
+    /// The dependent task — the one that "exists because of" / "cannot
+    /// continue without".
+    pub task_id: Id,
+    pub task_state: TaskState,
+    pub task_title: String,
+    /// The depended-on task (parent / blocker).
+    pub depends_on_id: Id,
+    pub depends_on_state: TaskState,
+    pub depends_on_title: String,
+    pub kind: DependencyKind,
+    /// Author of the edge — attributed like `decisions.actor` (REQ-07 AC3).
+    pub actor: String,
+    pub created_at: Timestamp,
+}
+
+/// One task node of the stored dependency graph with its outgoing edges:
+/// the planning-level view (REQ-05) and the roadmap input (REQ-04) — node =
+/// task + state, edge = typed dependency. A task with no stored edges is a
+/// node with an empty `dependencies` set, never a corrupt row (REQ-08 AC2):
+/// rows written before schema v4 simply have no dependency records.
+/// An "epic" is not a separate entity: it is the role of a task that other
+/// tasks' edges point at — the same dependency query names it (REQ-06).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DependencyNode {
+    pub task: Task,
+    pub dependencies: Vec<TaskDependency>,
+}
+
+// ---------------------------------------------------------------------------
 // Artifacts
 // ---------------------------------------------------------------------------
 
@@ -488,6 +551,9 @@ pub mod decision_kind {
 
 pub mod event_kind {
     pub const TASK_CREATED: &str = "task.created";
+    /// A typed task-to-task dependency edge was registered (REQ-07): at
+    /// derivation time or retroactively, attributed and timed.
+    pub const TASK_DEPENDENCY_LINKED: &str = "task.dependency.linked";
     pub const WORKFLOW_STARTED: &str = "workflow.started";
     pub const STATE_CHANGED: &str = "workflow.state_changed";
     pub const REQUIREMENTS_PUBLISHED: &str = "requirements.published";
@@ -568,4 +634,8 @@ pub mod json_field {
     // Migration (one-time repair) records.
     pub const BACKFILL: &str = "backfill";
     pub const SCRIPT_PATH: &str = "script";
+    // Task dependency graph (store `link_task_dependency`, REQ-07).
+    pub const DEPENDENCY_ID: &str = "dependency_id";
+    pub const DEPENDS_ON_ID: &str = "depends_on_id";
+    pub const DEPENDENCY_KIND: &str = "dependency_kind";
 }

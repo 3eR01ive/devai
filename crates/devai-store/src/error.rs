@@ -17,6 +17,13 @@ pub enum StoreError {
     #[error("ambiguous identifier: {0}")]
     Ambiguous(String),
 
+    /// REQ-07 AC2: a dependency reference is rejected AT WRITE — never
+    /// stored and silently ignored at read. (Dangling endpoints surface as
+    /// `NotFound`; this variant names the shape violations: self-dependency
+    /// and a duplicate edge.)
+    #[error("invalid task dependency: {0}")]
+    InvalidDependency(String),
+
     #[error("database schema version {found}, but this build expects {expected}")]
     SchemaVersion { found: i64, expected: i64 },
 

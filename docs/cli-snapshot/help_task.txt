@@ -1,28 +1,31 @@
 Usage: devai task [OPTIONS] <COMMAND>
 
 Commands:
-  new       Create a task (DRAFT). A task is owned by the platform from birth
-  list      
-  get       
-  status    Current state + the operations the platform permits next
-  progress  Pipeline position of the task, allowed operations and a snapshot of running executions — state at a glance without copy-pasting ids (with --json: the same snapshot for machines)
-  report    Show the CURRENT quality report — the rendering a human signs at the QA gate (with --json: the full machine report)
-  start     DRAFT → ANALYSIS: start the workflow
-  run       Run the assigned roles through all autonomous stages until the next human gate (APPROVAL / final acceptance), hold, or terminal state
-  revise    Publish/replace a REQUIREMENTS_SPEC and move to REVIEW
-  review    Record the reviewer's verdict in REVIEW
-  approve   APPROVAL → IMPLEMENTATION (requires approval rights: human/approver only)
-  reject    APPROVAL → ANALYSIS
-  accept    QA → ACCEPTED (requires a CURRENT QUALITY_REPORT)
-  return    QA → REWORK (return for fixes)
-  merge     The MERGE GATE (human-only): merge the task's platform-created `rework/<task-id>` branch into the workspace's current baseline branch. The platform never merges by itself — this command is the single merge path, records a `rework_merge` decision + event, and moves no task state. Conflicts stay with the human who invoked it
-  pause     
-  resume    Resume a PAUSED/BLOCKED/FAILED task, or answer-driven restore
-  block     
-  cancel    
-  fail      Record a runtime failure (task parks in FAILED; `resume` retries)
-  events    Show immutable event history
-  help      Print this message or the help of the given subcommand(s)
+  new           Create a task (DRAFT). A task is owned by the platform from birth
+  list          
+  get           
+  status        Current state + the operations the platform permits next
+  progress      Pipeline position of the task, allowed operations and a snapshot of running executions — state at a glance without copy-pasting ids (with --json: the same snapshot for machines)
+  report        Show the CURRENT quality report — the rendering a human signs at the QA gate (with --json: the full machine report)
+  start         DRAFT → ANALYSIS: start the workflow
+  run           Run the assigned roles through all autonomous stages until the next human gate (APPROVAL / final acceptance), hold, or terminal state
+  revise        Publish/replace a REQUIREMENTS_SPEC and move to REVIEW
+  review        Record the reviewer's verdict in REVIEW
+  approve       APPROVAL → IMPLEMENTATION (requires approval rights: human/approver only)
+  reject        APPROVAL → ANALYSIS
+  accept        QA → ACCEPTED (requires a CURRENT QUALITY_REPORT)
+  return        QA → REWORK (return for fixes)
+  merge         The MERGE GATE (human-only): merge the task's platform-created `rework/<task-id>` branch into the workspace's current baseline branch. The platform never merges by itself — this command is the single merge path, records a `rework_merge` decision + event, and moves no task state. Conflicts stay with the human who invoked it
+  pause         
+  resume        Resume a PAUSED/BLOCKED/FAILED task, or answer-driven restore
+  block         
+  cancel        
+  fail          Record a runtime failure (task parks in FAILED; `resume` retries)
+  events        Show immutable event history
+  depend        Register a typed task dependency: 'parent' ("породила" — why this task exists) or 'blocks' ("не может продолжиться без той" — resume and acceptance refused while open). Works at creation (--parent / --blocked-by) and retroactively, from either moment (REQ-DEP-07)
+  dependencies  Typed dependencies of one task: what it depends on (outgoing) and what depends on it (incoming). An epic is not a separate entity — a task with incoming edges IS the vertex of a plan tree here (REQ-DEP-06), named by this ordinary dependency query
+  graph         The task dependency graph with task states — planning-level "what is happening": every node, its outgoing typed edges and whether an open 'blocks' edge still holds it. Built purely from stored data (REQ-DEP-04/05); the roadmap orders itself out of this graph
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
       --home <HOME>    Data directory (default: $DEVAI_HOME or ~/.devai) [env: DEVAI_HOME=]

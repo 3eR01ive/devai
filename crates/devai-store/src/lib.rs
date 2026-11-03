@@ -311,6 +311,152 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // task dependency graph (REQ-01/02/07)
+    // ------------------------------------------------------------------
+
+    /// Shared projection of one stored edge with the JOINed states/titles of
+    /// both endpoint tasks. The states are a read-time projection, never
+    /// denormalised onto the edge — one query yields dependencies AND task
+    /// states (REQ-04 AC1).
+    const DEPENDENCY_EDGE_SELECT: &'static str = "SELECT d.id, d.task_id, t.state, t.title, d.depends_on_id, p.state, p.title, d.kind, d.actor, d.created_at \
+        FROM task_dependencies d JOIN tasks t ON t.id = d.task_id JOIN tasks p ON p.id = d.depends_on_id";
+
+    /// Registers a typed dependency edge `task_id → depends_on_id` (REQ-07).
+    /// Integrity is LOUD AT WRITE, never silently ignored on read:
+    /// self-dependency and a duplicate of the same (task, depends-on, kind)
+    /// triple are rejected here (and pinned again by the CHECK/UNIQUE in
+    /// v4 DDL); a dangling endpoint surfaces as `NotFound`. The edge stores
+    /// its author and creation time (the `decisions.actor` precedent) and
+    /// lands in `workflow_events` as `task.dependency.linked` inside ONE
+    /// transaction — the relation and its provenance are never half-written.
+    pub fn link_task_dependency(&self, task_id: Id, depends_on_id: Id, kind: DependencyKind, actor: &str, now: Timestamp) -> StoreResult<TaskDependency> {
+        if task_id == depends_on_id {
+            return Err(StoreError::InvalidDependency(format!(
+                "task `{task_id}` cannot depend on itself"
+            )));
+        }
+        // Loud reference check before the INSERT (REQ-07 AC2): the dependent
+        // and the depended-on task must both exist as platform data.
+        let dependent = self.get_task(&task_id.to_string())?;
+        let depends_on = self.get_task(&depends_on_id.to_string())?;
+        let duplicate: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM task_dependencies WHERE task_id=?1 AND depends_on_id=?2 AND kind=?3",
+                params![task_id.to_string(), depends_on_id.to_string(), kind.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if duplicate.is_some() {
+            return Err(StoreError::InvalidDependency(format!(
+                "dependency `{task_id}` —{}→ `{depends_on_id}` already exists",
+                kind.as_str()
+            )));
+        }
+        let edge = TaskDependency {
+            id: new_id(),
+            task_id,
+            task_state: dependent.state,
+            task_title: dependent.title,
+            depends_on_id,
+            depends_on_state: depends_on.state,
+            depends_on_title: depends_on.title,
+            kind,
+            actor: actor.to_string(),
+            created_at: now,
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,actor,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![edge.id.to_string(), edge.task_id.to_string(), edge.depends_on_id.to_string(), kind.as_str(), edge.actor, rows::ts(&edge.created_at)],
+        )?;
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                edge.task_id.to_string(),
+                event_kind::TASK_DEPENDENCY_LINKED,
+                edge.actor,
+                json_string(&serde_json::json!({
+                    (json_field::DEPENDENCY_ID): edge.id.to_string(),
+                    (json_field::DEPENDS_ON_ID): edge.depends_on_id.to_string(),
+                    (json_field::DEPENDENCY_KIND): edge.kind.as_str(),
+                })),
+                rows::ts(&edge.created_at),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(edge)
+    }
+
+    /// Outgoing edges of one task — what it depends on (the resume/accept
+    /// gate input; REQ-03). A task with no edge rows (every task created
+    /// before v4, or one with nothing registered) returns an EMPTY list,
+    /// never an error (REQ-08 AC2).
+    pub fn task_dependencies(&self, task_id: Id) -> StoreResult<Vec<TaskDependency>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{} WHERE d.task_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
+        let mut rows = stmt.query(params![task_id.to_string()])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::dependency_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    /// Incoming edges of one task — which tasks depend on it. This is the
+    /// SAME query shape as the outgoing view: an "epic" needs no separate
+    /// entity, the epic role of a task is named by this ordinary dependency
+    /// read (REQ-06 AC2).
+    pub fn incoming_dependencies(&self, task_id: Id) -> StoreResult<Vec<TaskDependency>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{} WHERE d.depends_on_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
+        let mut rows = stmt.query(params![task_id.to_string()])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::dependency_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    /// The WHOLE graph in ONE query: every task node with its state and its
+    /// outgoing typed edges (both endpoint states included). This is what
+    /// makes the plan computable from platform data alone — a roadmap
+    /// consumer takes this set, the ready set is `open_blockers` per node
+    /// (REQ-04 AC1/AC2) — and the planning-level "what is happening"
+    /// view (REQ-05 AC1). Tasks without edges appear with an empty set.
+    pub fn dependency_graph(&self) -> StoreResult<Vec<DependencyNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.project_id, t.title, t.business_description, t.state, t.return_state,
+                    t.requirements_seq, t.lock_version, t.created_at, t.updated_at,
+                    d.id, d.kind, d.depends_on_id, d.actor, d.created_at, p.state, p.title
+             FROM tasks t
+             LEFT JOIN task_dependencies d ON d.task_id = t.id
+             LEFT JOIN tasks p ON p.id = d.depends_on_id
+             ORDER BY t.updated_at DESC, t.id, d.created_at, d.id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out: Vec<DependencyNode> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let task = rows::task_from_row(r)?;
+            let edge = rows::dependency_tail_from_row(r, &task)?;
+            match out.last_mut() {
+                // Rows of one task are consecutive (the ORDER BY): append
+                // the edge to the node instead of emitting the task twice.
+                Some(node) if node.task.id == task.id => {
+                    if let Some(e) = edge {
+                        node.dependencies.push(e);
+                    }
+                }
+                _ => out.push(DependencyNode { task, dependencies: edge.into_iter().collect() }),
+            }
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------
     // artifacts & content-addressed store
     // ------------------------------------------------------------------
 

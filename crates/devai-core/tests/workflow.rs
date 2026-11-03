@@ -89,13 +89,13 @@ fn full_happy_lifecycle() {
     t = workflow::implementation_reported(&t, None, "impl", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Qa);
 
-    // accept requires a quality report
-    let err = workflow::accept(&t, &artifacts, None, "u", now()).unwrap_err();
+    // accept requires a quality report (and no open 'blocks' edge — &[])
+    let err = workflow::accept(&t, &artifacts, &[], None, "u", now()).unwrap_err();
     assert!(err.to_string().contains("QUALITY_REPORT"));
 
     let qr = artifact(&t, ArtifactKind::QualityReport, 1, ArtifactStatus::Current, vec![spec.id]);
     artifacts.push(qr);
-    t = workflow::accept(&t, &artifacts, None, "u", now()).unwrap().task;
+    t = workflow::accept(&t, &artifacts, &[], None, "u", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Accepted);
     assert!(t.state.is_terminal());
 }
@@ -163,7 +163,7 @@ fn accepted_task_accepts_no_more_operations() {
     let t = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
     let qr = artifact(&t, ArtifactKind::QualityReport, 1, ArtifactStatus::Current, vec![]);
     artifacts.push(qr);
-    let t = workflow::accept(&t, &artifacts, None, "u", now()).unwrap().task;
+    let t = workflow::accept(&t, &artifacts, &[], None, "u", now()).unwrap().task;
     assert!(workflow::pause(&t, None, "u", now()).is_err());
     assert!(workflow::cancel(&t, None, "u", now()).is_err());
     assert!(workflow::start(&t, "u", now()).is_err());
@@ -201,7 +201,7 @@ fn pause_resume_roundtrip() {
     let t = workflow::pause(&t, Some("lunch"), "u", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Paused);
     assert_eq!(t.return_state, Some(TaskState::Implementation));
-    let t = workflow::resume(&t, "u", now()).unwrap().task;
+    let t = workflow::resume(&t, &[], "u", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Implementation);
 }
 
@@ -211,12 +211,12 @@ fn block_and_fail_releases() {
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
     let b = workflow::block(&t, Some("need access"), "u", now()).unwrap().task;
     assert_eq!(b.state, TaskState::Blocked);
-    let b = workflow::resume(&b, "u", now()).unwrap().task;
+    let b = workflow::resume(&b, &[], "u", now()).unwrap().task;
     assert_eq!(b.state, TaskState::Implementation);
 
     let f = workflow::fail(&t, Some("runtime crashed"), "runtime", now()).unwrap().task;
     assert_eq!(f.state, TaskState::Failed);
-    let f = workflow::resume(&f, "u", now()).unwrap().task;
+    let f = workflow::resume(&f, &[], "u", now()).unwrap().task;
     assert_eq!(f.state, TaskState::Implementation);
 }
 
@@ -339,6 +339,97 @@ fn json_array_column_fails_loud_instead_of_reading_empty() {
     assert!(json_array::<Id>(Some("[\"1b9d6ed4-1c7c-7c3e-9d1e-cd0f0a0b0c0d\"]")).unwrap().len() == 1);
     let err = json_array::<Id>(Some("{broken")).unwrap_err();
     assert!(format!("{err}").contains("corrupt JSON array"), "{err}");
+}
+
+// --- task dependency graph: typed edges gate continuation (REQ-03). ---
+
+/// One edge as the store's dependency projection hands it to the pure
+/// workflow: both endpoints' states travel in on the edge row.
+fn dep(task: &Task, on_id: Id, on_state: TaskState, kind: DependencyKind) -> TaskDependency {
+    TaskDependency {
+        id: new_id(),
+        task_id: task.id,
+        task_state: task.state,
+        task_title: task.title.clone(),
+        depends_on_id: on_id,
+        depends_on_state: on_state,
+        depends_on_title: "depended-on".into(),
+        kind,
+        actor: "tester".into(),
+        created_at: now(),
+    }
+}
+
+#[test]
+fn resume_refuses_open_blocks_edges_and_carries_the_blocker_ids_as_data() {
+    let mut artifacts = vec![];
+    let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
+    let t = workflow::pause(&t, None, "u", now()).unwrap().task;
+
+    let blocker_a = new_id();
+    let blocker_b = new_id();
+    let genealogy_only = new_id();
+    let mut deps = vec![
+        dep(&t, blocker_a, TaskState::Paused, DependencyKind::Blocks),
+        dep(&t, blocker_b, TaskState::Analysis, DependencyKind::Blocks),
+        // 'parent' is genealogy: the spec names ONLY 'blocks' as the gate,
+        // and whether parent should gate too is an open question — not
+        // invented here.
+        dep(&t, genealogy_only, TaskState::Implementation, DependencyKind::Parent),
+    ];
+    let err = workflow::resume(&t, &deps, "u", now()).unwrap_err();
+    match &err {
+        devai_core::CoreError::OpenBlockers { blockers } => {
+            assert_eq!(blockers.len(), 2, "both open blockers enumerated, the parent edge not among them");
+            assert!(blockers.contains(&blocker_a.to_string()) && blockers.contains(&blocker_b.to_string()));
+            assert!(!blockers.contains(&genealogy_only.to_string()));
+        }
+        other => panic!("expected OpenBlockers, got {other:?}"),
+    }
+    assert!(err.to_string().contains(&blocker_a.to_string()), "the refusal message lists the blocking ids as data");
+
+    // REQ-03 AC2: closing every blocking dependency lets resume through
+    // with no other change. CLOSED = the depended-on task is terminal
+    // (documented resolution of the spec's open question; a CANCELLED
+    // blocker is closed too — it will never complete, and leaving its edge
+    // open would deadlock the dependent with no platform recourse).
+    for d in &mut deps {
+        d.depends_on_state = if d.kind == DependencyKind::Blocks { TaskState::Cancelled } else { d.depends_on_state };
+    }
+    let r = workflow::resume(&t, &deps, "u", now()).unwrap().task;
+    assert_eq!(r.state, TaskState::Implementation, "resume passes once the blockers are terminal");
+    assert_eq!(r.return_state, None);
+}
+
+#[test]
+fn acceptance_is_refused_while_a_blocking_edge_is_open() {
+    let mut artifacts = vec![];
+    let t = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
+    let qr = artifact(&t, ArtifactKind::QualityReport, 1, ArtifactStatus::Current, vec![]);
+    artifacts.push(qr);
+    let blocker = new_id();
+    let deps = vec![dep(&t, blocker, TaskState::Analysis, DependencyKind::Blocks)];
+    // REQ-03 AC3: the human gate refuses and enumerates the blocker.
+    let err = workflow::accept(&t, &artifacts, &deps, None, "u", now()).unwrap_err();
+    assert!(matches!(&err, devai_core::CoreError::OpenBlockers { blockers } if blockers == &vec![blocker.to_string()]), "{err}");
+    // The same acceptance passes with the edge closed (blocker ACCEPTED).
+    let deps_closed = vec![dep(&t, blocker, TaskState::Accepted, DependencyKind::Blocks)];
+    let accepted = workflow::accept(&t, &artifacts, &deps_closed, None, "u", now()).unwrap().task;
+    assert_eq!(accepted.state, TaskState::Accepted);
+}
+
+#[test]
+fn edges_of_other_tasks_never_gate_this_one() {
+    // open_blockers filters on the edge's OWN dependent task id (pure
+    // function robust against a graph slice handed to it wholesale).
+    let mut artifacts = vec![];
+    let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
+    let t = workflow::pause(&t, None, "u", now()).unwrap().task;
+    let mut foreign = dep(&t, new_id(), TaskState::Analysis, DependencyKind::Blocks);
+    foreign.task_id = new_id();
+    let deps = [foreign];
+    assert!(workflow::open_blockers(&t, &deps).is_empty());
+    assert!(workflow::resume(&t, &deps, "u", now()).is_ok());
 }
 
 // --- REQ-PROG-03: pipeline projection is engine-owned display data. ---

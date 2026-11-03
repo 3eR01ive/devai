@@ -99,6 +99,15 @@ enum TaskCmd {
         description: String,
         #[arg(long)]
         description_file: Option<std::path::PathBuf>,
+        /// Task ids this task was DERIVED from ('parent' edges), registered
+        /// at the moment of creation — the "exists because" never leaves
+        /// for the operator chat (REQ-DEP-07). Comma-separated prefixes ok.
+        #[arg(long, value_delimiter = ',')]
+        parent: Vec<String>,
+        /// Task ids blocking this one ('blocks' edges: resume/acceptance
+        /// stay refused until they close). Comma-separated prefixes ok.
+        #[arg(long, value_delimiter = ',')]
+        blocked_by: Vec<String>,
     },
     List,
     Get {
@@ -224,6 +233,32 @@ enum TaskCmd {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Register a typed task dependency: 'parent' ("породила" — why this
+    /// task exists) or 'blocks' ("не может продолжиться без той" — resume
+    /// and acceptance refused while open). Works at creation (--parent /
+    /// --blocked-by) and retroactively, from either moment (REQ-DEP-07).
+    Depend {
+        /// The dependent task (id or unique prefix)
+        id: String,
+        /// The task it depends on (id or unique prefix)
+        #[arg(long)]
+        on: String,
+        /// Dependency kind: parent | blocks
+        #[arg(long)]
+        kind: String,
+    },
+    /// Typed dependencies of one task: what it depends on (outgoing) and
+    /// what depends on it (incoming). An epic is not a separate entity —
+    /// a task with incoming edges IS the vertex of a plan tree here
+    /// (REQ-DEP-06), named by this ordinary dependency query.
+    Dependencies {
+        id: String,
+    },
+    /// The task dependency graph with task states — planning-level "what
+    /// is happening": every node, its outgoing typed edges and whether an
+    /// open 'blocks' edge still holds it. Built purely from stored data
+    /// (REQ-DEP-04/05); the roadmap orders itself out of this graph.
+    Graph,
 }
 
 #[derive(Subcommand)]
