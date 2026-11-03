@@ -1,0 +1,12 @@
+Usage: devai agent [OPTIONS] <COMMAND>
+
+Commands:
+  add   Register a local AgentInstance (provider/model/runtime; keys stay out of the store)
+  list  
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --home <HOME>    Data directory (default: $DEVAI_HOME or ~/.devai) [env: DEVAI_HOME=]
+      --actor <ACTOR>  Actor identity recorded in events/decisions (default: $DEVAI_USER or $USER) [env: DEVAI_USER=]
+      --json           Machine-readable JSON output where supported
+  -h, --help           Print help

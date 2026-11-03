@@ -45,6 +45,12 @@ error_types:
   process/no-evidence:
     desc: Rubric-нарушение выставлено без обязательного evidence.
     severity: minor
+  process/lint-debt:
+    desc: fmt/clippy нарушения в новом коде (fmt-дрейф, clippy warning под -D warnings).
+    severity: minor
+  architecture/sovereignty-by-proxy:
+    desc: Сетевой доступ опосредованно — через subprocess-адаптер, внешний CLI которого ходит в сеть.
+    severity: major
 
 gates:
   - id: build-green
@@ -54,7 +60,11 @@ gates:
     desc: cargo test --workspace exit 0
     probe: { cmd: "cargo test --workspace" }
   - id: no-network
-    desc: Никаких сетевых путей в коде и зависимостях (local-first суверенность)
+    desc: >
+      Никаких сетевых путей в коде и зависимостях (local-first суверенность).
+      НЕ покрывает: сетевой доступ через subprocess-адаптеры
+      (devai-runtime/src/adapters.rs запускает `claude` — внешний процесс сам ходит в сеть).
+    blind_spot: subprocess-адаптеры (см. architecture/sovereignty-by-proxy — тип зарезервирован, критерий не объявлен)
     probe:
       - { cmd: "grep -RInE 'reqwest|hyper|ureq|TcpStream|UdpSocket' crates/*/src/", map: "hits>0 → FAIL" }
   - id: no-secrets
@@ -205,18 +215,21 @@ evaluations:
   - id: process
     title: Процесс (тесты и evidence)
     checks:
-      - id: proc/diff-coverage
-        statement: Новые ветки покрыты тестами (ориентир 80% diff-coverage); negative-кейсы переходов присутствуют.
-        detects: [process/untested-branch]
-        verify: mechanical
-        probe:
-          - { cmd: "cargo llvm-cov --workspace --diff" }
       - id: proc/evidence-completeness
         statement: Каждая rubric-оценка ниже 1.0 имеет evidence-цитаты.
         detects: [process/no-evidence]
         verify: mechanical
         probe:
           - { cmd: "tools/audit validate-report report.json" }
+      - id: arch/lint
+        statement: >
+          cargo fmt --check и cargo clippy -D warnings чисты на новом коде.
+          Поймано прогоном 2026-11-01: fmt дрейфует в cli, clippy даёт ~20 warning.
+        detects: [process/lint-debt]
+        verify: mechanical
+        probe:
+          - { cmd: "cargo fmt --check", map: "exit!=0 → violation" }
+          - { cmd: "cargo clippy --workspace --all-targets -- -D warnings", map: "exit!=0 → violation" }
 
 # scoring v0.2 draft — веса вынесены после первого прогона (2026-11-01, весь tree как диф).
 # Некомпенсируемость обеспечивается НЕ суровостью весов, а полами (floors),
@@ -241,19 +254,23 @@ scoring:
     inconclusive: "blocked_weight > max_blocked_weight or pending_human"
   weights:
     # correctness 0.36 — доверие к поведению против спеки
-    corr/transitions: 0.14
+    corr/transitions: 0.18
     corr/data-immutability: 0.12
     corr/concurrency: 0.10
     # architecture 0.30 — state-машина и границы как актив платформы
     arch/layer-boundaries: 0.12
     arch/idiom-consistency: 0.08
     arch/principles: 0.07
-    arch/no-magic: 0.03
+    arch/no-magic: 0.01
+    arch/lint: 0.02
     # reliability 0.18
-    rel/no-panic: 0.10
+    rel/no-panic: 0.14
     rel/error-context: 0.08
     # ux + process 0.16 — до первого релиза наблюдатели
     ux/json-stability: 0.08
-    proc/diff-coverage: 0.08
+    # proc/diff-coverage удалён 2026-11-03 (запрет cargo llvm-cov: OOM-вешает машину);
+    # meta-проверка proc/evidence-completeness весит 0.0 — освобождённые 0.08
+    # уходят к тяжёлым поведенческим проверкам: corr/transitions 0.14->0.18 (+0.04)
+    # и rel/no-panic 0.10->0.14 (+0.04) — сумма остаётся 1.00.
     # meta-check отчёта: вес 0, но нарушение => вердикт не выдаётся (отчёт невалиден)
     proc/evidence-completeness: 0.0
