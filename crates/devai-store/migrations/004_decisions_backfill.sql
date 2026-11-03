@@ -1,0 +1,40 @@
+-- v3 -> v4: backfill of `decisions` from historical approve/reject/return
+-- events (REQ-BF-*). Before REQ-QAD-001 grew the write-path, `task approve`
+-- (and every `task reject` / `task return`) persisted its rationale ONLY in
+-- the event payload — the decision table stayed empty for those acts, so the
+-- QA auditor's APPROVED_DECISIONS section (fed by `list_decisions`) never saw
+-- the ratified open-question resolutions (precedent 01a1a0b5-0fcf).
+--
+-- The extraction itself runs as CODE (manifest apply tag
+-- `decisions_backfill` -> src/lib.rs): it must parse the payload JSON, mint
+-- UUIDv7 decision ids and write ONE fact event per (task_id, source event
+-- kind) group citing exactly the rows it created — the observe-before-mutate
+-- boundary the manifest comment defines. This script carries what pure SQL
+-- CAN express: the additive index. Predicate the handler implements, kept in
+-- sync with this comment (003's byte-identical-predicate discipline):
+--
+--   events.task_id IS NOT NULL
+--   AND a task row with that id exists (decisions has the FK; an orphan
+--       event must not abort `open()`)
+--   AND events.kind IN ('requirements.approved','requirements.rejected',
+--                       'quality.returned')
+--   AND json payload carries a string `rationale`
+--   AND NOT EXISTS (a decision of the same task storing that same rationale)
+--
+-- The last clause IS the idempotence and the modern-path protection: today's
+-- `task approve` writes event AND decision row in one command (refs=[spec
+-- id]) — its rationale is already disclosed, so its event is skipped; the
+-- handler's own rows make a re-applied rung a no-op for the same reason.
+-- Append-only: NEW decision rows only, events and existing decisions are
+-- never UPDATEd or DELETEd (the wf_events_no_update/no_delete triggers pin
+-- the event side; nothing here touches the decision side).
+--
+-- No UNIQUE index on decisions: a repeated (task_id, kind, rationale) is
+-- legitimate live behavior (e.g. reject, re-approve, reject again with the
+-- same text), and a uniqueness DDL here would start rejecting real writes —
+-- the dedup mechanism is the predicate, not the schema. The non-unique index
+-- makes the disclosure check and the chronological read
+-- (`list_decisions ... ORDER BY created_at`) cheap at the volume the backfill
+-- adds; fresh databases get the same index from schema.sql, so migrated and
+-- fresh shapes stay identical.
+CREATE INDEX IF NOT EXISTS decisions_task ON decisions(task_id, created_at);

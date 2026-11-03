@@ -574,6 +574,12 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         .into_iter()
         .filter(|e| e.status == ExecutionStatus::Running)
         .collect();
+    // Stored human decisions (REQ-BF-006 acceptance reading (a)): the same
+    // rows that feed the auditor's APPROVED_DECISIONS section, rendered here
+    // so the ratified rationale is visible at a glance without re-deriving
+    // anything from artifacts or events (the rung-004 backfill lands in this
+    // exact read path — no special casing).
+    let decisions = ctx.store.list_decisions(t.id)?;
 
     if json {
         outln!(
@@ -602,6 +608,7 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
                         "elapsed_seconds": (now - e.started_at).num_seconds().max(0),
                     }))
                     .collect::<Vec<_>>(),
+                "decisions": decisions,
             })
         );
         return Ok(());
@@ -647,6 +654,31 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
                 short(&e.id),
                 human_elapsed((now - e.started_at).num_seconds())
             );
+        }
+    }
+    // DECISIONS (REQ-BF-006): the stored rows in stored chronology
+    // (`list_decisions ORDER BY created_at`), reproduced verbatim — a
+    // multi-line rationale keeps its continuation indent, a NULL one is
+    // marked explicitly. Absence says so loudly; nothing is re-derived.
+    outln!("---");
+    outln!("DECISIONS:");
+    if decisions.is_empty() {
+        outln!("  (no decisions recorded for this task)");
+    } else {
+        for d in &decisions {
+            outln!("  {}  {:<24} {:<14} {}", d.created_at.format("%Y-%m-%d %H:%M:%S"), d.kind, d.verdict.as_str(), d.actor);
+            match d.rationale.as_deref() {
+                Some(text) => {
+                    for (i, line) in text.lines().enumerate() {
+                        if i == 0 {
+                            outln!("    rationale: {line}");
+                        } else {
+                            outln!("      {line}");
+                        }
+                    }
+                }
+                None => outln!("    rationale: (none stored)"),
+            }
         }
     }
     outln!(

@@ -206,6 +206,7 @@ dependencies = [
  "devai-runtime",
  "devai-store",
  "dirs",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "uuid",
