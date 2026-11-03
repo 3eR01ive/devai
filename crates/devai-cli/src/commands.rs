@@ -183,12 +183,39 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             op(ctx, &id, move |t, _a| workflow::review_recorded(t, v, summary.as_deref(), &ctx.actor, ctx.now()))?;
         }
         TaskCmd::Approve { id, rationale } => {
+            // The approve act is persisted like every other human-gate act
+            // (`rework_merge` below, `qa_reaudit_override` in the engine):
+            // a workflow event via `op` AND a stored decision row. The row
+            // is what makes the rationale a fact the QA auditor is fed —
+            // REQ-QAD-001 read the `decisions` table, and before this the
+            // approve rationale existed only inside the event payload, so
+            // spec-fidelity scoring never saw the ratified open-question
+            // resolutions (precedent 01a1a0b5-0fcf).
+            let task = ctx.store.resolve_task(&id)?;
+            let spec_ref = ctx
+                .store
+                .artifacts(task.id)?
+                .iter()
+                .find(|x| x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current)
+                .map(|x| x.id.to_string())
+                .unwrap_or_default();
+            let decision_rationale = rationale.clone();
             op(ctx, &id, move |t, a| {
                 if a.iter().any(|x| x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current) {
                     workflow::approve_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now())
                 } else {
                     Err(devai_core::CoreError::guard("no CURRENT REQUIREMENTS_SPEC artifact to approve"))
                 }
+            })?;
+            ctx.store.record_decision(&Decision {
+                id: new_id(),
+                task_id: task.id,
+                kind: decision_kind::REQUIREMENTS_APPROVAL.into(),
+                verdict: Verdict::Approved,
+                actor: ctx.actor.clone(),
+                rationale: decision_rationale,
+                refs: if spec_ref.is_empty() { Vec::new() } else { vec![spec_ref] },
+                created_at: ctx.now(),
             })?;
         }
         TaskCmd::Reject { id, rationale } => op(ctx, &id, move |t, _a| workflow::reject_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
