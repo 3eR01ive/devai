@@ -1,0 +1,26 @@
+{
+  "gates_ok": true,
+  "scores": {
+    "corr/transitions": 1.0,
+    "corr/data-immutability": 1.0,
+    "corr/concurrency": 1.0,
+    "arch/idiom-consistency": 0.7,
+    "arch/principles": 0.7,
+    "arch/no-magic": 0.7,
+    "arch/lint": 0.0,
+    "rel/no-panic": 0.4,
+    "rel/error-context": 0.7,
+    "proc/evidence-completeness": 1.0,
+    "arch/layer-boundaries": 1.0,
+    "ux/json-stability": 1.0
+  },
+  "findings": [
+    {"check": "rel/no-panic", "text": "три достижимых unwrap в library-коде без invariant-комментария: store/src/lib.rs:158 (found.pop().unwrap), :228 и :709 (path.parent().unwrap в fs::create_dir_all); core чист"},
+    {"check": "arch/lint", "text": "cargo fmt --check exit!=0 (cli/src/commands.rs:4 import-дрейф); clippy -D warnings: ~20 warning (collapsible_if ×8, redundant closure ×3, too-many-args 8/7 и др.)"},
+    {"check": "arch/idiom-consistency", "text": "crate devai-runtime (3773 стр., adapters/engine/worktree/evaluation/prompt) не покрыт ни одним statement/architecture-путём профиля — grammar drift: архитектурная оценка проходит его молча"},
+    {"check": "arch/idiom-consistency", "text": "runtime/src/adapters.rs:81 Command::new(\"claude\") — сеть через subprocess; шлюз no-network формально зелёный (слепая зона, описана в gate.blind_spot), error_type sovereignty-by-proxy зарезервирован без критерия"},
+    {"check": "arch/no-magic", "text": "store/src/lib.rs:158 магическое «1 =>» инварианта уникальности без константы; нарушение лежит МЕЖДУ якорями 1.0 и 0.4 — пробел шкалы, требуется уровень 0.7 с обоснованием"}
+  ],
+  "blocked_reasons": {},
+  "pending_human": ["arch/principles"]
+}

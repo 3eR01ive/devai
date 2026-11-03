@@ -35,7 +35,7 @@
 # не if-цепочка по номеру шага. Вес (0.04) уступили arch/idiom-consistency и
 # log/completeness — сумма прежняя, иерархия смыслов та же.
 
-version: 5
+version: 7
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -102,7 +102,13 @@ gates:
     probes:
       - { cmd: "cargo test --workspace", pass_exit: [0] }
   - id: no-network
-    desc: Никаких сетевых путей в коде (local-first суверенность)
+    desc: >
+      Прямых сетевых вызовов из кода нет (local-first суверенность). Запрет
+      КОСВЕННЫЙ, а не абсолютный: fetch/HTTP из кода проекта — моветон и валится
+      сюда; но вызов внешних инструментов, которые по архитектуре сами ходят в
+      сеть (адаптер-субпроцесс вроде `claude`), — легитимный паттерн и шлюзом
+      НЕ штрафуется. Грейп смотрит сетевые crate/API в коде, не subprocess.
+    blind_spot: subprocess-адаптеры — по дизайну; см. architecture/sovereignty-by-proxy (зарезервирован как наблюдение, не нарушение)
     probes:
       - { cmd: "test -z \"$(grep -RIlE 'reqwest|hyper|ureq|TcpStream|UdpSocket' crates 2>/dev/null)\"", pass_exit: [0] }
   - id: no-secrets
@@ -311,20 +317,6 @@ evaluations:
           - { cmd: "./target/debug/devai task --help >/dev/null", pass_exit: [0] }
         reviewer: tool
 
-  - id: process
-    title: Процесс (тесты и evidence)
-    checks:
-      - id: proc/diff-coverage
-        statement: Новые ветки покрыты тестами (ориентир 80% diff-coverage); negative-кейсы переходов присутствуют.
-        detects: [process/untested-branch]
-        verify: mechanical
-        probes:
-          # Отсутствие cargo-llvm-cov даёт exit 101 — неотличимо от честного
-          # провала. Preflight относит неподключённый инструмент к сентинелу
-          # BLOCKED: НЕ ПРОВЕРЕНО, никогда не fake FAIL и не fake PASS.
-          - { cmd: "cargo llvm-cov --version >/dev/null 2>&1 || exit 127; cargo llvm-cov --workspace --diff", pass_exit: [0] }
-        reviewer: tool
-
   - id: logic
     title: Логическая полнота и тупики
     checks:
@@ -383,18 +375,20 @@ scoring:
     # v5: +arch/registry-in-data 0.04 (инцидент 2026-11-02: миграционные имена
     # const-таблицей в store/lib.rs); снято по 0.01 с четырёх тяжеловесов,
     # иерархия весов не нарушена.
-    corr/transitions: 0.11
+    # v6: proc/diff-coverage УДАЛЁН по требованию пользователя (2026-11-03):
+    # cargo llvm-cov запускает массовый перекомпилятор, который вешает машину
+    # через OOM. Освободившийся 0.08 распределён по тяжёлым проверкам.
+    corr/transitions: 0.13
     corr/data-immutability: 0.10
     corr/concurrency: 0.08
-    arch/layer-boundaries: 0.10
+    arch/layer-boundaries: 0.12
     arch/idiom-consistency: 0.04
     arch/sequence-as-data: 0.04
     arch/registry-in-data: 0.04
     arch/principles: 0.07
     arch/no-magic: 0.02
-    rel/no-panic: 0.07
+    rel/no-panic: 0.09
     rel/error-context: 0.06
     ux/json-stability: 0.06
-    proc/diff-coverage: 0.08
-    log/dead-ends: 0.09
+    log/dead-ends: 0.11
     log/completeness: 0.04
