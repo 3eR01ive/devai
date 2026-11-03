@@ -90,7 +90,7 @@ fn revision_marks_dependents_stale_persistently() {
 
     let plan = publish(&store, &t, ArtifactKind::ImplementationPlan, b"plan", vec![spec1.id]);
     let report = publish(&store, &t, ArtifactKind::ImplementationReport, b"report", vec![plan.id]);
-    commit(&store, &t, workflow::implementation_reported(&t, None, "impl", now()).unwrap());
+    commit(&store, &t, workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap());
     t = store.get_task(&t.id.to_string()).unwrap();
     assert_eq!(t.state, TaskState::Qa);
 
@@ -171,7 +171,7 @@ fn export_import_roundtrip_restores_everything() {
     store.answer_question(q.id, "worktree", "u", now()).unwrap();
     commit(&store, &t, workflow::answer_question(&t, q.id, "u", now()).unwrap());
     t = store.get_task(&t.id.to_string()).unwrap();
-    commit(&store, &t, workflow::implementation_reported(&t, None, "impl", now()).unwrap());
+    commit(&store, &t, workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap());
     store.finish_execution(&store.get_execution(&e.id.to_string()).unwrap(), ExecutionStatus::Completed, Some("done"), None, now()).unwrap();
     store
         .record_decision(&Decision {

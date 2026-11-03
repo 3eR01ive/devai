@@ -306,6 +306,25 @@ impl Store {
                 ],
             )?;
         }
+        // A mutation that PARKS the task on a blocking question carries the
+        // question row itself: it lands in this SAME transaction, so a held
+        // task is never left without an answerable question (REQ-RG-02: the
+        // empty-rework gate is loud only if the operator can act on it).
+        for q in &m.questions {
+            tx.execute(
+                "INSERT INTO questions(id,task_id,execution_id,text,context,options,blocking,status,answer,answered_by,answered_at,created_at)
+                 VALUES(?1,?2,NULL,?3,?4,?5,?6,'OPEN',NULL,NULL,NULL,?7)",
+                params![
+                    q.id.to_string(),
+                    m.task.id.to_string(),
+                    q.text,
+                    q.context,
+                    json_string(&q.options),
+                    q.blocking as i64,
+                    rows::ts(&Utc::now()),
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }

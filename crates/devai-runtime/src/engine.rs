@@ -18,6 +18,7 @@ use devai_store::{ArtifactDraft, Store, StoreError};
 
 use crate::adapters::{self, AdapterError, AgentRuntime, ExecOutput, ExecRequest};
 use crate::evaluation;
+use crate::gate;
 use crate::prompt::build_user_prompt;
 use crate::worktree;
 
@@ -773,7 +774,18 @@ impl<'a> Engine<'a> {
                     .unwrap_or(Verdict::NeedsRevision);
                 workflow::review_recorded(task, verdict, out.summary.as_deref(), actor, Utc::now())?
             }
-            ArtifactKind::ImplementationReport => workflow::implementation_reported(task, out.summary.as_deref(), actor, Utc::now())?,
+            ArtifactKind::ImplementationReport => {
+                // REQ-RG-01/02: the empty-rework gate serializes INSIDE the
+                // core command — the engine only hands it the stored facts
+                // (stamped commits of the report bodies, the task's human
+                // ratifications, the QA-return rationale). A REWORK
+                // publication naming the previous report's identical commit
+                // parks the task in WAITING_FOR_INPUT on a blocking question
+                // instead of riding silently into QA; the engine creates no
+                // ratification of its own (REQ-RG-03 AC2).
+                let facts = gate::collect_implementation_report_facts(self.store, task.id, &artifact, &fresh, out.summary.clone())?;
+                workflow::implementation_reported(task, &facts, actor, Utc::now())?
+            }
             ArtifactKind::QualityReport => {
                 // QA produced its report; acceptance is a HUMAN decision.
                 // No state transition: stop right here.

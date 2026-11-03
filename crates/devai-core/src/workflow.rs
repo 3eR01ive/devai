@@ -20,6 +20,11 @@ pub struct Mutation {
     /// Artifact status downgrades (STALE / SUPERSEDED). Results are never
     /// deleted, only marked (history is immutable).
     pub artifact_status: Vec<(Id, ArtifactStatus)>,
+    /// Question rows a blocking command parks the task on. Persisted by the
+    /// store in the SAME transaction as the state change and the events, so
+    /// a held task is always answerable (REQ-RG-02: the empty-rework gate's
+    /// loud state is a real, actionable question, not only a log line).
+    pub questions: Vec<QuestionDraft>,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +80,7 @@ fn transition(
         task: next,
         events: vec![EventDraft { kind, actor: actor.to_string(), payload }],
         artifact_status: Vec::new(),
+        questions: Vec::new(),
     }
 }
 
@@ -88,6 +94,7 @@ fn note(task: &Task, kind: &'static str, actor: &str, now: Timestamp, payload: s
         task: next,
         events: vec![EventDraft { kind, actor: actor.to_string(), payload }],
         artifact_status: Vec::new(),
+        questions: Vec::new(),
     }
 }
 
@@ -209,11 +216,209 @@ pub fn reject_requirements(task: &Task, rationale: Option<&str>, actor: &str, no
     Ok(transition(task, TaskState::Analysis, event_kind::REQUIREMENTS_REJECTED, actor, now, json!({ "rationale": rationale })))
 }
 
-pub fn implementation_reported(task: &Task, summary: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
+/// One previous IMPLEMENTATION_REPORT as the producer read it from stored
+/// values: identity + version order + the platform-stamped `commit` the body
+/// carries (engine-side stamp of implementation-report@2). `None` commit means
+/// "this report names no comparable commit" (read-only producer, pre-@2 body,
+/// manual publication without the field) — a fact the gate must SEE, not guess.
+#[derive(Clone, Debug)]
+pub struct PriorImplementationReport {
+    pub artifact_id: Id,
+    pub seq: u32,
+    pub commit: Option<String>,
+}
+
+/// The stored facts a producer assembles AT PUBLICATION TIME for
+/// [`implementation_reported`] (REQ-RG-01: producer-side detection, never
+/// read-time; comparison over stored values only, no git recompute). The gate
+/// itself lives in this module — the single serialization point every
+/// publication path passes through, so no producer can bypass it.
+#[derive(Clone, Debug)]
+pub struct ImplementationReportFacts {
+    pub summary: Option<String>,
+    /// The report being published (already stored when this command runs).
+    pub current_report: Id,
+    /// Its stamped `commit`, read from the stored body.
+    pub current_commit: Option<String>,
+    /// Every other IMPLEMENTATION_REPORT of the task; the gate compares
+    /// against the one with the highest `seq`.
+    pub priors: Vec<PriorImplementationReport>,
+    /// The task's stored `rework_noop_ratified` decisions (REQ-RG-03: only a
+    /// human command records one; the engine never does).
+    pub ratifications: Vec<Decision>,
+    /// The `quality.returned` rationale that opened the current REWORK cycle,
+    /// quoted into the gate event (REQ-RG-02 AC1: the loud record names the
+    /// points the skipped rework was supposed to fix).
+    pub qa_return_rationale: Option<String>,
+}
+
+impl ImplementationReportFacts {
+    /// Facts for a producer with nothing to compare against — a first report,
+    /// an IMPLEMENTATION publication the gate never touches (REQ-RG-01), or a
+    /// test fixture. A REWORK publication built from `bare` facts resolves to
+    /// the distinct INCOMPARABLE outcome of REQ-RG-04, never to a silent pass.
+    pub fn bare(current_report: Id) -> Self {
+        Self { summary: None, current_report, current_commit: None, priors: Vec::new(), ratifications: Vec::new(), qa_return_rationale: None }
+    }
+}
+
+/// Publish of an IMPLEMENTATION_REPORT: IMPLEMENTATION → QA as always;
+/// REWORK → QA only through the empty-rework gate (REQ-RG-01..04). The gate
+/// compares the stamped `commit` of the report being published with the stamped
+/// `commit` of the previous report (by seq) of the same task. Identical — and
+/// not yet ratified for this exact pair — is NOT a silent ride into QA: the
+/// task parks in WAITING_FOR_INPUT (returning to REWORK) on a blocking question
+/// and an immutable trip event naming both reports, both shas and the QA
+/// return that opened the cycle (REQ-RG-02). A human `rework_noop_ratified`
+/// decision covering the pair re-opens the passage with `ratified_by` on the
+/// transition event (REQ-RG-03); a ratification belongs to its cycle's pair
+/// only, never to the task at large (AC4). Uncomparable sides produce the
+/// distinct `qa.rework_gate_incomparable` record and NO verdict claim
+/// (REQ-RG-04).
+pub fn implementation_reported(
+    task: &Task,
+    facts: &ImplementationReportFacts,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
     require_state(task, &[TaskState::Implementation, TaskState::Rework], "publish-implementation-report", CoreError::hint(
         "implementation reports are recorded in IMPLEMENTATION or REWORK",
     ))?;
-    Ok(transition(task, TaskState::Qa, event_kind::IMPLEMENTATION_REPORTED, actor, now, json!({ "summary": summary })))
+
+    let mut payload = json!({ "summary": facts.summary });
+    let mut incomparable: Option<(&'static str, Option<String>)> = None;
+    // The gate binds REWORK publications only: the first report of a task and
+    // an IMPLEMENTATION publication have nothing to compare against by
+    // construction and pass exactly as before (REQ-RG-01).
+    if task.state == TaskState::Rework {
+        match facts.priors.iter().max_by_key(|p| p.seq) {
+            None => {
+                incomparable = Some(("no prior implementation report to compare against", None));
+            }
+            Some(prior) => {
+                let prev_sha = prior.commit.as_deref();
+                let cur_sha = facts.current_commit.as_deref();
+                match (prev_sha, cur_sha) {
+                    (Some(p), Some(c)) if p == c => {
+                        // Identical tips: with the worktree discipline an
+                        // unchanged rework re-names the same commit
+                        // (worktree.rs `commit_platform_work` returns the tip,
+                        // never an empty commit) — so equality means the
+                        // rework brought no new work.
+                        let ratified = facts.ratifications.iter().find(|d| {
+                            d.kind == decision_kind::REWORK_NOOP_RATIFIED
+                                && d.verdict == Verdict::Approved
+                                && d.refs.iter().any(|r| *r == prior.artifact_id.to_string())
+                                && d.refs.iter().any(|r| *r == facts.current_report.to_string())
+                        });
+                        match ratified {
+                            None => return Ok(empty_rework_trip(task, facts, prior, p, c, actor, now)),
+                            Some(d) => {
+                                payload[json_field::GATE] = json!("empty-rework");
+                                payload[json_field::VERDICT] = json!("IDENTICAL_RATIFIED");
+                                payload[json_field::PREV_REPORT] = json!(prior.artifact_id.to_string());
+                                payload[json_field::PREV_COMMIT] = json!(p);
+                                payload[json_field::RATIFIED_BY] = json!(d.id.to_string());
+                            }
+                        }
+                    }
+                    (Some(p), Some(c)) => {
+                        payload[json_field::GATE] = json!("empty-rework");
+                        payload[json_field::VERDICT] = json!("DISTINCT");
+                        payload[json_field::PREV_REPORT] = json!(prior.artifact_id.to_string());
+                        payload[json_field::PREV_COMMIT] = json!(p);
+                        payload[json_field::CURRENT_COMMIT] = json!(c);
+                    }
+                    _ => {
+                        // REQ-RG-04: at least one side names no commit. The
+                        // passage proceeds (the contract leaves `commit`
+                        // optional by construction — forcing it would punish
+                        // the legitimate read-only producer), but the record
+                        // says the comparison NEVER RAN.
+                        let side = if prev_sha.is_none() && cur_sha.is_none() {
+                            "neither report names a stamped commit"
+                        } else if prev_sha.is_none() {
+                            "the previous report names no stamped commit"
+                        } else {
+                            "the published report names no stamped commit"
+                        };
+                        incomparable = Some((side, Some(prior.artifact_id.to_string())));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut m = transition(task, TaskState::Qa, event_kind::IMPLEMENTATION_REPORTED, actor, now, payload);
+    if let Some((reason, prev_report)) = incomparable {
+        m.events.push(EventDraft {
+            kind: event_kind::QA_REWORK_GATE_INCOMPARABLE,
+            actor: actor.to_string(),
+            payload: json!({
+                (json_field::PREV_REPORT): prev_report,
+                (json_field::CURRENT_REPORT): facts.current_report.to_string(),
+                (json_field::REASON): reason,
+            }),
+        });
+    }
+    Ok(m)
+}
+
+/// The loud outcome of an unratified identical-commit REWORK publication:
+/// the task parks in WAITING_FOR_INPUT returning to REWORK, one immutable
+/// `qa.rework_gate_tripped` event names both reports, both shas and the QA
+/// points that were supposed to be fixed, and the blocking question the
+/// operator acts on is carried IN this mutation so the store persists it in
+/// the same transaction (REQ-RG-02: no quiet log-only exit, no state change
+/// without an answerable question).
+fn empty_rework_trip(
+    task: &Task,
+    facts: &ImplementationReportFacts,
+    prior: &PriorImplementationReport,
+    prev_sha: &str,
+    cur_sha: &str,
+    actor: &str,
+    now: Timestamp,
+) -> Mutation {
+    let question_id = new_id();
+    let mut m = transition(
+        task,
+        TaskState::WaitingForInput,
+        event_kind::QUESTION_RAISED,
+        actor,
+        now,
+        json!({
+            (json_field::QUESTION_ID): question_id.to_string(),
+            "blocking": true,
+            (json_field::GATE): "empty-rework",
+        }),
+    );
+    m.events.push(EventDraft {
+        kind: event_kind::QA_REWORK_GATE_TRIPPED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::PREV_REPORT): prior.artifact_id.to_string(),
+            (json_field::CURRENT_REPORT): facts.current_report.to_string(),
+            (json_field::PREV_COMMIT): prev_sha,
+            (json_field::CURRENT_COMMIT): cur_sha,
+            (json_field::QA_RETURN_RATIONALE): facts.qa_return_rationale,
+            (json_field::QUESTION_ID): question_id.to_string(),
+        }),
+    });
+    m.questions.push(QuestionDraft {
+        id: question_id,
+        text: format!(
+            "REWORK publication {} names commit {cur_sha} — the SAME commit as report {} ({prev_sha}): the rework captured no new changes. QA returned with: {}. If the points were genuinely already satisfied, the operator may ratify the no-op explicitly: `devai task ratify-empty-rework {} --rationale \"why no fixes were required\"` (a stored human decision — the QA transition will cite it). Otherwise run the implementation-agent with the actual fixes and publish again.",
+            facts.current_report,
+            prior.artifact_id,
+            facts.qa_return_rationale.as_deref().unwrap_or("(rationale not stored)"),
+            task.id,
+        ),
+        context: Some(format!("gate=empty-rework prev={} current={} commit={cur_sha}", prior.artifact_id, facts.current_report)),
+        options: vec!["ratify-empty-rework (no fixes were required)".into(), "re-run implementation with fixes".into()],
+        blocking: true,
+    });
+    m
 }
 
 pub fn accept(
@@ -440,7 +645,10 @@ pub fn allowed_ops(task: &Task) -> Vec<&'static str> {
         TaskState::Approval => vec!["approve", "reject", "revise"],
         TaskState::Implementation => vec!["publish-implementation-report", "run-role-execution(implementation-agent)", "revise", "raise-question"],
         TaskState::Qa => vec!["accept", "return", "run-role-execution(quality-auditor)", "run-role-execution(quality-aggregator)", "revise"],
-        TaskState::Rework => vec!["publish-implementation-report", "run-role-execution(implementation-agent)", "revise"],
+        // REQ-RG-05: the empty-rework gate's loud primitive is the blocking
+        // question, so the REWORK row of this table names it (the gate itself
+        // raises it at publication; the listing is the operator's surface).
+        TaskState::Rework => vec!["publish-implementation-report", "run-role-execution(implementation-agent)", "revise", "raise-question"],
         TaskState::WaitingForInput => vec!["answer"],
         TaskState::Paused | TaskState::Failed => vec!["resume"],
         TaskState::Blocked => vec!["resume"],

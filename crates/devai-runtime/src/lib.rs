@@ -9,6 +9,7 @@
 mod adapters;
 mod engine;
 pub mod evaluation;
+pub mod gate;
 mod prompt;
 pub mod revision;
 pub mod worktree;

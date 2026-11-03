@@ -57,7 +57,7 @@ fn in_state(task: &Task, target: TaskState, artifacts: &mut Vec<Artifact>) -> Ta
     if target == TaskState::Implementation {
         return t;
     }
-    t = workflow::implementation_reported(&t, None, "impl", now()).unwrap().task;
+    t = workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap().task;
     if target == TaskState::Qa {
         return t;
     }
@@ -86,7 +86,7 @@ fn full_happy_lifecycle() {
     t = workflow::approve_requirements(&t, Some("ok"), "u", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Implementation);
 
-    t = workflow::implementation_reported(&t, None, "impl", now()).unwrap().task;
+    t = workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Qa);
 
     // accept requires a quality report
@@ -114,8 +114,148 @@ fn qa_can_return_to_rework_and_back() {
     let t = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
     let t = workflow::return_to_rework(&t, Some("tests missing"), "auditor", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Rework);
-    let t = workflow::implementation_reported(&t, None, "impl", now()).unwrap().task;
+    // The rework brought REAL changes: the gate compares stored stamped
+    // commits, a new one passes REWORK → QA exactly as before (REQ-RG-01 AC4).
+    let prev = new_id();
+    let facts = gate_facts(&prev, Some("aaaa"), "bbbb");
+    let t = workflow::implementation_reported(&t, &facts, "impl", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Qa);
+}
+
+// --- empty-rework gate (REQ-RG-01..05) --------------------------------------
+
+/// Facts for a REWORK publication: one prior report (id `prev`, optional
+/// stamped commit) and the current report naming `current` commit.
+fn gate_facts(prev: &Id, prev_commit: Option<&str>, current_commit: &str) -> workflow::ImplementationReportFacts {
+    workflow::ImplementationReportFacts {
+        summary: Some("rework".into()),
+        current_report: new_id(),
+        current_commit: Some(current_commit.into()),
+        priors: vec![workflow::PriorImplementationReport { artifact_id: *prev, seq: 1, commit: prev_commit.map(|s| s.to_string()) }],
+        ratifications: vec![],
+        qa_return_rationale: Some("п1; п2; п3".into()),
+    }
+}
+
+/// A `rework_noop_ratified`-shaped decision for the pair (prev, current).
+fn ratification(prev: &Id, current: &Id) -> Decision {
+    Decision {
+        id: new_id(),
+        task_id: new_id(),
+        kind: decision_kind::REWORK_NOOP_RATIFIED.into(),
+        verdict: Verdict::Approved,
+        actor: "operator".into(),
+        rationale: Some("no fixes were required".into()),
+        refs: vec![prev.to_string(), current.to_string()],
+        created_at: now(),
+    }
+}
+
+fn rework_task() -> Task {
+    let mut artifacts = vec![];
+    let t = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
+    workflow::return_to_rework(&t, Some("п1; п2; п3"), "auditor", now()).unwrap().task
+}
+
+#[test]
+fn empty_rework_gate_trips_loud_instead_of_silent_qa() {
+    // The 04.11 precedent as a unit: REWORK publication naming the identical
+    // commit must NOT ride into QA — the task parks on a blocking question
+    // returning to REWORK, with an immutable trip event (REQ-RG-01/02).
+    let t = rework_task();
+    let prev = new_id();
+    let facts = gate_facts(&prev, Some("c0ffee"), "c0ffee");
+    let m = workflow::implementation_reported(&t, &facts, "impl", now()).unwrap();
+    assert_eq!(m.task.state, TaskState::WaitingForInput);
+    assert_eq!(m.task.return_state, Some(TaskState::Rework));
+    let tripped = m.events.iter().find(|e| e.kind == event_kind::QA_REWORK_GATE_TRIPPED).expect("the trip is an event, not a log");
+    assert_eq!(tripped.payload[json_field::PREV_COMMIT], "c0ffee");
+    assert_eq!(tripped.payload[json_field::CURRENT_COMMIT], "c0ffee");
+    assert_eq!(tripped.payload[json_field::PREV_REPORT], prev.to_string());
+    assert_eq!(tripped.payload[json_field::QA_RETURN_RATIONALE], "п1; п2; п3");
+    // The parked state carries its answerable question IN the mutation:
+    // the store persists both in one transaction.
+    let qid = m.events.iter().find(|e| e.kind == event_kind::QUESTION_RAISED).unwrap().payload[json_field::QUESTION_ID].as_str().unwrap().to_string();
+    assert_eq!(m.questions.len(), 1, "the gate ships one blocking question");
+    assert_eq!(m.questions[0].id.to_string(), qid, "the event cites the question the store will hold");
+    assert!(m.questions[0].blocking);
+    assert!(m.questions[0].text.contains("ratify-empty-rework"), "the question names the operator escape");
+}
+
+#[test]
+fn ratified_identical_rework_reaches_qa_citing_the_decision() {
+    // REQ-RG-03: a human ratification for exactly this pair admits the
+    // passage, and the transition event references the decision id.
+    let t = rework_task();
+    let prev = new_id();
+    let mut facts = gate_facts(&prev, Some("c0ffee"), "c0ffee");
+    let d = ratification(&prev, &facts.current_report);
+    facts.ratifications.push(d.clone());
+    let m = workflow::implementation_reported(&t, &facts, "operator", now()).unwrap();
+    assert_eq!(m.task.state, TaskState::Qa);
+    let ev = &m.events[0];
+    assert_eq!(ev.kind, event_kind::IMPLEMENTATION_REPORTED);
+    assert_eq!(ev.payload[json_field::RATIFIED_BY], d.id.to_string());
+    assert_eq!(ev.payload[json_field::VERDICT], "IDENTICAL_RATIFIED");
+}
+
+#[test]
+fn ratification_is_bound_to_its_cycle_pair_never_lifetime() {
+    // REQ-RG-03 AC4: the next cycle's identical commit trips again — the old
+    // decision references the previous pair and is inert for a new one.
+    let t = rework_task();
+    let prev = new_id();
+    let mut facts = gate_facts(&prev, Some("c0ffee"), "c0ffee");
+    facts.ratifications.push(ratification(&prev, &facts.current_report));
+    assert_eq!(workflow::implementation_reported(&t, &facts, "operator", now()).unwrap().task.state, TaskState::Qa);
+    // New cycle: prior is the RATIFIED report itself; new current id; same
+    // unchanged commit → no pair-bound ratification exists → trip.
+    let mut t2 = facts.clone();
+    t2.priors = vec![workflow::PriorImplementationReport { artifact_id: prev, seq: 2, commit: Some("c0ffee".into()) }];
+    t2.current_report = new_id();
+    let m = workflow::implementation_reported(&rework_task(), &t2, "impl", now()).unwrap();
+    assert_eq!(m.task.state, TaskState::WaitingForInput, "cycle-N ratification is not lifetime");
+}
+
+#[test]
+fn incomparable_commits_warn_distinctly_and_claim_no_verdict() {
+    // REQ-RG-04: one side lacks a stamped commit → the passage proceeds, but
+    // the record says the check NEVER RAN — no "gate passed" verdict ships.
+    let t = rework_task();
+    let prev = new_id();
+    let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
+    facts.current_commit = None;
+    let m = workflow::implementation_reported(&t, &facts, "impl", now()).unwrap();
+    assert_eq!(m.task.state, TaskState::Qa);
+    assert!(m.events[0].payload.get(json_field::VERDICT).is_none(), "no verdict without a real comparison");
+    let warn = m.events.iter().find(|e| e.kind == event_kind::QA_REWORK_GATE_INCOMPARABLE).expect("the gap is a distinct event");
+    assert!(warn.payload[json_field::REASON].as_str().unwrap().contains("no stamped commit"));
+    // And with neither side comparable: still distinct, still no verdict.
+    let mut none = gate_facts(&prev, None, "ignored");
+    none.current_commit = None;
+    let m = workflow::implementation_reported(&rework_task(), &none, "impl", now()).unwrap();
+    assert!(m.events[0].payload.get(json_field::VERDICT).is_none());
+}
+
+#[test]
+fn first_publication_from_implementation_is_never_gated() {
+    // REQ-RG-01: the IMPLEMENTATION path is untouched, even with priors that
+    // would collide — the gate binds REWORK only.
+    let mut artifacts = vec![];
+    let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
+    let prev = new_id();
+    let facts = gate_facts(&prev, Some("c0ffee"), "c0ffee");
+    let m = workflow::implementation_reported(&t, &facts, "impl", now()).unwrap();
+    assert_eq!(m.task.state, TaskState::Qa);
+    assert!(m.events.iter().all(|e| e.kind == event_kind::IMPLEMENTATION_REPORTED), "no gate events on the first passage");
+}
+
+#[test]
+fn allowed_ops_rework_lists_the_gate_primitive() {
+    // REQ-RG-05: the chosen loud mechanism is visible in the operations table.
+    let t = rework_task();
+    let ops = workflow::allowed_ops(&t);
+    assert!(ops.contains(&"raise-question"), "Rework must surface the blocking question: {ops:?}");
 }
 
 // --- sovereignty violations ------------------------------------------------
@@ -127,7 +267,7 @@ fn implementation_cannot_start_without_approval() {
     // an external agent tries to jump straight to implementation
     let err = workflow::approve_requirements(&t, None, "external", now()).unwrap_err();
     assert!(err.to_string().contains("not allowed in state REVIEW"), "{err}");
-    let err = workflow::implementation_reported(&t, None, "external", now()).unwrap_err();
+    let err = workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "external", now()).unwrap_err();
     assert!(err.to_string().contains("IMPLEMENTATION"), "{err}");
     // and cannot run an implementation role while awaiting review approval
     assert!(workflow::check_execution_allowed("implementation-agent", &t).is_err());
@@ -246,7 +386,7 @@ fn revise_supersedes_old_spec_and_stales_dependents() {
     };
     artifacts.extend([plan.clone(), patch.clone(), report.clone()]);
 
-    t = workflow::implementation_reported(&t, None, "impl", now()).unwrap().task; // QA
+    t = workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap().task; // QA
 
     // user revises requirements while in QA
     let spec2 = artifact(&t, ArtifactKind::RequirementsSpec, 2, ArtifactStatus::Current, vec![]);
@@ -306,7 +446,7 @@ fn revise_from_v3_shaped_snapshot_stales_dependents_without_double_flip() {
     let plan = artifact(&t, ArtifactKind::ImplementationPlan, 1, ArtifactStatus::Current, vec![spec1.id]);
     let report = artifact(&t, ArtifactKind::ImplementationReport, 1, ArtifactStatus::Current, vec![plan.id]);
     artifacts.extend([plan.clone(), report.clone()]);
-    t = workflow::implementation_reported(&t, None, "impl", now()).unwrap().task; // QA
+    t = workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap().task; // QA
 
     // Since REQ-001 the publication flipped v1 to SUPERSEDED in the store
     // BEFORE this call sees the snapshot — a CURRENT-only filter would
