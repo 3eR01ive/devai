@@ -134,7 +134,7 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
 
 fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::New { title, project, description, description_file } => {
+        TaskCmd::New { title, project, description, description_file, parent, blocked_by } => {
             let project_id = match project.as_deref() {
                 Some(name) => Some(ctx.store.get_project(name)?.context(format!("project `{name}` not found"))?.id),
                 None => None,
@@ -145,10 +145,26 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             };
             let t = Task::new(title, desc, project_id, ctx.now());
             ctx.store.create_task(&t)?;
+            // REQ-DEP-07: a derived task records WHY it exists at the moment
+            // it is created — the genealogy/blocking never leaves for the
+            // operator chat. Dangling references fail loudly here (resolve),
+            // exactly as they would via `task depend`.
+            let mut linked: Vec<TaskDependency> = Vec::new();
+            for p in &parent {
+                let pt = ctx.store.resolve_task(p)?;
+                linked.push(ctx.store.link_task_dependency(t.id, pt.id, DependencyKind::Parent, &ctx.actor, ctx.now())?);
+            }
+            for b in &blocked_by {
+                let bt = ctx.store.resolve_task(b)?;
+                linked.push(ctx.store.link_task_dependency(t.id, bt.id, DependencyKind::Blocks, &ctx.actor, ctx.now())?);
+            }
             if json {
                 outln!("{}", serde_json::to_string_pretty(&t)?);
             } else {
                 outln!("task {} created in DRAFT — workflow is owned by devai", short(&t.id));
+                for d in &linked {
+                    outln!("  depends {} {} ({} in {})", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title);
+                }
                 outln!("start it with: devai task start {}", short(&t.id));
             }
         }
@@ -219,12 +235,35 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             })?;
         }
         TaskCmd::Reject { id, rationale } => op(ctx, &id, move |t, _a| workflow::reject_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
-        TaskCmd::Accept { id, rationale } => op(ctx, &id, move |t, a| workflow::accept(t, a, rationale.as_deref(), &ctx.actor, ctx.now()))?,
+        TaskCmd::Accept { id, rationale } => {
+            // REQ-DEP-03: the human acceptance gate reads the stored
+            // dependency graph — an open 'blocks' edge refuses the gate and
+            // the refusal enumerates the blocking task ids as data. The one
+            // release (RATIFIED DECISION OQ2) is the operator's explicit
+            // `dependency_override` decision, read from stored decisions —
+            // an edge closed means the blocker ACCEPTED, never merely
+            // cancelled/failed (RATIFIED DECISION OQ1).
+            let tid = ctx.store.resolve_task(&id)?.id;
+            let deps = ctx.store.task_dependencies(tid)?;
+            let decisions = ctx.store.list_decisions(tid)?;
+            op(ctx, &id, move |t, a| workflow::accept(t, a, &deps, &decisions, rationale.as_deref(), &ctx.actor, ctx.now()))?;
+        }
         TaskCmd::Return { id, rationale } => op(ctx, &id, move |t, _a| workflow::return_to_rework(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::RatifyEmptyRework { id, rationale } => ratify_empty_rework(ctx, &id, rationale.as_deref(), json)?,
         TaskCmd::Merge { id, workspace, rationale } => task_merge(ctx, &id, workspace.as_deref(), rationale.as_deref(), json)?,
         TaskCmd::Pause { id, reason } => op(ctx, &id, move |t, _a| workflow::pause(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
-        TaskCmd::Resume { id } => op(ctx, &id, |t, _a| workflow::resume(t, &ctx.actor, ctx.now()))?,
+        TaskCmd::Resume { id } => {
+            // REQ-DEP-03: resume from a hold state consults the stored graph
+            // (open blockers enumerate into the refusal; "closed" = blocker
+            // ACCEPTED per ratified OQ1). The only escape is the operator's
+            // own `task override` ratification (ratified OQ2). Closing the
+            // last blocker does NOT resume the task by itself — auto-unpause
+            // is forbidden, resume stays a human command.
+            let tid = ctx.store.resolve_task(&id)?.id;
+            let deps = ctx.store.task_dependencies(tid)?;
+            let decisions = ctx.store.list_decisions(tid)?;
+            op(ctx, &id, move |t, _a| workflow::resume(t, &deps, &decisions, &ctx.actor, ctx.now()))?;
+        }
         TaskCmd::Block { id, reason } => op(ctx, &id, move |t, _a| workflow::block(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Cancel { id, reason } => op(ctx, &id, move |t, _a| workflow::cancel(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Fail { id, reason } => op(ctx, &id, move |t, _a| workflow::fail(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
@@ -236,6 +275,168 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             } else {
                 for e in evs {
                     outln!("{}  {:<28} {:<12} {}", e.created_at.format("%Y-%m-%d %H:%M:%S"), e.kind, e.actor, compact(&e.payload));
+                }
+            }
+        }
+        TaskCmd::Depend { id, on, kind } => {
+            let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
+            let task = ctx.store.resolve_task(&id)?;
+            let depends_on = ctx.store.resolve_task(&on)?;
+            // Registration is LOUD at write (REQ-DEP-07 AC2): self-reference,
+            // a duplicate edge, a dangling id or a cycle WITHIN one kind
+            // (ratified OQ4: parent-DAG and blocks-DAG; a mixed
+            // parent↔blocks cycle — the standard backfill/gate case — is
+            // legal) never land in the store.
+            let d = ctx.store.link_task_dependency(task.id, depends_on.id, kind, &ctx.actor, ctx.now())?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                outln!("task {} —{}→ task {} recorded ({} in {}, by {}, {})",
+                    short(&task.id), kind.as_str(), short(&depends_on.id), depends_on.state.as_str(), depends_on.title, d.actor, d.created_at.format("%Y-%m-%d %H:%M:%S"));
+            }
+        }
+        TaskCmd::Dependencies { id } => {
+            let t = ctx.store.resolve_task(&id)?;
+            let outgoing = ctx.store.task_dependencies(t.id)?;
+            let incoming = ctx.store.incoming_dependencies(t.id)?;
+            if json {
+                outln!("{}", serde_json::json!({"task": t.id.to_string(), "outgoing": outgoing, "incoming": incoming}));
+            } else {
+                print_task(&t);
+                outln!("---");
+                outln!("depends on (outgoing): {}", outgoing.len());
+                for d in &outgoing {
+                    outln!("  {:<7} {}  {:<13} {}  by {}", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title, d.actor);
+                }
+                outln!("dependents (incoming): {}", incoming.len());
+                for d in &incoming {
+                    outln!("  {:<7} {}  {:<13} {}  by {}", d.kind.as_str(), short(&d.task_id), d.task_state.as_str(), d.task_title, d.actor);
+                }
+                // REQ-DEP-06 + RATIFIED DECISION OQ8: no epic entity exists —
+                // an epic VERTEX is a task with no outgoing ACTIVE 'parent'
+                // edge and at least one incoming one — named by this same
+                // dependency read; `task epics` lists the whole registry.
+                let epic_children = incoming.iter().filter(|d| d.kind == DependencyKind::Parent).count();
+                let own_parents = outgoing.iter().filter(|d| d.kind == DependencyKind::Parent).count();
+                if epic_children > 0 && own_parents == 0 {
+                    outln!("epic role: {epic_children} task(s) carry a 'parent' edge into this vertex, the vertex has no parent of its own (the registry is this view, not a table)");
+                }
+            }
+        }
+        TaskCmd::Unlink { id, on, kind } => {
+            // RATIFIED DECISION OQ7: dependency edges are IMMUTABLE —
+            // "removal" is a SUPERSEDED marker. The edge row keeps author
+            // and created_at, gains who/when superseded it, and stays in
+            // the table forever; only the live graph stops seeing it.
+            let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
+            let task = ctx.store.resolve_task(&id)?;
+            let depends_on = ctx.store.resolve_task(&on)?;
+            let d = ctx.store.supersede_task_dependency(task.id, depends_on.id, kind, &ctx.actor, ctx.now())?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&d)?);
+            } else {
+                outln!("task {} —{}→ task {} superseded (edge {} stays as history, by {})",
+                    short(&task.id), kind.as_str(), short(&depends_on.id), short(&d.id), ctx.actor);
+            }
+        }
+        TaskCmd::Override { id, blocker, rationale } => {
+            // RATIFIED DECISION OQ2 — the human-escape of the dependency
+            // gate. The refusal of resume/acceptance is unconditional, the
+            // ONE release is this explicit operator ratification ("continue
+            // despite"), recorded with the same decisions mechanism every
+            // other human gate act uses. `refs` = the FULL task ids it
+            // covers, so a NEW blocker opened later is NOT covered by an
+            // old decision; closing the last blocker never resumes the task
+            // by itself (auto-unpause forbidden) — resume stays a human act.
+            let task = ctx.store.resolve_task(&id)?;
+            let mut blockers: Vec<String> = Vec::new();
+            for b in &blocker {
+                blockers.push(ctx.store.resolve_task(b)?.id.to_string());
+            }
+            if blockers.is_empty() {
+                // Without explicit --blocker, ratify against exactly the
+                // blockers OPEN right now (computed from stored data).
+                let deps = ctx.store.task_dependencies(task.id)?;
+                blockers = workflow::open_blockers(&task, &deps);
+                if blockers.is_empty() {
+                    bail!("task {} has no open blocking dependencies — nothing to override", short(&task.id));
+                }
+            }
+            ctx.store.record_decision(&Decision {
+                id: new_id(),
+                task_id: task.id,
+                kind: decision_kind::DEPENDENCY_OVERRIDE.into(),
+                verdict: Verdict::Approved,
+                actor: ctx.actor.clone(),
+                rationale: rationale.clone(),
+                refs: blockers.clone(),
+                created_at: ctx.now(),
+            })?;
+            ctx.store.insert_event(
+                Some(task.id),
+                event_kind::TASK_DEPENDENCY_OVERRIDDEN,
+                &ctx.actor,
+                serde_json::json!({ "blockers": blockers }),
+            )?;
+            if json {
+                outln!("{}", serde_json::json!({"task": task.id.to_string(), "override_blockers": blockers}));
+            } else {
+                outln!("override recorded for task {}: continuing despite {} — the gate stands for any NEW blocker",
+                    short(&task.id), blockers.join(", "));
+                outln!("the task stays in its hold state until a human runs `devai task resume {}`", short(&task.id));
+            }
+        }
+        TaskCmd::Epics => {
+            // REQ-DEP-06 + RATIFIED DECISION OQ8: the epic registry is a
+            // VIEW over the same stored graph — epic = a task vertex with no
+            // outgoing ACTIVE 'parent' edge and at least one incoming one,
+            // derived by one dependency-table query. No epic entity exists.
+            let epics = ctx.store.epic_heads()?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&epics)?);
+            } else {
+                for e in &epics {
+                    outln!("{}  {:<13} {}  ({} derived child/ren via 'parent')",
+                        short(&e.task.id), e.task.state.as_str(), e.task.title, e.derived_children);
+                }
+                if epics.is_empty() {
+                    outln!("(no epic vertices — no 'parent' tree roots in the graph)");
+                }
+            }
+        }
+        TaskCmd::Graph => {
+            // REQ-DEP-04/05: the planning-level "what is happening" is built
+            // purely from the stored graph in ONE query — node = task +
+            // state, edge = typed dependency; readiness needs no external
+            // information. The epic registry (OQ8) is the same data shaped
+            // by `task epics`; the READY mark below is blocker-purity (an
+            // operator override releases the GATE, not the readiness view —
+            // the blockers stay open until the blocker is ACCEPTED, OQ1).
+            let nodes = ctx.store.dependency_graph()?;
+            if json {
+                let ready: Vec<String> = nodes
+                    .iter()
+                    .filter(|n| !n.task.state.is_terminal() && workflow::open_blockers(&n.task, &n.dependencies).is_empty())
+                    .map(|n| n.task.id.to_string())
+                    .collect();
+                outln!("{}", serde_json::json!({"graph": nodes, "ready": ready}));
+            } else {
+                for n in &nodes {
+                    let blockers = workflow::open_blockers(&n.task, &n.dependencies);
+                    let mark = if n.task.state.is_terminal() {
+                        "terminal".to_string()
+                    } else if blockers.is_empty() {
+                        "ready".to_string()
+                    } else {
+                        format!("open blockers: {}", blockers.join(", "))
+                    };
+                    outln!("{}  {:<13} {}  [{mark}]", short(&n.task.id), n.task.state.as_str(), n.task.title);
+                    for d in &n.dependencies {
+                        outln!("    —{:<7}→ {}  {:<13} {}", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title);
+                    }
+                }
+                if nodes.is_empty() {
+                    outln!("(no tasks)");
                 }
             }
         }

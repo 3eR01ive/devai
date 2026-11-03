@@ -4,6 +4,16 @@
 //! dependency graph. Deliberately excludes caches, model context and
 //! credentials: a task must continue from domain data alone.
 //!
+//! Bundle format v2 (schema v4): adds `dependencies.jsonl` — the task's
+//! ACTIVE OUTGOING typed dependency edges (REQ-01 AC3: dependencies travel
+//! with the bundle like every other table; SUPERSEDED rows are local
+//! history and do not — the live graph restores, the audit trail stays on
+//! its machine). A v1 bundle simply carries no such file and imports
+//! unchanged. Edges reference the depended-on task BY ID,
+//! so importing a bundle whose blocker/parent is not yet in the target
+//! store fails LOUDLY on the FK and rolls the whole import back — import
+//! the blocker's bundle first; a dangling graph is never silently truncated.
+//!
 //! Bundle layout (directory):
 //! ```text
 //! manifest.json      — format version + sha256/size of every file
@@ -14,6 +24,7 @@
 //! executions.jsonl   — role executions incl. their recorded workspace_revision
 //! questions.jsonl
 //! decisions.jsonl
+//! dependencies.jsonl — outgoing task-dependency edges (v2; typed, attributed)
 //! roles.jsonl        — role definitions referenced by executions
 //! contracts.jsonl    — contracts referenced by artifacts/roles
 //! profiles.jsonl     — evaluation profile definitions referenced by
@@ -66,6 +77,10 @@ pub struct BundleCounts {
     /// `default` keeps pre-v2 manifests readable.
     #[serde(default)]
     pub profiles: usize,
+    /// Outgoing dependency edges of the task (bundle v2 / schema v4).
+    /// `default` keeps pre-v2 manifests readable.
+    #[serde(default)]
+    pub dependencies: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +111,13 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
 
     let decisions = store.list_decisions(task.id)?;
     write_jsonl(out_dir, "decisions.jsonl", &decisions, &mut files)?;
+
+    // REQ-01 AC3: the dependency edges are domain data of this task —
+    // exported like every other table. Outgoing edges only: each task's
+    // bundle carries the edges IT declared; incoming ones travel inside
+    // the other task's bundle, so no edge is exported twice.
+    let dependencies = store.task_dependencies(task.id)?;
+    write_jsonl(out_dir, "dependencies.jsonl", &dependencies, &mut files)?;
 
     // Blobs of all exported artifacts (content-addressed copies).
     let mut seen = std::collections::HashSet::new();
@@ -159,7 +181,10 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
 
     let manifest = BundleManifest {
         format: BUNDLE_FORMAT.into(),
-        bundle_version: 1,
+        // v2: `dependencies.jsonl` added (schema v4). A v1 bundle (no such
+        // file) still imports: the reader treats the missing file as an
+        // empty edge set, exactly like the missing pre-v2 profiles file.
+        bundle_version: 2,
         schema_version: SCHEMA_VERSION,
         exported_at: Utc::now().to_rfc3339(),
         task_id: task.id,
@@ -173,6 +198,7 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
             roles: roles.len(),
             contracts: contracts.len(),
             profiles: profiles.len(),
+            dependencies: dependencies.len(),
         },
         files,
     };
@@ -277,6 +303,10 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
     // profiles.jsonl appeared with schema v2: a pre-v2 bundle simply carries
     // no profile definitions, and its executions carry no recorded revisions.
     let profiles: Vec<ProfileEntry> = if dir.join("profiles.jsonl").exists() { read_jsonl(dir, "profiles.jsonl")? } else { Vec::new() };
+    // dependencies.jsonl appeared with schema v4 / bundle v2: a pre-v4 bundle
+    // carries no edges — that is an empty dependency set, not corruption
+    // (REQ-08 AC2: absent means empty, never broken).
+    let dependencies: Vec<TaskDependency> = if dir.join("dependencies.jsonl").exists() { read_jsonl(dir, "dependencies.jsonl")? } else { Vec::new() };
 
     let tx = store.conn.unchecked_transaction()?;
 
@@ -415,6 +445,22 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
             rusqlite::params![
                 d.id.to_string(), d.task_id.to_string(), d.kind, d.verdict.as_str(), d.actor,
                 d.rationale, json_string(&d.refs), rows::ts(&d.created_at),
+            ],
+        )?;
+    }
+
+    // REQ-01 AC3: the dependency edges restore inside the same transaction.
+    // Plain INSERT (no OR IGNORE): the FK check is the loud integrity gate —
+    // an edge whose depended-on task is not in the target store fails the
+    // whole import and rolls it back, instead of silently truncating the
+    // graph (a dangling dependency chain is exactly the defect class of
+    // corrupt-on-read data loss; REQ-07 AC2 discipline at the bundle seam).
+    for d in &dependencies {
+        tx.execute(
+            "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,actor,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                d.id.to_string(), d.task_id.to_string(), d.depends_on_id.to_string(),
+                d.kind.as_str(), d.actor, rows::ts(&d.created_at),
             ],
         )?;
     }

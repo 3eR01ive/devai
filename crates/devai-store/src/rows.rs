@@ -95,6 +95,50 @@ pub fn project_from_row(r: &Row) -> StoreResult<Project> {
     })
 }
 
+/// A dependency edge row from the shared 10-column projection
+/// (`DEPENDENCY_EDGE_SELECT` in lib.rs): edge columns interleaved with the
+/// JOINed states/titles of BOTH endpoint tasks. An unknown `kind` literal is
+/// a loud read error, never a silently dropped edge.
+pub fn dependency_from_row(r: &Row) -> StoreResult<TaskDependency> {
+    Ok(TaskDependency {
+        id: parse_id(get(r, 0)?)?,
+        task_id: parse_id(get(r, 1)?)?,
+        task_state: enum_col("TaskState", get(r, 2)?, TaskState::parse)?,
+        task_title: get(r, 3)?,
+        depends_on_id: parse_id(get(r, 4)?)?,
+        depends_on_state: enum_col("TaskState", get(r, 5)?, TaskState::parse)?,
+        depends_on_title: get(r, 6)?,
+        kind: enum_col("DependencyKind", get(r, 7)?, DependencyKind::parse)?,
+        actor: get(r, 8)?,
+        created_at: parse_ts(get(r, 9)?)?,
+    })
+}
+
+/// The edge tail of the dependency-graph node projection (columns 10..16 —
+/// `d.id, d.kind, d.depends_on_id, d.actor, d.created_at, p.state, p.title`).
+/// `None` is the LEFT JOIN's honest answer for a task with no stored edges:
+/// rows written before v4 read as an EMPTY dependency set, never as corrupt
+/// (REQ-08 AC2). The endpoint task fields come from the node itself.
+pub fn dependency_tail_from_row(r: &Row, task: &Task) -> StoreResult<Option<TaskDependency>> {
+    let edge_id: Option<String> = get(r, 10)?;
+    let Some(edge_id) = edge_id else {
+        return Ok(None);
+    };
+    let depends_on_state: String = get(r, 15)?;
+    Ok(Some(TaskDependency {
+        id: parse_id(edge_id)?,
+        task_id: task.id,
+        task_state: task.state,
+        task_title: task.title.clone(),
+        depends_on_id: parse_id(get(r, 12)?)?,
+        depends_on_state: enum_col("TaskState", depends_on_state, TaskState::parse)?,
+        depends_on_title: get(r, 16)?,
+        kind: enum_col("DependencyKind", get(r, 11)?, DependencyKind::parse)?,
+        actor: get(r, 13)?,
+        created_at: parse_ts(get(r, 14)?)?,
+    }))
+}
+
 pub fn artifact_from_row(r: &Row) -> StoreResult<Artifact> {
     let contract: Option<String> = get(r, 10)?;
     let version: Option<i64> = get(r, 11)?;
