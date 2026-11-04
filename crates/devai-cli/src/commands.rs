@@ -1669,16 +1669,14 @@ fn parse_verdict(s: &str) -> Result<Verdict> {
 }
 
 pub(crate) fn short(id: &Uuid) -> String {
-    // UUIDv7's leading bytes encode the creation timestamp, so very short
-    // prefixes collide for tasks created in the same instant. 12 chars keep
-    // the display compact while remaining practically unique; resolve_task
-    // still fails loudly on any genuine ambiguity (never silently overwrites).
-    id.to_string()[..12].to_string()
+    // The canonical width + rationale live in devai_core::types::ID_PREFIX_CHARS
+    // (single source, shared with devai-api — R1 QA no-magic).
+    devai_core::types::short_id(id)
 }
 
 /// Display-short of an id that already arrives as a string (API views).
 pub(crate) fn short_str(id: &str) -> String {
-    id[..12.min(id.len())].to_string()
+    devai_core::types::short_id_str(id)
 }
 
 fn ellipsis(s: &str, n: usize) -> String {

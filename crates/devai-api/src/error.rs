@@ -40,32 +40,87 @@ pub enum ApiError {
     Io(#[from] std::io::Error),
 }
 
+fn store_code(e: &StoreError) -> ErrorCode {
+    match e {
+        StoreError::NotFound(..) => ErrorCode("not_found"),
+        StoreError::Ambiguous(..) => ErrorCode("ambiguous"),
+        StoreError::Conflict { .. } => ErrorCode("conflict"),
+        StoreError::SingleWriterBusy { .. } => ErrorCode("single_writer_busy"),
+        StoreError::SingleCurrentCollision { .. } => ErrorCode("single_current_collision"),
+        StoreError::InvalidDependency(..) => ErrorCode("invalid_dependency"),
+        StoreError::SchemaVersion { .. } => ErrorCode("schema_version"),
+        StoreError::Corrupt(..) => ErrorCode("corrupt"),
+        StoreError::Config(..) => ErrorCode("config"),
+        StoreError::Io(..) => ErrorCode("io"),
+        StoreError::Sql(..) => ErrorCode("store"),
+    }
+}
+
+fn core_code(e: &CoreError) -> ErrorCode {
+    match e {
+        CoreError::InvalidTransition { .. } => ErrorCode("invalid_transition"),
+        CoreError::Guard(..) => ErrorCode("guard"),
+        CoreError::UnknownVariant { .. } => ErrorCode("unknown_variant"),
+        CoreError::OpenBlockers { .. } => ErrorCode("open_blockers"),
+    }
+}
+
+/// Same recursion through the worktree family: each REQ-WT refusal keeps
+/// its own token instead of hiding behind one "worktree" (R1 QA).
+fn worktree_code(e: &devai_runtime::worktree::WorktreeError) -> ErrorCode {
+    use devai_runtime::worktree::WorktreeError as W;
+    match e {
+        W::NotGit(..) => ErrorCode("worktree_not_git"),
+        W::NoBoundCommit => ErrorCode("worktree_no_bound_commit"),
+        W::Git { .. } => ErrorCode("worktree_git_failed"),
+        W::BranchMismatch { .. } => ErrorCode("worktree_branch_mismatch"),
+        W::Io(..) => ErrorCode("worktree_io"),
+    }
+}
+
+/// Per-variant codes for the engine's runtime errors (R1 QA [arch/log]):
+/// a whole `RuntimeError` must not collapse into one token — the transparent
+/// wrappers recurse into their inner mapping, each domain variant keeps its
+/// own name across the API boundary.
+fn runtime_code(e: &RuntimeError) -> ErrorCode {
+    match e {
+        RuntimeError::Store(inner) => store_code(inner),
+        RuntimeError::Core(inner) => core_code(inner),
+        RuntimeError::Adapter(inner) => adapter_code(inner),
+        RuntimeError::MissingRole(..) => ErrorCode("missing_role"),
+        RuntimeError::MissingArtifact(..) => ErrorCode("missing_artifact"),
+        RuntimeError::StepLimit(..) => ErrorCode("step_limit"),
+        RuntimeError::MissingProfile(..) => ErrorCode("missing_profile"),
+        RuntimeError::MissingContract(..) => ErrorCode("missing_contract"),
+        RuntimeError::Worktree(inner) => worktree_code(inner),
+        RuntimeError::ReportShape(..) => ErrorCode("report_shape"),
+    }
+}
+
+/// Per-variant codes for the contract gate / agent adapter (R1 QA): the
+/// form-rejection, provider-failure and platform-failure families are
+/// distinguishable without parsing text (mirrors `failure_class`, which is
+/// row data, not this wire code).
+fn adapter_code(e: &AdapterError) -> ErrorCode {
+    match e {
+        AdapterError::UnknownProvider(..) => ErrorCode("unknown_provider"),
+        AdapterError::Io(..) => ErrorCode("adapter_io"),
+        AdapterError::Agent(..) => ErrorCode("agent_error"),
+        AdapterError::BadOutput { .. } => ErrorCode("contract_violation"),
+        AdapterError::Platform(..) => ErrorCode("platform_contract"),
+    }
+}
+
 impl ApiError {
     /// Programmatic category (REQ-API-06 AC3). The mapping is exhaustive per
-    /// underlying variant so a consumer never has to guess from the text.
+    /// underlying variant so a consumer never has to guess from the text,
+    /// and no variant family collapses into one token (R1 QA).
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::Store(e) => match e {
-                StoreError::NotFound(..) => ErrorCode("not_found"),
-                StoreError::Ambiguous(..) => ErrorCode("ambiguous"),
-                StoreError::Conflict { .. } => ErrorCode("conflict"),
-                StoreError::SingleWriterBusy { .. } => ErrorCode("single_writer_busy"),
-                StoreError::SingleCurrentCollision { .. } => ErrorCode("single_current_collision"),
-                StoreError::InvalidDependency(..) => ErrorCode("invalid_dependency"),
-                StoreError::SchemaVersion { .. } => ErrorCode("schema_version"),
-                StoreError::Corrupt(..) => ErrorCode("corrupt"),
-                StoreError::Config(..) => ErrorCode("config"),
-                StoreError::Io(..) => ErrorCode("io"),
-                StoreError::Sql(..) => ErrorCode("store"),
-            },
-            Self::Core(e) => match e {
-                CoreError::InvalidTransition { .. } => ErrorCode("invalid_transition"),
-                CoreError::Guard(..) => ErrorCode("guard"),
-                CoreError::UnknownVariant { .. } => ErrorCode("unknown_variant"),
-                CoreError::OpenBlockers { .. } => ErrorCode("open_blockers"),
-            },
-            Self::Runtime(..) => ErrorCode("runtime"),
-            Self::Adapter(..) => ErrorCode("contract_gate"),
+            Self::Store(e) => store_code(e),
+            Self::Core(e) => core_code(e),
+            Self::Runtime(e) => runtime_code(e),
+            Self::Adapter(e) => adapter_code(e),
             Self::BadRequest(..) => ErrorCode("bad_request"),
             Self::NotUtf8 => ErrorCode("not_utf8"),
             Self::Io(..) => ErrorCode("io"),
@@ -90,5 +145,44 @@ mod tests {
         assert_eq!(e3.code(), ErrorCode("bad_request"));
         // Display stays human-readable and carries the inner text (CLI parity).
         assert!(format!("{e}").contains("task `deadbeef` not found"));
+    }
+
+    #[test]
+    fn runtime_and_adapter_variants_keep_their_own_codes() {
+        // R1 QA [arch/log-completeness]: whole RuntimeError/AdapterError
+        // variant families must NOT collapse into one token — each variant
+        // is distinguishable across the API boundary.
+        let cases: Vec<(ApiError, &str)> = vec![
+            (RuntimeError::MissingRole("x".into()).into(), "missing_role"),
+            (RuntimeError::MissingArtifact("spec").into(), "missing_artifact"),
+            (RuntimeError::StepLimit(3, "QA").into(), "step_limit"),
+            (RuntimeError::MissingProfile("/p".into()).into(), "missing_profile"),
+            (RuntimeError::MissingContract("c".into(), 1).into(), "missing_contract"),
+            (RuntimeError::ReportShape("s".into()).into(), "report_shape"),
+            (RuntimeError::Worktree(devai_runtime::worktree::WorktreeError::NoBoundCommit).into(), "worktree_no_bound_commit"),
+            (AdapterError::UnknownProvider("q".into()).into(), "unknown_provider"),
+            (AdapterError::Agent("boom".into()).into(), "agent_error"),
+            (AdapterError::BadOutput { violations: vec!["$.x".into()] }.into(), "contract_violation"),
+            (AdapterError::Platform("asm".into()).into(), "platform_contract"),
+            // Transparent wrappers recurse into the inner family's mapping —
+            // a store NotFound under Runtime is still `not_found`.
+            (RuntimeError::Store(StoreError::SingleWriterBusy { task_id: "t".into(), existing_id: "e".into(), started_at: "now".into(), owner_pid: None, owner_host: None }).into(), "single_writer_busy"),
+            (RuntimeError::Core(CoreError::guard("g")).into(), "guard"),
+            (RuntimeError::Adapter(AdapterError::BadOutput { violations: vec!["v".into()] }).into(), "contract_violation"),
+        ];
+        // Distinct expectations set — captured before `cases` moves into the loop.
+        let distinct_expected: std::collections::HashSet<&str> = cases.iter().map(|(_, c)| *c).collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for (e, want) in cases {
+            assert_eq!(e.code(), ErrorCode(want), "code for {e}");
+            seen.push(want);
+        }
+        // Uniqueness is asserted over the mapping's whole reachable set:
+        // a wrapped variant MAY share the inner family's token (that is the
+        // recursion), but no two DISTINCT expectations may collide.
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), distinct_expected.len(), "codes drift or collide");
     }
 }
