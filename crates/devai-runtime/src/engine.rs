@@ -877,6 +877,11 @@ impl<'a> Engine<'a> {
             role: exec_role,
             provider: agent.provider.clone(),
             model: agent.model.clone(),
+            // Ratified OQ-4: the hermes `--provider` SOURCE is the agent's
+            // `runtime` field (`provider` is already the driver name). Pure
+            // data plumbing — the engine stays provider-agnostic, the
+            // driver decides how to read the value (R3 constraint).
+            provider_override: agent.runtime.clone(),
             inputs: inputs.clone(),
             contract_schema: contract_schema.clone(),
             // REQ-WT-02 AC1: a writing role is NEVER handed the main
@@ -901,7 +906,31 @@ impl<'a> Engine<'a> {
             open: execution.clone(),
             store_err: None,
         };
-        let out = match AgentRuntime::run_with_form_loop(&req, max_repairs, &mut hook) {
+        let outcome = AgentRuntime::run_with_form_loop(&req, max_repairs, &mut hook);
+        // R5 / ratified OQ-7: usage is collected as an OBSERVABLE execution
+        // fact. If the driver said a usage report was expected here (hermes
+        // + platform evidence dir — the provider vocabulary lives in the
+        // driver, `adapters::expects_usage_report`) and the file is absent
+        // after the run, the absence becomes a loud warning event, never
+        // silence. Checked whatever the outcome was: hermes writes the
+        // report even on a failed run, so a missing file is itself a fact
+        // worth recording on success and on failure alike.
+        if let Some(path) = adapters::expects_usage_report(&req) {
+            if !path.exists() {
+                self.store.insert_event(
+                    Some(task.id),
+                    event_kind::EXECUTION_USAGE_MISSING,
+                    &execution.role_slug,
+                    serde_json::json!({
+                        "execution": execution.id.to_string(),
+                        "provider": req.provider,
+                        "usage_file": path.display().to_string(),
+                        "detail": "the run wrote no usage report into the platform evidence dir",
+                    }),
+                )?;
+            }
+        }
+        let out = match outcome {
             RunOutcome::Output(o) => o,
             RunOutcome::Failed(e) => {
                 if let Some(se) = hook.store_err {
@@ -1194,7 +1223,12 @@ impl<'a> Engine<'a> {
             return Ok(a);
         }
         // Builtin fallbacks so `devai task run --agent mock` works in a
-        // freshly initialised home without registration.
+        // freshly initialised home without registration. Ratified OQ-6:
+        // this list STAYS `mock`|`claude` — a `hermes` (or any future)
+        // provider is not silently built in; it is registered explicitly
+        // with `devai agent add <name> --provider hermes [--model ...]
+        // [--runtime <llm-provider>]`, and an unregistered name fails with
+        // the honest NotFound above, never a quiet mock substitution.
         if name == "mock" || name == "claude" {
             return Ok(AgentInstance {
                 id: new_id(),
