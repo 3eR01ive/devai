@@ -641,6 +641,15 @@ impl<'a> Engine<'a> {
                     input_arts.push(rep.clone());
                 }
             }
+            // invariant: an empty input list is correct for the remaining
+            // ArtifactKinds (ProjectProfile, ImplementationPlan, Patch,
+            // TestReport, DecisionRecord, Other) — none of them is a
+            // stage-output of the workflow run loop, and the workflow
+            // guard above (`check_execution_allowed`) admits only stage
+            // roles here. Should a non-stage kind ever reach this match,
+            // the role still receives its context from `role.instructions`
+            // (below); artifact inputs are simply undefined for it, so an
+            // empty `input_arts` is harmless, not a silent bug.
             _ => {}
         }
         let mut inputs: Vec<(String, String)> = input_arts
