@@ -13,7 +13,7 @@ use chrono::Utc;
 use devai_core::error::CoreError;
 use devai_core::types::*;
 use devai_core::workflow;
-use devai_store::config::{Profile, ResponseFormPolicy};
+use devai_store::config::{Profile, ResponseFormPolicy, ReworkPolicy};
 use devai_store::{ArtifactDraft, Store, StoreError};
 
 use crate::adapters::{self, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome};
@@ -122,6 +122,13 @@ pub enum RuntimeError {
     /// stop the run, never fall back to the main checkout.
     #[error(transparent)]
     Worktree(#[from] worktree::WorktreeError),
+    /// The CURRENT quality-report body does not fit the ONE typed shape
+    /// model at its stored contract version (R-003). A reader that cannot
+    /// recognise the structure says so loudly — it never quotes a
+    /// half-empty or silently-empty findings block (2026-11-02 return,
+    /// block 4).
+    #[error("report shape: {0}")]
+    ReportShape(String),
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -281,6 +288,16 @@ pub struct Engine<'a> {
     /// platform-owned `config/workflow/*.yaml` data, never hardcoded at a
     /// call site. `max_repair_attempts = 0` keeps today's one-shot behavior.
     response_form: ResponseFormPolicy,
+    /// REWORK-context delivery table (R-001): which recorded decision events
+    /// feed which role. Platform workflow data, loaded from
+    /// `config/workflow/rework-context.yaml`; a home without it falls back
+    /// to the embedded factory bytes — the same table, never a code copy.
+    rework: Vec<ReworkPolicy>,
+    /// A present-but-broken delivery table is LOUD at the next stage run,
+    /// not silent and not fatal at construction: the message is held here
+    /// (Engine::new stays infallible, as every caller assumes) and raised
+    /// in `run_stage` before any prompt is built.
+    rework_config_error: Option<String>,
 }
 
 impl<'a> Engine<'a> {
@@ -299,8 +316,22 @@ impl<'a> Engine<'a> {
         // seed time (seed.rs), so this fallback only shields a broken manual
         // edit from taking the whole engine down.
         let response_form = devai_store::config::load_response_form_policy(&cfg_dir.join("workflow")).unwrap_or_default();
+        // REWORK delivery table. Unlike the form budget, the table cannot
+        // degrade quietly — a silently empty table would disable delivery
+        // while the YAML on disk claims otherwise. Absent file/dir =>
+        // embedded factory bytes (R-007); present-but-broken => the error
+        // is HELD and raised loudly at the next stage that could deliver.
+        let mut rework_config_error = None;
+        let rework = match devai_store::config::load_rework_policies(&cfg_dir.join("workflow")) {
+            Ok(policies) if policies.is_empty() => devai_store::config::factory_rework_policies(),
+            Ok(policies) => policies,
+            Err(e) => {
+                rework_config_error = Some(e.to_string());
+                Vec::new()
+            }
+        };
         let workspace = std::env::current_dir().unwrap_or_else(|_| store.root().to_path_buf());
-        Engine { store, max_steps: DEFAULT_MAX_STEPS, profile, workspace, force_reaudit: false, response_form }
+        Engine { store, max_steps: DEFAULT_MAX_STEPS, profile, workspace, force_reaudit: false, response_form, rework, rework_config_error }
     }
 
     /// Override the probe workspace (tests, monorepo subdirs).
@@ -326,6 +357,40 @@ impl<'a> Engine<'a> {
     /// value comes from `config/workflow/response-form-loop.yaml`).
     pub fn with_max_repair_attempts(mut self, max_repair_attempts: u32) -> Self {
         self.response_form.max_repair_attempts = max_repair_attempts;
+        self
+    }
+
+    /// Provide the REWORK delivery table explicitly (tests; the production
+    /// value comes from `config/workflow/rework-context.yaml`, falling back
+    /// to the embedded factory bytes). Replacing the table also clears any
+    /// held load error — the caller has just supplied a valid table.
+    pub fn with_rework_policy(mut self, rework: Vec<ReworkPolicy>) -> Self {
+        self.rework = rework;
+        self.rework_config_error = None;
+        self
+    }
+
+    /// Re-read the delivery table from an explicit `workflow/` directory,
+    /// applying the exact resolution of `new` (files if declared, factory
+    /// bytes if the directory or file is absent, HELD loud error if present
+    /// but malformed). Deterministic test seam — so a proof about config
+    /// resolution never depends on a stray `DEVAI_CONFIG` in the ambient
+    /// environment.
+    pub fn with_rework_config_dir(mut self, dir: &std::path::Path) -> Self {
+        match devai_store::config::load_rework_policies(dir) {
+            Ok(policies) if policies.is_empty() => {
+                self.rework = devai_store::config::factory_rework_policies();
+                self.rework_config_error = None;
+            }
+            Ok(policies) => {
+                self.rework = policies;
+                self.rework_config_error = None;
+            }
+            Err(e) => {
+                self.rework = Vec::new();
+                self.rework_config_error = Some(e.to_string());
+            }
+        }
         self
     }
 
@@ -597,6 +662,18 @@ impl<'a> Engine<'a> {
             "APPROVED_DECISIONS (all stored human decisions for this task, reproduced verbatim; approve rationales are the ratified resolutions of the spec's open questions)".to_string(),
             decisions_prompt_text(&self.store.list_decisions(task.id)?),
         ));
+        // REWORK CONTEXT (R-001..R-008): the platform assembles the quoted
+        // rejection context for this role from the append-only record,
+        // following the declarative table — role YAML never learns it.
+        // `Ok(None)` => NO section is added (a first-run prompt stays
+        // byte-identical); a broken delivery table fails loudly HERE, never
+        // masquerades as "nothing to deliver".
+        if let Some(err) = &self.rework_config_error {
+            return Err(RuntimeError::Store(StoreError::Config(err.clone())));
+        }
+        if let Some(section) = crate::context::rework_context(self.store, task, role_slug, &self.rework)? {
+            inputs.push((crate::context::REWORK_CONTEXT_LABEL.to_string(), section));
+        }
         // QA stage: the platform runs the profile's probes FIRST, so the
         // auditor sees real mechanical evidence and cannot invent any.
         let eval_run = if is_qa {

@@ -7,6 +7,7 @@
 //! the workflow. Human gates (APPROVAL, final ACCEPT) stop the engine.
 
 mod adapters;
+pub mod context;
 mod engine;
 pub mod evaluation;
 pub mod gate;
@@ -17,5 +18,6 @@ pub mod worktree;
 pub use adapters::{
     contract_violations, form_repair_section, validate_against_contract, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
 };
+pub use context::{rework_context, REWORK_CONTEXT_LABEL};
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};
 pub use prompt::{build_system_prompt, build_user_prompt, extract_json_object};

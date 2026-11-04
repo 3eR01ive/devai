@@ -983,7 +983,7 @@ impl Store {
                 format!("role:{}", e.role_slug),
                 json_string(&serde_json::json!({
                     "execution_id": e.id.to_string(),
-                    "role": e.role_slug,
+                    (json_field::ROLE): e.role_slug,
                     "role_version": e.role_version,
                     "agent": e.agent_name,
                     "workspace_revision": e.workspace_revision,
@@ -1023,9 +1023,9 @@ impl Store {
                 format!("role:{}", e.role_slug),
                 json_string(&serde_json::json!({
                     "execution_id": e.id.to_string(),
-                    "role": e.role_slug,
-                    "status": status.as_str(),
-                    "summary": summary,
+                    (json_field::ROLE): e.role_slug,
+                    (json_field::STATUS): status.as_str(),
+                    (json_field::SUMMARY): summary,
                     "error": error,
                 })),
                 rows::ts(&now),

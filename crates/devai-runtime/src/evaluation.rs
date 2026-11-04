@@ -17,10 +17,10 @@ use std::process::Command;
 use std::sync::LazyLock;
 
 use devai_store::config::Profile;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProbeState {
     Pass,
@@ -28,11 +28,11 @@ pub enum ProbeState {
     Blocked,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GateOutcome {
     pub id: String,
     pub state: ProbeState,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub detail: String,
 }
 
@@ -43,27 +43,30 @@ pub struct ProbeOutcome {
     pub output: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckOutcome {
     pub id: String,
     pub verify: String,
     #[serde(rename = "state")]
     pub state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor: Option<f64>,
+    #[serde(default)]
     pub weight: f64,
+    #[serde(default)]
     pub detects: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<String>,
     /// QA rule (quality-report@3, carried unchanged into @4): ALWAYS
     /// non-empty after assembly — every criteria entry cites at least one
     /// concrete piece of evidence. Kept serialized even when empty so a
     /// future bug fails the contract gate with `minimum 1` instead of hiding
     /// behind a missing key.
+    #[serde(default)]
     pub evidence: Vec<String>,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
 }
 
@@ -219,6 +222,63 @@ fn guarantee_evidence(c: &mut CheckOutcome, assessment_execution: &str) {
         };
         c.evidence.push(citation);
     }
+}
+
+/// The evaluation section of the stored report — ONE shape model shared by
+/// the producer (`assemble` writes through it) and every reader (the REWORK
+/// context delivery quotes from it). "Никогда не две формы" (R-003): there is
+/// no second ad-hoc shape a reader may invent, and a body the model cannot
+/// recognise at the stored contract version is a loud error, never empty
+/// quotes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvaluationBlock {
+    /// PASS | FAIL | INCONCLUSIVE — the machine verdict, §2.5.
+    pub verdict: String,
+    #[serde(default)]
+    pub score: f64,
+    #[serde(default)]
+    pub theta: f64,
+    #[serde(default)]
+    pub blocked_weight: f64,
+    #[serde(default)]
+    pub max_blocked_weight: f64,
+    /// The red-line items AS DECIDED AT ASSEMBLY — the reader quotes these
+    /// strings, it never re-applies the predicate to scores (no read-time
+    /// re-derivation).
+    #[serde(default)]
+    pub floors_breached: Vec<String>,
+    #[serde(default)]
+    pub pending_human: Vec<String>,
+    pub gates: Vec<GateOutcome>,
+    pub checks: Vec<CheckOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfileIdentity {
+    pub project: String,
+    pub version: u32,
+}
+
+/// The full quality-report document the platform stores as the report blob.
+/// Serialised by `assemble` and deserialised by readers at the contract
+/// version recorded on the artifact row — one shape for both sides.
+/// `workspace_revision` became required only at @4; @3 bodies load it as
+/// None via the serde default (the legacy-vs-current dispatch is decided by
+/// the STORED contract ref, not by sniffing keys).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QualityReportDoc {
+    /// ACCEPT | RETURN | ESCALATE — the platform recommendation to the human.
+    pub verdict: String,
+    #[serde(default)]
+    pub recommendation_basis: String,
+    #[serde(default)]
+    pub report_text: String,
+    #[serde(default)]
+    pub assessment_execution: String,
+    pub profile: ProfileIdentity,
+    #[serde(default)]
+    pub workspace_revision: Option<devai_core::types::WorkspaceRevision>,
+    pub evaluation: EvaluationBlock,
 }
 
 pub struct Assembled {
@@ -492,28 +552,32 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
     };
 
     let report_text = render(profile, verdict, score, basis.clone(), &checks, &run.gates, &pending, blocked_weight);
-    let json = serde_json::json!({
-        "verdict": rec,
-        "recommendation_basis": basis,
-        "report_text": report_text,
-        "profile": { "project": profile.project, "version": profile.version },
-        // Workspace provenance: the exact state this report judges. Equal to
-        // the revision on the auditor's execution row — recorded, never
-        // recomputed here.
-        "workspace_revision": revision,
-        "assessment_execution": assessment_execution,
-        "evaluation": {
-            "verdict": verdict,
-            "score": (score * 1000.0).round() / 1000.0,
-            "theta": theta,
-            "blocked_weight": (blocked_weight * 1000.0).round() / 1000.0,
-            "max_blocked_weight": cap,
-            "floors_breached": floors_breached,
-            "pending_human": pending,
-            "gates": run.gates,
-            "checks": checks,
-        }
-    });
+    // ONE shape model for both sides (R-003): the producer writes the stored
+    // document THROUGH the same type every reader parses it back into — the
+    // keys and their order are exactly what `assemble` has always emitted,
+    // now declared once as a type instead of a `json!` literal. Workspace
+    // provenance: the revision the PLATFORM captured at execution start,
+    // recorded here and never recomputed by anyone.
+    let doc = QualityReportDoc {
+        verdict: rec.into(),
+        recommendation_basis: basis,
+        report_text: report_text.clone(),
+        assessment_execution: assessment_execution.into(),
+        profile: ProfileIdentity { project: profile.project.clone(), version: profile.version },
+        workspace_revision: Some(revision.clone()),
+        evaluation: EvaluationBlock {
+            verdict: verdict.into(),
+            score: (score * 1000.0).round() / 1000.0,
+            theta,
+            blocked_weight: (blocked_weight * 1000.0).round() / 1000.0,
+            max_blocked_weight: cap,
+            floors_breached,
+            pending_human: pending,
+            gates: run.gates.to_vec(),
+            checks,
+        },
+    };
+    let json = serde_json::to_value(&doc).expect("the typed quality-report model serialises by construction");
     Assembled { json, recommendation: rec, evaluation_verdict: verdict, score, report_text }
 }
 

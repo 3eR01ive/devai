@@ -747,6 +747,57 @@ pub mod event_kind {
     /// distinguishable outcome — this event, and NEVER a verdict claim: the
     /// transition proceeds without a "gate passed" verdict in its payload.
     pub const QA_REWORK_GATE_INCOMPARABLE: &str = "qa.rework_gate_incomparable";
+
+    /// The COMPLETE enumerable vocabulary of kinds the platform may persist.
+    /// Load-time policy validation (the REWORK delivery table in
+    /// `config/workflow/rework-context.yaml`) checks user-authored event
+    /// strings against this list, so a typo (`quality.retruned`) is a loud
+    /// config error at load — never a trigger that silently matches nothing
+    /// forever (2026-11-02 QA return, block 2). A new const above MUST be
+    /// added here too; the `vocabulary.rs` test pins that it is.
+    pub const ALL: &[&str] = &[
+        TASK_CREATED,
+        TASK_DEPENDENCY_LINKED,
+        TASK_DEPENDENCY_UNLINKED,
+        TASK_DEPENDENCY_OVERRIDDEN,
+        WORKFLOW_STARTED,
+        STATE_CHANGED,
+        REQUIREMENTS_PUBLISHED,
+        REQUIREMENTS_REVISED,
+        REVIEW_RECORDED,
+        REQUIREMENTS_APPROVED,
+        REQUIREMENTS_REJECTED,
+        IMPLEMENTATION_REPORTED,
+        QUALITY_RETURNED,
+        TASK_ACCEPTED,
+        ARTIFACTS_STALED,
+        QUESTION_RAISED,
+        QUESTION_ANSWERED,
+        TASK_PAUSED,
+        TASK_RESUMED,
+        TASK_BLOCKED,
+        TASK_UNBLOCKED,
+        TASK_CANCELLED,
+        TASK_FAILED,
+        EXECUTION_STARTED,
+        EXECUTION_FINISHED,
+        EXECUTION_FAILED,
+        EXECUTION_FORM_REJECTED,
+        EXECUTION_FORM_ESCALATED,
+        EXECUTION_CANCELLED,
+        ARTIFACT_PUBLISHED,
+        ARTIFACT_SUPERSEDED,
+        DECISIONS_BACKFILLED,
+        EXPORTED,
+        IMPORTED,
+        QA_FRESH_AWAITING_DECISION,
+        QA_REAUDIT_FORCED,
+        REWORK_MERGED,
+        WORKTREE_PREPARED,
+        WORKTREE_COMMITTED,
+        QA_REWORK_GATE_TRIPPED,
+        QA_REWORK_GATE_INCOMPARABLE,
+    ];
 }
 
 /// The single vocabulary of JSON field names the platform WRITES into
@@ -811,4 +862,60 @@ pub mod json_field {
     pub const VIOLATIONS: &str = "violations";
     pub const FAILURE_CLASS: &str = "failure_class";
     pub const ROLE: &str = "role";
+    // Execution lifecycle payloads (store `finish_execution_classified`): the
+    // REWORK delivery window cutoff reads `role` + `status` back off the
+    // append-only `execution.finished` record — the producer and the reader
+    // must speak one vocabulary (R-002: the store already writes both keys).
+    pub const STATUS: &str = "status";
+    /// The reviewer/implementation text persisted on `review.recorded` and
+    /// `implementation.reported` payloads; `review.recorded`'s rejection text
+    /// is read from here (rework-context.yaml: `rationale_field: summary`).
+    pub const SUMMARY: &str = "summary";
+
+    /// The COMPLETE enumerable vocabulary of payload field names the platform
+    /// itself mints. Load-time policy validation checks user-authored field
+    /// selectors (a trigger's `rationale_field`, `verdict_field`) against
+    /// this list: a typo is a config error naming the field, never a
+    /// delivery that silently reads NOTHING. A new const above MUST be added
+    /// here too; the `vocabulary.rs` test pins that it is.
+    pub const ALL: &[&str] = &[
+        ARTIFACT_ID,
+        CURRENT_ARTIFACT_ID,
+        SUPERSEDED,
+        TASK_ID,
+        KIND,
+        NAME,
+        SEQ,
+        SHA256,
+        SIZE,
+        CONTRACT,
+        REQUIREMENTS_SEQ,
+        SPEC_ID,
+        REASON,
+        STALED,
+        CAUSE,
+        QUESTION_ID,
+        GATE,
+        VERDICT,
+        PREV_REPORT,
+        CURRENT_REPORT,
+        PREV_COMMIT,
+        CURRENT_COMMIT,
+        RATIFIED_BY,
+        QA_RETURN_RATIONALE,
+        BACKFILL,
+        SCRIPT_PATH,
+        DEPENDENCY_ID,
+        DEPENDS_ON_ID,
+        DEPENDENCY_KIND,
+        SOURCE_EVENTS,
+        DECISION_IDS,
+        RATIONALE,
+        ATTEMPT,
+        VIOLATIONS,
+        FAILURE_CLASS,
+        ROLE,
+        STATUS,
+        SUMMARY,
+    ];
 }

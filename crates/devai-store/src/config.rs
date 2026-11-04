@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use devai_core::types::{ContractRef, RoleDefinition, Timestamp, new_id};
+use devai_core::types::{ContractRef, RoleDefinition, Timestamp, Verdict, event_kind, json_field, new_id};
 use serde::{Deserialize, Serialize};
 
 use crate::{Store, StoreError, StoreResult};
@@ -36,6 +36,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("roles/quality-auditor.yaml", include_str!("../../../config/roles/quality-auditor.yaml")),
     ("roles/quality-aggregator.yaml", include_str!("../../../config/roles/quality-aggregator.yaml")),
     ("workflow/response-form-loop.yaml", include_str!("../../../config/workflow/response-form-loop.yaml")),
+    ("workflow/rework-context.yaml", include_str!("../../../config/workflow/rework-context.yaml")),
 ];
 
 fn cfg_err(msg: impl Into<String>) -> StoreError {
@@ -572,6 +573,165 @@ pub fn load_response_form_policy(dir: &Path) -> StoreResult<ResponseFormPolicy> 
     Ok(policy)
 }
 
+// ---------------------------------------------------------------------------
+// REWORK CONTEXT delivery policy (R-001..R-007) — platform workflow data.
+// ---------------------------------------------------------------------------
+
+fn default_verdict_field() -> String {
+    "verdict".into()
+}
+
+/// One recorded-decision-event entry feeding the next execution of a role.
+/// Every selector here is human-authored text and is validated against the
+/// platform's own vocabularies at LOAD time (`event_kind::ALL`,
+/// `json_field::ALL`, the `Verdict` vocabulary): a typo is an explicit config
+/// error naming the file and field — never a delivery that silently matches
+/// nothing or reads nothing (2026-11-02 QA return, block 2).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReworkTrigger {
+    /// The `workflow_events.kind` that feeds delivery for this role.
+    pub event: String,
+    /// Payload field carrying the rejection text exactly as persisted —
+    /// delivery reads, never rewrites.
+    pub rationale_field: String,
+    /// Payload field carrying the decision verdict for `only_if_verdict_not`.
+    #[serde(default = "default_verdict_field")]
+    pub verdict_field: String,
+    /// Verdict filter: the event counts only when `payload[verdict_field]`
+    /// differs from this stored value.
+    #[serde(default)]
+    pub only_if_verdict_not: Option<String>,
+    /// Additionally quote the failing / sub-threshold items of the CURRENT
+    /// quality report as data (the QA→REWORK flow only).
+    #[serde(default)]
+    pub attach_findings: bool,
+}
+
+/// One row of the delivery table: which triggers feed which role.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReworkPolicy {
+    pub role: String,
+    pub triggers: Vec<ReworkTrigger>,
+}
+
+impl ReworkPolicy {
+    /// Grammar of the human-authored table, validated before any execution
+    /// can depend on it.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.role.trim().is_empty() {
+            return Err("policy has an empty `role` slug".into());
+        }
+        if self.triggers.is_empty() {
+            return Err(format!(
+                "role `{}`: `triggers` is empty — a policy that delivers nothing is a typo, not a feature (delete the row instead)",
+                self.role
+            ));
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for t in &self.triggers {
+            if !event_kind::ALL.contains(&t.event.as_str()) {
+                return Err(format!(
+                    "role `{}`: event `{}` is not a workflow event kind the platform records — a kind that is never written matches nothing (a new persisted kind MUST be added to event_kind::ALL)",
+                    self.role, t.event
+                ));
+            }
+            if !seen.insert(t.event.as_str()) {
+                return Err(format!("role `{}`: duplicate trigger event `{}`", self.role, t.event));
+            }
+            for (field, value) in [("rationale_field", &t.rationale_field), ("verdict_field", &t.verdict_field)] {
+                if !json_field::ALL.contains(&value.as_str()) {
+                    return Err(format!(
+                        "role `{}`: {field} `{value}` is not a payload field the platform writes — delivery would silently read NOTHING",
+                        self.role
+                    ));
+                }
+            }
+            if let Some(excluded) = &t.only_if_verdict_not {
+                // The filter compares against the STORED text, so the literal
+                // must be the canonical spelling: `Verdict::parse` is
+                // case-insensitive, the payload comparison is not, and a
+                // value that parses but never equals the stored one silently
+                // disables the filter.
+                let parsed = Verdict::parse(excluded).map_err(|_| {
+                    format!(
+                        "role `{}`: only_if_verdict_not `{excluded}` is not a Verdict ({}) — the filter cannot be evaluated",
+                        self.role,
+                        Verdict::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(" | ")
+                    )
+                })?;
+                if excluded != parsed.as_str() {
+                    return Err(format!(
+                        "role `{}`: only_if_verdict_not `{excluded}` names a real verdict but is not the canonical stored spelling `{}`; the filter compares stored payload text exactly",
+                        self.role,
+                        parsed.as_str()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Merge-scan `workflow/*.yaml` for REWORK-context policy files: a file whose
+/// top level is a SEQUENCE of `{role, triggers}` rows participates; a
+/// top-level MAPPING (e.g. `response-form-loop.yaml`) is left to its own
+/// loader. Cross-file duplicate roles are rejected naming BOTH files — two
+/// rows for one role would make delivery order depend on directory listings.
+/// Absent directory is not an error (the caller falls back to factory bytes);
+/// a present-but-malformed file IS a loud error.
+pub fn load_rework_policies(dir: &Path) -> StoreResult<Vec<ReworkPolicy>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    let mut by_role: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut policies = Vec::new();
+    for p in &paths {
+        let text = fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if doc.is_mapping() {
+            continue;
+        }
+        let file_policies: Vec<ReworkPolicy> = serde_yaml::from_value(doc).map_err(|e| {
+            cfg_err(format!("{}: a REWORK-context policy file must be a list of `{{role, triggers}}` rows: {e}", p.display()))
+        })?;
+        for pol in file_policies {
+            pol.validate().map_err(|e| cfg_err(format!("{}: {e}", p.display())))?;
+            if let Some(prev) = by_role.get(&pol.role) {
+                return Err(cfg_err(format!(
+                    "{}: role `{}` is already declared in {} — a role has exactly one rework policy row",
+                    p.display(),
+                    pol.role,
+                    prev.display()
+                )));
+            }
+            by_role.insert(pol.role.clone(), p.clone());
+            policies.push(pol);
+        }
+    }
+    Ok(policies)
+}
+
+/// The factory table read from the embedded YAML bytes — the fallback when a
+/// home has no `workflow/` directory or file, so the delivery map lives in
+/// exactly one place (this YAML), never as a second copy in code (R-007).
+pub fn factory_rework_policies() -> Vec<ReworkPolicy> {
+    let (_, text) = DEFAULT_FILES
+        .iter()
+        .find(|(rel, _)| *rel == "workflow/rework-context.yaml")
+        .expect("factory rework-context.yaml is embedded in DEFAULT_FILES");
+    let policies: Vec<ReworkPolicy> = serde_yaml::from_str(text).expect("factory rework-context.yaml parses");
+    for p in &policies {
+        p.validate().expect("factory rework-context.yaml validates");
+    }
+    policies
+}
+
 fn parse_yaml<T: DeserializeOwnedPlus>(path: &Path) -> StoreResult<T> {
     let text = fs::read_to_string(path).map_err(|e| cfg_err(format!("read {}: {e}", path.display())))?;
     serde_yaml::from_str(&text).map_err(|e| cfg_err(format!("parse {}: {e}", path.display())))
@@ -870,6 +1030,130 @@ mod tests {
         // A broken declaration is a loud config error, never a silent default.
         fs::write(wf.join("response-form-loop.yaml"), "response_form:\n  max_repair_attempts: -1\n").unwrap();
         assert!(load_response_form_policy(&wf).unwrap_err().to_string().contains("max_repair_attempts"));
+    }
+
+    /// R-007 AC1 + one-table invariant: `init` materialises the policy file,
+    /// the home file and the embedded factory bytes read as ONE table, and
+    /// the coverage block holds: quality.returned + qa.rework_gate_tripped
+    /// feed the implementation role, `qa.rework_gate_incomparable` has NO
+    /// trigger (ratified OQ-2 — it carries no human rationale).
+    #[test]
+    fn rework_policy_materialises_and_the_loader_reads_the_factory_table() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfgdir = dir.path().join("config");
+        let written = materialize_if_absent(&cfgdir).unwrap();
+        assert!(
+            written.iter().any(|p| p.file_name().is_some_and(|n| n == "rework-context.yaml")),
+            "init must materialise the REWORK-context policy: {written:?}"
+        );
+        let loaded = load_rework_policies(&cfgdir.join("workflow")).unwrap();
+        assert_eq!(loaded, factory_rework_policies(), "home file and embedded factory bytes are one table, not two");
+        let impl_role = loaded.iter().find(|p| p.role == "implementation-agent").expect("implementation-agent row");
+        let gate = impl_role.triggers.iter().find(|t| t.event == "qa.rework_gate_tripped").expect("gate trigger declared in factory policy");
+        assert_eq!(gate.rationale_field, "qa_return_rationale");
+        assert!(!gate.attach_findings, "the gate quotes no findings — only the QA return flow does");
+        let returned = impl_role.triggers.iter().find(|t| t.event == "quality.returned").unwrap();
+        assert!(returned.attach_findings);
+        assert!(
+            !impl_role.triggers.iter().any(|t| t.event == "qa.rework_gate_incomparable"),
+            "OQ-2: qa.rework_gate_incomparable deliberately feeds nothing"
+        );
+        // Removing the file re-reads the SAME table from embedded bytes.
+        fs::remove_dir_all(cfgdir.join("workflow")).unwrap();
+        assert!(load_rework_policies(&cfgdir.join("workflow")).unwrap().is_empty(), "absent dir is the caller's fallback signal, not an error");
+        assert_eq!(factory_rework_policies(), loaded, "fallback is the factory bytes themselves");
+    }
+
+    /// Every human-authored selector is checked against the platform's own
+    /// vocabularies at load; each misspelling is an error naming file+field.
+    #[test]
+    fn rework_policy_rejects_every_malformed_selector_loudly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wf = dir.path().join("workflow");
+        fs::create_dir_all(&wf).unwrap();
+        let write = |body: &str| fs::write(wf.join("zz-policy.yaml"), body).unwrap();
+        // unknown event kind — a never-written kind silently matches nothing
+        write("- role: implementation-agent\n  triggers:\n    - event: quality.retruned\n      rationale_field: rationale\n");
+        let err = load_rework_policies(&wf).unwrap_err().to_string();
+        assert!(err.contains("quality.retruned") && err.contains("zz-policy.yaml"), "{err}");
+        // unknown rationale field — would silently read NOTHING
+        write("- role: implementation-agent\n  triggers:\n    - event: quality.returned\n      rationale_field: rational\n");
+        let err = load_rework_policies(&wf).unwrap_err().to_string();
+        assert!(err.contains("rationale_field"), "{err}");
+        // unknown verdict field
+        write("- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      verdict_field: verdikt\n      only_if_verdict_not: APPROVED\n");
+        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("verdict_field"));
+        // broken literal — not a verdict at all (ratified 'APPR0VED' example)
+        write("- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      only_if_verdict_not: APPR0VED\n");
+        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("not a Verdict"));
+        // parses but non-canonical: the stored-text comparison would never match
+        write("- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      only_if_verdict_not: approved\n");
+        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("canonical"));
+        // duplicate event within one role row
+        write("- role: implementation-agent\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n    - event: quality.returned\n      rationale_field: rationale\n");
+        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("duplicate"));
+        // empty triggers row
+        write("- role: implementation-agent\n  triggers: []\n");
+        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("triggers` is empty"));
+        // empty role slug
+        write("- role: \"\"\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n");
+        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("empty `role`"));
+    }
+
+    /// Two rows for one role across files would make delivery order depend on
+    /// directory listing — rejected, naming BOTH files.
+    #[test]
+    fn duplicate_rework_role_across_files_names_both_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wf = dir.path().join("workflow");
+        fs::create_dir_all(&wf).unwrap();
+        let row = "- role: implementation-agent\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n";
+        fs::write(wf.join("aa-first.yaml"), row).unwrap();
+        fs::write(wf.join("zz-second.yaml"), row).unwrap();
+        let err = load_rework_policies(&wf).unwrap_err().to_string();
+        assert!(err.contains("implementation-agent") && err.contains("aa-first.yaml") && err.contains("zz-second.yaml"), "{err}");
+    }
+
+    /// A top-level MAPPING is a different loader's business and must not
+    /// break this one; present-but-malformed sequence content IS loud.
+    #[test]
+    fn rework_loader_skips_mapping_files_and_is_loud_on_malformed_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wf = dir.path().join("workflow");
+        fs::create_dir_all(&wf).unwrap();
+        materialize_if_absent(&dir.path().join("config")).unwrap();
+        fs::copy(
+            dir.path().join("config/workflow/response-form-loop.yaml"),
+            wf.join("response-form-loop.yaml"),
+        )
+        .unwrap();
+        assert!(load_rework_policies(&wf).unwrap().is_empty(), "the mapping file is skipped, not parsed as rows");
+        fs::write(wf.join("broken.yaml"), "- not-a-row\n").unwrap();
+        let err = load_rework_policies(&wf).unwrap_err().to_string();
+        assert!(err.contains("broken.yaml") && err.contains("role, triggers"), "{err}");
+    }
+
+    /// REQ-006 sovereignty, pinned as a fact about the factory tree: role
+    /// YAMLs say nothing about REWORK delivery — the mechanism is
+    /// platform-owned config plus platform code; roles stay generic.
+    #[test]
+    fn role_configs_never_mention_rework_delivery() {
+        let roles = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/roles");
+        let mut seen = 0usize;
+        for entry in fs::read_dir(&roles).unwrap() {
+            let p = entry.unwrap().path();
+            if !p.extension().is_some_and(|x| x == "yaml") {
+                continue;
+            }
+            let text = fs::read_to_string(&p).unwrap();
+            assert!(
+                !text.contains("REWORK CONTEXT") && !text.contains("rework-context") && !text.contains("rationale_field"),
+                "{} leaks the delivery policy into a role config",
+                p.display()
+            );
+            seen += 1;
+        }
+        assert!(seen >= 5, "the factory role set must be present (saw {seen} files)");
     }
 
     #[test]
