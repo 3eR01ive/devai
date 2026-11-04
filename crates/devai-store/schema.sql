@@ -10,12 +10,20 @@
 -- databases are repaired by migrations/003_artifact_supersession.sql.
 -- v4 adds the task dependency graph as a stored platform fact (REQ-01/02):
 -- the task_dependencies edge table below — many-to-many in both directions,
--- typed ('parent' genealogy / 'blocks' continuation gate). Existing v3
+-- typed ('parent' genealogy / 'blocks' continuation gate)). Existing v3
 -- databases gain it additively via migrations/004_task_dependencies.sql;
 -- tasks written before v4 simply have no edge rows and read as tasks with an
 -- EMPTY dependency set, never as corrupt (REQ-08). Edges are IMMUTABLE:
 -- removal marks the row SUPERSEDED (the artifacts status pattern, OQ7), so
 -- the full edge history stays in the table.
+-- v5 adds no table shape beyond the decision indexes below: the v4→v5 rung
+-- (migrations/005_decisions_backfill.sql) backfills NEW decision rows from
+-- historical approve/reject/return event payloads — a one-time DATA repair,
+-- append-only, no column touched. Fresh homes land the same index set so
+-- migrated and fresh shapes stay identical (the partial unique index is
+-- inert here: fresh rows carry UUIDv7 ids, the predicate selects v5 only).
+-- (Renumbered 004→005 at integration: the dependency graph took 004 in
+-- main first — the ladder is per-rung data, renumbering is a merge act.)
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -173,6 +181,18 @@ CREATE TABLE decisions(
   refs       TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL
 );
+-- The decisions read/disclosure indexes (v4; the same two the v3→v4 rung
+-- builds, so fresh and migrated databases keep identical shapes).
+-- list_decisions filters by task and reproduces the stored chronology
+-- (ORDER BY created_at); the backfill's "already disclosed" predicate scans
+-- the same column. `decisions_backfill_source_event` pins the ratified
+-- idempotence of rung 004 (spec OQ2/OQ6): it constrains ONLY rows whose id
+-- is the deterministic UUIDv5 derived from a source event id (predicate
+-- '5' = that id space; live rows are v7 and unconstrained), making a second
+-- extraction of the same event impossible at the database level.
+CREATE INDEX decisions_task ON decisions(task_id, created_at);
+CREATE UNIQUE INDEX decisions_backfill_source_event ON decisions(refs)
+WHERE substr(id, 15, 1) = '5';
 
 CREATE TABLE questions(
   id           TEXT PRIMARY KEY,

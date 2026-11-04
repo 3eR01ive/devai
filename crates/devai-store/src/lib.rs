@@ -21,6 +21,7 @@ use devai_core::types::*;
 use devai_core::workflow::Mutation;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 // The schema ladder is DATA (REQ-004 / arch/registry-in-data v5): the
 // catalog — order, `from`/`to`, stable id, SQL script path and apply-handler
@@ -39,6 +40,11 @@ const MIGRATION_ACTOR_PREFIX: &str = "migration:";
 /// Why the supersession backfill flipped rows — cited verbatim in its
 /// events so the one-time repair is auditable, not silent (REQ-003).
 const SUPERSESSION_BACKFILL_REASON: &str = "publication did not honor supersession before v3: within each (task_id, kind) the max-seq CURRENT row is kept CURRENT, the rest marked SUPERSEDED (status transition only — nothing deleted)";
+
+/// Why the decisions backfill copied rationale out of event payloads —
+/// cited verbatim in its fact events (REQ-BF-004): the one-time extraction
+/// is auditable, not silent.
+const DECISIONS_BACKFILL_REASON: &str = "approve/reject/return rationales lived only in event payloads before the decisions write-path: each undisclosed rationale is copied VERBATIM into a NEW decision row (actor/created_at from the event columns, refs cite the source event id) — existing decisions and events are never touched";
 
 /// The loser predicate of the v3 repair: a CURRENT row that has a strictly
 /// better CURRENT sibling in its (task_id, kind) group under the total
@@ -86,13 +92,15 @@ pub(crate) fn schema_rungs() -> Vec<SchemaRung> {
 /// function pointer only with this justification): pure SQL expresses every
 /// rung's DDL/DML verbatim (the `"script"` tag), but SQL CANNOT observe the
 /// pre-mutation state BEFORE the UPDATE so the backfill events can cite
-/// exactly the rows the script flips (`supersession_backfill`), nor — for
-/// future rungs — detect table shape before a rebuild. A new pure-SQL rung
+/// exactly the rows the script flips (`supersession_backfill`), nor parse a
+/// JSON payload / mint UUID ids while appending repair rows
+/// (`decisions_backfill`), nor — for future rungs — detect table shape
+/// before a rebuild. A new pure-SQL rung
 /// appends a manifest record and NO code; only genuinely un-expressible
 /// behavior appends a handler here. The tag NAME is manifest data; this
 /// table maps name → behavior, failing loud on a tag it cannot run.
 type RungApply = fn(&Transaction<'_>, &SchemaRung) -> StoreResult<()>;
-const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill)];
+const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill), ("decisions_backfill", decisions_backfill)];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
 pub struct Store {
@@ -1234,6 +1242,169 @@ fn supersession_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult
     Ok(())
 }
 
+/// Fixed namespace for the deterministic ids of rung 004 (ratified spec
+/// OQ2): every created decision row gets `UUIDv5(namespace, source event
+/// id)` — a name-based id computed FROM the event id, so a repeated
+/// extraction recomputes the same primary key and the same refs, and the
+/// partial unique index `decisions_backfill_source_event` (predicated on
+/// the v5 id space, which live rows — UUIDv7 — never enter) makes a second
+/// insertion of the same event impossible at the database level. The value
+/// is the backfill task id and is STABLE FOREVER: changing it would mint a
+/// fresh id space that no longer dedups against the rows the first
+/// application wrote.
+pub const DECISIONS_BACKFILL_NAMESPACE: Uuid = Uuid::from_u128(0x01a1a14e2c0775a292ba905fe9886adc);
+
+/// The deterministic decision id of the backfill (spec OQ2: "детерминированный
+/// id decision из id исходного события"). Public so acceptance tests can
+/// recompute the expected id instead of trusting the handler's bookkeeping.
+pub fn backfill_decision_id(event_id: &str) -> Id {
+    Uuid::new_v5(&DECISIONS_BACKFILL_NAMESPACE, event_id.as_bytes())
+}
+
+/// Rung v3→v4 (REQ-BF-*): the one-time extraction of historical
+/// approve/reject/return acts into `decisions`. Runs INSIDE the rung
+/// transaction opened by `open()`, so detection, the NEW decision rows, the
+/// fact events and the `user_version` bump commit atomically — a failure
+/// writing an event rolls the whole rung back (the 003 precedent, REQ-BF-003
+/// AC3). This is CODE because SQL cannot parse the payload JSON, derive the
+/// deterministic ids and emit one fact event per (task_id, source event
+/// kind) group citing exactly the rows it created (the manifest's
+/// documented code/data boundary); the shipped script's DDL still applies
+/// verbatim inside the handler. Detection runs BEFORE any mutation in the
+/// ratified "already disclosed" form (OQ2/OQ6, predicate style of 003,
+/// REQ-BF-005): an event is extracted only when NO decision cites its id in
+/// `refs` (re-application matches nothing its own rows already store) and —
+/// when the payload carries a string rationale — no decision of the same
+/// task already stores that exact text (today's `task approve` records
+/// event AND decision beside each other, so its event is skipped). A
+/// payload WITHOUT a rationale is still extracted as a NULL-rationale row
+/// (ratified OQ4: the fact of the decision must not be lost — the reader
+/// renders "(none stored)"). Beyond detection, the hard idempotence is the
+/// database's: each insert carries the deterministic id and
+/// `ON CONFLICT DO NOTHING` (never INSERT OR IGNORE — the silent-loss
+/// precedent), and the affected-row count says whether THIS run created the
+/// row, so fact events cite only rows truly created. One extraction NEVER
+/// rewrites history: rows are only appended, events are only appended.
+/// Verdict and decision kind are derived from the event kind — the payload
+/// does not carry a verdict; the kind IS the act (REQ-BF-002); the reject/
+/// return kinds are the producer-dictionary constants of ratified OQ3.
+/// `actor` and `created_at` are copied from the event COLUMNS verbatim, and
+/// every created row cites its source event id in `refs` (OQ6:
+/// traceability and the dedup material).
+fn decisions_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    // Shape detection before any mutation (the code-rung boundary the
+    // RUNG_APPLIERS comment anticipates): a database predating the very
+    // tables this extraction reads has nothing to backfill — inventing
+    // domain rows from absent history is not repair, and a shipped v1
+    // fixture shape stays migratable forward. Both tables must be present
+    // or the rung is inert.
+    let shapes: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('workflow_events', 'decisions')", [], |r| r.get(0))?;
+    if shapes < 2 {
+        return Ok(());
+    }
+    let candidates: Vec<(String, String, String, String, String, String)> = {
+        // Only events of a LIVE task are extractable: `decisions.task_id`
+        // carries an FK, and an orphan row (task removed via CASCADE while
+        // its events stay, e.g. bundle handling) must not brick `open()`.
+        let mut stmt = tx.prepare(
+            "SELECT id, task_id, kind, actor, payload, created_at FROM workflow_events \
+             WHERE task_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM tasks tk WHERE tk.id = workflow_events.task_id) \
+               AND kind IN (?1, ?2, ?3) ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(
+            params![event_kind::REQUIREMENTS_APPROVED, event_kind::REQUIREMENTS_REJECTED, event_kind::QUALITY_RETURNED],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    // The shipped script (additive DDL) lands inside the same transaction.
+    tx.execute_batch(step.script)?;
+
+    // Grouped exactly like 003 (ratified OQ5): one fact event per
+    // (task_id, source event kind) group that produced rows; a clean
+    // database produces zero events.
+    let mut groups: Vec<((String, String), Vec<String>, Vec<String>)> = Vec::new();
+    for (event_id, task_id, kind, actor, payload, created_at) in candidates {
+        let (dec_kind, verdict) = match kind.as_str() {
+            k if k == event_kind::REQUIREMENTS_APPROVED => (decision_kind::REQUIREMENTS_APPROVAL, Verdict::Approved),
+            k if k == event_kind::REQUIREMENTS_REJECTED => (decision_kind::REQUIREMENTS_REJECTION, Verdict::Rejected),
+            k if k == event_kind::QUALITY_RETURNED => (decision_kind::QUALITY_RETURN, Verdict::Returned),
+            _ => continue,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&payload).map_err(|e| {
+            StoreError::Corrupt(format!("workflow_events id={event_id}: payload is not valid JSON ({e}) — refusing to build decisions on unreadable history"))
+        })?;
+        // Ratified OQ4: a payload WITHOUT a rationale (missing key or JSON
+        // null) is still extracted, as a NULL-rationale row — skipping it
+        // would lose the fact that the human acted; the reader renders
+        // "(none stored)". Nothing is ever invented: the rationale column
+        // stores the payload text verbatim, byte-identical, or NULL.
+        let rationale: Option<String> = parsed.get(json_field::RATIONALE).and_then(|v| v.as_str()).map(|s| s.to_string());
+        // "Already disclosed" detection BEFORE any mutation (REQ-BF-005,
+        // predicate style of 003), in the ratified OQ2/OQ6 order:
+        // (a) a decision already citing THIS event id in refs — a
+        //     re-applied rung matches nothing its own rows stored;
+        let refs_json = json_string(&vec![event_id.clone()]);
+        let cited: i64 = tx.query_row("SELECT count(*) FROM decisions WHERE refs=?1", params![refs_json], |r| r.get(0))?;
+        if cited > 0 {
+            continue;
+        }
+        // (b) for string rationales: a decision of the same task already
+        //     storing that exact text — the modern write-path's event is
+        //     never backfilled secondarily. NULL rationales have no text to
+        //     match; (a) plus the deterministic id dedups them.
+        if let Some(text) = &rationale {
+            let disclosed: i64 = tx.query_row("SELECT count(*) FROM decisions WHERE task_id=?1 AND rationale=?2", params![task_id, text], |r| r.get(0))?;
+            if disclosed > 0 {
+                continue;
+            }
+        }
+        // Deterministic id from the source event id (OQ2/OQ6) inserted with
+        // ON CONFLICT DO NOTHING (never INSERT OR IGNORE — the silent-loss
+        // precedent): the database pins the no-op, the affected-row count
+        // tells whether THIS run created the row, so a re-applied rung
+        // cites zero rows and writes zero fact events.
+        let decision_id = backfill_decision_id(&event_id).to_string();
+        let inserted = tx.execute(
+            "INSERT INTO decisions(id,task_id,kind,verdict,actor,rationale,refs,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT DO NOTHING",
+            params![decision_id, task_id, dec_kind, verdict.as_str(), actor, rationale, refs_json, created_at],
+        )?;
+        if inserted == 0 {
+            continue;
+        }
+        match groups.iter_mut().find(|((g_task, g_kind), _, _)| *g_task == task_id && *g_kind == kind) {
+            Some((_, src, decs)) => {
+                src.push(event_id);
+                decs.push(decision_id);
+            }
+            None => groups.push(((task_id, kind), vec![event_id], vec![decision_id])),
+        }
+    }
+    for ((task_id, kind), source_events, decision_ids) in groups {
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                task_id,
+                event_kind::DECISIONS_BACKFILLED,
+                format!("{MIGRATION_ACTOR_PREFIX}{}", step.id),
+                json_string(&serde_json::json!({
+                    (json_field::BACKFILL): step.id,
+                    (json_field::SCRIPT_PATH): step.script_path,
+                    (json_field::TASK_ID): task_id,
+                    (json_field::KIND): kind,
+                    (json_field::SOURCE_EVENTS): source_events,
+                    (json_field::DECISION_IDS): decision_ids,
+                    (json_field::REASON): DECISIONS_BACKFILL_REASON,
+                })),
+                rows::ts(&Utc::now()),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1670,5 +1841,222 @@ mod supersession_tests {
             prev_to = rung.to;
         }
         assert_eq!(prev_to, SCHEMA_VERSION, "SCHEMA_VERSION is derived from the manifest top rung");
+    }
+}
+
+#[cfg(test)]
+mod decisions_backfill_tests {
+    use super::*;
+
+    fn seed_event(store: &Store, id: &str, task_id: &str, kind: &str, actor: &str, payload: &str, created_at: &str) {
+        store.conn.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![id, task_id, kind, actor, payload, created_at],
+        )
+        .unwrap();
+    }
+
+    fn payload_of(store: &Store, event_id: &str) -> String {
+        store.conn.query_row("SELECT payload FROM workflow_events WHERE id=?1", params![event_id], |r| r.get(0)).unwrap()
+    }
+
+    /// REQ-BF-002/004/005 + REQ-BF-007 (store half): historical approve/
+    /// reject/return acts are copied VERBATIM into NEW decision rows
+    /// (actor/created_at from the event columns, verdict derived from the
+    /// kind, deterministic ids from the event ids per ratified OQ2), one
+    /// fact event per (task_id, kind) group (OQ5); a NULL-rationale event is
+    /// extracted as a NULL row (ratified OQ4) while an already-disclosed
+    /// modern approve is skipped; events stay byte-intact; a re-applied rung
+    /// is a no-op.
+    #[test]
+    fn historical_events_backfill_decisions_once_and_idempotently() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let task_id: Id;
+        // Real UUID strings: the event reader parses ids as UUIDs.
+        let (e_rej, e_appr, e_ret, e_null, e_modern) = (new_id().to_string(), new_id().to_string(), new_id().to_string(), new_id().to_string(), new_id().to_string());
+        {
+            let store = Store::open(dir.path()).unwrap();
+            let t = Task::new("backfill", "fixture", None, Utc::now());
+            store.create_task(&t).unwrap();
+            task_id = t.id;
+            let tid = t.id.to_string();
+            // Pre-REQ-QAD-001 shape: the rationale lives only in the payload.
+            seed_event(&store, &e_rej, &tid, event_kind::REQUIREMENTS_REJECTED, "human:legacy", r#"{"rationale":"split OQ1 before approving"}"#, "2026-09-01T00:00:00.000000Z");
+            seed_event(&store, &e_appr, &tid, event_kind::REQUIREMENTS_APPROVED, "human:legacy", r#"{"requirements_seq":2,"rationale":"OQ1: keep `task active`, do NOT ship `exec list --active`"}"#, "2026-10-01T00:00:00.000000Z");
+            seed_event(&store, &e_ret, &tid, event_kind::QUALITY_RETURNED, "human:legacy", r#"{"rationale":"ships the rejected alternative"}"#, "2026-10-05T00:00:00.000000Z");
+            // The NULL-rationale approve IS extracted (ratified OQ4: the
+            // fact of the act must not be lost — NULL lands as a NULL row).
+            seed_event(&store, &e_null, &tid, event_kind::REQUIREMENTS_APPROVED, "human:legacy", r#"{"requirements_seq":1,"rationale":null}"#, "2026-08-01T00:00:00.000000Z");
+            // The MODERN approve is the skip case: its decision row already
+            // stands beside the event (the commands.rs write-path shape).
+            seed_event(&store, &e_modern, &tid, event_kind::REQUIREMENTS_APPROVED, "human:now", r#"{"rationale":"already a stored decision"}"#, "2026-10-06T00:00:00.000000Z");
+            store
+                .record_decision(&Decision {
+                    id: new_id(),
+                    task_id: t.id,
+                    kind: decision_kind::REQUIREMENTS_APPROVAL.into(),
+                    verdict: Verdict::Approved,
+                    actor: "human:now".into(),
+                    rationale: Some("already a stored decision".into()),
+                    refs: vec!["spec-id".into()],
+                    created_at: Utc::now(),
+                })
+                .unwrap();
+            // Pretend this database never saw v4: open() must run rung 004.
+            store.conn.execute_batch("PRAGMA user_version=3;").unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION, "open migrates v3 forward");
+        let idx: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(idx, 2, "the rung landed both indexes — the partial unique one pins the ratified OQ2 dedup at the database level");
+
+        let decisions = store.list_decisions(task_id).unwrap();
+        // The one pre-existing row + all four undisclosed events, the
+        // NULL-rationale one included (ratified OQ4); only the modern
+        // approve is skipped — its rationale is already disclosed.
+        assert_eq!(decisions.len(), 5, "1 existing + 4 backfilled (NULL included), e-modern skipped: {decisions:?}");
+        assert!(decisions.iter().all(|d| d.refs.iter().all(|r| *r != e_modern)), "the modern approve event is not extracted secondarily (REQ-BF-005 AC)");
+        // Stored chronology (ORDER BY created_at): Aug NULL-approve, Sep
+        // reject, Oct approve, Oct return, then the pre-existing live row.
+        for (event, row) in [(&e_null, &decisions[0]), (&e_rej, &decisions[1]), (&e_appr, &decisions[2]), (&e_ret, &decisions[3])] {
+            assert_eq!(row.id, backfill_decision_id(event), "decision id is DETERMINISTICALLY derived from the source event id (ratified OQ2)");
+            assert_eq!(row.refs, vec![event.clone()], "the row cites its source event id in refs (ratified OQ6)");
+        }
+        assert_eq!(decisions[0].kind, decision_kind::REQUIREMENTS_APPROVAL);
+        assert_eq!(decisions[0].verdict, Verdict::Approved);
+        assert!(decisions[0].rationale.is_none(), "OQ4: the NULL payload rationale lands as a NULL row, not a skip");
+        assert_eq!(decisions[1].kind, decision_kind::REQUIREMENTS_REJECTION);
+        assert_eq!(decisions[1].verdict, Verdict::Rejected);
+        let appr = &decisions[2];
+        assert_eq!(appr.verdict, Verdict::Approved);
+        assert_eq!(appr.rationale.as_deref().unwrap(), "OQ1: keep `task active`, do NOT ship `exec list --active`", "rationale copied byte-identical — never paraphrased");
+        assert!(appr.rationale.as_deref().unwrap().contains("task active"), "the acceptance string is visible to readers");
+        assert_eq!(appr.actor, "human:legacy", "actor comes from the event column");
+        let ret = &decisions[3];
+        assert_eq!(ret.kind, decision_kind::QUALITY_RETURN);
+        assert_eq!(ret.verdict, Verdict::Returned);
+        assert_eq!(ret.created_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true), "2026-10-05T00:00:00.000000Z", "created_at preserved from the event");
+
+        // created_at byte-identity at the column level too (the reader
+        // reproduces the stored text, not a re-format).
+        let raw: String = store
+            .conn
+            .query_row("SELECT created_at FROM decisions WHERE id=?1", params![backfill_decision_id(&e_appr).to_string()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, "2026-10-01T00:00:00.000000Z");
+
+        // One fact event per (task, source kind) group (ratified OQ5) —
+        // actor migration:004, payload naming rung/script/reason and the
+        // ids of both sides.
+        let facts: Vec<WorkflowEvent> = store.events(task_id, None).unwrap().into_iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).collect();
+        assert_eq!(facts.len(), 3, "one event per group: {facts:?}");
+        for f in &facts {
+            assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}004_decisions_backfill"));
+            assert_eq!(f.payload[json_field::BACKFILL], "004_decisions_backfill");
+            assert_eq!(f.payload[json_field::SCRIPT_PATH], "migrations/004_decisions_backfill.sql");
+            assert!(f.payload[json_field::REASON].as_str().unwrap().contains("VERBATIM"), "the why is recorded, not silent");
+        }
+        let appr_fact = facts.iter().find(|f| f.payload[json_field::KIND] == serde_json::json!(event_kind::REQUIREMENTS_APPROVED)).unwrap();
+        assert_eq!(appr_fact.payload[json_field::SOURCE_EVENTS].as_array().unwrap().len(), 2, "e-appr AND e-null were extracted for the approve group");
+        assert_eq!(appr_fact.payload[json_field::DECISION_IDS].as_array().unwrap().len(), 2);
+
+        // REQ-BF-003: the source events are untouched history.
+        assert_eq!(payload_of(&store, &e_appr), r#"{"requirements_seq":2,"rationale":"OQ1: keep `task active`, do NOT ship `exec list --active`"}"#);
+        assert_eq!(payload_of(&store, &e_modern), r#"{"rationale":"already a stored decision"}"#);
+
+        // Idempotence (REQ-BF-005, ratified OQ2): force the version back,
+        // re-open — the deterministic ids recompute identically, the ON
+        // CONFLICT DO NOTHING inserts affect no row, no group produces a
+        // fact event.
+        drop(store);
+        {
+            let conn = Connection::open(dir.path().join("devai.db")).unwrap();
+            conn.execute_batch("PRAGMA user_version=3;").unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.list_decisions(task_id).unwrap().len(), 5, "a re-applied rung creates no decision row");
+        assert_eq!(store.events(task_id, None).unwrap().iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).count(), 3, "a re-applied rung creates no fact event");
+    }
+
+    /// The ratified OQ2 mechanism, pinned: the backfill id is a pure
+    /// function of the source event id, lands in the UUIDv5 version space
+    /// the partial unique index predicates on, never aliases another
+    /// event's id, and never collides with the live v7 id space.
+    #[test]
+    fn backfill_decision_id_is_deterministic_and_lives_in_the_indexed_space() {
+        let a = new_id().to_string();
+        let b = new_id().to_string();
+        assert_eq!(backfill_decision_id(&a), backfill_decision_id(&a), "the same event recomputes the same id");
+        assert_ne!(backfill_decision_id(&a), backfill_decision_id(&b), "distinct events get distinct ids");
+        let id = backfill_decision_id(&a).to_string();
+        assert_eq!(&id[14..15], "5", "backfilled ids enter the v5 space the index selects (substr(id,15,1)='5')");
+        assert_eq!(&new_id().to_string()[14..15], "7", "live ids stay OUTSIDE that space — the index never constrains the write-path");
+    }
+
+    /// REQ-BF-007 (clean database): no candidate events → zero rows, zero
+    /// fact events — the 003 "already honest" precedent.
+    #[test]
+    fn decisions_backfill_on_clean_database_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let task_id;
+        {
+            let store = Store::open(dir.path()).unwrap();
+            let t = Task::new("clean", "fixture", None, Utc::now());
+            store.create_task(&t).unwrap();
+            task_id = t.id;
+            store.conn.execute_batch("PRAGMA user_version=3;").unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.list_decisions(task_id).unwrap().is_empty());
+        assert_eq!(store.events(task_id, None).unwrap().iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).count(), 0);
+    }
+
+    /// REQ-BF-003 AC3 (atomicity, the 003 precedent): if the fact-event
+    /// write fails, the created decision rows, the DDL and the version bump
+    /// roll back together — a half-backfilled database is impossible; a retry
+    /// completes exactly once.
+    #[test]
+    fn decisions_backfill_is_atomic_when_the_event_write_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tid: String;
+        let e_a = new_id().to_string();
+        {
+            let store = Store::open(dir.path()).unwrap();
+            let t = Task::new("atomic", "fixture", None, Utc::now());
+            store.create_task(&t).unwrap();
+            tid = t.id.to_string();
+            seed_event(&store, &e_a, &tid, event_kind::REQUIREMENTS_APPROVED, "human:legacy", r#"{"rationale":"keep task active"}"#, "2026-10-01T00:00:00.000000Z");
+            // Block every event INSERT — the rung must fail AFTER its rows.
+            store.conn.execute_batch("CREATE TRIGGER test_fail_event_insert BEFORE INSERT ON workflow_events BEGIN SELECT RAISE(ABORT,'boom'); END;").unwrap();
+            // Drop the fresh-install copies of the rung's indexes so the
+            // rollback check below observes the RUNG's DDL, not schema.sql's.
+            store.conn.execute_batch("DROP INDEX decisions_task; DROP INDEX decisions_backfill_source_event; PRAGMA user_version=3;").unwrap();
+        }
+        assert!(Store::open(dir.path()).is_err(), "a mid-rung failure must surface");
+        {
+            let conn = Connection::open(dir.path().join("devai.db")).unwrap();
+            let n: i64 = conn.query_row("SELECT count(*) FROM decisions", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "the rolled-back rung left no decision row");
+            let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, 3, "the version bump rolled back with the rows");
+            let idx: i64 = conn
+                .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(idx, 0, "the rung's DDL rolled back too");
+            conn.execute_batch("DROP TRIGGER test_fail_event_insert;").unwrap();
+        }
+        // With writes restored, the next open completes the backfill once.
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.conn.query_row("SELECT count(*) FROM decisions WHERE refs LIKE '%' || ?1 || '%'", params![e_a], |r| r.get::<_, i64>(0)).unwrap(), 1, "the retry created exactly one row");
+        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.conn.query_row("SELECT count(*) FROM decisions WHERE id=?1", params![backfill_decision_id(&e_a).to_string()], |r| r.get::<_, i64>(0)).unwrap(), 1, "the retried row carries the SAME deterministic id — the retry cannot fork a second row for one event");
+        let idx: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(idx, 2, "the completed retry landed the rung's full DDL");
     }
 }

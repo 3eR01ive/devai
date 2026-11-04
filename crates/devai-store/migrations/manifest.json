@@ -32,6 +32,13 @@
       "to": 4,
       "script": "migrations/004_task_dependencies.sql",
       "apply": "script"
+    },
+    {
+      "id": "005_decisions_backfill",
+      "from": 4,
+      "to": 5,
+      "script": "migrations/005_decisions_backfill.sql",
+      "apply": "decisions_backfill"
     }
   ]
 }

@@ -586,6 +586,7 @@ pub mod decision_kind {
     /// auditor scoring spec-fidelity never saw the rejected alternative).
     /// Recorded by the human-invoked CLI `task approve` only.
     pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
+<<<<<<< HEAD
     /// The empty-rework gate (REQ-RG-03): the operator's explicit ratification
     /// that a QA return needed NO new changes — `refs` carry the pair
     /// (previous report id, current report id) of exactly one rework cycle, so
@@ -604,6 +605,19 @@ pub mod decision_kind {
     /// never an implicit platform-side assumption. Recorded ONLY by the
     /// human-invoked CLI `task override`.
     pub const DEPENDENCY_OVERRIDE: &str = "dependency_override";
+=======
+    /// Requirements rejection rationale (verdict REJECTED). Before the live
+    /// write-path grows a decision row for `task reject`, the ONE-TIME rung
+    /// `004_decisions_backfill` copies historical `requirements.rejected`
+    /// payload rationales into rows of this kind; the auditor's section
+    /// reproduces every stored row verbatim — the verdict field says which
+    /// was not an approval (resolves spec OQ: the APPROVED_DECISIONS contract
+    /// is "all stored human decisions", not an approval filter).
+    pub const REQUIREMENTS_REJECTION: &str = "requirements_rejection";
+    /// QA return rationale (verdict RETURNED), same backfill provenance as
+    /// `REQUIREMENTS_REJECTION`.
+    pub const QUALITY_RETURN: &str = "quality_return";
+>>>>>>> rework/01a1a14e-2c07-75a2-92ba-905fe9886adc
 }
 
 pub mod event_kind {
@@ -650,6 +664,12 @@ pub mod event_kind {
     /// exactly the one the task text names, design source
     /// wip/pre-t2-merge@5db7fb5 types.rs:490).
     pub const ARTIFACT_SUPERSEDED: &str = "task.artifact.superseded";
+    /// The decisions backfill (rung 004) created NEW decision rows from a
+    /// historical approve/reject/return event's payload rationale. One fact
+    /// event per (task_id, source event kind) group — never per row —
+    /// actor `migration:<rung id>`, mirroring the supersession repair-event
+    /// discipline (REQ-003/004: the one-time mutation is auditable, not silent).
+    pub const DECISIONS_BACKFILLED: &str = "decisions.backfilled";
     pub const EXPORTED: &str = "task.exported";
     pub const IMPORTED: &str = "task.imported";
     /// QA freshness gate: the recomputed workspace revision equals the one
@@ -724,8 +744,19 @@ pub mod json_field {
     // Migration (one-time repair) records.
     pub const BACKFILL: &str = "backfill";
     pub const SCRIPT_PATH: &str = "script";
+<<<<<<< HEAD
     // Task dependency graph (store `link_task_dependency`, REQ-07).
     pub const DEPENDENCY_ID: &str = "dependency_id";
     pub const DEPENDS_ON_ID: &str = "depends_on_id";
     pub const DEPENDENCY_KIND: &str = "dependency_kind";
+=======
+    /// Source workflow events a backfill extracted from, and the decision
+    /// rows it created (rung 004 fact-event payload; the ids are also cited
+    /// row-to-event via `decisions.refs`).
+    pub const SOURCE_EVENTS: &str = "source_events";
+    pub const DECISION_IDS: &str = "decision_ids";
+    /// The human's stated reason, stored in approve/reject/return event
+    /// payloads and in decision rows (the backfill reads it verbatim).
+    pub const RATIONALE: &str = "rationale";
+>>>>>>> rework/01a1a14e-2c07-75a2-92ba-905fe9886adc
 }

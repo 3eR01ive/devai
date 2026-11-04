@@ -1,0 +1,55 @@
+-- v3 -> v4: backfill of `decisions` from historical approve/reject/return
+-- events (REQ-BF-*). Before REQ-QAD-001 grew the write-path, `task approve`
+-- (and every `task reject` / `task return`) persisted its rationale ONLY in
+-- the event payload — the decision table stayed empty for those acts, so the
+-- QA auditor's APPROVED_DECISIONS section (fed by `list_decisions`) never saw
+-- the ratified open-question resolutions (precedent 01a1a0b5-0fcf).
+--
+-- The extraction itself runs as CODE (manifest apply tag
+-- `decisions_backfill` -> src/lib.rs): it must parse the payload JSON, derive
+-- the deterministic decision id and write ONE fact event per
+-- (task_id, source event kind) group citing exactly the rows it created —
+-- the observe-before-mutate boundary the manifest comment defines. This
+-- script carries the additive DDL.
+--
+-- The ratified idempotence mechanism (spec OQ2 + OQ6): every created row
+-- stores refs = the source event id and an id DETERMINISTICALLY derived from
+-- that event id (UUIDv5, name-based, fixed namespace — see
+-- `backfill_decision_id`). The partial unique index below makes a repeated
+-- extraction of the same event impossible at the database level; the handler
+-- inserts with ON CONFLICT DO NOTHING (never INSERT OR IGNORE — the
+-- silent-loss precedent). PARTIAL is what makes this safe for live writes:
+-- the predicate `substr(id, 15, 1) = '5'` selects only the version-5 ids this
+-- rung mints; ordinary rows carry UUIDv7 ids ('7') and stay unconstrained,
+-- so repeated (task_id, kind, rationale) facts from the write-path remain
+-- legitimate.
+--
+-- The handler's detection predicate (kept byte-in-sync with this comment,
+-- 003's discipline): an event is extracted only when
+--
+--   events.task_id IS NOT NULL
+--   AND a task row with that id exists (decisions has the FK; an orphan
+--       event must not abort `open()`)
+--   AND events.kind IN ('requirements.approved','requirements.rejected',
+--                       'quality.returned')
+--   AND NO decision already cites this event id in refs  (re-application is
+--       a no-op — the OQ6 traceability refs are the dedup material)
+--   AND, when the payload carries a string `rationale`, NO decision of the
+--       same task already stores that exact rationale (the modern `task
+--       approve` records event AND decision beside each other — its event is
+--       already disclosed and is skipped; a payload WITHOUT a rationale is
+--       still backfilled as a NULL-rationale row: the fact of the decision
+--       must not be lost, the renderer prints "(none stored)" — ratified
+--       OQ4).
+--
+-- Append-only: NEW decision rows only, events and existing decisions are
+-- never UPDATEd or DELETEd (the wf_events_no_update/no_delete triggers pin
+-- the event side; nothing here touches the decision side).
+--
+-- The non-unique read index makes the disclosure check and the chronological
+-- read (`list_decisions ... ORDER BY created_at`) cheap at the volume the
+-- backfill adds; fresh databases get both indexes from schema.sql, so
+-- migrated and fresh shapes stay identical.
+CREATE INDEX IF NOT EXISTS decisions_task ON decisions(task_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS decisions_backfill_source_event ON decisions(refs)
+WHERE substr(id, 15, 1) = '5';
