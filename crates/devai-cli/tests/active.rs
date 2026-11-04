@@ -89,9 +89,16 @@ fn task_active_lifecycle_through_the_real_binary() {
     let short_a = id_a[..12].to_string();
     devai(h, &["task", "start", &short_a]); // DRAFT → ANALYSIS
 
+    // UUIDv7's leading bits are the creation timestamp; the 12-char display
+    // short therefore covers one 16ms bucket. Two tasks created back-to-back
+    // can share it, and the whole lifecycle below addresses tasks by that
+    // short — separate the creations past one bucket so shorts provably
+    // differ and prefix resolution stays deterministic.
+    std::thread::sleep(std::time::Duration::from_millis(20));
     let b = devai_json(h, &["task", "new", "Beta active", "--description", ""]);
     let id_b = b["id"].as_str().unwrap().to_string();
     let short_b = id_b[..12].to_string();
+    assert_ne!(short_a, short_b, "task display shorts must be distinct to drive the lifecycle");
     devai(h, &["task", "start", &short_b]);
     let spec = write(h, "spec.json", "{\"requirements\": []}");
     devai(h, &["artifact", "publish", &short_b, "--kind", "REQUIREMENTS_SPEC", "--file", &spec]);
@@ -101,10 +108,32 @@ fn task_active_lifecycle_through_the_real_binary() {
     // REQ-ACT-01: one command, RUNNING rows across ALL tasks, no caller
     // filter. A is started first → larger elapsed → must lead the view
     // (OQ-3 ratified: elapsed desc, древнейшие сверху).
-    let started_a = devai(h, &["exec", "start", &short_a, "--role", "requirements-analyst", "--agent", "mock"]);
-    let exec_a = started_a.split_whitespace().nth(1).unwrap().to_string();
-    let started_b = devai(h, &["exec", "start", &short_b, "--role", "implementation-agent", "--agent", "mock"]);
-    let exec_b = started_b.split_whitespace().nth(1).unwrap().to_string();
+    devai(h, &["exec", "start", &short_a, "--role", "requirements-analyst", "--agent", "mock"]);
+    // started_at is a millisecond clock: two executions started in the same
+    // ms would have EQUAL elapsed, and the elapsed-desc ordering would fall
+    // to the id tie-break on random bits. The gap makes "A started first" a
+    // fact the view must then display, not a coin flip the test guesses at.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    devai(h, &["exec", "start", &short_b, "--role", "implementation-agent", "--agent", "mock"]);
+    // FULL execution ids, never the printed 12-char display short: two
+    // executions started within the same UUIDv7 millisecond bucket share
+    // that prefix, and a test must not depend on which row a colliding
+    // prefix resolves to (the store now refuses to guess — get_execution
+    // fails loudly, mirroring resolve_task).
+    let execs = devai_json(h, &["exec", "list"]);
+    let full_running = |task_id: &str| -> String {
+        execs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["task_id"].as_str() == Some(task_id) && e["status"].as_str() == Some("RUNNING"))
+            .unwrap_or_else(|| panic!("no RUNNING execution for task {task_id} in {execs}"))["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let exec_a = full_running(&id_a);
+    let exec_b = full_running(&id_b);
 
     let v = devai(h, &["task", "active"]);
     assert!(v.contains(&short_a) && v.contains("requirements-analyst@") && v.contains("elapsed"), "alpha row present:\n{v}");
@@ -132,7 +161,7 @@ fn task_active_lifecycle_through_the_real_binary() {
     assert_eq!(rows.len(), 2, "both RUNNING rows, none else: {rows:?}");
     assert_eq!(rows[0]["task_id"], id_a.as_str(), "OQ-3: elapsed desc, longest-running first: {rows:?}");
     for (row, id, exec, slug, state) in [(&rows[0], &id_a, &exec_a, "requirements-analyst", "ANALYSIS"), (&rows[1], &id_b, &exec_b, "implementation-agent", "IMPLEMENTATION")] {
-        assert!(row["id"].as_str().unwrap().starts_with(exec.as_str()), "row id matches execution {exec}: {row}");
+        assert_eq!(row["id"].as_str().unwrap(), exec.as_str(), "row id matches execution {exec}: {row}");
         assert_eq!(row["task_id"], id.as_str());
         assert_eq!(row["role_slug"], slug);
         assert!(row["role_version"].as_i64().unwrap() >= 1);
