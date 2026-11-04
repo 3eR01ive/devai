@@ -123,6 +123,11 @@ enum TaskCmd {
     Progress {
         id: String,
     },
+    /// What is running right now, across all tasks of this store: short task
+    /// id, role@version, elapsed, workflow stage, worktree link — a read-only
+    /// snapshot, no waiting (with --json: one machine snapshot). Per-task
+    /// pipeline detail stays with `task progress`.
+    Active,
     /// Show the CURRENT quality report — the rendering a human signs at the
     /// QA gate (with --json: the full machine report).
     Report {
@@ -448,15 +453,9 @@ enum ExecCmd {
     Cancel {
         exec_id: String,
     },
-    /// List executions. With --active: a read-only snapshot of RUNNING
-    /// executions across all tasks — task, role@version, elapsed, workflow
-    /// stage, worktree link. Detail of one task stays in `task progress`.
     List {
         #[arg(long)]
         task: Option<String>,
-        /// Only RUNNING executions, enriched with task stage and worktree link
-        #[arg(long)]
-        active: bool,
     },
 }
 

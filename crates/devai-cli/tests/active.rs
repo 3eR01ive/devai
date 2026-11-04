@@ -1,10 +1,18 @@
-//! `devai exec list --active [--json]` (REQ-ACT-01..06): the cross-task
-//! snapshot of RUNNING executions. Pins the decisive properties:
-//! * RUNNING-only, across ALL tasks, no post-filtering by the caller;
+//! `devai task active [--json]` (REQ-ACT-01..06): the cross-task snapshot of
+//! RUNNING executions. OQ-1 as ratified: the surface is a separate `task
+//! active` subcommand — NOT a flag on `exec list` (execution rows and
+//! running work are different entities). Pins the decisive properties:
+//! * RUNNING-only, across ALL tasks of the current store, no post-filtering
+//!   by the caller;
 //! * the stage is the task's live engine state (never a CLI-local table);
 //! * the worktree link appears only after the platform recorded the
 //!   `worktree.prepared` fact — before it, a dash, never an invented path;
-//! * `--json` prints exactly one parseable snapshot object;
+//! * `stale?` is the ratified limit of OQ-2: a mark on rows the STORE itself
+//!   proves contradictory (terminal task, still-RUNNING execution) — no pid
+//!   detection here, real orphan detection belongs to the guard task;
+//! * rows come elapsed-descending (oldest work first), deterministically
+//!   (OQ-3 ratified); the row carries no task title (OQ-6 ratified);
+//! * `--json` prints exactly one parseable snapshot object (OQ-4 ratified);
 //! * snapshot semantics: repeated calls agree, nothing is written, an idle
 //!   store exits 0 with the empty marker.
 
@@ -57,17 +65,23 @@ fn strip_elapsed(out: &str) -> Vec<&str> {
 }
 
 #[test]
-fn active_overview_lifecycle_through_the_real_binary() {
+fn task_active_lifecycle_through_the_real_binary() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     devai(h, &["init"]);
 
-    // OQ-1 (interim answer: flag on the existing `exec list`): the surface
-    // is registered and visible in help.
-    let help = devai(h, &["exec", "--help"]);
-    assert!(help.contains("list"), "`exec --help` must list `list`:\n{help}");
+    // OQ-1 (ratified): the surface is `task active`, registered and visible
+    // in help; `exec list` stays a plain execution listing — no --active.
+    let help = devai(h, &["task", "--help"]);
+    assert!(help.contains("active"), "`task --help` must list `active`:\n{help}");
     let list_help = devai(h, &["exec", "list", "--help"]);
-    assert!(list_help.contains("--active"), "`exec list --help` must expose --active:\n{list_help}");
+    assert!(!list_help.contains("--active"), "`exec list` keeps no --active flag:\n{list_help}");
+    let rejected = Command::new(env!("CARGO_BIN_EXE_devai"))
+        .arg("--home").arg(h).env_remove("DEVAI_HOME").env_remove("DEVAI_CONFIG")
+        .args(["exec", "list", "--active"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success(), "`exec list --active` must not exist (OQ-1: entities not mixed)");
 
     // Two tasks driven to DIFFERENT engine states: ANALYSIS and IMPLEMENTATION.
     let a = devai_json(h, &["task", "new", "Alpha active", "--description", ""]);
@@ -84,13 +98,15 @@ fn active_overview_lifecycle_through_the_real_binary() {
     devai(h, &["task", "review", &short_b, "--verdict", "approved"]);
     devai(h, &["task", "approve", &short_b]); // → IMPLEMENTATION
 
-    // REQ-ACT-01: one command, RUNNING rows across ALL tasks, no caller filter.
+    // REQ-ACT-01: one command, RUNNING rows across ALL tasks, no caller
+    // filter. A is started first → larger elapsed → must lead the view
+    // (OQ-3 ratified: elapsed desc, древнейшие сверху).
     let started_a = devai(h, &["exec", "start", &short_a, "--role", "requirements-analyst", "--agent", "mock"]);
     let exec_a = started_a.split_whitespace().nth(1).unwrap().to_string();
     let started_b = devai(h, &["exec", "start", &short_b, "--role", "implementation-agent", "--agent", "mock"]);
     let exec_b = started_b.split_whitespace().nth(1).unwrap().to_string();
 
-    let v = devai(h, &["exec", "list", "--active"]);
+    let v = devai(h, &["task", "active"]);
     assert!(v.contains(&short_a) && v.contains("requirements-analyst@") && v.contains("elapsed"), "alpha row present:\n{v}");
     assert!(v.contains(&short_b) && v.contains("implementation-agent@"), "beta row present:\n{v}");
     // REQ-ACT-02/05: stage is the task's live engine state, per task.
@@ -100,20 +116,21 @@ fn active_overview_lifecycle_through_the_real_binary() {
     assert!(!v.contains(&format!("worktrees/{id_a}")), "no fabricated worktree path:\n{v}");
     // REQ-ACT-06: this is NOT the per-task pipeline — no checkmarks, no ops.
     assert!(!v.contains('✓') && !v.contains("allowed operations"), "detail stays with task progress:\n{v}");
+    // OQ-6 (ratified): the row carries ids, never the task title.
+    assert!(!v.contains("Alpha active") && !v.contains("Beta active"), "no titles in the rows:\n{v}");
+    // OQ-2 (ratified): live tasks with RUNNING work are NOT marked stale.
+    assert!(!v.contains("stale?"), "nothing provably stale yet:\n{v}");
     // REQ-ACT-06 AC2: the row's task id is sufficient to drill down.
     let p = devai(h, &["task", "progress", &short_b]);
     assert!(p.contains("Beta active"), "short id from the active view resolves in progress:\n{p}");
 
-    // Flag composition: --active narrows within one task.
-    let v = devai(h, &["exec", "list", "--active", "--task", &short_b]);
-    assert!(v.contains(&short_b) && !v.contains(&short_a), "--task filter still RUNNING-only:\n{v}");
-
-    // REQ-ACT-03: --json is exactly one snapshot object, flat RUNNING rows.
-    let j = devai_json(h, &["exec", "list", "--active"]);
+    // REQ-ACT-03 / OQ-4 (ratified): --json is exactly one snapshot object,
+    // snapshot_at + a flat list of RUNNING rows.
+    let j = devai_json(h, &["task", "active"]);
     assert!(j["snapshot_at"].is_string(), "snapshot_at present: {j}");
     let rows = j["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "both RUNNING rows, none else: {rows:?}");
-    assert_eq!(rows[0]["task_id"], id_a.as_str(), "interim OQ-3: longest-running first: {rows:?}");
+    assert_eq!(rows[0]["task_id"], id_a.as_str(), "OQ-3: elapsed desc, longest-running first: {rows:?}");
     for (row, id, exec, slug, state) in [(&rows[0], &id_a, &exec_a, "requirements-analyst", "ANALYSIS"), (&rows[1], &id_b, &exec_b, "implementation-agent", "IMPLEMENTATION")] {
         assert!(row["id"].as_str().unwrap().starts_with(exec.as_str()), "row id matches execution {exec}: {row}");
         assert_eq!(row["task_id"], id.as_str());
@@ -123,25 +140,27 @@ fn active_overview_lifecycle_through_the_real_binary() {
         assert_eq!(row["agent_name"], "mock");
         assert!(row["started_at"].is_string() && row["elapsed_seconds"].as_i64().unwrap() >= 0);
         assert_eq!(row["state"], state, "stage comes from the live TaskState: {row}");
+        assert_eq!(row["stale"], serde_json::Value::Bool(false), "a live task's RUNNING row is not stale: {row}");
         assert_eq!(row["branch"], serde_json::Value::Null, "no worktree.prepared fact → null: {row}");
         assert_eq!(row["worktree"], serde_json::Value::Null);
+        assert!(row.get("task_title").is_none(), "OQ-6: no title travels in the row: {row}");
     }
 
     // REQ-ACT-04: idempotent snapshot — unchanged state, same output modulo
     // the allowed elapsed growth.
-    let first = devai(h, &["exec", "list", "--active"]);
-    let second = devai(h, &["exec", "list", "--active"]);
+    let first = devai(h, &["task", "active"]);
+    let second = devai(h, &["task", "active"]);
     assert_eq!(strip_elapsed(&first), strip_elapsed(&second), "two snapshots of unchanged state agree");
 
-    // REQ-ACT-04: the view wrote nothing — both rows are still RUNNING and
-    // finish through the normal path afterwards.
+    // REQ-ACT-04: the view wrote nothing — rows still finish through the
+    // normal path afterwards.
     devai(h, &["exec", "finish", &exec_a, "--summary", "done"]);
-    let v = devai(h, &["exec", "list", "--active"]);
+    let v = devai(h, &["task", "active"]);
     assert!(!v.contains(&short_a), "COMPLETED rows drop out (AC2): {v}");
     assert!(v.contains(&short_b));
     let plain = devai(h, &["exec", "list"]);
-    assert!(plain.contains("COMPLETED"), "plain exec list keeps showing history — --active is additive: {plain}");
-    let j = devai_json(h, &["exec", "list", "--active"]);
+    assert!(plain.contains("COMPLETED"), "plain exec list keeps showing history — task active is the separate view: {plain}");
+    let j = devai_json(h, &["task", "active"]);
     assert_eq!(j["rows"].as_array().unwrap().len(), 1, "json mirrors the RUNNING-only filter: {j}");
 
     // REQ-ACT-02: the worktree link is backed by the platform FACT — the
@@ -160,45 +179,73 @@ fn active_overview_lifecycle_through_the_real_binary() {
             }),
         )
         .unwrap();
-    let v = devai(h, &["exec", "list", "--active"]);
+    let v = devai(h, &["task", "active"]);
     assert!(v.contains(&format!("rework/{id_b}")), "branch shown once the fact exists:\n{v}");
     assert!(v.contains(&h.join("worktrees").join(&id_b).display().to_string()), "worktree path shown:\n{v}");
     assert!(!v.contains('—'), "the only remaining row (beta) is prepared — the dash is gone");
-    let j = devai_json(h, &["exec", "list", "--active"]);
+    let j = devai_json(h, &["task", "active"]);
     let rows = j["rows"].as_array().unwrap();
     assert_eq!(rows[0]["branch"], format!("rework/{id_b}").as_str());
     assert_eq!(rows[0]["worktree"], h.join("worktrees").join(&id_b).display().to_string().as_str());
 
+    // OQ-2 (ratified): `stale?` marks exactly what the store itself proves
+    // contradictory — the task was cancelled while its execution is still
+    // RUNNING (terminal state + RUNNING row). No pid was consulted: the
+    // store keeps none; real orphan detection is the guard task's ownership.
+    devai(h, &["task", "cancel", &short_b, "--reason", "human cancel with work in flight"]);
+    let v = devai(h, &["task", "active"]);
+    assert!(v.contains("stale?") && v.contains("CANCELLED"), "terminal task with a RUNNING row is marked:\n{v}");
+    let j = devai_json(h, &["task", "active"]);
+    let rows = j["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the cancelled task's execution is still RUNNING in the store: {rows:?}");
+    assert_eq!(rows[0]["stale"], serde_json::Value::Bool(true), "json carries the same mark: {rows:?}");
+    assert_eq!(rows[0]["state"], "CANCELLED");
+
     // REQ-ACT-04: empty activity is the idle state, not an error — exit 0,
     // empty marker, json with an empty row list.
-    devai(h, &["exec", "finish", &exec_b, "--summary", "done"]);
-    let v = devai(h, &["exec", "list", "--active"]);
+    devai(h, &["exec", "cancel", &exec_b]);
+    let v = devai(h, &["task", "active"]);
     assert_eq!(v.trim(), "(no running executions)", "empty marker printed:\n{v}");
-    let j = devai_json(h, &["exec", "list", "--active"]);
+    let j = devai_json(h, &["task", "active"]);
     assert!(j["rows"].as_array().unwrap().is_empty(), "json says so too: {j}");
 }
 
-/// The docs/cli-snapshot/help_exec.txt artifact must equal the binary's real
-/// help (same discipline as the task-progress snapshot); refresh with:
+/// The docs/cli-snapshot artifacts must equal the binary's real help (same
+/// discipline as the task-progress snapshot): `task` gained `active`, `exec`
+/// lost `--active`. Refresh with:
 /// `cargo test -p devai-cli --test active -- --ignored`
 #[test]
-fn help_exec_snapshot_has_no_drift() {
+fn help_snapshots_have_no_drift() {
     let home = TempDir::new().unwrap();
-    let help = devai(home.path(), &["exec", "--help"]);
-    let path = snapshot_path();
-    let stored = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(stored.trim_end(), help.trim_end(), "help snapshot drifted from `devai exec --help`");
-    assert!(stored.contains("list"), "snapshot must list the list subcommand");
+    let h = home.path();
+
+    let task_help = devai(h, &["task", "--help"]);
+    let stored = read_snapshot(task_snapshot_path());
+    assert_eq!(stored.trim_end(), task_help.trim_end(), "help_task snapshot drifted from `devai task --help`");
+    assert!(stored.contains("active"), "task help snapshot must list `active`");
+
+    let exec_help = devai(h, &["exec", "--help"]);
+    let stored = read_snapshot(exec_snapshot_path());
+    assert_eq!(stored.trim_end(), exec_help.trim_end(), "help_exec snapshot drifted from `devai exec --help`");
+    assert!(!stored.contains("--active"), "the ratified surface removed the exec flag");
 }
 
 #[test]
-#[ignore = "rewrites the docs snapshot; run deliberately to refresh it"]
-fn update_help_exec_snapshot() {
+#[ignore = "rewrites the docs snapshots; run deliberately to refresh them"]
+fn update_help_snapshots() {
     let home = TempDir::new().unwrap();
-    let help = devai(home.path(), &["exec", "--help"]);
-    std::fs::write(snapshot_path(), help).expect("write snapshot");
+    std::fs::write(task_snapshot_path(), devai(home.path(), &["task", "--help"])).expect("write task snapshot");
+    std::fs::write(exec_snapshot_path(), devai(home.path(), &["exec", "--help"])).expect("write exec snapshot");
 }
 
-fn snapshot_path() -> std::path::PathBuf {
+fn read_snapshot(path: std::path::PathBuf) -> String {
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn task_snapshot_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli-snapshot/help_task.txt")
+}
+
+fn exec_snapshot_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli-snapshot/help_exec.txt")
 }

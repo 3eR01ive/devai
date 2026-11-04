@@ -1,35 +1,29 @@
 Usage: devai task [OPTIONS] <COMMAND>
 
 Commands:
-  new                  Create a task (DRAFT). A task is owned by the platform from birth
-  list                 
-  get                  
-  status               Current state + the operations the platform permits next
-  progress             Pipeline position of the task, allowed operations and a snapshot of running executions — state at a glance without copy-pasting ids (with --json: the same snapshot for machines)
-  report               Show the CURRENT quality report — the rendering a human signs at the QA gate (with --json: the full machine report)
-  start                DRAFT → ANALYSIS: start the workflow
-  run                  Run the assigned roles through all autonomous stages until the next human gate (APPROVAL / final acceptance), hold, or terminal state
-  revise               Publish/replace a REQUIREMENTS_SPEC and move to REVIEW
-  review               Record the reviewer's verdict in REVIEW
-  approve              APPROVAL → IMPLEMENTATION (requires approval rights: human/approver only)
-  reject               APPROVAL → ANALYSIS
-  accept               QA → ACCEPTED (requires a CURRENT QUALITY_REPORT)
-  return               QA → REWORK (return for fixes)
-  ratify-empty-rework  The EMPTY-REWORK GATE escape (human-only, REQ-RG-03): the task sits on a `qa.rework_gate_tripped` hold because a REWORK publication named the SAME platform-stamped commit as the previous report — the rework brought no new work. This command records an explicit `rework_noop_ratified` decision for exactly that report pair, releases the gate question, and runs the withheld REWORK → QA transition citing the decision. Only a human invocation can ratify; no agent or engine path can create the decision, and the ratification binds to the one cycle's pair — a later identical-commit rework trips the gate again
-  merge                The MERGE GATE (human-only): merge the task's platform-created `rework/<task-id>` branch into the workspace's current baseline branch. The platform never merges by itself — this command is the single merge path, records a `rework_merge` decision + event, and moves no task state. Conflicts stay with the human who invoked it
-  pause                
-  resume               Resume a PAUSED/BLOCKED/FAILED task, or answer-driven restore
-  block                
-  cancel               
-  fail                 Record a runtime failure (task parks in FAILED; `resume` retries)
-  events               Show immutable event history
-  depend               Register a typed task dependency: 'parent' ("породила" — why this task exists, pure genealogy, never gates — approved OQ3) or 'blocks' ("не может продолжиться без той" — resume and acceptance refused while open; closed only when the blocker is ACCEPTED, approved OQ1). Works at creation (--parent / --blocked-by) and retroactively, from either moment (REQ-DEP-07). Cycles are rejected WITHIN each kind (approved OQ4); a mixed parent↔blocks cycle is legal
-  dependencies         Typed dependencies of one task: what it depends on (outgoing) and what depends on it (incoming), ACTIVE edges only. An epic is not a separate entity — per the ratified OQ8 the epic VERTEX (no outgoing 'parent', incoming ones) reads out of this same dependency view (REQ-DEP-06); `task epics` lists the whole registry
-  unlink               Supersede (the approved removal, OQ7: edges are immutable) an ACTIVE dependency edge. The row stays in the store as SUPERSEDED history with full attribution; the live graph stops seeing it, so a gate it held opens and the same relation may be re-registered fresh
-  override             Human-escape of the dependency gate (approved OQ2): record an explicit ratification to continue DESPITE open 'blocks' dependencies. Stored as a `dependency_override` decision (verdict APPROVED, refs = the covered blocker ids). The refusal itself stays unconditional for anything not covered — a NEW blocker re-opens the gate; nothing ever resumes or accepts automatically by itself
-  epics                Epic registry as a VIEW over the dependency graph (approved OQ8): epic = task vertex with no outgoing ACTIVE 'parent' edge and at least one incoming one. No separate epic entity exists — this is the same stored dependency data, one query (REQ-DEP-06)
-  graph                The task dependency graph with task states — planning-level "what is happening": every node, its outgoing typed edges and whether an open 'blocks' edge still holds it. Built purely from stored data (REQ-DEP-04/05); the roadmap orders itself out of this graph
-  help                 Print this message or the help of the given subcommand(s)
+  new       Create a task (DRAFT). A task is owned by the platform from birth
+  list      
+  get       
+  status    Current state + the operations the platform permits next
+  progress  Pipeline position of the task, allowed operations and a snapshot of running executions — state at a glance without copy-pasting ids (with --json: the same snapshot for machines)
+  active    What is running right now, across all tasks of this store: short task id, role@version, elapsed, workflow stage, worktree link — a read-only snapshot, no waiting (with --json: one machine snapshot). Per-task pipeline detail stays with `task progress`
+  report    Show the CURRENT quality report — the rendering a human signs at the QA gate (with --json: the full machine report)
+  start     DRAFT → ANALYSIS: start the workflow
+  run       Run the assigned roles through all autonomous stages until the next human gate (APPROVAL / final acceptance), hold, or terminal state
+  revise    Publish/replace a REQUIREMENTS_SPEC and move to REVIEW
+  review    Record the reviewer's verdict in REVIEW
+  approve   APPROVAL → IMPLEMENTATION (requires approval rights: human/approver only)
+  reject    APPROVAL → ANALYSIS
+  accept    QA → ACCEPTED (requires a CURRENT QUALITY_REPORT)
+  return    QA → REWORK (return for fixes)
+  merge     The MERGE GATE (human-only): merge the task's platform-created `rework/<task-id>` branch into the workspace's current baseline branch. The platform never merges by itself — this command is the single merge path, records a `rework_merge` decision + event, and moves no task state. Conflicts stay with the human who invoked it
+  pause     
+  resume    Resume a PAUSED/BLOCKED/FAILED task, or answer-driven restore
+  block     
+  cancel    
+  fail      Record a runtime failure (task parks in FAILED; `resume` retries)
+  events    Show immutable event history
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --home <HOME>    Data directory (default: $DEVAI_HOME or ~/.devai) [env: DEVAI_HOME=]
