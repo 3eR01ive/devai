@@ -1035,18 +1035,32 @@ impl Store {
         Ok(())
     }
 
+    /// Resolves an execution by full id or short prefix. The prefix lookup
+    /// fails LOUDLY on ambiguity (same discipline as `resolve_task`): UUIDv7
+    /// leading bytes encode the creation timestamp, so display-shortened ids
+    /// collide for rows created in the same instant, and `LIMIT 1` would
+    /// silently finish the WRONG execution.
     pub fn get_execution(&self, id: &str) -> StoreResult<RoleExecution> {
-        rows::unwrap_row(
-            self.conn
-                .query_row(
-                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class
-                 FROM role_executions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 1",
-                    params![id.to_lowercase()],
-                    |r| rows::r2sql(rows::execution_from_row(r)),
-                )
-                .optional(),
-        )?
-        .ok_or_else(|| StoreError::NotFound("execution".into(), id.to_string()))
+        // Merged (rebase onto v6): the branch's loud ambiguity discipline —
+        // UUIDv7 display-prefixes collide for same-instant rows, LIMIT 1
+        // would finish the WRONG execution — over main's widened row (the
+        // form-loop columns attempt/parent_execution/failure_class ride in).
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class
+             FROM role_executions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 2",
+        )?;
+        let mut rows = stmt.query(params![id.to_lowercase()])?;
+        let mut found: Vec<RoleExecution> = Vec::new();
+        while let Some(r) = rows.next()? {
+            found.push(rows::execution_from_row(r)?);
+        }
+        match found.len() {
+            0 => Err(StoreError::NotFound("execution".into(), id.to_string())),
+            // invariant: found.len()==1 here — the match arm above guarantees
+            // exactly one element, pop() cannot return None.
+            1 => Ok(found.pop().unwrap()),
+            _ => Err(StoreError::Ambiguous(format!("execution id prefix `{id}` matches multiple executions"))),
+        }
     }
 
     pub fn list_executions(&self, task_id: Option<Id>) -> StoreResult<Vec<RoleExecution>> {

@@ -3,7 +3,7 @@ use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
 use devai_store::bundle;
 use devai_store::seed;
-use devai_store::{ArtifactDraft, Store};
+use devai_store::{ArtifactDraft, Store, StoreError};
 use tempfile::TempDir;
 
 fn open() -> (TempDir, Store) {
@@ -424,4 +424,41 @@ fn supersession_events_are_batched_per_publication() {
     assert_eq!(evs[1].payload[json_field::SUPERSEDED].as_array().unwrap()[0], v2.id.to_string());
     // Nothing deleted: all three rows still readable, two marked.
     assert_eq!(store.artifacts(t.id).unwrap().len(), 3);
+}
+
+/// UUIDv7 leading bytes are the creation timestamp, so two executions
+/// started in the same millisecond share the 12-char display short id used
+/// across the CLI. Prefix resolution must REFUSE to guess which row the
+/// caller meant — silently taking the first match would finish the wrong
+/// execution. Same loud discipline as `resolve_task`.
+#[test]
+fn execution_id_prefix_resolution_fails_loudly_on_ambiguity() {
+    let (_d, store) = open();
+    let t = draft(&store);
+    let exec = |s: &str| RoleExecution {
+        id: Id::parse_str(s).unwrap(),
+        task_id: t.id,
+        role_slug: "implementation-agent".into(),
+        role_version: 1,
+        agent_name: Some("mock".into()),
+        status: ExecutionStatus::Running,
+        inputs: vec![],
+        summary: None,
+        error: None,
+        started_at: now(),
+        finished_at: None,
+        workspace_revision: None,
+    };
+    let a = exec("01a1a5db-3ba0-7a5b-8176-3f38ad4c1ea8");
+    let b = exec("01a1a5db-3ba1-7a5b-8176-3f38ad4c1ea9");
+    store.start_execution(&a).unwrap();
+    store.start_execution(&b).unwrap();
+
+    // The shared display short prefix matches BOTH rows: ambiguous, loud.
+    let err = store.get_execution("01a1a5db-3ba").unwrap_err();
+    assert!(matches!(err, StoreError::Ambiguous(_)), "{err}");
+    assert!(format!("{err}").contains("01a1a5db-3ba"), "{err}");
+    // A unique prefix still resolves — the human-friendly convenience survives.
+    assert_eq!(store.get_execution("01a1a5db-3ba0").unwrap().id, a.id);
+    assert_eq!(store.get_execution(&b.id.to_string()).unwrap().id, b.id);
 }
