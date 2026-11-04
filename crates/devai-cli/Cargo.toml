@@ -11,12 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-chrono.workspace = true
 clap.workspace = true
 devai-api.workspace = true
 devai-core.workspace = true
 devai-runtime.workspace = true
-devai-store.workspace = true
 dirs.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -24,3 +22,7 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile = "3"
 rusqlite.workspace = true
+# Cycle 2 (REQ-MUT-02): the CLI sources own no Store handle — `devai-store`
+# moved from [dependencies] to dev-only, where tests inspect stored rows.
+devai-store.workspace = true
+chrono.workspace = true

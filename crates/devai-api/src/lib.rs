@@ -9,14 +9,27 @@
 //! The CLI is its first consumer (REQ-API-03); nothing here may assume a
 //! terminal, argument parsing, or human formatting (REQ-API-08).
 //!
-//! Cycle 1 (REQ-API-11) ships the READ plane as working code plus the
-//! published operation registry; mutation operations are named by the
-//! registry contract and move onto this surface in cycle 2.
+//! Cycle 1 (REQ-API-11) shipped the READ plane as working code plus the
+//! published operation registry; cycle 2 (REQ-MUT-*) moved the MUTATION
+//! plane onto this same surface — every write the CLI used to issue
+//! through its own store handle is a typed operation here, and the
+//! `Api::store()` accessor is gone (no consumer gets a bypass).
+//! Bootstrap (open + seed) is encapsulated in `Api::open`/`seed_config`
+//! per the human-ratified cycle-2 answer to Q2: the prohibition on direct
+//! store access in consumers is total.
 
 mod error;
+mod mutations;
 mod registry;
 
 pub use error::{ApiError, ApiResult, ErrorCode};
+pub use mutations::{
+    AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
+    ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted,
+    MergeRecordReq, MergeResult, MutationResult, OverrideResult, ProjectAddReq,
+    PublishOutcome, PublishReq, PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome,
+    ReviseReq, RunOutcome, RunReq, TaskCreateReq, TaskCreated, UnlinkResult, WorkflowOp,
+};
 pub use registry::{OpClass, OpDescriptor, operations};
 
 use std::collections::HashMap;
@@ -29,17 +42,25 @@ use devai_runtime::liveness;
 use devai_store::{Store, bundle};
 use serde::Serialize;
 
-/// Borrowed handle to one store home. Cheap to create per command; the
-/// single-writer discipline lives in the store, not here.
-pub struct Api<'a> {
-    store: &'a Store,
+/// One store home behind the typed operation surface. The `Store` handle
+/// is OWNED here and never exposed (REQ-MUT-03): cycle 1 borrowed it from
+/// the CLI (the accepted cycle-1 boundary); cycle 2 inverted the
+/// ownership — the consumer reaches the home through `Api::open` and every
+/// read/write through operations. The single-writer discipline lives in
+/// the store, not here.
+pub struct Api {
+    store: Store,
     home: PathBuf,
     actor: String,
 }
 
-impl<'a> Api<'a> {
-    pub fn new(store: &'a Store, home: &Path, actor: &str) -> Api<'a> {
-        Api { store, home: home.to_path_buf(), actor: actor.to_string() }
+impl Api {
+    /// Bootstrap entry (the ratified OQ-10 exception, encapsulated per the
+    /// human-ratified cycle-2 Q2): opening a home is not an operation of
+    /// the registry — it happens before the domain exists — but it is also
+    /// no longer a consumer-side `Store::open`. The handle stays inside.
+    pub fn open(home: &Path, actor: &str) -> ApiResult<Api> {
+        Ok(Api { store: Store::open(home)?, home: home.to_path_buf(), actor: actor.to_string() })
     }
 
     pub fn actor(&self) -> &str {
@@ -48,16 +69,6 @@ impl<'a> Api<'a> {
 
     pub fn home(&self) -> &Path {
         &self.home
-    }
-
-    /// EXCEPTION PATH (RATIFIED OQ-10 + REQ-API-03 C2 bootstrap entry): the
-    /// store handle is exposed ONLY for `init`/`seed` bootstrap — the store
-    /// is opened before it exists and seeding cannot be expressed through
-    /// this API — and for the cycle-2-pending mutation handlers. It is NOT a
-    /// read channel: every listed read operation of the registry has a typed
-    /// method here.
-    pub fn store(&self) -> &'a Store {
-        self.store
     }
 
     // ------------------------------------------------------------------
@@ -354,7 +365,7 @@ impl<'a> Api<'a> {
     /// paths converge on `bundle::export` over the same store).
     pub fn export_bundle(&self, id_prefix: &str, out_dir: &Path) -> ApiResult<bundle::BundleManifest> {
         let t = self.store.resolve_task(id_prefix)?;
-        Ok(bundle::export(self.store, &t, out_dir)?)
+        Ok(bundle::export(&self.store, &t, out_dir)?)
     }
 
     // internal: none — every read above is one store call per fact.

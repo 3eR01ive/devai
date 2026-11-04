@@ -1,4 +1,4 @@
-//! The machine-readable operation registry (REQ-API-06 AC1/AC4).
+//! The machine-readable operation registry (REQ-API-06 AC1/AC4, REQ-MUT-05).
 //!
 //! One entry per API operation: its name, whether it reads or mutates, the
 //! typed request/response shapes by name, and a TEXTUAL description of its
@@ -6,6 +6,10 @@
 //! consumer writes against it without reading CLI code, and the description
 //! is stored data, never re-derived from source at read time
 //! (no-read-time-rederivation doctrine).
+//!
+//! Cycle 2 moved the mutation plane onto the surface: every entry whose
+//! class is Mutation is working code (`crates/devai-api/src/mutations.rs`),
+//! and the shape names below are the actual request/result types.
 
 use serde::{Deserialize, Serialize};
 
@@ -48,8 +52,8 @@ pub fn operations() -> Vec<OpDescriptor> {
         OpDescriptor { name: "project.get", class: OpClass::Read, input: "id_or_name", output: "Option<Project>",
             description: "Look up one project by full id or name; None when absent." },
         // ---- task: creation & reads ----
-        OpDescriptor { name: "task.create", class: OpClass::Mutation, input: "TaskCreateReq{title, project, description, description_file, parent, blocked_by}", output: "TaskCreated{task, linked}",
-            description: "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. Mirrors `task new`." },
+        OpDescriptor { name: "task.create", class: OpClass::Mutation, input: "TaskCreateReq{title, project_id, description, parent, blocked_by}", output: "TaskCreated{task, linked}",
+            description: "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. The project name resolves through the `project.get` read, so its not-found refusal keeps the exact position the command had." },
         OpDescriptor { name: "task.list", class: OpClass::Read, input: "()", output: "Vec<Task>",
             description: "List all tasks ordered by most recently updated." },
         OpDescriptor { name: "task.get", class: OpClass::Read, input: "id_prefix", output: "Task",
@@ -72,49 +76,55 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "Epic registry as a VIEW over the dependency graph (no epic entity exists). Mirrors `task epics`." },
         OpDescriptor { name: "task.graph", class: OpClass::Read, input: "()", output: "GraphView{nodes, ready}",
             description: "The task dependency graph with states and the ready set (no open blockers, non-terminal), built purely from stored data. Mirrors `task graph`." },
-        // ---- task: workflow mutations (engine commands; cycle 2 execution) ----
-        OpDescriptor { name: "task.start", class: OpClass::Mutation, input: "id_prefix", output: "MutationResult{task, state_changed, staled, superseded, event_kind, allowed_operations}",
+        // ---- task: workflow mutations (engine commands; working code in
+        // crates/devai-api/src/mutations.rs — the dispatch `task_op` and
+        // every named operation are the same path, REQ-MUT-05 AC3) ----
+        OpDescriptor { name: "task.start", class: OpClass::Mutation, input: "id_prefix", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "DRAFT → ANALYSIS through workflow::start. Mirrors `task start`." },
-        OpDescriptor { name: "task.run", class: OpClass::Mutation, input: "RunReq{id, agent, workspace, force_reaudit}", output: "RunReport (plus gate_report_text)",
+        OpDescriptor { name: "task.run", class: OpClass::Mutation, input: "RunReq{id, agent, workspace, force_reaudit}", output: "RunOutcome{report, current_quality_report, gate_report_text, allowed_operations}",
             description: "Drive assigned roles through all autonomous stages to the next human gate; refuses while a RUNNING execution exists (single writer). force_reaudit carries the --force-reaudit gate semantics. Mirrors `task run`." },
-        OpDescriptor { name: "task.revise", class: OpClass::Mutation, input: "ReviseReq{id, file, reason}", output: "MutationResult",
+        OpDescriptor { name: "task.revise", class: OpClass::Mutation, input: "ReviseReq{id, name, content, reason}", output: "ReviseOutcome{task, staled_ids, allowed_operations}",
             description: "Publish/replace the REQUIREMENTS_SPEC and move to REVIEW through the contract gate. Mirrors `task revise`." },
-        OpDescriptor { name: "task.review", class: OpClass::Mutation, input: "id_prefix, verdict, summary", output: "MutationResult",
+        OpDescriptor { name: "task.review", class: OpClass::Mutation, input: "id_prefix, verdict, summary", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "Record the reviewer verdict in REVIEW. Mirrors `task review`." },
-        OpDescriptor { name: "task.approve", class: OpClass::Mutation, input: "id_prefix, rationale", output: "MutationResult + Decision",
+        OpDescriptor { name: "task.approve", class: OpClass::Mutation, input: "id_prefix, rationale", output: "ApproveOutcome{mutation: MutationResult, decision: Decision}",
             description: "APPROVAL → IMPLEMENTATION: requires a CURRENT REQUIREMENTS_SPEC; persists the workflow event AND a requirements_approval decision row. Mirrors `task approve`." },
-        OpDescriptor { name: "task.reject", class: OpClass::Mutation, input: "id_prefix, rationale", output: "MutationResult",
+        OpDescriptor { name: "task.reject", class: OpClass::Mutation, input: "id_prefix, rationale", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "APPROVAL → ANALYSIS. Mirrors `task reject`." },
-        OpDescriptor { name: "task.accept", class: OpClass::Mutation, input: "id_prefix, rationale", output: "MutationResult",
+        OpDescriptor { name: "task.accept", class: OpClass::Mutation, input: "id_prefix, rationale", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "QA → ACCEPTED; refuses while open 'blocks' dependencies stand unless a dependency_override decision covers every blocker. Mirrors `task accept`." },
-        OpDescriptor { name: "task.return", class: OpClass::Mutation, input: "id_prefix, rationale", output: "MutationResult",
+        OpDescriptor { name: "task.return", class: OpClass::Mutation, input: "id_prefix, rationale", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "QA → REWORK. Mirrors `task return`." },
-        OpDescriptor { name: "task.pause", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult",
+        OpDescriptor { name: "task.pause", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "Park the task in PAUSED. Mirrors `task pause`." },
-        OpDescriptor { name: "task.resume", class: OpClass::Mutation, input: "id_prefix", output: "MutationResult",
+        OpDescriptor { name: "task.resume", class: OpClass::Mutation, input: "id_prefix", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "Resume a PAUSED/BLOCKED/FAILED task or answer-driven restore, subject to the dependency gate. Mirrors `task resume`." },
-        OpDescriptor { name: "task.block", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult",
+        OpDescriptor { name: "task.block", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "Move the task to BLOCKED. Mirrors `task block`." },
-        OpDescriptor { name: "task.cancel", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult",
+        OpDescriptor { name: "task.cancel", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "Terminal CANCELLED. Mirrors `task cancel`." },
-        OpDescriptor { name: "task.fail", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult",
+        OpDescriptor { name: "task.fail", class: OpClass::Mutation, input: "id_prefix, reason", output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "Record a runtime failure; the task parks in FAILED for `resume`. Mirrors `task fail`." },
-        OpDescriptor { name: "task.depend", class: OpClass::Mutation, input: "id_prefix, on_prefix, kind", output: "TaskDependency",
+        OpDescriptor { name: "task.depend", class: OpClass::Mutation, input: "DependReq{id, on, kind}", output: "TaskDependency",
             description: "Register a typed ACTIVE dependency edge, loud at write on self-reference, duplicate, dangling or intra-kind cycles. Mirrors `task depend`." },
-        OpDescriptor { name: "task.unlink", class: OpClass::Mutation, input: "id_prefix, on_prefix, kind", output: "TaskDependency",
-            description: "Supersede an ACTIVE edge; the row stays as history immutable (OQ7). Mirrors `task unlink`." },
+        OpDescriptor { name: "task.unlink", class: OpClass::Mutation, input: "DependReq{id, on, kind}", output: "UnlinkResult{edge, superseded_by}",
+            description: "Supersede an ACTIVE edge; the row stays as history immutable (OQ7) and the edge is returned AS IT WAS while ACTIVE — the row's own actor is the original author, the superseder is `superseded_by`. Mirrors `task unlink`." },
         // ---- human-only gate escapes (RATIFIED OQ-13: v1 privilege of the
         // human operator — published so a consumer sees them, enforced by the
         // actor rights of the calling session, never by the transport) ----
         OpDescriptor { name: "task.override", class: OpClass::Mutation, input: "id_prefix, blockers, rationale", output: "OverrideResult{task, override_blockers}",
             description: "HUMAN-ONLY (OQ-13): record a dependency_override ratification to continue despite open blockers; refs bound to exactly the covered ids. Mirrors `task override`." },
-        OpDescriptor { name: "task.ratify_empty_rework", class: OpClass::Mutation, input: "id_prefix, rationale", output: "RatifyResult{task, decision, recorded_now, prev_report, current_report, state}",
+        OpDescriptor { name: "task.ratify_empty_rework", class: OpClass::Mutation, input: "id_prefix, rationale", output: "RatifyResult{task, decision, recorded_now, prev_report, current_report, state, allowed_operations}",
             description: "HUMAN-ONLY (OQ-13): the EMPTY-REWORK GATE escape — records rework_noop_ratified for the exact report pair, releases the gate question, runs the withheld REWORK → QA transition. Mirrors `task ratify-empty-rework`." },
-        OpDescriptor { name: "task.merge", class: OpClass::Mutation, input: "MergeReq{id, workspace, rationale}", output: "MergeResult{task, branch, workspace, head_before, head_after}",
-            description: "HUMAN-ONLY (OQ-13): the single merge path — merges the platform rework/<task-id> branch into the checked-out baseline; records rework_merge decision + event, never touches task state. Mirrors `task merge`." },
+        OpDescriptor { name: "task.merge", class: OpClass::Mutation, input: "MergeRecordReq{id, branch, workspace, head_before, head_after, rationale}", output: "MergeResult{task_id, branch, workspace, head_before, head_after}",
+            description: "HUMAN-ONLY (OQ-13): the persistence half of the single merge path — records the `rework_merge` decision and `rework.merged` event for a merge of the platform rework/<task-id> branch into the checked-out baseline. The repository act itself stays in the human-invoked command (REQ-WT-07 keeps the git invocation behind the CLI subcommand so no engine path reaches it); this operation never touches task state. Mirrors the recording inside `task merge`." },
         // ---- artifacts ----
-        OpDescriptor { name: "artifact.publish", class: OpClass::Mutation, input: "PublishReq{id, kind, file, name, depends, contract, execution, verdict, category}", output: "PublishResult{artifact, state_changed, gate}",
-            description: "Publish a versioned artifact through the contract gate; certain kinds advance the workflow through the SAME core commands. Requires a RUNNING execution row when --execution is given. Mirrors `artifact publish`." },
+        OpDescriptor { name: "artifact.publish", class: OpClass::Mutation, input: "PublishReq{id, kind, name, content, depends, contract, execution, verdict, category}", output: "PublishOutcome{publish: PublishedRow{artifact, task}, advanced: Option<AdvanceOutcome>}",
+            description: "Publish a versioned artifact through the contract gate; certain kinds advance the workflow through the SAME core commands. Requires a RUNNING execution row when execution is given. Mirrors `artifact publish`." },
+        OpDescriptor { name: "artifact.publish_row", class: OpClass::Mutation, input: "PublishReq{id, kind, name, content, depends, contract, execution, verdict, category}", output: "PublishedRow{artifact, task}",
+            description: "The first phase of `artifact.publish` alone: the row through the contract gate, no workflow advance. Exists beside the compound so a consumer that renders between the phases (the CLI, printing the artifact row before the advance) keeps output parity even when the advance fails." },
+        OpDescriptor { name: "artifact.advance", class: OpClass::Mutation, input: "AdvanceReq{id, artifact_id, kind, verdict}", output: "AdvanceOutcome{from, to, rework_gate}",
+            description: "The second phase of `artifact.publish`: the workflow advance certain kinds carry (requirements → REVIEW, review report → gate, implementation report → QA through the empty-rework gate). Same core commands as the compound and the engine." },
         OpDescriptor { name: "artifact.list", class: OpClass::Read, input: "id_prefix", output: "Vec<Artifact>",
             description: "All artifact rows of the task with versions and statuses. Mirrors `artifact list`." },
         OpDescriptor { name: "artifact.cat", class: OpClass::Read, input: "artifact_id", output: "Vec<u8> (raw bytes)",
@@ -122,9 +132,9 @@ pub fn operations() -> Vec<OpDescriptor> {
         OpDescriptor { name: "artifact.cat_text", class: OpClass::Read, input: "artifact_id", output: "String",
             description: "Text presentation of artifact content; NotUtf8 error when the bytes are not text." },
         // ---- questions ----
-        OpDescriptor { name: "question.ask", class: OpClass::Mutation, input: "AskReq{id, text, context, options, blocking, execution}", output: "Question",
+        OpDescriptor { name: "question.ask", class: OpClass::Mutation, input: "AskReq{id, text, context, options, blocking, execution}", output: "QuestionAsked{question, parked}",
             description: "Raise a question; a blocking one parks the task in WAITING_FOR_INPUT through workflow::raise_question. Mirrors `question ask`." },
-        OpDescriptor { name: "question.answer", class: OpClass::Mutation, input: "question_id, text", output: "Question",
+        OpDescriptor { name: "question.answer", class: OpClass::Mutation, input: "question_id, text", output: "AnsweredOutcome{question_id, from_state, to_state}",
             description: "Answer an OPEN question and run the answer-driven transition. Mirrors `question answer`." },
         OpDescriptor { name: "question.list", class: OpClass::Read, input: "id_prefix", output: "Vec<Question>",
             description: "All questions of the task. Mirrors `question list`." },
@@ -139,12 +149,12 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "Register a local agent instance; credentials stay outside the store. Mirrors `agent add`." },
         OpDescriptor { name: "agent.list", class: OpClass::Read, input: "()", output: "Vec<AgentInstance>",
             description: "List registered agents." },
-        OpDescriptor { name: "contract.add", class: OpClass::Mutation, input: "name, version, file (JSON)", output: "()",
+        OpDescriptor { name: "contract.add", class: OpClass::Mutation, input: "ContractAddReq{name, version, schema}", output: "ContractRegistration{name, version}",
             description: "Register a versioned contract schema. Mirrors `contract add`." },
         OpDescriptor { name: "contract.get", class: OpClass::Read, input: "name, version", output: "Option<String> (schema JSON text)",
             description: "Fetch a stored contract schema. Mirrors `contract get`." },
         // ---- executions ----
-        OpDescriptor { name: "exec.start", class: OpClass::Mutation, input: "id_prefix, role, agent, inputs", output: "RoleExecution",
+        OpDescriptor { name: "exec.start", class: OpClass::Mutation, input: "ExecStartReq{id, role, agent, inputs}", output: "ExecStarted{execution, task}",
             description: "Start a role execution: role/stage matrix validated, workspace revision and owner columns captured platform-side, single-writer guard enforced. Mirrors `exec start`." },
         OpDescriptor { name: "exec.finish", class: OpClass::Mutation, input: "exec_id, summary", output: "RoleExecution",
             description: "Close a RUNNING row as COMPLETED. Mirrors `exec finish`." },
@@ -168,11 +178,13 @@ pub fn operations() -> Vec<OpDescriptor> {
         // ---- registry ----
         OpDescriptor { name: "api.registry", class: OpClass::Read, input: "()", output: "Vec<OpDescriptor>",
             description: "The published operation registry itself — every operation with typed input/output names and textual semantics. Backs `devai api registry`." },
-        // ---- excluded units (RATIFIED OQ-10) ----
-        // init/seed keep DIRECT store access: bootstrap executes when the
-        // store does not exist yet and cannot be expressed through the API.
-        // They are the ratified exception of REQ-API-05 AC3, handled in
-        // crates/devai-cli/src/commands.rs, NOT operations of this registry.
+        // ---- excluded units (RATIFIED OQ-10, encapsulated per human-ratified
+        // cycle-2 Q2) ----
+        // init/seed stay the bootstrap pair and are NOT operations of this
+        // registry — but the handle moved inside the API: consumers open a
+        // home through `Api::open` and seed through `Api::seed_config`,
+        // never through a returned Store (the cycle-2 prohibition is total).
+        // Implemented in crates/devai-cli/src/commands.rs over the API.
     ]
 }
 
@@ -214,10 +226,27 @@ mod tests {
 
     #[test]
     fn init_seed_exception_is_not_an_operation() {
-        // RATIFIED OQ-10: init/seed stay the direct-store bootstrap pair —
-        // they must never appear in the API registry, in either class.
+        // RATIFIED OQ-10 (encapsulated per cycle-2 Q2): the bootstrap pair
+        // is not an operation of the registry in either class — the API
+        // owns the handle (`Api::open`/`seed_config`), consumers never do.
         for o in operations() {
             assert!(!o.name.starts_with("init") && !o.name.starts_with("seed"), "{}: OQ-10 exception leaked into the registry", o.name);
+        }
+    }
+
+    #[test]
+    fn mutation_plane_is_fully_registered() {
+        // REQ-MUT-05: every mutation the cycle-2 surface implements has a
+        // registry entry of class Mutation. The list mirrors the public
+        // operations in crates/devai-api/src/mutations.rs.
+        let muts: std::collections::HashSet<&str> = operations().iter().filter(|o| o.class == OpClass::Mutation).map(|o| o.name).collect();
+        for n in [
+            "project.add", "task.create", "task.start", "task.run", "task.revise", "task.review", "task.approve", "task.reject", "task.accept", "task.return",
+            "task.pause", "task.resume", "task.block", "task.cancel", "task.fail", "task.depend", "task.unlink", "task.override", "task.ratify_empty_rework", "task.merge",
+            "artifact.publish", "artifact.publish_row", "artifact.advance", "question.ask", "question.answer", "role.add", "agent.add", "contract.add", "exec.start",
+            "exec.finish", "exec.fail", "exec.cancel", "import.bundle",
+        ] {
+            assert!(muts.contains(n), "{n}: mutation of the API surface missing from the registry");
         }
     }
 }

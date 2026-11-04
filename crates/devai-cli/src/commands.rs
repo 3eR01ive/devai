@@ -1,22 +1,26 @@
-use std::path::{Path, PathBuf};
+//! The CLI surface. Cycle 2 (REQ-MUT-02/04): the command layer owns NO
+//! store handle and touches NO store — every read AND every write runs as
+//! a typed operation of `devai_api::Api`, and the handlers below only
+//! render results (workflow rules stay where the API delegates:
+//! `core::workflow` + the store, unchanged). Bootstrap is encapsulated too
+//! (human-ratified Q2): `Api::open` owns the home, `Api::seed_config`
+//! seeds it; `init`/seed are not registry operations, they are the
+//! ratified OQ-10 bootstrap pair behind the API surface.
+
+use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use chrono::Utc;
 use devai_core::types::*;
-use devai_core::workflow::{self, Mutation};
-use devai_runtime::{liveness, worktree, Engine, Gate};
-use devai_store::{ArtifactDraft, Store, guess_media_type};
+use devai_core::workflow;
+use devai_runtime::{Gate, worktree};
 use uuid::Uuid;
 
 use crate::outln;
 use crate::{ApiCmd, ArtifactCmd, AgentCmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd, TaskCmd, Cmd};
-use devai_api::Api;
-use devai_store::seed;
+use devai_api::{Api, ApiError, AdvanceReq, AgentAddReq, AskReq, ContractAddReq, DependReq, ExecStartReq, MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq};
 
 pub struct Ctx {
-    pub home: PathBuf,
-    pub actor: String,
-    pub store: Store,
+    api: Api,
 }
 
 impl Ctx {
@@ -29,24 +33,21 @@ impl Ctx {
             }
         };
         let actor = actor.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
-        // REQ-API-03 C2: Store::open here is the BOOTSTRAP entry point — the
-        // home directory is opened before any operation runs. It is not an
-        // operation path: every command dispatches through `Ctx::api` below.
-        let store = Store::open(&dir).context("open local store")?;
-        Ok(Ctx { home: dir, actor, store })
+        // Cycle 2 (REQ-MUT-04, human-ratified Q2): the API opens the home
+        // and OWNS the store handle — the bootstrap entry stays outside the
+        // operation registry (RATIFIED OQ-10) but is no longer consumer-
+        // side store access. Every command dispatches through `Ctx::api`.
+        let api = Api::open(&dir, &actor).context("open local store")?;
+        Ok(Ctx { api })
     }
 
     /// The platform API surface this CLI consumes as its first consumer
-    /// (REQ-API-03, ratified OQ-1: in-process crate). Commands routed through
-    /// it call typed operations here; direct `ctx.store` reads are the
-    /// RATIFIED OQ-10 exception (init/seed bootstrap) and the cycle-2
-    /// mutation paths pending migration (REQ-API-11) — marked at each site.
-    pub fn api(&self) -> Api<'_> {
-        Api::new(&self.store, &self.home, &self.actor)
-    }
-
-    fn now(&self) -> Timestamp {
-        Utc::now()
+    /// (REQ-API-03, ratified OQ-1: in-process crate). After cycle 2 this
+    /// is the ONLY path to data: reads (REQ-API-03 AC1) and mutations
+    /// (REQ-MUT-02) alike — no direct store handle exists in this crate
+    /// (pinned by tests/api_cycle2_mutations.rs::cli_sources_touch_no_store).
+    pub fn api(&self) -> &Api {
+        &self.api
     }
 }
 
@@ -54,17 +55,19 @@ impl Ctx {
 /// API layer existed: `devai: <message>` on stderr, nonzero exit
 /// (REQ-API-04 AC2 — an API failure is an explicit message, never an empty
 /// or truncated output). `ApiError` Display forwards the inner text, so the
-/// human-visible message is byte-identical to the pre-API path.
+/// human-visible message is byte-identical to the pre-API path; mutation
+/// refusals carry the operator text with a machine-readable code beside it
+/// (REQ-MUT-08).
 pub fn render_api_error(e: devai_api::ApiError) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
 pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
     match cmd {
-        // RATIFIED OQ-10 EXCEPTION (REQ-API-05 AC3, marked per AC2):
-        // init/seed keep the direct store path — bootstrap runs against a
-        // home that may not exist yet and cannot be expressed through the
-        // API. The pair stays together by ratification.
+        // RATIFIED OQ-10 + human-ratified cycle-2 Q2: `init` seeds through
+        // `Api::seed_config` — the bootstrap pair is encapsulated behind
+        // the API (no consumer-side Store) yet never an operation of the
+        // registry.
         Cmd::Init { config } => init(ctx, config.as_deref(), json),
         Cmd::Project(c) => project(ctx, c, json),
         Cmd::Task(c) => task(ctx, c, json),
@@ -99,7 +102,7 @@ fn api_registry(ctx: &Ctx, cmd: ApiCmd, json: bool) -> Result<()> {
                     outln!("{}  [{class}]  in={}  out={}", o.name, o.input, o.output);
                     outln!("    {}", o.description);
                 }
-                outln!("--- {} operations published (RATIFIED OQ-10 init/seed stay a direct-store bootstrap exception, not API operations)", ops.len());
+                outln!("--- {} operations published (RATIFIED OQ-10 init/seed stay the bootstrap pair encapsulated behind the API, not operations of this registry)", ops.len());
             }
         }
     }
@@ -112,16 +115,16 @@ fn api_registry(ctx: &Ctx, cmd: ApiCmd, json: bool) -> Result<()> {
 
 fn init(ctx: &Ctx, config_dir: Option<&Path>, json: bool) -> Result<()> {
     let (seeded, cfg_path) = match config_dir {
-        Some(dir) => (seed::seed_from(&ctx.store, dir, ctx.now())?, dir.to_path_buf()),
+        Some(dir) => (ctx.api().seed_config(Some(dir)).map_err(render_api_error)?, dir.to_path_buf()),
         None => {
-            let dir = ctx.home.join("config");
-            (seed::seed_defaults(&ctx.store, ctx.now())?, dir)
+            let dir = ctx.api().home().join("config");
+            (ctx.api().seed_config(None).map_err(render_api_error)?, dir)
         }
     };
     if json {
-        outln!("{}", serde_json::json!({"home": ctx.home, "config": cfg_path, "roles_seeded": seeded}));
+        outln!("{}", serde_json::json!({"home": ctx.api().home(), "config": cfg_path, "roles_seeded": seeded}));
     } else {
-        outln!("devai home: {}", ctx.home.display());
+        outln!("devai home: {}", ctx.api().home().display());
         outln!("config tree: {}", cfg_path.display());
         if seeded > 0 {
             outln!("seeded/updated {seeded} role version(s) from config");
@@ -146,8 +149,7 @@ fn init(ctx: &Ctx, config_dir: Option<&Path>, json: bool) -> Result<()> {
 fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
     match cmd {
         ProjectCmd::Add { name, description, repo } => {
-            let p = Project::new(name, description, repo, ctx.now());
-            ctx.store.create_project(&p)?;
+            let p = ctx.api().project_add(ProjectAddReq { name, description, repos: repo }).map_err(render_api_error)?;
             outln!("project {} ({})", p.name, short(&p.id));
         }
         ProjectCmd::List => {
@@ -185,35 +187,29 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
 // task
 // ---------------------------------------------------------------------------
 
-/// Cycle-2 mark (REQ-API-11): handlers whose READ facts below still resolve
-/// the task through `ctx.store` carry a CYCLE-2 PENDING comment; every pure
-/// read path routes through `ctx.api()` (REQ-API-03 AC1 for the read plane).
+/// Cycle 2 (REQ-MUT-02): every mutation arm below calls an `Api` operation;
+/// the handler owns only presentation. Reads were routed the same way since
+/// cycle 1 — the CYCLE-2 PENDING marks are gone because the plane moved.
 fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::New { title, project, description, description_file, parent, blocked_by } => {
+            // The project name resolves through the API read FIRST, so its
+            // not-found refusal keeps the exact position the command had.
             let project_id = match project.as_deref() {
-                Some(name) => Some(ctx.store.get_project(name)?.context(format!("project `{name}` not found"))?.id),
+                Some(name) => Some(ctx.api().project_get(name).map_err(render_api_error)?.context(format!("project `{name}` not found"))?.id),
                 None => None,
             };
             let desc = match description_file {
                 Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
                 None => description,
             };
-            let t = Task::new(title, desc, project_id, ctx.now());
-            ctx.store.create_task(&t)?;
             // REQ-DEP-07: a derived task records WHY it exists at the moment
             // it is created — the genealogy/blocking never leaves for the
-            // operator chat. Dangling references fail loudly here (resolve),
-            // exactly as they would via `task depend`.
-            let mut linked: Vec<TaskDependency> = Vec::new();
-            for p in &parent {
-                let pt = ctx.store.resolve_task(p)?;
-                linked.push(ctx.store.link_task_dependency(t.id, pt.id, DependencyKind::Parent, &ctx.actor, ctx.now())?);
-            }
-            for b in &blocked_by {
-                let bt = ctx.store.resolve_task(b)?;
-                linked.push(ctx.store.link_task_dependency(t.id, bt.id, DependencyKind::Blocks, &ctx.actor, ctx.now())?);
-            }
+            // operator chat. Dangling references fail loudly in the
+            // operation, exactly as they would via `task depend`.
+            let created = ctx.api().task_create(TaskCreateReq { title, project_id, description: desc, parent, blocked_by }).map_err(render_api_error)?;
+            let t = created.task;
+            let linked = created.linked;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&t)?);
             } else {
@@ -248,67 +244,48 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Progress { id } => progress(ctx, &id, json)?,
         TaskCmd::Active => active_overview(ctx, json)?,
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
-        TaskCmd::Start { id } => op(ctx, &id, |t, _a| workflow::start(t, &ctx.actor, ctx.now()))?,
+        TaskCmd::Start { id } => render_mutation(&ctx.api().task_start(&id).map_err(render_api_error)?)?,
         TaskCmd::Run { id, agent, workspace, force_reaudit } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
-        TaskCmd::Revise { id, file, reason } => revise(ctx, &id, &file, reason.as_deref())?,
+        TaskCmd::Revise { id, file, reason } => {
+            let task_ref = ctx.api().task_get(&id).map_err(render_api_error)?;
+            let content = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            let o = ctx.api().task_revise(ReviseReq { id: task_ref.id.to_string(), name: file.display().to_string(), content, reason }).map_err(render_api_error)?;
+            outln!("requirements v{} published → REVIEW", o.task.requirements_seq);
+            if !o.staled_ids.is_empty() {
+                outln!("consequences: {} artifact(s) marked STALE:", o.staled_ids.len());
+                for s in &o.staled_ids {
+                    outln!("  stale  {s}");
+                }
+                outln!("old versions are kept in history; nothing was deleted");
+            }
+            outln!("next: {}", o.allowed_operations.join(" | "));
+        }
         TaskCmd::Review { id, verdict, summary } => {
-            let v = parse_verdict(&verdict)?;
-            op(ctx, &id, move |t, _a| workflow::review_recorded(t, v, summary.as_deref(), &ctx.actor, ctx.now()))?;
+            let v = Api::parse_verdict(&verdict).map_err(render_api_error)?;
+            render_mutation(&ctx.api().task_review(&id, v, summary).map_err(render_api_error)?)?;
         }
         TaskCmd::Approve { id, rationale } => {
-            // The approve act is persisted like every other human-gate act
-            // (`rework_merge` below, `qa_reaudit_override` in the engine):
-            // a workflow event via `op` AND a stored decision row. The row
-            // is what makes the rationale a fact the QA auditor is fed —
-            // REQ-QAD-001 read the `decisions` table, and before this the
-            // approve rationale existed only inside the event payload, so
-            // spec-fidelity scoring never saw the ratified open-question
-            // resolutions (precedent 01a1a0b5-0fcf).
-            let task = ctx.store.resolve_task(&id)?;
-            let spec_ref = ctx
-                .store
-                .artifacts(task.id)?
-                .iter()
-                .find(|x| x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current)
-                .map(|x| x.id.to_string())
-                .unwrap_or_default();
-            let decision_rationale = rationale.clone();
-            op(ctx, &id, move |t, a| {
-                if a.iter().any(|x| x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current) {
-                    workflow::approve_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now())
-                } else {
-                    Err(devai_core::CoreError::guard("no CURRENT REQUIREMENTS_SPEC artifact to approve"))
-                }
-            })?;
-            ctx.store.record_decision(&Decision {
-                id: new_id(),
-                task_id: task.id,
-                kind: decision_kind::REQUIREMENTS_APPROVAL.into(),
-                verdict: Verdict::Approved,
-                actor: ctx.actor.clone(),
-                rationale: decision_rationale,
-                refs: if spec_ref.is_empty() { Vec::new() } else { vec![spec_ref] },
-                created_at: ctx.now(),
-            })?;
+            // The approve act is persisted like every other human-gate act:
+            // a workflow event AND a stored requirements_approval decision
+            // row — the row is what makes the rationale a fact the QA
+            // auditor is fed (precedent 01a1a0b5-0fcf). The API operation
+            // owns both writes in the old order.
+            let o = ctx.api().task_approve(&id, rationale).map_err(render_api_error)?;
+            render_mutation(&o.mutation)?;
         }
-        TaskCmd::Reject { id, rationale } => op(ctx, &id, move |t, _a| workflow::reject_requirements(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
+        TaskCmd::Reject { id, rationale } => render_mutation(&ctx.api().task_reject(&id, rationale).map_err(render_api_error)?)?,
         TaskCmd::Accept { id, rationale } => {
             // REQ-DEP-03: the human acceptance gate reads the stored
             // dependency graph — an open 'blocks' edge refuses the gate and
             // the refusal enumerates the blocking task ids as data. The one
             // release (RATIFIED DECISION OQ2) is the operator's explicit
-            // `dependency_override` decision, read from stored decisions —
-            // an edge closed means the blocker ACCEPTED, never merely
-            // cancelled/failed (RATIFIED DECISION OQ1).
-            let tid = ctx.store.resolve_task(&id)?.id;
-            let deps = ctx.store.task_dependencies(tid)?;
-            let decisions = ctx.store.list_decisions(tid)?;
-            op(ctx, &id, move |t, a| workflow::accept(t, a, &deps, &decisions, rationale.as_deref(), &ctx.actor, ctx.now()))?;
+            // `dependency_override` decision (see `task override` below).
+            render_mutation(&ctx.api().task_accept(&id, rationale).map_err(render_api_error)?)?;
         }
-        TaskCmd::Return { id, rationale } => op(ctx, &id, move |t, _a| workflow::return_to_rework(t, rationale.as_deref(), &ctx.actor, ctx.now()))?,
-        TaskCmd::RatifyEmptyRework { id, rationale } => ratify_empty_rework(ctx, &id, rationale.as_deref(), json)?,
-        TaskCmd::Merge { id, workspace, rationale } => task_merge(ctx, &id, workspace.as_deref(), rationale.as_deref(), json)?,
-        TaskCmd::Pause { id, reason } => op(ctx, &id, move |t, _a| workflow::pause(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
+        TaskCmd::Return { id, rationale } => render_mutation(&ctx.api().task_return(&id, rationale).map_err(render_api_error)?)?,
+        TaskCmd::RatifyEmptyRework { id, rationale } => ratify_empty_rework(ctx, &id, rationale, json)?,
+        TaskCmd::Merge { id, workspace, rationale } => task_merge(ctx, &id, workspace.as_deref(), rationale, json)?,
+        TaskCmd::Pause { id, reason } => render_mutation(&ctx.api().task_pause(&id, reason).map_err(render_api_error)?)?,
         TaskCmd::Resume { id } => {
             // REQ-DEP-03: resume from a hold state consults the stored graph
             // (open blockers enumerate into the refusal; "closed" = blocker
@@ -316,14 +293,11 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // own `task override` ratification (ratified OQ2). Closing the
             // last blocker does NOT resume the task by itself — auto-unpause
             // is forbidden, resume stays a human command.
-            let tid = ctx.store.resolve_task(&id)?.id;
-            let deps = ctx.store.task_dependencies(tid)?;
-            let decisions = ctx.store.list_decisions(tid)?;
-            op(ctx, &id, move |t, _a| workflow::resume(t, &deps, &decisions, &ctx.actor, ctx.now()))?;
+            render_mutation(&ctx.api().task_resume(&id).map_err(render_api_error)?)?;
         }
-        TaskCmd::Block { id, reason } => op(ctx, &id, move |t, _a| workflow::block(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
-        TaskCmd::Cancel { id, reason } => op(ctx, &id, move |t, _a| workflow::cancel(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
-        TaskCmd::Fail { id, reason } => op(ctx, &id, move |t, _a| workflow::fail(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
+        TaskCmd::Block { id, reason } => render_mutation(&ctx.api().task_block(&id, reason).map_err(render_api_error)?)?,
+        TaskCmd::Cancel { id, reason } => render_mutation(&ctx.api().task_cancel(&id, reason).map_err(render_api_error)?)?,
+        TaskCmd::Fail { id, reason } => render_mutation(&ctx.api().task_fail(&id, reason).map_err(render_api_error)?)?,
         TaskCmd::Events { id, limit } => {
             let evs = ctx.api().task_events(&id, limit).map_err(render_api_error)?;
             if json {
@@ -353,19 +327,17 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         }
         TaskCmd::Depend { id, on, kind } => {
             let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
-            let task = ctx.store.resolve_task(&id)?;
-            let depends_on = ctx.store.resolve_task(&on)?;
             // Registration is LOUD at write (REQ-DEP-07 AC2): self-reference,
             // a duplicate edge, a dangling id or a cycle WITHIN one kind
             // (ratified OQ4: parent-DAG and blocks-DAG; a mixed
             // parent↔blocks cycle — the standard backfill/gate case — is
             // legal) never land in the store.
-            let d = ctx.store.link_task_dependency(task.id, depends_on.id, kind, &ctx.actor, ctx.now())?;
+            let d = ctx.api().task_depend(DependReq { id, on, kind }).map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&d)?);
             } else {
                 outln!("task {} —{}→ task {} recorded ({} in {}, by {}, {})",
-                    short(&task.id), kind.as_str(), short(&depends_on.id), depends_on.state.as_str(), depends_on.title, d.actor, d.created_at.format("%Y-%m-%d %H:%M:%S"));
+                    short(&d.task_id), d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title, d.actor, d.created_at.format("%Y-%m-%d %H:%M:%S"));
             }
         }
         TaskCmd::Dependencies { id } => {
@@ -403,14 +375,12 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // and created_at, gains who/when superseded it, and stays in
             // the table forever; only the live graph stops seeing it.
             let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
-            let task = ctx.store.resolve_task(&id)?;
-            let depends_on = ctx.store.resolve_task(&on)?;
-            let d = ctx.store.supersede_task_dependency(task.id, depends_on.id, kind, &ctx.actor, ctx.now())?;
+            let u = ctx.api().task_unlink(DependReq { id, on, kind }).map_err(render_api_error)?;
             if json {
-                outln!("{}", serde_json::to_string_pretty(&d)?);
+                outln!("{}", serde_json::to_string_pretty(&u.edge)?);
             } else {
                 outln!("task {} —{}→ task {} superseded (edge {} stays as history, by {})",
-                    short(&task.id), kind.as_str(), short(&depends_on.id), short(&d.id), ctx.actor);
+                    short(&u.edge.task_id), kind.as_str(), short(&u.edge.depends_on_id), short(&u.edge.id), u.superseded_by);
             }
         }
         TaskCmd::Override { id, blocker, rationale } => {
@@ -422,42 +392,14 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // covers, so a NEW blocker opened later is NOT covered by an
             // old decision; closing the last blocker never resumes the task
             // by itself (auto-unpause forbidden) — resume stays a human act.
-            let task = ctx.store.resolve_task(&id)?;
-            let mut blockers: Vec<String> = Vec::new();
-            for b in &blocker {
-                blockers.push(ctx.store.resolve_task(b)?.id.to_string());
-            }
-            if blockers.is_empty() {
-                // Without explicit --blocker, ratify against exactly the
-                // blockers OPEN right now (computed from stored data).
-                let deps = ctx.store.task_dependencies(task.id)?;
-                blockers = workflow::open_blockers(&task, &deps);
-                if blockers.is_empty() {
-                    bail!("task {} has no open blocking dependencies — nothing to override", short(&task.id));
-                }
-            }
-            ctx.store.record_decision(&Decision {
-                id: new_id(),
-                task_id: task.id,
-                kind: decision_kind::DEPENDENCY_OVERRIDE.into(),
-                verdict: Verdict::Approved,
-                actor: ctx.actor.clone(),
-                rationale: rationale.clone(),
-                refs: blockers.clone(),
-                created_at: ctx.now(),
-            })?;
-            ctx.store.insert_event(
-                Some(task.id),
-                event_kind::TASK_DEPENDENCY_OVERRIDDEN,
-                &ctx.actor,
-                serde_json::json!({ "blockers": blockers }),
-            )?;
+            let r = ctx.api().task_override(&id, blocker, rationale).map_err(render_api_error)?;
+            let blockers = r.override_blockers;
             if json {
-                outln!("{}", serde_json::json!({"task": task.id.to_string(), "override_blockers": blockers}));
+                outln!("{}", serde_json::json!({"task": r.task.id.to_string(), "override_blockers": blockers}));
             } else {
                 outln!("override recorded for task {}: continuing despite {} — the gate stands for any NEW blocker",
-                    short(&task.id), blockers.join(", "));
-                outln!("the task stays in its hold state until a human runs `devai task resume {}`", short(&task.id));
+                    short(&r.task.id), blockers.join(", "));
+                outln!("the task stays in its hold state until a human runs `devai task resume {}`", short(&r.task.id));
             }
         }
         TaskCmd::Epics => {
@@ -516,52 +458,36 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Load task, run a core command, commit with optimistic locking, report.
-fn op<F>(ctx: &Ctx, id: &str, f: F) -> Result<()>
-where
-    F: FnOnce(&Task, &[Artifact]) -> devai_core::CoreResult<Mutation>,
-{
-    let task = ctx.store.resolve_task(id)?;
-    let artifacts = ctx.store.artifacts(task.id)?;
-    let m = f(&task, &artifacts).map_err(anyhow::Error::new)?;
-    let staled = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Stale).count();
-    let superseded = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Superseded).count();
-    ctx.store.commit(task.lock_version, &m)?;
-    if m.task.state != task.state {
-        outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
+/// Render the committed workflow mutation exactly as the old CLI `op()`
+/// helper printed it: transition line, STALE/SUPERSEDED consequences, the
+/// next allowed operations. The facts arrive typed from the API
+/// (REQ-MUT-01: the operation returns the workflow result, not a store
+/// proxy; REQ-MUT-08: one rendering path for success and refusal).
+fn render_mutation(m: &MutationResult) -> Result<()> {
+    if m.task.state != m.previous_state {
+        outln!("state: {} → {}", m.previous_state.as_str(), m.task.state.as_str());
     } else {
-        outln!("recorded ({})", m.events[0].kind);
+        outln!("recorded ({})", m.event_kinds[0]);
     }
-    if staled > 0 {
-        outln!("marked STALE: {staled} dependent artifact(s) — history preserved");
+    if m.staled > 0 {
+        outln!("marked STALE: {} dependent artifact(s) — history preserved", m.staled);
     }
-    if superseded > 0 {
-        outln!("superseded: {superseded}");
+    if m.superseded > 0 {
+        outln!("superseded: {}", m.superseded);
     }
-    let ops = workflow::allowed_ops(&m.task);
-    if !ops.is_empty() {
-        outln!("next: {}", ops.join(" | "));
+    if !m.allowed_operations.is_empty() {
+        outln!("next: {}", m.allowed_operations.join(" | "));
     }
     Ok(())
 }
 
 /// Drive the task through every AUTONOMOUS stage with a real role
-/// execution. Stops at human gates (APPROVAL, acceptance) — never past them.
-fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path>, force_reaudit: bool, json: bool) -> Result<()> {
-    // REQ-SW-05: while the task carries an unresolved RUNNING execution —
-    // live writer or orphan — `task run` refuses with the blocking row's
-    // full id and the allowed exits. The engine's own start would hit the
-    // same wall at the index (enforcement point), this is the labeled,
-    // early refusal. A pre-check failure on an unknown id resolves inside
-    // the engine exactly as before.
-    if let Ok(task) = ctx.store.resolve_task(id) {
-        running_writer_guard(ctx, &task)?;
-    }
-    let mut engine = Engine::new(&ctx.store).with_force_reaudit(force_reaudit);
-    if let Some(w) = workspace {
-        engine = engine.with_workspace(w);
-    }
-    let report = engine.advance(id, agent, &ctx.actor).map_err(anyhow::Error::new)?;
+/// execution (API `task.run` — the engine drive including the single-writer
+/// guard, which moved into the operation and keeps its labeled refusal
+/// text). Stops at human gates (APPROVAL, acceptance) — never past them.
+fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&Path>, force_reaudit: bool, json: bool) -> Result<()> {
+    let o = ctx.api().task_run(RunReq { id: id.to_string(), agent: agent.to_string(), workspace: workspace.map(|p| p.to_path_buf()), force_reaudit }).map_err(render_api_error)?;
+    let report = o.report;
     if json {
         outln!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -584,7 +510,7 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
         Gate::WaitingApproval => outln!("⏸ APPROVAL is a human gate — approve or reject the requirements"),
         Gate::WaitingAccept => {
             // The §2.6 rendering is for the human at the gate.
-            if let Some(text) = latest_quality_report_text(&ctx.store, report.task_id) {
+            if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
                 outln!("{text}");
             }
@@ -593,14 +519,8 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
         Gate::ReportFresh => {
             // The freshness gate stopped the run: no auditor execution was
             // started, no artifact was published. The human decides.
-            let arts = ctx.store.artifacts(report.task_id)?;
-            // REQ-005: selection by status alone — the store guarantees at
-            // most one CURRENT per (task_id, kind) (schema v3 partial
-            // unique index); no seq tie-break workaround here anymore.
-            if let Some(a) = arts
-                .iter()
-                .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
-            {
+            // REQ-005: CURRENT-by-status selection lives in the API.
+            if let Some(a) = &o.current_quality_report {
                 outln!(
                     "⏸ quality report v{} ({}) is FRESH — it is bound to exactly the recomputed workspace revision; the auditor was NOT re-run",
                     a.seq,
@@ -609,7 +529,7 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
             } else {
                 outln!("⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run");
             }
-            if let Some(text) = latest_quality_report_text(&ctx.store, report.task_id) {
+            if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
                 outln!("{text}");
             }
@@ -621,10 +541,8 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
         Gate::Terminal(st) => outln!("task finished: {}", st.as_str()),
         Gate::Hold(st) => outln!("task held in {} — release it first", st.as_str()),
     }
-    let t = ctx.store.get_task(&report.task_id.to_string())?;
-    let ops = workflow::allowed_ops(&t);
-    if !ops.is_empty() {
-        outln!("next: {}", ops.join(" | "));
+    if !o.allowed_operations.is_empty() {
+        outln!("next: {}", o.allowed_operations.join(" | "));
     }
     Ok(())
 }
@@ -640,9 +558,11 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path
 /// branch checked out when the command runs (OQ-9: the business does not
 /// fix a configured baseline — what the human has checked out is theirs to
 /// merge into). Task state is untouched by design: the merge is a repository
-/// act, recorded as a decision + event, not a workflow transition.
-fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<&str>, json: bool) -> Result<()> {
-    let task = ctx.store.resolve_task(id)?;
+/// act, recorded (API `task.merge`) as a decision + event, not a workflow
+/// transition. Cycle 2 moves the RECORDING behind the API; the repository
+/// act stays here exactly where REQ-WT-07 ratified it.
+fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<String>, json: bool) -> Result<()> {
+    let task = ctx.api().task_get(id).map_err(render_api_error)?;
     let repo = match workspace {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir().context("no current directory; pass --workspace")?,
@@ -658,31 +578,18 @@ fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<&
     git_in(&repo, &["merge", "--no-edit", &branch])?;
     let head_after = git_in(&repo, &["rev-parse", "HEAD"])?;
 
-    ctx.store.record_decision(&Decision {
-        id: new_id(),
-        task_id: task.id,
-        kind: decision_kind::REWORK_MERGE.into(),
-        verdict: Verdict::Approved,
-        actor: ctx.actor.clone(),
-        rationale: rationale.map(|s| s.to_string()),
-        refs: vec![branch.clone(), head_after.clone()],
-        created_at: ctx.now(),
-    })?;
-    ctx.store.insert_event(
-        Some(task.id),
-        event_kind::REWORK_MERGED,
-        &ctx.actor,
-        serde_json::json!({
-            "branch": branch,
-            "workspace": repo.display().to_string(),
-            "head_before": head_before,
-            "head_after": head_after,
-        }),
-    )?;
+    let r = ctx.api().task_merge_record(MergeRecordReq {
+        id: task.id.to_string(),
+        branch: branch.clone(),
+        workspace: repo.display().to_string(),
+        head_before: head_before.clone(),
+        head_after: head_after.clone(),
+        rationale,
+    }).map_err(render_api_error)?;
     if json {
         outln!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "task": task.id.to_string(), "branch": branch, "workspace": repo.display().to_string(),
-            "head_before": head_before, "head_after": head_after,
+            "task": r.task_id.to_string(), "branch": r.branch, "workspace": r.workspace,
+            "head_before": r.head_before, "head_after": r.head_after,
         }))?);
     } else {
         outln!("merged `{branch}` into {}  {head_before} → {head_after}", repo.display());
@@ -691,9 +598,10 @@ fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<&
     Ok(())
 }
 
-/// The EMPTY-REWORK GATE escape (REQ-RG-03), human-only like the merge gate.
-/// Records (or reuses) a `rework_noop_ratified` Decision for the exact report
-/// pair named by the most recent `qa.rework_gate_tripped` event of the latest
+/// The EMPTY-REWORK GATE escape (REQ-RG-03), human-only like the merge gate:
+/// the API `task.ratify_empty_rework` operation records (or reuses) the
+/// pair-bound `rework_noop_ratified` Decision for the exact report pair
+/// named by the most recent `qa.rework_gate_tripped` event of the latest
 /// report, releases the gate's blocking question, and runs the withheld
 /// REWORK → QA transition through the same core command
 /// (`implementation_reported`), which now finds the pair-bound ratification
@@ -701,202 +609,36 @@ fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<&
 /// agent path reaches this handler — the decision can only be created by a
 /// human invoking the CLI (AC2), and there is no timeout auto-pass (AC
 /// constraint): without the explicit act the task simply stays parked.
-fn ratify_empty_rework(ctx: &Ctx, id: &str, rationale: Option<&str>, json: bool) -> Result<()> {
-    let task = ctx.store.resolve_task(id)?;
-    match task.state {
-        // The gate hold is WAITING_FOR_INPUT returning to REWORK. If the
-        // operator answered the question first (back to REWORK, no
-        // ratification) — or a previous run died between the two acts —
-        // ratifying from REWORK converges here too. Never from a hold of a
-        // different question.
-        TaskState::WaitingForInput if task.return_state == Some(TaskState::Rework) => {}
-        TaskState::Rework => {}
-        s => bail!(
-            "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
-            s.as_str()
-        ),
-    }
-    let arts = ctx.store.artifacts(task.id)?;
-    let Some(current) = arts.iter().filter(|a| a.kind == ArtifactKind::ImplementationReport).max_by_key(|a| a.seq) else {
-        bail!("the task has no implementation report — nothing to ratify");
-    };
-    let events = ctx.store.all_events_for_task(task.id)?;
-    let current_id_s = current.id.to_string();
-    // Only the trip of the LATEST report is ratifiable: a newer report
-    // changes the pair, and the older cycle's ratification is not lifetime
-    // (REQ-RG-03 AC4) — the new publication tripped its own gate or passed.
-    let trip = events
-        .iter()
-        .rev()
-        .find(|e| {
-            e.kind == event_kind::QA_REWORK_GATE_TRIPPED
-                && e.payload.get(json_field::CURRENT_REPORT).and_then(|v| v.as_str()) == Some(current_id_s.as_str())
-        })
-        .ok_or_else(|| anyhow::anyhow!(
-            "no empty-rework gate recorded for report {} — the gate fires when a REWORK publication names the unchanged commit; if the latest report is newer, let the engine publish it from REWORK first",
-            short(&current.id)
-        ))?;
-    let prev_report = trip
-        .payload
-        .get(json_field::PREV_REPORT)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .context("the gate trip event names no previous report — history corruption")?
-        .to_string();
-
-    // The ratification decision for exactly this pair. Recorded once; a retry
-    // reuses the stored row (this command must never double-write a judgment,
-    // and it stays crash-safe between its commits).
-    let decisions = ctx.store.list_decisions(task.id)?;
-    let existing = decisions
-        .iter()
-        .find(|d| {
-            d.kind == decision_kind::REWORK_NOOP_RATIFIED
-                && d.refs.iter().any(|r| r == &prev_report)
-                && d.refs.iter().any(|r| r == &current_id_s)
-        })
-        .cloned();
-    let (decision, recorded_now) = match existing {
-        Some(d) => (d, false),
-        None => {
-            let d = Decision {
-                id: new_id(),
-                task_id: task.id,
-                kind: decision_kind::REWORK_NOOP_RATIFIED.into(),
-                verdict: Verdict::Approved,
-                actor: ctx.actor.clone(),
-                rationale: rationale.map(|s| s.to_string()),
-                refs: vec![prev_report.clone(), current_id_s.clone()],
-                created_at: ctx.now(),
-            };
-            ctx.store.record_decision(&d)?;
-            (d, true)
-        }
-    };
-
-    // Release the blocking gate question while the hold is still up.
-    let mut cur = task.clone();
-    if cur.state == TaskState::WaitingForInput {
-        let q_ref = trip.payload.get(json_field::QUESTION_ID).and_then(|v| v.as_str()).unwrap_or_default();
-        let q = ctx.store.get_question(q_ref)?;
-        if q.status == QuestionStatus::Open {
-            ctx.store.answer_question(q.id, &format!("operator ratified the empty rework (decision {})", decision.id), &ctx.actor, ctx.now())?;
-        }
-        let m = workflow::answer_question(&cur, q.id, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-        ctx.store.commit(cur.lock_version, &m)?;
-        cur = ctx.store.get_task(&cur.id.to_string())?;
-    }
-
-    // Run the withheld transition through the single serialization point.
-    // With the stored ratification now in the facts, the core command admits
-    // REWORK → QA and puts `ratified_by` on the event (REQ-RG-03 AC3).
-    let arts = ctx.store.artifacts(cur.id)?;
-    let facts = devai_runtime::gate::collect_implementation_report_facts(
-        &ctx.store,
-        cur.id,
-        current,
-        &arts,
-        Some(format!("empty rework ratified by decision {}", decision.id)),
-    )?;
-    let m = workflow::implementation_reported(&cur, &facts, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-    if m.task.state != TaskState::Qa {
-        bail!(
-            "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
-            m.task.state.as_str(),
-            decision.id,
-            short(&cur.id)
-        );
-    }
-    ctx.store.commit(cur.lock_version, &m)?;
+fn ratify_empty_rework(ctx: &Ctx, id: &str, rationale: Option<String>, json: bool) -> Result<()> {
+    let r = ctx.api().task_ratify_empty_rework(id, rationale).map_err(render_api_error)?;
     if json {
         outln!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "task": cur.id.to_string(),
-            "decision": decision.id.to_string(),
-            "recorded_now": recorded_now,
-            "prev_report": prev_report,
-            "current_report": current_id_s,
-            "state": m.task.state.as_str(),
+            "task": r.task.id.to_string(),
+            "decision": r.decision.id.to_string(),
+            "recorded_now": r.recorded_now,
+            "prev_report": r.prev_report,
+            "current_report": r.current_report,
+            "state": r.state.as_str(),
         }))?);
     } else {
-        outln!("ratified: decision {} ({}) — the no-op rework is now a conscious operator passage", decision.id, if recorded_now { "recorded" } else { "reused stored" });
-        outln!("pair: report {prev_report} → report {current_id_s} on the same commit");
-        outln!("state: {} → QA; the transition event cites the decision", cur.state.as_str());
-        outln!("next: {}", workflow::allowed_ops(&m.task).join(" | "));
+        outln!("ratified: decision {} ({}) — the no-op rework is now a conscious operator passage", r.decision.id, if r.recorded_now { "recorded" } else { "reused stored" });
+        outln!("pair: report {} → report {} on the same commit", r.prev_report, r.current_report);
+        outln!("state: {} → QA; the transition event cites the decision", r.task.state.as_str());
+        outln!("next: {}", r.allowed_operations.join(" | "));
     }
     Ok(())
 }
 
 /// Read-only git plumbing for the merge gate: the CLI never grows domain
-/// logic, it only performs exactly the one repository act a human ordered.
+/// logic, it only performs exactly the one repository act a human ordered
+/// (REQ-WT-07 — the git invocation stays CLI-side BY RATIFICATION; it is a
+/// repository act, not store access, and is out of the REQ-MUT-02 scope).
 fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
     let out = std::process::Command::new("git").args(args).current_dir(dir).output().with_context(|| format!("launch git in {}", dir.display()))?;
     if !out.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// The human gate's viewing channel: the CURRENT quality report. A verdict
-/// that must be signed must also be readable — after the run printed it, on
-/// demand, forever (history is never deleted; only CURRENT is shown).
-fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
-    // (API task.report read — QualityReportView is the machine-complete
-    // form; REQ-005 CURRENT-by-status selection lives in the API layer.)
-    let v = ctx.api().task_report(id).map_err(render_api_error)?;
-    if json {
-        outln!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-    outln!(
-        "quality report v{}  artifact {}  contract {}  execution {}",
-        v.seq,
-        short_str(&v.artifact),
-        v.contract,
-        v.execution.as_deref().map(short_str).unwrap_or_else(|| "-".to_string())
-    );
-    outln!("---");
-    match v.report_text {
-        Some(text) => outln!("{text}"),
-        // Reports assembled before @2 carry no rendering: show the machine
-        // JSON rather than pretend there is nothing to read.
-        None => outln!("{}", serde_json::to_string_pretty(&v.report).unwrap_or_default()),
-    }
-    Ok(())
-}
-
-fn latest_quality_report_text(store: &devai_store::Store, task_id: devai_core::types::Id) -> Option<String> {
-    let arts = store.artifacts(task_id).ok()?;
-    // REQ-005: status-only selection (single CURRENT pinned at v3).
-    let a = arts
-        .iter()
-        .find(|a| a.kind == devai_core::types::ArtifactKind::QualityReport && a.status == devai_core::types::ArtifactStatus::Current)?;
-    let blob = store.read_blob(&a.sha256).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&blob).ok()?;
-    v.get("report_text")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| Some("(report assembled before @2 — no rendering)".into()))
-}
-
-fn revise(ctx: &Ctx, id: &str, file: &Path, reason: Option<&str>) -> Result<()> {
-    let task = ctx.store.resolve_task(id)?;
-    let (kind, name) = (ArtifactKind::RequirementsSpec, file.display().to_string());
-    let content = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
-    let _a = publish_raw(ctx, task.id, kind, &name, content, None, None, vec![], None, DataCategory::Artifact)?;
-    let after = ctx.store.artifacts(task.id)?;
-    let m = workflow::requirements_published(&task, &after, reason, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-    ctx.store.commit(task.lock_version, &m)?;
-    outln!("requirements v{} published → REVIEW", m.task.requirements_seq);
-    let staled: Vec<_> = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Stale).map(|(i, _)| i.to_string()).collect();
-    if !staled.is_empty() {
-        outln!("consequences: {} artifact(s) marked STALE:", staled.len());
-        for s in &staled {
-            outln!("  stale  {s}");
-        }
-        outln!("old versions are kept in history; nothing was deleted");
-    }
-    outln!("next: {}", workflow::allowed_ops(&m.task).join(" | "));
-    Ok(())
 }
 
 fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
@@ -934,97 +676,31 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_task(t: &Task) {
-    outln!("id:        {}", t.id);
-    outln!("title:     {}", t.title);
-    outln!("state:     {}{}", t.state.as_str(), t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default());
-    outln!("requirements: v{}", t.requirements_seq);
-    outln!("project:   {}", t.project_id.map(|i| short(&i)).unwrap_or_else(|| "-".into()));
-    outln!("lock:      {}", t.lock_version);
-    outln!("created:   {}  updated: {}", t.created_at.format("%Y-%m-%d %H:%M:%S"), t.updated_at.format("%Y-%m-%d %H:%M:%S"));
-    if !t.business_description.is_empty() {
-        outln!("business:  {}", ellipsis(&t.business_description, 200));
-    }
-}
-
-/// `devai task progress <ID>` — pipeline position at a glance. The view data
-/// comes from the API task.progress operation (the machine-complete
-/// ProgressView); the renderer owns no state-machine knowledge of its own:
-/// the spine order, position/re-entry and the running-execution snapshot are
-/// computed in the API layer from `workflow::pipeline_*` / `allowed_ops` /
-/// `store.list_executions`, change the engine's op set and the view follows.
-fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
-    let v = ctx.api().task_progress(id).map_err(render_api_error)?;
-
+/// The human gate's viewing channel: the CURRENT quality report. A verdict
+/// that must be signed must also be readable — after the run printed it, on
+/// demand, forever (history is never deleted; only CURRENT is shown).
+fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {    // (API task.report read — QualityReportView is the machine-complete
+    // form; REQ-005 CURRENT-by-status selection lives in the API layer.)
+    let v = ctx.api().task_report(id).map_err(render_api_error)?;
     if json {
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-
-    let t = &v.task;
-    let ops = &v.allowed_operations;
-    let order = &v.pipeline.order;
-    let pos_idx = v.pipeline.position_index;
-    let running: Vec<_> = v.running_executions.iter().collect();
-
-    outln!("id:    {}", t.id);
-    outln!("title: {}", t.title);
     outln!(
-        "state: {}{}",
-        t.state.as_str(),
-        t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default()
+        "quality report v{}  artifact {}  contract {}  execution {}",
+        v.seq,
+        short_str(&v.artifact),
+        v.contract,
+        v.execution.as_deref().map(short_str).unwrap_or_else(|| "-".to_string())
     );
-    let mut nodes = Vec::with_capacity(order.len());
-    for (i, name) in order.iter().enumerate() {
-        if Some(i) == pos_idx && !t.state.is_terminal() {
-            nodes.push(format!("[{name}]"));
-        } else if pos_idx.is_some_and(|p| p > i) {
-            nodes.push(format!("✓ {name}"));
-        } else {
-            nodes.push(name.clone());
-        }
-    }
-    outln!("pipeline: {}", nodes.join(" → "));
-    if t.state.is_terminal() {
-        outln!("cycle ended in {} — terminal state, no open pipeline step", t.state.as_str());
-    } else if v.pipeline.off_spine {
-        // REWORK loop / hold state: the bracket marks where it re-enters.
-        match v.pipeline.position.as_deref() {
-            Some(p) => outln!("note:  {} is off the spine — it returns to [{}]", t.state.as_str(), p),
-            None => outln!("note:  {} holds no remembered stage (state corruption — check `devai task events`)", t.state.as_str()),
-        }
-    }
     outln!("---");
-    outln!("running executions:");
-    if running.is_empty() {
-        outln!("  (no running executions)");
-    } else {
-        for e in &running {
-            outln!(
-                "  {:<24} {:<12} elapsed {}",
-                format!("{}@{}", e.role_slug, e.role_version),
-                short_str(&e.id),
-                human_elapsed(e.elapsed_seconds)
-            );
-        }
+    match v.report_text {
+        Some(text) => outln!("{text}"),
+        // Reports assembled before @2 carry no rendering: show the machine
+        // JSON rather than pretend there is nothing to read.
+        None => outln!("{}", serde_json::to_string_pretty(&v.report).unwrap_or_default()),
     }
-    outln!(
-        "allowed operations: {}",
-        if ops.is_empty() { "(none — task is terminal)".to_string() } else { ops.join(" | ") }
-    );
     Ok(())
-}
-
-/// Readable elapsed from a raw seconds count: `42s`, `3m 07s`, `2h 05m`.
-fn human_elapsed(total: i64) -> String {
-    let s = total.max(0);
-    if s >= 3600 {
-        format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
-    } else if s >= 60 {
-        format!("{}m {:02}s", s / 60, s % 60)
-    } else {
-        format!("{s}s")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,43 +712,37 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
         ArtifactCmd::Publish { id, kind, file, name, depends, contract, execution, verdict, category } => {
             let kind = ArtifactKind::parse(&kind.replace('-', "_")).map_err(anyhow::Error::new)?;
             let category = DataCategory::parse(&category.replace('-', "_")).map_err(anyhow::Error::new)?;
-            let task = ctx.store.resolve_task(&id)?;
+            // The task ref resolves before the file read — the exact order
+            // the pre-cycle-2 handler had (error-position parity).
+            ctx.api().task_get(&id).map_err(render_api_error)?;
             let content = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-            let mut depends_ids = resolve_ids(ctx, &depends)?;
-            // Downstream role results are implicitly children of the current
-            // approved specification, so a later requirements revision marks
-            // them STALE through the dependency graph (unless deps were given).
-            if depends.is_empty() && is_downstream_of_spec(kind) {
-                if let Some(spec) = current_spec_id(&ctx.store.artifacts(task.id)?) {
-                    depends_ids.push(spec);
-                }
-            }
-            let execution_id = match execution.as_deref() {
-                Some(e) => {
-                    // Ratified OQ-4: a publication into a row that is no
-                    // longer RUNNING is a LOUD refusal — the orphan whose
-                    // process survived its own cancellation must not write
-                    // into a closed execution («зомби не пишет в закрытую
-                    // строку»). Work that continues needs a NEW execution
-                    // opened by the platform (and the single-writer index
-                    // will let only one exist).
-                    let ex = ctx.store.get_execution(e)?;
-                    if ex.status != ExecutionStatus::Running {
-                        bail!("execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)", ex.id, ex.status.as_str());
+            // The publication runs in two API operations so the artifact
+            // row prints BEFORE a failing advance — the store effects and
+            // their order match the compound `artifact.publish` exactly.
+            let row = ctx.api().artifact_publish_row(PublishReq {
+                id: id.clone(),
+                kind,
+                name: name.unwrap_or_else(|| file.display().to_string()),
+                content,
+                depends,
+                contract,
+                execution,
+                verdict: verdict.clone(),
+                category,
+            })
+            .map_err(|e| {
+                // Gate parity (ratified OQ-FG-05, REQ-FG-08): the manual
+                // path runs the SAME contract gate as the engine loop — the
+                // API enforces, the CLI renders the ratified PRESENTATION:
+                // warning + the FULL violation list, then the refusal.
+                if let ApiError::ContractRejected { contract, violations } = &e {
+                    for v in violations {
+                        eprintln!("warning: {contract} contract gate rejected this artifact: {v}");
                     }
-                    Some(ex.id)
                 }
-                None => None,
-            };
-            let created_by = match &execution_id {
-                Some(_) => format!("execution:{}", execution_id.unwrap()),
-                None => ctx.actor.clone(),
-            };
-            let contract_ref = match contract.as_deref() {
-                Some(c) => Some(ContractRef::parse(c).map_err(anyhow::Error::new)?),
-                None => None,
-            };
-            let a = publish_raw(ctx, task.id, kind, &name.unwrap_or_else(|| file.display().to_string()), content, contract_ref, execution_id, depends_ids, Some(&created_by), category)?;
+                render_api_error(e)
+            })?;
+            let a = row.artifact;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&a)?);
             } else {
@@ -1080,33 +750,12 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
             }
             // Some kinds carry the workflow forward.
             match kind {
-                ArtifactKind::RequirementsSpec => {
-                    let arts = ctx.store.artifacts(task.id)?;
-                    let m = workflow::requirements_published(&task, &arts, None, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-                    ctx.store.commit(task.lock_version, &m)?;
-                    outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
-                }
-                ArtifactKind::ReviewReport => {
-                    let v = match verdict.as_deref() {
-                        Some(s) => parse_verdict(s)?,
-                        None => bail!("publishing REVIEW_REPORT requires --verdict approved|needs_revision"),
-                    };
-                    let m = workflow::review_recorded(&task, v, None, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-                    ctx.store.commit(task.lock_version, &m)?;
-                    outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
-                }
-                ArtifactKind::ImplementationReport => {
-                    // The manual publication crosses the SAME core command as
-                    // the engine — including the empty-rework gate: no
-                    // producer path may bypass it (REQ-RG-01 constraint).
-                    let arts = ctx.store.artifacts(task.id)?;
-                    let facts = devai_runtime::gate::collect_implementation_report_facts(&ctx.store, task.id, &a, &arts, None)?;
-                    let m = workflow::implementation_reported(&task, &facts, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-                    ctx.store.commit(task.lock_version, &m)?;
-                    outln!("state: {} → {}", task.state.as_str(), m.task.state.as_str());
-                    if m.task.state == TaskState::WaitingForInput {
+                ArtifactKind::RequirementsSpec | ArtifactKind::ReviewReport | ArtifactKind::ImplementationReport => {
+                    let adv = ctx.api().artifact_advance(AdvanceReq { id, artifact_id: a.id.to_string(), kind, verdict }).map_err(render_api_error)?;
+                    outln!("state: {} → {}", adv.from.as_str(), adv.to.as_str());
+                    if kind == ArtifactKind::ImplementationReport && adv.rework_gate {
                         outln!("⏸ EMPTY-REWORK GATE: report {} names the SAME commit as the previous one — the rework captured no new work; QA is withheld.", short(&a.id));
-                        outln!("   operator: ratify the no-op explicitly with `devai task ratify-empty-rework {} --rationale \"...\"`, or answer the question and re-run the implementation with real fixes", short(&task.id));
+                        outln!("   operator: ratify the no-op explicitly with `devai task ratify-empty-rework {} --rationale \"...\"`, or answer the question and re-run the implementation with real fixes", short(&a.task_id));
                     }
                 }
                 ArtifactKind::QualityReport => {
@@ -1139,55 +788,6 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_raw(
-    ctx: &Ctx,
-    task_id: Id,
-    kind: ArtifactKind,
-    name: &str,
-    content: Vec<u8>,
-    contract: Option<ContractRef>,
-    execution: Option<Id>,
-    depends: Vec<Id>,
-    created_by: Option<&str>,
-    category: DataCategory,
-) -> Result<Artifact> {
-    if let Some(c) = &contract {
-        let schema = ctx.store.get_contract(&c.name, c.version)?;
-        if schema.is_none() {
-            bail!("contract {c} is not registered (devai contract add)");
-        }
-        // Gate parity (ratified OQ-FG-05, REQ-FG-08): a manual
-        // `devai artifact publish` runs the SAME contract gate as the engine
-        // loop — otherwise a non-contract-shaped body enters the store via
-        // the CLI and a later stage re-validates on the role's behalf. The
-        // decision ratified the PRESENTATION (warning + the FULL violation
-        // list) and the scope; the spec fixes enforcement
-        // ("контракт-гейт не обходится выбором пути публикации", AC: the
-        // manual path rejects with the same list) — so: print every
-        // violation, then refuse.
-        let violations = devai_runtime::contract_violations(String::from_utf8_lossy(&content).as_ref(), schema.as_deref())?;
-        if !violations.is_empty() {
-            for v in &violations {
-                eprintln!("warning: {c} contract gate rejected this artifact: {v}");
-            }
-            bail!("artifact does not satisfy contract {c}: {violations:?}");
-        }
-    }
-    Ok(ctx.store.publish_artifact(ArtifactDraft {
-        task_id,
-        kind,
-        name: name.to_string(),
-        category,
-        media_type: guess_media_type(Path::new(name)),
-        content,
-        contract,
-        created_by: created_by.unwrap_or(&ctx.actor).to_string(),
-        execution_id: execution,
-        depends_on: depends,
-    })?)
-}
-
 // ---------------------------------------------------------------------------
 // questions
 // ---------------------------------------------------------------------------
@@ -1195,29 +795,9 @@ fn publish_raw(
 fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
     match cmd {
         QuestionCmd::Ask { id, text, context, options, blocking, execution } => {
-            let task = ctx.store.resolve_task(&id)?;
-            let execution_id = match execution.as_deref() {
-                Some(e) => Some(ctx.store.get_execution(e)?.id),
-                None => None,
-            };
-            let q = Question {
-                id: new_id(),
-                task_id: task.id,
-                execution_id,
-                text,
-                context,
-                options,
-                blocking,
-                status: QuestionStatus::Open,
-                answer: None,
-                answered_by: None,
-                answered_at: None,
-                created_at: ctx.now(),
-            };
-            ctx.store.create_question(&q)?;
-            let m = workflow::raise_question(&task, q.id, blocking, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-            ctx.store.commit(task.lock_version, &m)?;
-            if blocking && m.task.state != task.state {
+            let asked = ctx.api().question_ask(AskReq { id, text, context, options, blocking, execution }).map_err(render_api_error)?;
+            let q = asked.question;
+            if asked.parked {
                 outln!("question {} raised; task parked in WAITING_FOR_INPUT", short(&q.id));
                 outln!("answer with: devai question answer {}", short(&q.id));
             } else {
@@ -1225,15 +805,8 @@ fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
             }
         }
         QuestionCmd::Answer { question_id, text } => {
-            let q = ctx.store.get_question(&question_id)?;
-            if q.status == QuestionStatus::Answered {
-                bail!("question {} is already answered", q.id);
-            }
-            let task = ctx.store.get_task(&q.task_id.to_string())?;
-            ctx.store.answer_question(q.id, &text, &ctx.actor, ctx.now())?;
-            let m = workflow::answer_question(&task, q.id, &ctx.actor, ctx.now()).map_err(anyhow::Error::new)?;
-            ctx.store.commit(task.lock_version, &m)?;
-            outln!("answer recorded; state: {} → {}", task.state.as_str(), m.task.state.as_str());
+            let o = ctx.api().question_answer(&question_id, &text).map_err(render_api_error)?;
+            outln!("answer recorded; state: {} → {}", o.from_state.as_str(), o.to_state.as_str());
         }
         QuestionCmd::List { id } => {
             // (API question.list read.)
@@ -1260,16 +833,10 @@ fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
     match cmd {
         RoleCmd::Add { file } => {
             let body = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-            let mut r: RoleDefinition = serde_json::from_str(&body).context("invalid RoleDefinition JSON")?;
-            // version override: latest+1 for this slug if caller left 0
-            if r.version == 0 {
-                r.version = ctx.store.get_role(&r.slug)?.map(|e| e.version + 1).unwrap_or(1);
-            }
-            if r.id == Uuid::nil() {
-                r.id = new_id();
-            }
-            r.created_at = ctx.now();
-            ctx.store.put_role(&r)?;
+            let r: RoleDefinition = serde_json::from_str(&body).context("invalid RoleDefinition JSON")?;
+            // The version override (0 = latest+1 for the slug) and the
+            // id/timestamp defaulting run inside the API `role.add`.
+            let r = ctx.api().role_add(r).map_err(render_api_error)?;
             outln!("role {}@{} registered", r.slug, r.version);
         }
         RoleCmd::List => {
@@ -1287,7 +854,7 @@ fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
                 }
             }
         }
-        RoleCmd::Get { slug } => match ctx.store.get_role(&slug)? {
+        RoleCmd::Get { slug } => match ctx.api().role_get(&slug).map_err(render_api_error)? {
             Some(r) => outln!("{}", serde_json::to_string_pretty(&r)?),
             None => bail!("role `{slug}` not found"),
         },
@@ -1298,9 +865,8 @@ fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
 fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
     match cmd {
         AgentCmd::Add { name, provider, model, runtime } => {
-            let a = AgentInstance { id: new_id(), name: name.clone(), provider, model, runtime, created_at: ctx.now() };
-            ctx.store.put_agent(&a)?;
-            outln!("agent {name} registered (credentials stay outside the store)");
+            let a = ctx.api().agent_add(AgentAddReq { name, provider, model, runtime }).map_err(render_api_error)?;
+            outln!("agent {} registered (credentials stay outside the store)", a.name);
         }
         AgentCmd::List => {
             // (API agent.list read.)
@@ -1322,8 +888,8 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
         ContractCmd::Add { name, version, file } => {
             let schema = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
             serde_json::from_str::<serde_json::Value>(&schema).context("contract file must be valid JSON")?;
-            ctx.store.put_contract(&name, version, &schema)?;
-            outln!("contract {name}@{version} registered");
+            let r = ctx.api().contract_add(ContractAddReq { name, version, schema }).map_err(render_api_error)?;
+            outln!("contract {}@{} registered", r.name, r.version);
         }
         ContractCmd::Get { name, version } => match ctx.api().contract_get(&name, version).map_err(render_api_error)? {
             Some(s) => {
@@ -1344,106 +910,30 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
 // role executions
 // ---------------------------------------------------------------------------
 
-/// REQ-SW-02/05: the CLI refusal shown BEFORE an attempt is made, when the
-/// task already carries a RUNNING execution. This is the labeled
-/// application-level check; the ENFORCEMENT point stays the SQLite partial
-/// unique index (spec A-5 — a pre-check never replaces the index, and a
-/// race between this read and the INSERT still lands on
-/// `StoreError::SingleWriterBusy`). The refusal is distinct per ratified
-/// liveness class (OQ-3/OQ-5): a LIVE writer means the one-writer invariant
-/// fired; a DEAD owner is an orphan only a human resolves; an owner that
-/// cannot be checked renders as-is, never as dead. The only resolution is
-/// closing the row with `exec finish|fail|cancel` — the process itself is
-/// never touched (REQ-SW-06).
-fn running_writer_guard(ctx: &Ctx, task: &Task) -> Result<()> {
-    let blocker = ctx.store.list_executions(Some(task.id))?.into_iter().find(|e| e.status == ExecutionStatus::Running);
-    let Some(e) = blocker else { return Ok(()) };
-    let owner = match (e.owner_pid, e.owner_host.as_deref()) {
-        (Some(pid), Some(host)) => format!("pid {pid}@{host}"),
-        (Some(pid), None) => format!("pid {pid} (host unrecorded)"),
-        (None, _) => "owner unrecorded (row predates the v7 guard)".to_string(),
-    };
-    let verdict = match liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start) {
-        liveness::Liveness::Alive => format!("a LIVE writer is in flight ({owner}) — wait for it to finish, or stop it explicitly"),
-        liveness::Liveness::Dead => format!("an ORPHAN ({owner} is no longer running) — nobody is collecting this writer's work"),
-        liveness::Liveness::Unknown => format!("a writer whose owner cannot be verified ({owner}) — never assumed dead"),
-    };
-    bail!(
-        "single-writer guard: task `{}` already has a RUNNING execution `{}` — {} ({}). \
-         The second writer is refused by design: no queueing, no overwrite. \
-         Resolve the open row first (a human decision, the process is not touched): \
-         `devai exec finish|fail|cancel {}`",
-        task.id, e.id, verdict, short(&e.id), e.id
-    )
-}
-
 fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
         ExecCmd::Start { id, role, agent, inputs } => {
-            let task = ctx.store.resolve_task(&id)?;
-            workflow::check_execution_allowed(&role, &task).map_err(anyhow::Error::new)?;
-            // REQ-SW-02 AC2 (CLI path): refuse the second RUNNING row with
-            // the blocking id named, before the index would reject it.
-            running_writer_guard(ctx, &task)?;
-            let rd = ctx.store.get_role(&role)?;
-            let version = rd.as_ref().map(|r| r.version).unwrap_or(1);
-            let inputs_str: Vec<String> = resolve_ids(ctx, &inputs)?.iter().map(|i| i.to_string()).collect();
-            // REQ-001/REQ-006: even a manually started execution binds to the
-            // workspace state the platform can observe right now (cwd),
-            // computed platform-side — never supplied by the caller.
-            let revision = Engine::new(&ctx.store).current_revision().map_err(anyhow::Error::new)?;
-            // REQ-SW-03: the owner columns are captured platform-side, the
-            // same way as the revision — this CLI process is the one
-            // OPENING the row. When it exits and the row is still RUNNING,
-            // the orphan detect (REQ-SW-04) will find exactly that.
-            let (owner_pid, owner_host, owner_process_start) = liveness::current_owner().into_columns();
-            let e = RoleExecution {
-                id: new_id(),
-                task_id: task.id,
-                role_slug: role.clone(),
-                role_version: version,
-                agent_name: agent,
-                status: ExecutionStatus::Running,
-                inputs: inputs_str,
-                summary: None,
-                error: None,
-                started_at: ctx.now(),
-                finished_at: None,
-                workspace_revision: Some(revision),
-                // A manual start is its own root attempt (REQ-FG-06).
-                attempt: 1,
-                parent_execution: None,
-                failure_class: None,
-                owner_pid,
-                owner_host,
-                owner_process_start,
-            };
-            ctx.store.start_execution(&e)?;
-            outln!("execution {} for role {role}@{version} started in state {}", short(&e.id), task.state.as_str());
-            outln!("publish its output artifact with: devai artifact publish {} --execution {}", short(&task.id), short(&e.id));
+            // The API `exec.start` operation validates the role/stage
+            // matrix, runs the labeled single-writer refusal (REQ-SW-02
+            // AC2 — the enforcement point stays the store index), computes
+            // the workspace revision and the owner columns platform-side
+            // (REQ-001/REQ-006, REQ-SW-03) and opens the row as its own
+            // root attempt (REQ-FG-06) — exactly the path the CLI drove
+            // directly before cycle 2.
+            let s = ctx.api().exec_start(ExecStartReq { id, role, agent, inputs }).map_err(render_api_error)?;
+            outln!("execution {} for role {}@{} started in state {}", short(&s.execution.id), s.execution.role_slug, s.execution.role_version, s.task.state.as_str());
+            outln!("publish its output artifact with: devai artifact publish {} --execution {}", short(&s.task.id), short(&s.execution.id));
         }
         ExecCmd::Finish { exec_id, summary } => {
-            let e = ctx.store.get_execution(&exec_id)?;
-            if e.status != ExecutionStatus::Running {
-                bail!("execution {} is {}, not RUNNING", e.id, e.status.as_str());
-            }
-            ctx.store.finish_execution(&e, ExecutionStatus::Completed, summary.as_deref(), None, ctx.now())?;
+            let e = ctx.api().exec_finish(&exec_id, summary).map_err(render_api_error)?;
             outln!("execution {} completed", short(&e.id));
         }
         ExecCmd::Fail { exec_id, error } => {
-            let e = ctx.store.get_execution(&exec_id)?;
-            if e.status != ExecutionStatus::Running {
-                bail!("execution {} is {}, not RUNNING", e.id, e.status.as_str());
-            }
-            ctx.store.finish_execution(&e, ExecutionStatus::Failed, None, Some(&error), ctx.now())?;
+            let e = ctx.api().exec_fail(&exec_id, &error).map_err(render_api_error)?;
             outln!("execution {} failed (task workflow state unchanged; the stage may be retried)", short(&e.id));
         }
         ExecCmd::Cancel { exec_id } => {
-            let e = ctx.store.get_execution(&exec_id)?;
-            if e.status != ExecutionStatus::Running {
-                bail!("execution {} is {}, not RUNNING", e.id, e.status.as_str());
-            }
-            ctx.store.finish_execution(&e, ExecutionStatus::Cancelled, None, None, ctx.now())?;
+            let e = ctx.api().exec_cancel(&exec_id).map_err(render_api_error)?;
             outln!("execution {} cancelled (cooperative stop acknowledged)", short(&e.id));
         }
         ExecCmd::List { task } => {
@@ -1591,6 +1081,18 @@ fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Readable elapsed from a raw seconds count: `42s`, `3m 07s`, `2h 05m`.
+fn human_elapsed(total: i64) -> String {
+    let s = total.max(0);
+    if s >= 3600 {
+        format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // export / import
 // ---------------------------------------------------------------------------
@@ -1612,7 +1114,9 @@ fn export(ctx: &Ctx, id: &str, out: &Path, json: bool) -> Result<()> {
 }
 
 fn import(ctx: &Ctx, dir: &Path, json: bool) -> Result<()> {
-    let o = devai_store::bundle::import(&ctx.store, dir)?;
+    // (API import.bundle — the store side-effect moved behind the operation;
+    // single-CURRENT and single-writer invariants are enforced inside.)
+    let o = ctx.api().import_bundle(dir).map_err(render_api_error)?;
     if json {
         outln!("{}", serde_json::json!({"task_id": o.task_id.to_string(), "artifacts": o.imported_artifacts, "events": o.imported_events, "skipped_existing": o.skipped_existing}));
     } else if o.skipped_existing {
@@ -1627,56 +1131,85 @@ fn import(ctx: &Ctx, dir: &Path, json: bool) -> Result<()> {
 // helpers
 // ---------------------------------------------------------------------------
 
-/// Kinds that are derived from the approved requirements and should be
-/// marked STALE when requirements are revised.
-fn is_downstream_of_spec(kind: ArtifactKind) -> bool {
-    matches!(
-        kind,
-        ArtifactKind::ReviewReport
-            | ArtifactKind::ImplementationPlan
-            | ArtifactKind::ImplementationReport
-            | ArtifactKind::Patch
-            | ArtifactKind::TestReport
-            | ArtifactKind::QualityReport
-    )
-}
-
-/// The CURRENT requirements spec, if any — by status alone (REQ-005: the
-/// store pins at most one CURRENT per (task_id, kind) since schema v3).
-fn current_spec_id(arts: &[Artifact]) -> Option<Id> {
-    arts.iter()
-        .find(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current)
-        .map(|a| a.id)
-}
-
-fn resolve_ids(ctx: &Ctx, prefixes: &[String]) -> Result<Vec<Id>> {
-    let mut out = Vec::new();
-    for p in prefixes {
-        let a = ctx.store.get_artifact(p)?;
-        out.push(a.id);
+fn print_task(t: &Task) {
+    outln!("id:        {}", t.id);
+    outln!("title:     {}", t.title);
+    outln!("state:     {}{}", t.state.as_str(), t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default());
+    outln!("requirements: v{}", t.requirements_seq);
+    outln!("project:   {}", t.project_id.map(|i| short(&i)).unwrap_or_else(|| "-".into()));
+    outln!("lock:      {}", t.lock_version);
+    outln!("created:   {}  updated: {}", t.created_at.format("%Y-%m-%d %H:%M:%S"), t.updated_at.format("%Y-%m-%d %H:%M:%S"));
+    if !t.business_description.is_empty() {
+        outln!("business:  {}", ellipsis(&t.business_description, 200));
     }
-    Ok(out)
 }
 
-fn parse_verdict(s: &str) -> Result<Verdict> {
-    Ok(match s.to_ascii_lowercase().as_str() {
-        "approved" | "approve" | "pass" => Verdict::Approved,
-        "needs_revision" | "revision" | "changes" => Verdict::NeedsRevision,
-        "rejected" | "reject" => Verdict::Rejected,
-        "returned" | "return" => Verdict::Returned,
-        other => bail!("unknown verdict `{other}` (approved|needs_revision|rejected|returned)"),
-    })
-}
+/// `devai task progress <ID>` — pipeline position at a glance. The view data
+/// comes from the API task.progress operation (the machine-complete
+/// ProgressView); the renderer owns no state-machine knowledge of its own:
+/// the spine order, position/re-entry and the running-execution snapshot are
+/// computed in the API layer from `workflow::pipeline_*` / `allowed_ops` /
+/// `store.list_executions`, change the engine's op set and the view follows.
+fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    let v = ctx.api().task_progress(id).map_err(render_api_error)?;
 
-pub(crate) fn short(id: &Uuid) -> String {
-    // The canonical width + rationale live in devai_core::types::ID_PREFIX_CHARS
-    // (single source, shared with devai-api — R1 QA no-magic).
-    devai_core::types::short_id(id)
-}
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
 
-/// Display-short of an id that already arrives as a string (API views).
-pub(crate) fn short_str(id: &str) -> String {
-    devai_core::types::short_id_str(id)
+    let t = &v.task;
+    let ops = &v.allowed_operations;
+    let order = &v.pipeline.order;
+    let pos_idx = v.pipeline.position_index;
+    let running: Vec<_> = v.running_executions.iter().collect();
+
+    outln!("id:    {}", t.id);
+    outln!("title: {}", t.title);
+    outln!(
+        "state: {}{}",
+        t.state.as_str(),
+        t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default()
+    );
+    let mut nodes = Vec::with_capacity(order.len());
+    for (i, name) in order.iter().enumerate() {
+        if Some(i) == pos_idx && !t.state.is_terminal() {
+            nodes.push(format!("[{name}]"));
+        } else if pos_idx.is_some_and(|p| p > i) {
+            nodes.push(format!("✓ {name}"));
+        } else {
+            nodes.push(name.clone());
+        }
+    }
+    outln!("pipeline: {}", nodes.join(" → "));
+    if t.state.is_terminal() {
+        outln!("cycle ended in {} — terminal state, no open pipeline step", t.state.as_str());
+    } else if v.pipeline.off_spine {
+        // REWORK loop / hold state: the bracket marks where it re-enters.
+        match v.pipeline.position.as_deref() {
+            Some(p) => outln!("note:  {} is off the spine — it returns to [{}]", t.state.as_str(), p),
+            None => outln!("note:  {} holds no remembered stage (state corruption — check `devai task events`)", t.state.as_str()),
+        }
+    }
+    outln!("---");
+    outln!("running executions:");
+    if running.is_empty() {
+        outln!("  (no running executions)");
+    } else {
+        for e in &running {
+            outln!(
+                "  {:<24} {:<12} elapsed {}",
+                format!("{}@{}", e.role_slug, e.role_version),
+                short_str(&e.id),
+                human_elapsed(e.elapsed_seconds)
+            );
+        }
+    }
+    outln!(
+        "allowed operations: {}",
+        if ops.is_empty() { "(none — task is terminal)".to_string() } else { ops.join(" | ") }
+    );
+    Ok(())
 }
 
 fn ellipsis(s: &str, n: usize) -> String {
@@ -1694,4 +1227,15 @@ fn compact(v: &serde_json::Value) -> String {
         other => other.to_string(),
     };
     ellipsis(&s, 120)
+}
+
+pub(crate) fn short(id: &Uuid) -> String {
+    // The canonical width + rationale live in devai_core::types::ID_PREFIX_CHARS
+    // (single source, shared with devai-api — R1 QA no-magic).
+    devai_core::types::short_id(id)
+}
+
+/// Display-short of an id that already arrives as a string (API views).
+pub(crate) fn short_str(id: &str) -> String {
+    devai_core::types::short_id_str(id)
 }

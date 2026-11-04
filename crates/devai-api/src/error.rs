@@ -38,6 +38,32 @@ pub enum ApiError {
     NotUtf8,
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// Cycle 2 (REQ-MUT-01/08): a domain refusal raised by a mutation
+    /// operation. The message carries the operator-facing text the CLI
+    /// printed before the API owned this path (output parity, REQ-MUT-06);
+    /// `code` is the machine token a second consumer branches on. A consumer
+    /// that formats its own text reads `code` + the structured fields and
+    /// never has to parse the message.
+    #[error("{message}")]
+    Refused { code: ErrorCode, message: String },
+    /// The manual publish contract gate: the named contract is not
+    /// registered in this store (the same refusal the pre-API CLI path
+    /// printed).
+    #[error("contract {contract} is not registered (devai contract add)")]
+    ContractUnregistered { contract: String },
+    /// The manual publish contract gate (ratified OQ-FG-05): the artifact
+    /// violates the registered contract. `violations` is the FULL machine
+    /// list — the presentation (warning per violation, then the refusal)
+    /// belongs to the consumer, enforcement to the API.
+    #[error("artifact does not satisfy contract {contract}: {violations:?}")]
+    ContractRejected { contract: String, violations: Vec<String> },
+}
+
+impl ApiError {
+    /// Internal constructor for the mutation surface's domain refusals.
+    pub(crate) fn refused(code: &'static str, message: impl Into<String>) -> ApiError {
+        ApiError::Refused { code: ErrorCode(code), message: message.into() }
+    }
 }
 
 fn store_code(e: &StoreError) -> ErrorCode {
@@ -124,6 +150,9 @@ impl ApiError {
             Self::BadRequest(..) => ErrorCode("bad_request"),
             Self::NotUtf8 => ErrorCode("not_utf8"),
             Self::Io(..) => ErrorCode("io"),
+            Self::Refused { code, .. } => *code,
+            Self::ContractUnregistered { .. } => ErrorCode("contract_unregistered"),
+            Self::ContractRejected { .. } => ErrorCode("contract_violation"),
         }
     }
 }
@@ -184,5 +213,22 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), distinct_expected.len(), "codes drift or collide");
+    }
+
+    #[test]
+    fn mutation_plane_refusals_carry_own_code_and_parity_text() {
+        // Cycle 2 (REQ-MUT-01/08): a domain refusal keeps the exact
+        // operator-facing text AND a machine token of its own.
+        let e = ApiError::refused("execution_not_running", "execution x is COMPLETED, not RUNNING");
+        assert_eq!(e.code(), ErrorCode("execution_not_running"));
+        assert_eq!(format!("{e}"), "execution x is COMPLETED, not RUNNING");
+        // The contract-gate family renders the same sentences the pre-API
+        // CLI path bailed with (parity, REQ-MUT-06).
+        let e = ApiError::ContractRejected { contract: "c@1".into(), violations: vec!["$.a".into()] };
+        assert_eq!(e.code(), ErrorCode("contract_violation"));
+        assert_eq!(format!("{e}"), "artifact does not satisfy contract c@1: [\"$.a\"]");
+        let e = ApiError::ContractUnregistered { contract: "c@1".into() };
+        assert_eq!(e.code(), ErrorCode("contract_unregistered"));
+        assert_eq!(format!("{e}"), "contract c@1 is not registered (devai contract add)");
     }
 }
