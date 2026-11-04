@@ -55,6 +55,10 @@ enum Cmd {
     Contract(ContractCmd),
     #[command(subcommand)]
     Exec(ExecCmd),
+    /// The published API operation registry — the contract every consumer
+    /// (CLI first) is built on. Read-only, machine-complete.
+    #[command(subcommand)]
+    Api(ApiCmd),
     /// Export a task bundle for portability (domain data + artifacts, no caches)
     Export {
         #[arg(long)]
@@ -252,6 +256,12 @@ enum TaskCmd {
         id: String,
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Decision rows recorded for the task (requirements approvals,
+    /// dependency overrides, gate ratifications, merges) — the human acts
+    /// as data, through the API task.decisions operation
+    Decisions {
+        id: String,
     },
     /// Register a typed task dependency: 'parent' ("породила" — why this
     /// task exists, pure genealogy, never gates — approved OQ3) or 'blocks'
@@ -458,6 +468,25 @@ enum ExecCmd {
         #[arg(long)]
         task: Option<String>,
     },
+    /// One execution row by id/prefix — observable without the launching
+    /// terminal (REQ-API-07, via the API exec.get operation)
+    Get {
+        exec_id: String,
+    },
+    /// Liveness of the recorded owner of an execution: alive | dead |
+    /// unknown — orphans distinguishable by stored data, not pgrep
+    /// (REQ-API-07 AC3, via the API exec.liveness operation; read-only,
+    /// never signals the process)
+    Liveness {
+        exec_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiCmd {
+    /// Print the published operation registry: every API operation with its
+    /// typed input/output shapes and textual semantics (REQ-API-06).
+    Registry,
 }
 
 fn main() {

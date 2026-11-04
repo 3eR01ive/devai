@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -10,7 +9,8 @@ use devai_store::{ArtifactDraft, Store, guess_media_type};
 use uuid::Uuid;
 
 use crate::outln;
-use crate::{ArtifactCmd, AgentCmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd, TaskCmd, Cmd};
+use crate::{ApiCmd, ArtifactCmd, AgentCmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd, TaskCmd, Cmd};
+use devai_api::Api;
 use devai_store::seed;
 
 pub struct Ctx {
@@ -29,8 +29,20 @@ impl Ctx {
             }
         };
         let actor = actor.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+        // REQ-API-03 C2: Store::open here is the BOOTSTRAP entry point — the
+        // home directory is opened before any operation runs. It is not an
+        // operation path: every command dispatches through `Ctx::api` below.
         let store = Store::open(&dir).context("open local store")?;
         Ok(Ctx { home: dir, actor, store })
+    }
+
+    /// The platform API surface this CLI consumes as its first consumer
+    /// (REQ-API-03, ratified OQ-1: in-process crate). Commands routed through
+    /// it call typed operations here; direct `ctx.store` reads are the
+    /// RATIFIED OQ-10 exception (init/seed bootstrap) and the cycle-2
+    /// mutation paths pending migration (REQ-API-11) — marked at each site.
+    pub fn api(&self) -> Api<'_> {
+        Api::new(&self.store, &self.home, &self.actor)
     }
 
     fn now(&self) -> Timestamp {
@@ -38,8 +50,21 @@ impl Ctx {
     }
 }
 
+/// Render an API error the way the CLI rendered the store error before the
+/// API layer existed: `devai: <message>` on stderr, nonzero exit
+/// (REQ-API-04 AC2 — an API failure is an explicit message, never an empty
+/// or truncated output). `ApiError` Display forwards the inner text, so the
+/// human-visible message is byte-identical to the pre-API path.
+pub fn render_api_error(e: devai_api::ApiError) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
 pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
     match cmd {
+        // RATIFIED OQ-10 EXCEPTION (REQ-API-05 AC3, marked per AC2):
+        // init/seed keep the direct store path — bootstrap runs against a
+        // home that may not exist yet and cannot be expressed through the
+        // API. The pair stays together by ratification.
         Cmd::Init { config } => init(ctx, config.as_deref(), json),
         Cmd::Project(c) => project(ctx, c, json),
         Cmd::Task(c) => task(ctx, c, json),
@@ -49,9 +74,36 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
         Cmd::Agent(c) => agent(ctx, c, json),
         Cmd::Contract(c) => contract(ctx, c, json),
         Cmd::Exec(c) => exec(ctx, c, json),
+        Cmd::Api(c) => api_registry(ctx, c, json),
         Cmd::Export { task, out } => export(ctx, &task, &out, json),
         Cmd::Import { dir } => import(ctx, &dir, json),
     }
+}
+
+// ---------------------------------------------------------------------------
+// api registry (REQ-API-06 AC4: the published contract, one command)
+// ---------------------------------------------------------------------------
+
+fn api_registry(ctx: &Ctx, cmd: ApiCmd, json: bool) -> Result<()> {
+    match cmd {
+        ApiCmd::Registry => {
+            let ops = ctx.api().api_registry();
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&ops)?);
+            } else {
+                for o in &ops {
+                    let class = match o.class {
+                        devai_api::OpClass::Read => "read",
+                        devai_api::OpClass::Mutation => "mutation",
+                    };
+                    outln!("{}  [{class}]  in={}  out={}", o.name, o.input, o.output);
+                    outln!("    {}", o.description);
+                }
+                outln!("--- {} operations published (RATIFIED OQ-10 init/seed stay a direct-store bootstrap exception, not API operations)", ops.len());
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +151,7 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
             outln!("project {} ({})", p.name, short(&p.id));
         }
         ProjectCmd::List => {
-            let ps = ctx.store.list_projects()?;
+            let ps = ctx.api().project_list().map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&ps)?);
             } else if ps.is_empty() {
@@ -110,7 +162,7 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
                 }
             }
         }
-        ProjectCmd::Get { id } => match ctx.store.get_project(&id)? {
+        ProjectCmd::Get { id } => match ctx.api().project_get(&id).map_err(render_api_error)? {
             Some(p) => {
                 if json {
                     outln!("{}", serde_json::to_string_pretty(&p)?);
@@ -133,6 +185,9 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
 // task
 // ---------------------------------------------------------------------------
 
+/// Cycle-2 mark (REQ-API-11): handlers whose READ facts below still resolve
+/// the task through `ctx.store` carry a CYCLE-2 PENDING comment; every pure
+/// read path routes through `ctx.api()` (REQ-API-03 AC1 for the read plane).
 fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
         TaskCmd::New { title, project, description, description_file, parent, blocked_by } => {
@@ -170,7 +225,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             }
         }
         TaskCmd::List => {
-            let ts = ctx.store.list_tasks()?;
+            let ts = ctx.api().task_list().map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&ts)?);
             } else if ts.is_empty() {
@@ -182,7 +237,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             }
         }
         TaskCmd::Get { id } => {
-            let t = ctx.store.resolve_task(&id)?;
+            let t = ctx.api().task_get(&id).map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&t)?);
             } else {
@@ -270,13 +325,29 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Cancel { id, reason } => op(ctx, &id, move |t, _a| workflow::cancel(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Fail { id, reason } => op(ctx, &id, move |t, _a| workflow::fail(t, reason.as_deref(), &ctx.actor, ctx.now()))?,
         TaskCmd::Events { id, limit } => {
-            let t = ctx.store.resolve_task(&id)?;
-            let evs = ctx.store.events(t.id, limit)?;
+            let evs = ctx.api().task_events(&id, limit).map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&evs)?);
             } else {
                 for e in evs {
                     outln!("{}  {:<28} {:<12} {}", e.created_at.format("%Y-%m-%d %H:%M:%S"), e.kind, e.actor, compact(&e.payload));
+                }
+            }
+        }
+        TaskCmd::Decisions { id } => {
+            // New CLI surface over the API task.decisions read: the human
+            // decision rows as data, available to any consumer.
+            let ds = ctx.api().task_decisions(&id).map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&ds)?);
+            } else if ds.is_empty() {
+                outln!("(no decisions)");
+            } else {
+                for d in ds {
+                    outln!("{}  {:<26} {:<10} by {}  {}", d.created_at.format("%Y-%m-%d %H:%M:%S"), d.kind, d.verdict.as_str(), d.actor, d.rationale.map(|s| ellipsis(&s, 100)).unwrap_or_default());
+                    if !d.refs.is_empty() {
+                        outln!("    refs: {}", d.refs.join(", "));
+                    }
                 }
             }
         }
@@ -298,9 +369,10 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             }
         }
         TaskCmd::Dependencies { id } => {
-            let t = ctx.store.resolve_task(&id)?;
-            let outgoing = ctx.store.task_dependencies(t.id)?;
-            let incoming = ctx.store.incoming_dependencies(t.id)?;
+            let v = ctx.api().task_dependencies(&id).map_err(render_api_error)?;
+            let t = v.task;
+            let outgoing = v.outgoing;
+            let incoming = v.incoming;
             if json {
                 outln!("{}", serde_json::json!({"task": t.id.to_string(), "outgoing": outgoing, "incoming": incoming}));
             } else {
@@ -393,7 +465,8 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // VIEW over the same stored graph — epic = a task vertex with no
             // outgoing ACTIVE 'parent' edge and at least one incoming one,
             // derived by one dependency-table query. No epic entity exists.
-            let epics = ctx.store.epic_heads()?;
+            // (API task.epics read.)
+            let epics = ctx.api().task_epics().map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&epics)?);
             } else {
@@ -414,14 +487,11 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // by `task epics`; the READY mark below is blocker-purity (an
             // operator override releases the GATE, not the readiness view —
             // the blockers stay open until the blocker is ACCEPTED, OQ1).
-            let nodes = ctx.store.dependency_graph()?;
+            // (API task.graph read.)
+            let gv = ctx.api().task_graph().map_err(render_api_error)?;
+            let nodes = gv.graph;
             if json {
-                let ready: Vec<String> = nodes
-                    .iter()
-                    .filter(|n| !n.task.state.is_terminal() && workflow::open_blockers(&n.task, &n.dependencies).is_empty())
-                    .map(|n| n.task.id.to_string())
-                    .collect();
-                outln!("{}", serde_json::json!({"graph": nodes, "ready": ready}));
+                outln!("{}", serde_json::json!({"graph": nodes, "ready": gv.ready}));
             } else {
                 for n in &nodes {
                     let blockers = workflow::open_blockers(&n.task, &n.dependencies);
@@ -770,51 +840,26 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
 /// that must be signed must also be readable — after the run printed it, on
 /// demand, forever (history is never deleted; only CURRENT is shown).
 fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
-    let t = ctx.store.resolve_task(id)?;
-    let arts = ctx.store.artifacts(t.id)?;
-    // REQ-005: the CURRENT quality report is found by status alone — the
-    // domain keeps at most one CURRENT per (task_id, kind), so there is no
-    // seq tie-break to do here (the old highest-seq selection masked
-    // multi-CURRENT corruption at the UI instead of letting it surface as
-    // a domain bug).
-    let a = arts
-        .iter()
-        .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
-        .with_context(|| format!("no quality report for {} yet — QA has not run", short(&t.id)))?;
-    let blob = ctx.store.read_blob(&a.sha256)?;
-    let contract = a
-        .contract
-        .as_ref()
-        .map(|c| format!("{}@{}", c.name, c.version))
-        .unwrap_or_else(|| "—".into());
-    let value: serde_json::Value = serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
+    // (API task.report read — QualityReportView is the machine-complete
+    // form; REQ-005 CURRENT-by-status selection lives in the API layer.)
+    let v = ctx.api().task_report(id).map_err(render_api_error)?;
     if json {
-        outln!(
-            "{}",
-            serde_json::json!({
-                "task": t.id.to_string(),
-                "artifact": a.id.to_string(),
-                "seq": a.seq,
-                "contract": contract,
-                "created_at": a.created_at,
-                "execution": a.execution_id.map(|e| e.to_string()),
-                "report": value,
-            })
-        );
+        outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
     outln!(
-        "quality report v{}  artifact {}  contract {contract}  execution {}",
-        a.seq,
-        short(&a.id),
-        a.execution_id.map(|e| short(&e)).unwrap_or_else(|| "-".into())
+        "quality report v{}  artifact {}  contract {}  execution {}",
+        v.seq,
+        short_str(&v.artifact),
+        v.contract,
+        v.execution.as_deref().map(short_str).unwrap_or_else(|| "-".to_string())
     );
     outln!("---");
-    match value.get("report_text").and_then(|s| s.as_str()) {
+    match v.report_text {
         Some(text) => outln!("{text}"),
         // Reports assembled before @2 carry no rendering: show the machine
         // JSON rather than pretend there is nothing to read.
-        None => outln!("{}", serde_json::to_string_pretty(&value).unwrap_or_else(|_| String::from_utf8_lossy(&blob).into_owned())),
+        None => outln!("{}", serde_json::to_string_pretty(&v.report).unwrap_or_default()),
     }
     Ok(())
 }
@@ -855,12 +900,12 @@ fn revise(ctx: &Ctx, id: &str, file: &Path, reason: Option<&str>) -> Result<()> 
 }
 
 fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
-    let t = ctx.store.resolve_task(id)?;
-    let artifacts = ctx.store.artifacts(t.id)?;
-    let questions = ctx.store.list_questions(t.id)?;
-    let open_q: Vec<_> = questions.iter().filter(|q| q.status == QuestionStatus::Open).collect();
-    let current: Vec<_> = artifacts.iter().filter(|a| a.status == ArtifactStatus::Current).collect();
-    let ops = workflow::allowed_ops(&t);
+    // (API task.status read — StatusView is the machine-complete form.)
+    let v = ctx.api().task_status(id).map_err(render_api_error)?;
+    let t = v.task;
+    let ops: Vec<String> = v.allowed_operations;
+    let current: Vec<Artifact> = v.current_artifacts;
+    let open_q: Vec<Question> = v.open_questions;
     if json {
         outln!(
             "{}",
@@ -902,58 +947,25 @@ fn print_task(t: &Task) {
     }
 }
 
-/// `devai task progress <ID>` — pipeline position at a glance. The view is
-/// drawn purely from engine data (REQ-PROG-03): the spine order and the
-/// position/re-entry come from `workflow::pipeline_*`, the operations from
-/// `workflow::allowed_ops`, the running executions from
-/// `store.list_executions`. The renderer owns no state-machine knowledge of
-/// its own: change the engine's op set and the progress view changes with it.
+/// `devai task progress <ID>` — pipeline position at a glance. The view data
+/// comes from the API task.progress operation (the machine-complete
+/// ProgressView); the renderer owns no state-machine knowledge of its own:
+/// the spine order, position/re-entry and the running-execution snapshot are
+/// computed in the API layer from `workflow::pipeline_*` / `allowed_ops` /
+/// `store.list_executions`, change the engine's op set and the view follows.
 fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
-    let t = ctx.store.resolve_task(id)?;
-    let ops = workflow::allowed_ops(&t);
-    let order = workflow::pipeline_order();
-    let position = workflow::pipeline_position(&t);
-    let pos_idx = position.and_then(|p| order.iter().position(|s| *s == p));
-    let off_spine = workflow::pipeline_off_spine(&t);
-    let now = ctx.now();
-    let running: Vec<_> = ctx
-        .store
-        .list_executions(Some(t.id))?
-        .into_iter()
-        .filter(|e| e.status == ExecutionStatus::Running)
-        .collect();
+    let v = ctx.api().task_progress(id).map_err(render_api_error)?;
 
     if json {
-        outln!(
-            "{}",
-            serde_json::json!({
-                "task": t,
-                "snapshot_at": now,
-                "pipeline": {
-                    "order": order.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                    "current": t.state.as_str(),
-                    "position": position.map(|s| s.as_str()),
-                    "position_index": pos_idx,
-                    "off_spine": off_spine,
-                    "terminal": t.state.is_terminal(),
-                },
-                "allowed_operations": ops,
-                "running_executions": running
-                    .iter()
-                    .map(|e| serde_json::json!({
-                        "id": e.id.to_string(),
-                        "role": format!("{}@{}", e.role_slug, e.role_version),
-                        "role_slug": e.role_slug,
-                        "role_version": e.role_version,
-                        "agent_name": e.agent_name,
-                        "started_at": e.started_at,
-                        "elapsed_seconds": (now - e.started_at).num_seconds().max(0),
-                    }))
-                    .collect::<Vec<_>>(),
-            })
-        );
+        outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
+
+    let t = &v.task;
+    let ops = &v.allowed_operations;
+    let order = &v.pipeline.order;
+    let pos_idx = v.pipeline.position_index;
+    let running: Vec<_> = v.running_executions.iter().collect();
 
     outln!("id:    {}", t.id);
     outln!("title: {}", t.title);
@@ -963,23 +975,22 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default()
     );
     let mut nodes = Vec::with_capacity(order.len());
-    for (i, s) in order.iter().enumerate() {
-        let name = s.as_str();
+    for (i, name) in order.iter().enumerate() {
         if Some(i) == pos_idx && !t.state.is_terminal() {
             nodes.push(format!("[{name}]"));
         } else if pos_idx.is_some_and(|p| p > i) {
             nodes.push(format!("✓ {name}"));
         } else {
-            nodes.push(name.to_string());
+            nodes.push(name.clone());
         }
     }
     outln!("pipeline: {}", nodes.join(" → "));
     if t.state.is_terminal() {
         outln!("cycle ended in {} — terminal state, no open pipeline step", t.state.as_str());
-    } else if off_spine {
+    } else if v.pipeline.off_spine {
         // REWORK loop / hold state: the bracket marks where it re-enters.
-        match position {
-            Some(p) => outln!("note:  {} is off the spine — it returns to [{}]", t.state.as_str(), p.as_str()),
+        match v.pipeline.position.as_deref() {
+            Some(p) => outln!("note:  {} is off the spine — it returns to [{}]", t.state.as_str(), p),
             None => outln!("note:  {} holds no remembered stage (state corruption — check `devai task events`)", t.state.as_str()),
         }
     }
@@ -992,8 +1003,8 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
             outln!(
                 "  {:<24} {:<12} elapsed {}",
                 format!("{}@{}", e.role_slug, e.role_version),
-                short(&e.id),
-                human_elapsed((now - e.started_at).num_seconds())
+                short_str(&e.id),
+                human_elapsed(e.elapsed_seconds)
             );
         }
     }
@@ -1105,8 +1116,8 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
             }
         }
         ArtifactCmd::List { id } => {
-            let t = ctx.store.resolve_task(&id)?;
-            let as_ = ctx.store.artifacts(t.id)?;
+            // (API artifact.list read.)
+            let as_ = ctx.api().artifact_list(&id).map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&as_)?);
             } else if as_.is_empty() {
@@ -1118,9 +1129,10 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
             }
         }
         ArtifactCmd::Cat { artifact_id } => {
-            let a = ctx.store.get_artifact(&artifact_id)?;
-            let bytes = ctx.store.read_blob(&a.sha256)?;
-            // Central raw-bytes path: a closed reader dies quietly (REQ-PIPE-01).
+            // (API artifact.bytes read — the raw stored content, identical
+            // bytes to the pre-API path; the central raw-bytes path stays a
+            // closed reader dies quietly (REQ-PIPE-01).)
+            let bytes = ctx.api().artifact_bytes(&artifact_id).map_err(render_api_error)?;
             crate::out::write_bytes_all(&bytes)?;
         }
     }
@@ -1224,8 +1236,8 @@ fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
             outln!("answer recorded; state: {} → {}", task.state.as_str(), m.task.state.as_str());
         }
         QuestionCmd::List { id } => {
-            let t = ctx.store.resolve_task(&id)?;
-            let qs = ctx.store.list_questions(t.id)?;
+            // (API question.list read.)
+            let qs = ctx.api().question_list(&id).map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&qs)?);
             } else if qs.is_empty() {
@@ -1261,7 +1273,8 @@ fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
             outln!("role {}@{} registered", r.slug, r.version);
         }
         RoleCmd::List => {
-            let rs = ctx.store.list_roles()?;
+            // (API role.list read.)
+            let rs = ctx.api().role_list().map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&rs)?);
             } else if rs.is_empty() {
@@ -1290,7 +1303,8 @@ fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
             outln!("agent {name} registered (credentials stay outside the store)");
         }
         AgentCmd::List => {
-            let as_ = ctx.store.list_agents()?;
+            // (API agent.list read.)
+            let as_ = ctx.api().agent_list().map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&as_)?);
             } else {
@@ -1311,7 +1325,7 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
             ctx.store.put_contract(&name, version, &schema)?;
             outln!("contract {name}@{version} registered");
         }
-        ContractCmd::Get { name, version } => match ctx.store.get_contract(&name, version)? {
+        ContractCmd::Get { name, version } => match ctx.api().contract_get(&name, version).map_err(render_api_error)? {
             Some(s) => {
                 if json {
                     outln!("{s}");
@@ -1433,11 +1447,8 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
             outln!("execution {} cancelled (cooperative stop acknowledged)", short(&e.id));
         }
         ExecCmd::List { task } => {
-            let tid = match task.as_deref() {
-                Some(id) => Some(ctx.store.resolve_task(id)?.id),
-                None => None,
-            };
-            let es = ctx.store.list_executions(tid)?;
+            // (API exec.list read.)
+            let es = ctx.api().exec_list(task.as_deref()).map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&es)?);
             } else if es.is_empty() {
@@ -1457,6 +1468,47 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                     outln!("{}  {:<22} {:<12} {:<10}{} {}", short(&e.id), e.role_slug, short(&e.task_id), e.status.as_str(), flags,
                         e.summary.as_deref().or(e.error.as_deref()).map(|s| ellipsis(s, 60)).unwrap_or_default());
                 }
+            }
+        }
+        ExecCmd::Get { exec_id } => {
+            // (API exec.get read: one execution row by id/prefix — a second
+            // consumer sees the same row the launching CLI saw, REQ-API-07 AC1.)
+            let e = ctx.api().exec_get(&exec_id).map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&e)?);
+            } else {
+                outln!("id:        {}", e.id);
+                outln!("task:      {}", e.task_id);
+                outln!("role:      {}@{}", e.role_slug, e.role_version);
+                outln!("agent:     {}", e.agent_name.as_deref().unwrap_or("-"));
+                outln!("status:    {}", e.status.as_str());
+                outln!("attempt:   {}", e.attempt);
+                outln!("started:   {}", e.started_at.format("%Y-%m-%d %H:%M:%S"));
+                if let Some(f) = e.finished_at {
+                    outln!("finished:  {}", f.format("%Y-%m-%d %H:%M:%S"));
+                }
+                if let Some(s) = &e.summary {
+                    outln!("summary:   {}", s);
+                }
+                if let Some(err) = &e.error {
+                    outln!("error:     {}", err);
+                }
+                if let Some(fc) = &e.failure_class {
+                    outln!("failure:   [{fc}]");
+                }
+            }
+        }
+        ExecCmd::Liveness { exec_id } => {
+            // (API exec.liveness read.) Read-only triage of the recorded
+            // owner: alive | dead | unknown — an orphan RUNNING row is
+            // distinguishable by stored data, not operator pgrep
+            // (REQ-API-07 AC3). Never signals the process (REQ-SW-06).
+            let v = ctx.api().exec_liveness(&exec_id).map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                outln!("execution {}  status {}  owner pid={:?} host={:?}  liveness: {}",
+                    v.id, v.status, v.owner_pid, v.owner_host, v.liveness);
             }
         }
     }
@@ -1490,93 +1542,24 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
 /// stays the single owner of that detail, so the row carries the short task
 /// id and no title (REQ-ACT-06; OQ-6 as ratified).
 fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
-    let now = ctx.now();
-    // REQ-ACT-01 AC1: this store, all tasks, no caller-side filtering.
-    let mut running: Vec<RoleExecution> = ctx
-        .store
-        .list_executions(None)?
-        .into_iter()
-        .filter(|e| e.status == ExecutionStatus::Running)
-        .collect();
-    // OQ-3 (ratified): elapsed desc = started_at asc; the id tie-break keeps
-    // two snapshots of an unchanged state identical (REQ-ACT-04 AC3).
-    running.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
-
-    // Engine facts per distinct task, resolved once: the live task row (for
-    // the stage and terminality — via resolve_task, REQ-ACT-02 AC3) and
-    // whether the platform ever recorded `worktree.prepared`, the only
-    // honest source for the worktree link, since a RUNNING execution row
-    // does not carry it.
-    let mut facts: HashMap<Id, (Task, bool)> = HashMap::new();
-    for e in &running {
-        if !facts.contains_key(&e.task_id) {
-            let t = ctx.store.resolve_task(&e.task_id.to_string())?;
-            let prepared = ctx
-                .store
-                .all_events_for_task(t.id)?
-                .iter()
-                .any(|ev| ev.kind == event_kind::WORKTREE_PREPARED);
-            facts.insert(e.task_id, (t, prepared));
-        }
-    }
-
-    // One liveness observation per row, computed ONCE for the snapshot
-    // (json and text render the same answer; the OS is not consulted
-    // twice). Read-only: REQ-SW-06 — detection never writes and never
-    // signals a process.
-    let checked: Vec<(Id, liveness::Liveness)> = running
-        .iter()
-        .map(|e| (e.id, liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start)))
-        .collect();
-    let live_of = |id: Id| checked.iter().find(|(i, _)| *i == id).map(|(_, l)| *l).unwrap_or(liveness::Liveness::Unknown);
-
-    let rows: Vec<serde_json::Value> = running
-        .iter()
-        .map(|e| {
-            let (t, prepared) = &facts[&e.task_id];
-            // REQ-SW-04 AC1: stale = terminal task OR dead owner — the two
-            // ratified signals stay separately visible (OQ-5: additive, not
-            // a replacement): the terminal mark keeps its exact meaning,
-            // the orphan is a new cause beside it. `owner_liveness` is the
-            // triage surface for everything not provable (OQ-3: a foreign
-            // host renders as-is, never dead).
-            let liveness_row = live_of(e.id);
-            let terminal = t.state.is_terminal();
-            serde_json::json!({
-                "id": e.id.to_string(),
-                "task_id": e.task_id.to_string(),
-                "role": format!("{}@{}", e.role_slug, e.role_version),
-                "role_slug": e.role_slug,
-                "role_version": e.role_version,
-                "agent_name": e.agent_name,
-                "started_at": e.started_at,
-                "elapsed_seconds": (now - e.started_at).num_seconds().max(0),
-                "state": t.state.as_str(),
-                "stale": terminal || liveness_row == liveness::Liveness::Dead,
-                "stale_terminal_task": terminal,
-                "stale_dead_owner": liveness_row == liveness::Liveness::Dead,
-                "owner_pid": e.owner_pid,
-                "owner_host": e.owner_host,
-                "owner_liveness": liveness_row.as_str(),
-                "branch": prepared.then(|| worktree::branch_name(e.task_id)),
-                "worktree": prepared.then(|| worktree::path_for(&ctx.home, e.task_id).display().to_string()),
-            })
-        })
-        .collect();
+    // (API task.active read — ActiveSnapshot is the machine-complete form:
+    // REQ-ACT-01 AC1 this store, all tasks; OQ-3 ordering and the one
+    // liveness observation per row live in the API layer. Read-only:
+    // REQ-SW-06 — detection never writes and never signals a process.)
+    let snap = ctx.api().task_active().map_err(render_api_error)?;
 
     if json {
         // REQ-ACT-03 / OQ-4 (ratified): exactly one JSON object on stdout —
         // snapshot_at and a flat list of RUNNING rows, nothing before or
         // after: early return, the progress-view precedent.
-        outln!("{}", serde_json::json!({"snapshot_at": now, "rows": rows}));
+        outln!("{}", serde_json::to_string_pretty(&snap)?);
         return Ok(());
     }
-    if rows.is_empty() {
+    if snap.rows.is_empty() {
         outln!("(no running executions)");
         return Ok(());
     }
-    for e in &running {
-        let (t, prepared) = &facts[&e.task_id];
+    for e in &snap.rows {
         // OQ-6 (ratified): the row carries short task id, role@version,
         // elapsed and stage — never the title (it is one `task progress <id>`
         // away); the worktree link only on the platform fact. The trailing
@@ -1584,25 +1567,23 @@ fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
         // this view always had) OR provably-dead owner (orphan). A row whose
         // owner cannot be checked gets the separate `owner?` triage mark —
         // never `stale?`, never assumed dead (OQ-3).
-        let link = if *prepared {
-            format!("{}  {}", worktree::branch_name(e.task_id), worktree::path_for(&ctx.home, e.task_id).display())
-        } else {
-            "—".to_string()
+        let link = match (&e.branch, &e.worktree) {
+            (Some(b), Some(w)) => format!("{b}  {w}"),
+            _ => "—".to_string(),
         };
-        let live = live_of(e.id);
-        let stale = if t.state.is_terminal() || live == liveness::Liveness::Dead {
+        let stale = if e.stale {
             "  stale?"
-        } else if live == liveness::Liveness::Unknown {
+        } else if e.owner_liveness == "unknown" {
             "  owner?"
         } else {
             ""
         };
         outln!(
             "  {:<12} {:<24} {:<16} {:<13} {}{}",
-            short(&e.task_id),
+            short_str(&e.task_id),
             format!("{}@{}", e.role_slug, e.role_version),
-            t.state.as_str(),
-            format!("elapsed {}", human_elapsed((now - e.started_at).num_seconds())),
+            e.state,
+            format!("elapsed {}", human_elapsed(e.elapsed_seconds)),
             link,
             stale,
         );
@@ -1615,8 +1596,9 @@ fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn export(ctx: &Ctx, id: &str, out: &Path, json: bool) -> Result<()> {
-    let t = ctx.store.resolve_task(id)?;
-    let manifest = devai_store::bundle::export(&ctx.store, &t, out)?;
+    // (API export.bundle — the same bundle path over the same store:
+    // identical data and artifact version identity via the API, REQ-API-02 AC3.)
+    let manifest = ctx.api().export_bundle(id, out).map_err(render_api_error)?;
     if json {
         outln!("{}", serde_json::to_string_pretty(&manifest)?);
     } else {
@@ -1692,6 +1674,11 @@ pub(crate) fn short(id: &Uuid) -> String {
     // the display compact while remaining practically unique; resolve_task
     // still fails loudly on any genuine ambiguity (never silently overwrites).
     id.to_string()[..12].to_string()
+}
+
+/// Display-short of an id that already arrives as a string (API views).
+pub(crate) fn short_str(id: &str) -> String {
+    id[..12.min(id.len())].to_string()
 }
 
 fn ellipsis(s: &str, n: usize) -> String {

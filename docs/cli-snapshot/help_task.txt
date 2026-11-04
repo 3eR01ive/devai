@@ -24,6 +24,7 @@ Commands:
   cancel               
   fail                 Record a runtime failure (task parks in FAILED; `resume` retries)
   events               Show immutable event history
+  decisions            Decision rows recorded for the task (requirements approvals, dependency overrides, gate ratifications, merges) — the human acts as data, through the API task.decisions operation
   depend               Register a typed task dependency: 'parent' ("породила" — why this task exists, pure genealogy, never gates — approved OQ3) or 'blocks' ("не может продолжиться без той" — resume and acceptance refused while open; closed only when the blocker is ACCEPTED, approved OQ1). Works at creation (--parent / --blocked-by) and retroactively, from either moment (REQ-DEP-07). Cycles are rejected WITHIN each kind (approved OQ4); a mixed parent↔blocks cycle is legal
   dependencies         Typed dependencies of one task: what it depends on (outgoing) and what depends on it (incoming), ACTIVE edges only. An epic is not a separate entity — per the ratified OQ8 the epic VERTEX (no outgoing 'parent', incoming ones) reads out of this same dependency view (REQ-DEP-06); `task epics` lists the whole registry
   unlink               Supersede (the approved removal, OQ7: edges are immutable) an ACTIVE dependency edge. The row stays in the store as SUPERSEDED history with full attribution; the live graph stops seeing it, so a gate it held opens and the same relation may be re-registered fresh

@@ -196,12 +196,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "devai-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "devai-core",
+ "devai-runtime",
+ "devai-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "devai-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "devai-api",
  "devai-core",
  "devai-runtime",
  "devai-store",
