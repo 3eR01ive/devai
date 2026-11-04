@@ -8,5 +8,5 @@ instructions: >-
   замечания.
 done_criteria: Review Report опубликован с вердиктом APPROVED или NEEDS_REVISION
 tools: ["filesystem:read", "api:project-knowledge"]
-input_contract: requirements-specification@1
+input_contract: requirements-specification@2
 output_contract: review-report@1

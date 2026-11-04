@@ -1,4 +1,4 @@
--- Devai local store schema (v4).
+-- Devai local store schema (v6).
 -- SQLite is the local system of record; everything is domain data so a task
 -- can be restored after a restart and exported for portability.
 -- v2 adds workspace provenance: role_executions.workspace_revision and the
@@ -24,6 +24,15 @@
 -- inert here: fresh rows carry UUIDv7 ids, the predicate selects v5 only).
 -- (Renumbered 004→005 at integration: the dependency graph took 004 in
 -- main first — the ladder is per-rung data, renumbering is a merge act.)
+-- v6 makes the response-form correction loop ROW DATA (OQ-FG-06, REQ-FG-01):
+-- role_executions gains `attempt` (1-based counter inside one role stage's
+-- loop), `parent_execution` (lineage to the first attempt row) and
+-- `failure_class` (response_form | provider | platform — form-vs-content is
+-- answerable WITHOUT parsing error text). Existing v5 databases gain them via
+-- migrations/006_role_execution_form_attempts.sql; pre-loop rows read as
+-- attempt=1, NULL parent, NULL class.
+-- (Renumbered 005→006 at integration: the decisions backfill took 005 in
+-- main first — same merge-act precedent as 004→005 before it.)
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -154,7 +163,14 @@ CREATE TABLE role_executions(
   -- Workspace provenance captured platform-side at execution start (JSON:
   -- git_head, dirty_digest, profile name@version, roles slug@version).
   -- Append-only: rows written before v2 keep NULL; nothing is rewritten.
-  workspace_revision TEXT NULL
+  workspace_revision TEXT NULL,
+  -- Response-form correction loop (v6): attempt counter inside one role
+  -- stage's loop, lineage to the first attempt row, and the failure class
+  -- vocabulary. Rows written before v6 read as a single attempt, no parent,
+  -- no class — the loop never rewrites history.
+  attempt            INTEGER NOT NULL DEFAULT 1,
+  parent_execution   TEXT NULL,
+  failure_class      TEXT NULL
 );
 CREATE INDEX exec_task ON role_executions(task_id);
 

@@ -155,7 +155,7 @@ fn backfill_runs_on_open_lands_deterministic_rows_and_progress_stays_clean() {
 
     // Any command opens the store — the rung lands here.
     devai(home.path(), &["task", "events", &id]);
-    assert_eq!(version_of(home.path()), 5, "the ladder walked 4 → 5");
+    assert_eq!(version_of(home.path()), 6, "fresh install lands at the ladder top (v6 after two integration renumbers)");
 
     // The human view stays exactly as it was (ratified OQ1 variant (б)):
     // acceptance is the auditor's APPROVED_DECISIONS, not a new progress
@@ -254,6 +254,6 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     // Ratified OQ4: the NULL-rationale act is a STORED fact the auditor
     // sees marked as such, not a silently skipped event.
     assert!(section.contains("(none stored)"), "the NULL-rationale backfilled decision renders the explicit mark (ratified OQ4):\n{section}");
-    assert_eq!(version_of(home.path()), 5);
+    assert_eq!(version_of(home.path()), 6);
     println!("──── dogfood evidence: APPROVED_DECISIONS with backfilled rows ────\n{section}");
 }

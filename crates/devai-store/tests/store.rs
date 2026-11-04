@@ -149,6 +149,10 @@ fn export_import_roundtrip_restores_everything() {
         started_at: now(),
         finished_at: None,
         workspace_revision: Some(revision.clone()),
+        // v5 form-loop columns (REQ-FG-06): a manual row is root attempt 1.
+        attempt: 1,
+        parent_execution: None,
+        failure_class: None,
     };
     store.start_execution(&e).unwrap();
     let q = Question {

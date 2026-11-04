@@ -6,3 +6,4 @@ rules:
   - "Do not invent missing business rules; record them as unknowns/open questions."
   - "Output ONLY a single JSON object that matches the provided output contract. No prose, no markdown fences."
   - "Ground every factual claim about current code in a source reference (file:line, commit sha) or mark it unverified."
+  - "In your contract-shaped JSON reply, an optional field you cannot fill is OMITTED entirely — never written as null; the schema is the single source of truth for the reply shape, and required keys must be present with their declared type."

@@ -39,6 +39,13 @@
       "to": 5,
       "script": "migrations/005_decisions_backfill.sql",
       "apply": "decisions_backfill"
+    },
+    {
+      "id": "006_role_execution_form_attempts",
+      "from": 5,
+      "to": 6,
+      "script": "migrations/006_role_execution_form_attempts.sql",
+      "apply": "execution_form_columns"
     }
   ]
 }

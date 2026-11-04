@@ -476,6 +476,47 @@ pub struct RoleExecution {
     /// written before this field existed deserialize/round-trip as NULL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_revision: Option<WorkspaceRevision>,
+    /// 1-based counter of THIS attempt inside the role's response-form
+    /// correction loop (OQ-FG-06: one execution row per attempt — the
+    /// rejection history is platform data, not a log line). Rows written
+    /// before the loop existed round-trip as 1 (the single attempt they were).
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+    /// Lineage: id of the FIRST attempt row of the same role stage (NULL on
+    /// attempt 1 itself and on pre-loop rows). `attempt` + this link rebuild
+    /// the whole loop from rows alone (`devai exec list`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution: Option<Id>,
+    /// WHY a failed execution failed, as DATA (REQ-FG-01 AC1): an operator
+    /// distinguishes `response_form` (protocol — the reply did not pass the
+    /// contract gate) from a provider/process or platform-assembly failure
+    /// without parsing the error text. NULL = no recorded failure class
+    /// (success, or a row written before the split existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+}
+
+fn default_attempt() -> u32 {
+    1
+}
+
+/// The closed vocabulary of `RoleExecution.failure_class` (REQ-FG-01/03).
+/// Producers write these strings; consumers read them back — never a raw
+/// literal at a call site.
+pub mod failure_class {
+    /// The reply did not satisfy the stored reply-shape contract (invalid
+    /// JSON, no extractable object, schema violations — OQ-FG-02 ratified:
+    /// unparseable JSON IS the form class). Owned by the form loop.
+    pub const RESPONSE_FORM: &str = "response_form";
+    /// The provider/process itself failed (`claude` exit != 0, broken
+    /// envelope, unknown provider). NOT the form loop's to retry on this
+    /// task (OQ-FG-04 ratified: provider retries stay outside).
+    pub const PROVIDER: &str = "provider";
+    /// The PLATFORM produced the failure: broken stored contract schema,
+    /// platform-assembled report rejected by its own gate, stamping error.
+    /// Never replayed to the role (REQ-FG-03 AC2) — the role is not guilty
+    /// of a shape the platform assembled.
+    pub const PLATFORM: &str = "platform";
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +692,16 @@ pub mod event_kind {
     pub const EXECUTION_STARTED: &str = "execution.started";
     pub const EXECUTION_FINISHED: &str = "execution.finished";
     pub const EXECUTION_FAILED: &str = "execution.failed";
+    /// One attempt of the response-form correction loop was rejected by the
+    /// contract gate (REQ-FG-07: the loop is LOUD — attempts and the FULL
+    /// violation list are events, not silent retries). Payload: execution id,
+    /// attempt, the complete `violations` array with json paths.
+    pub const EXECUTION_FORM_REJECTED: &str = "execution.form_rejected";
+    /// The form loop exhausted its configured attempts and the task parked
+    /// on a blocking question instead of a bare FAILED (OQ-FG-08: the
+    /// operator receives the list of WHAT to fix). Payload: attempts and the
+    /// last attempt's violations.
+    pub const EXECUTION_FORM_ESCALATED: &str = "execution.form_escalated";
     pub const EXECUTION_CANCELLED: &str = "execution.cancelled";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     /// Publishing a new artifact version supersedes the previous CURRENT
@@ -753,4 +804,11 @@ pub mod json_field {
     /// The human's stated reason, stored in approve/reject/return event
     /// payloads and in decision rows (the backfill reads it verbatim).
     pub const RATIONALE: &str = "rationale";
+    // Response-form correction loop (REQ-FG-01/02/07): the attempt counter,
+    // the full violation list with json paths, and the failure class —
+    // written by the adapter hook, the escalation command and the CLI.
+    pub const ATTEMPT: &str = "attempt";
+    pub const VIOLATIONS: &str = "violations";
+    pub const FAILURE_CLASS: &str = "failure_class";
+    pub const ROLE: &str = "role";
 }

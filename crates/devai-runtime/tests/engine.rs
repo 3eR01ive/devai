@@ -370,6 +370,155 @@ fn failed_adapter_leaves_workflow_untouched() {
     assert_eq!(execs.len(), 1);
     assert_eq!(execs[0].status, ExecutionStatus::Failed);
     assert!(execs[0].error.is_some());
+    // REQ-FG-03: a provider failure is CLASSIFIED as provider — it never
+    // entered the form loop (one row, one attempt, no rejection events).
+    assert_eq!(execs[0].failure_class.as_deref(), Some(failure_class::PROVIDER));
+    assert_eq!(execs[0].attempt, 1);
+    assert!(store.events(t.id, None).unwrap().iter().all(|e| e.kind != event_kind::EXECUTION_FORM_REJECTED));
+}
+
+// ---------------------------------------------------------------------------
+// The response-form contract gate (task 01a1a2d8): a form refusal must not
+// eat the cycle. The fixture providers (`mock-form-*`, `mock-spec-noecho`)
+// live in adapters.rs; these tests drive the loop THROUGH the engine, which
+// owns what the loop leaves behind: ROWS, EVENTS, the ESCALATION, the
+// STAMPING (OQ-FG-06).
+// ---------------------------------------------------------------------------
+
+/// Register one builtin fixture provider as an agent instance.
+fn form_agent(store: &Store, name: &str) {
+    store
+        .put_agent(&AgentInstance {
+            id: new_id(),
+            name: name.into(),
+            provider: name.into(),
+            model: "".into(),
+            runtime: "test".into(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+}
+
+/// Drive DRAFT → ANALYSIS as pure bookkeeping, so what a test observes below
+/// is exactly ONE stage's behavior.
+fn to_analysis(store: &Store, t: &Task) {
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::start(&cur, "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+}
+
+fn analyst_rows(store: &Store, task_id: Id) -> Vec<RoleExecution> {
+    let mut rows: Vec<RoleExecution> = store.list_executions(Some(task_id)).unwrap().into_iter().filter(|e| e.role_slug == "requirements-analyst").collect();
+    rows.sort_by_key(|e| e.attempt);
+    rows
+}
+
+#[test]
+fn form_loop_self_repairs_without_the_operator() {
+    let (_d, store) = store();
+    let t = Task::new("Flaky form", "A single shape slip must heal inside one run", None, Utc::now());
+    store.create_task(&t).unwrap();
+    to_analysis(&store, &t);
+    form_agent(&store, "mock-form-flaky");
+    let engine = mk_engine(&store);
+    // The run walks to the first human gate as if nothing had happened: the
+    // refusals were repaired INSIDE the cycle, not by a re-launch (REQ-FG-02 AC1).
+    let r = engine.advance(&t.id.to_string(), "mock-form-flaky", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingApproval, "{:?}", r.gate);
+    assert_eq!(r.steps.len(), 2, "analyst and reviewer each healed their form mid-run");
+
+    let rows = analyst_rows(&store, t.id);
+    assert_eq!(rows.len(), 2, "rejected attempt + accepted repair, as ROWS (REQ-FG-06/07)");
+    assert_eq!(rows[0].attempt, 1);
+    assert_eq!(rows[0].status, ExecutionStatus::Failed);
+    assert_eq!(rows[0].failure_class.as_deref(), Some(failure_class::RESPONSE_FORM));
+    assert!(rows[0].parent_execution.is_none(), "the root attempt is its own parent");
+    assert_eq!(rows[1].attempt, 2);
+    assert_eq!(rows[1].parent_execution, Some(rows[0].id), "lineage back to the first attempt");
+    assert_eq!(rows[1].status, ExecutionStatus::Completed);
+
+    // Loud, never silent (REQ-FG-07): the rejection is an EVENT with the
+    // full violation list as data.
+    let evs = store.events(t.id, None).unwrap();
+    let rejected: Vec<_> = evs.iter().filter(|e| e.kind == event_kind::EXECUTION_FORM_REJECTED).collect();
+    assert!(rejected.iter().any(|e| e.payload[json_field::ROLE] == serde_json::json!("requirements-analyst")), "{rejected:?}");
+    assert!(rejected.iter().any(|e| e.payload[json_field::VIOLATIONS].as_array().is_some_and(|a| !a.is_empty())), "violations travel as data");
+
+    // The repaired answer became the formal artifact.
+    assert!(store.artifacts(t.id).unwrap().iter().any(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current));
+}
+
+#[test]
+fn form_loop_exhaustion_parks_task_on_blocking_question() {
+    let (_d, store) = store();
+    let t = Task::new("Broken form", "Exhaustion must become a question, not a bare FAILED", None, Utc::now());
+    store.create_task(&t).unwrap();
+    to_analysis(&store, &t);
+    form_agent(&store, "mock-form-broken");
+    let engine = mk_engine(&store).with_max_repair_attempts(2);
+    let r = engine.advance(&t.id.to_string(), "mock-form-broken", "tester").unwrap();
+    // OQ-FG-08: the task waits for an ANSWER, not for a re-run command.
+    assert_eq!(r.now, TaskState::WaitingForInput);
+    assert_eq!(r.gate, Gate::Hold(TaskState::WaitingForInput));
+    assert!(r.steps.is_empty(), "an exhausted stage produces no step");
+
+    let rows = analyst_rows(&store, t.id);
+    assert_eq!(rows.len(), 3, "1 initial call + 2 re-prompts = the whole budget spent as rows");
+    assert_eq!(rows.iter().map(|e| e.attempt).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert!(rows.iter().all(|e| e.status == ExecutionStatus::Failed && e.failure_class.as_deref() == Some(failure_class::RESPONSE_FORM)));
+    assert!(rows[1].parent_execution == Some(rows[0].id) && rows[2].parent_execution == Some(rows[0].id));
+
+    // The answerable blocking question carries the FULL violation list.
+    let qs = store.list_questions(t.id).unwrap();
+    assert_eq!(qs.len(), 1);
+    assert!(qs[0].blocking, "the park is answerable (OQ-FG-08)");
+    assert_eq!(qs[0].status, QuestionStatus::Open);
+    assert!(qs[0].text.contains("$.unknowns") && qs[0].text.contains("$.assumptions"), "every violation, not the first: {}", qs[0].text);
+
+    let evs = store.events(t.id, None).unwrap();
+    assert_eq!(evs.iter().filter(|e| e.kind == event_kind::EXECUTION_FORM_REJECTED).count(), 3);
+    assert_eq!(evs.iter().filter(|e| e.kind == event_kind::EXECUTION_FORM_ESCALATED).count(), 1);
+
+    // Rejected bodies never become artifacts (REQ-FG-07 AC2).
+    assert!(store.artifacts(t.id).unwrap().is_empty());
+}
+
+#[test]
+fn form_loop_disabled_by_config_keeps_todays_failure() {
+    let (_d, store) = store();
+    let t = Task::new("Loop off", "max_repair_attempts=0 means the pre-loop behavior", None, Utc::now());
+    store.create_task(&t).unwrap();
+    to_analysis(&store, &t);
+    form_agent(&store, "mock-form-broken");
+    let engine = mk_engine(&store).with_max_repair_attempts(0);
+    let err = engine.advance(&t.id.to_string(), "mock-form-broken", "tester").unwrap_err();
+    assert!(err.to_string().contains("does not satisfy the contract"), "{err}");
+    let rows = analyst_rows(&store, t.id);
+    assert_eq!(rows.len(), 1, "budget 0: exactly one provider call, like before the feature");
+    assert_eq!(rows[0].failure_class.as_deref(), Some(failure_class::RESPONSE_FORM));
+    assert!(store.list_questions(t.id).unwrap().is_empty(), "a disabled loop escalates nothing");
+    assert_eq!(store.get_task(&t.id.to_string()).unwrap().state, TaskState::Analysis, "workflow untouched (REQ-FG-03 AC1)");
+}
+
+#[test]
+fn platform_stamps_spec_echo_fields_from_stored_data() {
+    let (_d, store) = store();
+    let t = Task::new("No echo", "The analyst skips what only the platform knows", None, Utc::now());
+    store.create_task(&t).unwrap();
+    to_analysis(&store, &t);
+    form_agent(&store, "mock-spec-noecho");
+    let engine = mk_engine(&store);
+    // A reply WITHOUT task_id/business_description is legal under @2 (the
+    // ratified OQ-FG-03/07 pairing) — no repair loop is spent on it.
+    let r = engine.advance(&t.id.to_string(), "mock-spec-noecho", "tester").unwrap();
+    assert_eq!(r.gate, Gate::WaitingApproval);
+    assert_eq!(analyst_rows(&store, t.id).len(), 1, "valid-under-@2 shape needs no re-prompt");
+
+    let spec = store.artifacts(t.id).unwrap().into_iter().find(|a| a.kind == ArtifactKind::RequirementsSpec).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&store.read_blob(&spec.sha256).unwrap()).unwrap();
+    // REQ-FG-06: the platform completed the echo from STORED data.
+    assert_eq!(body["task_id"], serde_json::json!(t.id.to_string()));
+    assert_eq!(body["business_description"], serde_json::json!(t.business_description));
 }
 
 /// The same contract gate `Engine::run_stage` runs on the assembled QA

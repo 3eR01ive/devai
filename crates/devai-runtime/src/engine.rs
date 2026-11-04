@@ -13,10 +13,10 @@ use chrono::Utc;
 use devai_core::error::CoreError;
 use devai_core::types::*;
 use devai_core::workflow;
-use devai_store::config::Profile;
+use devai_store::config::{Profile, ResponseFormPolicy};
 use devai_store::{ArtifactDraft, Store, StoreError};
 
-use crate::adapters::{self, AdapterError, AgentRuntime, ExecOutput, ExecRequest};
+use crate::adapters::{self, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome};
 use crate::evaluation;
 use crate::gate;
 use crate::prompt::build_user_prompt;
@@ -179,6 +179,93 @@ pub struct RunReport {
     pub gate: Gate,
 }
 
+/// What one stage produced: a completed step, or — when the response-form
+/// loop exhausted its budget — a LOUD escalation that parked the task on a
+/// blocking question (OQ-FG-08) with no artifact and no step.
+enum StageResult {
+    Stepped(StepOutcome),
+    Escalated,
+}
+
+/// HOST of the adapter-owned form-correction loop (OQ-FG-06: the loop lives
+/// in the adapter, the rows and events live HERE — the adapter must never
+/// touch the store, adapters.rs module docs). One RoleExecution row per
+/// attempt with `attempt` + `parent_execution` lineage (the rejection
+/// history is data: `devai exec list` shows the loop by itself, REQ-FG-07).
+struct StageAttempts<'a> {
+    store: &'a Store,
+    /// Attempt-1 row, already started by `run_stage` before the loop opens.
+    template: RoleExecution,
+    /// The row of the attempt currently RUNNING.
+    open: RoleExecution,
+    /// A store failure inside a callback cannot abort the provider loop from
+    /// the inside; it is surfaced to the engine right after the loop ends.
+    store_err: Option<StoreError>,
+}
+
+impl FormLoopHost for StageAttempts<'_> {
+    fn attempt_started(&mut self, attempt: u32) {
+        if attempt == 1 {
+            // run_stage already opened the root row before worktree prep.
+            return;
+        }
+        let mut row = self.template.clone();
+        row.id = new_id();
+        row.attempt = attempt;
+        row.parent_execution = Some(self.template.id);
+        row.started_at = Utc::now();
+        row.status = ExecutionStatus::Running;
+        row.summary = None;
+        row.error = None;
+        row.finished_at = None;
+        row.failure_class = None;
+        if let Err(e) = self.store.start_execution(&row) {
+            self.store_err.get_or_insert(e);
+        } else {
+            self.open = row;
+        }
+    }
+
+    fn attempt_rejected(&mut self, attempt: u32, violations: &[String]) {
+        // Loud, not silent (REQ-FG-07): the attempt row is closed as a FORM
+        // failure with the class written as DATA, and the FULL list goes into
+        // an event payload — never truncated to the first violation.
+        let err = self
+            .store
+            .finish_execution_classified(&self.open, ExecutionStatus::Failed, None, Some(&violations.join("; ")), Some(failure_class::RESPONSE_FORM), Utc::now())
+            .and_then(|_| {
+                self.store.insert_event(
+                    Some(self.template.task_id),
+                    event_kind::EXECUTION_FORM_REJECTED,
+                    &format!("role:{}", self.template.role_slug),
+                    serde_json::json!({
+                        "execution_id": self.open.id.to_string(),
+                        (json_field::ROLE): self.template.role_slug,
+                        (json_field::ATTEMPT): attempt,
+                        (json_field::VIOLATIONS): violations,
+                    }),
+                )
+            });
+        if let Err(e) = err {
+            self.store_err.get_or_insert(e);
+        }
+    }
+
+    fn attempt_failed(&mut self, _attempt: u32, class: &'static str, error: &str) {
+        let err = self.store.finish_execution_classified(
+            &self.open,
+            ExecutionStatus::Failed,
+            None,
+            Some(error),
+            Some(class),
+            Utc::now(),
+        );
+        if let Err(e) = err {
+            self.store_err.get_or_insert(e);
+        }
+    }
+}
+
 pub struct Engine<'a> {
     store: &'a Store,
     max_steps: usize,
@@ -190,6 +277,10 @@ pub struct Engine<'a> {
     /// Explicit human override of the QA freshness gate: re-audit despite a
     /// fresh CURRENT report. Never set implicitly — the gate only stops.
     force_reaudit: bool,
+    /// Declarative response-form repair budget (REQ-FG-05): loaded from the
+    /// platform-owned `config/workflow/*.yaml` data, never hardcoded at a
+    /// call site. `max_repair_attempts = 0` keeps today's one-shot behavior.
+    response_form: ResponseFormPolicy,
 }
 
 impl<'a> Engine<'a> {
@@ -202,8 +293,14 @@ impl<'a> Engine<'a> {
             .unwrap_or_else(|| store.root().join("config"));
         let profiles = devai_store::config::load_profiles(&cfg_dir.join("evaluation")).unwrap_or_default();
         let profile = profiles.into_iter().find(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"));
+        // Same loud-degrade discipline as profiles: an unreadable or invalid
+        // form-loop config falls back to the declared default (2) rather than
+        // silently zeroing the budget; `devai init` already validates it at
+        // seed time (seed.rs), so this fallback only shields a broken manual
+        // edit from taking the whole engine down.
+        let response_form = devai_store::config::load_response_form_policy(&cfg_dir.join("workflow")).unwrap_or_default();
         let workspace = std::env::current_dir().unwrap_or_else(|_| store.root().to_path_buf());
-        Engine { store, max_steps: DEFAULT_MAX_STEPS, profile, workspace, force_reaudit: false }
+        Engine { store, max_steps: DEFAULT_MAX_STEPS, profile, workspace, force_reaudit: false, response_form }
     }
 
     /// Override the probe workspace (tests, monorepo subdirs).
@@ -222,6 +319,13 @@ impl<'a> Engine<'a> {
     /// Provide the profile explicitly instead of loading it from the home.
     pub fn with_profile(mut self, profile: Profile) -> Self {
         self.profile = Some(profile);
+        self
+    }
+
+    /// Override the declarative form-repair budget (tests; the production
+    /// value comes from `config/workflow/response-form-loop.yaml`).
+    pub fn with_max_repair_attempts(mut self, max_repair_attempts: u32) -> Self {
+        self.response_form.max_repair_attempts = max_repair_attempts;
         self
     }
 
@@ -362,7 +466,18 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            let step = self.run_stage(&task, role_slug, kind, agent_name, actor)?;
+            let step = match self.run_stage(&task, role_slug, kind, agent_name, actor)? {
+                StageResult::Stepped(step) => step,
+                StageResult::Escalated => {
+                    // The form loop exhausted: the task is parked in
+                    // WAITING_FOR_INPUT on a blocking question carrying the
+                    // full violation list (OQ-FG-08). No step, no artifact —
+                    // the run stops LOUDLY at the question, not silently at a
+                    // FAILED marker.
+                    let task = self.store.resolve_task(task_ref)?;
+                    return Ok(self.report(&task, steps, Gate::Hold(task.state)));
+                }
+            };
             let gated = step.artifact_kind == ArtifactKind::QualityReport;
             steps.push(step);
             if gated {
@@ -420,8 +535,13 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Run exactly one stage end-to-end: guard, execute, publish, commit.
-    fn run_stage(&self, task: &Task, role_slug: &str, kind: ArtifactKind, agent_name: &str, actor: &str) -> RuntimeResult<StepOutcome> {
+    /// Run exactly one stage end-to-end: guard, execute (through the
+    /// adapter-owned form loop, this engine hosting one execution row per
+    /// attempt), publish, commit. `StageResult::Escalated` is returned when
+    /// the loop exhausted its budget: the task is then parked in
+    /// WAITING_FOR_INPUT on a blocking question (OQ-FG-08), no artifact and
+    /// no step were produced.
+    fn run_stage(&self, task: &Task, role_slug: &str, kind: ArtifactKind, agent_name: &str, actor: &str) -> RuntimeResult<StageResult> {
         // Sovereignty check first: the role may only run in this stage.
         workflow::check_execution_allowed(role_slug, task)?;
 
@@ -535,6 +655,12 @@ impl<'a> Engine<'a> {
             started_at: now,
             finished_at: None,
             workspace_revision: Some(revision.clone()),
+            // The ROOT attempt (1): subsequent attempts of the same stage
+            // clone this row with a fresh id, `attempt = n` and
+            // `parent_execution` pointing here (REQ-FG-06 lineage).
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
         };
         self.store.start_execution(&execution)?;
 
@@ -554,11 +680,12 @@ impl<'a> Engine<'a> {
             match worktree::prepare(&self.workspace, self.store.root(), task.id, revision.git_head.as_deref()) {
                 Ok(wt) => {
                     if let Err(e) = std::fs::create_dir_all(&evidence) {
-                        let _ = self.store.finish_execution(
+                        let _ = self.store.finish_execution_classified(
                             &execution,
                             ExecutionStatus::Failed,
                             None,
                             Some(&format!("cannot create platform evidence dir {}: {e}", evidence.display())),
+                            Some(failure_class::PLATFORM),
                             Utc::now(),
                         );
                         return Err(RuntimeError::Store(e.into()));
@@ -577,7 +704,7 @@ impl<'a> Engine<'a> {
                     isolated = Some(wt);
                 }
                 Err(e) => {
-                    let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Utc::now());
+                    let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Some(failure_class::PLATFORM), Utc::now());
                     return Err(e.into());
                 }
             }
@@ -590,7 +717,7 @@ impl<'a> Engine<'a> {
             if let Err(e) = std::fs::create_dir_all(&evidence)
                 .and_then(|_| std::fs::write(evidence.join(PROBE_EVIDENCE_FILE), &run.evidence_text))
             {
-                let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store probe evidence in {}: {e}", evidence.display())), Utc::now());
+                let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store probe evidence in {}: {e}", evidence.display())), Some(failure_class::PLATFORM), Utc::now());
                 return Err(RuntimeError::Store(e.into()));
             }
             inputs.push((
@@ -645,7 +772,7 @@ impl<'a> Engine<'a> {
                 contract_schema.as_deref(),
             );
             if let Err(e) = std::fs::write(evidence.join(AUDITOR_PROMPT_FILE), prompt) {
-                let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store auditor prompt in {}: {e}", evidence.display())), Utc::now());
+                let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store auditor prompt in {}: {e}", evidence.display())), Some(failure_class::PLATFORM), Utc::now());
                 return Err(RuntimeError::Store(e.into()));
             }
         }
@@ -663,17 +790,73 @@ impl<'a> Engine<'a> {
             // checkout path — its workspace is the isolation worktree.
             workspace: Some(isolated.as_ref().map(|w| w.dir.clone()).unwrap_or_else(|| self.workspace.clone())),
             evidence: if writing { Some(evidence) } else { None },
+            // Attempt 1 answers the ORIGINAL question; the loop fills this
+            // in for re-prompts (REQ-FG-02 AC2).
+            repair: None,
         };
 
-        let out = match AgentRuntime::run(&req) {
-            Ok(o) => o,
-            Err(e) => {
-                // The execution is recorded as failed; the task state is
-                // untouched — history says what happened, workflow says nothing
-                // moved.
-                let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Utc::now());
+        // THE response-form correction loop (REQ-FG-02..04, OQ-FG-06/08/09):
+        // the protocol lives in the adapter, the rows and events live here.
+        // A FORM rejection re-prompts the same role with its full violation
+        // list up to the declarative budget; provider/platform failures
+        // never consume attempts. While attempts remain the workflow does
+        // NOT fail — the loop just runs another attempt.
+        let max_repairs = self.response_form.max_repair_attempts;
+        let mut hook = StageAttempts {
+            store: self.store,
+            template: execution.clone(),
+            open: execution.clone(),
+            store_err: None,
+        };
+        let out = match AgentRuntime::run_with_form_loop(&req, max_repairs, &mut hook) {
+            RunOutcome::Output(o) => o,
+            RunOutcome::Failed(e) => {
+                if let Some(se) = hook.store_err {
+                    return Err(RuntimeError::Store(se));
+                }
+                // The failing attempt's row was closed by the host with its
+                // class; the task state is untouched — history says what
+                // happened, workflow says nothing moved.
                 return Err(e.into());
             }
+            RunOutcome::FormExhausted { attempts, violations } => {
+                if let Some(se) = hook.store_err {
+                    return Err(RuntimeError::Store(se));
+                }
+                if max_repairs == 0 {
+                    // The loop is OFF by config: exactly the pre-loop
+                    // behavior — one call, the form failure fails the
+                    // execution, no escalation to invent (REQ-FG-04 AC2).
+                    return Err(RuntimeError::Adapter(AdapterError::BadOutput { violations }));
+                }
+                // Exhaustion is LOUD and ANSWERABLE (OQ-FG-08): the core
+                // command parks the task in WAITING_FOR_INPUT with a blocking
+                // question carrying the full list; transition + event +
+                // question commit atomically. No artifact is published —
+                // rejected bodies never become artifacts (REQ-FG-07 AC2).
+                let m = workflow::escalate_form_rejection(task, new_id(), role_slug, attempts, &violations, actor, Utc::now())?;
+                self.store.commit(task.lock_version, &m)?;
+                return Ok(StageResult::Escalated);
+            }
+        };
+        if let Some(se) = hook.store_err {
+            return Err(RuntimeError::Store(se));
+        }
+        // The row of the ACCEPTED attempt (attempt 1 == the root): the
+        // engine may still honestly fail it during stamping/assembly.
+        let execution = hook.open.clone();
+
+        // REQ-FG-06 / ratified OQ-FG-07: the spec's echo fields are the
+        // PLATFORM's from stored data — task_id is stamped (the role cannot
+        // know the id its reply is recorded under), business_description is
+        // completed from the stored task only when the reply SKIPPED it (an
+        // analyst's own refined wording is the artifact's value and stays).
+        // The stamped body is re-validated against the stored schema before
+        // publication — the same gate, no bypass.
+        let out = if kind == ArtifactKind::RequirementsSpec {
+            self.stamp_spec_echo(task, contract_schema.as_deref(), out)?
+        } else {
+            out
         };
 
         // QA: merge the platform's probe results with the auditor's
@@ -692,7 +875,10 @@ impl<'a> Engine<'a> {
             match self.capture_writing_result(task, &execution, wt, contract_schema.as_deref(), &out) {
                 Ok((content, summary)) => (content, Some(summary), role.output_contract.clone()),
                 Err(e) => {
-                    let _ = self.store.finish_execution(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Utc::now());
+                    // Post-loop capture is platform-side work (commit +
+                    // stamp): its failure is classed `platform`, never
+                    // replayed to the role as a form defect (REQ-FG-03 AC2).
+                    let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Some(failure_class::PLATFORM), Utc::now());
                     return Err(e);
                 }
             }
@@ -700,17 +886,20 @@ impl<'a> Engine<'a> {
             match (&eval_run, is_qa) {
             (Some(run), true) => {
                 let profile = self.profile.as_ref().expect("eval_run implies profile present");
+                // The adapter already gate-checked this reply; a re-parse
+                // failure here is the PLATFORM's assembly breaking, never a
+                // role form defect (REQ-FG-03 AC2).
                 let assessment: serde_json::Value = serde_json::from_slice(&out.content)
-                    .map_err(|e| AdapterError::BadOutput(format!("assessment reply is not valid JSON: {e}")))?;
+                    .map_err(|e| AdapterError::Platform(format!("assessment reply is not valid JSON, cannot assemble: {e}")))?;
                 let assembled = evaluation::assemble(profile, run, &assessment, &execution.id.to_string(), &revision);
                 let text = serde_json::to_string_pretty(&assembled.json)
-                    .map_err(|e| AdapterError::Agent(format!("cannot serialize assembled report: {e}")))?;
+                    .map_err(|e| AdapterError::Platform(format!("cannot serialize assembled report: {e}")))?;
                 let schema = self
                     .store
                     .get_contract(QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1)?
                     .ok_or_else(|| RuntimeError::MissingContract(QUALITY_REPORT_CONTRACT.0.into(), QUALITY_REPORT_CONTRACT.1))?;
                 if let Err(e) = adapters::validate_against_contract(&text, Some(&schema)) {
-                    let _ = self.store.finish_execution(
+                    let _ = self.store.finish_execution_classified(
                         &execution,
                         ExecutionStatus::Failed,
                         None,
@@ -718,6 +907,9 @@ impl<'a> Engine<'a> {
                             "platform-assembled report violates {}@{}: {e}",
                             QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1
                         )),
+                        // The report was assembled by the platform — the
+                        // rejection is its own defect class, never the role's.
+                        Some(failure_class::PLATFORM),
                         Utc::now(),
                     );
                     return Err(e.into());
@@ -786,7 +978,7 @@ impl<'a> Engine<'a> {
             ArtifactKind::QualityReport => {
                 // QA produced its report; acceptance is a HUMAN decision.
                 // No state transition: stop right here.
-                return Ok(StepOutcome {
+                return Ok(StageResult::Stepped(StepOutcome {
                     from: task.state,
                     to: task.state,
                     role: role_slug.to_string(),
@@ -795,7 +987,7 @@ impl<'a> Engine<'a> {
                     artifact_id: artifact.id,
                     artifact_kind: kind,
                     summary: exec_summary,
-                });
+                }));
             }
             other => {
                 return Err(CoreError::guard(format!("engine produced an unexpected output kind {other:?}")).into());
@@ -803,7 +995,7 @@ impl<'a> Engine<'a> {
         };
         self.store.commit(task.lock_version, &m)?;
 
-        Ok(StepOutcome {
+        Ok(StageResult::Stepped(StepOutcome {
             from: task.state,
             to: m.task.state,
             role: role_slug.to_string(),
@@ -812,7 +1004,40 @@ impl<'a> Engine<'a> {
             artifact_id: artifact.id,
             artifact_kind: kind,
             summary: exec_summary,
-        })
+        }))
+    }
+
+    /// REQ-FG-06 / ratified OQ-FG-07: complete the requirements-spec echo
+    /// fields from STORED task data, then re-check the stamped body against
+    /// the stored schema — the same gate, applied to the platform's own
+    /// addition (parity with `capture_writing_result` for writing roles).
+    /// `task_id` is always overwritten with the stored id; a present
+    /// non-empty `business_description` is the analyst's refined wording and
+    /// stands untouched; a skipped one (absent or null or blank) is filled
+    /// from the task. Nothing here is ever implied silently: a body that
+    /// cannot be stamped fails LOUDLY as a platform error.
+    fn stamp_spec_echo(&self, task: &Task, contract_schema: Option<&str>, out: ExecOutput) -> RuntimeResult<ExecOutput> {
+        let mut body: serde_json::Value = serde_json::from_slice(&out.content)
+            .map_err(|e| AdapterError::Platform(format!("spec reply is not valid JSON, cannot stamp: {e}")))?;
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| AdapterError::Platform("spec reply is not one JSON object".to_string()))?;
+        obj.insert("task_id".to_string(), serde_json::json!(task.id.to_string()));
+        let skipped = match obj.get("business_description") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+            Some(_) => false,
+        };
+        if skipped {
+            obj.insert("business_description".to_string(), serde_json::json!(task.business_description));
+        }
+        let text = serde_json::to_string_pretty(&body)
+            .map_err(|e| AdapterError::Platform(format!("cannot serialize stamped spec: {e}")))?;
+        // Re-validate the STAMPED body: the platform never loosens its own
+        // gate after touching the reply.
+        adapters::validate_against_contract(&text, contract_schema)
+            .map_err(|e| AdapterError::Platform(format!("platform stamping broke the spec contract: {e}")))?;
+        Ok(ExecOutput { content: text.into_bytes(), summary: out.summary })
     }
 
     /// Commit + stamp for one completed writing execution (REQ-WT-06,
@@ -835,16 +1060,20 @@ impl<'a> Engine<'a> {
     ) -> Result<(Vec<u8>, String), RuntimeError> {
         let one_line: String = task.title.split_whitespace().collect::<Vec<_>>().join(" ");
         let sha = worktree::commit_platform_work(&wt.dir, &format!("{}: {one_line}", worktree::COMMIT_SUBJECT_PREFIX), task.id, execution.id)?;
+        // Stamping is platform-side work: a failure here is the PLATFORM's
+        // (REQ-FG-03 AC2) — the role's reply already passed the form gate,
+        // and re-prompting it for the platform's own serialization cannot
+        // fix anything.
         let mut body: serde_json::Value = serde_json::from_slice(&out.content)
-            .map_err(|e| AdapterError::BadOutput(format!("implementation report is not valid JSON, cannot stamp: {e}")))?;
+            .map_err(|e| AdapterError::Platform(format!("implementation report is not valid JSON, cannot stamp: {e}")))?;
         let obj = body
             .as_object_mut()
-            .ok_or_else(|| AdapterError::BadOutput("implementation report must be one JSON object — nothing to stamp".to_string()))?;
+            .ok_or_else(|| AdapterError::Platform("implementation report must be one JSON object — nothing to stamp".to_string()))?;
         obj.insert("branch".to_string(), serde_json::json!(wt.branch));
         obj.insert("worktree".to_string(), serde_json::json!(wt.dir.display().to_string()));
         obj.insert("commit".to_string(), serde_json::json!(sha));
         let text = serde_json::to_string_pretty(&body)
-            .map_err(|e| AdapterError::BadOutput(format!("cannot serialize stamped report: {e}")))?;
+            .map_err(|e| AdapterError::Platform(format!("cannot serialize stamped report: {e}")))?;
         // Re-validate the STAMPED body against the role's contract (the
         // mechanical half of implementation-report@2: the guarantee is
         // engine-side, not a promise to the model).

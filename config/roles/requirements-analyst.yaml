@@ -20,4 +20,4 @@ instructions: >-
 done_criteria: Requirements Specification опубликован; все неизвестные вынесены в вопросы
 tools: ["filesystem:read", "api:project-knowledge"]
 input_contract: null
-output_contract: requirements-specification@1
+output_contract: requirements-specification@2
