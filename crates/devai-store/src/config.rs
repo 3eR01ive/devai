@@ -35,6 +35,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
     ("roles/implementation-agent.yaml", include_str!("../../../config/roles/implementation-agent.yaml")),
     ("roles/quality-auditor.yaml", include_str!("../../../config/roles/quality-auditor.yaml")),
     ("roles/quality-aggregator.yaml", include_str!("../../../config/roles/quality-aggregator.yaml")),
+    ("workflow/response-form-loop.yaml", include_str!("../../../config/workflow/response-form-loop.yaml")),
 ];
 
 fn cfg_err(msg: impl Into<String>) -> StoreError {
@@ -510,6 +511,67 @@ pub fn load_profiles(dir: &Path) -> StoreResult<Vec<Profile>> {
     Ok(profiles)
 }
 
+// ---------------------------------------------------------------------------
+// Response-form correction loop (REQ-FG-04) — platform protocol data.
+// ---------------------------------------------------------------------------
+
+/// Declarative budget of the form loop: how many re-prompts the platform may
+/// hand the SAME role after a reply-shape rejection before it parks the task
+/// on a blocking question (OQ-FG-01/08, ratified). Lives in
+/// `config/workflow/response-form-loop.yaml` — protocol of the platform, not
+/// a role property; `0` turns the loop off (= pre-feature behavior).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ResponseFormPolicy {
+    #[serde(default = "default_max_repair_attempts")]
+    pub max_repair_attempts: u32,
+}
+
+fn default_max_repair_attempts() -> u32 {
+    2
+}
+
+impl Default for ResponseFormPolicy {
+    /// The factory bytes are the fallback: a home without the file behaves
+    /// exactly like one that has it at defaults (same idiom as the embedded
+    /// workflow config materialisation — never a second copy of the policy).
+    fn default() -> Self {
+        ResponseFormPolicy { max_repair_attempts: default_max_repair_attempts() }
+    }
+}
+
+/// Merge-scan `workflow/*.yaml` for the `response_form:` key. Other files in
+/// the directory (e.g. `rework-context.yaml`, a top-level list) are left
+/// alone: only a mapping that declares `response_form` participates.
+/// A malformed declaration is a LOUD config error — a silently ignored typo
+/// in a budget would quietly resurrect the old behavior.
+pub fn load_response_form_policy(dir: &Path) -> StoreResult<ResponseFormPolicy> {
+    let mut policy = ResponseFormPolicy::default();
+    if !dir.is_dir() {
+        return Ok(policy);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    for p in &paths {
+        let text = fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if let Some(section) = doc.get("response_form") {
+            // The loud message names the field and its meaning: a typo in a
+            // budget must tell the operator exactly what to fix.
+            policy = serde_yaml::from_value::<ResponseFormPolicy>(section.clone()).map_err(|e| {
+                cfg_err(format!(
+                    "{}: response_form.max_repair_attempts must be a non-negative integer (re-prompts on top of the first call; 0 disables the loop): {e}",
+                    p.display()
+                ))
+            })?;
+        }
+    }
+    Ok(policy)
+}
+
 fn parse_yaml<T: DeserializeOwnedPlus>(path: &Path) -> StoreResult<T> {
     let text = fs::read_to_string(path).map_err(|e| cfg_err(format!("read {}: {e}", path.display())))?;
     serde_yaml::from_str(&text).map_err(|e| cfg_err(format!("parse {}: {e}", path.display())))
@@ -713,6 +775,101 @@ mod tests {
         fs::write(&edited, "different").unwrap();
         materialize_if_absent(&cfgdir).unwrap();
         assert_eq!(fs::read_to_string(&edited).unwrap(), "different");
+    }
+
+    /// REQ-FG-05 AC1 — the schema-authority audit: for every CURRENT contract
+    /// version (the latest per name; older stay in the store as history),
+    /// each `required` key MUST be declared in `properties` at the same level,
+    /// recursively. The precedent violation was requirements-specification@1:
+    /// `business_description` required but undeclared — "the validator wants
+    /// more than the producer sees", costing full role re-runs (3× '$.
+    /// business_description: missing required key'). A reply-shape contract
+    /// may not hide expectations behind a `required` list alone.
+    #[test]
+    fn current_contracts_declare_every_required_key() {
+        // Keep only the latest version per name — @1 stays seeded untouched.
+        let mut latest: BTreeMap<&str, (u32, &str)> = BTreeMap::new();
+        for (name, version, schema) in crate::seed::contracts() {
+            let e = latest.entry(name).or_insert((0, ""));
+            if version > e.0 {
+                *e = (version, schema);
+            }
+        }
+        fn walk(label: &str, node: &serde_json::Value, bad: &mut Vec<String>) {
+            let Some(obj) = node.as_object() else { return };
+            if let Some(req) = obj.get("required").and_then(|r| r.as_array()) {
+                let props = obj.get("properties").and_then(|p| p.as_object());
+                for k in req.iter().filter_map(|r| r.as_str()) {
+                    if !props.is_some_and(|p| p.contains_key(k)) {
+                        bad.push(format!("{label}: required key `{k}` is not declared in properties"));
+                    }
+                }
+            }
+            if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
+                for (k, sub) in props {
+                    walk(&format!("{label}.{k}"), sub, bad);
+                }
+            }
+            if let Some(items) = obj.get("items") {
+                walk(&format!("{label}[]"), items, bad);
+            }
+        }
+        let mut bad = Vec::new();
+        for (name, (version, schema)) in &latest {
+            let v: serde_json::Value = serde_json::from_str(schema).unwrap_or_else(|e| panic!("{name}@{version} must parse: {e}"));
+            walk(&format!("{name}@{version}"), &v, &mut bad);
+        }
+        assert!(bad.is_empty(), "contract schema-authority audit failed:\n{}", bad.join("\n"));
+    }
+
+    /// The ratified reply-shape of @2: echo fields the platform stamps are no
+    /// longer hidden obligations on the producer (REQ-FG-06 / OQ-FG-07) — and
+    /// the historical incident key is declared in properties now.
+    #[test]
+    fn requirements_specification_v2_makes_echo_fields_optional_and_declared() {
+        let (_, v2, schema) = crate::seed::contracts()
+            .into_iter()
+            .find(|(name, ver, _)| *name == "requirements-specification" && *ver == 2)
+            .expect("requirements-specification@2 is seeded");
+        let doc: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        let required: Vec<&str> = doc["required"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+        assert!(!required.contains(&"task_id"), "task_id is platform-stamped, not role-carried");
+        assert!(!required.contains(&"business_description"), "business_description is platform-completed when skipped");
+        assert!(required.contains(&"version"), "version stays role-owned (rework semantics)");
+        for k in ["task_id", "business_description", "source", "open_questions", "change_history"] {
+            assert!(doc["properties"][k].is_object(), "{k} declared in properties");
+        }
+    }
+
+    /// REQ-FG-04: the loop budget is declarative config, not code — the
+    /// factory file materialises, an edit changes it, a home without the file
+    /// falls back to the same factory default, and a broken declaration is
+    /// loud. `rework-context.yaml` in the same directory must not disturb it.
+    #[test]
+    fn response_form_budget_is_declarative_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfgdir = dir.path().join("config");
+        materialize_if_absent(&cfgdir).unwrap();
+        let wf = cfgdir.join("workflow");
+        // Factory value: the ratified default (OQ-FG-01), 2 re-prompts.
+        let pol = load_response_form_policy(&wf).unwrap();
+        assert_eq!(pol.max_repair_attempts, 2, "factory budget");
+        // A home predating the file: same factory bytes as fallback.
+        fs::remove_file(wf.join("response-form-loop.yaml")).unwrap();
+        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 2);
+        fs::remove_dir_all(&wf).unwrap();
+        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 2, "absent dir is not an error");
+        // Operator edit — no rebuild (REQ-FG-04 AC1).
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(wf.join("response-form-loop.yaml"), "response_form:\n  max_repair_attempts: 0\n").unwrap();
+        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 0, "0 is valid: loop off, today's behavior");
+        // A non-participating workflow file is left alone (rework-context.yaml
+        // is a top-level list; it carries no response_form section).
+        fs::write(wf.join("other-list.yaml"), "- role: x\n  triggers: []\n").unwrap();
+        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 0);
+        // A broken declaration is a loud config error, never a silent default.
+        fs::write(wf.join("response-form-loop.yaml"), "response_form:\n  max_repair_attempts: -1\n").unwrap();
+        assert!(load_response_form_policy(&wf).unwrap_err().to_string().contains("max_repair_attempts"));
     }
 
     #[test]

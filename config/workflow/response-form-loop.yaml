@@ -1,0 +1,23 @@
+# RESPONSE-FORM CORRECTION LOOP — platform-owned workflow data (REQ-FG-04).
+#
+# How many times the platform may hand the SAME role its own violation list
+# for a re-reply before the task parks on a blocking question (OQ-FG-08).
+# This is protocol, not a role property — it lives in the workflow config
+# tree (ratified OQ-FG-01: "ключ живёт в config/workflow/"), the same idiom
+# as `rework-context.yaml`: the runtime is a generic executor of it, role
+# YAML never sees any of this.
+#
+# Fields:
+# * `max_repair_attempts` — re-prompts after a form rejection, so the role
+#   gets at most `1 + max_repair_attempts` provider calls per stage.
+#   Default 2 (ratified OQ-FG-01). `0` is a valid configuration that turns
+#   the loop off: the first form rejection fails the execution exactly as
+#   before this feature (REQ-FG-04 AC2).
+#
+# Edit this file and re-run `devai init` (per-file materialisation never
+# clobbers a user edit); the next `devai task run` picks the new budget up —
+# no code rebuild (REQ-FG-04 AC1). When the directory or key is absent (a
+# home predating this file), the platform falls back to these same factory
+# values — never to a code copy of the policy.
+response_form:
+  max_repair_attempts: 2

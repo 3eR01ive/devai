@@ -539,6 +539,64 @@ pub fn answer_question(task: &Task, question_id: Id, actor: &str, now: Timestamp
     Ok(m)
 }
 
+/// The response-form correction loop exhausted its configured attempts
+/// (OQ-FG-08, ratified): the task parks in WAITING_FOR_INPUT on a blocking
+/// question carrying the FULL violation list of the last attempt — a bare
+/// FAILED leaves the operator no "what to fix" list. Same loudness discipline
+/// as the empty-rework gate (REQ-RG-02 precedent): the parked state is a real,
+/// answerable question persisted in the SAME mutation/transaction, never a
+/// log-only exit. The workflow effect of a form exhaustion is exactly this
+/// park — the stage itself is replayed by the next `advance` once answered.
+pub fn escalate_form_rejection(
+    task: &Task,
+    question_id: Id,
+    role_slug: &str,
+    attempts: u32,
+    violations: &[String],
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(task, &ACTIVE_STATES, "escalate-form-rejection", CoreError::hint("only an active stage can park on a form escalation"))?;
+    let bullet_list = violations.iter().map(|v| format!("\n  - {v}")).collect::<String>();
+    let mut m = transition(
+        task,
+        TaskState::WaitingForInput,
+        event_kind::QUESTION_RAISED,
+        actor,
+        now,
+        json!({
+            (json_field::QUESTION_ID): question_id.to_string(),
+            "blocking": true,
+            (json_field::GATE): "response-form-loop",
+            (json_field::ROLE): role_slug,
+            (json_field::ATTEMPT): attempts,
+        }),
+    );
+    m.events.push(EventDraft {
+        kind: event_kind::EXECUTION_FORM_ESCALATED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::ROLE): role_slug,
+            (json_field::ATTEMPT): attempts,
+            (json_field::VIOLATIONS): violations,
+            (json_field::QUESTION_ID): question_id.to_string(),
+        }),
+    });
+    m.questions.push(QuestionDraft {
+        id: question_id,
+        text: format!(
+            "Role `{role_slug}` failed its reply-shape contract gate on ALL {attempts} attempt(s) of the response-form correction loop — the task is parked, nothing was published. Full violation list of the last attempt:{bullet_list}\n\nFix the FORM source (the stored contract, the role prompt, or `config/workflow/response-form-loop.yaml`) and answer this question, then re-run `devai task run`: the remembered stage replays from the answer. This is protocol noise, not a content judgement — do NOT count it as the role failing its task.",
+        ),
+        context: Some(format!("gate=response-form-loop role={role_slug} attempts={attempts}")),
+        options: vec![
+            "fix contract/prompt/config and re-run this role".into(),
+            "answer with correction guidance for the next attempt".into(),
+        ],
+        blocking: true,
+    });
+    Ok(m)
+}
+
 // ---------------------------------------------------------------------------
 // holds: pause / block / cancel / fail
 // ---------------------------------------------------------------------------

@@ -1117,8 +1117,25 @@ fn publish_raw(
     category: DataCategory,
 ) -> Result<Artifact> {
     if let Some(c) = &contract {
-        if ctx.store.get_contract(&c.name, c.version)?.is_none() {
+        let schema = ctx.store.get_contract(&c.name, c.version)?;
+        if schema.is_none() {
             bail!("contract {c} is not registered (devai contract add)");
+        }
+        // Gate parity (ratified OQ-FG-05, REQ-FG-08): a manual
+        // `devai artifact publish` runs the SAME contract gate as the engine
+        // loop — otherwise a non-contract-shaped body enters the store via
+        // the CLI and a later stage re-validates on the role's behalf. The
+        // decision ratified the PRESENTATION (warning + the FULL violation
+        // list) and the scope; the spec fixes enforcement
+        // ("контракт-гейт не обходится выбором пути публикации", AC: the
+        // manual path rejects with the same list) — so: print every
+        // violation, then refuse.
+        let violations = devai_runtime::contract_violations(String::from_utf8_lossy(&content).as_ref(), schema.as_deref())?;
+        if !violations.is_empty() {
+            for v in &violations {
+                eprintln!("warning: {c} contract gate rejected this artifact: {v}");
+            }
+            bail!("artifact does not satisfy contract {c}: {violations:?}");
         }
     }
     Ok(ctx.store.publish_artifact(ArtifactDraft {
@@ -1314,6 +1331,10 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 started_at: ctx.now(),
                 finished_at: None,
                 workspace_revision: Some(revision),
+                // A manual start is its own root attempt (REQ-FG-06).
+                attempt: 1,
+                parent_execution: None,
+                failure_class: None,
             };
             ctx.store.start_execution(&e)?;
             outln!("execution {} for role {role}@{version} started in state {}", short(&e.id), task.state.as_str());
@@ -1355,7 +1376,17 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 outln!("(no executions)");
             } else {
                 for e in es {
-                    outln!("{}  {:<22} {:<12} {:<10} {}", short(&e.id), e.role_slug, short(&e.task_id), e.status.as_str(),
+                    // The form loop is readable from ROW DATA (REQ-FG-07):
+                    // attempt number and failure class are stored columns,
+                    // not something the display reconstructs by parsing text.
+                    let mut flags = String::new();
+                    if e.attempt > 1 {
+                        flags.push_str(&format!(" attempt#{}", e.attempt));
+                    }
+                    if let Some(fc) = &e.failure_class {
+                        flags.push_str(&format!(" [{fc}]"));
+                    }
+                    outln!("{}  {:<22} {:<12} {:<10}{} {}", short(&e.id), e.role_slug, short(&e.task_id), e.status.as_str(), flags,
                         e.summary.as_deref().or(e.error.as_deref()).map(|s| ellipsis(s, 60)).unwrap_or_default());
                 }
             }

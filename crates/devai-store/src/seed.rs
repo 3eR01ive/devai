@@ -49,6 +49,11 @@ pub fn seed_defaults(store: &Store, now: Timestamp) -> StoreResult<usize> {
 /// Seed from an explicit config directory (CLI `--config`).
 pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize> {
     let cfg = config::load(dir)?;
+    // Validate the loop budget at init time so a typo'd
+    // `config/workflow/response-form-loop.yaml` is a LOUD seed error, not a
+    // silently ignored policy (the engine itself falls back to factory
+    // defaults — the home has been proven here by then).
+    config::load_response_form_policy(&dir.join("workflow"))?;
     let inserted = config::seed_roles(store, &cfg, now)?;
 
     for (name, version, schema) in contracts() {
@@ -118,6 +123,62 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
     "unknowns": { "type": "array", "items": { "type": "string" } },
     "assumptions": { "type": "array", "items": { "type": "string" } },
     "change_history": { "type": "array", "items": { "type": "object" } }
+  }
+}"#,
+        ),
+        (
+            // @2 — reply-shape consistency of the SAME contract the gate
+            // enforces (REQ-FG-05/06, ratified OQ-FG-03/07). @1 stays seeded
+            // as history, insert-only. Fixes @1's hidden expectation
+            // `business_description` (required at seed.rs:96 but undeclared
+            // in properties — the 3× "$.business_description: missing
+            // required key" incident class):
+            //  * every required key is now declared in properties (pinned by
+            //    a seed audit test over all CURRENT contract versions);
+            //  * `task_id` and `business_description` left `required`: the
+            //    platform STAMPS `task_id` from the stored task id and
+            //    COMPLETES a skipped `business_description` from the stored
+            //    description before publishing (REQ-FG-06 / OQ-FG-07 — echo
+            //    fields the producer no longer re-types, capture_writing_result
+            //    precedent); `version` stays role-owned (rework semantics);
+            //  * optional typed fields declare nullability ["x","null"] — the
+            //    schema is the single truth for producer AND validator;
+            //  * WRITE policy (prompts/common.yaml): omit absent fields, never
+            //    write null; READ policy (the subset validator): explicit null
+            //    on an OPTIONAL field reads as absence (OQ-FG-03).
+            "requirements-specification",
+            2,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Requirements Specification v2 — reply shape consistent with the gate",
+  "description": "Reply-shape contract of the requirements analyst. WRITE: an optional field you cannot fill is OMITTED entirely — never written as null. READ: the platform gate accepts an explicit null on an optional field as absence and rejects it on a required one. `task_id` is stamped by the platform from stored data (the role does not carry it back); `business_description` is completed from the stored task description when skipped; `version` is role-owned (rework bumps it). Every required key below is declared in `properties` — the schema states exactly what the gate enforces, nothing more.",
+  "type": "object",
+  "required": ["version", "requirements", "unknowns", "assumptions"],
+  "properties": {
+    "task_id": { "type": ["string", "null"], "description": "optional in the reply — the platform stamps the stored task id before publishing" },
+    "version": { "type": "integer", "minimum": 1 },
+    "source": { "type": ["string", "null"], "description": "initial description or reference" },
+    "business_description": { "type": ["string", "null"], "description": "optional in the reply — the platform completes it from the stored task description when absent" },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "statement"],
+        "properties": {
+          "id": { "type": "string" },
+          "statement": { "type": "string" },
+          "acceptance_criteria": { "type": ["array", "null"], "items": { "type": "string" } },
+          "constraints": { "type": ["array", "null"], "items": { "type": "string" } },
+          "depends_on": { "type": ["array", "null"], "items": { "type": "string" } },
+          "source": { "type": ["object", "null"], "properties": { "file": { "type": "string" }, "commit_sha": { "type": "string" }, "checked_at": { "type": "string" } } },
+          "unverified": { "type": ["boolean", "null"] }
+        }
+      }
+    },
+    "open_questions": { "type": ["array", "null"], "items": { "type": "string" } },
+    "unknowns": { "type": "array", "items": { "type": "string" } },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "change_history": { "type": ["array", "null"], "items": { "type": "object" } }
   }
 }"#,
         ),

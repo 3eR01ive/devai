@@ -46,5 +46,5 @@ instructions: >-
   штампует платформа фактическими значениями репозитория — не выдумывай их.
 done_criteria: Код изменён в рабочем каталоге, сборка и тесты прогнаны, Implementation Report опубликован
 tools: ["git", "filesystem:read-write", "shell:test", "shell:build"]
-input_contract: requirements-specification@1
+input_contract: requirements-specification@2
 output_contract: implementation-report@2
