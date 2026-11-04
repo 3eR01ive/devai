@@ -1,4 +1,4 @@
--- Devai local store schema (v6).
+-- Devai local store schema (v7).
 -- SQLite is the local system of record; everything is domain data so a task
 -- can be restored after a restart and exported for portability.
 -- v2 adds workspace provenance: role_executions.workspace_revision and the
@@ -33,6 +33,17 @@
 -- attempt=1, NULL parent, NULL class.
 -- (Renumbered 005→006 at integration: the decisions backfill took 005 in
 -- main first — same merge-act precedent as 004→005 before it.)
+-- v7 pins the SINGLE-WRITER guard (REQ-SW-01/03, ratified OQ-1/OQ-2): at
+-- most one RUNNING execution per task_id — the partial unique index below,
+-- the same storage-level discipline as artifacts_single_current (v3) — and
+-- the owner identity stamped platform-side at start (`owner_pid`,
+-- `owner_host`, `owner_process_start`). Rows written before v7 keep NULL:
+-- they read as «owner unknown» (a triage marker), never as «owner dead»
+-- (REQ-SW-03 AC2). Existing v6 databases gain both via
+-- migrations/007_single_writer_guard.sql, whose apply handler first closes
+-- duplicate RUNNING rows (newest started_at survives, the rest FAILED with
+-- the 'single-writer migration' marker and one fact event per group) so
+-- the index DDL lands without aborting the ladder.
 
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
@@ -170,9 +181,28 @@ CREATE TABLE role_executions(
   -- no class — the loop never rewrites history.
   attempt            INTEGER NOT NULL DEFAULT 1,
   parent_execution   TEXT NULL,
-  failure_class      TEXT NULL
+  failure_class      TEXT NULL,
+  -- Single-writer owner identity (v7, REQ-SW-03, ratified OQ-2): captured
+  -- PLATFORM-side at start, never supplied by a model (the workspace_revision
+  -- precedence). owner_process_start is the START TIME OF THE PROCESS (epoch
+  -- seconds) — pid + start time is the pid-reuse defense ratified by OQ-3
+  -- (`kill(pid,0)` alone is not enough). NULL = written before v7: «unknown
+  -- owner», a triage signal, never «dead».
+  owner_pid          INTEGER NULL,
+  owner_host         TEXT NULL,
+  owner_process_start INTEGER NULL
 );
 CREATE INDEX exec_task ON role_executions(task_id);
+-- The single-writer invariant pinned at the database level (REQ-SW-01,
+-- A-5): one RUNNING execution per task_id — two writers into one rework
+-- branch are impossible at the storage layer, on every start path (CLI
+-- `exec start`, engine stages, the form loop). The predicate cites exactly
+-- the stored string 'RUNNING' (types.rs ExecutionStatus). Fail-loud on a
+-- second start: the store maps the violation to StoreError::SingleWriterBusy
+-- naming the live row — never an opaque constraint message.
+CREATE UNIQUE INDEX role_executions_single_writer
+  ON role_executions(task_id)
+  WHERE status = 'RUNNING';
 
 -- Evaluation profile history: every (name, version) ever seeded, with the
 -- raw YAML body, so a recorded profile identity in an old execution stays

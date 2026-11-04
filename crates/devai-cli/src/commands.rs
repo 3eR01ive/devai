@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
 use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
-use devai_runtime::{worktree, Engine, Gate};
+use devai_runtime::{liveness, worktree, Engine, Gate};
 use devai_store::{ArtifactDraft, Store, guess_media_type};
 use uuid::Uuid;
 
@@ -478,6 +478,15 @@ where
 /// Drive the task through every AUTONOMOUS stage with a real role
 /// execution. Stops at human gates (APPROVAL, acceptance) — never past them.
 fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&std::path::Path>, force_reaudit: bool, json: bool) -> Result<()> {
+    // REQ-SW-05: while the task carries an unresolved RUNNING execution —
+    // live writer or orphan — `task run` refuses with the blocking row's
+    // full id and the allowed exits. The engine's own start would hit the
+    // same wall at the index (enforcement point), this is the labeled,
+    // early refusal. A pre-check failure on an unknown id resolves inside
+    // the engine exactly as before.
+    if let Ok(task) = ctx.store.resolve_task(id) {
+        running_writer_guard(ctx, &task)?;
+    }
     let mut engine = Engine::new(&ctx.store).with_force_reaudit(force_reaudit);
     if let Some(w) = workspace {
         engine = engine.with_workspace(w);
@@ -1028,7 +1037,20 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
                 }
             }
             let execution_id = match execution.as_deref() {
-                Some(e) => Some(ctx.store.get_execution(e)?.id),
+                Some(e) => {
+                    // Ratified OQ-4: a publication into a row that is no
+                    // longer RUNNING is a LOUD refusal — the orphan whose
+                    // process survived its own cancellation must not write
+                    // into a closed execution («зомби не пишет в закрытую
+                    // строку»). Work that continues needs a NEW execution
+                    // opened by the platform (and the single-writer index
+                    // will let only one exist).
+                    let ex = ctx.store.get_execution(e)?;
+                    if ex.status != ExecutionStatus::Running {
+                        bail!("execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)", ex.id, ex.status.as_str());
+                    }
+                    Some(ex.id)
+                }
                 None => None,
             };
             let created_by = match &execution_id {
@@ -1308,11 +1330,47 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
 // role executions
 // ---------------------------------------------------------------------------
 
+/// REQ-SW-02/05: the CLI refusal shown BEFORE an attempt is made, when the
+/// task already carries a RUNNING execution. This is the labeled
+/// application-level check; the ENFORCEMENT point stays the SQLite partial
+/// unique index (spec A-5 — a pre-check never replaces the index, and a
+/// race between this read and the INSERT still lands on
+/// `StoreError::SingleWriterBusy`). The refusal is distinct per ratified
+/// liveness class (OQ-3/OQ-5): a LIVE writer means the one-writer invariant
+/// fired; a DEAD owner is an orphan only a human resolves; an owner that
+/// cannot be checked renders as-is, never as dead. The only resolution is
+/// closing the row with `exec finish|fail|cancel` — the process itself is
+/// never touched (REQ-SW-06).
+fn running_writer_guard(ctx: &Ctx, task: &Task) -> Result<()> {
+    let blocker = ctx.store.list_executions(Some(task.id))?.into_iter().find(|e| e.status == ExecutionStatus::Running);
+    let Some(e) = blocker else { return Ok(()) };
+    let owner = match (e.owner_pid, e.owner_host.as_deref()) {
+        (Some(pid), Some(host)) => format!("pid {pid}@{host}"),
+        (Some(pid), None) => format!("pid {pid} (host unrecorded)"),
+        (None, _) => "owner unrecorded (row predates the v7 guard)".to_string(),
+    };
+    let verdict = match liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start) {
+        liveness::Liveness::Alive => format!("a LIVE writer is in flight ({owner}) — wait for it to finish, or stop it explicitly"),
+        liveness::Liveness::Dead => format!("an ORPHAN ({owner} is no longer running) — nobody is collecting this writer's work"),
+        liveness::Liveness::Unknown => format!("a writer whose owner cannot be verified ({owner}) — never assumed dead"),
+    };
+    bail!(
+        "single-writer guard: task `{}` already has a RUNNING execution `{}` — {} ({}). \
+         The second writer is refused by design: no queueing, no overwrite. \
+         Resolve the open row first (a human decision, the process is not touched): \
+         `devai exec finish|fail|cancel {}`",
+        task.id, e.id, verdict, short(&e.id), e.id
+    )
+}
+
 fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
         ExecCmd::Start { id, role, agent, inputs } => {
             let task = ctx.store.resolve_task(&id)?;
             workflow::check_execution_allowed(&role, &task).map_err(anyhow::Error::new)?;
+            // REQ-SW-02 AC2 (CLI path): refuse the second RUNNING row with
+            // the blocking id named, before the index would reject it.
+            running_writer_guard(ctx, &task)?;
             let rd = ctx.store.get_role(&role)?;
             let version = rd.as_ref().map(|r| r.version).unwrap_or(1);
             let inputs_str: Vec<String> = resolve_ids(ctx, &inputs)?.iter().map(|i| i.to_string()).collect();
@@ -1320,6 +1378,11 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
             // workspace state the platform can observe right now (cwd),
             // computed platform-side — never supplied by the caller.
             let revision = Engine::new(&ctx.store).current_revision().map_err(anyhow::Error::new)?;
+            // REQ-SW-03: the owner columns are captured platform-side, the
+            // same way as the revision — this CLI process is the one
+            // OPENING the row. When it exits and the row is still RUNNING,
+            // the orphan detect (REQ-SW-04) will find exactly that.
+            let (owner_pid, owner_host, owner_process_start) = liveness::current_owner().into_columns();
             let e = RoleExecution {
                 id: new_id(),
                 task_id: task.id,
@@ -1337,6 +1400,9 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 attempt: 1,
                 parent_execution: None,
                 failure_class: None,
+                owner_pid,
+                owner_host,
+                owner_process_start,
             };
             ctx.store.start_execution(&e)?;
             outln!("execution {} for role {role}@{version} started in state {}", short(&e.id), task.state.as_str());
@@ -1407,11 +1473,17 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
 /// printed only where the platform recorded the `worktree.prepared` fact for
 /// that task — otherwise a dash, never an invented directory. Rows come in
 /// elapsed-descending order, oldest work first, ties by id — deterministic
-/// (OQ-3 as ratified). The `stale?` mark is exactly the ratified limit of
-/// OQ-2: the store keeps no OS pid, so this view performs NO pid detection
-/// (real orphan detection is the guard task's ownership) — it marks a row
-/// only where the store itself proves the contradiction: the task is already
-/// in a terminal state while its execution is still RUNNING. The command
+/// (OQ-3 as ratified). The `stale?` mark is the guard task's shipped
+/// detect (REQ-SW-04, ratified OQ-5: ADDITIVE, never a replacement): a row
+/// is stale where the task is already in a terminal state while its
+/// execution is still RUNNING — the store-proven contradiction the view
+/// always marked — OR where the row's recorded owner process is provably
+/// DEAD on this host (pid gone, or pid recycled under the OQ-3 start-time
+/// check). An owner that cannot be checked (other host, no /proc, a row
+/// predating rung 007) is NOT dead: it renders `owner?` as a separate
+/// triage marker and `owner_liveness: "unknown"` in json, as-is. Detection
+/// is READ-ONLY (REQ-SW-06): this view writes nothing and kills no one —
+/// resolution belongs to a human via `exec fail|cancel`. The command
 /// writes nothing and waits for nothing: print the snapshot, exit 0 — an
 /// empty list is the normal idle state, not an error (REQ-ACT-04). It
 /// deliberately stops short of the per-task pipeline: `task progress <id>`
@@ -1448,10 +1520,28 @@ fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
         }
     }
 
+    // One liveness observation per row, computed ONCE for the snapshot
+    // (json and text render the same answer; the OS is not consulted
+    // twice). Read-only: REQ-SW-06 — detection never writes and never
+    // signals a process.
+    let checked: Vec<(Id, liveness::Liveness)> = running
+        .iter()
+        .map(|e| (e.id, liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start)))
+        .collect();
+    let live_of = |id: Id| checked.iter().find(|(i, _)| *i == id).map(|(_, l)| *l).unwrap_or(liveness::Liveness::Unknown);
+
     let rows: Vec<serde_json::Value> = running
         .iter()
         .map(|e| {
             let (t, prepared) = &facts[&e.task_id];
+            // REQ-SW-04 AC1: stale = terminal task OR dead owner — the two
+            // ratified signals stay separately visible (OQ-5: additive, not
+            // a replacement): the terminal mark keeps its exact meaning,
+            // the orphan is a new cause beside it. `owner_liveness` is the
+            // triage surface for everything not provable (OQ-3: a foreign
+            // host renders as-is, never dead).
+            let liveness_row = live_of(e.id);
+            let terminal = t.state.is_terminal();
             serde_json::json!({
                 "id": e.id.to_string(),
                 "task_id": e.task_id.to_string(),
@@ -1462,7 +1552,12 @@ fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
                 "started_at": e.started_at,
                 "elapsed_seconds": (now - e.started_at).num_seconds().max(0),
                 "state": t.state.as_str(),
-                "stale": t.state.is_terminal(),
+                "stale": terminal || liveness_row == liveness::Liveness::Dead,
+                "stale_terminal_task": terminal,
+                "stale_dead_owner": liveness_row == liveness::Liveness::Dead,
+                "owner_pid": e.owner_pid,
+                "owner_host": e.owner_host,
+                "owner_liveness": liveness_row.as_str(),
                 "branch": prepared.then(|| worktree::branch_name(e.task_id)),
                 "worktree": prepared.then(|| worktree::path_for(&ctx.home, e.task_id).display().to_string()),
             })
@@ -1485,13 +1580,23 @@ fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
         // OQ-6 (ratified): the row carries short task id, role@version,
         // elapsed and stage — never the title (it is one `task progress <id>`
         // away); the worktree link only on the platform fact. The trailing
-        // `stale?` is the OQ-2 mark: terminal task, execution still RUNNING.
+        // `stale?` is the REQ-SW-04 additive mark: terminal task (the mark
+        // this view always had) OR provably-dead owner (orphan). A row whose
+        // owner cannot be checked gets the separate `owner?` triage mark —
+        // never `stale?`, never assumed dead (OQ-3).
         let link = if *prepared {
             format!("{}  {}", worktree::branch_name(e.task_id), worktree::path_for(&ctx.home, e.task_id).display())
         } else {
             "—".to_string()
         };
-        let stale = if t.state.is_terminal() { "  stale?" } else { "" };
+        let live = live_of(e.id);
+        let stale = if t.state.is_terminal() || live == liveness::Liveness::Dead {
+            "  stale?"
+        } else if live == liveness::Liveness::Unknown {
+            "  owner?"
+        } else {
+            ""
+        };
         outln!(
             "  {:<12} {:<24} {:<16} {:<13} {}{}",
             short(&e.task_id),

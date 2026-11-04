@@ -153,6 +153,11 @@ fn export_import_roundtrip_restores_everything() {
         attempt: 1,
         parent_execution: None,
         failure_class: None,
+        // v7 owner identity (REQ-SW-03): a fixture value — the roundtrip
+        // below checks it travels into the bundle and back.
+        owner_pid: Some(4242),
+        owner_host: Some("fixture-host".into()),
+        owner_process_start: Some(1_730_000_000),
     };
     store.start_execution(&e).unwrap();
     let q = Question {
@@ -227,6 +232,11 @@ fn export_import_roundtrip_restores_everything() {
         Some(&revision),
         "bundle roundtrip must preserve the workspace binding exactly"
     );
+    // REQ-SW-03 AC3: the owner identity travels with the row (ratified
+    // OQ-2 — columns, so bundle export/import carries them verbatim).
+    assert_eq!(execs2[0].owner_pid, Some(4242), "owner pid survives the roundtrip: {:?}", execs2[0]);
+    assert_eq!(execs2[0].owner_host.as_deref(), Some("fixture-host"), "owner host survives the roundtrip");
+    assert_eq!(execs2[0].owner_process_start, Some(1_730_000_000), "owner process start survives the roundtrip");
     // And the cited profile identity resolves in the fresh store too.
     assert!(store2.get_evaluation_profile("quality", 3).unwrap().is_some(), "imported bundle re-seeds the profile history its revisions reference");
     let q2 = store2.get_question(&q.id.to_string()).unwrap();
@@ -431,13 +441,20 @@ fn supersession_events_are_batched_per_publication() {
 /// across the CLI. Prefix resolution must REFUSE to guess which row the
 /// caller meant — silently taking the first match would finish the wrong
 /// execution. Same loud discipline as `resolve_task`.
+///
+/// Since the v7 single-writer guard the two colliding rows live on
+/// DIFFERENT tasks: at most one RUNNING execution per task_id is storable
+/// now (partial unique index, REQ-SW-01), while same-millisecond prefix
+/// collisions remain reachable across tasks — the class of ambiguity this
+/// test pins is unchanged by the guard.
 #[test]
 fn execution_id_prefix_resolution_fails_loudly_on_ambiguity() {
     let (_d, store) = open();
-    let t = draft(&store);
-    let exec = |s: &str| RoleExecution {
+    let ta = draft(&store);
+    let tb = draft(&store);
+    let exec = |s: &str, task_id: Id| RoleExecution {
         id: Id::parse_str(s).unwrap(),
-        task_id: t.id,
+        task_id,
         role_slug: "implementation-agent".into(),
         role_version: 1,
         agent_name: Some("mock".into()),
@@ -451,9 +468,12 @@ fn execution_id_prefix_resolution_fails_loudly_on_ambiguity() {
         attempt: 1,
         parent_execution: None,
         failure_class: None,
+        owner_pid: None,
+        owner_host: None,
+        owner_process_start: None,
     };
-    let a = exec("01a1a5db-3ba0-7a5b-8176-3f38ad4c1ea8");
-    let b = exec("01a1a5db-3ba1-7a5b-8176-3f38ad4c1ea9");
+    let a = exec("01a1a5db-3ba0-7a5b-8176-3f38ad4c1ea8", ta.id);
+    let b = exec("01a1a5db-3ba1-7a5b-8176-3f38ad4c1ea9", tb.id);
     store.start_execution(&a).unwrap();
     store.start_execution(&b).unwrap();
 

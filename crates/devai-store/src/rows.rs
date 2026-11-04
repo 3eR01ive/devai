@@ -233,6 +233,12 @@ pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
         attempt: get::<i64>(r, 12)? as u32,
         parent_execution: opt_id(get(r, 13)?)?,
         failure_class: get(r, 14)?,
+        // Pre-v7 rows keep NULL owner columns: «owner unknown», a triage
+        // signal — never coerced into «owner dead» (REQ-SW-03 AC2, REQ-SW-04
+        // AC3). The liveness question is answered by the reader, not here.
+        owner_pid: get(r, 15)?,
+        owner_host: get(r, 16)?,
+        owner_process_start: get(r, 17)?,
     })
 }
 

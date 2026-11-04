@@ -46,6 +46,25 @@ const SUPERSESSION_BACKFILL_REASON: &str = "publication did not honor supersessi
 /// is auditable, not silent.
 const DECISIONS_BACKFILL_REASON: &str = "approve/reject/return rationales lived only in event payloads before the decisions write-path: each undisclosed rationale is copied VERBATIM into a NEW decision row (actor/created_at from the event columns, refs cite the source event id) — existing decisions and events are never touched";
 
+/// Why the v7 single-writer migration closed RUNNING rows — the ratified
+/// marker string (OQ-1: «остальные закрываются FAILED с явной пометкой
+/// 'single-writer migration'») written into each closed row's `error`
+/// column AND cited verbatim in its repair event, so the one-time closure
+/// is auditable, never silent.
+const SINGLE_WRITER_REPAIR_REASON: &str = "single-writer migration: the v7 index allows at most one RUNNING execution per task_id; within each duplicated group the newest started_at stays RUNNING (equal started_at resolves on the UUIDv7 id order, same tie discipline as rung 003), the others are closed FAILED — a status/finished_at/error write only, no row or event is deleted or rewritten";
+
+/// The loser predicate of the v7 repair: a RUNNING row that has a strictly
+/// better RUNNING sibling in its task under the total order (started_at,
+/// id) — newest started_at wins, ties break on the UUIDv7 id (lexicographic
+/// order IS time order). Detection runs FIRST inside the rung transaction,
+/// exactly like `MULTI_CURRENT_LOSER_PREDICATE` in rung 003, so each closed
+/// row is named by its repair event before the UPDATE flips it.
+const RUNNING_DUPLICATE_LOSER_PREDICATE: &str = "status = 'RUNNING' AND EXISTS (\
+    SELECT 1 FROM role_executions AS b \
+    WHERE b.task_id = role_executions.task_id AND b.status = 'RUNNING' \
+      AND (b.started_at > role_executions.started_at \
+        OR (b.started_at = role_executions.started_at AND b.id > role_executions.id)))";
+
 /// The loser predicate of the v3 repair: a CURRENT row that has a strictly
 /// better CURRENT sibling in its (task_id, kind) group under the total
 /// order (seq, created_at, id). Kept byte-identical to the UPDATE in
@@ -100,7 +119,7 @@ pub(crate) fn schema_rungs() -> Vec<SchemaRung> {
 /// behavior appends a handler here. The tag NAME is manifest data; this
 /// table maps name → behavior, failing loud on a tag it cannot run.
 type RungApply = fn(&Transaction<'_>, &SchemaRung) -> StoreResult<()>;
-const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill), ("decisions_backfill", decisions_backfill), ("execution_form_columns", execution_form_columns)];
+const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill), ("decisions_backfill", decisions_backfill), ("execution_form_columns", execution_form_columns), ("single_writer_repair", single_writer_repair)];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
 pub struct Store {
@@ -957,9 +976,9 @@ impl Store {
         // computed at execution start. NULL is reserved for rows written
         // before provenance existed and for manual rows without one.
         let revision = e.workspace_revision.as_ref().map(|r| json_string(r));
-        tx.execute(
-            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9,?10,?11,NULL)",
+        let insert = tx.execute(
+            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9,?10,?11,NULL,?12,?13,?14)",
             params![
                 e.id.to_string(),
                 e.task_id.to_string(),
@@ -972,8 +991,41 @@ impl Store {
                 revision,
                 e.attempt as i64,
                 e.parent_execution.map(|p| p.to_string()),
+                // Owner identity (REQ-SW-03): what the platform-side caller
+                // recorded at construction. Direct store users may leave
+                // NULL — such rows read as «owner unknown», never «dead».
+                e.owner_pid,
+                e.owner_host,
+                e.owner_process_start,
             ],
-        )?;
+        );
+        if let Err(err) = insert {
+            // REQ-SW-01/02: the partial unique index rejected a second
+            // RUNNING row for this task. Map the opaque violation to the
+            // named variant citing the blocking row (the raw SQLite message
+            // carries no execution id — the acceptance demands one). A
+            // unique violation NOT naming task_id (the row id) or a missing
+            // RUNNING row means some other constraint fired: propagate.
+            if is_single_writer_violation(&err) {
+                let blocker: Option<(String, String, Option<i64>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT id, started_at, owner_pid, owner_host FROM role_executions WHERE task_id=?1 AND status='RUNNING' ORDER BY started_at, id LIMIT 1",
+                        params![e.task_id.to_string()],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?;
+                if let Some((id, started_at, owner_pid, owner_host)) = blocker {
+                    return Err(StoreError::SingleWriterBusy {
+                        task_id: e.task_id.to_string(),
+                        existing_id: id,
+                        started_at,
+                        owner_pid,
+                        owner_host,
+                    });
+                }
+            }
+            return Err(err.into());
+        }
         tx.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![
@@ -1046,7 +1098,7 @@ impl Store {
         // would finish the WRONG execution — over main's widened row (the
         // form-loop columns attempt/parent_execution/failure_class ride in).
         let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class
+            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start
              FROM role_executions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 2",
         )?;
         let mut rows = stmt.query(params![id.to_lowercase()])?;
@@ -1066,11 +1118,11 @@ impl Store {
     pub fn list_executions(&self, task_id: Option<Id>) -> StoreResult<Vec<RoleExecution>> {
         let (sql, args): (&str, Vec<Option<String>>) = match task_id {
             Some(t) => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class FROM role_executions WHERE task_id=?1 ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start FROM role_executions WHERE task_id=?1 ORDER BY started_at",
                 vec![Some(t.to_string())],
             ),
             None => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class FROM role_executions ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start FROM role_executions ORDER BY started_at",
                 vec![],
             ),
         };
@@ -1200,6 +1252,17 @@ fn apply_script(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
     Ok(())
 }
 
+/// True when a failed `role_executions` statement hit the v7 partial unique
+/// index: the violation fires on the indexed column pair (`task_id` in the
+/// SQLite message), not on the row id. Anything else — FK, NOT NULL, a
+/// PRIMARY KEY collision — stays the opaque `Sql` it honestly is.
+fn is_single_writer_violation(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(f, msg) => f.code == rusqlite::ErrorCode::ConstraintViolation && msg.as_deref().map_or(true, |m| m.contains("role_executions.task_id")),
+        _ => false,
+    }
+}
+
 /// Rung v4→v5: the three additive `role_executions` columns of the
 /// response-form loop. SQLite has no `ADD COLUMN IF NOT EXISTS`, so the
 /// shipped script is executed STATEMENT BY STATEMENT, each `ADD COLUMN`
@@ -1212,6 +1275,14 @@ fn apply_script(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
 /// abort. An `ADD COLUMN` statement is recognized textually from the script
 /// itself — the .sql file stays the single source of the target shape.
 fn execution_form_columns(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    apply_script_with_column_skip(tx, step.script)
+}
+
+/// Statement-by-statement script application with `ADD COLUMN` presence
+/// checks (SQLite has no `ADD COLUMN IF NOT EXISTS`) — the idempotence pure
+/// SQL cannot express, shared by rung 006 and rung 007. Everything else
+/// (index DDL written `IF NOT EXISTS`) runs verbatim.
+fn apply_script_with_column_skip(tx: &Transaction<'_>, script: &'static str) -> StoreResult<()> {
     let existing: Vec<String> = {
         let mut stmt = tx.prepare("SELECT name FROM pragma_table_info('role_executions')")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -1220,8 +1291,7 @@ fn execution_form_columns(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResul
     // `--` commentary (Russian included, and its punctuation may contain
     // `;`) is cut from EVERY line BEFORE splitting on statements — comment
     // text must never reach the executor or the token parser.
-    let code: String = step
-        .script
+    let code: String = script
         .lines()
         .map(|l| match l.find("--") {
             Some(i) => &l[..i],
@@ -1481,6 +1551,85 @@ fn decisions_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()
                     (json_field::SOURCE_EVENTS): source_events,
                     (json_field::DECISION_IDS): decision_ids,
                     (json_field::REASON): DECISIONS_BACKFILL_REASON,
+                })),
+                rows::ts(&Utc::now()),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Rung v6→v7 (REQ-SW-01/07, ratified OQ-1): the single-writer guard lands
+/// on an EXISTING database whose history may already hold several RUNNING
+/// rows for one task — nothing forbade that before v7, so a bare
+/// `CREATE UNIQUE INDEX` would abort the ladder on a store that is merely
+/// old, not corrupt. The repair, in the 003 observe-before-mutate shape:
+/// detection runs FIRST inside the rung transaction (exactly the rows the
+/// closure flips, cited by id in the event, never performed silently), the
+/// losers close as FAILED carrying the 'single-writer migration' marker in
+/// `error` — winner = newest `started_at`, ties on the UUIDv7 id order —
+/// then the shipped script applies idempotently (columns + index), then one
+/// fact event per duplicated task. Rerunning the rung against an already
+/// honest database matches zero rows, closes zero rows, writes zero events.
+/// A status/finished_at/error write only: no row or event is deleted, no
+/// review chain is touched (the append-only store discipline).
+fn single_writer_repair(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    let losers: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, task_id FROM role_executions WHERE {RUNNING_DUPLICATE_LOSER_PREDICATE} ORDER BY task_id, started_at, id"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push((r.get(0)?, r.get(1)?));
+        }
+        out
+    };
+    let now = rows::ts(&Utc::now());
+    for (id, _) in &losers {
+        tx.execute("UPDATE role_executions SET status='FAILED', finished_at=?1, error=?2 WHERE id=?3", params![now, SINGLE_WRITER_REPAIR_REASON, id])?;
+    }
+    // Columns + index DDL, idempotent (the 006 ADD COLUMN precedent): the
+    // closure above already left every group with exactly one RUNNING row,
+    // so the unique index builds.
+    apply_script_with_column_skip(tx, step.script)?;
+    // One fact event per duplicated task (grouping discipline of 003/005;
+    // a clean database produces zero events).
+    let mut by_task: Vec<(String, Vec<String>)> = Vec::new();
+    for (id, task_id) in losers {
+        match by_task.iter_mut().find(|(t, _)| *t == task_id) {
+            Some((_, ids)) => ids.push(id),
+            None => by_task.push((task_id, vec![id])),
+        }
+    }
+    for (task_id, ids) in by_task {
+        // The surviving RUNNING row of the group: exactly one — the strict
+        // maximum of the (started_at, id) total order never matches its own
+        // loser predicate.
+        let winner: String = tx
+            .query_row(
+                "SELECT id FROM role_executions WHERE task_id=?1 AND status='RUNNING'",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Corrupt(format!(
+                "single-writer repair left task {task_id} with no RUNNING row — aborted before commit"
+            )))?;
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                task_id,
+                event_kind::EXECUTION_SINGLE_WRITER_REPAIR,
+                format!("{MIGRATION_ACTOR_PREFIX}{}", step.id),
+                json_string(&serde_json::json!({
+                    (json_field::BACKFILL): step.id,
+                    (json_field::SCRIPT_PATH): step.script_path,
+                    (json_field::TASK_ID): task_id,
+                    "kept_running": winner,
+                    "closed_executions": ids,
+                    (json_field::REASON): SINGLE_WRITER_REPAIR_REASON,
                 })),
                 rows::ts(&Utc::now()),
             ],
@@ -2145,5 +2294,298 @@ mod decisions_backfill_tests {
             .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
             .unwrap();
         assert_eq!(idx, 2, "the completed retry landed the rung's full DDL");
+    }
+}
+
+#[cfg(test)]
+mod single_writer_tests {
+    use super::*;
+
+    /// A full `RoleExecution` literal with overridable fields — every guard
+    /// test starts from the same honest row shape.
+    fn exec_for(task_id: Id, started_at: chrono::DateTime<Utc>) -> RoleExecution {
+        RoleExecution {
+            id: new_id(),
+            task_id,
+            role_slug: "implementation-agent".into(),
+            role_version: 1,
+            agent_name: Some("mock".into()),
+            status: ExecutionStatus::Running,
+            inputs: vec![],
+            summary: None,
+            error: None,
+            started_at,
+            finished_at: None,
+            workspace_revision: None,
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
+            owner_pid: None,
+            owner_host: None,
+            owner_process_start: None,
+        }
+    }
+
+    fn task(store: &Store, name: &str) -> Id {
+        let t = Task::new(name, "fixture", None, Utc::now());
+        store.create_task(&t).unwrap();
+        t.id
+    }
+
+    /// The v7 index as the database sees it (REQ-SW-01: the invariant lives
+    /// in the schema, not only in code).
+    fn index_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='role_executions_single_writer'", [], |r| r.get(0)).unwrap()
+    }
+
+    /// Pretend the store never saw rung 007: the index and the version
+    /// stamp ARE the rung's state change, so dropping the index and walking
+    /// `user_version` back makes duplicate RUNNING history storable exactly
+    /// as it was pre-v7. The owner columns stay — their ADD on a genuinely
+    /// old table shape is what the v1→v7 ladder of `migration_tests` walks
+    /// end-to-end; dropping/re-adding them here would only re-test the
+    /// column-skip path that re-application asserts directly below.
+    fn downgrade_to_v6(store: &Store) {
+        store.conn.execute_batch("DROP INDEX role_executions_single_writer; PRAGMA user_version=6;").unwrap();
+    }
+
+    /// Seed a RUNNING row at an explicit started_at on an old-shape database
+    /// (direct SQL — the v7 write path could not even address such a table).
+    fn seed_running_v6(store: &Store, id: &str, task_id: &str, started_at: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO role_executions(id,task_id,role_slug,role_version,status,started_at) VALUES(?1,?2,'implementation-agent',1,'RUNNING',?3)",
+                params![id, task_id, started_at],
+            )
+            .unwrap();
+    }
+
+    /// REQ-SW-01 AC1: the partial unique index exists on a fresh store and
+    /// rejects a second RUNNING row for one task_id AT THE DATABASE LEVEL —
+    /// raw SQL, bypassing every mapping in this crate.
+    #[test]
+    fn the_index_itself_rejects_a_second_running_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(index_count(&store.conn), 1, "the guard index ships in schema.sql");
+        let t = task(&store, "index");
+        store.start_execution(&exec_for(t, Utc::now())).unwrap();
+        let raw = store.conn.execute(
+            "INSERT INTO role_executions(id,task_id,role_slug,role_version,status,started_at) VALUES('x2',?1,'implementation-agent',1,'RUNNING','2026-11-01T00:00:00.000000Z')",
+            params![t.to_string()],
+        );
+        let err = raw.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("UNIQUE constraint failed: role_executions.task_id"), "the DATABASE refuses, not the code: {msg}");
+    }
+
+    /// REQ-SW-01/02 + OQ-2/REQ-SW-03: the named error cites the blocking
+    /// row and the task; the owner columns round-trip through the reader;
+    /// closing the row re-opens the slot (sequential starts stay legal —
+    /// the form-loop shape, REQ-SW-01 AC4).
+    #[test]
+    fn second_running_start_fails_loud_naming_the_live_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let t = task(&store, "busy");
+        let mut first = exec_for(t, Utc::now());
+        first.owner_pid = Some(4242);
+        first.owner_host = Some("fixture-host".into());
+        first.owner_process_start = Some(1_730_000_000);
+        store.start_execution(&first).unwrap();
+
+        // REQ-SW-03: owner identity travels through the reader unchanged.
+        let read = store.get_execution(&first.id.to_string()).unwrap();
+        assert_eq!(read.owner_pid, Some(4242));
+        assert_eq!(read.owner_host.as_deref(), Some("fixture-host"));
+        assert_eq!(read.owner_process_start, Some(1_730_000_000));
+
+        // REQ-SW-02: the second start yields the NAMED variant, never
+        // an opaque Sql error, and it names both ids.
+        let err = store.start_execution(&exec_for(t, Utc::now())).unwrap_err();
+        match &err {
+            StoreError::SingleWriterBusy { task_id, existing_id, owner_pid, owner_host, .. } => {
+                assert_eq!(*task_id, t.to_string(), "the busy task is named");
+                assert_eq!(*existing_id, first.id.to_string(), "the LIVE row is named by full id");
+                assert_eq!(*owner_pid, Some(4242), "the blocker's owner is cited for triage");
+                assert_eq!(owner_host.as_deref(), Some("fixture-host"));
+            }
+            other => panic!("expected SingleWriterBusy, got {other:?}"),
+        }
+        assert!(err.to_string().contains("single-writer guard"), "the message is self-describing: {err}");
+
+        // Closing the live row re-opens the writer slot — one RUNNING per
+        // task is the invariant, not one-ever (AC4: attempts are sequential).
+        store.finish_execution(&first, ExecutionStatus::Completed, Some("done"), None, Utc::now()).unwrap();
+        let second = exec_for(t, Utc::now());
+        store.start_execution(&second).unwrap();
+        assert!(store.start_execution(&exec_for(t, Utc::now())).is_err(), "and the new RUNNING row blocks again");
+    }
+
+    /// REQ-SW-03 AC2 / OQ-2: rows written without owner columns (direct
+    /// store users, pre-v7 history) read as ALL-NULL owner — «unknown»,
+    /// never a fabricated identity.
+    #[test]
+    fn rows_without_an_owner_read_as_unknown_not_dead() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let t = task(&store, "ownerless");
+        store.start_execution(&exec_for(t, Utc::now())).unwrap();
+        let e = store.list_executions(Some(t)).unwrap().pop().unwrap();
+        assert_eq!((e.owner_pid, e.owner_host.clone(), e.owner_process_start), (None, None, None));
+    }
+
+    /// REQ-SW-07 + ratified OQ-1: opening a v6-shaped store that already
+    /// holds duplicate RUNNING rows heals it atomically — newest
+    /// started_at keeps the slot, the rest close FAILED carrying the
+    /// 'single-writer migration' marker, one fact event names both sides,
+    /// the index lands, the ladder completes. Untouched rows (a clean
+    /// task, a COMPLETED history row) stay byte-stable.
+    #[test]
+    fn migration_closes_losers_keeps_winner_and_records_the_repair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (ta, tb);
+        let (old1, old2, winner, untouched, clean_row);
+        {
+            let store = Store::open(dir.path()).unwrap();
+            ta = task(&store, "duplicated");
+            tb = task(&store, "clean");
+            let (ta_s, tb_s) = (ta.to_string(), tb.to_string());
+            old1 = new_id().to_string();
+            old2 = new_id().to_string();
+            winner = new_id().to_string();
+            untouched = new_id().to_string();
+            clean_row = new_id().to_string();
+            // First become the OLD store, then write the pre-v7 history:
+            // duplicates are storable only where the guard does not yet
+            // exist — nothing forbade these rows then, and the repair must
+            // not treat them as corrupt.
+            downgrade_to_v6(&store);
+            seed_running_v6(&store, &old1, &ta_s, "2026-10-01T00:00:00.000000Z");
+            seed_running_v6(&store, &old2, &ta_s, "2026-10-02T00:00:00.000000Z");
+            seed_running_v6(&store, &winner, &ta_s, "2026-10-03T00:00:00.000000Z");
+            seed_running_v6(&store, &untouched, &ta_s, "2026-09-30T00:00:00.000000Z");
+            // A legitimately closed history row: terminal BEFORE the repair,
+            // with its own close time — the repair must leave it byte-stable.
+            store.conn.execute("UPDATE role_executions SET status='COMPLETED', finished_at='2026-10-01T00:00:00.000000Z' WHERE id=?1", params![&untouched]).unwrap();
+            seed_running_v6(&store, &clean_row, &tb_s, "2026-10-01T00:00:00.000000Z");
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION, "open runs the ladder to v7");
+        assert_eq!(index_count(&store.conn), 1, "the guard index landed after the closure");
+
+        let rows = store.list_executions(Some(ta)).unwrap();
+        let by = |id: &str| rows.iter().find(|e| e.id.to_string() == id).unwrap_or_else(|| panic!("row {id} missing from {rows:?}"));
+        assert_eq!(by(&winner).status, ExecutionStatus::Running, "the NEWEST started_at keeps the single-writer slot (OQ-1)");
+        for loser in [&old1, &old2] {
+            let e = by(loser);
+            assert_eq!(e.status, ExecutionStatus::Failed, "the older duplicate closes FAILED (OQ-1)");
+            assert!(e.error.as_deref().unwrap().starts_with("single-writer migration"), "the explicit marker is in the row itself: {:?}", e.error);
+            assert!(e.finished_at.is_some(), "a closed row carries its close time");
+        }
+        let e = by(&untouched);
+        assert_eq!(e.status, ExecutionStatus::Completed, "terminal history is never touched");
+        assert!(e.error.is_none(), "the repair wrote no marker into an unrelated row");
+        assert_eq!(e.finished_at.map(|f| f.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)).as_deref(), Some("2026-10-01T00:00:00.000000Z"), "its close time is byte-stable — the repair rewrote nothing");
+
+        // The clean task keeps its RUNNING row and gets NO repair event.
+        let clean = store.list_executions(Some(tb)).unwrap();
+        assert_eq!(clean[0].status, ExecutionStatus::Running, "a task without duplicates is untouched");
+        // One fact event for the duplicated task, naming both sides (003's
+        // observe-before-mutate discipline).
+        let facts = store.events(ta, None).unwrap().into_iter().filter(|ev| ev.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).collect::<Vec<_>>();
+        assert_eq!(facts.len(), 1, "one repair event per duplicated task: {facts:?}");
+        let f = &facts[0];
+        assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}007_single_writer_guard"));
+        assert_eq!(f.payload[json_field::BACKFILL], serde_json::json!("007_single_writer_guard"));
+        assert_eq!(f.payload[json_field::SCRIPT_PATH], serde_json::json!("migrations/007_single_writer_guard.sql"));
+        assert_eq!(f.payload["kept_running"], serde_json::json!(winner), "the survivor is cited by id");
+        let closed: Vec<String> = f.payload["closed_executions"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        assert_eq!(closed, vec![old1.clone(), old2.clone()], "every closed row is cited, in loser order");
+        assert!(f.payload[json_field::REASON].as_str().unwrap().contains("single-writer migration"), "the why is recorded, not silent");
+        assert_eq!(
+            store.events(tb, None).unwrap().iter().filter(|ev| ev.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).count(),
+            0,
+            "a clean database produces zero events (the 003 precedent)"
+        );
+    }
+
+    /// OQ-1 tie rule: equal started_at resolves on the UUIDv7 id order
+    /// (lexicographic id IS time order) — same tie discipline as rung 003.
+    #[test]
+    fn equal_started_at_breaks_on_the_id_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ta;
+        let (lo, hi);
+        {
+            let store = Store::open(dir.path()).unwrap();
+            ta = task(&store, "tie");
+            let ta_s = ta.to_string();
+            lo = new_id().to_string();
+            hi = new_id().to_string();
+            let at = "2026-10-01T00:00:00.000000Z";
+            downgrade_to_v6(&store);
+            seed_running_v6(&store, &lo, &ta_s, at);
+            seed_running_v6(&store, &hi, &ta_s, at);
+        }
+        let (winner, loser) = if lo > hi { (lo.clone(), hi.clone()) } else { (hi.clone(), lo.clone()) };
+        let store = Store::open(dir.path()).unwrap();
+        let rows = store.list_executions(Some(ta)).unwrap();
+        let by = |id: &str| rows.iter().find(|e| e.id.to_string() == id).unwrap();
+        assert_eq!(by(&winner).status, ExecutionStatus::Running, "the lexicographically greater id wins the tie");
+        assert_eq!(by(&loser).status, ExecutionStatus::Failed);
+    }
+
+    /// REQ-SW-07 idempotence: a re-applied rung 007 (version forced back)
+    /// matches zero duplicates, closes zero rows, writes zero events — the
+    /// repair cannot run twice on one history.
+    #[test]
+    fn reapplying_the_rung_on_a_healed_store_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ta;
+        {
+            let store = Store::open(dir.path()).unwrap();
+            ta = task(&store, "twice");
+            downgrade_to_v6(&store);
+            seed_running_v6(&store, &new_id().to_string(), &ta.to_string(), "2026-10-01T00:00:00.000000Z");
+        }
+        let store = Store::open(dir.path()).unwrap(); // heals
+        assert_eq!(store.events(ta, None).unwrap().iter().filter(|e| e.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).count(), 0, "a single RUNNING row was never a duplicate");
+        store.conn.execute_batch("PRAGMA user_version=6;").unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION, "the re-applied rung still completes the ladder");
+        assert_eq!(store.events(ta, None).unwrap().iter().filter(|e| e.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).count(), 0, "re-application writes no event");
+        assert_eq!(index_count(&store.conn), 1, "the IF NOT EXISTS DDL stays idempotent");
+    }
+
+    /// The full duplicate→repair→re-apply→verify loop on a store that also
+    /// carries a live v7 row afterwards: once healed, the guard is ACTIVE —
+    /// a second start on the kept row's task hits SingleWriterBusy.
+    #[test]
+    fn a_healed_store_enforces_the_guard_immediately() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ta;
+        {
+            let store = Store::open(dir.path()).unwrap();
+            ta = task(&store, "healed-then-live");
+            let winner = new_id().to_string();
+            downgrade_to_v6(&store);
+            seed_running_v6(&store, &new_id().to_string(), &ta.to_string(), "2026-10-01T00:00:00.000000Z");
+            seed_running_v6(&store, &winner, &ta.to_string(), "2026-10-02T00:00:00.000000Z");
+        }
+        let store = Store::open(dir.path()).unwrap();
+        let survivor = store
+            .list_executions(Some(ta))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.status == ExecutionStatus::Running)
+            .unwrap();
+        let err = store.start_execution(&exec_for(ta, Utc::now())).unwrap_err();
+        match &err {
+            StoreError::SingleWriterBusy { existing_id, .. } => assert_eq!(*existing_id, survivor.id.to_string(), "the kept winner is the named blocker"),
+            other => panic!("expected SingleWriterBusy, got {other:?}"),
+        }
     }
 }
