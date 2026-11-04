@@ -416,13 +416,16 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
 
     for e in &executions {
         tx.execute(
-            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             rusqlite::params![
                 e.id.to_string(), e.task_id.to_string(), e.role_slug, e.role_version, e.agent_name,
                 e.status.as_str(), json_string(&e.inputs), e.summary, e.error,
                 rows::ts(&e.started_at), e.finished_at.as_ref().map(rows::ts),
                 e.workspace_revision.as_ref().map(|r| json_string(r)),
+                // The form-loop columns travel with the row: an exported loop
+                // history must still be reconstructible after import (v5).
+                e.attempt as i64, e.parent_execution.map(|p| p.to_string()), e.failure_class,
             ],
         )?;
     }

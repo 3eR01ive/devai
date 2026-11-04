@@ -160,8 +160,8 @@ fn v3_database_gains_the_graph_additively() {
     }
     let store = Store::open(dir.path()).unwrap();
     let version: i64 = raw(&dir).query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, devai_store::SCHEMA_VERSION, "open migrated v3 forward to v4");
-    assert_eq!(devai_store::SCHEMA_VERSION, 4, "the ladder top is now v4");
+    assert_eq!(version, devai_store::SCHEMA_VERSION, "open migrated v3 forward through v4 and v5");
+    assert_eq!(devai_store::SCHEMA_VERSION, 6, "the ladder top is now v6");
 
     let t = store.get_task(&t_id.to_string()).unwrap();
     assert_eq!(t.title, title, "the pre-existing task row is byte-intact");

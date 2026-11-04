@@ -34,6 +34,13 @@ pub struct ExecRequest {
     /// go here and never into the source tree (REQ-WT-05). Location is
     /// platform-owned, not agent-chosen.
     pub evidence: Option<std::path::PathBuf>,
+    /// Response-form correction loop context (REQ-FG-02 AC2): on attempt N>1
+    /// the ORIGINAL task context is kept by the unchanged fields above and
+    /// this carries `(attempt, full violation list of attempt N-1)`, rendered
+    /// as a loud repair section into the prompt. The role process is
+    /// sessionless (`--no-session-persistence`) — what the repair prompt does
+    /// not carry, the role cannot know (constraint of REQ-FG-02).
+    pub repair: Option<(u32, Vec<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +50,11 @@ pub struct ExecOutput {
     pub summary: Option<String>,
 }
 
+/// The two protocol halves of a failed role reply (REQ-FG-01, ASM-3):
+/// `BadOutput` is a RESPONSE-FORM rejection — the reply did not satisfy the
+/// stored reply-shape contract, a cheap fix the SAME role can make;
+/// everything else is a provider/process or platform failure the form loop
+/// must not consume attempts on (REQ-FG-03, ratified OQ-FG-02/04).
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     #[error("unknown agent provider `{0}` (expected `mock` or `claude`)")]
@@ -51,19 +63,122 @@ pub enum AdapterError {
     Io(#[from] std::io::Error),
     #[error("agent error: {0}")]
     Agent(String),
-    #[error("agent output does not satisfy the contract: {0}")]
-    BadOutput(String),
+    /// Form rejection with the FULL structured violation list — every json
+    /// path, not truncated to the first (REQ-FG-01 AC2). The joined string
+    /// stays in the Display for humans and stored row `error` text; the Vec
+    /// is what the loop replays to the role and events carry as data.
+    #[error("agent output does not satisfy the contract: {}", .violations.join("; "))]
+    BadOutput { violations: Vec<String> },
+    /// The PLATFORM's own artifact: a broken stored schema, an assembly the
+    /// platform produced and its gate rejects. Never replayed to the role
+    /// (REQ-FG-03 AC2) — the role is not guilty of a shape the platform
+    /// assembled; retrying it would spend role cycles on a platform bug.
+    #[error("platform contract/assembly error: {0}")]
+    Platform(String),
+}
+
+impl AdapterError {
+    /// The stored `failure_class` for this error (REQ-FG-01/03): form vs
+    /// provider vs platform, as data on the execution row — an operator
+    /// answers "form rejection or role failure?" without parsing text.
+    pub fn failure_class(&self) -> &'static str {
+        match self {
+            AdapterError::BadOutput { .. } => devai_core::types::failure_class::RESPONSE_FORM,
+            AdapterError::Agent(_) | AdapterError::Io(_) | AdapterError::UnknownProvider(_) => devai_core::types::failure_class::PROVIDER,
+            AdapterError::Platform(_) => devai_core::types::failure_class::PLATFORM,
+        }
+    }
 }
 
 pub struct AgentRuntime;
+
+/// The engine implements this to HOST the adapter's form-correction loop
+/// (OQ-FG-06, ratified: the loop lives in the adapter, which owns reply
+/// shape; the host owns the store rows and events, which the adapter must
+/// never touch — `adapters` decides the protocol, the engine keeps
+/// sovereignty). Every adapter attempt reports through these three calls so
+/// the loop is observable as data: one execution row per attempt.
+pub trait FormLoopHost {
+    /// A provider attempt is about to run: open its execution row
+    /// (`attempt` is 1-based; a new RoleExecution row per attempt).
+    fn attempt_started(&mut self, attempt: u32);
+    /// The attempt was rejected by the FORM gate: close its row as failed
+    /// with class `response_form` and record the FULL violation list — a
+    /// loud event, never a silent retry (REQ-FG-02, REQ-FG-07).
+    fn attempt_rejected(&mut self, attempt: u32, violations: &[String]);
+    /// The attempt failed for a NON-form reason (provider/process/platform):
+    /// close its row with the given failure class. The loop does NOT
+    /// continue — form attempts are never spent on provider failures
+    /// (REQ-FG-03).
+    fn attempt_failed(&mut self, attempt: u32, class: &'static str, error: &str);
+}
+
+/// Terminal result of [`AgentRuntime::run_with_form_loop`].
+#[derive(Debug)]
+pub enum RunOutcome {
+    /// A contract-valid reply; its attempt row stays open for the engine to
+    /// finish (stamp / assembly / publish may still fail it honestly).
+    Output(ExecOutput),
+    /// Every allowed attempt was rejected on FORM; `violations` is the last
+    /// attempt's FULL list — what the escalation question carries (OQ-FG-08).
+    FormExhausted { attempts: u32, violations: Vec<String> },
+    /// A non-form failure; its row was closed by the host. No attempt
+    /// budget was consumed beyond the failing call (REQ-FG-03).
+    Failed(AdapterError),
+}
 
 impl AgentRuntime {
     pub fn run(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
         match req.provider.as_str() {
             "mock" => Self::mock(req),
             "claude" => Self::claude(req),
+            // Test/protocol fixtures for the form loop, in the same spirit as
+            // `mock` (offline, deterministic): `mock-form-flaky` violates the
+            // contract on its FIRST answer and fixes the FORM (never the
+            // substance) on every re-reply — the synthetic-incident drive for
+            // REQ-FG-02 AC1; `mock-form-broken` violates on every attempt,
+            // driving exhaustion/escalation. Not seeded as agents anywhere.
+            "mock-form-flaky" => Self::mock_form_flaky(req),
+            "mock-form-broken" => Self::mock_form_broken(req),
+            "mock-spec-noecho" => Self::mock_spec_no_echo(req),
             other => Err(AdapterError::UnknownProvider(other.to_string())),
         }
+    }
+
+    /// THE response-form correction loop (REQ-FG-02): run the role; if the
+    /// reply is rejected on FORM, hand the SAME role its full violation list
+    /// for a re-reply (fresh sessionless process — the repair prompt must
+    /// carry the context, `ExecRequest::repair`), up to `max_repair_attempts`
+    /// re-prompts on top of the initial call. While attempts remain nothing
+    /// fails at all; on exhaustion the caller escalates (OQ-FG-08) or, with
+    /// `max_repair_attempts = 0`, behaves exactly as before the loop existed
+    /// (REQ-FG-04 AC2). A non-form error aborts immediately (REQ-FG-03).
+    /// The loop publishes nothing: rejected bodies never become artifacts
+    /// (REQ-FG-07 AC2).
+    pub fn run_with_form_loop(req: &ExecRequest, max_repair_attempts: u32, host: &mut dyn FormLoopHost) -> RunOutcome {
+        let total = 1 + max_repair_attempts;
+        let mut req = req.clone();
+        let mut violations: Vec<String> = Vec::new();
+        for attempt in 1..=total {
+            host.attempt_started(attempt);
+            req.repair = if attempt == 1 { None } else { Some((attempt, violations.clone())) };
+            match Self::run(&req) {
+                Ok(out) => return RunOutcome::Output(out),
+                Err(AdapterError::BadOutput { violations: v }) => {
+                    host.attempt_rejected(attempt, &v);
+                    violations = v;
+                    if attempt == total {
+                        return RunOutcome::FormExhausted { attempts: attempt, violations };
+                    }
+                }
+                Err(e) => {
+                    let (class, text) = (e.failure_class(), e.to_string());
+                    host.attempt_failed(attempt, class, &text);
+                    return RunOutcome::Failed(e);
+                }
+            }
+        }
+        unreachable!("the loop returns on every attempt")
     }
 
     // -----------------------------------------------------------------
@@ -73,7 +188,14 @@ impl AgentRuntime {
     fn claude(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
         let system = build_system_prompt(&req.role);
         let contract = req.role.output_contract.as_ref().map(|c| (c.name.as_str(), c.version));
-        let user = build_user_prompt(&req.title, &req.business, &req.inputs, contract, req.contract_schema.as_deref());
+        let mut user = build_user_prompt(&req.title, &req.business, &req.inputs, contract, req.contract_schema.as_deref());
+        // Attempt N+1 of the form loop: original context (kept above by the
+        // unchanged request fields) PLUS the full violation list of attempt
+        // N-1... as data (REQ-FG-02 AC2). The sessionless process can only
+        // repair what this prompt carries.
+        if let Some((attempt, violations)) = &req.repair {
+            user.push_str(&form_repair_section(*attempt, violations));
+        }
 
         // The role's declarative `tools` (config/roles/*.yaml) decide what the
         // provider process may touch. No tools declared == pure text answer.
@@ -119,10 +241,15 @@ impl AgentRuntime {
             .get("result")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AdapterError::Agent("envelope has no `result` field".into()))?;
+        // OQ-FG-02 (ratified): an unextractable / unparseable reply IS the
+        // form class — the adapter already distinguishes it from a provider
+        // failure above — so the loop can repair it. Left as an Agent-class
+        // error, 'agent reply contains no JSON object' would keep eating the
+        // full role re-run, which is exactly this task's incident.
         let json = extract_json_object(text)
-            .ok_or_else(|| AdapterError::BadOutput("agent reply contains no JSON object".into()))?;
+            .ok_or_else(|| AdapterError::BadOutput { violations: vec!["agent reply contains no JSON object".into()] })?;
         let parsed: Value = serde_json::from_str(&json)
-            .map_err(|e| AdapterError::BadOutput(format!("extracted object is not valid JSON: {e}")))?;
+            .map_err(|e| AdapterError::BadOutput { violations: vec![format!("extracted object is not valid JSON: {e}")] })?;
         validate_against_contract(&json, req.contract_schema.as_deref())?;
         Ok(ExecOutput { content: json.into_bytes(), summary: summarize(contract.map(|c| c.0), &parsed) })
     }
@@ -185,9 +312,81 @@ impl AgentRuntime {
         };
         let text = serde_json::to_vec_pretty(&json).map_err(|e| AdapterError::Agent(e.to_string()))?;
         validate_against_contract(&String::from_utf8_lossy(&text), req.contract_schema.as_deref())
-            .map_err(|e| AdapterError::Agent(format!("mock output invalid (seed/schema drift): {e}")))?;
+            // Seed/schema drift is a PLATFORM bug, not the fixture role's
+            // form error — it must not burn loop re-prompts (REQ-FG-03).
+            .map_err(|e| AdapterError::Platform(format!("mock output invalid (seed/schema drift): {e}")))?;
         Ok(ExecOutput { content: text, summary: summarize(Some(name), &json) })
     }
+
+    /// Protocol fixture: first answer violates the stored contract, every
+    /// re-reply (a request carrying `repair`) answers in the same shape as
+    /// `mock` — a role that FIXES THE FORM, not the substance. Drives the
+    /// synthetic incident of REQ-FG-02 AC1 offline and deterministically.
+    fn mock_form_flaky(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
+        if req.repair.is_some() {
+            return Self::mock(req);
+        }
+        Self::mock_form_broken(req)
+    }
+
+    /// Protocol fixture for REQ-FG-06 / ratified OQ-FG-07: the analyst
+    /// answers in a fully LEGAL @2 shape but SKIPS the echo fields
+    /// (`task_id`, `business_description`) — exactly the form @2 exists to
+    /// allow, so the platform-side stamping is what fills them. Every other
+    /// role behaves like plain `mock`.
+    fn mock_spec_no_echo(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
+        if req.role.slug != "requirements-analyst" {
+            return Self::mock(req);
+        }
+        let out = Self::mock(req)?;
+        let mut body: Value = serde_json::from_slice(&out.content).map_err(|e| AdapterError::Agent(e.to_string()))?;
+        let obj = body.as_object_mut().ok_or_else(|| AdapterError::Agent("mock spec reply is not an object".to_string()))?;
+        obj.remove("task_id");
+        obj.remove("business_description");
+        let text = serde_json::to_vec_pretty(&body).map_err(|e| AdapterError::Agent(e.to_string()))?;
+        // LEGAL under @2 precisely because the echo fields are optional and
+        // declared (OQ-FG-03/07) — a schema regression would fail this here,
+        // loudly, not silently at the stamp.
+        validate_against_contract(&String::from_utf8_lossy(&text), req.contract_schema.as_deref())
+            .map_err(|e| AdapterError::Platform(format!("no-echo fixture invalid under the stored schema: {e}")))?;
+        Ok(ExecOutput { content: text, summary: out.summary })
+    }
+
+    /// Protocol fixture: violates the stored contract on EVERY attempt,
+    /// whatever the repair context — drives loop exhaustion (REQ-FG-02 AC3,
+    /// OQ-FG-08 escalation) offline.
+    fn mock_form_broken(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
+        // The historical incident shape: a plausible object missing exactly
+        // one required key. Violations come from the SAME gate as real
+        // replies — never a hand-written error here.
+        let json = serde_json::json!({ "mock": "form-broken", "requirements": [] });
+        let text = serde_json::to_vec_pretty(&json).map_err(|e| AdapterError::Agent(e.to_string()))?;
+        validate_against_contract(&String::from_utf8_lossy(&text), req.contract_schema.as_deref())?;
+        // Valid under no stored reply contract (no required keys satisfied);
+        // if a test passes no schema at all, manufacture the form failure.
+        Err(AdapterError::BadOutput { violations: vec!["mock-form-broken: no contract to fail".into()] })
+    }
+}
+
+/// The loud repair section of attempt N+1 (REQ-FG-02 AC2): what failed, the
+/// FULL violation list verbatim, and the standing null policy (OQ-FG-03
+/// strict-write half). Carried in the prompt because the role process is
+/// sessionless — the loop has no other channel to say "what to fix".
+pub fn form_repair_section(attempt: u32, violations: &[String]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "\nOUTPUT REJECTED BY THE CONTRACT GATE (attempt {attempt}): your previous reply did not pass the stored reply-shape contract. This is a FORM problem, not a judgment of your content — keep the substance and every source-verified fact, fix the shape. Full violation list of the previous attempt:\n"
+    );
+    for v in violations {
+        let _ = writeln!(s, "  - {v}");
+    }
+    let _ = write!(
+        s,
+        "Re-emit the COMPLETE JSON object satisfying the schema above: every required key present with its declared type; an optional field you cannot fill is OMITTED entirely — never written as null. Return only the JSON object.\n"
+    );
+    s
 }
 
 /// Translate a role's declarative capability list (`tools:` in
@@ -222,48 +421,94 @@ fn claude_tools_for(role: &RoleDefinition) -> Vec<String> {
 /// Contract gate: a JSON-Schema draft-07 subset enforced RECURSIVELY —
 /// `required` at every object level, `items` schemas through arrays,
 /// `minItems` cardinality on arrays, `enum` membership and primitive type
-/// checks, with a json path on each violation. Full JSON-Schema is still out
-/// of scope, but garbage cannot silently enter the artifact store any more
-/// (defect R2 of the dogfood task). `minItems` is what makes the QA rule
-/// "every criteria entry cites concrete evidence" (born in `quality-report@3`,
-/// carried unchanged into @4) mechanically enforced, not just declared.
+/// checks, with a json path on EACH violation (the full list, never only the
+/// first — REQ-FG-01 AC2). Full JSON-Schema is still out of scope, but
+/// garbage cannot silently enter the artifact store any more (defect R2 of
+/// the dogfood task). `minItems` is what makes the QA rule "every criteria
+/// entry cites concrete evidence" mechanically enforced, not just declared.
+///
+/// Null policy (OQ-FG-03, ratified — all three layers):
+/// * schema: optional typed fields declare nullability (`["x","null"]`) —
+///   the stored schema is the single truth for producer and validator;
+/// * this READ half: an explicit null on an OPTIONAL key is accepted as
+///   absence (lenient read); on a REQUIRED key it stays a violation —
+///   precedent 2.11's `expected object, got null` is pinned by test;
+/// * WRITE half (prompts/common.yaml + repair section): producers OMIT
+///   absent fields, never write null.
 pub fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<(), AdapterError> {
-    let Some(schema) = schema else { return Ok(()); };
-    let value: Value = serde_json::from_str(content)
-        .map_err(|e| AdapterError::BadOutput(format!("output is not valid JSON: {e}")))?;
-    if !value.is_object() {
-        return Err(AdapterError::BadOutput("output must be a JSON object".into()));
-    }
-    let schema_v: Value = serde_json::from_str(schema)
-        .map_err(|e| AdapterError::BadOutput(format!("stored contract schema is broken: {e}")))?;
-    let mut errs = Vec::new();
-    validate_node(&schema_v, &value, "$", &mut errs);
-    if !errs.is_empty() {
-        return Err(AdapterError::BadOutput(errs.join("; ")));
+    let violations = contract_violations(content, schema)?;
+    if !violations.is_empty() {
+        return Err(AdapterError::BadOutput { violations });
     }
     Ok(())
 }
 
-fn validate_node(schema: &Value, value: &Value, path: &str, errs: &mut Vec<String>) {
-    let Some(s) = schema.get("type").and_then(|t| t.as_str()) else { return; };
+/// The form gate as DATA: every violation with its json path, whole.
+/// `Err` is reserved for the PLATFORM half — a broken stored schema the role
+/// can neither see nor fix (REQ-FG-03 AC2: never replayed to the role).
+/// A reply that is not parseable JSON, or is JSON but not an object, is
+/// FORM-class (ratified OQ-FG-02) and therefore arrives as a violation list.
+pub fn contract_violations(content: &str, schema: Option<&str>) -> Result<Vec<String>, AdapterError> {
+    let Some(schema) = schema else { return Ok(Vec::new()); };
+    let value: Value = serde_json::from_str(content)
+        .map_err(|e| AdapterError::BadOutput { violations: vec![format!("$: output is not valid JSON: {e}")] })?;
+    if !value.is_object() {
+        return Ok(vec![format!("$: output must be a JSON object, got {}", json_kind(&value))]);
+    }
+    let schema_v: Value = serde_json::from_str(schema)
+        .map_err(|e| AdapterError::Platform(format!("stored contract schema is broken: {e}")))?;
+    let mut errs = Vec::new();
+    validate_node(&schema_v, &value, "$", true, &mut errs);
+    Ok(errs)
+}
+
+/// Declared types of a schema node — a string or a nullability array
+/// (`["string","null"]`, the schema-authority declaration of OQ-FG-03).
+fn schema_types(schema: &Value) -> Vec<&str> {
+    match schema.get("type") {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(|t| t.as_str()).collect(),
+        _ => vec![],
+    }
+}
+
+fn validate_node(schema: &Value, value: &Value, path: &str, required: bool, errs: &mut Vec<String>) {
     let Some(obj) = schema.as_object() else { return; };
+    let types = schema_types(schema);
+    if types.is_empty() {
+        return;
+    }
+    if value.is_null() {
+        // Nullable declaration, or explicit null on an OPTIONAL key: absence
+        // is honoured, nothing to check below (OQ-FG-03 lenient read). On a
+        // REQUIRED key the type dispatch continues and reports the mismatch.
+        if types.contains(&"null") || !required {
+            return;
+        }
+    }
+    let s = types.iter().copied().find(|t| *t != "null").unwrap_or("null");
     match s {
         "object" => {
             let Some(map) = value.as_object() else {
                 errs.push(format!("{path}: expected object, got {}", json_kind(value)));
                 return;
             };
-            if let Some(required) = obj.get("required").and_then(|r| r.as_array()) {
-                for k in required.iter().filter_map(|r| r.as_str()) {
-                    if !map.contains_key(k) {
-                        errs.push(format!("{path}.{k}: missing required key"));
-                    }
+            let req_keys: Vec<&str> = obj
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|r| r.as_str()).collect())
+                .unwrap_or_default();
+            for k in &req_keys {
+                if !map.contains_key(*k) {
+                    errs.push(format!("{path}.{k}: missing required key"));
                 }
             }
             if let Some(props) = obj.get("properties").and_then(|p| p.as_object()) {
                 for (k, v) in map {
                     if let Some(sub) = props.get(k) {
-                        validate_node(sub, v, &format!("{path}.{k}"), errs);
+                        // The child's required-ness decides its null policy:
+                        // REQUIRED + null keeps failing the type check below.
+                        validate_node(sub, v, &format!("{path}.{k}"), req_keys.iter().any(|r| r == k), errs);
                     }
                 }
             }
@@ -281,7 +526,7 @@ fn validate_node(schema: &Value, value: &Value, path: &str, errs: &mut Vec<Strin
             if let Some(sub) = obj.get("items") {
                 if sub.get("type").is_some() {
                     for (i, it) in items.iter().enumerate() {
-                        validate_node(sub, it, &format!("{path}[{i}]"), errs);
+                        validate_node(sub, it, &format!("{path}[{i}]"), true, errs);
                     }
                 }
             }
@@ -392,6 +637,29 @@ mod tests {
             contract_schema: None,
             workspace: None,
             evidence: None,
+            repair: None,
+        }
+    }
+
+    /// Test host for the form loop: records every callback in order — the
+    /// observation discipline of REQ-FG-07 (loud loop, no silent retries).
+    struct LoopRecorder {
+        log: Vec<String>,
+    }
+    impl LoopRecorder {
+        fn new() -> Self {
+            LoopRecorder { log: vec![] }
+        }
+    }
+    impl FormLoopHost for LoopRecorder {
+        fn attempt_started(&mut self, attempt: u32) {
+            self.log.push(format!("started:{attempt}"));
+        }
+        fn attempt_rejected(&mut self, attempt: u32, violations: &[String]) {
+            self.log.push(format!("rejected:{attempt}:{}", violations.join("|")));
+        }
+        fn attempt_failed(&mut self, attempt: u32, class: &'static str, error: &str) {
+            self.log.push(format!("failed:{attempt}:{class}:{error}"));
         }
     }
 
@@ -437,7 +705,7 @@ mod tests {
         // mock review has both keys
         assert!(AgentRuntime::run(&r).is_ok());
         // a broken schema check: feed a payload missing `verdict` through claude-path validation fn directly
-        assert!(matches!(validate_against_contract(r#"{"summary":"x"}"#, Some(schema)), Err(AdapterError::BadOutput(_))));
+        assert!(matches!(validate_against_contract(r#"{"summary":"x"}"#, Some(schema)), Err(AdapterError::BadOutput { .. })));
     }
 
     #[test]
@@ -548,5 +816,141 @@ mod tests {
         missing["criteria_results"][0].as_object_mut().unwrap().remove("evidence");
         let e = validate_against_contract(&missing.to_string(), Some(&schema_v1)).unwrap_err().to_string();
         assert!(e.contains("$.criteria_results[0].evidence: missing required key"), "{e}");
+    }
+
+    /// REQ-FG-05 AC2 + ratified OQ-FG-03, pinned as REGRESSION behavior:
+    /// the three-layer null policy. Optional + explicit null -> accepted as
+    /// absence (lenient READ); required + explicit null -> the historical
+    /// 2.11 violation stays (`expected object, got null`); a nullability
+    /// declaration (`["x","null"]`) keeps TYPE checks for non-null values.
+    #[test]
+    fn null_policy_is_layered_absence_vs_strict_required() {
+        let schema = r#"{
+            "type": "object",
+            "required": ["verdict", "evaluation"],
+            "properties": {
+                "verdict": { "type": ["string", "null"] },
+                "summary": { "type": "string" },
+                "evaluation": { "type": "object", "required": ["score"], "properties": { "score": { "type": "number" } } }
+            }
+        }"#;
+        // PRESENT null on the OPTIONAL `summary` key = absence, gate passes.
+        let lenient = r#"{"verdict":"ACCEPT","summary":null,"evaluation":{"score":1.0}}"#;
+        assert!(validate_against_contract(lenient, Some(schema)).is_ok(), "explicit null on an optional field reads as absence");
+        // PRESENT null on a REQUIRED object field keeps the 2.11 shape.
+        let strict = r#"{"verdict":"ACCEPT","evaluation":null}"#;
+        let e = validate_against_contract(strict, Some(schema)).unwrap_err().to_string();
+        assert!(e.contains("$.evaluation: expected object, got null"), "precedent 2.11 pinned: {e}");
+        // Nullability declaration still type-checks NON-null values.
+        let wrong = r#"{"verdict":7,"evaluation":{"score":1.0}}"#;
+        let e = validate_against_contract(wrong, Some(schema)).unwrap_err().to_string();
+        assert!(e.contains("$.verdict: expected string, got number"), "{e}");
+        // ...and accepts null where the schema declares it nullable.
+        let nullable_ok = r#"{"verdict":null,"evaluation":{"score":1.0}}"#;
+        assert!(validate_against_contract(nullable_ok, Some(schema)).is_ok());
+    }
+
+    /// REQ-FG-01 AC2: the gate keeps the FULL list with json paths — nothing
+    /// is truncated to the first violation (it is what the role is handed).
+    #[test]
+    fn gate_returns_the_whole_violation_list_as_data() {
+        let schema = r#"{"type":"object","required":["a","b"],"properties":{"a":{"type":"string"},"b":{"type":"string"},"c":{"type":"integer"}}}"#;
+        let e = validate_against_contract(r#"{"b":7,"c":"x"}"#, Some(schema)).unwrap_err();
+        let AdapterError::BadOutput { violations } = &e else { panic!("form class expected: {e}") };
+        assert!(violations.contains(&"$.a: missing required key".to_string()), "{violations:?}");
+        assert!(violations.iter().any(|v| v.starts_with("$.b: expected string")), "{violations:?}");
+        assert!(violations.iter().any(|v| v.starts_with("$.c: expected integer")), "{violations:?}");
+        assert_eq!(violations.len(), 3, "every violation, none lost");
+    }
+
+    /// REQ-FG-03: a broken STORED schema is a platform half — it never
+    /// masquerades as a role form error the loop could repair.
+    #[test]
+    fn broken_stored_schema_is_platform_not_form() {
+        let e = validate_against_contract(r#"{"a":1}"#, Some("{ not json")).unwrap_err();
+        assert!(matches!(e, AdapterError::Platform(_)), "{e}");
+    }
+
+    /// OQ-FG-02 (ratified): unparseable output IS the form class — both in
+    /// the raw-JSON half and via the extractable-object half of claude().
+    #[test]
+    fn unparseable_output_is_form_class() {
+        let schema = r#"{"type":"object","required":["a"],"properties":{"a":{"type":"integer"}}}"#;
+        let v = contract_violations("{ broken", Some(schema)).unwrap_err();
+        assert!(matches!(v, AdapterError::BadOutput { .. }), "{v}");
+        // A JSON scalar is FORM too (violations, not platform).
+        let v = contract_violations("7", Some(schema)).unwrap();
+        assert_eq!(v.len(), 1);
+        assert!(v[0].starts_with("$: output must be a JSON object"), "{v:?}");
+    }
+
+    /// REQ-FG-02 AC1, offline and deterministic: one schema violation on the
+    /// synthetic first answer is self-repaired by the SAME role with zero
+    /// operator intervention — the loop re-presents the FULL list and the
+    /// second attempt publishes.
+    #[test]
+    fn form_loop_repairs_a_single_violation_without_the_operator() {
+        let mut r = req("mock-form-flaky", "review-report");
+        r.contract_schema = Some(r#"{"type":"object","required":["verdict","summary","findings"],"properties":{"verdict":{"type":"string"},"summary":{"type":"string"},"findings":{"type":"array"}}}"#.into());
+        let mut host = LoopRecorder::new();
+        let out = AgentRuntime::run_with_form_loop(&r, 2, &mut host);
+        assert!(matches!(out, RunOutcome::Output(_)), "role self-repaired: {out:?}" );
+        assert_eq!(&host.log[0], "started:1");
+        assert!(host.log[1].starts_with("rejected:1:$.business_description") || host.log[1].starts_with("rejected:1:$"), "rejection names the missing keys: {}", host.log[1]);
+        assert_eq!(&host.log[2], "started:2");
+        assert_eq!(host.log.len(), 3, "no provider call after success");
+    }
+
+    /// REQ-FG-02/04: exhaustion stops at `1 + max_repair_attempts` provider
+    /// calls, keeping the LAST full violation list for escalation; with a
+    /// budget of 0 the behavior is exactly today's — one call, then fail.
+    #[test]
+    fn form_loop_exhausts_at_the_configured_budget() {
+        let mut r = req("mock-form-broken", "review-report");
+        r.contract_schema = Some(r#"{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string"}}}"#.into());
+        let mut host = LoopRecorder::new();
+        match AgentRuntime::run_with_form_loop(&r, 2, &mut host) {
+            RunOutcome::FormExhausted { attempts, violations } => {
+                assert_eq!(attempts, 3, "1 initial + 2 repair re-prompts (OQ-FG-01 default)");
+                assert!(violations.iter().any(|v| v.contains("missing required key")), "{violations:?}");
+            }
+            other => panic!("exhaustion expected, got {other:?}"),
+        }
+        assert!(host.log.iter().filter(|l| l.starts_with("started:")).count() == 3, "{:?}", host.log);
+
+        // Zero budget: one call, then the form failure surfaces immediately.
+        let mut host0 = LoopRecorder::new();
+        match AgentRuntime::run_with_form_loop(&r, 0, &mut host0) {
+            RunOutcome::FormExhausted { attempts, .. } => assert_eq!(attempts, 1, "0 repairs = today's behavior"),
+            other => panic!("exhaustion expected: {other:?}"),
+        }
+        assert_eq!(host0.log.iter().filter(|l| l.starts_with("started:")).count(), 1, "no re-prompt at budget 0");
+    }
+
+    /// REQ-FG-03 AC1: provider/unknown failures never enter the loop —
+    /// exactly one attempt, no repair burns, FAILED stays FAILED.
+    #[test]
+    fn provider_errors_never_enter_the_form_loop() {
+        let r = req("telepathy", "review-report");
+        let mut host = LoopRecorder::new();
+        match AgentRuntime::run_with_form_loop(&r, 2, &mut host) {
+            RunOutcome::Failed(AdapterError::UnknownProvider(_)) => {}
+            other => panic!("provider abort expected: {other:?}"),
+        }
+        assert_eq!(host.log.len(), 2, "started + failed, no retries: {:?}", host.log);
+        assert!(host.log[1].contains(":provider:"), "class is provider, not form: {}", host.log[1]);
+    }
+
+    /// REQ-FG-02 AC2: the attempt-N+1 prompt carries the FULL violation list
+    /// of attempt N verbatim (the sessionless process has no other channel).
+    #[test]
+    fn repair_prompt_carries_the_full_violation_list() {
+        let violations = vec!["$.business_description: missing required key".to_string(), "$.requirements[7].source: expected object, got null".to_string()];
+        let s = form_repair_section(2, &violations);
+        assert!(s.contains("$.business_description: missing required key"), "{s}");
+        assert!(s.contains("$.requirements[7].source: expected object, got null"), "{s}");
+        assert!(s.contains("attempt 2"), "{s}");
+        assert!(s.contains("never written as null"), "write policy restated for the producer: {s}");
+        assert!(s.contains("not a judgment of your content"), "form-vs-content split told to the role: {s}");
     }
 }

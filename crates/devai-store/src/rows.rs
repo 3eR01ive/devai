@@ -228,6 +228,11 @@ pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
             .as_deref()
             .map(|s| serde_json::from_str::<WorkspaceRevision>(s).map_err(|e| StoreError::Corrupt(format!("bad workspace_revision: {e}"))))
             .transpose()?,
+        // Pre-v5 rows read as their single attempt (DEFAULT 1) with no loop
+        // lineage and no recorded failure class — never guessed (REQ-FG-01).
+        attempt: get::<i64>(r, 12)? as u32,
+        parent_execution: opt_id(get(r, 13)?)?,
+        failure_class: get(r, 14)?,
     })
 }
 
