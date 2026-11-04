@@ -100,7 +100,7 @@ pub(crate) fn schema_rungs() -> Vec<SchemaRung> {
 /// behavior appends a handler here. The tag NAME is manifest data; this
 /// table maps name → behavior, failing loud on a tag it cannot run.
 type RungApply = fn(&Transaction<'_>, &SchemaRung) -> StoreResult<()>;
-const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill), ("decisions_backfill", decisions_backfill)];
+const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill), ("decisions_backfill", decisions_backfill), ("execution_form_columns", execution_form_columns)];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
 pub struct Store {
@@ -958,8 +958,8 @@ impl Store {
         // before provenance existed and for manual rows without one.
         let revision = e.workspace_revision.as_ref().map(|r| json_string(r));
         tx.execute(
-            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9)",
+            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9,?10,?11,NULL)",
             params![
                 e.id.to_string(),
                 e.task_id.to_string(),
@@ -970,6 +970,8 @@ impl Store {
                 json_string(&e.inputs),
                 rows::ts(&e.started_at),
                 revision,
+                e.attempt as i64,
+                e.parent_execution.map(|p| p.to_string()),
             ],
         )?;
         tx.execute(
@@ -994,10 +996,18 @@ impl Store {
     }
 
     pub fn finish_execution(&self, e: &RoleExecution, status: ExecutionStatus, summary: Option<&str>, error: Option<&str>, now: Timestamp) -> StoreResult<()> {
+        self.finish_execution_classified(e, status, summary, error, None, now)
+    }
+
+    /// `finish_execution` plus the `failure_class` write (REQ-FG-01): WHY a
+    /// Failed row failed — `response_form` / `provider` / `platform` (the
+    /// `failure_class` vocabulary in core) — so form-vs-content stays
+    /// answerable as data, never by parsing the error text.
+    pub fn finish_execution_classified(&self, e: &RoleExecution, status: ExecutionStatus, summary: Option<&str>, error: Option<&str>, failure_class: Option<&str>, now: Timestamp) -> StoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE role_executions SET status=?1, summary=?2, error=?3, finished_at=?4 WHERE id=?5",
-            params![status.as_str(), summary, error, rows::ts(&now), e.id.to_string()],
+            "UPDATE role_executions SET status=?1, summary=?2, error=?3, finished_at=?4, failure_class=COALESCE(?6, failure_class) WHERE id=?5",
+            params![status.as_str(), summary, error, rows::ts(&now), e.id.to_string(), failure_class],
         )?;
         let kind = match status {
             ExecutionStatus::Completed => event_kind::EXECUTION_FINISHED,
@@ -1029,7 +1039,7 @@ impl Store {
         rows::unwrap_row(
             self.conn
                 .query_row(
-                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision
+                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class
                  FROM role_executions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 1",
                     params![id.to_lowercase()],
                     |r| rows::r2sql(rows::execution_from_row(r)),
@@ -1042,11 +1052,11 @@ impl Store {
     pub fn list_executions(&self, task_id: Option<Id>) -> StoreResult<Vec<RoleExecution>> {
         let (sql, args): (&str, Vec<Option<String>>) = match task_id {
             Some(t) => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision FROM role_executions WHERE task_id=?1 ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class FROM role_executions WHERE task_id=?1 ORDER BY started_at",
                 vec![Some(t.to_string())],
             ),
             None => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision FROM role_executions ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class FROM role_executions ORDER BY started_at",
                 vec![],
             ),
         };
@@ -1174,6 +1184,66 @@ impl Store {
 fn apply_script(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
     tx.execute_batch(step.script)?;
     Ok(())
+}
+
+/// Rung v4→v5: the three additive `role_executions` columns of the
+/// response-form loop. SQLite has no `ADD COLUMN IF NOT EXISTS`, so the
+/// shipped script is executed STATEMENT BY STATEMENT, each `ADD COLUMN`
+/// skipped when the live schema already carries that column. This is the
+/// manifest's documented code/data boundary — idempotence pure SQL cannot
+/// express. It matters in both directions: an interrupted earlier run that
+/// applied part of the script, and a fully-shaped database whose version
+/// marker was pushed back (the supersession tests rewrite history inside a
+/// current-shape file) must both re-land at v5 without a duplicate-column
+/// abort. An `ADD COLUMN` statement is recognized textually from the script
+/// itself — the .sql file stays the single source of the target shape.
+fn execution_form_columns(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    let existing: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT name FROM pragma_table_info('role_executions')")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    // `--` commentary (Russian included, and its punctuation may contain
+    // `;`) is cut from EVERY line BEFORE splitting on statements — comment
+    // text must never reach the executor or the token parser.
+    let code: String = step
+        .script
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for stmt in code.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some(col) = added_column_name(stmt) {
+            if existing.iter().any(|c| c == col) {
+                continue;
+            }
+        }
+        tx.execute(stmt, [])?;
+    }
+    Ok(())
+}
+
+/// The column name an `ALTER TABLE … ADD COLUMN <name> …` statement adds,
+/// by token scan; `None` for any other statement (those run verbatim —
+/// only column-adding statements get the presence check).
+fn added_column_name(code: &str) -> Option<&str> {
+    let toks: Vec<&str> = code.split_whitespace().collect();
+    for w in toks.windows(3) {
+        if w[0].eq_ignore_ascii_case("ADD") && w[1].eq_ignore_ascii_case("COLUMN") {
+            let name = w[2].trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 /// Rung v2→v3 (REQ-003): the one-time repair of pre-existing multi-CURRENT
@@ -1954,9 +2024,9 @@ mod decisions_backfill_tests {
         let facts: Vec<WorkflowEvent> = store.events(task_id, None).unwrap().into_iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).collect();
         assert_eq!(facts.len(), 3, "one event per group: {facts:?}");
         for f in &facts {
-            assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}004_decisions_backfill"));
-            assert_eq!(f.payload[json_field::BACKFILL], "004_decisions_backfill");
-            assert_eq!(f.payload[json_field::SCRIPT_PATH], "migrations/004_decisions_backfill.sql");
+            assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}005_decisions_backfill"));
+            assert_eq!(f.payload[json_field::BACKFILL], "005_decisions_backfill");
+            assert_eq!(f.payload[json_field::SCRIPT_PATH], "migrations/005_decisions_backfill.sql");
             assert!(f.payload[json_field::REASON].as_str().unwrap().contains("VERBATIM"), "the why is recorded, not silent");
         }
         let appr_fact = facts.iter().find(|f| f.payload[json_field::KIND] == serde_json::json!(event_kind::REQUIREMENTS_APPROVED)).unwrap();
@@ -2033,7 +2103,7 @@ mod decisions_backfill_tests {
             store.conn.execute_batch("CREATE TRIGGER test_fail_event_insert BEFORE INSERT ON workflow_events BEGIN SELECT RAISE(ABORT,'boom'); END;").unwrap();
             // Drop the fresh-install copies of the rung's indexes so the
             // rollback check below observes the RUNG's DDL, not schema.sql's.
-            store.conn.execute_batch("DROP INDEX decisions_task; DROP INDEX decisions_backfill_source_event; PRAGMA user_version=3;").unwrap();
+            store.conn.execute_batch("DROP INDEX decisions_task; DROP INDEX decisions_backfill_source_event; PRAGMA user_version=4;").unwrap();
         }
         assert!(Store::open(dir.path()).is_err(), "a mid-rung failure must surface");
         {
@@ -2041,7 +2111,7 @@ mod decisions_backfill_tests {
             let n: i64 = conn.query_row("SELECT count(*) FROM decisions", [], |r| r.get(0)).unwrap();
             assert_eq!(n, 0, "the rolled-back rung left no decision row");
             let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, 3, "the version bump rolled back with the rows");
+            assert_eq!(v, 4, "the version bump rolled back with the rows");
             let idx: i64 = conn
                 .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
                 .unwrap();

@@ -15,7 +15,7 @@ pub mod revision;
 pub mod worktree;
 
 pub use adapters::{
-    validate_against_contract, AdapterError, AgentRuntime, ExecOutput, ExecRequest,
+    contract_violations, form_repair_section, validate_against_contract, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
 };
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};
 pub use prompt::{build_system_prompt, build_user_prompt, extract_json_object};
