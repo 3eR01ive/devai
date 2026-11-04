@@ -586,7 +586,6 @@ pub mod decision_kind {
     /// auditor scoring spec-fidelity never saw the rejected alternative).
     /// Recorded by the human-invoked CLI `task approve` only.
     pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
-<<<<<<< HEAD
     /// The empty-rework gate (REQ-RG-03): the operator's explicit ratification
     /// that a QA return needed NO new changes — `refs` carry the pair
     /// (previous report id, current report id) of exactly one rework cycle, so
