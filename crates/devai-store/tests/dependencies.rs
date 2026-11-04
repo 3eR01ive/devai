@@ -160,8 +160,12 @@ fn v3_database_gains_the_graph_additively() {
     }
     let store = Store::open(dir.path()).unwrap();
     let version: i64 = raw(&dir).query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, devai_store::SCHEMA_VERSION, "open migrated v3 forward to v4");
-    assert_eq!(devai_store::SCHEMA_VERSION, 4, "the ladder top is now v4");
+    assert_eq!(version, devai_store::SCHEMA_VERSION, "open migrated v3 forward to the top");
+    // The ladder top is DATA (migrations/manifest.json); this pin only
+    // asserts build.rs generated the constant from it. Renumbering a rung at
+    // integration moves the top and this single line (precedent: the
+    // decisions rung landed as 005 after 004_task_dependencies).
+    assert_eq!(devai_store::SCHEMA_VERSION, 5, "the ladder top is now v5");
 
     let t = store.get_task(&t_id.to_string()).unwrap();
     assert_eq!(t.title, title, "the pre-existing task row is byte-intact");

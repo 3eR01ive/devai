@@ -1954,9 +1954,9 @@ mod decisions_backfill_tests {
         let facts: Vec<WorkflowEvent> = store.events(task_id, None).unwrap().into_iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).collect();
         assert_eq!(facts.len(), 3, "one event per group: {facts:?}");
         for f in &facts {
-            assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}004_decisions_backfill"));
-            assert_eq!(f.payload[json_field::BACKFILL], "004_decisions_backfill");
-            assert_eq!(f.payload[json_field::SCRIPT_PATH], "migrations/004_decisions_backfill.sql");
+            assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}005_decisions_backfill"));
+            assert_eq!(f.payload[json_field::BACKFILL], "005_decisions_backfill");
+            assert_eq!(f.payload[json_field::SCRIPT_PATH], "migrations/005_decisions_backfill.sql");
             assert!(f.payload[json_field::REASON].as_str().unwrap().contains("VERBATIM"), "the why is recorded, not silent");
         }
         let appr_fact = facts.iter().find(|f| f.payload[json_field::KIND] == serde_json::json!(event_kind::REQUIREMENTS_APPROVED)).unwrap();
@@ -2041,7 +2041,10 @@ mod decisions_backfill_tests {
             let n: i64 = conn.query_row("SELECT count(*) FROM decisions", [], |r| r.get(0)).unwrap();
             assert_eq!(n, 0, "the rolled-back rung left no decision row");
             let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(v, 3, "the version bump rolled back with the rows");
+            // After renumber the decisions rung is 005 (4→5): the ladder first
+            // completes 004_task_dependencies, and the mid-rung failure rolls
+            // back to the FAILED rung's `from` — 4, not 3.
+            assert_eq!(v, 4, "the version bump rolled back with the rows");
             let idx: i64 = conn
                 .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
                 .unwrap();
