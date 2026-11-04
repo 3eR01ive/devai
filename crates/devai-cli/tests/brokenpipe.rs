@@ -160,6 +160,49 @@ fn literal_head_pipelines_exit_clean() {
     }
 }
 
+/// REQ-ACT-04 constraint: the cross-task `task active` view must not
+/// regress the BrokenPipe silence of commit d89cc86. 1000 RUNNING rows are
+/// seeded straight into the store, so both shapes — ~80KB of human lines and
+/// a single ~150KB `--json` line — exceed the 64KiB pipe buffer: with the
+/// read end dropped the writer provably blocks in the kernel and takes the
+/// EPIPE path (the pre-d89cc86 code would panic here with exit 101).
+#[test]
+fn task_active_on_closed_pipe_dies_quietly() {
+    use devai_core::types::{new_id, ExecutionStatus, RoleExecution};
+    use devai_store::Store;
+
+    let home = TempDir::new().unwrap();
+    let id = seeded(home.path());
+    {
+        let store = Store::open(home.path()).unwrap();
+        let t = store.resolve_task(&id).unwrap();
+        let started_at = chrono::Utc::now();
+        for _ in 0..1000 {
+            store
+                .start_execution(&RoleExecution {
+                    id: new_id(),
+                    task_id: t.id,
+                    role_slug: "requirements-analyst".into(),
+                    role_version: 1,
+                    agent_name: Some("mock".into()),
+                    status: ExecutionStatus::Running,
+                    inputs: vec![],
+                    summary: None,
+                    error: None,
+                    started_at,
+                    finished_at: None,
+                    workspace_revision: None,
+                })
+                .unwrap();
+        }
+    }
+
+    let (code, err) = run_then_close_reader(home.path(), &["task", "active"], 1);
+    assert_quiet_pipe_death(code, &err, "task active (1000 RUNNING lines, reader closed)");
+    let (code, err) = run_then_close_reader(home.path(), &["--json", "task", "active"], 0);
+    assert_quiet_pipe_death(code, &err, "task active --json (one oversized line, reader closed)");
+}
+
 #[test]
 fn logical_errors_stay_loud() {
     // REQ-PIPE-02: the quietness is pipe-only; a missing task keeps stderr
