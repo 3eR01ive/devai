@@ -141,7 +141,8 @@ enum TaskCmd {
     /// human gate (APPROVAL / final acceptance), hold, or terminal state.
     Run {
         id: String,
-        /// Agent name from `devai agent list` (builtin: mock, claude)
+        /// Agent name from `devai agent list` (builtin: mock, claude;
+        /// other providers — e.g. hermes — via `devai agent add --provider hermes`)
         #[arg(long, default_value = "mock")]
         agent: String,
         /// Workspace where QA gates and mechanical probes execute (default: cwd).

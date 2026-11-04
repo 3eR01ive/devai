@@ -3,9 +3,12 @@
 //! A role execution receives an [`ExecRequest`] (role + inputs + contract)
 //! and must return contract-shaped JSON. Providers are ordinary data on the
 //! `AgentInstance`: `mock` runs fully offline (tests, dry runs), `claude`
-//! shells out to the headless `claude` CLI. The adapter is an *interface* —
-//! it cannot decide the workflow: the engine validates every transition
-//! through `devai-core` afterwards.
+//! shells out to the headless `claude` CLI, `hermes` shells out to the
+//! headless Hermes CLI (`-z` one-shot, bare final text on stdout — task
+//! 01a19dca, the second live driver proving the role/contract layer is
+//! provider-agnostic). The adapter is an *interface* — it cannot decide
+//! the workflow: the engine validates every transition through `devai-core`
+//! afterwards.
 
 use devai_core::types::{Id, RoleDefinition};
 use serde_json::Value;
@@ -20,6 +23,15 @@ pub struct ExecRequest {
     pub role: RoleDefinition,
     pub provider: String,
     pub model: String,
+    /// LLM-provider override SOURCE for drivers that spell one (ratified
+    /// OQ-4): the engine fills it from `AgentInstance.runtime`, because
+    /// `provider` already carries the DRIVER name (`hermes`, not the LLM
+    /// behind it) and `model` carries the model. Empty — or the neutral
+    /// `devai agent add` default `local` — means NO override: the driver
+    /// leaves the provider choice to the agent's own user config, where
+    /// the keys live (R3: keys stay out of the store; OQ-5: the platform
+    /// never forces `--ignore-user-config`).
+    pub provider_override: String,
     /// Input artifacts as `(label, content)` pairs, ordered by dependency.
     pub inputs: Vec<(String, String)>,
     /// JSON Schema text of the role's output contract, when defined.
@@ -57,7 +69,12 @@ pub struct ExecOutput {
 /// must not consume attempts on (REQ-FG-03, ratified OQ-FG-02/04).
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
-    #[error("unknown agent provider `{0}` (expected `mock` or `claude`)")]
+    /// The list names the REAL live drivers. `mock-form-*` / `mock-spec-*`
+    /// are offline protocol fixtures, deliberately not spelled out here
+    /// (they are not operator-selectable drivers — "Not seeded as agents
+    /// anywhere", see `AgentRuntime::run`). R6: the text stopped lying once
+    /// a second live driver existed.
+    #[error("unknown agent provider `{0}` (expected `mock`, `claude` or `hermes`)")]
     UnknownProvider(String),
     #[error("failed to launch agent process: {0}")]
     Io(#[from] std::io::Error),
@@ -132,6 +149,7 @@ impl AgentRuntime {
         match req.provider.as_str() {
             "mock" => Self::mock(req),
             "claude" => Self::claude(req),
+            "hermes" => Self::hermes(req),
             // Test/protocol fixtures for the form loop, in the same spirit as
             // `mock` (offline, deterministic): `mock-form-flaky` violates the
             // contract on its FIRST answer and fixes the FORM (never the
@@ -254,6 +272,201 @@ impl AgentRuntime {
         Ok(ExecOutput { content: json.into_bytes(), summary: summarize(contract.map(|c| c.0), &parsed) })
     }
 
+    // -----------------------------------------------------------------
+    // hermes: headless one-shot CLI call, bare text -> contract JSON
+    // -----------------------------------------------------------------
+
+    /// Drive the Hermes CLI one-shot. Interface facts were checked against
+    /// the live `hermes --help` (ratified requirements approval): `-z
+    /// PROMPT` prints ONLY the final response text to stdout (no banner,
+    /// no session line); `--usage-file PATH` writes the JSON usage report
+    /// after a `-z` run — even when the run fails; `-m MODEL` /
+    /// `--provider PROVIDER` / `-t TOOLSETS` scope one invocation. The
+    /// envelope difference from `claude` (ASM-3) is the ONLY difference on
+    /// the reply path: there is no `{"result": ...}` JSON envelope to
+    /// unwrap, so contract validation starts directly at
+    /// `extract_json_object` on the raw stdout text. Everything after that
+    /// — extract, gate, form class, summary — is the shared claude path
+    /// (provider-agnostic contract layer, R1). A non-zero exit is the
+    /// provider-class failure (`Agent`), never a form rejection, so the
+    /// loop spends no attempts on it (REQ-FG-03, R1 AC3).
+    fn hermes(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
+        let mut cmd = std::process::Command::new("hermes");
+        cmd.args(Self::hermes_argv(req)?);
+        // R4 / REQ-WT-02 AC1: cwd is the platform workspace (the isolation
+        // worktree for a writing role), identical mechanics to claude —
+        // never an agent-chosen directory.
+        if let Some(ws) = &req.workspace {
+            cmd.current_dir(ws);
+        }
+        // REQ-WT-05 (R4): the run-artifact sink is platform-declared and
+        // exported; the agent does not choose where its logs go.
+        if let Some(ev) = &req.evidence {
+            cmd.env("DEVAI_EVIDENCE_DIR", ev);
+        }
+        // Ratified OQ-5: no `--ignore-user-config` / `--safe-mode` by
+        // default — the inference keys live in hermes' own user config, and
+        // forcing isolation would break the R3 premise (keys outside the
+        // store). An operator who wants a hermetised agent keeps that
+        // choice in hermes config, out of platform argv.
+        let out = cmd.output()?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(AdapterError::Agent(format!("`hermes` exited with {}: {}", out.status, err.trim())));
+        }
+        Self::hermes_text_to_output(req, &String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// The hermes reply path, pure and offline-testable (R7): bare stdout
+    /// text -> contract-shaped output, form failures carry the violation
+    /// list exactly as the claude envelope path does.
+    fn hermes_text_to_output(req: &ExecRequest, text: &str) -> Result<ExecOutput, AdapterError> {
+        // OQ-FG-02 (ratified) applies unchanged: unextractable text IS the
+        // form class — the same repairable rejection as on claude.
+        let json = extract_json_object(text)
+            .ok_or_else(|| AdapterError::BadOutput { violations: vec!["agent reply contains no JSON object".into()] })?;
+        let parsed: Value = serde_json::from_str(&json)
+            .map_err(|e| AdapterError::BadOutput { violations: vec![format!("extracted object is not valid JSON: {e}")] })?;
+        validate_against_contract(&json, req.contract_schema.as_deref())?;
+        let contract = req.role.output_contract.as_ref().map(|c| c.name.as_str());
+        Ok(ExecOutput { content: json.into_bytes(), summary: summarize(contract, &parsed) })
+    }
+
+    // -----------------------------------------------------------------
+    // hermes: pure argv/prompt builders (R7 AC: no live binary needed)
+    // -----------------------------------------------------------------
+
+    /// Glue the role framing into the ONE prompt string (`-z` takes a
+    /// single prompt; there is no `--append-system-prompt` analog in the
+    /// live usage — ratified OQ-3). System section first, then the task
+    /// body built by the SAME `build_user_prompt` the claude path uses,
+    /// repair section included (REQ-FG-02 AC2: the session-independent
+    /// one-shot can only fix its form from what this text carries).
+    fn hermes_prompt(req: &ExecRequest) -> String {
+        let system = build_system_prompt(&req.role);
+        let contract = req.role.output_contract.as_ref().map(|c| (c.name.as_str(), c.version));
+        let mut user = build_user_prompt(&req.title, &req.business, &req.inputs, contract, req.contract_schema.as_deref());
+        if let Some((attempt, violations)) = &req.repair {
+            user.push_str(&form_repair_section(*attempt, violations));
+        }
+        if system.is_empty() {
+            return user;
+        }
+        format!("=== ROLE (system instructions) ===\n{system}\n\n=== TASK ===\n{user}")
+    }
+
+    /// Pure argv builder for one `hermes -z` invocation. Flag sources are
+    /// the ratified set: `-m` from `ExecRequest.model` (R3), `--provider`
+    /// from `provider_override` only when it is a real override (OQ-4),
+    /// `-t` from the capability table below (R2/OQ-2), `--usage-file`
+    /// inside the platform evidence dir only when one exists (R5; ratified
+    /// OQ-1: writing roles only — read-only roles keep `evidence = None`,
+    /// extending evidence there is a separate task).
+    fn hermes_argv(req: &ExecRequest) -> Result<Vec<String>, AdapterError> {
+        let mut argv = vec!["-z".to_string(), Self::hermes_prompt(req)];
+        let toolsets = hermes_toolsets_for(&req.role)?;
+        // R2: empty `tools:` == run without `-t` (hermes keeps its own
+        // configured posture; the operator's user config is not silently
+        // rewritten by the platform — consistent with OQ-5).
+        if !toolsets.is_empty() {
+            argv.push("-t".into());
+            argv.push(toolsets.join(","));
+        }
+        if !req.model.is_empty() {
+            argv.push("-m".into());
+            argv.push(req.model.clone());
+        }
+        if has_provider_override(&req.provider_override) {
+            argv.push("--provider".into());
+            argv.push(req.provider_override.clone());
+        }
+        if let Some(path) = hermes_usage_path(req) {
+            argv.push("--usage-file".into());
+            argv.push(path.display().to_string());
+        }
+        Ok(argv)
+    }
+
+}
+
+/// File name of the collected usage report inside the evidence dir (R5).
+const HERMES_USAGE_FILE: &str = "usage.json";
+
+/// The usage path when this execution HAS a platform evidence dir;
+/// `None` exactly when it does not (ratified OQ-1: read-only roles run
+/// with `evidence = None`, so `--usage-file` is not passed to them).
+pub fn hermes_usage_path(req: &ExecRequest) -> Option<std::path::PathBuf> {
+    req.evidence.as_ref().map(|ev| ev.join(HERMES_USAGE_FILE))
+}
+
+/// R5 / ratified OQ-7: the usage report is EXPECTED only from a `hermes`
+/// run inside a platform evidence dir. The engine asks THIS (the provider
+/// vocabulary lives in the driver, the engine only writes the event —
+/// sovereignty discipline) and records the ABSENCE as a loud fact event,
+/// never silence: silence would defeat the very reason usage was
+/// introduced — cost as an observable execution fact.
+pub fn expects_usage_report(req: &ExecRequest) -> Option<std::path::PathBuf> {
+    if req.provider == "hermes" {
+        hermes_usage_path(req)
+    } else {
+        None
+    }
+}
+
+/// Capability -> toolset names for hermes (ratified OQ-2 table): `file` =
+/// read/write/patch/search files, `terminal` = command execution + process
+/// management — names verified against the hermes toolset registry
+/// (`~/.hermes/hermes-agent/toolsets.py`). The driver only ever spells
+/// names from this const table, so a bogus `-t` value (`invalid_params` at
+/// hermes runtime) cannot reach argv by construction. This is the DRIVER
+/// translation layer, in the same spirit as `claude_tools_for` — WHICH
+/// capabilities a role has stays config.
+///
+/// Unknown capabilities fail LOUDLY at argv assembly (OQ-2: an unknown
+/// capability does not silently pass) — silently granting nothing could
+/// let a role that believes it has tools run with none. `Platform` class:
+/// the role config and the driver table are out of sync, a platform-side
+/// assembly fact; never replayed to the role, never burns a form attempt
+/// (REQ-FG-03). `api:*` capabilities are the DECLARED no-tool affordances
+/// of the platform vocabulary (R2 AC: `api:project-knowledge`,
+/// `api:artifacts` grant nothing on any CLI driver) — known, not a mapping
+/// gap, hence not an error.
+const HERMES_TOOLSET_FILE: &str = "file";
+const HERMES_TOOLSET_TERMINAL: &str = "terminal";
+
+fn hermes_toolsets_for(role: &RoleDefinition) -> Result<Vec<String>, AdapterError> {
+    let mut out: Vec<String> = Vec::new();
+    for cap in &role.tools {
+        match cap.as_str() {
+            "filesystem:read" | "filesystem:read-write" => out.push(HERMES_TOOLSET_FILE.into()),
+            "git" => out.push(HERMES_TOOLSET_TERMINAL.into()),
+            other if other.starts_with("shell:") => out.push(HERMES_TOOLSET_TERMINAL.into()),
+            other if other.starts_with("api:") => {}
+            other => {
+                return Err(AdapterError::Platform(format!(
+                    "role `{}` declares capability `{other}`, which has no known hermes toolset mapping: refusing to build argv (extend the driver table or fix the role config — no silent grant, no silent drop)",
+                    role.slug
+                )));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Ratified OQ-4, reconciled with R6 AC: `--provider` is passed only for a
+/// REAL override. Empty means absence; `local` is the neutral default
+/// `devai agent add --runtime` writes when the operator named no LLM
+/// provider — it is not a hermes provider and would make the R6 flow
+/// (`agent add --provider hermes`, then `task run`) fail, so it reads as
+/// absence too. A named provider (`--runtime anthropic|openrouter|...`)
+/// is passed through verbatim.
+fn has_provider_override(s: &str) -> bool {
+    !s.is_empty() && s != "local"
+}
+
+impl AgentRuntime {
     // -----------------------------------------------------------------
     // mock: deterministic, offline, contract-valid outputs
     // -----------------------------------------------------------------
@@ -633,6 +846,7 @@ mod tests {
             role: role("x", contract),
             provider: provider.into(),
             model: "".into(),
+            provider_override: "".into(),
             inputs: vec![],
             contract_schema: None,
             workspace: None,
@@ -952,5 +1166,113 @@ mod tests {
         assert!(s.contains("attempt 2"), "{s}");
         assert!(s.contains("never written as null"), "write policy restated for the producer: {s}");
         assert!(s.contains("not a judgment of your content"), "form-vs-content split told to the role: {s}");
+    }
+
+    // ---- hermes driver: the R7 offline discipline — NO live hermes
+    // binary is invoked by any test below; argv/prompt/reply-path are pure. ----
+
+    #[test]
+    fn hermes_argv_carries_prompt_toolsets_model_provider_usage() {
+        let mut r = req("hermes", "implementation-report");
+        r.role.tools = vec!["git".into(), "filesystem:read-write".into(), "shell:build".into(), "api:artifacts".into()];
+        r.model = "anthropic/claude-sonnet-4.6".into();
+        r.provider_override = "openrouter".into();
+        r.evidence = Some("/evidence/task/exec".into());
+        let argv = AgentRuntime::hermes_argv(&r).unwrap();
+        assert_eq!(argv[0], "-z", "headless one-shot (R1)");
+        assert!(argv[1].contains("TASK: Minimal process"), "user prompt rides -z");
+        let pos = |f: &str| argv.iter().position(|a| a == f).expect(f);
+        assert_eq!(argv[pos("-t") + 1], "file,terminal", "R2/OQ-2 table: filesystem->file, git/shell->terminal, api:*->nothing");
+        assert_eq!(argv[pos("-m") + 1], "anthropic/claude-sonnet-4.6", "R3: -m only from req.model");
+        assert_eq!(argv[pos("--provider") + 1], "openrouter", "OQ-4: override passed verbatim");
+        assert_eq!(argv[pos("--usage-file") + 1], "/evidence/task/exec/usage.json", "R5: inside the PLATFORM evidence dir, never the tree");
+    }
+
+    #[test]
+    fn hermes_argv_omits_absent_overrides_and_usage() {
+        let mut r = req("hermes", "review-report");
+        // Read-only shape (ratified OQ-1): evidence=None => no --usage-file.
+        r.evidence = None;
+        r.role.tools = vec![];
+        let argv = AgentRuntime::hermes_argv(&r).unwrap();
+        assert_eq!(argv.len(), 2, "-z + prompt only; empty tools => no -t (R2)");
+        for flag in ["-t", "-m", "--provider", "--usage-file"] {
+            assert!(!argv.iter().any(|a| a == flag), "absent sources emit no flag (R2/R3/R5): {flag}");
+        }
+        // The neutral `agent add` default is absence, not a provider (OQ-4 x R6).
+        r.provider_override = "local".into();
+        assert!(!AgentRuntime::hermes_argv(&r).unwrap().iter().any(|a| a == "--provider"));
+    }
+
+    #[test]
+    fn unknown_capability_is_a_loud_error_not_a_silent_grant() {
+        let mut r = req("hermes", "review-report");
+        r.role.tools = vec!["telepathy:read".into()];
+        let e = AgentRuntime::hermes_argv(&r).unwrap_err();
+        assert!(matches!(e, AdapterError::Platform(_)), "loud at argv assembly (ratified OQ-2): {e}");
+        assert!(e.to_string().contains("telepathy:read"), "names the offending capability: {e}");
+        assert_eq!(e.failure_class(), devai_core::types::failure_class::PLATFORM, "never burns form attempts (REQ-FG-03)");
+        // Declared no-tool capabilities and empty tools are known, not errors.
+        r.role.tools = vec!["api:project-knowledge".into()];
+        assert!(AgentRuntime::hermes_argv(&r).unwrap().iter().all(|a| a != "-t"));
+    }
+
+    /// R1/R7: the hermes reply path — BARE text (no `{"result":...}`
+    /// envelope, ASM-3) — reaches the SAME contract gate as claude: bad
+    /// text is the FORM class with a violation list, never a provider
+    /// failure; valid text passes exactly as the envelope path would.
+    #[test]
+    fn hermes_bare_text_reaches_the_same_contract_gate() {
+        let mut r = req("hermes", "review-report");
+        r.contract_schema = Some(r#"{"type":"object","required":["verdict","summary"]}"#.into());
+        let out = AgentRuntime::hermes_text_to_output(&r, "prose before {\"verdict\":\"APPROVED\",\"summary\":\"ok\"} prose after")
+            .expect("extract_json_object rides directly on raw stdout text");
+        assert_eq!(String::from_utf8(out.content).unwrap(), r#"{"verdict":"APPROVED","summary":"ok"}"#);
+        // Non-JSON text is a form rejection with the violation LIST (AC: form
+        // class, not provider failure — the loop may repair it).
+        let e = AgentRuntime::hermes_text_to_output(&r, "I cannot produce an object").unwrap_err();
+        assert!(matches!(&e, AdapterError::BadOutput { violations } if !violations.is_empty()), "form class: {e}");
+        assert_eq!(e.failure_class(), devai_core::types::failure_class::RESPONSE_FORM);
+        // A missing required key yields the SAME violation string the claude
+        // path produces — the gate is provider-agnostic (R1 constraint).
+        let e = AgentRuntime::hermes_text_to_output(&r, r#"{"summary":"done"}"#).unwrap_err();
+        assert!(matches!(&e, AdapterError::BadOutput { violations } if violations.contains(&"$.verdict: missing required key".to_string())), "{e}");
+    }
+
+    /// Ratified OQ-3: one glued prompt — system section before the task
+    /// body — carrying the same repair data (REQ-FG-02 AC2), pure and
+    /// offline-testable.
+    #[test]
+    fn hermes_prompt_glues_system_task_and_repair_sections() {
+        let mut r = req("hermes", "review-report");
+        r.repair = Some((2, vec!["$.verdict: missing required key".to_string()]));
+        let p = AgentRuntime::hermes_prompt(&r);
+        assert!(p.contains("=== ROLE (system instructions) ==="), "system section marker (OQ-3): {p}");
+        assert!(p.contains("Devai `x` agent"), "build_system_prompt content survives the glue");
+        assert!(p.contains("=== TASK ==="), "body section marker follows");
+        assert!(p.find("ROLE (system").unwrap() < p.find("=== TASK ===").unwrap(), "system first, body after");
+        assert!(p.contains("OUTPUT REJECTED BY THE CONTRACT GATE (attempt 2)"), "repair section rides the same single prompt (R1 AC4)");
+        assert!(p.contains("$.verdict: missing required key"), "full violation list verbatim");
+    }
+
+    #[test]
+    fn usage_fact_is_expected_only_for_hermes_with_evidence() {
+        let mut r = req("hermes", "review-report");
+        assert!(expects_usage_report(&r).is_none(), "no evidence dir => nothing to expect (OQ-1)");
+        r.evidence = Some("/tmp/ev".into());
+        assert_eq!(expects_usage_report(&r).unwrap().to_str().unwrap(), "/tmp/ev/usage.json");
+        let c = req("claude", "review-report");
+        assert!(expects_usage_report(&c).is_none(), "the claude driver has no usage analogue (motivation)");
+    }
+
+    /// R6: after a third live driver exists, the UnknownProvider text names
+    /// the real drivers (it said `mock` or `claude` while that was truth).
+    #[test]
+    fn unknown_provider_error_names_the_real_drivers() {
+        let e = AgentRuntime::run(&req("telepathy", "review-report")).unwrap_err();
+        let s = e.to_string();
+        for d in ["mock", "claude", "hermes"] {
+            assert!(s.contains(d), "text lists the actual driver `{d}`: {s}");
+        }
     }
 }

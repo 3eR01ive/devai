@@ -729,6 +729,13 @@ pub mod event_kind {
     /// `migration:<rung id>`, the supersession/decisions backfill discipline
     /// (REQ-003/REQ-BF: the one-time mutation is auditable, not silent).
     pub const EXECUTION_SINGLE_WRITER_REPAIR: &str = "execution.single_writer_repair";
+    /// Warning FACT (R5 / ratified OQ-7, provider `hermes`): the run was
+    /// given a platform evidence dir and expected a `--usage-file` report,
+    /// but `usage.json` is absent afterwards. Recorded as an observable
+    /// execution fact, NEVER silence — the whole point of collecting usage
+    /// is cost as a witnessed field of the execution. Payload: execution
+    /// id, provider, the expected `usage_file` path.
+    pub const EXECUTION_USAGE_MISSING: &str = "execution.usage_missing";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     /// Publishing a new artifact version supersedes the previous CURRENT
     /// row(s) of the same (task_id, kind) group: the status column flips,
@@ -812,6 +819,7 @@ pub mod event_kind {
         EXECUTION_FORM_ESCALATED,
         EXECUTION_CANCELLED,
         EXECUTION_SINGLE_WRITER_REPAIR,
+        EXECUTION_USAGE_MISSING,
         ARTIFACT_PUBLISHED,
         ARTIFACT_SUPERSEDED,
         DECISIONS_BACKFILLED,
