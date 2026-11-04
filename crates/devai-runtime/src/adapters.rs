@@ -291,7 +291,9 @@ impl AgentRuntime {
     /// provider-class failure (`Agent`), never a form rejection, so the
     /// loop spends no attempts on it (REQ-FG-03, R1 AC3).
     fn hermes(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
-        let mut cmd = std::process::Command::new("hermes");
+        // Driver identity is single-sourced in `PROVIDER_HERMES`: the PATH
+        // binary and the registry provider key are spelled by one const.
+        let mut cmd = std::process::Command::new(PROVIDER_HERMES);
         cmd.args(Self::hermes_argv(req)?);
         // R4 / REQ-WT-02 AC1: cwd is the platform workspace (the isolation
         // worktree for a writing role), identical mechanics to claude —
@@ -399,6 +401,18 @@ pub fn hermes_usage_path(req: &ExecRequest) -> Option<std::path::PathBuf> {
     req.evidence.as_ref().map(|ev| ev.join(HERMES_USAGE_FILE))
 }
 
+/// The canonical DRIVER key of this adapter (the second literal of the
+/// quality audit's arch/no-magic item 7, spelled once with its justification):
+/// exactly `"hermes"` because one value has three faces that must stay
+/// identical — (1) the provider string the operator registers with
+/// `devai agent add --provider hermes` (R6), (2) the binary name on PATH
+/// invoked by `Self::hermes`, (3) the `"hermes"` arm in `AgentRuntime::run`.
+/// Rust forbids `&str` consts in match patterns, so the run arm keeps the
+/// literal; every COMPARISON and the binary name go through this const, so
+/// the usage-expectation cannot silently drift from the driver that was
+/// actually selected (drift = cost-as-fact quietly stops being collected).
+const PROVIDER_HERMES: &str = "hermes";
+
 /// R5 / ratified OQ-7: the usage report is EXPECTED only from a `hermes`
 /// run inside a platform evidence dir. The engine asks THIS (the provider
 /// vocabulary lives in the driver, the engine only writes the event —
@@ -406,7 +420,7 @@ pub fn hermes_usage_path(req: &ExecRequest) -> Option<std::path::PathBuf> {
 /// never silence: silence would defeat the very reason usage was
 /// introduced — cost as an observable execution fact.
 pub fn expects_usage_report(req: &ExecRequest) -> Option<std::path::PathBuf> {
-    if req.provider == "hermes" {
+    if req.provider == PROVIDER_HERMES {
         hermes_usage_path(req)
     } else {
         None
@@ -455,15 +469,24 @@ fn hermes_toolsets_for(role: &RoleDefinition) -> Result<Vec<String>, AdapterErro
     Ok(out)
 }
 
+/// The sentinel `AgentInstance.runtime` value meaning NO LLM-provider
+/// override: `devai agent add --runtime`
+/// writes exactly this string as its CLI default
+/// (`crates/devai-cli/src/main.rs`, `default_value = "local"`) whenever the
+/// operator named no provider. The value is domain knowledge — WHICH string
+/// counts as "absent" — so it is spelled once, here, not inline in the
+/// comparison (same discipline as `START_TOLERANCE_SECS` in liveness.rs):
+/// if the CLI default ever changes, this const is the single place the
+/// driver learns about it. `local` is not a hermes provider name; passing
+/// it through would make the R6 flow die in hermes' provider validation.
+const RUNTIME_NO_PROVIDER: &str = "local";
+
 /// Ratified OQ-4, reconciled with R6 AC: `--provider` is passed only for a
-/// REAL override. Empty means absence; `local` is the neutral default
-/// `devai agent add --runtime` writes when the operator named no LLM
-/// provider — it is not a hermes provider and would make the R6 flow
-/// (`agent add --provider hermes`, then `task run`) fail, so it reads as
-/// absence too. A named provider (`--runtime anthropic|openrouter|...`)
-/// is passed through verbatim.
+/// REAL override. Empty means absence; the neutral `devai agent add`
+/// default (`RUNTIME_NO_PROVIDER`) means absence too. A named provider
+/// (`--runtime anthropic|openrouter|...`) is passed through verbatim.
 fn has_provider_override(s: &str) -> bool {
-    !s.is_empty() && s != "local"
+    !s.is_empty() && s != RUNTIME_NO_PROVIDER
 }
 
 impl AgentRuntime {
