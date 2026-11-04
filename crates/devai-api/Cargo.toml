@@ -1,0 +1,19 @@
+[package]
+name = "devai-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Devai platform API: the typed in-process operation surface every consumer (CLI first) calls instead of the store"
+
+[dependencies]
+chrono.workspace = true
+devai-core.workspace = true
+devai-runtime.workspace = true
+devai-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

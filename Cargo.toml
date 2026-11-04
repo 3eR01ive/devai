@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/devai-core", "crates/devai-store", "crates/devai-runtime", "crates/devai-cli"]
+members = ["crates/devai-core", "crates/devai-store", "crates/devai-api", "crates/devai-runtime", "crates/devai-cli"]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 devai-core = { path = "crates/devai-core" }
 devai-store = { path = "crates/devai-store" }
+devai-api = { path = "crates/devai-api" }
 devai-runtime = { path = "crates/devai-runtime" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }

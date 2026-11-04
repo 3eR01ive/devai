@@ -1,0 +1,408 @@
+[
+  {
+    "name": "project.add",
+    "class": "mutation",
+    "input": "ProjectAddReq{name, description, repos}",
+    "output": "Project",
+    "description": "Register a project with optional local repository paths; inserts one projects row. No workflow state involved."
+  },
+  {
+    "name": "project.list",
+    "class": "read",
+    "input": "()",
+    "output": "Vec<Project>",
+    "description": "List all registered projects ordered by name."
+  },
+  {
+    "name": "project.get",
+    "class": "read",
+    "input": "id_or_name",
+    "output": "Option<Project>",
+    "description": "Look up one project by full id or name; None when absent."
+  },
+  {
+    "name": "task.create",
+    "class": "mutation",
+    "input": "TaskCreateReq{title, project, description, description_file, parent, blocked_by}",
+    "output": "TaskCreated{task, linked}",
+    "description": "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. Mirrors `task new`."
+  },
+  {
+    "name": "task.list",
+    "class": "read",
+    "input": "()",
+    "output": "Vec<Task>",
+    "description": "List all tasks ordered by most recently updated."
+  },
+  {
+    "name": "task.get",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "Task",
+    "description": "Resolve one task by full id or unique id prefix; fails with not_found/ambiguous. Mirrors `task get`."
+  },
+  {
+    "name": "task.status",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "StatusView{task, allowed_operations, current_artifacts, open_questions}",
+    "description": "Current state plus the operations the platform permits next, the CURRENT artifacts and open questions. Mirrors `task status`."
+  },
+  {
+    "name": "task.progress",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions}",
+    "description": "Pipeline position, re-entry note and the snapshot of RUNNING executions, drawn purely from engine data. Mirrors `task progress`."
+  },
+  {
+    "name": "task.active",
+    "class": "read",
+    "input": "()",
+    "output": "ActiveSnapshot{snapshot_at, rows}",
+    "description": "Cross-task read-only snapshot of every RUNNING execution with liveness triage (alive/dead/unknown) and worktree link only where the platform recorded worktree.prepared. Mirrors `task active`."
+  },
+  {
+    "name": "task.report",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "QualityReportView",
+    "description": "The CURRENT quality report the human signs at the QA gate: artifact identity, contract, machine body and rendering. Mirrors `task report`."
+  },
+  {
+    "name": "task.events",
+    "class": "read",
+    "input": "id_prefix, limit",
+    "output": "Vec<WorkflowEvent>",
+    "description": "Immutable event history of the task, newest tail limited. Mirrors `task events`."
+  },
+  {
+    "name": "task.decisions",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "Vec<Decision>",
+    "description": "Decision rows recorded for the task (approvals, overrides, ratifications). Backs APPROVED_DECISIONS delivery to roles; the CLI exposes it as `task decisions`."
+  },
+  {
+    "name": "task.dependencies",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "DependenciesView{task, outgoing, incoming, epic_children, own_parents}",
+    "description": "Typed dependency view of one task (outgoing/incoming ACTIVE edges); the epic vertex role reads out of the same data. Mirrors `task dependencies`."
+  },
+  {
+    "name": "task.epics",
+    "class": "read",
+    "input": "()",
+    "output": "Vec<EpicVertex>",
+    "description": "Epic registry as a VIEW over the dependency graph (no epic entity exists). Mirrors `task epics`."
+  },
+  {
+    "name": "task.graph",
+    "class": "read",
+    "input": "()",
+    "output": "GraphView{nodes, ready}",
+    "description": "The task dependency graph with states and the ready set (no open blockers, non-terminal), built purely from stored data. Mirrors `task graph`."
+  },
+  {
+    "name": "task.start",
+    "class": "mutation",
+    "input": "id_prefix",
+    "output": "MutationResult{task, state_changed, staled, superseded, event_kind, allowed_operations}",
+    "description": "DRAFT → ANALYSIS through workflow::start. Mirrors `task start`."
+  },
+  {
+    "name": "task.run",
+    "class": "mutation",
+    "input": "RunReq{id, agent, workspace, force_reaudit}",
+    "output": "RunReport (plus gate_report_text)",
+    "description": "Drive assigned roles through all autonomous stages to the next human gate; refuses while a RUNNING execution exists (single writer). force_reaudit carries the --force-reaudit gate semantics. Mirrors `task run`."
+  },
+  {
+    "name": "task.revise",
+    "class": "mutation",
+    "input": "ReviseReq{id, file, reason}",
+    "output": "MutationResult",
+    "description": "Publish/replace the REQUIREMENTS_SPEC and move to REVIEW through the contract gate. Mirrors `task revise`."
+  },
+  {
+    "name": "task.review",
+    "class": "mutation",
+    "input": "id_prefix, verdict, summary",
+    "output": "MutationResult",
+    "description": "Record the reviewer verdict in REVIEW. Mirrors `task review`."
+  },
+  {
+    "name": "task.approve",
+    "class": "mutation",
+    "input": "id_prefix, rationale",
+    "output": "MutationResult + Decision",
+    "description": "APPROVAL → IMPLEMENTATION: requires a CURRENT REQUIREMENTS_SPEC; persists the workflow event AND a requirements_approval decision row. Mirrors `task approve`."
+  },
+  {
+    "name": "task.reject",
+    "class": "mutation",
+    "input": "id_prefix, rationale",
+    "output": "MutationResult",
+    "description": "APPROVAL → ANALYSIS. Mirrors `task reject`."
+  },
+  {
+    "name": "task.accept",
+    "class": "mutation",
+    "input": "id_prefix, rationale",
+    "output": "MutationResult",
+    "description": "QA → ACCEPTED; refuses while open 'blocks' dependencies stand unless a dependency_override decision covers every blocker. Mirrors `task accept`."
+  },
+  {
+    "name": "task.return",
+    "class": "mutation",
+    "input": "id_prefix, rationale",
+    "output": "MutationResult",
+    "description": "QA → REWORK. Mirrors `task return`."
+  },
+  {
+    "name": "task.pause",
+    "class": "mutation",
+    "input": "id_prefix, reason",
+    "output": "MutationResult",
+    "description": "Park the task in PAUSED. Mirrors `task pause`."
+  },
+  {
+    "name": "task.resume",
+    "class": "mutation",
+    "input": "id_prefix",
+    "output": "MutationResult",
+    "description": "Resume a PAUSED/BLOCKED/FAILED task or answer-driven restore, subject to the dependency gate. Mirrors `task resume`."
+  },
+  {
+    "name": "task.block",
+    "class": "mutation",
+    "input": "id_prefix, reason",
+    "output": "MutationResult",
+    "description": "Move the task to BLOCKED. Mirrors `task block`."
+  },
+  {
+    "name": "task.cancel",
+    "class": "mutation",
+    "input": "id_prefix, reason",
+    "output": "MutationResult",
+    "description": "Terminal CANCELLED. Mirrors `task cancel`."
+  },
+  {
+    "name": "task.fail",
+    "class": "mutation",
+    "input": "id_prefix, reason",
+    "output": "MutationResult",
+    "description": "Record a runtime failure; the task parks in FAILED for `resume`. Mirrors `task fail`."
+  },
+  {
+    "name": "task.depend",
+    "class": "mutation",
+    "input": "id_prefix, on_prefix, kind",
+    "output": "TaskDependency",
+    "description": "Register a typed ACTIVE dependency edge, loud at write on self-reference, duplicate, dangling or intra-kind cycles. Mirrors `task depend`."
+  },
+  {
+    "name": "task.unlink",
+    "class": "mutation",
+    "input": "id_prefix, on_prefix, kind",
+    "output": "TaskDependency",
+    "description": "Supersede an ACTIVE edge; the row stays as history immutable (OQ7). Mirrors `task unlink`."
+  },
+  {
+    "name": "task.override",
+    "class": "mutation",
+    "input": "id_prefix, blockers, rationale",
+    "output": "OverrideResult{task, override_blockers}",
+    "description": "HUMAN-ONLY (OQ-13): record a dependency_override ratification to continue despite open blockers; refs bound to exactly the covered ids. Mirrors `task override`."
+  },
+  {
+    "name": "task.ratify_empty_rework",
+    "class": "mutation",
+    "input": "id_prefix, rationale",
+    "output": "RatifyResult{task, decision, recorded_now, prev_report, current_report, state}",
+    "description": "HUMAN-ONLY (OQ-13): the EMPTY-REWORK GATE escape — records rework_noop_ratified for the exact report pair, releases the gate question, runs the withheld REWORK → QA transition. Mirrors `task ratify-empty-rework`."
+  },
+  {
+    "name": "task.merge",
+    "class": "mutation",
+    "input": "MergeReq{id, workspace, rationale}",
+    "output": "MergeResult{task, branch, workspace, head_before, head_after}",
+    "description": "HUMAN-ONLY (OQ-13): the single merge path — merges the platform rework/<task-id> branch into the checked-out baseline; records rework_merge decision + event, never touches task state. Mirrors `task merge`."
+  },
+  {
+    "name": "artifact.publish",
+    "class": "mutation",
+    "input": "PublishReq{id, kind, file, name, depends, contract, execution, verdict, category}",
+    "output": "PublishResult{artifact, state_changed, gate}",
+    "description": "Publish a versioned artifact through the contract gate; certain kinds advance the workflow through the SAME core commands. Requires a RUNNING execution row when --execution is given. Mirrors `artifact publish`."
+  },
+  {
+    "name": "artifact.list",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "Vec<Artifact>",
+    "description": "All artifact rows of the task with versions and statuses. Mirrors `artifact list`."
+  },
+  {
+    "name": "artifact.cat",
+    "class": "read",
+    "input": "artifact_id",
+    "output": "Vec<u8> (raw bytes)",
+    "description": "Fetch the stored content bytes of one artifact. Mirrors `artifact cat`."
+  },
+  {
+    "name": "artifact.cat_text",
+    "class": "read",
+    "input": "artifact_id",
+    "output": "String",
+    "description": "Text presentation of artifact content; NotUtf8 error when the bytes are not text."
+  },
+  {
+    "name": "question.ask",
+    "class": "mutation",
+    "input": "AskReq{id, text, context, options, blocking, execution}",
+    "output": "Question",
+    "description": "Raise a question; a blocking one parks the task in WAITING_FOR_INPUT through workflow::raise_question. Mirrors `question ask`."
+  },
+  {
+    "name": "question.answer",
+    "class": "mutation",
+    "input": "question_id, text",
+    "output": "Question",
+    "description": "Answer an OPEN question and run the answer-driven transition. Mirrors `question answer`."
+  },
+  {
+    "name": "question.list",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "Vec<Question>",
+    "description": "All questions of the task. Mirrors `question list`."
+  },
+  {
+    "name": "role.add",
+    "class": "mutation",
+    "input": "file (RoleDefinition JSON)",
+    "output": "RoleDefinition",
+    "description": "Register a versioned RoleDefinition; version 0 in the file means latest+1 for the slug. Mirrors `role add`."
+  },
+  {
+    "name": "role.list",
+    "class": "read",
+    "input": "()",
+    "output": "Vec<RoleDefinition>",
+    "description": "List all registered role versions."
+  },
+  {
+    "name": "role.get",
+    "class": "read",
+    "input": "slug",
+    "output": "Option<RoleDefinition>",
+    "description": "Latest definition for a role slug."
+  },
+  {
+    "name": "agent.add",
+    "class": "mutation",
+    "input": "name, provider, model, runtime",
+    "output": "AgentInstance",
+    "description": "Register a local agent instance; credentials stay outside the store. Mirrors `agent add`."
+  },
+  {
+    "name": "agent.list",
+    "class": "read",
+    "input": "()",
+    "output": "Vec<AgentInstance>",
+    "description": "List registered agents."
+  },
+  {
+    "name": "contract.add",
+    "class": "mutation",
+    "input": "name, version, file (JSON)",
+    "output": "()",
+    "description": "Register a versioned contract schema. Mirrors `contract add`."
+  },
+  {
+    "name": "contract.get",
+    "class": "read",
+    "input": "name, version",
+    "output": "Option<String> (schema JSON text)",
+    "description": "Fetch a stored contract schema. Mirrors `contract get`."
+  },
+  {
+    "name": "exec.start",
+    "class": "mutation",
+    "input": "id_prefix, role, agent, inputs",
+    "output": "RoleExecution",
+    "description": "Start a role execution: role/stage matrix validated, workspace revision and owner columns captured platform-side, single-writer guard enforced. Mirrors `exec start`."
+  },
+  {
+    "name": "exec.finish",
+    "class": "mutation",
+    "input": "exec_id, summary",
+    "output": "RoleExecution",
+    "description": "Close a RUNNING row as COMPLETED. Mirrors `exec finish`."
+  },
+  {
+    "name": "exec.fail",
+    "class": "mutation",
+    "input": "exec_id, error",
+    "output": "RoleExecution",
+    "description": "Close a RUNNING row as FAILED with the error text. Mirrors `exec fail`."
+  },
+  {
+    "name": "exec.cancel",
+    "class": "mutation",
+    "input": "exec_id",
+    "output": "RoleExecution",
+    "description": "Close a RUNNING row as CANCELLED (cooperative; the process is never touched, REQ-SW-06). Mirrors `exec cancel`."
+  },
+  {
+    "name": "exec.list",
+    "class": "read",
+    "input": "Option<task_ref>",
+    "output": "Vec<RoleExecution>",
+    "description": "Execution rows, optionally for one task; attempt/failure_class lineage ships in the rows. Mirrors `exec list`."
+  },
+  {
+    "name": "exec.get",
+    "class": "read",
+    "input": "exec_id_prefix",
+    "output": "RoleExecution",
+    "description": "One execution row by full id or unique prefix — machine observation of a running process's state without the launching terminal (REQ-API-07). Backs `exec get`."
+  },
+  {
+    "name": "exec.liveness",
+    "class": "read",
+    "input": "exec_id_prefix",
+    "output": "LivenessView{id, status, owner_pid, owner_host, liveness}",
+    "description": "Liveness verdict (alive/dead/unknown) for the recorded owner of one execution — orphans distinguishable by data, not pgrep. Backs `exec liveness`."
+  },
+  {
+    "name": "exec.active_rows",
+    "class": "read",
+    "input": "()",
+    "output": "Vec<ActiveRow>",
+    "description": "RUNNING rows with per-row liveness, ordered oldest-first — the data behind `task active`; the task plane wraps it into ActiveSnapshot."
+  },
+  {
+    "name": "export.bundle",
+    "class": "read",
+    "input": "id_prefix, out_dir",
+    "output": "BundleManifest",
+    "description": "Export the task bundle (domain data + artifacts, no caches/credentials) — identity and versions identical to the CLI path (REQ-API-02 AC3). Mirrors `export`."
+  },
+  {
+    "name": "import.bundle",
+    "class": "mutation",
+    "input": "dir",
+    "output": "ImportOutcome",
+    "description": "Import a bundle, respecting single-CURRENT and single-writer invariants. Mirrors `import`."
+  },
+  {
+    "name": "api.registry",
+    "class": "read",
+    "input": "()",
+    "output": "Vec<OpDescriptor>",
+    "description": "The published operation registry itself — every operation with typed input/output names and textual semantics. Backs `devai api registry`."
+  }
+]

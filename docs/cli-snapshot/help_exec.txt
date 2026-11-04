@@ -1,12 +1,14 @@
 Usage: devai exec [OPTIONS] <COMMAND>
 
 Commands:
-  start   Start a role execution. The platform validates the role/stage matrix before anything runs
-  finish  
-  fail    
-  cancel  
-  list    
-  help    Print this message or the help of the given subcommand(s)
+  start     Start a role execution. The platform validates the role/stage matrix before anything runs
+  finish    
+  fail      
+  cancel    
+  list      
+  get       One execution row by id/prefix — observable without the launching terminal (REQ-API-07, via the API exec.get operation)
+  liveness  Liveness of the recorded owner of an execution: alive | dead | unknown — orphans distinguishable by stored data, not pgrep (REQ-API-07 AC3, via the API exec.liveness operation; read-only, never signals the process)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --home <HOME>    Data directory (default: $DEVAI_HOME or ~/.devai) [env: DEVAI_HOME=]
