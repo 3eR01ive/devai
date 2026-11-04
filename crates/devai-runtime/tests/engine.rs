@@ -8,7 +8,7 @@ use chrono::Utc;
 use devai_core::types::*;
 use devai_core::workflow;
 use devai_runtime::{Engine, Gate};
-use devai_store::{Store, seed};
+use devai_store::{ArtifactDraft, Store, seed};
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1174,4 +1174,414 @@ fn rework_with_new_commit_still_reaches_qa() {
     assert_eq!(reported.payload[json_field::VERDICT], "DISTINCT", "the gate ran its comparison");
     assert_ne!(reported.payload[json_field::CURRENT_COMMIT], head, "the new tip is not the bound head");
     assert_eq!(reported.payload[json_field::PREV_COMMIT], head, "the compared predecessor was the first report's tip");
+}
+
+// ---------------------------------------------------------------------------
+// REWORK CONTEXT delivery — the engine executes the declarative
+// `config/workflow/rework-context.yaml` table: rationales read VERBATIM from
+// the append-only record, findings quoted AS STORED (no read-side
+// recomputation), the window cutting at the role's last COMPLETED execution,
+// sovereignty (roles never learn it) and inertness (no rework ⇒ no section,
+// byte-identical prompts) intact. Ported from the wip/pre-t2-merge delivery
+// tests and re-based onto main's typed quality-report model.
+// ---------------------------------------------------------------------------
+
+use devai_runtime::evaluation::{CheckOutcome, EvaluationBlock, GateOutcome, ProfileIdentity, ProbeState, QualityReportDoc};
+use devai_runtime::{build_user_prompt, rework_context, RuntimeError, REWORK_CONTEXT_LABEL};
+use devai_store::config::{factory_rework_policies, load_rework_policies, ReworkPolicy};
+
+/// The table exactly as the platform ships it — the same bytes the engine
+/// falls back to, so every executor assertion below runs on factory policy.
+fn policy() -> Vec<ReworkPolicy> {
+    factory_rework_policies()
+}
+
+/// A QA return as the transition persists it: `quality.returned` carrying
+/// the human's rationale text on the payload.
+fn returned(store: &Store, task_id: Id, text: &str) {
+    store.insert_event(Some(task_id), event_kind::QUALITY_RETURNED, "tester", serde_json::json!({ (json_field::RATIONALE): text })).unwrap();
+}
+
+/// The role's last COMPLETED finish as the store writes it (payload carries
+/// `role` + `status` — the window cutoff reads exactly those stored fields).
+fn completed(store: &Store, task_id: Id, role: &str) {
+    store.insert_event(Some(task_id), event_kind::EXECUTION_FINISHED, &format!("role:{role}"), serde_json::json!({ (json_field::ROLE): role, (json_field::STATUS): ExecutionStatus::Completed.as_str() })).unwrap();
+}
+
+fn craft_report(store: &Store, task_id: Id, content: serde_json::Value, version: u32) {
+    store
+        .publish_artifact(ArtifactDraft {
+            task_id,
+            kind: ArtifactKind::QualityReport,
+            name: "quality-report".into(),
+            category: DataCategory::Artifact,
+            content: content.to_string().into_bytes(),
+            media_type: "application/json".into(),
+            contract: Some(ContractRef { name: "quality-report".into(), version }),
+            created_by: "tester".into(),
+            execution_id: None,
+            depends_on: vec![],
+        })
+        .unwrap();
+}
+
+fn mk_check(id: &str, verify: &str, state: &str, score: Option<f64>, floor: Option<f64>, weight: f64, violations: Vec<String>) -> CheckOutcome {
+    CheckOutcome { id: id.into(), verify: verify.into(), state: state.into(), score, floor, weight, detects: vec!["process/untested-branch".into()], violations, evidence: vec![format!("crafted evidence for {id}")], reason: String::new() }
+}
+
+/// A @4-shaped failing report built THROUGH the one typed model `assemble`
+/// emits — two FAIL gates, one PASS gate, a MECHANICAL_FAIL check carrying
+/// the marker violation, and the stored red-line list.
+fn failing_doc() -> QualityReportDoc {
+    QualityReportDoc {
+        verdict: "RETURN".into(),
+        recommendation_basis: "красные линии: spec-coverage=0.40<floor 0.70".into(),
+        report_text: "crafted for delivery tests".into(),
+        assessment_execution: "exec-crafted".into(),
+        profile: ProfileIdentity { project: "devai".into(), version: 1 },
+        workspace_revision: None,
+        evaluation: EvaluationBlock {
+            verdict: "FAIL".into(),
+            score: 0.4,
+            theta: 0.8,
+            blocked_weight: 0.0,
+            max_blocked_weight: 0.2,
+            floors_breached: vec!["spec-coverage=0.40<floor 0.70".into()],
+            pending_human: vec![],
+            gates: vec![
+                GateOutcome { id: "build-green".into(), state: ProbeState::Fail, detail: "cargo build failed".into() },
+                GateOutcome { id: "tests-green".into(), state: ProbeState::Fail, detail: String::new() },
+                GateOutcome { id: "no-network".into(), state: ProbeState::Pass, detail: String::new() },
+            ],
+            checks: vec![
+                mk_check("arch/no-cycles", "mechanical", "MECHANICAL_FAIL", Some(0.0), Some(1.0), 0.5, vec!["FINDING-MARKER-4e7b: context module crosses the layer boundary".into()]),
+                mk_check("spec-coverage", "rubric", "SCORED", Some(0.40), Some(0.70), 0.3, vec![]),
+                mk_check("mech-green", "mechanical", "MECHANICAL_PASS", Some(1.0), None, 0.2, vec![]),
+            ],
+        },
+    }
+}
+
+#[test]
+fn qa_return_delivers_the_verbatim_rationale_and_stored_findings() {
+    let (_d, store) = store();
+    let t = Task::new("Delivery", "the rework role must see the return text and the failing items", None, Utc::now());
+    store.create_task(&t).unwrap();
+    craft_report(&store, t.id, serde_json::to_value(failing_doc()).unwrap(), 4);
+    returned(&store, t.id, "WIRING: контекст не доставлялся — чини доставку");
+
+    let section = rework_context(&store, &t, "implementation-agent", &policy())
+        .expect("an inert read of a stored body never fails")
+        .expect("a return against this role delivers a section");
+    assert!(section.starts_with("Platform-assembled rejection context"), "the preamble states the data-only rule FIRST: {section}");
+    assert!(section.contains("DECISION RATIONALES since the last successful `implementation-agent` execution"), "window header names the role");
+    // verbatim text, provenance line naming the recorded event and its actor
+    assert!(section.contains("WIRING: контекст не доставлялся — чини доставку"), "rationale quoted verbatim");
+    assert!(section.contains("[R1] quality.returned by tester at "), "the line names the event kind and author");
+    // findings quoted as stored — attach_findings fires on THIS trigger
+    assert!(section.contains("QUALITY REPORT FINDINGS"), "the QA return flow also quotes the report");
+    assert!(section.contains("FINDING-MARKER-4e7b"), "the stored MECHANICAL_FAIL violation text is quoted");
+    assert!(section.contains("spec-coverage=0.40<floor 0.70"), "the stored red-line string is quoted verbatim");
+    assert!(section.contains("- gate `build-green`: FAIL — cargo build failed"), "stored FAIL gate + detail");
+    assert!(section.contains("- gate `tests-green`: FAIL\n"), "an empty stored detail adds no dash");
+    assert!(!section.contains("no-network"), "the PASS gate is not a failing item and is never quoted");
+}
+
+#[test]
+fn the_window_cuts_at_this_roles_last_completed_execution() {
+    let (_d, store) = store();
+    let t = Task::new("Window", "old rejections must not haunt a role that already succeeded", None, Utc::now());
+    store.create_task(&t).unwrap();
+    returned(&store, t.id, "OLD-MARKER-a11 — answered by the completed rework");
+    completed(&store, t.id, "implementation-agent");
+    returned(&store, t.id, "NEW-MARKER-b77");
+    returned(&store, t.id, "NEW2-MARKER-c99");
+
+    let s1 = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert!(!s1.contains("OLD-MARKER-a11"), "rationales at or before the last COMPLETED finish are out of the window: {s1}");
+    let (i_new, i_new2) = (s1.find("NEW-MARKER-b77").unwrap(), s1.find("NEW2-MARKER-c99").unwrap());
+    assert!(i_new < i_new2, "inside the window the order is seq order, oldest first");
+    assert!(s1.contains("[R1]") && s1.contains("[R2]") && !s1.contains("[R3]"), "two in-window returns, numbered");
+
+    // Byte-stability: identical store state assembles an identical section.
+    let s2 = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert_eq!(s1, s2, "determinism: same state => byte-identical section");
+
+    // Another role's success does NOT move this role's cutoff.
+    completed(&store, t.id, "quality-auditor");
+    let s3 = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert_eq!(s1, s3, "the cutoff is located per declared role, on `execution.finished` role+status");
+}
+
+#[test]
+fn a_never_succeeded_role_receives_every_recorded_trigger_oldest_first() {
+    let (_d, store) = store();
+    let t = Task::new("NoSuccess", "no COMPLETED row yet => the whole recorded flow is in scope", None, Utc::now());
+    store.create_task(&t).unwrap();
+    craft_report(&store, t.id, serde_json::to_value(failing_doc()).unwrap(), 4);
+    store.insert_event(Some(t.id), event_kind::REQUIREMENTS_REJECTED, "tester", serde_json::json!({ (json_field::RATIONALE): "SPEC-REJ-1" })).unwrap();
+    store.insert_event(Some(t.id), event_kind::REQUIREMENTS_REJECTED, "tester", serde_json::json!({ (json_field::RATIONALE): "   " })).unwrap();
+    store.insert_event(Some(t.id), event_kind::REVIEW_RECORDED, "reviewer", serde_json::json!({ (json_field::VERDICT): "NEEDS_REVISION", (json_field::SUMMARY): "REVIEW-REJ-2" })).unwrap();
+    store.insert_event(Some(t.id), event_kind::REVIEW_RECORDED, "reviewer", serde_json::json!({ (json_field::VERDICT): "APPROVED", (json_field::SUMMARY): "APPROVED-SUMMARY-must-not-appear" })).unwrap();
+
+    let s = rework_context(&store, &t, "requirements-analyst", &policy()).unwrap().unwrap();
+    assert!(s.contains("SPEC-REJ-1") && s.contains("REVIEW-REJ-2"), "both rationale sources (approval rejection + review rejection) reach the analyst");
+    assert!(s.find("SPEC-REJ-1").unwrap() < s.find("REVIEW-REJ-2").unwrap(), "oldest first");
+    assert!(!s.contains("APPROVED-SUMMARY"), "the verdict filter drops APPROVED reviews — only non-approved records feed");
+    assert!(s.contains("[R1]") && s.contains("[R2]") && !s.contains("[R3]"), "a blank stored payload contributes no line; numbering stays dense");
+    assert!(!s.contains("QUALITY REPORT FINDINGS"), "attach_findings is per-trigger: the analyst flow quotes no findings even against a failing report");
+}
+
+#[test]
+fn delivery_follows_the_declared_table_not_code() {
+    let (_d, store) = store();
+    let wf = store.root().join("config/workflow");
+    // Swap the table: now the ANALYST reacts to QA returns (with findings)
+    // and the implementer is off the list. No Rust changed — delivery moved.
+    std::fs::write(
+        wf.join("rework-context.yaml"),
+        "- role: requirements-analyst\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n      attach_findings: true\n",
+    )
+    .unwrap();
+    let swapped = load_rework_policies(&wf).unwrap();
+    let t = Task::new("PolicyData", "which role reacts is data, not code", None, Utc::now());
+    store.create_task(&t).unwrap();
+    craft_report(&store, t.id, serde_json::to_value(failing_doc()).unwrap(), 4);
+    returned(&store, t.id, "POLICY-SWAP-MARKER");
+
+    let a = rework_context(&store, &t, "requirements-analyst", &swapped).unwrap().unwrap();
+    assert!(a.contains("POLICY-SWAP-MARKER") && a.contains("QUALITY REPORT FINDINGS"), "the declared role now receives both");
+    assert!(rework_context(&store, &t, "implementation-agent", &swapped).unwrap().is_none(), "the undeclared role now receives nothing");
+
+    // The factory table says the opposite — proving the move came from data.
+    let f = rework_context(&store, &t, "implementation-agent", &factory_rework_policies()).unwrap().unwrap();
+    assert!(f.contains("POLICY-SWAP-MARKER"));
+    assert!(rework_context(&store, &t, "requirements-analyst", &factory_rework_policies()).unwrap().is_none());
+}
+
+#[test]
+fn report_shape_drift_is_an_explicit_error_never_empty_quotes() {
+    let (_d, store) = store();
+    let t = Task::new("Drift", "a body the model cannot recognise must be named, not hushed", None, Utc::now());
+    store.create_task(&t).unwrap();
+    returned(&store, t.id, "DRIFT-MARKER");
+    // A CURRENT @4 body that does not fit the typed model: loud Err, never
+    // a rationale section silently missing its findings or faking them.
+    craft_report(&store, t.id, serde_json::json!({ "verdict": "RETURN", "evaluation": "not-an-object" }), 4);
+    let err = rework_context(&store, &t, "implementation-agent", &policy()).unwrap_err();
+    assert!(matches!(err, RuntimeError::ReportShape(_)), "typed shape error: {err}");
+    assert!(err.to_string().contains("cannot recognise"), "the message names the disease: {err}");
+
+    // A legacy @2 CURRENT report — even one carrying an `evaluation` key —
+    // is dispatched by the STORED contract ref, not by sniffing content:
+    // nothing is parsed from it, the rationale-only section still stands.
+    craft_report(&store, t.id, serde_json::json!({ "verdict": "RETURN", "evaluation": { "verdict": "FAIL" }, "findings": ["LEGACY-MUST-NOT-BE-QUOTED"] }), 2);
+    let s = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert!(s.contains("DRIFT-MARKER"), "rationale delivery survives a legacy report");
+    assert!(!s.contains("QUALITY REPORT FINDINGS") && !s.contains("LEGACY-MUST-NOT-BE-QUOTED"), "the @2 machine block (if any) predates the delivery contract: quoted NOTHING");
+}
+
+#[test]
+fn stored_findings_are_quoted_never_rederived_on_read() {
+    let (_d, store) = store();
+    let t = Task::new("NoRecompute", "which items fail is the assembler's answer, stored", None, Utc::now());
+    store.create_task(&t).unwrap();
+    returned(&store, t.id, "RECOMPUTE-MARKER");
+    // Report A: a SCORED check deep under its stored floor, but the stored
+    // red-line list says nothing was breached and states are green. The
+    // reader re-runs NO predicate — `score < floor` is not its call.
+    let mut doc_a = failing_doc();
+    doc_a.evaluation.verdict = "PASS".into();
+    doc_a.evaluation.floors_breached = vec![];
+    doc_a.evaluation.gates = vec![GateOutcome { id: "build-green".into(), state: ProbeState::Pass, detail: String::new() }];
+    doc_a.evaluation.checks = vec![mk_check("low-scored", "rubric", "SCORED", Some(0.20), Some(0.90), 1.0, vec![])];
+    craft_report(&store, t.id, serde_json::to_value(&doc_a).unwrap(), 4);
+    let s = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert!(s.contains("RECOMPUTE-MARKER"));
+    assert!(!s.contains("low-scored"), "a stored SCORED value is never re-judged against its floor on read: {s}");
+    assert!(!s.contains("QUALITY REPORT FINDINGS"), "the stored list says nothing failing: no invented sub-block");
+
+    // Report B: all-green states but a NON-empty stored red-line list —
+    // the stored strings are quoted verbatim, authority rests with what
+    // was decided once at assembly.
+    let mut doc_b = doc_a.clone();
+    doc_b.evaluation.floors_breached = vec!["ghost/check=0.10<floor 0.50".into()];
+    craft_report(&store, t.id, serde_json::to_value(&doc_b).unwrap(), 4);
+    let s = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert!(s.contains("QUALITY REPORT FINDINGS"), "the stored list is the answer — quoted even against green states");
+    assert!(s.contains("- ghost/check=0.10<floor 0.50"), "verbatim, in stored form");
+}
+
+#[test]
+fn a_first_run_gets_no_empty_section_and_qa_wait_adds_nothing() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Inert", "no rejections recorded: prompts stay byte-identical", None, Utc::now());
+    store.create_task(&t).unwrap();
+    for role in ["requirements-analyst", "requirements-reviewer", "implementation-agent", "quality-auditor"] {
+        assert!(rework_context(&store, &t, role, &policy()).unwrap().is_none(), "{role}: nothing recorded => NO section at all (R-008)");
+    }
+
+    drive_to_report(&store, &t, &ws);
+    // Every stage completed; the task waits at QA with an approved review
+    // and a report — NONE of that is a rejection: still no section anywhere.
+    for role in ["requirements-analyst", "requirements-reviewer", "implementation-agent", "quality-auditor"] {
+        assert!(rework_context(&store, &t, role, &policy()).unwrap().is_none(), "{role}: a QA WAIT and a green cycle add nothing");
+    }
+    // Engine-level proof: the FIRST implementation execution's body shows
+    // its prompt carried no REWORK CONTEXT label at all.
+    let arts = store.artifacts(t.id).unwrap();
+    let rep = arts.iter().find(|a| a.kind == ArtifactKind::ImplementationReport).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&store.read_blob(&rep.sha256).unwrap()).unwrap();
+    assert!(!body["notes"].as_str().unwrap().contains(REWORK_CONTEXT_LABEL), "first-run prompt gained no empty section: {}", body["notes"]);
+}
+
+#[test]
+fn the_rework_execution_actually_receives_the_assembled_section() {
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("RealRework", "the delivered context must reach the real rework prompt", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::return_to_rework(&cur, Some("THE-WIRING-MARKER — return text as the human wrote it"), "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.steps.len(), 1, "the rework stage ran");
+    // The mock echoes input-section LABELS into the report body — the
+    // ratified observation surface; contents are pinned by the assertions
+    // above, the label here proves the ENGINE wires the section in.
+    let arts = store.artifacts(t.id).unwrap();
+    let rep = arts.iter().find(|a| a.kind == ArtifactKind::ImplementationReport && a.status == ArtifactStatus::Current).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&store.read_blob(&rep.sha256).unwrap()).unwrap();
+    assert!(body["notes"].as_str().unwrap().contains(REWORK_CONTEXT_LABEL), "the rework execution's prompt carried the section: {}", body["notes"]);
+    // And the content delivered to that very execution is the verbatim
+    // return text plus the real report body read through the typed model
+    // (the engine-assembled @4 parses — producer/consumer share one shape).
+    let section = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert!(section.contains("THE-WIRING-MARKER — return text as the human wrote it"), "verbatim");
+    // The rework execution row stays bound to a workspace revision as before.
+    let impl_execs: Vec<_> = store.list_executions(Some(t.id)).unwrap().into_iter().filter(|e| e.role_slug == "implementation-agent").collect();
+    assert_eq!(impl_execs.len(), 2, "first pass + rework");
+    assert!(impl_execs[1].workspace_revision.is_some(), "the delivered-context execution is still revision-bound");
+}
+
+#[test]
+fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
+    let (_d, store) = store();
+    std::fs::remove_dir_all(store.root().join("config/workflow")).unwrap();
+    // Absent directory is the FALLBACK signal, never an error and never a
+    // silent delivery-less home (R-007): the engine re-reads the embedded
+    // factory bytes — the same table, not a code copy of the map.
+    let loaded = load_rework_policies(&store.root().join("config/workflow")).unwrap();
+    assert!(loaded.is_empty(), "absent dir => empty => caller falls back");
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("Fallback", "a home predating the file still gets delivery", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws); // the whole cycle runs on a home WITHOUT the workflow dir
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::return_to_rework(&cur, Some("FACTORY-FALLBACK-MARKER"), "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+    let engine = engine_in(&store, &ws, false);
+    engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    let arts = store.artifacts(t.id).unwrap();
+    let rep = arts.iter().find(|a| a.kind == ArtifactKind::ImplementationReport && a.status == ArtifactStatus::Current).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&store.read_blob(&rep.sha256).unwrap()).unwrap();
+    assert!(body["notes"].as_str().unwrap().contains(REWORK_CONTEXT_LABEL), "delivery moved on the factory fallback, not silently disabled: {}", body["notes"]);
+    // The fallback table is the DECLARED table — attach_findings intact.
+    let s = rework_context(&store, &t, "implementation-agent", &factory_rework_policies()).unwrap().unwrap();
+    assert!(s.contains("FACTORY-FALLBACK-MARKER"));
+}
+
+#[test]
+fn present_but_malformed_workflow_config_is_a_loud_error() {
+    let (_d, store) = store();
+    let wf = store.root().join("config/workflow");
+    std::fs::write(wf.join("zz-typo.yaml"), "- role: implementation-agent\n  triggers:\n    - event: quality.retruned\n      rationale_field: rationale\n").unwrap();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("LoudConfig", "a broken table must stop delivery loudly", None, Utc::now());
+    store.create_task(&t).unwrap();
+    // Construction still succeeds — Engine::new is infallible by contract…
+    let engine = Engine::new(&store)
+        .with_workspace(ws.to_path_buf())
+        .with_rework_config_dir(&wf);
+    // …but the first stage that could deliver fails EXPLICITLY, naming the
+    // file and the offending value — never masquerading as "nothing to say".
+    let err = engine.advance(&t.id.to_string(), "mock", "tester").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("zz-typo.yaml") && msg.contains("quality.retruned"), "the operator is told what to fix: {msg}");
+}
+
+#[test]
+fn delivered_context_is_inert_data_and_assembly_is_read_only() {
+    let (_d, store) = store();
+    let t = Task::new("ReadOnly", "assembly must not move a single stored byte", None, Utc::now());
+    store.create_task(&t).unwrap();
+    craft_report(&store, t.id, serde_json::to_value(failing_doc()).unwrap(), 4);
+    returned(&store, t.id, "INERT-MARKER");
+
+    let events_before = store.all_events_for_task(t.id).unwrap();
+    let artifacts_before = store.artifacts(t.id).unwrap();
+    let decisions_before = store.list_decisions(t.id).unwrap();
+    let lock_before = store.get_task(&t.id.to_string()).unwrap().lock_version;
+
+    let s1 = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    let s2 = rework_context(&store, &t, "implementation-agent", &policy()).unwrap().unwrap();
+    assert_eq!(s1, s2, "byte-stable");
+
+    assert_eq!(store.all_events_for_task(t.id).unwrap().len(), events_before.len(), "delivery writes no events");
+    assert_eq!(store.artifacts(t.id).unwrap().len(), artifacts_before.len(), "delivery publishes no artifacts");
+    assert_eq!(store.list_decisions(t.id).unwrap().len(), decisions_before.len(), "delivery records no decisions");
+    assert_eq!(store.get_task(&t.id.to_string()).unwrap().lock_version, lock_before, "delivery moves no state and bumps no lock");
+
+    // The section rides as ONE MORE input label; the output-contract tail
+    // is byte-identical with or without it — quoted text changes what the
+    // role READS, never what it must PRODUCE (R-007 AC4).
+    let base = vec![("REQUIREMENTS_SPEC v1".to_string(), "spec body".to_string())];
+    let with = {
+        let mut v = base.clone();
+        v.push((REWORK_CONTEXT_LABEL.to_string(), s1.clone()));
+        v
+    };
+    let p0 = build_user_prompt("T", "B", &base, Some(("implementation-report", 2)), Some("schema"));
+    let p1 = build_user_prompt("T", "B", &with, Some(("implementation-report", 2)), Some("schema"));
+    let tail = |p: &str| p[p.find("OUTPUT CONTRACT").unwrap()..].to_string();
+    assert_eq!(tail(&p0), tail(&p1), "the contract block is untouched by delivery");
+    assert!(p1.contains("\n--- REWORK CONTEXT ---\n"), "rendered as a plain input section");
+    assert!(s1.starts_with("Platform-assembled rejection context"), "the preamble itself states the data-only rule");
+}
+
+#[test]
+fn the_empty_rework_gate_trips_the_return_text_into_the_next_window() {
+    // Coverage block: the gate parks the task with a QUESTION instead of a
+    // fresh return, so without the declared `qa.rework_gate_tripped` trigger
+    // a gate-demanded rework would arrive with no rationale at all. The gate
+    // event lands AFTER the role's last COMPLETED (its own finish precedes
+    // the publish/gate commit), carrying the cycle's original return text.
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new("GateCover", "gate tripped by an identical rework must hand the same text forward", None, Utc::now());
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::return_to_rework(&cur, Some("GATE-CYCLE-RATIONALE — п1; п2"), "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+
+    // The noop rework runs and the gate trips (task parks).
+    let engine = engine_in(&store, &ws, false);
+    let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
+    assert_eq!(r.steps.len(), 1, "the rework stage ran");
+    assert_eq!(r.gate, Gate::Hold(TaskState::WaitingForInput), "the gate parked the cycle");
+    let held = store.get_task(&t.id.to_string()).unwrap();
+
+    // The OLD return is now behind the rework's COMPLETED row — out of the
+    // window. The gate event is the carrier that puts it back IN: the next
+    // execution of the role must see the cycle's text again.
+    let section = rework_context(&store, &held, "implementation-agent", &policy()).unwrap().unwrap();
+    assert!(section.contains("GATE-CYCLE-RATIONALE — п1; п2"), "the gate trigger re-delivers the cycle's rationale verbatim");
+    assert!(section.contains(event_kind::QA_REWORK_GATE_TRIPPED), "and names the gate event as its source");
+    let rationales: Vec<_> = section.match_indices("[R").collect();
+    assert_eq!(rationales.len(), 1, "exactly one carrier — the old quality.returned is cut, the gate supplies its text (no double-quote)");
 }

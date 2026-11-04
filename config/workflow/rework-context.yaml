@@ -25,6 +25,17 @@
     - event: quality.returned
       rationale_field: rationale
       attach_findings: true
+    # The empty-rework gate (REQ-RG) parks the task with a question instead
+    # of a QA return, so no `quality.returned` lands in the window; the gate
+    # event carries the cycle's original return text under
+    # `qa_return_rationale`. Without this trigger a rework demanded by the
+    # gate would arrive with no rationale at all (2026-11-02 QA return,
+    # coverage block: all three rationale sources must reach the role).
+    - event: qa.rework_gate_tripped
+      rationale_field: qa_return_rationale
+    # NOTE: `qa.rework_gate_incomparable` deliberately has NO trigger — it
+    # carries no human rationale (ratified OQ-2): inventing one would put
+    # words in the operator's mouth.
 - role: requirements-analyst
   triggers:
     - event: requirements.rejected

@@ -254,7 +254,7 @@ pub fn review_recorded(
         Verdict::Approved => TaskState::Approval,
         _ => TaskState::Analysis,
     };
-    Ok(transition(task, to, event_kind::REVIEW_RECORDED, actor, now, json!({ "verdict": verdict.as_str(), "summary": summary })))
+    Ok(transition(task, to, event_kind::REVIEW_RECORDED, actor, now, json!({ (json_field::VERDICT): verdict.as_str(), (json_field::SUMMARY): summary })))
 }
 
 pub fn approve_requirements(task: &Task, rationale: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
@@ -272,7 +272,7 @@ pub fn approve_requirements(task: &Task, rationale: Option<&str>, actor: &str, n
 
 pub fn reject_requirements(task: &Task, rationale: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
     require_state(task, &[TaskState::Approval], "reject", CoreError::hint("requirements can be rejected only while in APPROVAL"))?;
-    Ok(transition(task, TaskState::Analysis, event_kind::REQUIREMENTS_REJECTED, actor, now, json!({ "rationale": rationale })))
+    Ok(transition(task, TaskState::Analysis, event_kind::REQUIREMENTS_REJECTED, actor, now, json!({ (json_field::RATIONALE): rationale })))
 }
 
 /// One previous IMPLEMENTATION_REPORT as the producer read it from stored
@@ -511,7 +511,7 @@ pub fn accept(
 
 pub fn return_to_rework(task: &Task, rationale: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
     require_state(task, &[TaskState::Qa], "return", CoreError::hint("QA results can be returned only in QA"))?;
-    Ok(transition(task, TaskState::Rework, event_kind::QUALITY_RETURNED, actor, now, json!({ "rationale": rationale })))
+    Ok(transition(task, TaskState::Rework, event_kind::QUALITY_RETURNED, actor, now, json!({ (json_field::RATIONALE): rationale })))
 }
 
 /// A role raises a question. Blocking questions move the task to
