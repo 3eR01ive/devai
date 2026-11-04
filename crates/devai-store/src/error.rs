@@ -24,6 +24,21 @@ pub enum StoreError {
     #[error("invalid task dependency: {0}")]
     InvalidDependency(String),
 
+    /// REQ-SW-02: the single-writer guard fired — SQLite's partial unique
+    /// index `role_executions_single_writer` rejected a second RUNNING
+    /// execution for the same task.
+    /// A dedicated variant, never an opaque `Sql`: the message names the
+    /// task and the FULL id of the blocking RUNNING execution, because the
+    /// raw unique violation does not (acceptance: «явная ошибка с id живого
+    /// execution»). No silent queuing, no overwrite — the blocking row must
+    /// be closed by a human path (`exec finish|fail|cancel`) first.
+    #[error(
+        "single-writer guard: task `{task_id}` already has a RUNNING execution `{existing_id}` \
+         (started {started_at}, owner pid={owner_pid:?} host={owner_host:?}) — one writer per task, \
+         no queueing and no overwrite; resolve it first: `devai exec finish|fail|cancel {existing_id}`"
+    )]
+    SingleWriterBusy { task_id: String, existing_id: String, started_at: String, owner_pid: Option<i64>, owner_host: Option<String> },
+
     #[error("database schema version {found}, but this build expects {expected}")]
     SchemaVersion { found: i64, expected: i64 },
 

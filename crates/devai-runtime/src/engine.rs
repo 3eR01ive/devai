@@ -719,6 +719,14 @@ impl<'a> Engine<'a> {
         // checkout before any worktree exists, the worktree once one does
         // (the row then binds exactly what the stage measures, REQ-WT-03).
         let revision = self.revision_at(&self.eval_workspace(task))?;
+        // The single-writer owner identity (REQ-SW-03): the process opening
+        // THIS row — the engine's own `task run` process, observed
+        // platform-side exactly like the revision above, never supplied by
+        // a model. A later liveness check answers «is this pid still the
+        // same process» without touching the OS at start (the row carries
+        // it). Attempt rows cloned from this template inherit the same
+        // owner — same process, same stage.
+        let (owner_pid, owner_host, owner_process_start) = crate::liveness::current_owner().into_columns();
         let execution = RoleExecution {
             id: new_id(),
             task_id: task.id,
@@ -738,7 +746,15 @@ impl<'a> Engine<'a> {
             attempt: 1,
             parent_execution: None,
             failure_class: None,
+            owner_pid,
+            owner_host,
+            owner_process_start,
         };
+        // REQ-SW-01/02: a second RUNNING row for this task cannot commit —
+        // the partial unique index rejects it and `start_execution` answers
+        // with the named SingleWriterBusy error citing the live row. The
+        // form loop stays legal under the invariant: attempt n+1 opens only
+        // after attempt n closed (REQ-SW-01 AC4).
         self.store.start_execution(&execution)?;
 
         // REQ-WT-01: a writing role runs inside platform isolation. The

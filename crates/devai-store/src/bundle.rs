@@ -22,6 +22,7 @@
 //! artifacts.jsonl    — artifact metadata rows
 //! blobs/<sha256>     — artifact contents, content-addressed
 //! executions.jsonl   — role executions incl. their recorded workspace_revision
+//!                      and (v7) their platform-recorded owner identity
 //! questions.jsonl
 //! decisions.jsonl
 //! dependencies.jsonl — outgoing task-dependency edges (v2; typed, attributed)
@@ -416,8 +417,8 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
 
     for e in &executions {
         tx.execute(
-            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             rusqlite::params![
                 e.id.to_string(), e.task_id.to_string(), e.role_slug, e.role_version, e.agent_name,
                 e.status.as_str(), json_string(&e.inputs), e.summary, e.error,
@@ -426,6 +427,11 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
                 // The form-loop columns travel with the row: an exported loop
                 // history must still be reconstructible after import (v5).
                 e.attempt as i64, e.parent_execution.map(|p| p.to_string()), e.failure_class,
+                // The single-writer owner identity travels too (REQ-SW-03
+                // AC3, ratified OQ-2): an imported RUNNING row keeps the
+                // owner it was opened with — or NULL for a pre-v7 export,
+                // which reads as «owner unknown», never as «dead».
+                e.owner_pid, e.owner_host, e.owner_process_start,
             ],
         )?;
     }

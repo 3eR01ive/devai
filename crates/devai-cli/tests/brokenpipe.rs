@@ -162,22 +162,29 @@ fn literal_head_pipelines_exit_clean() {
 
 /// REQ-ACT-04 constraint: the cross-task `task active` view must not
 /// regress the BrokenPipe silence of commit d89cc86. 1000 RUNNING rows are
-/// seeded straight into the store, so both shapes — ~80KB of human lines and
-/// a single ~150KB `--json` line — exceed the 64KiB pipe buffer: with the
-/// read end dropped the writer provably blocks in the kernel and takes the
-/// EPIPE path (the pre-d89cc86 code would panic here with exit 101).
+/// seeded straight into the store — one per TASK: the v7 single-writer
+/// guard (`role_executions_single_writer`, REQ-SW-01) makes 1000 RUNNING
+/// rows on one task storable no more, and the cross-task view is exactly
+/// the surface the count must overflow anyway. Both shapes — ~80KB of human
+/// lines and a single ~150KB `--json` line — exceed the 64KiB pipe buffer:
+/// with the read end dropped the writer provably blocks in the kernel and
+/// takes the EPIPE path (the pre-d89cc86 code would panic here with exit
+/// 101).
 #[test]
 fn task_active_on_closed_pipe_dies_quietly() {
-    use devai_core::types::{new_id, ExecutionStatus, RoleExecution};
+    use devai_core::types::{new_id, ExecutionStatus, RoleExecution, Task};
     use devai_store::Store;
 
     let home = TempDir::new().unwrap();
     let id = seeded(home.path());
+    let _ = &id;
     {
         let store = Store::open(home.path()).unwrap();
-        let t = store.resolve_task(&id).unwrap();
         let started_at = chrono::Utc::now();
         for _ in 0..1000 {
+            // One task per row: ≤1 RUNNING per task IS the invariant.
+            let t = Task::new("pipe overflow task", "", None, started_at);
+            store.create_task(&t).unwrap();
             store
                 .start_execution(&RoleExecution {
                     id: new_id(),
@@ -195,6 +202,9 @@ fn task_active_on_closed_pipe_dies_quietly() {
                     attempt: 1,
                     parent_execution: None,
                     failure_class: None,
+                    owner_pid: Some(std::process::id() as i64),
+                    owner_host: devai_runtime::current_host(),
+                    owner_process_start: None,
                 })
                 .unwrap();
         }

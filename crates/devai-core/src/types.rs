@@ -494,6 +494,26 @@ pub struct RoleExecution {
     /// (success, or a row written before the split existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
+    /// Owner identity recorded PLATFORM-side at start (REQ-SW-03, ratified
+    /// OQ-2: dedicated columns, not payload JSON — queryability of the
+    /// orphan detect and bundle export outweighs the column economy). The
+    /// pid of the process that OPENED the row (the spec's wording: «pid
+    /// процесса, открывшего исполнение»), never supplied by a model — the
+    /// same precedence as `workspace_revision` above. NULL on rows written
+    /// before v7: they read as «owner unknown», never as «owner dead».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_pid: Option<i64>,
+    /// Hostname of the owner process's machine (ratified OQ-3: a host other
+    /// than the current one makes liveness NOT CHECKABLE — it must render
+    /// as «unknown», never as dead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_host: Option<String>,
+    /// Start time of the owner PROCESS (epoch seconds, platform-computed),
+    /// not of the execution row. Ratified OQ-3 closes pid-reuse with
+    /// pid + process start time — a bare `kill(pid,0)` is explicitly NOT
+    /// enough, because a recycled pid would fake liveness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_process_start: Option<i64>,
 }
 
 fn default_attempt() -> u32 {
@@ -703,6 +723,12 @@ pub mod event_kind {
     /// last attempt's violations.
     pub const EXECUTION_FORM_ESCALATED: &str = "execution.form_escalated";
     pub const EXECUTION_CANCELLED: &str = "execution.cancelled";
+    /// The v6→v7 single-writer migration closed duplicate RUNNING rows of
+    /// one task (ratified OQ-1: newest `started_at` survives, the rest are
+    /// closed FAILED). One fact event per duplicated task — actor
+    /// `migration:<rung id>`, the supersession/decisions backfill discipline
+    /// (REQ-003/REQ-BF: the one-time mutation is auditable, not silent).
+    pub const EXECUTION_SINGLE_WRITER_REPAIR: &str = "execution.single_writer_repair";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     /// Publishing a new artifact version supersedes the previous CURRENT
     /// row(s) of the same (task_id, kind) group: the status column flips,
@@ -785,6 +811,7 @@ pub mod event_kind {
         EXECUTION_FORM_REJECTED,
         EXECUTION_FORM_ESCALATED,
         EXECUTION_CANCELLED,
+        EXECUTION_SINGLE_WRITER_REPAIR,
         ARTIFACT_PUBLISHED,
         ARTIFACT_SUPERSEDED,
         DECISIONS_BACKFILLED,

@@ -11,6 +11,7 @@ pub mod context;
 mod engine;
 pub mod evaluation;
 pub mod gate;
+pub mod liveness;
 mod prompt;
 pub mod revision;
 pub mod worktree;
@@ -20,4 +21,5 @@ pub use adapters::{
 };
 pub use context::{rework_context, REWORK_CONTEXT_LABEL};
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};
+pub use liveness::{check_owner, current_host, current_owner, Liveness, OwnerInfo};
 pub use prompt::{build_system_prompt, build_user_prompt, extract_json_object};

@@ -7,9 +7,11 @@
 //! * the stage is the task's live engine state (never a CLI-local table);
 //! * the worktree link appears only after the platform recorded the
 //!   `worktree.prepared` fact — before it, a dash, never an invented path;
-//! * `stale?` is the ratified limit of OQ-2: a mark on rows the STORE itself
-//!   proves contradictory (terminal task, still-RUNNING execution) — no pid
-//!   detection here, real orphan detection belongs to the guard task;
+//! * `stale?` is the RATIFIED additive rule (OQ-5, REQ-SW-04): the store-
+//!   proven contradiction (terminal task, still-RUNNING execution) OR a
+//!   provably dead owner process (the guard's orphan detect — the CLI that
+//!   opened the row is gone). An owner that cannot be checked renders a
+//!   separate `owner?` triage mark, never `stale?` (OQ-3);
 //! * rows come elapsed-descending (oldest work first), deterministically
 //!   (OQ-3 ratified); the row carries no task title (OQ-6 ratified);
 //! * `--json` prints exactly one parseable snapshot object (OQ-4 ratified);
@@ -147,8 +149,12 @@ fn task_active_lifecycle_through_the_real_binary() {
     assert!(!v.contains('✓') && !v.contains("allowed operations"), "detail stays with task progress:\n{v}");
     // OQ-6 (ratified): the row carries ids, never the task title.
     assert!(!v.contains("Alpha active") && !v.contains("Beta active"), "no titles in the rows:\n{v}");
-    // OQ-2 (ratified): live tasks with RUNNING work are NOT marked stale.
-    assert!(!v.contains("stale?"), "nothing provably stale yet:\n{v}");
+    // REQ-SW-04 / OQ-5 (ratified): both rows were opened by `devai exec
+    // start` CLI processes that have already exited — the owner is provably
+    // DEAD, so the shipped orphan detect marks BOTH rows `stale?` (the
+    // additive rule: terminal task OR dead owner). The terminal-task mark
+    // below must keep working unchanged.
+    assert_eq!(v.matches("stale?").count(), 2, "dead-owner orphan rows are marked:\n{v}");
     // REQ-ACT-06 AC2: the row's task id is sufficient to drill down.
     let p = devai(h, &["task", "progress", &short_b]);
     assert!(p.contains("Beta active"), "short id from the active view resolves in progress:\n{p}");
@@ -169,7 +175,14 @@ fn task_active_lifecycle_through_the_real_binary() {
         assert_eq!(row["agent_name"], "mock");
         assert!(row["started_at"].is_string() && row["elapsed_seconds"].as_i64().unwrap() >= 0);
         assert_eq!(row["state"], state, "stage comes from the live TaskState: {row}");
-        assert_eq!(row["stale"], serde_json::Value::Bool(false), "a live task's RUNNING row is not stale: {row}");
+        // OQ-5 (ratified): the two stale signals stay separately named —
+        // the task is live, so `stale` here comes from the NEW cause only.
+        assert_eq!(row["stale"], serde_json::Value::Bool(true), "a CLI-opened RUNNING row reads stale by its dead owner: {row}");
+        assert_eq!(row["stale_dead_owner"], serde_json::Value::Bool(true), "the dead-owner signal is named: {row}");
+        assert_eq!(row["stale_terminal_task"], serde_json::Value::Bool(false), "the task itself is not terminal: {row}");
+        assert_eq!(row["owner_liveness"], "dead", "liveness is the stored snapshot answer: {row}");
+        assert!(row["owner_pid"].is_i64(), "REQ-SW-03: pid stamped platform-side: {row}");
+        assert!(row["owner_host"].is_string(), "REQ-SW-03: host stamped platform-side: {row}");
         assert_eq!(row["branch"], serde_json::Value::Null, "no worktree.prepared fact → null: {row}");
         assert_eq!(row["worktree"], serde_json::Value::Null);
         assert!(row.get("task_title").is_none(), "OQ-6: no title travels in the row: {row}");
@@ -217,10 +230,9 @@ fn task_active_lifecycle_through_the_real_binary() {
     assert_eq!(rows[0]["branch"], format!("rework/{id_b}").as_str());
     assert_eq!(rows[0]["worktree"], h.join("worktrees").join(&id_b).display().to_string().as_str());
 
-    // OQ-2 (ratified): `stale?` marks exactly what the store itself proves
-    // contradictory — the task was cancelled while its execution is still
-    // RUNNING (terminal state + RUNNING row). No pid was consulted: the
-    // store keeps none; real orphan detection is the guard task's ownership.
+    // OQ-5 (ratified): the terminal-task mark must NOT regress under the new
+    // orphan detect — it keeps its exact meaning and stays separately named
+    // (`stale_terminal_task`) beside the dead-owner signal.
     devai(h, &["task", "cancel", &short_b, "--reason", "human cancel with work in flight"]);
     let v = devai(h, &["task", "active"]);
     assert!(v.contains("stale?") && v.contains("CANCELLED"), "terminal task with a RUNNING row is marked:\n{v}");
@@ -228,6 +240,7 @@ fn task_active_lifecycle_through_the_real_binary() {
     let rows = j["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "the cancelled task's execution is still RUNNING in the store: {rows:?}");
     assert_eq!(rows[0]["stale"], serde_json::Value::Bool(true), "json carries the same mark: {rows:?}");
+    assert_eq!(rows[0]["stale_terminal_task"], serde_json::Value::Bool(true), "the terminal-task signal survives the additive detect: {rows:?}");
     assert_eq!(rows[0]["state"], "CANCELLED");
 
     // REQ-ACT-04: empty activity is the idle state, not an error — exit 0,
@@ -237,6 +250,50 @@ fn task_active_lifecycle_through_the_real_binary() {
     assert_eq!(v.trim(), "(no running executions)", "empty marker printed:\n{v}");
     let j = devai_json(h, &["task", "active"]);
     assert!(j["rows"].as_array().unwrap().is_empty(), "json says so too: {j}");
+
+    // REQ-SW-04 AC3 / OQ-3: a row whose owner cannot be checked — the
+    // pre-rung-007 shape, no owner columns — is NOT assumed dead: it renders
+    // the separate `owner?` triage mark and `owner_liveness: "unknown"`,
+    // never `stale?`. Written straight through the store: the CLI paths
+    // always stamp an owner (REQ-SW-03).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    use devai_core::types::{new_id, ExecutionStatus, RoleExecution};
+    let g = devai_json(h, &["task", "new", "Gamma ownerless", "--description", ""]);
+    let id_g = g["id"].as_str().unwrap().to_string();
+    devai(h, &["task", "start", &id_g[..12].to_string()]);
+    {
+        let store = Store::open(h).unwrap();
+        store
+            .start_execution(&RoleExecution {
+                id: new_id(),
+                task_id: uuid::Uuid::parse_str(&id_g).unwrap(),
+                role_slug: "implementation-agent".into(),
+                role_version: 1,
+                agent_name: Some("mock".into()),
+                status: ExecutionStatus::Running,
+                inputs: vec![],
+                summary: None,
+                error: None,
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                workspace_revision: None,
+                attempt: 1,
+                parent_execution: None,
+                failure_class: None,
+                owner_pid: None,
+                owner_host: None,
+                owner_process_start: None,
+            })
+            .unwrap();
+    }
+    let v = devai(h, &["task", "active"]);
+    assert!(v.contains("owner?") && !v.contains("stale?"), "unverifiable owner is triage, never stale:\n{v}");
+    let j = devai_json(h, &["task", "active"]);
+    let rows = j["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the ownerless row is the only RUNNING one: {rows:?}");
+    assert_eq!(rows[0]["owner_liveness"], "unknown", "as-is, never promoted to dead: {rows:?}");
+    assert_eq!(rows[0]["stale"], serde_json::Value::Bool(false), "unknown owner does not make it stale: {rows:?}");
+    assert_eq!(rows[0]["stale_dead_owner"], serde_json::Value::Bool(false));
 }
 
 /// The docs/cli-snapshot artifacts must equal the binary's real help (same

@@ -46,6 +46,13 @@
       "to": 6,
       "script": "migrations/006_role_execution_form_attempts.sql",
       "apply": "execution_form_columns"
+    },
+    {
+      "id": "007_single_writer_guard",
+      "from": 6,
+      "to": 7,
+      "script": "migrations/007_single_writer_guard.sql",
+      "apply": "single_writer_repair"
     }
   ]
 }
