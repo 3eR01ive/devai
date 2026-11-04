@@ -1,8 +1,10 @@
 //! `devai` — local-first multi-agent development platform, CLI interface.
 //!
 //! The CLI is a thin translation layer: it maps user/agent intent onto
-//! domain commands, hands them to `devai-core` for validation and persists
-//! through `devai-store`. No workflow logic lives here.
+//! domain commands and executes them as typed operations of the platform
+//! API (`devai-api`). Since cycle 2 it holds no store handle at all —
+//! reads and mutations both go through `Api`, and this layer renders
+//! results. No workflow logic lives here.
 
 mod commands;
 mod out;
