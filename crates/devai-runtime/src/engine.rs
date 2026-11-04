@@ -922,6 +922,21 @@ mod decisions_render_tests {
         assert!(text.find(&a.kind).unwrap() < text.find(&b.kind).unwrap());
     }
 
+    /// The rung-004 backfill adds rows of the reject/return kinds; the
+    /// APPROVED_DECISIONS contract is "ALL stored human decisions" — the
+    /// verdict field, not a filter, tells the auditor which act was which.
+    /// This pins that backfilled rows reach the auditor on equal footing
+    /// with the live rows (REQ-BF-006 AC3).
+    #[test]
+    fn backfilled_rejection_and_return_rows_render_too() {
+        let rej = decision("requirements_rejection", Verdict::Rejected, Some("split OQ1 before approving"));
+        let ret = decision("quality_return", Verdict::Returned, Some("ships the rejected alternative"));
+        let text = decisions_prompt_text(&[rej, ret]);
+        assert!(text.contains("- kind: requirements_rejection\n  verdict: REJECTED\n"), "{text}");
+        assert!(text.contains("- kind: quality_return\n  verdict: RETURNED\n"), "{text}");
+        assert!(text.contains("  rationale: split OQ1 before approving\n"));
+    }
+
     #[test]
     fn null_rationale_is_marked_not_dropped() {
         let d = decision("acceptance", Verdict::Approved, None);
