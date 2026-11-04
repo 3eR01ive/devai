@@ -361,7 +361,9 @@ impl<'a> Api<'a> {
 }
 
 fn short_hint(id: &Id) -> String {
-    id.to_string()[..12].to_string()
+    // Single source for the display width + rationale (R1 QA no-magic:
+    // the width is devai_core's, not a duplicated literal).
+    devai_core::types::short_id(id)
 }
 
 // ---------------------------------------------------------------------------

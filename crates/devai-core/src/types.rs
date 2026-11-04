@@ -12,6 +12,28 @@ pub fn new_id() -> Id {
     Uuid::now_v7()
 }
 
+/// The single canonical display width of an id prefix (R1 QA: the width was
+/// duplicated as a wild literal in devai-api; one source, one number).
+/// Rationale carried from the CLI: UUIDv7's leading bytes encode the creation
+/// timestamp, so very short prefixes collide for tasks created in the same
+/// instant. 12 chars keep the display compact while remaining practically
+/// unique; `resolve_task` still fails loudly on any genuine ambiguity.
+pub const ID_PREFIX_CHARS: usize = 12;
+
+/// Typed accessor for the canonical short display of an id. Taking `&Uuid`
+/// (not a `&str`) guarantees the canonical 36-char `to_string` form, so the
+/// byte slice below is always inside an ASCII boundary — no length check at
+/// call sites can be forgotten.
+pub fn short_id(id: &Uuid) -> String {
+    id.to_string()[..ID_PREFIX_CHARS].to_string()
+}
+
+/// Display-short of an id that already arrives as a string (API views):
+/// same width as `short_id`, tolerant of already-short inputs.
+pub fn short_id_str(id: &str) -> String {
+    id[..ID_PREFIX_CHARS.min(id.len())].to_string()
+}
+
 /// Renders an entity as its JSON form (used for stable string columns).
 pub fn json_string<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|e| panic!("core json serialize failed: {e}"))
