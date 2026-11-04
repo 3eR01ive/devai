@@ -81,6 +81,13 @@ pub struct EvalRun {
     pub evidence_text: String,
 }
 
+/// Heuristic (no measured basis — ratified as an explicit assumption, OQ-2
+/// of 01a1a0a8): per-probe evidence snippet length fed to the auditor in
+/// `evidence_text`. 400 chars is sized to fit the first failure line of a
+/// pytest/cargo report (the rest is available on disk in the evidence dir);
+/// it also bounds the evidence section under the auditor's reply limit.
+/// Longer output is trimmed to the leading `SNIPPET` chars — nothing else
+/// happens to it.
 const SNIPPET: usize = 400;
 
 fn exec_probe(cmd: &str, workspace: &Path, pass_exit: &[i64]) -> ProbeOutcome {

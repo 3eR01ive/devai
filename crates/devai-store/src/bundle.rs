@@ -132,6 +132,9 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
         })?;
         let rel = format!("blobs/{}", a.sha256);
         let abs = out_dir.join(&rel);
+        // invariant: why unreachable — `abs` is `out_dir.join("blobs/<sha>")`:
+        // a rooted path with at least the `blobs` component appended, so
+        // `parent()` is always `Some` by the shape of the bundle layout itself.
         std::fs::create_dir_all(abs.parent().unwrap())?;
         std::fs::write(&abs, &content)?;
         files.push(FileEntry { path: rel, sha256: hex_encode(&Sha256::digest(&content)), size: content.len() as u64 });
@@ -519,6 +522,10 @@ fn write_jsonl<T: Serialize>(dir: &Path, rel: &str, values: &[T], files: &mut Ve
         buf.push(b'\n');
     }
     let parent: PathBuf = dir.join(rel);
+    // invariant: why unreachable — `rel` is always a bundle-relative path
+    // with at least one component ("<table>.jsonl" or "blobs/<sha>"), so
+    // `dir.join(rel)` has a non-empty final component and `parent()` is
+    // always `Some` for any rooted `dir`.
     std::fs::create_dir_all(parent.parent().unwrap())?;
     std::fs::write(&parent, &buf)?;
     files.push(FileEntry { path: rel.into(), sha256: hex_encode(&Sha256::digest(&buf)), size: buf.len() as u64 });

@@ -274,6 +274,8 @@ impl Store {
         }
         match found.len() {
             0 => Err(StoreError::NotFound("task".into(), prefix.to_string())),
+            // invariant: found.len()==1 here — the match arm above guarantees
+            // exactly one element, pop() cannot return None.
             1 => Ok(found.pop().unwrap()),
             _ => Err(StoreError::Ambiguous(format!("task id prefix `{prefix}` matches multiple tasks"))),
         }
@@ -1229,6 +1231,10 @@ impl Store {
             return Err(StoreError::Corrupt(format!("blob checksum mismatch: expected {sha}, content hashes to {computed}")));
         }
         let path = self.blob_path(sha);
+        // invariant: why unreachable — `path` is `blob_path(sha)` =
+        // `<root>/blobs/<xx>/<yy>/<sha>`: at least three components are
+        // appended to a rooted dir, so `parent()` is always `Some` by the
+        // shape of the blob layout itself.
         std::fs::create_dir_all(path.parent().unwrap())?;
         if !path.exists() {
             std::fs::write(&path, content)?;
