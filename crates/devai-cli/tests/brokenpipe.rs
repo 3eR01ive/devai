@@ -192,6 +192,9 @@ fn task_active_on_closed_pipe_dies_quietly() {
                     started_at,
                     finished_at: None,
                     workspace_revision: None,
+                    attempt: 1,
+                    parent_execution: None,
+                    failure_class: None,
                 })
                 .unwrap();
         }

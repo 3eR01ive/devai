@@ -448,6 +448,9 @@ fn execution_id_prefix_resolution_fails_loudly_on_ambiguity() {
         started_at: now(),
         finished_at: None,
         workspace_revision: None,
+        attempt: 1,
+        parent_execution: None,
+        failure_class: None,
     };
     let a = exec("01a1a5db-3ba0-7a5b-8176-3f38ad4c1ea8");
     let b = exec("01a1a5db-3ba1-7a5b-8176-3f38ad4c1ea9");
