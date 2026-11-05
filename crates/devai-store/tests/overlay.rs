@@ -12,7 +12,9 @@
 
 use chrono::Utc;
 use devai_core::types::*;
-use devai_store::config::{self, Profile, ProfileOverlay, overlay_path, unresolved_slot};
+use devai_store::config::{
+    self, Profile, ProfileOverlay, overlay_path, profile_has_open_slots, unresolved_slot,
+};
 use devai_store::{Store, seed};
 use std::fs;
 use tempfile::TempDir;
@@ -676,4 +678,39 @@ items:
         .to_string();
     assert!(err.contains("unknown variant"), "{err}");
     assert!(err.contains("delete"), "{err}");
+}
+
+/// manual operator fix (05.11, C1 defect found by dogfood — devai-ui re-audit):
+/// a task WITHOUT a project resolves to the BOUND auditor profile present in
+/// the home (quality.yaml), never to the slot-open factory base. The base
+/// stays court only for a clean home that carries nothing else (REQ-SP-101).
+#[test]
+fn projectless_resolution_prefers_bound_profile_over_open_base() {
+    let (_d, store, cfg) = home();
+    // devai-home shape: the pre-split home already carries the BOUND court
+    // (init never clobbers existing files, so quality.yaml survives next to
+    // the newly seeded base).
+    let src = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/evaluation/quality.yaml"
+    );
+    fs::copy(src, cfg.join("evaluation").join("quality.yaml")).unwrap();
+    let res = config::resolve_effective_profile(&store, &cfg, None).unwrap();
+    let profile = res.profile.expect("projectless home still yields a court");
+    assert_eq!(
+        profile.name.as_deref(),
+        Some("quality"),
+        "projectless tasks must be judged on the bound court, not the slot-open base"
+    );
+    assert!(!profile_has_open_slots(&profile));
+    // sanity: the base IS open-slots (otherwise the test above proves nothing)
+    let base = config::load_profiles(&cfg.join("evaluation"))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name.as_deref() == Some("base"))
+        .expect("factory base is present");
+    assert!(
+        profile_has_open_slots(&base),
+        "factory base must still carry unbound slots — the fallback distinction lives"
+    );
 }

@@ -679,6 +679,23 @@ pub fn unresolved_slot(cmd: &str) -> Option<String> {
     Some(format!("{{{{{}}}}}", &rest[..close]))
 }
 
+/// True when ANY gate/check probe of the profile still carries an open
+/// `{{slot}}` token — the profile is not yet bound to project tooling.
+/// Used by the projectless fallback in `resolve_effective_profile`
+/// (manual operator fix 05.11): bound courts win over the pure base.
+pub fn profile_has_open_slots(p: &Profile) -> bool {
+    p.gates
+        .iter()
+        .flat_map(|g| g.probes.iter())
+        .chain(
+            p.evaluations
+                .iter()
+                .flat_map(|e| e.checks.iter())
+                .flat_map(|c| c.probes.iter()),
+        )
+        .any(|x| unresolved_slot(&x.cmd).is_some())
+}
+
 /// Collect every `{{name}}` token name in a command (deduplicated, sorted).
 fn slot_names(cmd: &str) -> Vec<String> {
     let mut names = Vec::new();
@@ -1200,9 +1217,17 @@ pub fn resolve_effective_profile(
     project_id: Option<&str>,
 ) -> StoreResult<Resolution> {
     let profiles = load_profiles(&cfg_dir.join("evaluation"))?;
+    let applies = |p: &&Profile| p.applies_to_roles.iter().any(|r| r == "quality-auditor");
+    // manual operator fix (05.11, C1 defect found by dogfood — UI re-audit):
+    // a task WITHOUT a project must be judged on a BOUND auditor profile when
+    // the home carries one. Glob order alone would hand base.yaml (open slots
+    // -> BLOCKED flood past the cap) to exactly the platform's own court the
+    // split was introduced for. A pure open-slots base stays the last resort,
+    // preserving the clean-home semantics of REQ-SP-101.
     let fallback = profiles
         .iter()
-        .find(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"));
+        .find(|p| applies(p) && !profile_has_open_slots(p))
+        .or_else(|| profiles.iter().find(|p| applies(p)));
     let Some(pid) = project_id else {
         // No project: judged on the base (a clean home carries exactly it).
         return Ok(Resolution {
