@@ -127,7 +127,9 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
             continue;
         }
         let content = store.read_blob(&a.sha256).map_err(|e| match e {
-            StoreError::Io(_) => StoreError::Corrupt(format!("artifact {} blob missing: {}", a.id, a.sha256)),
+            StoreError::Io(_) => {
+                StoreError::Corrupt(format!("artifact {} blob missing: {}", a.id, a.sha256))
+            }
             other => other,
         })?;
         let rel = format!("blobs/{}", a.sha256);
@@ -137,7 +139,11 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
         // `parent()` is always `Some` by the shape of the bundle layout itself.
         std::fs::create_dir_all(abs.parent().unwrap())?;
         std::fs::write(&abs, &content)?;
-        files.push(FileEntry { path: rel, sha256: hex_encode(&Sha256::digest(&content)), size: content.len() as u64 });
+        files.push(FileEntry {
+            path: rel,
+            sha256: hex_encode(&Sha256::digest(&content)),
+            size: content.len() as u64,
+        });
     }
 
     // Referenced role definitions (slug@version per execution).
@@ -157,11 +163,18 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
 
     let mut contracts: Vec<ContractEntry> = Vec::new();
     for (name, version) in contract_refs.iter().cloned() {
-        if contracts.iter().any(|c| c.name == name && c.version == version) {
+        if contracts
+            .iter()
+            .any(|c| c.name == name && c.version == version)
+        {
             continue;
         }
         if let Some(schema) = store.get_contract(&name, version)? {
-            contracts.push(ContractEntry { name, version, schema });
+            contracts.push(ContractEntry {
+                name,
+                version,
+                schema,
+            });
         }
     }
     write_jsonl(out_dir, "contracts.jsonl", &contracts, &mut files)?;
@@ -171,14 +184,32 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
     // cites, even where local configs have since advanced.
     let mut profiles: Vec<ProfileEntry> = Vec::new();
     for e in &executions {
-        let Some(ident) = e.workspace_revision.as_ref().and_then(|r| r.profile.clone()) else { continue };
-        let Some((name, version)) = ident.rsplit_once('@') else { continue };
-        let Ok(version) = version.parse::<u32>() else { continue };
-        if profiles.iter().any(|p| p.name == name && p.version == version) {
+        let Some(ident) = e
+            .workspace_revision
+            .as_ref()
+            .and_then(|r| r.profile.clone())
+        else {
+            continue;
+        };
+        let Some((name, version)) = ident.rsplit_once('@') else {
+            continue;
+        };
+        let Ok(version) = version.parse::<u32>() else {
+            continue;
+        };
+        if profiles
+            .iter()
+            .any(|p| p.name == name && p.version == version)
+        {
             continue;
         }
         if let Some((project, body)) = store.get_evaluation_profile(name, version)? {
-            profiles.push(ProfileEntry { name: name.into(), version, project, body });
+            profiles.push(ProfileEntry {
+                name: name.into(),
+                version,
+                project,
+                body,
+            });
         }
     }
     write_jsonl(out_dir, "profiles.jsonl", &profiles, &mut files)?;
@@ -207,7 +238,8 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
         files,
     };
     let abs = out_dir.join("manifest.json");
-    let body = serde_json::to_vec_pretty(&manifest).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    let body =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     std::fs::write(&abs, &body)?;
 
     store.insert_event(
@@ -236,8 +268,15 @@ pub struct ProfileEntry {
     pub body: String,
 }
 
-fn push_role(roles: &mut Vec<RoleDefinition>, r: RoleDefinition, contract_refs: &mut Vec<(String, u32)>) {
-    if roles.iter().any(|x| x.slug == r.slug && x.version == r.version) {
+fn push_role(
+    roles: &mut Vec<RoleDefinition>,
+    r: RoleDefinition,
+    contract_refs: &mut Vec<(String, u32)>,
+) {
+    if roles
+        .iter()
+        .any(|x| x.slug == r.slug && x.version == r.version)
+    {
         return;
     }
     if let Some(c) = &r.input_contract {
@@ -249,36 +288,59 @@ fn push_role(roles: &mut Vec<RoleDefinition>, r: RoleDefinition, contract_refs: 
     roles.push(r);
 }
 
-fn get_role(store: &Store, slug: &str, version: Option<u32>) -> StoreResult<Option<RoleDefinition>> {
+fn get_role(
+    store: &Store,
+    slug: &str,
+    version: Option<u32>,
+) -> StoreResult<Option<RoleDefinition>> {
     let sql = match version {
-        Some(_) => "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 AND version=?2",
-        None => "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 ORDER BY version DESC LIMIT 1",
+        Some(_) => {
+            "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 AND version=?2"
+        }
+        None => {
+            "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 ORDER BY version DESC LIMIT 1"
+        }
     };
     let v = version.map(|x| x.to_string());
     store
         .conn
-        .query_row(sql, rusqlite::params_from_iter([Some(slug.to_string()), v]), |r| {
-            rows::role_from_row(r).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-        })
+        .query_row(
+            sql,
+            rusqlite::params_from_iter([Some(slug.to_string()), v]),
+            |r| {
+                rows::role_from_row(r)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            },
+        )
         .optional()
         .map_err(|e| match e {
-            rusqlite::Error::ToSqlConversionFailure(b) => b.downcast::<StoreError>().map(|e| *e).unwrap_or(StoreError::Sql(rusqlite::Error::InvalidQuery)),
+            rusqlite::Error::ToSqlConversionFailure(b) => b
+                .downcast::<StoreError>()
+                .map(|e| *e)
+                .unwrap_or(StoreError::Sql(rusqlite::Error::InvalidQuery)),
             other => StoreError::Sql(other),
         })
 }
 
 pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
     let manifest_raw = std::fs::read(dir.join("manifest.json"))?;
-    let manifest: BundleManifest = serde_json::from_slice(&manifest_raw).map_err(|e| StoreError::Corrupt(format!("bad manifest: {e}")))?;
+    let manifest: BundleManifest = serde_json::from_slice(&manifest_raw)
+        .map_err(|e| StoreError::Corrupt(format!("bad manifest: {e}")))?;
     if manifest.format != BUNDLE_FORMAT {
-        return Err(StoreError::Corrupt(format!("not a devai bundle: format `{}`", manifest.format)));
+        return Err(StoreError::Corrupt(format!(
+            "not a devai bundle: format `{}`",
+            manifest.format
+        )));
     }
     // Forward/backward compatibility: a bundle from an OLDER store schema is
     // acceptable (its rows just lack the nullable workspace_revision; the
     // new table starts empty), but a bundle from a FUTURE schema may carry
     // columns we cannot store, so it is refused rather than silently truncated.
     if manifest.schema_version > SCHEMA_VERSION {
-        return Err(StoreError::SchemaVersion { found: manifest.schema_version, expected: SCHEMA_VERSION });
+        return Err(StoreError::SchemaVersion {
+            found: manifest.schema_version,
+            expected: SCHEMA_VERSION,
+        });
     }
 
     // Verify every listed file against its recorded checksum.
@@ -294,7 +356,12 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
 
     let task: Task = read_json(dir, "task.json")?;
     if store.has_task(&task.id.to_string())? {
-        return Ok(ImportOutcome { task_id: task.id, imported_artifacts: 0, imported_events: 0, skipped_existing: true });
+        return Ok(ImportOutcome {
+            task_id: task.id,
+            imported_artifacts: 0,
+            imported_events: 0,
+            skipped_existing: true,
+        });
     }
 
     let events: Vec<WorkflowEvent> = read_jsonl(dir, "events.jsonl")?;
@@ -306,11 +373,19 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
     let contracts: Vec<ContractEntry> = read_jsonl(dir, "contracts.jsonl")?;
     // profiles.jsonl appeared with schema v2: a pre-v2 bundle simply carries
     // no profile definitions, and its executions carry no recorded revisions.
-    let profiles: Vec<ProfileEntry> = if dir.join("profiles.jsonl").exists() { read_jsonl(dir, "profiles.jsonl")? } else { Vec::new() };
+    let profiles: Vec<ProfileEntry> = if dir.join("profiles.jsonl").exists() {
+        read_jsonl(dir, "profiles.jsonl")?
+    } else {
+        Vec::new()
+    };
     // dependencies.jsonl appeared with schema v4 / bundle v2: a pre-v4 bundle
     // carries no edges — that is an empty dependency set, not corruption
     // (REQ-08 AC2: absent means empty, never broken).
-    let dependencies: Vec<TaskDependency> = if dir.join("dependencies.jsonl").exists() { read_jsonl(dir, "dependencies.jsonl")? } else { Vec::new() };
+    let dependencies: Vec<TaskDependency> = if dir.join("dependencies.jsonl").exists() {
+        read_jsonl(dir, "dependencies.jsonl")?
+    } else {
+        Vec::new()
+    };
 
     let tx = store.conn.unchecked_transaction()?;
 
@@ -342,7 +417,10 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
         let rel = format!("blobs/{}", a.sha256);
         let content = std::fs::read(dir.join(&rel))?;
         if hex_encode(&Sha256::digest(&content)) != a.sha256 {
-            return Err(StoreError::Corrupt(format!("blob {} failed verification on import", a.sha256)));
+            return Err(StoreError::Corrupt(format!(
+                "blob {} failed verification on import",
+                a.sha256
+            )));
         }
         store.store_blob(&a.sha256, &content)?;
         // No `INSERT OR IGNORE` on this table: since v3 a second CURRENT
@@ -511,11 +589,20 @@ fn write_json<T: Serialize>(
 ) -> StoreResult<()> {
     let body = serde_json::to_vec_pretty(value).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     std::fs::write(dir.join(rel), &body)?;
-    files.push(FileEntry { path: rel.into(), sha256: hex_encode(&Sha256::digest(&body)), size: body.len() as u64 });
+    files.push(FileEntry {
+        path: rel.into(),
+        sha256: hex_encode(&Sha256::digest(&body)),
+        size: body.len() as u64,
+    });
     Ok(())
 }
 
-fn write_jsonl<T: Serialize>(dir: &Path, rel: &str, values: &[T], files: &mut Vec<FileEntry>) -> StoreResult<()> {
+fn write_jsonl<T: Serialize>(
+    dir: &Path,
+    rel: &str,
+    values: &[T],
+    files: &mut Vec<FileEntry>,
+) -> StoreResult<()> {
     let mut buf = Vec::new();
     for v in values {
         buf.extend(serde_json::to_vec(v).map_err(|e| StoreError::Corrupt(e.to_string()))?);
@@ -528,7 +615,11 @@ fn write_jsonl<T: Serialize>(dir: &Path, rel: &str, values: &[T], files: &mut Ve
     // always `Some` for any rooted `dir`.
     std::fs::create_dir_all(parent.parent().unwrap())?;
     std::fs::write(&parent, &buf)?;
-    files.push(FileEntry { path: rel.into(), sha256: hex_encode(&Sha256::digest(&buf)), size: buf.len() as u64 });
+    files.push(FileEntry {
+        path: rel.into(),
+        sha256: hex_encode(&Sha256::digest(&buf)),
+        size: buf.len() as u64,
+    });
     Ok(())
 }
 
@@ -541,7 +632,9 @@ fn read_jsonl<T: serde::de::DeserializeOwned>(dir: &Path, rel: &str) -> StoreRes
     let body = std::fs::read(dir.join(rel))?;
     let mut out = Vec::new();
     for line in body.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        out.push(serde_json::from_slice(line).map_err(|e| StoreError::Corrupt(format!("{rel}: {e}")))?);
+        out.push(
+            serde_json::from_slice(line).map_err(|e| StoreError::Corrupt(format!("{rel}: {e}")))?,
+        );
     }
     Ok(out)
 }

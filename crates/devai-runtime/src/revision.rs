@@ -33,16 +33,17 @@ pub fn compute(workspace: &Path, profile: Option<&Profile>, roles: &[String]) ->
 /// not a git repo or git is unavailable — such a revision is not comparable
 /// and freshness must never be claimed from it.
 pub fn git_head(workspace: &Path) -> Option<String> {
-    let out = Command::new("git").arg("rev-parse").arg("HEAD").current_dir(workspace).output().ok()?;
+    let out = Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(workspace)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Canonical dirty-tree digest. Returns (head, digest); both are None when
@@ -54,7 +55,13 @@ fn tree_state(workspace: &Path) -> (Option<String>, Option<String>) {
     // --no-renames keeps each NUL record 1:1 (a rename would otherwise append
     // an extra origin path); --untracked-files=all lists every loose file.
     let porcelain = Command::new("git")
-        .args(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"])
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+        ])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(workspace)
         .output();
@@ -72,7 +79,11 @@ fn tree_state(workspace: &Path) -> (Option<String>, Option<String>) {
         let xy = String::from_utf8_lossy(&record[0..2]).into_owned();
         let path = &record[3..];
         let path = String::from_utf8_lossy(path).into_owned();
-        entries.push(format!("{xy}\t{wt_oid}\t{idx_oid}\t{path}", wt_oid = worktree_oid(workspace, &path), idx_oid = index_oid(workspace, &path)));
+        entries.push(format!(
+            "{xy}\t{wt_oid}\t{idx_oid}\t{path}",
+            wt_oid = worktree_oid(workspace, &path),
+            idx_oid = index_oid(workspace, &path)
+        ));
     }
 
     // Order-independent: sort the canonical sequence, hash it.
@@ -94,7 +105,12 @@ fn worktree_oid(workspace: &Path, path: &str) -> String {
         return "-".into();
     }
     // hash-object with -- allows a leading-dash path safely.
-    match Command::new("git").args(["hash-object", "--"]).arg(path).current_dir(workspace).output() {
+    match Command::new("git")
+        .args(["hash-object", "--"])
+        .arg(path)
+        .current_dir(workspace)
+        .output()
+    {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => "-".into(),
     }
@@ -103,11 +119,19 @@ fn worktree_oid(workspace: &Path, path: &str) -> String {
 /// Staged (index) blob oid for the path, `-` when the path is untracked or
 /// absent from the index. `git ls-files -s` lists the index entry (stage 0).
 fn index_oid(workspace: &Path, path: &str) -> String {
-    match Command::new("git").args(["ls-files", "-s", "--"]).arg(path).current_dir(workspace).output() {
+    match Command::new("git")
+        .args(["ls-files", "-s", "--"])
+        .arg(path)
+        .current_dir(workspace)
+        .output()
+    {
         Ok(o) if o.status.success() => {
             let line = String::from_utf8_lossy(&o.stdout);
             // "mode oid stage\tpath" -> oid is the second whitespace token.
-            line.split_whitespace().nth(1).map(|s| s.to_string()).unwrap_or_else(|| "-".into())
+            line.split_whitespace()
+                .nth(1)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into())
         }
         _ => "-".into(),
     }
@@ -135,7 +159,18 @@ mod tests {
             git(dir.path(), &["add", "a.txt"]);
             git(
                 dir.path(),
-                &["-c", "user.email=devai@test.local", "-c", "user.name=devai-test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"],
+                &[
+                    "-c",
+                    "user.email=devai@test.local",
+                    "-c",
+                    "user.name=devai-test",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "init",
+                ],
             );
             Repo { dir }
         }
@@ -150,7 +185,11 @@ mod tests {
             .current_dir(dir)
             .output()
             .expect("git is available");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -163,7 +202,11 @@ mod tests {
         let r = Repo::new();
         let rev = compute(r.path(), None, &[]);
         assert!(rev.git_head.is_some(), "committed repo has HEAD");
-        assert_eq!(rev.dirty_digest.as_deref(), Some(CLEAN_TREE_DIGEST), "clean tree → empty-sequence constant");
+        assert_eq!(
+            rev.dirty_digest.as_deref(),
+            Some(CLEAN_TREE_DIGEST),
+            "clean tree → empty-sequence constant"
+        );
         assert!(rev.is_comparable());
     }
 
@@ -172,7 +215,11 @@ mod tests {
         let r = Repo::new();
         std::fs::write(r.path().join("a.txt"), b"changed\n").unwrap();
         std::fs::write(r.path().join("loose.txt"), b"untracked\n").unwrap();
-        assert_eq!(digest(&r), digest(&r), "two computations on the same state must agree");
+        assert_eq!(
+            digest(&r),
+            digest(&r),
+            "two computations on the same state must agree"
+        );
         assert_ne!(digest(&r).as_deref(), Some(CLEAN_TREE_DIGEST));
     }
 
@@ -189,20 +236,34 @@ mod tests {
         // staged content differs from worktree → staging the same edit moves it again
         git(r.path(), &["add", "a.txt"]);
         let staged = digest(&r);
-        assert_ne!(staged, modified, "index change with the same worktree moves the digest");
+        assert_ne!(
+            staged, modified,
+            "index change with the same worktree moves the digest"
+        );
 
         // untracked file
         std::fs::write(r.path().join("new.txt"), b"x\n").unwrap();
         let with_untracked = digest(&r);
-        assert_ne!(with_untracked, staged, "untracked non-ignored file changes the digest");
+        assert_ne!(
+            with_untracked, staged,
+            "untracked non-ignored file changes the digest"
+        );
 
         // removing the untracked file returns to the previous digest
         std::fs::remove_file(r.path().join("new.txt")).unwrap();
-        assert_eq!(digest(&r), staged, "digest tracks removal as precisely as addition");
+        assert_eq!(
+            digest(&r),
+            staged,
+            "digest tracks removal as precisely as addition"
+        );
 
         // deletion of a tracked file changes the digest (worktree oid '-')
         std::fs::remove_file(r.path().join("a.txt")).unwrap();
-        assert_ne!(digest(&r), staged, "deleted tracked file must not collide with its prior states");
+        assert_ne!(
+            digest(&r),
+            staged,
+            "deleted tracked file must not collide with its prior states"
+        );
     }
 
     #[test]
@@ -213,11 +274,26 @@ mod tests {
         git(r.path(), &["add", ".gitignore"]);
         git(
             r.path(),
-            &["-c", "user.email=devai@test.local", "-c", "user.name=devai-test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "ignore rule"],
+            &[
+                "-c",
+                "user.email=devai@test.local",
+                "-c",
+                "user.name=devai-test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "ignore rule",
+            ],
         );
         std::fs::create_dir(r.path().join("ignored")).unwrap();
         let clean = digest(&r);
-        assert_eq!(clean.as_deref(), Some(CLEAN_TREE_DIGEST), "committed .gitignore leaves the tree clean");
+        assert_eq!(
+            clean.as_deref(),
+            Some(CLEAN_TREE_DIGEST),
+            "committed .gitignore leaves the tree clean"
+        );
 
         // Files inside the ignored directory must not move the digest.
         std::fs::write(r.path().join("ignored/junk.txt"), b"junk\n").unwrap();
@@ -227,7 +303,11 @@ mod tests {
         // While non-ignored untracked files DO: the contrast must be real,
         // not an accident of everything being ignored.
         std::fs::write(r.path().join("visible.txt"), b"seen\n").unwrap();
-        assert_ne!(digest(&r), clean, "non-ignored untracked file moves the digest");
+        assert_ne!(
+            digest(&r),
+            clean,
+            "non-ignored untracked file moves the digest"
+        );
     }
 
     #[test]
@@ -256,8 +336,16 @@ mod tests {
         let _ = compute(r.path(), None, &[]);
         // hash-object without -w never writes a blob; status/ls-files are
         // plumbing reads. Neither the worktree, the index, nor HEAD may move.
-        assert_eq!(git(r.path(), &["status", "--porcelain"]), status_before, "computing the digest must not change the tree state");
-        assert_eq!(git(r.path(), &["ls-files", "-s"]), index_before, "computing the digest must not touch the index");
+        assert_eq!(
+            git(r.path(), &["status", "--porcelain"]),
+            status_before,
+            "computing the digest must not change the tree state"
+        );
+        assert_eq!(
+            git(r.path(), &["ls-files", "-s"]),
+            index_before,
+            "computing the digest must not touch the index"
+        );
     }
 
     #[test]
@@ -266,7 +354,10 @@ mod tests {
         let rev = compute(dir.path(), None, &[]);
         assert_eq!(rev.git_head, None);
         assert_eq!(rev.dirty_digest, None);
-        assert!(!rev.is_comparable(), "a non-git revision must never support a freshness claim");
+        assert!(
+            !rev.is_comparable(),
+            "a non-git revision must never support a freshness claim"
+        );
     }
 
     #[test]
@@ -277,9 +368,21 @@ mod tests {
         let rev = compute(
             r.path(),
             None,
-            &["quality-auditor@2".to_string(), "requirements-analyst@1".to_string()],
+            &[
+                "quality-auditor@2".to_string(),
+                "requirements-analyst@1".to_string(),
+            ],
         );
-        assert_eq!(rev.profile, None, "no profile loaded → recorded as absent, not guessed");
-        assert_eq!(rev.roles, vec!["quality-auditor@2".to_string(), "requirements-analyst@1".to_string()]);
+        assert_eq!(
+            rev.profile, None,
+            "no profile loaded → recorded as absent, not guessed"
+        );
+        assert_eq!(
+            rev.roles,
+            vec![
+                "quality-auditor@2".to_string(),
+                "requirements-analyst@1".to_string()
+            ]
+        );
     }
 }

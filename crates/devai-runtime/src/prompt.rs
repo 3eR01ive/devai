@@ -27,7 +27,9 @@ pub fn build_user_prompt(
     contract_schema: Option<&str>,
 ) -> String {
     let mut s = String::new();
-    s.push_str(&format!("TASK: {title}\nBUSINESS DESCRIPTION:\n{business}\n\n"));
+    s.push_str(&format!(
+        "TASK: {title}\nBUSINESS DESCRIPTION:\n{business}\n\n"
+    ));
     if !inputs.is_empty() {
         s.push_str("INPUT ARTIFACTS:\n");
         for (label, content) in inputs {
@@ -39,7 +41,9 @@ pub fn build_user_prompt(
         s.push_str(&format!("OUTPUT CONTRACT: {name}@{ver}\n"));
     }
     if let Some(schema) = contract_schema {
-        s.push_str(&format!("OUTPUT JSON SCHEMA:\n{schema}\n\nReturn only the JSON object.\n"));
+        s.push_str(&format!(
+            "OUTPUT JSON SCHEMA:\n{schema}\n\nReturn only the JSON object.\n"
+        ));
     }
     s
 }
@@ -99,11 +103,23 @@ mod tests {
 
     #[test]
     fn extracts_plain_and_fenced_json() {
-        assert_eq!(extract_json_object(r#"{"a":1}"#).as_deref(), Some(r#"{"a":1}"#));
-        assert_eq!(extract_json_object("```json\n{\"a\":1}\n```").as_deref(), Some(r#"{"a":1}"#));
-        assert_eq!(extract_json_object("here you go: {\"k\":{\"n\":2}} trailing").as_deref(), Some(r#"{"k":{"n":2}}"#));
+        assert_eq!(
+            extract_json_object(r#"{"a":1}"#).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(
+            extract_json_object("```json\n{\"a\":1}\n```").as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(
+            extract_json_object("here you go: {\"k\":{\"n\":2}} trailing").as_deref(),
+            Some(r#"{"k":{"n":2}}"#)
+        );
         assert_eq!(extract_json_object("no object here"), None);
         // braces inside strings must not affect depth
-        assert_eq!(extract_json_object(r#"{"s":"{not a brace}"}"#).as_deref(), Some(r#"{"s":"{not a brace}"}"#));
+        assert_eq!(
+            extract_json_object(r#"{"s":"{not a brace}"}"#).as_deref(),
+            Some(r#"{"s":"{not a brace}"}"#)
+        );
     }
 }

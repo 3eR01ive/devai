@@ -56,14 +56,24 @@ pub struct Worktree {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
-    #[error("`{0}` is not a git repository — a writing stage cannot be isolated without history to branch from; the run fails instead of falling back (REQ-WT-08 hard rule)")]
+    #[error(
+        "`{0}` is not a git repository — a writing stage cannot be isolated without history to branch from; the run fails instead of falling back (REQ-WT-08 hard rule)"
+    )]
     NotGit(PathBuf),
-    #[error("the task is bound to no workspace revision commit — the writing stage fails explicitly instead of silently using the main checkout's current state (REQ-WT-01 AC2)")]
+    #[error(
+        "the task is bound to no workspace revision commit — the writing stage fails explicitly instead of silently using the main checkout's current state (REQ-WT-01 AC2)"
+    )]
     NoBoundCommit,
     #[error("git {cmd} failed: {reason}")]
     Git { cmd: String, reason: String },
-    #[error("{dir} exists but is checked out on `{found}`, not the task's `{expected}` branch — refusing to run a writing stage against a foreign tree")]
-    BranchMismatch { dir: String, expected: String, found: String },
+    #[error(
+        "{dir} exists but is checked out on `{found}`, not the task's `{expected}` branch — refusing to run a writing stage against a foreign tree"
+    )]
+    BranchMismatch {
+        dir: String,
+        expected: String,
+        found: String,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -86,13 +96,20 @@ fn git(dir: &Path, args: &[&str]) -> WorktreeResult<String> {
     let out = Command::new("git").args(args).current_dir(dir).output()?;
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if !out.status.success() {
-        return Err(WorktreeError::Git { cmd: format!("git {}", args.join(" ")), reason: stderr });
+        return Err(WorktreeError::Git {
+            cmd: format!("git {}", args.join(" ")),
+            reason: stderr,
+        });
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git").args(args).current_dir(dir).output().is_ok_and(|o| o.status.success())
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// True when `repo` is usable as the repository a worktree branches from.
@@ -107,7 +124,15 @@ pub fn is_git_repo(repo: &Path) -> bool {
 /// branch is the durable fact, the directory is reconstructible (REQ-WT-07
 /// AC3: the branch persists until a human merges).
 pub fn has_branch(repo: &Path, task_id: Id) -> bool {
-    git_ok(repo, &["show-ref", "--verify", "--quiet", &format!("refs/heads/{}", branch_name(task_id))])
+    git_ok(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", branch_name(task_id)),
+        ],
+    )
 }
 
 /// The branch currently checked out in `dir`, if it is a git checkout at
@@ -138,7 +163,12 @@ pub fn current_branch(dir: &Path) -> Option<String> {
 /// * directory present: verified to be exactly the task's branch — a
 ///   foreign tree there is [`WorktreeError::BranchMismatch`], never silently
 ///   reused.
-pub fn prepare(repo: &Path, home: &Path, task_id: Id, bound_head: Option<&str>) -> WorktreeResult<Worktree> {
+pub fn prepare(
+    repo: &Path,
+    home: &Path,
+    task_id: Id,
+    bound_head: Option<&str>,
+) -> WorktreeResult<Worktree> {
     if !is_git_repo(repo) {
         return Err(WorktreeError::NotGit(repo.to_path_buf()));
     }
@@ -151,7 +181,11 @@ pub fn prepare(repo: &Path, home: &Path, task_id: Id, bound_head: Option<&str>) 
             return Err(WorktreeError::BranchMismatch {
                 dir: dir.display().to_string(),
                 expected: branch,
-                found: if found.is_empty() { "(not a git checkout)".into() } else { found },
+                found: if found.is_empty() {
+                    "(not a git checkout)".into()
+                } else {
+                    found
+                },
             });
         }
         return Ok(Worktree { dir, branch });
@@ -165,7 +199,10 @@ pub fn prepare(repo: &Path, home: &Path, task_id: Id, bound_head: Option<&str>) 
         // out in a still-live other worktree honestly fails the add (git
         // refuses it) rather than corrupting that run's isolation.
         git(repo, &["worktree", "prune"])?;
-        git(repo, &["worktree", "add", &dir.display().to_string(), &branch])?;
+        git(
+            repo,
+            &["worktree", "add", &dir.display().to_string(), &branch],
+        )?;
         return Ok(Worktree { dir, branch });
     }
 
@@ -173,9 +210,22 @@ pub fn prepare(repo: &Path, home: &Path, task_id: Id, bound_head: Option<&str>) 
     // The bound revision's commit must actually exist in the object store;
     // `worktree add` verifies, but a clear typed error beats a git one.
     if !git_ok(repo, &["rev-parse", "--verify", &format!("{head}^0")]) {
-        return Err(WorktreeError::Git { cmd: format!("git rev-parse --verify {head}^0"), reason: "the bound commit does not exist in the repository".into() });
+        return Err(WorktreeError::Git {
+            cmd: format!("git rev-parse --verify {head}^0"),
+            reason: "the bound commit does not exist in the repository".into(),
+        });
     }
-    git(repo, &["worktree", "add", &dir.display().to_string(), "-b", &branch, head])?;
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            &dir.display().to_string(),
+            "-b",
+            &branch,
+            head,
+        ],
+    )?;
     Ok(Worktree { dir, branch })
 }
 
@@ -194,7 +244,12 @@ pub fn prepare(repo: &Path, home: &Path, task_id: Id, bound_head: Option<&str>) 
 ///
 /// The commit message is the interim OQ-5 answer: subject
 /// `<prefix>: <task title>` with a body citing the task and execution ids.
-pub fn commit_platform_work(dir: &Path, subject: &str, task_id: Id, execution_id: Id) -> WorktreeResult<String> {
+pub fn commit_platform_work(
+    dir: &Path,
+    subject: &str,
+    task_id: Id,
+    execution_id: Id,
+) -> WorktreeResult<String> {
     git(dir, &["add", "-A"])?;
     // `diff --cached --quiet`: exit 1 means staged content exists; 0 means
     // the worktree matches the branch tip and there is nothing to capture.
@@ -244,7 +299,22 @@ mod tests {
             git(p, &["init", "-q"]).unwrap();
             std::fs::write(p.join("base.txt"), b"baseline\n").unwrap();
             git(p, &["add", "base.txt"]).unwrap();
-            git(p, &["-c", "user.email=devai@test.local", "-c", "user.name=devai-test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "bound state"]).unwrap();
+            git(
+                p,
+                &[
+                    "-c",
+                    "user.email=devai@test.local",
+                    "-c",
+                    "user.name=devai-test",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "bound state",
+                ],
+            )
+            .unwrap();
             std::fs::write(p.join("base.txt"), b"dirty user edit\n").unwrap();
             std::fs::write(p.join("loose.txt"), b"untracked\n").unwrap();
             Fixture { home, repo }
@@ -254,7 +324,17 @@ mod tests {
         }
         fn main_state(&self) -> (String, String, String) {
             (
-                git(self.repo.path(), &["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]).unwrap(),
+                git(
+                    self.repo.path(),
+                    &[
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--no-renames",
+                        "--untracked-files=all",
+                    ],
+                )
+                .unwrap(),
                 git(self.repo.path(), &["rev-parse", "HEAD"]).unwrap(),
                 git(self.repo.path(), &["ls-files", "-s"]).unwrap(),
             )
@@ -278,7 +358,10 @@ mod tests {
         // Branch points at exactly the bound HEAD (REQ-WT-01 AC1).
         assert_eq!(git(&wt.dir, &["rev-parse", "HEAD"]).unwrap(), f.head());
         // The worktree carries the COMMITTED tree — not main's dirty state.
-        assert_eq!(std::fs::read_to_string(wt.dir.join("base.txt")).unwrap(), "baseline\n");
+        assert_eq!(
+            std::fs::read_to_string(wt.dir.join("base.txt")).unwrap(),
+            "baseline\n"
+        );
         assert!(!wt.dir.join("loose.txt").exists());
     }
 
@@ -290,12 +373,23 @@ mod tests {
         let baseline_ref = git(f.repo.path(), &["rev-parse", "HEAD"]).unwrap();
         let wt = prepare(f.repo.path(), f.home.path(), id, Some(&f.head())).unwrap();
         std::fs::write(wt.dir.join("new.txt"), b"agent work\n").unwrap();
-        let sha = commit_platform_work(&wt.dir, "devai: implementation: demo", id, new_id()).unwrap();
+        let sha =
+            commit_platform_work(&wt.dir, "devai: implementation: demo", id, new_id()).unwrap();
         let after = f.main_state();
-        assert_eq!(after, before, "status/HEAD/index of the main checkout must be byte-identical across a full writing stage (REQ-WT-08 AC2)");
-        assert_eq!(git(f.repo.path(), &["rev-parse", "HEAD"]).unwrap(), baseline_ref, "HEAD unmoved");
+        assert_eq!(
+            after, before,
+            "status/HEAD/index of the main checkout must be byte-identical across a full writing stage (REQ-WT-08 AC2)"
+        );
+        assert_eq!(
+            git(f.repo.path(), &["rev-parse", "HEAD"]).unwrap(),
+            baseline_ref,
+            "HEAD unmoved"
+        );
         // The only ref that moved is the task's own branch.
-        assert_eq!(git(f.repo.path(), &["rev-parse", &branch_name(id)]).unwrap(), sha);
+        assert_eq!(
+            git(f.repo.path(), &["rev-parse", &branch_name(id)]).unwrap(),
+            sha
+        );
         // Nothing of the run leaked into the main checkout's tree.
         assert!(!f.repo.path().join("worktrees").exists());
         assert!(!f.repo.path().join("evidence").exists());
@@ -306,8 +400,18 @@ mod tests {
         let f = Fixture::new();
         let id = new_id();
         let wt = prepare(f.repo.path(), f.home.path(), id, Some(&f.head())).unwrap();
-        let tip = commit_platform_work(&wt.dir, "devai: implementation: nothing changed", id, new_id()).unwrap();
-        assert_eq!(tip, f.head(), "zero-change writing run names the capturing tip, not an empty commit");
+        let tip = commit_platform_work(
+            &wt.dir,
+            "devai: implementation: nothing changed",
+            id,
+            new_id(),
+        )
+        .unwrap();
+        assert_eq!(
+            tip,
+            f.head(),
+            "zero-change writing run names the capturing tip, not an empty commit"
+        );
         let count = git(&wt.dir, &["rev-list", "--count", "HEAD"]).unwrap();
         assert_eq!(count, "1");
     }
@@ -317,7 +421,10 @@ mod tests {
         let f = Fixture::new();
         let err = prepare(f.repo.path(), f.home.path(), new_id(), None).unwrap_err();
         assert!(matches!(err, WorktreeError::NoBoundCommit), "{err}");
-        assert!(err.to_string().contains("fails explicitly"), "the AC2 rule is in the message itself");
+        assert!(
+            err.to_string().contains("fails explicitly"),
+            "the AC2 rule is in the message itself"
+        );
     }
 
     #[test]
@@ -334,16 +441,23 @@ mod tests {
         let id = new_id();
         let wt = prepare(f.repo.path(), f.home.path(), id, Some(&f.head())).unwrap();
         std::fs::write(wt.dir.join("wip.txt"), b"first run\n").unwrap();
-        let sha1 = commit_platform_work(&wt.dir, "devai: implementation: first", id, new_id()).unwrap();
+        let sha1 =
+            commit_platform_work(&wt.dir, "devai: implementation: first", id, new_id()).unwrap();
         // A human deleted the directory (branch ref persists — REQ-WT-07 AC3).
         std::fs::remove_dir_all(&wt.dir).unwrap();
         let wt2 = prepare(f.repo.path(), f.home.path(), id, Some(&f.head())).unwrap();
         assert_eq!(wt2.dir, wt.dir);
-        assert_eq!(current_branch(&wt2.dir).as_deref(), Some(branch_name(id).as_str()));
+        assert_eq!(
+            current_branch(&wt2.dir).as_deref(),
+            Some(branch_name(id).as_str())
+        );
         // Reuse attaches the EXISTING branch — not a fresh one at the bound
         // HEAD: the first run's committed work continues.
         assert_eq!(git(&wt2.dir, &["rev-parse", "HEAD"]).unwrap(), sha1);
-        assert_eq!(std::fs::read_to_string(wt2.dir.join("wip.txt")).unwrap(), "first run\n");
+        assert_eq!(
+            std::fs::read_to_string(wt2.dir.join("wip.txt")).unwrap(),
+            "first run\n"
+        );
     }
 
     #[test]

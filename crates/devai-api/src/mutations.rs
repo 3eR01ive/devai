@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
-use devai_runtime::{liveness, Gate, Engine, RunReport};
-use devai_store::{bundle, guess_media_type, seed, ArtifactDraft};
+use devai_runtime::{Engine, Gate, RunReport, liveness};
+use devai_store::{ArtifactDraft, bundle, guess_media_type, seed};
 use uuid::Uuid;
 
 use crate::{Api, ApiError, ApiResult};
@@ -73,16 +73,35 @@ pub struct TaskCreated {
 #[derive(Debug, Clone)]
 pub enum WorkflowOp {
     Start,
-    Review { verdict: Verdict, summary: Option<String> },
-    Approve { rationale: Option<String> },
-    Reject { rationale: Option<String> },
-    Accept { rationale: Option<String> },
-    Return { rationale: Option<String> },
-    Pause { reason: Option<String> },
+    Review {
+        verdict: Verdict,
+        summary: Option<String>,
+    },
+    Approve {
+        rationale: Option<String>,
+    },
+    Reject {
+        rationale: Option<String>,
+    },
+    Accept {
+        rationale: Option<String>,
+    },
+    Return {
+        rationale: Option<String>,
+    },
+    Pause {
+        reason: Option<String>,
+    },
     Resume,
-    Block { reason: Option<String> },
-    Cancel { reason: Option<String> },
-    Fail { reason: Option<String> },
+    Block {
+        reason: Option<String>,
+    },
+    Cancel {
+        reason: Option<String>,
+    },
+    Fail {
+        reason: Option<String>,
+    },
 }
 
 /// The committed outcome of one workflow mutation — the facts the CLI's
@@ -365,11 +384,23 @@ impl Api {
         let mut linked: Vec<TaskDependency> = Vec::new();
         for p in &req.parent {
             let pt = self.store.resolve_task(p)?;
-            linked.push(self.store.link_task_dependency(t.id, pt.id, DependencyKind::Parent, &self.actor, Utc::now())?);
+            linked.push(self.store.link_task_dependency(
+                t.id,
+                pt.id,
+                DependencyKind::Parent,
+                &self.actor,
+                Utc::now(),
+            )?);
         }
         for b in &req.blocked_by {
             let bt = self.store.resolve_task(b)?;
-            linked.push(self.store.link_task_dependency(t.id, bt.id, DependencyKind::Blocks, &self.actor, Utc::now())?);
+            linked.push(self.store.link_task_dependency(
+                t.id,
+                bt.id,
+                DependencyKind::Blocks,
+                &self.actor,
+                Utc::now(),
+            )?);
         }
         Ok(TaskCreated { task: t, linked })
     }
@@ -381,18 +412,28 @@ impl Api {
     /// was. Every named workflow operation delegates here (REQ-MUT-05 AC3).
     pub fn task_op(&self, id: &str, op: WorkflowOp) -> ApiResult<MutationResult> {
         match op {
-            WorkflowOp::Start => self.run_op(id, |t, _a| workflow::start(t, &self.actor, Utc::now())),
-            WorkflowOp::Review { verdict, summary } => self.run_op(id, move |t, _a| workflow::review_recorded(t, verdict, summary.as_deref(), &self.actor, Utc::now())),
+            WorkflowOp::Start => {
+                self.run_op(id, |t, _a| workflow::start(t, &self.actor, Utc::now()))
+            }
+            WorkflowOp::Review { verdict, summary } => self.run_op(id, move |t, _a| {
+                workflow::review_recorded(t, verdict, summary.as_deref(), &self.actor, Utc::now())
+            }),
             WorkflowOp::Approve { rationale } => self.run_op(id, move |t, a| {
                 // The approve gate reads the CURRENT spec exactly as the old
                 // closure did — same guard, same refusal text.
-                if a.iter().any(|x| x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current) {
+                if a.iter().any(|x| {
+                    x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
+                }) {
                     workflow::approve_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
                 } else {
-                    Err(devai_core::CoreError::guard("no CURRENT REQUIREMENTS_SPEC artifact to approve"))
+                    Err(devai_core::CoreError::guard(
+                        "no CURRENT REQUIREMENTS_SPEC artifact to approve",
+                    ))
                 }
             }),
-            WorkflowOp::Reject { rationale } => self.run_op(id, move |t, _a| workflow::reject_requirements(t, rationale.as_deref(), &self.actor, Utc::now())),
+            WorkflowOp::Reject { rationale } => self.run_op(id, move |t, _a| {
+                workflow::reject_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
+            }),
             WorkflowOp::Accept { rationale } => {
                 // REQ-DEP-03: the acceptance gate consults the stored
                 // dependency graph and the override decisions before the
@@ -400,19 +441,41 @@ impl Api {
                 let task = self.store.resolve_task(id)?;
                 let deps = self.store.task_dependencies(task.id)?;
                 let decisions = self.store.list_decisions(task.id)?;
-                self.run_op(id, move |t, a| workflow::accept(t, a, &deps, &decisions, rationale.as_deref(), &self.actor, Utc::now()))
+                self.run_op(id, move |t, a| {
+                    workflow::accept(
+                        t,
+                        a,
+                        &deps,
+                        &decisions,
+                        rationale.as_deref(),
+                        &self.actor,
+                        Utc::now(),
+                    )
+                })
             }
-            WorkflowOp::Return { rationale } => self.run_op(id, move |t, _a| workflow::return_to_rework(t, rationale.as_deref(), &self.actor, Utc::now())),
-            WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| workflow::pause(t, reason.as_deref(), &self.actor, Utc::now())),
+            WorkflowOp::Return { rationale } => self.run_op(id, move |t, _a| {
+                workflow::return_to_rework(t, rationale.as_deref(), &self.actor, Utc::now())
+            }),
+            WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| {
+                workflow::pause(t, reason.as_deref(), &self.actor, Utc::now())
+            }),
             WorkflowOp::Resume => {
                 let task = self.store.resolve_task(id)?;
                 let deps = self.store.task_dependencies(task.id)?;
                 let decisions = self.store.list_decisions(task.id)?;
-                self.run_op(id, move |t, _a| workflow::resume(t, &deps, &decisions, &self.actor, Utc::now()))
+                self.run_op(id, move |t, _a| {
+                    workflow::resume(t, &deps, &decisions, &self.actor, Utc::now())
+                })
             }
-            WorkflowOp::Block { reason } => self.run_op(id, move |t, _a| workflow::block(t, reason.as_deref(), &self.actor, Utc::now())),
-            WorkflowOp::Cancel { reason } => self.run_op(id, move |t, _a| workflow::cancel(t, reason.as_deref(), &self.actor, Utc::now())),
-            WorkflowOp::Fail { reason } => self.run_op(id, move |t, _a| workflow::fail(t, reason.as_deref(), &self.actor, Utc::now())),
+            WorkflowOp::Block { reason } => self.run_op(id, move |t, _a| {
+                workflow::block(t, reason.as_deref(), &self.actor, Utc::now())
+            }),
+            WorkflowOp::Cancel { reason } => self.run_op(id, move |t, _a| {
+                workflow::cancel(t, reason.as_deref(), &self.actor, Utc::now())
+            }),
+            WorkflowOp::Fail { reason } => self.run_op(id, move |t, _a| {
+                workflow::fail(t, reason.as_deref(), &self.actor, Utc::now())
+            }),
         }
     }
 
@@ -423,8 +486,16 @@ impl Api {
         let task = self.store.resolve_task(id)?;
         let artifacts = self.store.artifacts(task.id)?;
         let m = f(&task, &artifacts)?;
-        let staled = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Stale).count();
-        let superseded = m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Superseded).count();
+        let staled = m
+            .artifact_status
+            .iter()
+            .filter(|(_, s)| *s == ArtifactStatus::Stale)
+            .count();
+        let superseded = m
+            .artifact_status
+            .iter()
+            .filter(|(_, s)| *s == ArtifactStatus::Superseded)
+            .count();
         self.store.commit(task.lock_version, &m)?;
         Ok(MutationResult {
             task: m.task.clone(),
@@ -432,14 +503,22 @@ impl Api {
             event_kinds: m.events.iter().map(|e| e.kind.to_string()).collect(),
             staled,
             superseded,
-            allowed_operations: workflow::allowed_ops(&m.task).into_iter().map(|s| s.to_string()).collect(),
+            allowed_operations: workflow::allowed_ops(&m.task)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
     pub fn task_start(&self, id: &str) -> ApiResult<MutationResult> {
         self.task_op(id, WorkflowOp::Start)
     }
-    pub fn task_review(&self, id: &str, verdict: Verdict, summary: Option<String>) -> ApiResult<MutationResult> {
+    pub fn task_review(
+        &self,
+        id: &str,
+        verdict: Verdict,
+        summary: Option<String>,
+    ) -> ApiResult<MutationResult> {
         self.task_op(id, WorkflowOp::Review { verdict, summary })
     }
     pub fn task_reject(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
@@ -476,10 +555,17 @@ impl Api {
             .store
             .artifacts(task.id)?
             .iter()
-            .find(|x| x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current)
+            .find(|x| {
+                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
+            })
             .map(|x| x.id.to_string())
             .unwrap_or_default();
-        let mutation = self.task_op(id, WorkflowOp::Approve { rationale: rationale.clone() })?;
+        let mutation = self.task_op(
+            id,
+            WorkflowOp::Approve {
+                rationale: rationale.clone(),
+            },
+        )?;
         let decision = Decision {
             id: new_id(),
             task_id: task.id,
@@ -487,7 +573,11 @@ impl Api {
             verdict: Verdict::Approved,
             actor: self.actor.clone(),
             rationale,
-            refs: if spec_ref.is_empty() { Vec::new() } else { vec![spec_ref] },
+            refs: if spec_ref.is_empty() {
+                Vec::new()
+            } else {
+                vec![spec_ref]
+            },
             created_at: Utc::now(),
         };
         self.store.record_decision(&decision)?;
@@ -513,7 +603,9 @@ impl Api {
         let (current_quality_report, gate_report_text) = match report.gate {
             Gate::WaitingAccept => (None, self.quality_report_text(report.task_id)?),
             Gate::ReportFresh => (
-                self.store.artifacts(report.task_id)?.into_iter().find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current),
+                self.store.artifacts(report.task_id)?.into_iter().find(|x| {
+                    x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
+                }),
                 self.quality_report_text(report.task_id)?,
             ),
             _ => (None, None),
@@ -523,20 +615,47 @@ impl Api {
             report,
             current_quality_report,
             gate_report_text,
-            allowed_operations: workflow::allowed_ops(&t).into_iter().map(|s| s.to_string()).collect(),
+            allowed_operations: workflow::allowed_ops(&t)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
         let task = self.store.resolve_task(&req.id)?;
-        let _a = self.publish_row_internal(task.id, ArtifactKind::RequirementsSpec, &req.name, req.content, None, None, vec![], None, DataCategory::Artifact)?;
+        let _a = self.publish_row_internal(
+            task.id,
+            ArtifactKind::RequirementsSpec,
+            &req.name,
+            req.content,
+            None,
+            None,
+            vec![],
+            None,
+            DataCategory::Artifact,
+        )?;
         let after = self.store.artifacts(task.id)?;
-        let m = workflow::requirements_published(&task, &after, req.reason.as_deref(), &self.actor, Utc::now())?;
+        let m = workflow::requirements_published(
+            &task,
+            &after,
+            req.reason.as_deref(),
+            &self.actor,
+            Utc::now(),
+        )?;
         self.store.commit(task.lock_version, &m)?;
         Ok(ReviseOutcome {
             task: m.task.clone(),
-            staled_ids: m.artifact_status.iter().filter(|(_, s)| *s == ArtifactStatus::Stale).map(|(i, _)| i.to_string()).collect(),
-            allowed_operations: workflow::allowed_ops(&m.task).into_iter().map(|s| s.to_string()).collect(),
+            staled_ids: m
+                .artifact_status
+                .iter()
+                .filter(|(_, s)| *s == ArtifactStatus::Stale)
+                .map(|(i, _)| i.to_string())
+                .collect(),
+            allowed_operations: workflow::allowed_ops(&m.task)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
@@ -556,7 +675,15 @@ impl Api {
         // approved specification (a later requirements revision marks them
         // STALE through the dependency graph — unless deps were given).
         if req.depends.is_empty() && req.kind.is_downstream_of_spec() {
-            if let Some(spec) = self.store.artifacts(task.id)?.iter().find(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current).map(|a| a.id) {
+            if let Some(spec) = self
+                .store
+                .artifacts(task.id)?
+                .iter()
+                .find(|a| {
+                    a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
+                })
+                .map(|a| a.id)
+            {
                 depends_ids.push(spec);
             }
         }
@@ -566,10 +693,14 @@ impl Api {
                 // refusal — «зомби не пишет в закрытую строку».
                 let ex = self.store.get_execution(e)?;
                 if ex.status != ExecutionStatus::Running {
-                    return Err(ApiError::refused("execution_not_running", format!(
-                        "execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)",
-                        ex.id, ex.status.as_str()
-                    )));
+                    return Err(ApiError::refused(
+                        "execution_not_running",
+                        format!(
+                            "execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)",
+                            ex.id,
+                            ex.status.as_str()
+                        ),
+                    ));
                 }
                 Some(ex.id)
             }
@@ -582,7 +713,17 @@ impl Api {
             Some(c) => Some(ContractRef::parse(c).map_err(devai_core::CoreError::from)?),
             None => None,
         };
-        let artifact = self.publish_row_internal(task.id, req.kind, &req.name, req.content, contract, execution_id, depends_ids, created_by.as_deref(), req.category)?;
+        let artifact = self.publish_row_internal(
+            task.id,
+            req.kind,
+            &req.name,
+            req.content,
+            contract,
+            execution_id,
+            depends_ids,
+            created_by.as_deref(),
+            req.category,
+        )?;
         Ok(PublishedRow { artifact, task })
     }
 
@@ -600,36 +741,68 @@ impl Api {
         match req.kind {
             ArtifactKind::RequirementsSpec => {
                 let arts = self.store.artifacts(task.id)?;
-                let m = workflow::requirements_published(&task, &arts, None, &self.actor, Utc::now())?;
+                let m =
+                    workflow::requirements_published(&task, &arts, None, &self.actor, Utc::now())?;
                 self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome { from: task.state, to: m.task.state, rework_gate: false })
+                Ok(AdvanceOutcome {
+                    from: task.state,
+                    to: m.task.state,
+                    rework_gate: false,
+                })
             }
             ArtifactKind::ReviewReport => {
                 let v = match req.verdict.as_deref() {
                     Some(s) => Self::parse_verdict(s)?,
-                    None => return Err(ApiError::refused("bad_request", "publishing REVIEW_REPORT requires --verdict approved|needs_revision")),
+                    None => {
+                        return Err(ApiError::refused(
+                            "bad_request",
+                            "publishing REVIEW_REPORT requires --verdict approved|needs_revision",
+                        ));
+                    }
                 };
                 let m = workflow::review_recorded(&task, v, None, &self.actor, Utc::now())?;
                 self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome { from: task.state, to: m.task.state, rework_gate: false })
+                Ok(AdvanceOutcome {
+                    from: task.state,
+                    to: m.task.state,
+                    rework_gate: false,
+                })
             }
             ArtifactKind::ImplementationReport => {
                 // The manual publication crosses the SAME core command as
                 // the engine — including the empty-rework gate.
                 let arts = self.store.artifacts(task.id)?;
-                let facts = devai_runtime::gate::collect_implementation_report_facts(&self.store, task.id, &a, &arts, None)?;
+                let facts = devai_runtime::gate::collect_implementation_report_facts(
+                    &self.store,
+                    task.id,
+                    &a,
+                    &arts,
+                    None,
+                )?;
                 let m = workflow::implementation_reported(&task, &facts, &self.actor, Utc::now())?;
                 self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome { from: task.state, to: m.task.state, rework_gate: m.task.state == TaskState::WaitingForInput })
+                Ok(AdvanceOutcome {
+                    from: task.state,
+                    to: m.task.state,
+                    rework_gate: m.task.state == TaskState::WaitingForInput,
+                })
             }
             // Fail-closed (QA R5): the kind carries no advance. The refusal
             // lists the advancing kinds DERIVED from the core predicate —
             // never a hand-copied set that could drift (QA R4).
-            other => Err(ApiError::refused("artifact_kind_not_advancing", format!(
-                "{} carries no workflow advance — the advancing kinds are {} (the row alone lands via `artifact.publish_row`; publish through `artifact.publish` to get the row and its advance in one call)",
-                other.as_str(),
-                ArtifactKind::ALL.iter().filter(|k| k.advances_state()).map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
-            ))),
+            other => Err(ApiError::refused(
+                "artifact_kind_not_advancing",
+                format!(
+                    "{} carries no workflow advance — the advancing kinds are {} (the row alone lands via `artifact.publish_row`; publish through `artifact.publish` to get the row and its advance in one call)",
+                    other.as_str(),
+                    ArtifactKind::ALL
+                        .iter()
+                        .filter(|k| k.advances_state())
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
         }
     }
 
@@ -644,7 +817,12 @@ impl Api {
         let verdict = req.verdict.clone();
         let publish = self.artifact_publish_row(req)?;
         let advanced = if kind.advances_state() {
-            Some(self.artifact_advance(AdvanceReq { id: publish.task.id.to_string(), artifact_id: publish.artifact.id.to_string(), kind, verdict })?)
+            Some(self.artifact_advance(AdvanceReq {
+                id: publish.task.id.to_string(),
+                artifact_id: publish.artifact.id.to_string(),
+                kind,
+                verdict,
+            })?)
         } else {
             None
         };
@@ -656,7 +834,16 @@ impl Api {
     /// rules, only delegation); the API maps the miss to the machine-coded
     /// refusal carrying the exact CLI text pinned by parity (REQ-MUT-06).
     pub fn parse_verdict(s: &str) -> ApiResult<Verdict> {
-        Verdict::from_token(s).ok_or_else(|| ApiError::refused("unknown_variant", format!("unknown verdict `{}` ({})", s.to_ascii_lowercase(), Verdict::token_hint())))
+        Verdict::from_token(s).ok_or_else(|| {
+            ApiError::refused(
+                "unknown_variant",
+                format!(
+                    "unknown verdict `{}` ({})",
+                    s.to_ascii_lowercase(),
+                    Verdict::token_hint()
+                ),
+            )
+        })
     }
 
     /// The old CLI `publish_raw`: unregistered contract and contract-gate
@@ -679,15 +866,23 @@ impl Api {
         if let Some(c) = &contract {
             let schema = self.store.get_contract(&c.name, c.version)?;
             let Some(schema) = schema else {
-                return Err(ApiError::ContractUnregistered { contract: c.to_string() });
+                return Err(ApiError::ContractUnregistered {
+                    contract: c.to_string(),
+                });
             };
             // Gate parity (ratified OQ-FG-05, REQ-FG-08): the manual path
             // runs the SAME contract gate as the engine loop; enforcement
             // is the API's, the presentation (warning + full list) the
             // consumer's.
-            let violations = devai_runtime::contract_violations(String::from_utf8_lossy(&content).as_ref(), Some(schema.as_str()))?;
+            let violations = devai_runtime::contract_violations(
+                String::from_utf8_lossy(&content).as_ref(),
+                Some(schema.as_str()),
+            )?;
             if !violations.is_empty() {
-                return Err(ApiError::ContractRejected { contract: c.to_string(), violations });
+                return Err(ApiError::ContractRejected {
+                    contract: c.to_string(),
+                    violations,
+                });
             }
         }
         Ok(self.store.publish_artifact(ArtifactDraft {
@@ -712,7 +907,13 @@ impl Api {
         // Registration is LOUD at write (REQ-DEP-07 AC2): self-reference,
         // duplicate, dangling or an intra-kind cycle (ratified OQ4) never
         // land — the store enforces, unchanged.
-        Ok(self.store.link_task_dependency(task.id, depends_on.id, req.kind, &self.actor, Utc::now())?)
+        Ok(self.store.link_task_dependency(
+            task.id,
+            depends_on.id,
+            req.kind,
+            &self.actor,
+            Utc::now(),
+        )?)
     }
 
     pub fn task_unlink(&self, req: DependReq) -> ApiResult<UnlinkResult> {
@@ -720,11 +921,25 @@ impl Api {
         let depends_on = self.store.resolve_task(&req.on)?;
         // RATIFIED DECISION OQ7: edges are IMMUTABLE — removal is a
         // SUPERSEDED marker; the row stays as history forever.
-        let edge = self.store.supersede_task_dependency(task.id, depends_on.id, req.kind, &self.actor, Utc::now())?;
-        Ok(UnlinkResult { edge, superseded_by: self.actor.clone() })
+        let edge = self.store.supersede_task_dependency(
+            task.id,
+            depends_on.id,
+            req.kind,
+            &self.actor,
+            Utc::now(),
+        )?;
+        Ok(UnlinkResult {
+            edge,
+            superseded_by: self.actor.clone(),
+        })
     }
 
-    pub fn task_override(&self, id: &str, blocker: Vec<String>, rationale: Option<String>) -> ApiResult<OverrideResult> {
+    pub fn task_override(
+        &self,
+        id: &str,
+        blocker: Vec<String>,
+        rationale: Option<String>,
+    ) -> ApiResult<OverrideResult> {
         // RATIFIED DECISION OQ2 — the human escape of the dependency gate.
         // `refs` = the FULL task ids covered, so a NEW blocker is never
         // covered by an old decision (the gate stands for anything not
@@ -740,7 +955,13 @@ impl Api {
             let deps = self.store.task_dependencies(task.id)?;
             blockers = workflow::open_blockers(&task, &deps);
             if blockers.is_empty() {
-                return Err(ApiError::refused("bad_request", format!("task {} has no open blocking dependencies — nothing to override", short_id(&task.id))));
+                return Err(ApiError::refused(
+                    "bad_request",
+                    format!(
+                        "task {} has no open blocking dependencies — nothing to override",
+                        short_id(&task.id)
+                    ),
+                ));
             }
         }
         self.store.record_decision(&Decision {
@@ -753,8 +974,16 @@ impl Api {
             refs: blockers.clone(),
             created_at: Utc::now(),
         })?;
-        self.store.insert_event(Some(task.id), event_kind::TASK_DEPENDENCY_OVERRIDDEN, &self.actor, serde_json::json!({ "blockers": blockers }))?;
-        Ok(OverrideResult { task, override_blockers: blockers })
+        self.store.insert_event(
+            Some(task.id),
+            event_kind::TASK_DEPENDENCY_OVERRIDDEN,
+            &self.actor,
+            serde_json::json!({ "blockers": blockers }),
+        )?;
+        Ok(OverrideResult {
+            task,
+            override_blockers: blockers,
+        })
     }
 
     pub fn task_merge_record(&self, req: MergeRecordReq) -> ApiResult<MergeResult> {
@@ -784,7 +1013,13 @@ impl Api {
                 "head_after": req.head_after,
             }),
         )?;
-        Ok(MergeResult { task_id: task.id, branch: req.branch, workspace: req.workspace, head_before: req.head_before, head_after: req.head_after })
+        Ok(MergeResult {
+            task_id: task.id,
+            branch: req.branch,
+            workspace: req.workspace,
+            head_before: req.head_before,
+            head_after: req.head_after,
+        })
     }
 
     /// The EMPTY-REWORK GATE escape (REQ-RG-03), human-only like the merge
@@ -792,7 +1027,11 @@ impl Api {
     /// decision, releases the gate's blocking question, and runs the
     /// withheld REWORK → QA transition through the same core command —
     // which now finds the ratification and cites its decision id (AC3).
-    pub fn task_ratify_empty_rework(&self, id: &str, rationale: Option<String>) -> ApiResult<RatifyResult> {
+    pub fn task_ratify_empty_rework(
+        &self,
+        id: &str,
+        rationale: Option<String>,
+    ) -> ApiResult<RatifyResult> {
         let task = self.store.resolve_task(id)?;
         match task.state {
             // The gate hold is WAITING_FOR_INPUT returning to REWORK. If
@@ -801,14 +1040,26 @@ impl Api {
             // — ratifying from REWORK converges here too.
             TaskState::WaitingForInput if task.return_state == Some(TaskState::Rework) => {}
             TaskState::Rework => {}
-            s => return Err(ApiError::refused("empty_rework_gate", format!(
-                "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
-                s.as_str()
-            ))),
+            s => {
+                return Err(ApiError::refused(
+                    "empty_rework_gate",
+                    format!(
+                        "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
+                        s.as_str()
+                    ),
+                ));
+            }
         }
         let arts = self.store.artifacts(task.id)?;
-        let Some(current) = arts.iter().filter(|a| a.kind == ArtifactKind::ImplementationReport).max_by_key(|a| a.seq) else {
-            return Err(ApiError::refused("empty_rework_gate", "the task has no implementation report — nothing to ratify"));
+        let Some(current) = arts
+            .iter()
+            .filter(|a| a.kind == ArtifactKind::ImplementationReport)
+            .max_by_key(|a| a.seq)
+        else {
+            return Err(ApiError::refused(
+                "empty_rework_gate",
+                "the task has no implementation report — nothing to ratify",
+            ));
         };
         let events = self.store.all_events_for_task(task.id)?;
         let current_id_s = current.id.to_string();
@@ -826,7 +1077,12 @@ impl Api {
             .get(json_field::PREV_REPORT)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ApiError::refused("corrupt", "the gate trip event names no previous report — history corruption"))?
+            .ok_or_else(|| {
+                ApiError::refused(
+                    "corrupt",
+                    "the gate trip event names no previous report — history corruption",
+                )
+            })?
             .to_string();
 
         // The ratification for exactly this pair, recorded once; a retry
@@ -834,7 +1090,11 @@ impl Api {
         let decisions = self.store.list_decisions(task.id)?;
         let existing = decisions
             .iter()
-            .find(|d| d.kind == decision_kind::REWORK_NOOP_RATIFIED && d.refs.iter().any(|r| r == &prev_report) && d.refs.iter().any(|r| r == &current_id_s))
+            .find(|d| {
+                d.kind == decision_kind::REWORK_NOOP_RATIFIED
+                    && d.refs.iter().any(|r| r == &prev_report)
+                    && d.refs.iter().any(|r| r == &current_id_s)
+            })
             .cloned();
         let (decision, recorded_now) = match existing {
             Some(d) => (d, false),
@@ -857,10 +1117,22 @@ impl Api {
         // Release the blocking gate question while the hold is still up.
         let mut cur = task.clone();
         if cur.state == TaskState::WaitingForInput {
-            let q_ref = trip.payload.get(json_field::QUESTION_ID).and_then(|v| v.as_str()).unwrap_or_default();
+            let q_ref = trip
+                .payload
+                .get(json_field::QUESTION_ID)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             let q = self.store.get_question(q_ref)?;
             if q.status == QuestionStatus::Open {
-                self.store.answer_question(q.id, &format!("operator ratified the empty rework (decision {})", decision.id), &self.actor, Utc::now())?;
+                self.store.answer_question(
+                    q.id,
+                    &format!(
+                        "operator ratified the empty rework (decision {})",
+                        decision.id
+                    ),
+                    &self.actor,
+                    Utc::now(),
+                )?;
             }
             let m = workflow::answer_question(&cur, q.id, &self.actor, Utc::now())?;
             self.store.commit(cur.lock_version, &m)?;
@@ -871,15 +1143,24 @@ impl Api {
         // point; with the stored ratification in the facts, the core
         // command admits REWORK → QA and puts `ratified_by` on the event.
         let arts = self.store.artifacts(cur.id)?;
-        let facts = devai_runtime::gate::collect_implementation_report_facts(&self.store, cur.id, current, &arts, Some(format!("empty rework ratified by decision {}", decision.id)))?;
+        let facts = devai_runtime::gate::collect_implementation_report_facts(
+            &self.store,
+            cur.id,
+            current,
+            &arts,
+            Some(format!("empty rework ratified by decision {}", decision.id)),
+        )?;
         let m = workflow::implementation_reported(&cur, &facts, &self.actor, Utc::now())?;
         if m.task.state != TaskState::Qa {
-            return Err(ApiError::refused("empty_rework_gate", format!(
-                "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
-                m.task.state.as_str(),
-                decision.id,
-                short_id(&cur.id)
-            )));
+            return Err(ApiError::refused(
+                "empty_rework_gate",
+                format!(
+                    "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
+                    m.task.state.as_str(),
+                    decision.id,
+                    short_id(&cur.id)
+                ),
+            ));
         }
         self.store.commit(cur.lock_version, &m)?;
         Ok(RatifyResult {
@@ -889,7 +1170,10 @@ impl Api {
             prev_report,
             current_report: current_id_s,
             state: m.task.state,
-            allowed_operations: workflow::allowed_ops(&m.task).into_iter().map(|s| s.to_string()).collect(),
+            allowed_operations: workflow::allowed_ops(&m.task)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
         })
     }
 
@@ -918,19 +1202,30 @@ impl Api {
         self.store.create_question(&q)?;
         let m = workflow::raise_question(&task, q.id, q.blocking, &self.actor, Utc::now())?;
         self.store.commit(task.lock_version, &m)?;
-        Ok(QuestionAsked { question: q, parked: req.blocking && m.task.state != task.state })
+        Ok(QuestionAsked {
+            question: q,
+            parked: req.blocking && m.task.state != task.state,
+        })
     }
 
     pub fn question_answer(&self, question_id: &str, text: &str) -> ApiResult<AnsweredOutcome> {
         let q = self.store.get_question(question_id)?;
         if q.status == QuestionStatus::Answered {
-            return Err(ApiError::refused("bad_request", format!("question {} is already answered", q.id)));
+            return Err(ApiError::refused(
+                "bad_request",
+                format!("question {} is already answered", q.id),
+            ));
         }
         let task = self.store.get_task(&q.task_id.to_string())?;
-        self.store.answer_question(q.id, text, &self.actor, Utc::now())?;
+        self.store
+            .answer_question(q.id, text, &self.actor, Utc::now())?;
         let m = workflow::answer_question(&task, q.id, &self.actor, Utc::now())?;
         self.store.commit(task.lock_version, &m)?;
-        Ok(AnsweredOutcome { question_id: q.id, from_state: task.state, to_state: m.task.state })
+        Ok(AnsweredOutcome {
+            question_id: q.id,
+            from_state: task.state,
+            to_state: m.task.state,
+        })
     }
 
     // ---- roles / agents / contracts ----------------------------------------
@@ -940,7 +1235,11 @@ impl Api {
     /// old CLI defaulting, now behind the API).
     pub fn role_add(&self, mut r: RoleDefinition) -> ApiResult<RoleDefinition> {
         if r.version == 0 {
-            r.version = self.store.get_role(&r.slug)?.map(|e| e.version + 1).unwrap_or(1);
+            r.version = self
+                .store
+                .get_role(&r.slug)?
+                .map(|e| e.version + 1)
+                .unwrap_or(1);
         }
         if r.id == Uuid::nil() {
             r.id = new_id();
@@ -951,14 +1250,25 @@ impl Api {
     }
 
     pub fn agent_add(&self, req: AgentAddReq) -> ApiResult<AgentInstance> {
-        let a = AgentInstance { id: new_id(), name: req.name.clone(), provider: req.provider, model: req.model, runtime: req.runtime, created_at: Utc::now() };
+        let a = AgentInstance {
+            id: new_id(),
+            name: req.name.clone(),
+            provider: req.provider,
+            model: req.model,
+            runtime: req.runtime,
+            created_at: Utc::now(),
+        };
         self.store.put_agent(&a)?;
         Ok(a)
     }
 
     pub fn contract_add(&self, req: ContractAddReq) -> ApiResult<ContractRegistration> {
-        self.store.put_contract(&req.name, req.version, &req.schema)?;
-        Ok(ContractRegistration { name: req.name, version: req.version })
+        self.store
+            .put_contract(&req.name, req.version, &req.schema)?;
+        Ok(ContractRegistration {
+            name: req.name,
+            version: req.version,
+        })
     }
 
     // ---- executions --------------------------------------------------------
@@ -1013,7 +1323,12 @@ impl Api {
     }
 
     pub fn exec_finish(&self, exec_id: &str, summary: Option<String>) -> ApiResult<RoleExecution> {
-        self.exec_close(exec_id, ExecutionStatus::Completed, summary.as_deref(), None)
+        self.exec_close(
+            exec_id,
+            ExecutionStatus::Completed,
+            summary.as_deref(),
+            None,
+        )
     }
 
     pub fn exec_fail(&self, exec_id: &str, error: &str) -> ApiResult<RoleExecution> {
@@ -1024,12 +1339,22 @@ impl Api {
         self.exec_close(exec_id, ExecutionStatus::Cancelled, None, None)
     }
 
-    fn exec_close(&self, exec_id: &str, status: ExecutionStatus, summary: Option<&str>, error: Option<&str>) -> ApiResult<RoleExecution> {
+    fn exec_close(
+        &self,
+        exec_id: &str,
+        status: ExecutionStatus,
+        summary: Option<&str>,
+        error: Option<&str>,
+    ) -> ApiResult<RoleExecution> {
         let e = self.store.get_execution(exec_id)?;
         if e.status != ExecutionStatus::Running {
-            return Err(ApiError::refused("execution_not_running", format!("execution {} is {}, not RUNNING", e.id, e.status.as_str())));
+            return Err(ApiError::refused(
+                "execution_not_running",
+                format!("execution {} is {}, not RUNNING", e.id, e.status.as_str()),
+            ));
         }
-        self.store.finish_execution(&e, status, summary, error, Utc::now())?;
+        self.store
+            .finish_execution(&e, status, summary, error, Utc::now())?;
         Ok(e)
     }
 
@@ -1072,22 +1397,43 @@ impl Api {
     /// CLI printed while this check lived there (parity, REQ-MUT-06); the
     /// machine token is `single_writer_busy`.
     fn guard_running_writer(&self, task: &Task) -> ApiResult<()> {
-        let blocker = self.store.list_executions(Some(task.id))?.into_iter().find(|e| e.status == ExecutionStatus::Running);
+        let blocker = self
+            .store
+            .list_executions(Some(task.id))?
+            .into_iter()
+            .find(|e| e.status == ExecutionStatus::Running);
         let Some(e) = blocker else { return Ok(()) };
         let owner = match (e.owner_pid, e.owner_host.as_deref()) {
             (Some(pid), Some(host)) => format!("pid {pid}@{host}"),
             (Some(pid), None) => format!("pid {pid} (host unrecorded)"),
             (None, _) => "owner unrecorded (row predates the v7 guard)".to_string(),
         };
-        let verdict = match liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start) {
-            liveness::Liveness::Alive => format!("a LIVE writer is in flight ({owner}) — wait for it to finish, or stop it explicitly"),
-            liveness::Liveness::Dead => format!("an ORPHAN ({owner} is no longer running) — nobody is collecting this writer's work"),
-            liveness::Liveness::Unknown => format!("a writer whose owner cannot be verified ({owner}) — never assumed dead"),
+        let verdict = match liveness::check_owner(
+            e.owner_pid,
+            e.owner_host.as_deref(),
+            e.owner_process_start,
+        ) {
+            liveness::Liveness::Alive => format!(
+                "a LIVE writer is in flight ({owner}) — wait for it to finish, or stop it explicitly"
+            ),
+            liveness::Liveness::Dead => format!(
+                "an ORPHAN ({owner} is no longer running) — nobody is collecting this writer's work"
+            ),
+            liveness::Liveness::Unknown => {
+                format!("a writer whose owner cannot be verified ({owner}) — never assumed dead")
+            }
         };
-        Err(ApiError::refused("single_writer_busy", format!(
-            "single-writer guard: task `{}` already has a RUNNING execution `{}` — {} ({}). The second writer is refused by design: no queueing, no overwrite. Resolve the open row first (a human decision, the process is not touched): `devai exec finish|fail|cancel {}`",
-            task.id, e.id, verdict, short_id(&e.id), e.id
-        )))
+        Err(ApiError::refused(
+            "single_writer_busy",
+            format!(
+                "single-writer guard: task `{}` already has a RUNNING execution `{}` — {} ({}). The second writer is refused by design: no queueing, no overwrite. Resolve the open row first (a human decision, the process is not touched): `devai exec finish|fail|cancel {}`",
+                task.id,
+                e.id,
+                verdict,
+                short_id(&e.id),
+                e.id
+            ),
+        ))
     }
 
     /// The §2.6 rendering of the CURRENT quality report, when one is
@@ -1100,7 +1446,10 @@ impl Api {
     pub fn quality_report_text(&self, task_id: Id) -> ApiResult<Option<String>> {
         let arts = self.store.artifacts(task_id)?;
         // REQ-005: status-only selection (single CURRENT pinned at v3).
-        let Some(a) = arts.iter().find(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current) else {
+        let Some(a) = arts
+            .iter()
+            .find(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
+        else {
             return Ok(None);
         };
         let blob = self.store.read_blob(&a.sha256)?;
@@ -1129,10 +1478,16 @@ mod tests {
     }
 
     fn fresh_task(api: &Api, title: &str) -> Id {
-        api.task_create(TaskCreateReq { title: title.into(), project_id: None, description: String::new(), parent: vec![], blocked_by: vec![] })
-            .expect("create")
-            .task
-            .id
+        api.task_create(TaskCreateReq {
+            title: title.into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![],
+            blocked_by: vec![],
+        })
+        .expect("create")
+        .task
+        .id
     }
 
     /// REQ-MUT-05 AC3: the named operation and the `task_op` dispatch run
@@ -1152,8 +1507,14 @@ mod tests {
         assert_eq!(via_dispatch.task.state, via_named.task.state);
         assert_eq!(via_dispatch.staled, via_named.staled);
         assert_eq!(via_dispatch.superseded, via_named.superseded);
-        assert_eq!(via_dispatch.allowed_operations, via_named.allowed_operations);
-        assert_eq!(via_named.event_kinds, vec![event_kind::WORKFLOW_STARTED.to_string()]);
+        assert_eq!(
+            via_dispatch.allowed_operations,
+            via_named.allowed_operations
+        );
+        assert_eq!(
+            via_named.event_kinds,
+            vec![event_kind::WORKFLOW_STARTED.to_string()]
+        );
     }
 
     /// Approve through the operation writes BOTH the transition and the
@@ -1171,14 +1532,27 @@ mod tests {
         // No spec yet → the guard refuses with the old text, no decision.
         let e = api.task_approve(&id, Some("early".into())).unwrap_err();
         assert_eq!(e.code(), ErrorCode("guard"));
-        assert!(format!("{e}").contains("no CURRENT REQUIREMENTS_SPEC artifact to approve"), "{e}");
+        assert!(
+            format!("{e}").contains("no CURRENT REQUIREMENTS_SPEC artifact to approve"),
+            "{e}"
+        );
         assert!(api.task_decisions(&id).unwrap().is_empty());
 
         // Publish the spec through the compound operation, review it in,
         // then approve: mutation + decision row land together.
         let content = br#"{"requirements": "ok"}"#.to_vec();
-        api.artifact_publish(PublishReq { id: id.clone(), kind: ArtifactKind::RequirementsSpec, name: "spec.json".into(), content, depends: vec![], contract: None, execution: None, category: DataCategory::Artifact, verdict: None })
-            .expect("publish spec");
+        api.artifact_publish(PublishReq {
+            id: id.clone(),
+            kind: ArtifactKind::RequirementsSpec,
+            name: "spec.json".into(),
+            content,
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .expect("publish spec");
         api.task_review(&id, Verdict::Approved, None).unwrap();
         let o = api.task_approve(&id, Some("ratified".into())).unwrap();
         assert_eq!(o.mutation.task.state, TaskState::Implementation);
@@ -1186,7 +1560,11 @@ mod tests {
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].kind, decision_kind::REQUIREMENTS_APPROVAL);
         assert_eq!(ds[0].rationale.as_deref(), Some("ratified"));
-        assert_eq!(ds[0].refs.len(), 1, "the decision refs bind the CURRENT spec id");
+        assert_eq!(
+            ds[0].refs.len(),
+            1,
+            "the decision refs bind the CURRENT spec id"
+        );
     }
 
     /// The compound `artifact_publish` and the phased
@@ -1206,25 +1584,57 @@ mod tests {
         let content = |x: &str| x.as_bytes().to_vec();
 
         let compound = api
-            .artifact_publish(PublishReq { id: a.to_string(), kind: ArtifactKind::RequirementsSpec, name: "s1".into(), content: content("s1"), depends: vec![], contract: None, execution: None, category: DataCategory::Artifact, verdict: None })
+            .artifact_publish(PublishReq {
+                id: a.to_string(),
+                kind: ArtifactKind::RequirementsSpec,
+                name: "s1".into(),
+                content: content("s1"),
+                depends: vec![],
+                contract: None,
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
             .unwrap();
         let row = api
-            .artifact_publish_row(PublishReq { id: b.to_string(), kind: ArtifactKind::RequirementsSpec, name: "s2".into(), content: content("s2"), depends: vec![], contract: None, execution: None, category: DataCategory::Artifact, verdict: None })
+            .artifact_publish_row(PublishReq {
+                id: b.to_string(),
+                kind: ArtifactKind::RequirementsSpec,
+                name: "s2".into(),
+                content: content("s2"),
+                depends: vec![],
+                contract: None,
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
             .unwrap();
         let adv = api
-            .artifact_advance(AdvanceReq { id: b.to_string(), artifact_id: row.artifact.id.to_string(), kind: ArtifactKind::RequirementsSpec, verdict: None })
+            .artifact_advance(AdvanceReq {
+                id: b.to_string(),
+                artifact_id: row.artifact.id.to_string(),
+                kind: ArtifactKind::RequirementsSpec,
+                verdict: None,
+            })
             .unwrap();
 
         assert_eq!(compound.publish.artifact.kind, row.artifact.kind);
         assert_eq!(compound.publish.artifact.seq, row.artifact.seq);
-        assert_eq!(compound.publish.task.state, TaskState::Analysis, "compound advance ran too: the task moved");
+        assert_eq!(
+            compound.publish.task.state,
+            TaskState::Analysis,
+            "compound advance ran too: the task moved"
+        );
         // Both paths converge on the same transition facts.
         let after_compound = api.task_get(&a.to_string()).unwrap();
         assert_eq!(after_compound.state, TaskState::Review);
         assert_eq!(after_compound.requirements_seq, 1);
         let after_phased = api.task_get(&b.to_string()).unwrap();
         assert_eq!(after_phased.state, after_compound.state);
-        assert_eq!(after_phased.requirements_seq, after_compound.requirements_seq);
+        assert_eq!(
+            after_phased.requirements_seq,
+            after_compound.requirements_seq
+        );
         assert_eq!(adv.from, TaskState::Analysis);
         assert_eq!(adv.to, TaskState::Review);
     }
@@ -1238,15 +1648,40 @@ mod tests {
         let t = fresh_task(&api, "writer");
         let id = t.to_string();
         api.task_start(&id).unwrap();
-        api.exec_start(ExecStartReq { id: id.clone(), role: "analyst".into(), agent: None, inputs: vec![] }).unwrap();
+        api.exec_start(ExecStartReq {
+            id: id.clone(),
+            role: "analyst".into(),
+            agent: None,
+            inputs: vec![],
+        })
+        .unwrap();
 
-        let e = api.exec_start(ExecStartReq { id: id.clone(), role: "analyst".into(), agent: None, inputs: vec![] }).unwrap_err();
+        let e = api
+            .exec_start(ExecStartReq {
+                id: id.clone(),
+                role: "analyst".into(),
+                agent: None,
+                inputs: vec![],
+            })
+            .unwrap_err();
         assert_eq!(e.code(), ErrorCode("single_writer_busy"));
         let text = format!("{e}");
-        assert!(text.starts_with(&format!("single-writer guard: task `{t}` already has a RUNNING execution")), "{text}");
+        assert!(
+            text.starts_with(&format!(
+                "single-writer guard: task `{t}` already has a RUNNING execution"
+            )),
+            "{text}"
+        );
         assert!(text.contains("`devai exec finish|fail|cancel "), "{text}");
         // Only one RUNNING row exists — the refusal wrote nothing.
-        assert_eq!(api.exec_list(Some(&id)).unwrap().iter().filter(|x| x.status == ExecutionStatus::Running).count(), 1);
+        assert_eq!(
+            api.exec_list(Some(&id))
+                .unwrap()
+                .iter()
+                .filter(|x| x.status == ExecutionStatus::Running)
+                .count(),
+            1
+        );
     }
 
     /// QA R5: the standalone advance of a NON-advancing kind refuses
@@ -1260,15 +1695,41 @@ mod tests {
         let t = fresh_task(&api, "advance-refuse");
         api.task_start(&t.to_string()).unwrap();
         let row = api
-            .artifact_publish_row(PublishReq { id: t.to_string(), kind: ArtifactKind::TestReport, name: "tests".into(), content: b"ok".to_vec(), depends: vec![], contract: None, execution: None, category: DataCategory::Artifact, verdict: None })
+            .artifact_publish_row(PublishReq {
+                id: t.to_string(),
+                kind: ArtifactKind::TestReport,
+                name: "tests".into(),
+                content: b"ok".to_vec(),
+                depends: vec![],
+                contract: None,
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
             .unwrap();
-        let e = api.artifact_advance(AdvanceReq { id: t.to_string(), artifact_id: row.artifact.id.to_string(), kind: ArtifactKind::TestReport, verdict: None }).unwrap_err();
+        let e = api
+            .artifact_advance(AdvanceReq {
+                id: t.to_string(),
+                artifact_id: row.artifact.id.to_string(),
+                kind: ArtifactKind::TestReport,
+                verdict: None,
+            })
+            .unwrap_err();
         assert_eq!(e.code(), ErrorCode("artifact_kind_not_advancing"));
         let text = format!("{e}");
-        assert!(text.contains("TEST_REPORT carries no workflow advance"), "{text}");
-        assert!(text.contains("REQUIREMENTS_SPEC, REVIEW_REPORT, IMPLEMENTATION_REPORT"), "advancing set derived from the core predicate: {text}");
+        assert!(
+            text.contains("TEST_REPORT carries no workflow advance"),
+            "{text}"
+        );
+        assert!(
+            text.contains("REQUIREMENTS_SPEC, REVIEW_REPORT, IMPLEMENTATION_REPORT"),
+            "advancing set derived from the core predicate: {text}"
+        );
         // The refusal wrote nothing: the task is where the row phase left it.
-        assert_eq!(api.task_get(&t.to_string()).unwrap().state, TaskState::Analysis);
+        assert_eq!(
+            api.task_get(&t.to_string()).unwrap().state,
+            TaskState::Analysis
+        );
     }
 
     /// QA R2: `quality_report_text` distinguishes «no report» (Ok(None))
@@ -1279,16 +1740,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let api = api(dir.path());
         let t = fresh_task(&api, "gate-text");
-        assert_eq!(api.quality_report_text(t).unwrap(), None, "no report yet — honest absence");
+        assert_eq!(
+            api.quality_report_text(t).unwrap(),
+            None,
+            "no report yet — honest absence"
+        );
 
         let row = api
-            .artifact_publish_row(PublishReq { id: t.to_string(), kind: ArtifactKind::QualityReport, name: "qr".into(), content: br#"{"report_text":"all good"}"#.to_vec(), depends: vec![], contract: None, execution: None, category: DataCategory::Artifact, verdict: None })
+            .artifact_publish_row(PublishReq {
+                id: t.to_string(),
+                kind: ArtifactKind::QualityReport,
+                name: "qr".into(),
+                content: br#"{"report_text":"all good"}"#.to_vec(),
+                depends: vec![],
+                contract: None,
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
             .unwrap();
-        assert_eq!(api.quality_report_text(t).unwrap().as_deref(), Some("all good"));
+        assert_eq!(
+            api.quality_report_text(t).unwrap().as_deref(),
+            Some("all good")
+        );
 
         // Corrupt the stored blob under the CURRENT row: the next read must
         // fail loudly, not fall through to None.
-        std::fs::write(api.store.blob_path(&row.artifact.sha256), b"not-json-at-all").unwrap();
+        std::fs::write(
+            api.store.blob_path(&row.artifact.sha256),
+            b"not-json-at-all",
+        )
+        .unwrap();
         let e = api.quality_report_text(t).unwrap_err();
         assert_eq!(e.code(), ErrorCode("corrupt"));
         assert!(format!("{e}").contains("does not parse as JSON"), "{e}");
@@ -1301,9 +1783,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("fresh-home");
         let api = api(&home);
-        assert!(home.join("devai.db").exists(), "opening through the API creates the store");
+        assert!(
+            home.join("devai.db").exists(),
+            "opening through the API creates the store"
+        );
         let seeded = api.seed_config(None).unwrap();
         assert!(seeded > 0);
-        assert!(!api.role_list().unwrap().is_empty(), "seeded roles are visible through the read plane");
+        assert!(
+            !api.role_list().unwrap().is_empty(),
+            "seeded roles are visible through the read plane"
+        );
     }
 }

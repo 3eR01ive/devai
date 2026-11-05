@@ -32,7 +32,9 @@ fn opt_ts(s: Option<String>) -> StoreResult<Option<Timestamp>> {
 
 fn get<'a, T: rusqlite::types::FromSql>(r: &'a Row, i: usize) -> StoreResult<T> {
     r.get::<usize, T>(i).map_err(|e| match e {
-        rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::InvalidQuery => StoreError::Corrupt(format!("column {i}: {e}")),
+        rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::InvalidQuery => {
+            StoreError::Corrupt(format!("column {i}: {e}"))
+        }
         other => StoreError::Sql(other),
     })
 }
@@ -61,11 +63,19 @@ fn arr<T: DeserializeOwned>(s: Option<String>) -> StoreResult<Vec<T>> {
     json_array(s.as_deref()).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
-pub fn enum_col<T: Copy>(ty: &'static str, s: String, f: impl Fn(&str) -> Result<T, devai_core::error::CoreError>) -> StoreResult<T> {
+pub fn enum_col<T: Copy>(
+    ty: &'static str,
+    s: String,
+    f: impl Fn(&str) -> Result<T, devai_core::error::CoreError>,
+) -> StoreResult<T> {
     f(&s).map_err(|_| StoreError::Corrupt(format!("bad {ty} variant `{s}`")))
 }
 
-fn opt_enum<T: Copy>(s: Option<String>, ty: &'static str, f: impl Fn(&str) -> Result<T, devai_core::error::CoreError>) -> StoreResult<Option<T>> {
+fn opt_enum<T: Copy>(
+    s: Option<String>,
+    ty: &'static str,
+    f: impl Fn(&str) -> Result<T, devai_core::error::CoreError>,
+) -> StoreResult<Option<T>> {
     s.map(|v| enum_col(ty, v, &f)).transpose()
 }
 
@@ -154,7 +164,10 @@ pub fn artifact_from_row(r: &Row) -> StoreResult<Artifact> {
         size: get::<i64>(r, 8)? as u64,
         media_type: get(r, 9)?,
         contract: match (contract, version) {
-            (Some(name), Some(v)) => Some(ContractRef { name, version: v as u32 }),
+            (Some(name), Some(v)) => Some(ContractRef {
+                name,
+                version: v as u32,
+            }),
             _ => None,
         },
         created_by: get(r, 12)?,
@@ -180,7 +193,9 @@ pub fn role_from_row(r: &Row) -> StoreResult<RoleDefinition> {
     let c = |s: Option<String>| -> StoreResult<Option<ContractRef>> {
         match s.as_deref() {
             None | Some("") => Ok(None),
-            Some(v) => ContractRef::parse(v).map(Some).map_err(|e| StoreError::Corrupt(e.to_string())),
+            Some(v) => ContractRef::parse(v)
+                .map(Some)
+                .map_err(|e| StoreError::Corrupt(e.to_string())),
         }
     };
     Ok(RoleDefinition {
@@ -226,7 +241,10 @@ pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
         // Pre-v2 rows carry NULL: the revision is absent, never guessed.
         workspace_revision: revision
             .as_deref()
-            .map(|s| serde_json::from_str::<WorkspaceRevision>(s).map_err(|e| StoreError::Corrupt(format!("bad workspace_revision: {e}"))))
+            .map(|s| {
+                serde_json::from_str::<WorkspaceRevision>(s)
+                    .map_err(|e| StoreError::Corrupt(format!("bad workspace_revision: {e}")))
+            })
             .transpose()?,
         // Pre-v5 rows read as their single attempt (DEFAULT 1) with no loop
         // lineage and no recorded failure class — never guessed (REQ-FG-01).

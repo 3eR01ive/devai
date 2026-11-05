@@ -12,7 +12,11 @@ pub enum StoreError {
     NotFound(String, String),
 
     #[error("concurrent modification of {what}: expected version {expected}, found {found}")]
-    Conflict { what: String, expected: u64, found: u64 },
+    Conflict {
+        what: String,
+        expected: u64,
+        found: u64,
+    },
 
     #[error("ambiguous identifier: {0}")]
     Ambiguous(String),
@@ -37,7 +41,13 @@ pub enum StoreError {
          (started {started_at}, owner pid={owner_pid:?} host={owner_host:?}) — one writer per task, \
          no queueing and no overwrite; resolve it first: `devai exec finish|fail|cancel {existing_id}`"
     )]
-    SingleWriterBusy { task_id: String, existing_id: String, started_at: String, owner_pid: Option<i64>, owner_host: Option<String> },
+    SingleWriterBusy {
+        task_id: String,
+        existing_id: String,
+        started_at: String,
+        owner_pid: Option<i64>,
+        owner_host: Option<String>,
+    },
 
     #[error("database schema version {found}, but this build expects {expected}")]
     SchemaVersion { found: i64, expected: i64 },
@@ -51,7 +61,13 @@ pub enum StoreError {
          `{seq}` as CURRENT too — re-export the task from a migrated (v3) store instead of \
          importing a pre-v3 bundle whose multi-CURRENT defect would silently drop a row"
     )]
-    SingleCurrentCollision { task_id: String, kind: String, seq: u32, existing_id: String, existing_seq: u32 },
+    SingleCurrentCollision {
+        task_id: String,
+        kind: String,
+        seq: u32,
+        existing_id: String,
+        existing_seq: u32,
+    },
 
     #[error("config error: {0}")]
     Config(String),

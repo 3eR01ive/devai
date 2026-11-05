@@ -10,7 +10,8 @@
 use std::collections::BTreeSet;
 
 fn types_src() -> String {
-    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types.rs")).expect("types.rs is readable from the test crate")
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types.rs"))
+        .expect("types.rs is readable from the test crate")
 }
 
 /// The full text of one `pub mod <name> { ... }` block, brace-matched. The
@@ -18,7 +19,9 @@ fn types_src() -> String {
 /// plain depth scan over the source is exact here.
 fn module_block(src: &str, module: &str) -> String {
     let header = format!("pub mod {module} {{");
-    let start = src.find(&header).unwrap_or_else(|| panic!("module `{module}` not found in types.rs"));
+    let start = src
+        .find(&header)
+        .unwrap_or_else(|| panic!("module `{module}` not found in types.rs"));
     let body = &src[start..];
     let mut depth = 0usize;
     for (idx, ch) in body.char_indices() {
@@ -57,7 +60,9 @@ fn parse_vocab(block: &str) -> (BTreeSet<String>, BTreeSet<String>) {
             // digits (`SHA256`), starts with a letter.
             if !name.is_empty()
                 && name.as_bytes()[0].is_ascii_uppercase()
-                && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
             {
                 all_members.insert(name.to_string());
             }

@@ -101,7 +101,9 @@ impl AdapterError {
     pub fn failure_class(&self) -> &'static str {
         match self {
             AdapterError::BadOutput { .. } => devai_core::types::failure_class::RESPONSE_FORM,
-            AdapterError::Agent(_) | AdapterError::Io(_) | AdapterError::UnknownProvider(_) => devai_core::types::failure_class::PROVIDER,
+            AdapterError::Agent(_) | AdapterError::Io(_) | AdapterError::UnknownProvider(_) => {
+                devai_core::types::failure_class::PROVIDER
+            }
             AdapterError::Platform(_) => devai_core::types::failure_class::PLATFORM,
         }
     }
@@ -138,7 +140,10 @@ pub enum RunOutcome {
     Output(ExecOutput),
     /// Every allowed attempt was rejected on FORM; `violations` is the last
     /// attempt's FULL list — what the escalation question carries (OQ-FG-08).
-    FormExhausted { attempts: u32, violations: Vec<String> },
+    FormExhausted {
+        attempts: u32,
+        violations: Vec<String>,
+    },
     /// A non-form failure; its row was closed by the host. No attempt
     /// budget was consumed beyond the failing call (REQ-FG-03).
     Failed(AdapterError),
@@ -173,20 +178,31 @@ impl AgentRuntime {
     /// (REQ-FG-04 AC2). A non-form error aborts immediately (REQ-FG-03).
     /// The loop publishes nothing: rejected bodies never become artifacts
     /// (REQ-FG-07 AC2).
-    pub fn run_with_form_loop(req: &ExecRequest, max_repair_attempts: u32, host: &mut dyn FormLoopHost) -> RunOutcome {
+    pub fn run_with_form_loop(
+        req: &ExecRequest,
+        max_repair_attempts: u32,
+        host: &mut dyn FormLoopHost,
+    ) -> RunOutcome {
         let total = 1 + max_repair_attempts;
         let mut req = req.clone();
         let mut violations: Vec<String> = Vec::new();
         for attempt in 1..=total {
             host.attempt_started(attempt);
-            req.repair = if attempt == 1 { None } else { Some((attempt, violations.clone())) };
+            req.repair = if attempt == 1 {
+                None
+            } else {
+                Some((attempt, violations.clone()))
+            };
             match Self::run(&req) {
                 Ok(out) => return RunOutcome::Output(out),
                 Err(AdapterError::BadOutput { violations: v }) => {
                     host.attempt_rejected(attempt, &v);
                     violations = v;
                     if attempt == total {
-                        return RunOutcome::FormExhausted { attempts: attempt, violations };
+                        return RunOutcome::FormExhausted {
+                            attempts: attempt,
+                            violations,
+                        };
                     }
                 }
                 Err(e) => {
@@ -205,8 +221,18 @@ impl AgentRuntime {
 
     fn claude(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
         let system = build_system_prompt(&req.role);
-        let contract = req.role.output_contract.as_ref().map(|c| (c.name.as_str(), c.version));
-        let mut user = build_user_prompt(&req.title, &req.business, &req.inputs, contract, req.contract_schema.as_deref());
+        let contract = req
+            .role
+            .output_contract
+            .as_ref()
+            .map(|c| (c.name.as_str(), c.version));
+        let mut user = build_user_prompt(
+            &req.title,
+            &req.business,
+            &req.inputs,
+            contract,
+            req.contract_schema.as_deref(),
+        );
         // Attempt N+1 of the form loop: original context (kept above by the
         // unchanged request fields) PLUS the full violation list of attempt
         // N-1... as data (REQ-FG-02 AC2). The sessionless process can only
@@ -247,12 +273,24 @@ impl AgentRuntime {
         let out = cmd.output()?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            return Err(AdapterError::Agent(format!("`claude` exited with {}: {}", out.status, err.trim())));
+            return Err(AdapterError::Agent(format!(
+                "`claude` exited with {}: {}",
+                out.status,
+                err.trim()
+            )));
         }
-        let envelope: Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| AdapterError::Agent(format!("cannot parse `claude` json envelope: {e}")))?;
-        if envelope.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let msg = envelope.get("result").and_then(|v| v.as_str()).unwrap_or("unknown agent error");
+        let envelope: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+            AdapterError::Agent(format!("cannot parse `claude` json envelope: {e}"))
+        })?;
+        if envelope
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let msg = envelope
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown agent error");
             return Err(AdapterError::Agent(msg.to_string()));
         }
         let text = envelope
@@ -264,12 +302,17 @@ impl AgentRuntime {
         // failure above — so the loop can repair it. Left as an Agent-class
         // error, 'agent reply contains no JSON object' would keep eating the
         // full role re-run, which is exactly this task's incident.
-        let json = extract_json_object(text)
-            .ok_or_else(|| AdapterError::BadOutput { violations: vec!["agent reply contains no JSON object".into()] })?;
-        let parsed: Value = serde_json::from_str(&json)
-            .map_err(|e| AdapterError::BadOutput { violations: vec![format!("extracted object is not valid JSON: {e}")] })?;
+        let json = extract_json_object(text).ok_or_else(|| AdapterError::BadOutput {
+            violations: vec!["agent reply contains no JSON object".into()],
+        })?;
+        let parsed: Value = serde_json::from_str(&json).map_err(|e| AdapterError::BadOutput {
+            violations: vec![format!("extracted object is not valid JSON: {e}")],
+        })?;
         validate_against_contract(&json, req.contract_schema.as_deref())?;
-        Ok(ExecOutput { content: json.into_bytes(), summary: summarize(contract.map(|c| c.0), &parsed) })
+        Ok(ExecOutput {
+            content: json.into_bytes(),
+            summary: summarize(contract.map(|c| c.0), &parsed),
+        })
     }
 
     // -----------------------------------------------------------------
@@ -314,7 +357,11 @@ impl AgentRuntime {
         let out = cmd.output()?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            return Err(AdapterError::Agent(format!("`hermes` exited with {}: {}", out.status, err.trim())));
+            return Err(AdapterError::Agent(format!(
+                "`hermes` exited with {}: {}",
+                out.status,
+                err.trim()
+            )));
         }
         Self::hermes_text_to_output(req, &String::from_utf8_lossy(&out.stdout))
     }
@@ -325,13 +372,18 @@ impl AgentRuntime {
     fn hermes_text_to_output(req: &ExecRequest, text: &str) -> Result<ExecOutput, AdapterError> {
         // OQ-FG-02 (ratified) applies unchanged: unextractable text IS the
         // form class — the same repairable rejection as on claude.
-        let json = extract_json_object(text)
-            .ok_or_else(|| AdapterError::BadOutput { violations: vec!["agent reply contains no JSON object".into()] })?;
-        let parsed: Value = serde_json::from_str(&json)
-            .map_err(|e| AdapterError::BadOutput { violations: vec![format!("extracted object is not valid JSON: {e}")] })?;
+        let json = extract_json_object(text).ok_or_else(|| AdapterError::BadOutput {
+            violations: vec!["agent reply contains no JSON object".into()],
+        })?;
+        let parsed: Value = serde_json::from_str(&json).map_err(|e| AdapterError::BadOutput {
+            violations: vec![format!("extracted object is not valid JSON: {e}")],
+        })?;
         validate_against_contract(&json, req.contract_schema.as_deref())?;
         let contract = req.role.output_contract.as_ref().map(|c| c.name.as_str());
-        Ok(ExecOutput { content: json.into_bytes(), summary: summarize(contract, &parsed) })
+        Ok(ExecOutput {
+            content: json.into_bytes(),
+            summary: summarize(contract, &parsed),
+        })
     }
 
     // -----------------------------------------------------------------
@@ -346,8 +398,18 @@ impl AgentRuntime {
     /// one-shot can only fix its form from what this text carries).
     fn hermes_prompt(req: &ExecRequest) -> String {
         let system = build_system_prompt(&req.role);
-        let contract = req.role.output_contract.as_ref().map(|c| (c.name.as_str(), c.version));
-        let mut user = build_user_prompt(&req.title, &req.business, &req.inputs, contract, req.contract_schema.as_deref());
+        let contract = req
+            .role
+            .output_contract
+            .as_ref()
+            .map(|c| (c.name.as_str(), c.version));
+        let mut user = build_user_prompt(
+            &req.title,
+            &req.business,
+            &req.inputs,
+            contract,
+            req.contract_schema.as_deref(),
+        );
         if let Some((attempt, violations)) = &req.repair {
             user.push_str(&form_repair_section(*attempt, violations));
         }
@@ -388,7 +450,6 @@ impl AgentRuntime {
         }
         Ok(argv)
     }
-
 }
 
 /// File name of the collected usage report inside the evidence dir (R5).
@@ -495,7 +556,12 @@ impl AgentRuntime {
     // -----------------------------------------------------------------
 
     fn mock(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
-        let name = req.role.output_contract.as_ref().map(|c| c.name.as_str()).unwrap_or("other");
+        let name = req
+            .role
+            .output_contract
+            .as_ref()
+            .map(|c| c.name.as_str())
+            .unwrap_or("other");
         let json: Value = match name {
             "requirements-specification" => serde_json::json!({
                 "task_id": req.task_id.to_string(),
@@ -546,12 +612,21 @@ impl AgentRuntime {
             }),
             _ => serde_json::json!({ "mock": true, "role": req.role.slug }),
         };
-        let text = serde_json::to_vec_pretty(&json).map_err(|e| AdapterError::Agent(e.to_string()))?;
-        validate_against_contract(&String::from_utf8_lossy(&text), req.contract_schema.as_deref())
-            // Seed/schema drift is a PLATFORM bug, not the fixture role's
-            // form error — it must not burn loop re-prompts (REQ-FG-03).
-            .map_err(|e| AdapterError::Platform(format!("mock output invalid (seed/schema drift): {e}")))?;
-        Ok(ExecOutput { content: text, summary: summarize(Some(name), &json) })
+        let text =
+            serde_json::to_vec_pretty(&json).map_err(|e| AdapterError::Agent(e.to_string()))?;
+        validate_against_contract(
+            &String::from_utf8_lossy(&text),
+            req.contract_schema.as_deref(),
+        )
+        // Seed/schema drift is a PLATFORM bug, not the fixture role's
+        // form error — it must not burn loop re-prompts (REQ-FG-03).
+        .map_err(|e| {
+            AdapterError::Platform(format!("mock output invalid (seed/schema drift): {e}"))
+        })?;
+        Ok(ExecOutput {
+            content: text,
+            summary: summarize(Some(name), &json),
+        })
     }
 
     /// Protocol fixture: first answer violates the stored contract, every
@@ -575,17 +650,31 @@ impl AgentRuntime {
             return Self::mock(req);
         }
         let out = Self::mock(req)?;
-        let mut body: Value = serde_json::from_slice(&out.content).map_err(|e| AdapterError::Agent(e.to_string()))?;
-        let obj = body.as_object_mut().ok_or_else(|| AdapterError::Agent("mock spec reply is not an object".to_string()))?;
+        let mut body: Value =
+            serde_json::from_slice(&out.content).map_err(|e| AdapterError::Agent(e.to_string()))?;
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| AdapterError::Agent("mock spec reply is not an object".to_string()))?;
         obj.remove("task_id");
         obj.remove("business_description");
-        let text = serde_json::to_vec_pretty(&body).map_err(|e| AdapterError::Agent(e.to_string()))?;
+        let text =
+            serde_json::to_vec_pretty(&body).map_err(|e| AdapterError::Agent(e.to_string()))?;
         // LEGAL under @2 precisely because the echo fields are optional and
         // declared (OQ-FG-03/07) — a schema regression would fail this here,
         // loudly, not silently at the stamp.
-        validate_against_contract(&String::from_utf8_lossy(&text), req.contract_schema.as_deref())
-            .map_err(|e| AdapterError::Platform(format!("no-echo fixture invalid under the stored schema: {e}")))?;
-        Ok(ExecOutput { content: text, summary: out.summary })
+        validate_against_contract(
+            &String::from_utf8_lossy(&text),
+            req.contract_schema.as_deref(),
+        )
+        .map_err(|e| {
+            AdapterError::Platform(format!(
+                "no-echo fixture invalid under the stored schema: {e}"
+            ))
+        })?;
+        Ok(ExecOutput {
+            content: text,
+            summary: out.summary,
+        })
     }
 
     /// Protocol fixture: violates the stored contract on EVERY attempt,
@@ -596,11 +685,17 @@ impl AgentRuntime {
         // one required key. Violations come from the SAME gate as real
         // replies — never a hand-written error here.
         let json = serde_json::json!({ "mock": "form-broken", "requirements": [] });
-        let text = serde_json::to_vec_pretty(&json).map_err(|e| AdapterError::Agent(e.to_string()))?;
-        validate_against_contract(&String::from_utf8_lossy(&text), req.contract_schema.as_deref())?;
+        let text =
+            serde_json::to_vec_pretty(&json).map_err(|e| AdapterError::Agent(e.to_string()))?;
+        validate_against_contract(
+            &String::from_utf8_lossy(&text),
+            req.contract_schema.as_deref(),
+        )?;
         // Valid under no stored reply contract (no required keys satisfied);
         // if a test passes no schema at all, manufacture the form failure.
-        Err(AdapterError::BadOutput { violations: vec!["mock-form-broken: no contract to fail".into()] })
+        Err(AdapterError::BadOutput {
+            violations: vec!["mock-form-broken: no contract to fail".into()],
+        })
     }
 }
 
@@ -636,7 +731,9 @@ fn claude_tools_for(role: &RoleDefinition) -> Vec<String> {
         match cap.as_str() {
             "filesystem:read" => out.extend(["Read", "Grep", "Glob"].iter().map(|s| s.to_string())),
             "filesystem:read-write" => out.extend(
-                ["Read", "Grep", "Glob", "Edit", "Write"].iter().map(|s| s.to_string()),
+                ["Read", "Grep", "Glob", "Edit", "Write"]
+                    .iter()
+                    .map(|s| s.to_string()),
             ),
             "git" => out.extend(
                 ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)"]
@@ -684,12 +781,21 @@ pub fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<
 /// can neither see nor fix (REQ-FG-03 AC2: never replayed to the role).
 /// A reply that is not parseable JSON, or is JSON but not an object, is
 /// FORM-class (ratified OQ-FG-02) and therefore arrives as a violation list.
-pub fn contract_violations(content: &str, schema: Option<&str>) -> Result<Vec<String>, AdapterError> {
-    let Some(schema) = schema else { return Ok(Vec::new()); };
-    let value: Value = serde_json::from_str(content)
-        .map_err(|e| AdapterError::BadOutput { violations: vec![format!("$: output is not valid JSON: {e}")] })?;
+pub fn contract_violations(
+    content: &str,
+    schema: Option<&str>,
+) -> Result<Vec<String>, AdapterError> {
+    let Some(schema) = schema else {
+        return Ok(Vec::new());
+    };
+    let value: Value = serde_json::from_str(content).map_err(|e| AdapterError::BadOutput {
+        violations: vec![format!("$: output is not valid JSON: {e}")],
+    })?;
     if !value.is_object() {
-        return Ok(vec![format!("$: output must be a JSON object, got {}", json_kind(&value))]);
+        return Ok(vec![format!(
+            "$: output must be a JSON object, got {}",
+            json_kind(&value)
+        )]);
     }
     let schema_v: Value = serde_json::from_str(schema)
         .map_err(|e| AdapterError::Platform(format!("stored contract schema is broken: {e}")))?;
@@ -708,8 +814,16 @@ fn schema_types(schema: &Value) -> Vec<&str> {
     }
 }
 
-fn validate_node(schema: &Value, value: &Value, path: &str, required: bool, errs: &mut Vec<String>) {
-    let Some(obj) = schema.as_object() else { return; };
+fn validate_node(
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    required: bool,
+    errs: &mut Vec<String>,
+) {
+    let Some(obj) = schema.as_object() else {
+        return;
+    };
     let types = schema_types(schema);
     if types.is_empty() {
         return;
@@ -722,7 +836,11 @@ fn validate_node(schema: &Value, value: &Value, path: &str, required: bool, errs
             return;
         }
     }
-    let s = types.iter().copied().find(|t| *t != "null").unwrap_or("null");
+    let s = types
+        .iter()
+        .copied()
+        .find(|t| *t != "null")
+        .unwrap_or("null");
     match s {
         "object" => {
             let Some(map) = value.as_object() else {
@@ -744,7 +862,13 @@ fn validate_node(schema: &Value, value: &Value, path: &str, required: bool, errs
                     if let Some(sub) = props.get(k) {
                         // The child's required-ness decides its null policy:
                         // REQUIRED + null keeps failing the type check below.
-                        validate_node(sub, v, &format!("{path}.{k}"), req_keys.iter().any(|r| r == k), errs);
+                        validate_node(
+                            sub,
+                            v,
+                            &format!("{path}.{k}"),
+                            req_keys.iter().any(|r| r == k),
+                            errs,
+                        );
                     }
                 }
             }
@@ -756,7 +880,10 @@ fn validate_node(schema: &Value, value: &Value, path: &str, required: bool, errs
             };
             if let Some(min) = obj.get("minItems").and_then(|m| m.as_u64()) {
                 if (items.len() as u64) < min {
-                    errs.push(format!("{path}: array has {} item(s), minimum {min}", items.len()));
+                    errs.push(format!(
+                        "{path}: array has {} item(s), minimum {min}",
+                        items.len()
+                    ));
                 }
             }
             if let Some(sub) = obj.get("items") {
@@ -780,7 +907,10 @@ fn validate_node(schema: &Value, value: &Value, path: &str, required: bool, errs
         }
         "integer" => {
             if value.as_i64().is_none() {
-                errs.push(format!("{path}: expected integer, got {}", json_kind(value)));
+                errs.push(format!(
+                    "{path}: expected integer, got {}",
+                    json_kind(value)
+                ));
             }
         }
         "number" => {
@@ -790,7 +920,10 @@ fn validate_node(schema: &Value, value: &Value, path: &str, required: bool, errs
         }
         "boolean" => {
             if value.as_bool().is_none() {
-                errs.push(format!("{path}: expected boolean, got {}", json_kind(value)));
+                errs.push(format!(
+                    "{path}: expected boolean, got {}",
+                    json_kind(value)
+                ));
             }
         }
         _ => {}
@@ -813,11 +946,23 @@ fn summarize(name: Option<&str>, json: &Value) -> Option<String> {
     match name.unwrap_or("") {
         "requirements-specification" => Some(format!(
             "{} requirement(s), {} open question(s)",
-            json.get("requirements").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
-            json.get("open_questions").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
+            json.get("requirements")
+                .and_then(|r| r.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+            json.get("open_questions")
+                .and_then(|r| r.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
         )),
-        "review-report" => Some(format!("verdict {verdict}: {}", json.get("summary").and_then(|s| s.as_str()).unwrap_or(""))),
-        "implementation-report" => Some(format!("branch {}", json.get("branch").and_then(|b| b.as_str()).unwrap_or("?"))),
+        "review-report" => Some(format!(
+            "verdict {verdict}: {}",
+            json.get("summary").and_then(|s| s.as_str()).unwrap_or("")
+        )),
+        "implementation-report" => Some(format!(
+            "branch {}",
+            json.get("branch").and_then(|b| b.as_str()).unwrap_or("?")
+        )),
         "quality-report" => match json.get("evaluation") {
             Some(ev) => Some(format!(
                 "{verdict} (evaluation {}, S={:.3})",
@@ -826,18 +971,34 @@ fn summarize(name: Option<&str>, json: &Value) -> Option<String> {
             )),
             None => Some(format!(
                 "assessment: {} score(s), {} finding(s), {} gap(s)",
-                json.get("scores").and_then(|s| s.as_object()).map(|o| o.len()).unwrap_or(0),
-                json.get("findings").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0),
-                json.get("gaps").and_then(|g| g.as_array()).map(|a| a.len()).unwrap_or(0),
+                json.get("scores")
+                    .and_then(|s| s.as_object())
+                    .map(|o| o.len())
+                    .unwrap_or(0),
+                json.get("findings")
+                    .and_then(|f| f.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+                json.get("gaps")
+                    .and_then(|g| g.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0),
             )),
         },
-        _ => json.get("summary").and_then(|s| s.as_str()).map(|s| s.to_string()),
+        _ => json
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()),
     }
 }
 
 fn one_line(s: &str) -> String {
     let t = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if t.chars().count() > 80 { format!("{}…", t.chars().take(80).collect::<String>()) } else { t }
+    if t.chars().count() > 80 {
+        format!("{}…", t.chars().take(80).collect::<String>())
+    } else {
+        t
+    }
 }
 
 #[cfg(test)]
@@ -855,7 +1016,10 @@ mod tests {
             instructions: "test".into(),
             tools: vec![],
             input_contract: None,
-            output_contract: Some(ContractRef { name: contract.into(), version: 1 }),
+            output_contract: Some(ContractRef {
+                name: contract.into(),
+                version: 1,
+            }),
             done_criteria: "test".into(),
             created_at: chrono::Utc::now(),
         }
@@ -893,7 +1057,8 @@ mod tests {
             self.log.push(format!("started:{attempt}"));
         }
         fn attempt_rejected(&mut self, attempt: u32, violations: &[String]) {
-            self.log.push(format!("rejected:{attempt}:{}", violations.join("|")));
+            self.log
+                .push(format!("rejected:{attempt}:{}", violations.join("|")));
         }
         fn attempt_failed(&mut self, attempt: u32, class: &'static str, error: &str) {
             self.log.push(format!("failed:{attempt}:{class}:{error}"));
@@ -903,13 +1068,21 @@ mod tests {
     #[test]
     fn declarative_role_tools_map_to_provider_syntax() {
         let mut r = role("quality-auditor", "quality-report");
-        r.tools = vec!["git".into(), "shell:test".into(), "filesystem:read".into(), "api:whatever".into()];
+        r.tools = vec![
+            "git".into(),
+            "shell:test".into(),
+            "filesystem:read".into(),
+            "api:whatever".into(),
+        ];
         let t = claude_tools_for(&r);
         assert!(t.contains(&"Bash(cargo test:*)".to_string()));
         assert!(t.contains(&"Bash(git diff:*)".to_string()));
         assert!(t.contains(&"Grep".to_string()));
         // Unknown capability grants nothing; no write/edit tools ever leak in.
-        assert!(!t.iter().any(|x| x.contains("Write") || x.contains("Edit") || x.contains("whatever")));
+        assert!(
+            !t.iter()
+                .any(|x| x.contains("Write") || x.contains("Edit") || x.contains("whatever"))
+        );
         // Empty declaration == fully closed, as before.
         assert!(claude_tools_for(&role("x", "review-report")).is_empty());
         // read-write capability: the implementer must be able to edit at all.
@@ -921,7 +1094,12 @@ mod tests {
 
     #[test]
     fn mock_outputs_are_contract_shaped() {
-        for c in ["requirements-specification", "review-report", "implementation-report", "quality-report"] {
+        for c in [
+            "requirements-specification",
+            "review-report",
+            "implementation-report",
+            "quality-report",
+        ] {
             let out = AgentRuntime::run(&req("mock", c)).unwrap();
             let v: Value = serde_json::from_slice(&out.content).unwrap();
             assert!(v.is_object(), "mock `{c}` must emit a JSON object");
@@ -931,7 +1109,10 @@ mod tests {
 
     #[test]
     fn unknown_provider_is_rejected() {
-        assert!(matches!(AgentRuntime::run(&req("telepathy", "review-report")), Err(AdapterError::UnknownProvider(_))));
+        assert!(matches!(
+            AgentRuntime::run(&req("telepathy", "review-report")),
+            Err(AdapterError::UnknownProvider(_))
+        ));
     }
 
     #[test]
@@ -942,7 +1123,10 @@ mod tests {
         // mock review has both keys
         assert!(AgentRuntime::run(&r).is_ok());
         // a broken schema check: feed a payload missing `verdict` through claude-path validation fn directly
-        assert!(matches!(validate_against_contract(r#"{"summary":"x"}"#, Some(schema)), Err(AdapterError::BadOutput { .. })));
+        assert!(matches!(
+            validate_against_contract(r#"{"summary":"x"}"#, Some(schema)),
+            Err(AdapterError::BadOutput { .. })
+        ));
     }
 
     #[test]
@@ -976,16 +1160,23 @@ mod tests {
         let good = r#"{"verdict":"ACCEPT","evaluation":{"score":0.9,"gates":[{"id":"build-green","state":"PASS"}]}}"#;
         assert!(validate_against_contract(good, Some(schema)).is_ok());
         // Missing key TWO levels down.
-        let shallow_missing = r#"{"verdict":"ACCEPT","evaluation":{"score":0.9,"gates":[{"id":"build-green"}]}}"#;
-        let e = validate_against_contract(shallow_missing, Some(schema)).unwrap_err().to_string();
+        let shallow_missing =
+            r#"{"verdict":"ACCEPT","evaluation":{"score":0.9,"gates":[{"id":"build-green"}]}}"#;
+        let e = validate_against_contract(shallow_missing, Some(schema))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("gates[0].state"), "{e}");
         // Enum violated at the top.
         let bad_enum = r#"{"verdict":"MAYBE","evaluation":{"score":0.9,"gates":[]}}"#;
-        let e = validate_against_contract(bad_enum, Some(schema)).unwrap_err().to_string();
+        let e = validate_against_contract(bad_enum, Some(schema))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("not in enum"), "{e}");
         // Type washed away.
         let bad_type = r#"{"verdict":"ACCEPT","evaluation":{"score":"0.9","gates":[]}}"#;
-        let e = validate_against_contract(bad_type, Some(schema)).unwrap_err().to_string();
+        let e = validate_against_contract(bad_type, Some(schema))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("$.evaluation.score: expected number"), "{e}");
     }
 
@@ -1014,19 +1205,35 @@ mod tests {
                 }]
             }
         });
-        assert!(validate_against_contract(&good.to_string(), Some(&schema_v3)).is_ok(), "report citing evidence on every check passes the gate");
+        assert!(
+            validate_against_contract(&good.to_string(), Some(&schema_v3)).is_ok(),
+            "report citing evidence on every check passes the gate"
+        );
 
         // Missing `evidence` key on a check entry.
         let mut missing = good.clone();
-        missing["evaluation"]["checks"][0].as_object_mut().unwrap().remove("evidence");
-        let e = validate_against_contract(&missing.to_string(), Some(&schema_v3)).unwrap_err().to_string();
-        assert!(e.contains("$.evaluation.checks[0].evidence: missing required key"), "{e}");
+        missing["evaluation"]["checks"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence");
+        let e = validate_against_contract(&missing.to_string(), Some(&schema_v3))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("$.evaluation.checks[0].evidence: missing required key"),
+            "{e}"
+        );
 
         // Empty evidence array — the core of the rule.
         let mut empty = good.clone();
         empty["evaluation"]["checks"][0]["evidence"] = serde_json::json!([]);
-        let e = validate_against_contract(&empty.to_string(), Some(&schema_v3)).unwrap_err().to_string();
-        assert!(e.contains("$.evaluation.checks[0].evidence: array has 0 item(s), minimum 1"), "{e}");
+        let e = validate_against_contract(&empty.to_string(), Some(&schema_v3))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("$.evaluation.checks[0].evidence: array has 0 item(s), minimum 1"),
+            "{e}"
+        );
     }
 
     /// Legacy wording of the same rule: `criteria_results` under @1.
@@ -1046,13 +1253,26 @@ mod tests {
 
         let mut empty = good.clone();
         empty["criteria_results"][0]["evidence"] = serde_json::json!([]);
-        let e = validate_against_contract(&empty.to_string(), Some(&schema_v1)).unwrap_err().to_string();
-        assert!(e.contains("$.criteria_results[0].evidence: array has 0 item(s), minimum 1"), "{e}");
+        let e = validate_against_contract(&empty.to_string(), Some(&schema_v1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("$.criteria_results[0].evidence: array has 0 item(s), minimum 1"),
+            "{e}"
+        );
 
         let mut missing = good.clone();
-        missing["criteria_results"][0].as_object_mut().unwrap().remove("evidence");
-        let e = validate_against_contract(&missing.to_string(), Some(&schema_v1)).unwrap_err().to_string();
-        assert!(e.contains("$.criteria_results[0].evidence: missing required key"), "{e}");
+        missing["criteria_results"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence");
+        let e = validate_against_contract(&missing.to_string(), Some(&schema_v1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("$.criteria_results[0].evidence: missing required key"),
+            "{e}"
+        );
     }
 
     /// REQ-FG-05 AC2 + ratified OQ-FG-03, pinned as REGRESSION behavior:
@@ -1073,14 +1293,24 @@ mod tests {
         }"#;
         // PRESENT null on the OPTIONAL `summary` key = absence, gate passes.
         let lenient = r#"{"verdict":"ACCEPT","summary":null,"evaluation":{"score":1.0}}"#;
-        assert!(validate_against_contract(lenient, Some(schema)).is_ok(), "explicit null on an optional field reads as absence");
+        assert!(
+            validate_against_contract(lenient, Some(schema)).is_ok(),
+            "explicit null on an optional field reads as absence"
+        );
         // PRESENT null on a REQUIRED object field keeps the 2.11 shape.
         let strict = r#"{"verdict":"ACCEPT","evaluation":null}"#;
-        let e = validate_against_contract(strict, Some(schema)).unwrap_err().to_string();
-        assert!(e.contains("$.evaluation: expected object, got null"), "precedent 2.11 pinned: {e}");
+        let e = validate_against_contract(strict, Some(schema))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("$.evaluation: expected object, got null"),
+            "precedent 2.11 pinned: {e}"
+        );
         // Nullability declaration still type-checks NON-null values.
         let wrong = r#"{"verdict":7,"evaluation":{"score":1.0}}"#;
-        let e = validate_against_contract(wrong, Some(schema)).unwrap_err().to_string();
+        let e = validate_against_contract(wrong, Some(schema))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("$.verdict: expected string, got number"), "{e}");
         // ...and accepts null where the schema declares it nullable.
         let nullable_ok = r#"{"verdict":null,"evaluation":{"score":1.0}}"#;
@@ -1093,10 +1323,25 @@ mod tests {
     fn gate_returns_the_whole_violation_list_as_data() {
         let schema = r#"{"type":"object","required":["a","b"],"properties":{"a":{"type":"string"},"b":{"type":"string"},"c":{"type":"integer"}}}"#;
         let e = validate_against_contract(r#"{"b":7,"c":"x"}"#, Some(schema)).unwrap_err();
-        let AdapterError::BadOutput { violations } = &e else { panic!("form class expected: {e}") };
-        assert!(violations.contains(&"$.a: missing required key".to_string()), "{violations:?}");
-        assert!(violations.iter().any(|v| v.starts_with("$.b: expected string")), "{violations:?}");
-        assert!(violations.iter().any(|v| v.starts_with("$.c: expected integer")), "{violations:?}");
+        let AdapterError::BadOutput { violations } = &e else {
+            panic!("form class expected: {e}")
+        };
+        assert!(
+            violations.contains(&"$.a: missing required key".to_string()),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("$.b: expected string")),
+            "{violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.starts_with("$.c: expected integer")),
+            "{violations:?}"
+        );
         assert_eq!(violations.len(), 3, "every violation, none lost");
     }
 
@@ -1131,9 +1376,17 @@ mod tests {
         r.contract_schema = Some(r#"{"type":"object","required":["verdict","summary","findings"],"properties":{"verdict":{"type":"string"},"summary":{"type":"string"},"findings":{"type":"array"}}}"#.into());
         let mut host = LoopRecorder::new();
         let out = AgentRuntime::run_with_form_loop(&r, 2, &mut host);
-        assert!(matches!(out, RunOutcome::Output(_)), "role self-repaired: {out:?}" );
+        assert!(
+            matches!(out, RunOutcome::Output(_)),
+            "role self-repaired: {out:?}"
+        );
         assert_eq!(&host.log[0], "started:1");
-        assert!(host.log[1].starts_with("rejected:1:$.business_description") || host.log[1].starts_with("rejected:1:$"), "rejection names the missing keys: {}", host.log[1]);
+        assert!(
+            host.log[1].starts_with("rejected:1:$.business_description")
+                || host.log[1].starts_with("rejected:1:$"),
+            "rejection names the missing keys: {}",
+            host.log[1]
+        );
         assert_eq!(&host.log[2], "started:2");
         assert_eq!(host.log.len(), 3, "no provider call after success");
     }
@@ -1147,21 +1400,50 @@ mod tests {
         r.contract_schema = Some(r#"{"type":"object","required":["verdict"],"properties":{"verdict":{"type":"string"}}}"#.into());
         let mut host = LoopRecorder::new();
         match AgentRuntime::run_with_form_loop(&r, 2, &mut host) {
-            RunOutcome::FormExhausted { attempts, violations } => {
-                assert_eq!(attempts, 3, "1 initial + 2 repair re-prompts (OQ-FG-01 default)");
-                assert!(violations.iter().any(|v| v.contains("missing required key")), "{violations:?}");
+            RunOutcome::FormExhausted {
+                attempts,
+                violations,
+            } => {
+                assert_eq!(
+                    attempts, 3,
+                    "1 initial + 2 repair re-prompts (OQ-FG-01 default)"
+                );
+                assert!(
+                    violations
+                        .iter()
+                        .any(|v| v.contains("missing required key")),
+                    "{violations:?}"
+                );
             }
             other => panic!("exhaustion expected, got {other:?}"),
         }
-        assert!(host.log.iter().filter(|l| l.starts_with("started:")).count() == 3, "{:?}", host.log);
+        assert!(
+            host.log
+                .iter()
+                .filter(|l| l.starts_with("started:"))
+                .count()
+                == 3,
+            "{:?}",
+            host.log
+        );
 
         // Zero budget: one call, then the form failure surfaces immediately.
         let mut host0 = LoopRecorder::new();
         match AgentRuntime::run_with_form_loop(&r, 0, &mut host0) {
-            RunOutcome::FormExhausted { attempts, .. } => assert_eq!(attempts, 1, "0 repairs = today's behavior"),
+            RunOutcome::FormExhausted { attempts, .. } => {
+                assert_eq!(attempts, 1, "0 repairs = today's behavior")
+            }
             other => panic!("exhaustion expected: {other:?}"),
         }
-        assert_eq!(host0.log.iter().filter(|l| l.starts_with("started:")).count(), 1, "no re-prompt at budget 0");
+        assert_eq!(
+            host0
+                .log
+                .iter()
+                .filter(|l| l.starts_with("started:"))
+                .count(),
+            1,
+            "no re-prompt at budget 0"
+        );
     }
 
     /// REQ-FG-03 AC1: provider/unknown failures never enter the loop —
@@ -1174,21 +1456,45 @@ mod tests {
             RunOutcome::Failed(AdapterError::UnknownProvider(_)) => {}
             other => panic!("provider abort expected: {other:?}"),
         }
-        assert_eq!(host.log.len(), 2, "started + failed, no retries: {:?}", host.log);
-        assert!(host.log[1].contains(":provider:"), "class is provider, not form: {}", host.log[1]);
+        assert_eq!(
+            host.log.len(),
+            2,
+            "started + failed, no retries: {:?}",
+            host.log
+        );
+        assert!(
+            host.log[1].contains(":provider:"),
+            "class is provider, not form: {}",
+            host.log[1]
+        );
     }
 
     /// REQ-FG-02 AC2: the attempt-N+1 prompt carries the FULL violation list
     /// of attempt N verbatim (the sessionless process has no other channel).
     #[test]
     fn repair_prompt_carries_the_full_violation_list() {
-        let violations = vec!["$.business_description: missing required key".to_string(), "$.requirements[7].source: expected object, got null".to_string()];
+        let violations = vec![
+            "$.business_description: missing required key".to_string(),
+            "$.requirements[7].source: expected object, got null".to_string(),
+        ];
         let s = form_repair_section(2, &violations);
-        assert!(s.contains("$.business_description: missing required key"), "{s}");
-        assert!(s.contains("$.requirements[7].source: expected object, got null"), "{s}");
+        assert!(
+            s.contains("$.business_description: missing required key"),
+            "{s}"
+        );
+        assert!(
+            s.contains("$.requirements[7].source: expected object, got null"),
+            "{s}"
+        );
         assert!(s.contains("attempt 2"), "{s}");
-        assert!(s.contains("never written as null"), "write policy restated for the producer: {s}");
-        assert!(s.contains("not a judgment of your content"), "form-vs-content split told to the role: {s}");
+        assert!(
+            s.contains("never written as null"),
+            "write policy restated for the producer: {s}"
+        );
+        assert!(
+            s.contains("not a judgment of your content"),
+            "form-vs-content split told to the role: {s}"
+        );
     }
 
     // ---- hermes driver: the R7 offline discipline — NO live hermes
@@ -1197,18 +1503,42 @@ mod tests {
     #[test]
     fn hermes_argv_carries_prompt_toolsets_model_provider_usage() {
         let mut r = req("hermes", "implementation-report");
-        r.role.tools = vec!["git".into(), "filesystem:read-write".into(), "shell:build".into(), "api:artifacts".into()];
+        r.role.tools = vec![
+            "git".into(),
+            "filesystem:read-write".into(),
+            "shell:build".into(),
+            "api:artifacts".into(),
+        ];
         r.model = "anthropic/claude-sonnet-4.6".into();
         r.provider_override = "openrouter".into();
         r.evidence = Some("/evidence/task/exec".into());
         let argv = AgentRuntime::hermes_argv(&r).unwrap();
         assert_eq!(argv[0], "-z", "headless one-shot (R1)");
-        assert!(argv[1].contains("TASK: Minimal process"), "user prompt rides -z");
+        assert!(
+            argv[1].contains("TASK: Minimal process"),
+            "user prompt rides -z"
+        );
         let pos = |f: &str| argv.iter().position(|a| a == f).expect(f);
-        assert_eq!(argv[pos("-t") + 1], "file,terminal", "R2/OQ-2 table: filesystem->file, git/shell->terminal, api:*->nothing");
-        assert_eq!(argv[pos("-m") + 1], "anthropic/claude-sonnet-4.6", "R3: -m only from req.model");
-        assert_eq!(argv[pos("--provider") + 1], "openrouter", "OQ-4: override passed verbatim");
-        assert_eq!(argv[pos("--usage-file") + 1], "/evidence/task/exec/usage.json", "R5: inside the PLATFORM evidence dir, never the tree");
+        assert_eq!(
+            argv[pos("-t") + 1],
+            "file,terminal",
+            "R2/OQ-2 table: filesystem->file, git/shell->terminal, api:*->nothing"
+        );
+        assert_eq!(
+            argv[pos("-m") + 1],
+            "anthropic/claude-sonnet-4.6",
+            "R3: -m only from req.model"
+        );
+        assert_eq!(
+            argv[pos("--provider") + 1],
+            "openrouter",
+            "OQ-4: override passed verbatim"
+        );
+        assert_eq!(
+            argv[pos("--usage-file") + 1],
+            "/evidence/task/exec/usage.json",
+            "R5: inside the PLATFORM evidence dir, never the tree"
+        );
     }
 
     #[test]
@@ -1220,11 +1550,19 @@ mod tests {
         let argv = AgentRuntime::hermes_argv(&r).unwrap();
         assert_eq!(argv.len(), 2, "-z + prompt only; empty tools => no -t (R2)");
         for flag in ["-t", "-m", "--provider", "--usage-file"] {
-            assert!(!argv.iter().any(|a| a == flag), "absent sources emit no flag (R2/R3/R5): {flag}");
+            assert!(
+                !argv.iter().any(|a| a == flag),
+                "absent sources emit no flag (R2/R3/R5): {flag}"
+            );
         }
         // The neutral `agent add` default is absence, not a provider (OQ-4 x R6).
         r.provider_override = "local".into();
-        assert!(!AgentRuntime::hermes_argv(&r).unwrap().iter().any(|a| a == "--provider"));
+        assert!(
+            !AgentRuntime::hermes_argv(&r)
+                .unwrap()
+                .iter()
+                .any(|a| a == "--provider")
+        );
     }
 
     #[test]
@@ -1232,12 +1570,27 @@ mod tests {
         let mut r = req("hermes", "review-report");
         r.role.tools = vec!["telepathy:read".into()];
         let e = AgentRuntime::hermes_argv(&r).unwrap_err();
-        assert!(matches!(e, AdapterError::Platform(_)), "loud at argv assembly (ratified OQ-2): {e}");
-        assert!(e.to_string().contains("telepathy:read"), "names the offending capability: {e}");
-        assert_eq!(e.failure_class(), devai_core::types::failure_class::PLATFORM, "never burns form attempts (REQ-FG-03)");
+        assert!(
+            matches!(e, AdapterError::Platform(_)),
+            "loud at argv assembly (ratified OQ-2): {e}"
+        );
+        assert!(
+            e.to_string().contains("telepathy:read"),
+            "names the offending capability: {e}"
+        );
+        assert_eq!(
+            e.failure_class(),
+            devai_core::types::failure_class::PLATFORM,
+            "never burns form attempts (REQ-FG-03)"
+        );
         // Declared no-tool capabilities and empty tools are known, not errors.
         r.role.tools = vec!["api:project-knowledge".into()];
-        assert!(AgentRuntime::hermes_argv(&r).unwrap().iter().all(|a| a != "-t"));
+        assert!(
+            AgentRuntime::hermes_argv(&r)
+                .unwrap()
+                .iter()
+                .all(|a| a != "-t")
+        );
     }
 
     /// R1/R7: the hermes reply path — BARE text (no `{"result":...}`
@@ -1248,18 +1601,33 @@ mod tests {
     fn hermes_bare_text_reaches_the_same_contract_gate() {
         let mut r = req("hermes", "review-report");
         r.contract_schema = Some(r#"{"type":"object","required":["verdict","summary"]}"#.into());
-        let out = AgentRuntime::hermes_text_to_output(&r, "prose before {\"verdict\":\"APPROVED\",\"summary\":\"ok\"} prose after")
-            .expect("extract_json_object rides directly on raw stdout text");
-        assert_eq!(String::from_utf8(out.content).unwrap(), r#"{"verdict":"APPROVED","summary":"ok"}"#);
+        let out = AgentRuntime::hermes_text_to_output(
+            &r,
+            "prose before {\"verdict\":\"APPROVED\",\"summary\":\"ok\"} prose after",
+        )
+        .expect("extract_json_object rides directly on raw stdout text");
+        assert_eq!(
+            String::from_utf8(out.content).unwrap(),
+            r#"{"verdict":"APPROVED","summary":"ok"}"#
+        );
         // Non-JSON text is a form rejection with the violation LIST (AC: form
         // class, not provider failure — the loop may repair it).
         let e = AgentRuntime::hermes_text_to_output(&r, "I cannot produce an object").unwrap_err();
-        assert!(matches!(&e, AdapterError::BadOutput { violations } if !violations.is_empty()), "form class: {e}");
-        assert_eq!(e.failure_class(), devai_core::types::failure_class::RESPONSE_FORM);
+        assert!(
+            matches!(&e, AdapterError::BadOutput { violations } if !violations.is_empty()),
+            "form class: {e}"
+        );
+        assert_eq!(
+            e.failure_class(),
+            devai_core::types::failure_class::RESPONSE_FORM
+        );
         // A missing required key yields the SAME violation string the claude
         // path produces — the gate is provider-agnostic (R1 constraint).
         let e = AgentRuntime::hermes_text_to_output(&r, r#"{"summary":"done"}"#).unwrap_err();
-        assert!(matches!(&e, AdapterError::BadOutput { violations } if violations.contains(&"$.verdict: missing required key".to_string())), "{e}");
+        assert!(
+            matches!(&e, AdapterError::BadOutput { violations } if violations.contains(&"$.verdict: missing required key".to_string())),
+            "{e}"
+        );
     }
 
     /// Ratified OQ-3: one glued prompt — system section before the task
@@ -1270,22 +1638,46 @@ mod tests {
         let mut r = req("hermes", "review-report");
         r.repair = Some((2, vec!["$.verdict: missing required key".to_string()]));
         let p = AgentRuntime::hermes_prompt(&r);
-        assert!(p.contains("=== ROLE (system instructions) ==="), "system section marker (OQ-3): {p}");
-        assert!(p.contains("Devai `x` agent"), "build_system_prompt content survives the glue");
+        assert!(
+            p.contains("=== ROLE (system instructions) ==="),
+            "system section marker (OQ-3): {p}"
+        );
+        assert!(
+            p.contains("Devai `x` agent"),
+            "build_system_prompt content survives the glue"
+        );
         assert!(p.contains("=== TASK ==="), "body section marker follows");
-        assert!(p.find("ROLE (system").unwrap() < p.find("=== TASK ===").unwrap(), "system first, body after");
-        assert!(p.contains("OUTPUT REJECTED BY THE CONTRACT GATE (attempt 2)"), "repair section rides the same single prompt (R1 AC4)");
-        assert!(p.contains("$.verdict: missing required key"), "full violation list verbatim");
+        assert!(
+            p.find("ROLE (system").unwrap() < p.find("=== TASK ===").unwrap(),
+            "system first, body after"
+        );
+        assert!(
+            p.contains("OUTPUT REJECTED BY THE CONTRACT GATE (attempt 2)"),
+            "repair section rides the same single prompt (R1 AC4)"
+        );
+        assert!(
+            p.contains("$.verdict: missing required key"),
+            "full violation list verbatim"
+        );
     }
 
     #[test]
     fn usage_fact_is_expected_only_for_hermes_with_evidence() {
         let mut r = req("hermes", "review-report");
-        assert!(expects_usage_report(&r).is_none(), "no evidence dir => nothing to expect (OQ-1)");
+        assert!(
+            expects_usage_report(&r).is_none(),
+            "no evidence dir => nothing to expect (OQ-1)"
+        );
         r.evidence = Some("/tmp/ev".into());
-        assert_eq!(expects_usage_report(&r).unwrap().to_str().unwrap(), "/tmp/ev/usage.json");
+        assert_eq!(
+            expects_usage_report(&r).unwrap().to_str().unwrap(),
+            "/tmp/ev/usage.json"
+        );
         let c = req("claude", "review-report");
-        assert!(expects_usage_report(&c).is_none(), "the claude driver has no usage analogue (motivation)");
+        assert!(
+            expects_usage_report(&c).is_none(),
+            "the claude driver has no usage analogue (motivation)"
+        );
     }
 
     /// R6: after a third live driver exists, the UnknownProvider text names

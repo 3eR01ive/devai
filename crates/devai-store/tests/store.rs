@@ -22,7 +22,13 @@ fn draft(store: &Store) -> Task {
     t
 }
 
-fn publish(store: &Store, t: &Task, kind: ArtifactKind, content: &[u8], depends: Vec<Id>) -> Artifact {
+fn publish(
+    store: &Store,
+    t: &Task,
+    kind: ArtifactKind,
+    content: &[u8],
+    depends: Vec<Id>,
+) -> Artifact {
     store
         .publish_artifact(ArtifactDraft {
             task_id: t.id,
@@ -49,14 +55,32 @@ fn to_implementation(store: &Store) -> (Task, Artifact, Artifact) {
     commit(store, &t, workflow::start(&t, "u", now()).unwrap());
     t = store.get_task(&t.id.to_string()).unwrap();
 
-    let spec = publish(store, &t, ArtifactKind::RequirementsSpec, b"reqs v1", vec![]);
+    let spec = publish(
+        store,
+        &t,
+        ArtifactKind::RequirementsSpec,
+        b"reqs v1",
+        vec![],
+    );
     let arts = store.artifacts(t.id).unwrap();
-    commit(store, &t, workflow::requirements_published(&t, &arts, None, "analyst", now()).unwrap());
+    commit(
+        store,
+        &t,
+        workflow::requirements_published(&t, &arts, None, "analyst", now()).unwrap(),
+    );
     t = store.get_task(&t.id.to_string()).unwrap();
 
-    commit(store, &t, workflow::review_recorded(&t, Verdict::Approved, None, "reviewer", now()).unwrap());
+    commit(
+        store,
+        &t,
+        workflow::review_recorded(&t, Verdict::Approved, None, "reviewer", now()).unwrap(),
+    );
     t = store.get_task(&t.id.to_string()).unwrap();
-    commit(store, &t, workflow::approve_requirements(&t, Some("ok"), "u", now()).unwrap());
+    commit(
+        store,
+        &t,
+        workflow::approve_requirements(&t, Some("ok"), "u", now()).unwrap(),
+    );
     t = store.get_task(&t.id.to_string()).unwrap();
     (t, spec.clone(), spec)
 }
@@ -78,9 +102,15 @@ fn create_resolve_commit_and_locking() {
     let stale = by_prefix.clone(); // lock 1, task is now lock 2
     let m = workflow::pause(&reloaded, Some("x"), "u", now()).unwrap();
     let err = store.commit(stale.lock_version, &m).unwrap_err();
-    assert!(format!("{err}").contains("concurrent modification"), "{err}");
+    assert!(
+        format!("{err}").contains("concurrent modification"),
+        "{err}"
+    );
     // the task is untouched after a rejected commit
-    assert_eq!(store.get_task(&t.id.to_string()).unwrap().state, TaskState::Analysis);
+    assert_eq!(
+        store.get_task(&t.id.to_string()).unwrap().state,
+        TaskState::Analysis
+    );
 }
 
 #[test]
@@ -88,14 +118,42 @@ fn revision_marks_dependents_stale_persistently() {
     let (_d, store) = open();
     let (mut t, spec1, _) = to_implementation(&store);
 
-    let plan = publish(&store, &t, ArtifactKind::ImplementationPlan, b"plan", vec![spec1.id]);
-    let report = publish(&store, &t, ArtifactKind::ImplementationReport, b"report", vec![plan.id]);
-    commit(&store, &t, workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap());
+    let plan = publish(
+        &store,
+        &t,
+        ArtifactKind::ImplementationPlan,
+        b"plan",
+        vec![spec1.id],
+    );
+    let report = publish(
+        &store,
+        &t,
+        ArtifactKind::ImplementationReport,
+        b"report",
+        vec![plan.id],
+    );
+    commit(
+        &store,
+        &t,
+        workflow::implementation_reported(
+            &t,
+            &workflow::ImplementationReportFacts::bare(new_id()),
+            "impl",
+            now(),
+        )
+        .unwrap(),
+    );
     t = store.get_task(&t.id.to_string()).unwrap();
     assert_eq!(t.state, TaskState::Qa);
 
     // user revises requirements in QA: v2 supersedes v1, downstream goes stale
-    let _spec2 = publish(&store, &t, ArtifactKind::RequirementsSpec, b"reqs v2", vec![]);
+    let _spec2 = publish(
+        &store,
+        &t,
+        ArtifactKind::RequirementsSpec,
+        b"reqs v2",
+        vec![],
+    );
     let arts = store.artifacts(t.id).unwrap();
     let m = workflow::requirements_published(&t, &arts, Some("scope change"), "u", now()).unwrap();
     commit(&store, &t, m);
@@ -104,7 +162,11 @@ fn revision_marks_dependents_stale_persistently() {
     let st = |id: Id| arts.iter().find(|a| a.id == id).unwrap().status;
     assert_eq!(st(spec1.id), ArtifactStatus::Superseded);
     assert_eq!(st(plan.id), ArtifactStatus::Stale);
-    assert_eq!(st(report.id), ArtifactStatus::Stale, "transitive dependents must be stale");
+    assert_eq!(
+        st(report.id),
+        ArtifactStatus::Stale,
+        "transitive dependents must be stale"
+    );
     let t2 = store.get_task(&t.id.to_string()).unwrap();
     assert_eq!(t2.state, TaskState::Review);
     assert_eq!(t2.requirements_seq, 2);
@@ -175,13 +237,39 @@ fn export_import_roundtrip_restores_everything() {
         created_at: now(),
     };
     store.create_question(&q).unwrap();
-    commit(&store, &t, workflow::raise_question(&t, q.id, true, "impl", now()).unwrap());
+    commit(
+        &store,
+        &t,
+        workflow::raise_question(&t, q.id, true, "impl", now()).unwrap(),
+    );
     t = store.get_task(&t.id.to_string()).unwrap();
     store.answer_question(q.id, "worktree", "u", now()).unwrap();
-    commit(&store, &t, workflow::answer_question(&t, q.id, "u", now()).unwrap());
+    commit(
+        &store,
+        &t,
+        workflow::answer_question(&t, q.id, "u", now()).unwrap(),
+    );
     t = store.get_task(&t.id.to_string()).unwrap();
-    commit(&store, &t, workflow::implementation_reported(&t, &workflow::ImplementationReportFacts::bare(new_id()), "impl", now()).unwrap());
-    store.finish_execution(&store.get_execution(&e.id.to_string()).unwrap(), ExecutionStatus::Completed, Some("done"), None, now()).unwrap();
+    commit(
+        &store,
+        &t,
+        workflow::implementation_reported(
+            &t,
+            &workflow::ImplementationReportFacts::bare(new_id()),
+            "impl",
+            now(),
+        )
+        .unwrap(),
+    );
+    store
+        .finish_execution(
+            &store.get_execution(&e.id.to_string()).unwrap(),
+            ExecutionStatus::Completed,
+            Some("done"),
+            None,
+            now(),
+        )
+        .unwrap();
     store
         .record_decision(&Decision {
             id: new_id(),
@@ -198,7 +286,15 @@ fn export_import_roundtrip_restores_everything() {
 
     // The profile identity the revision cites must be resolvable in the
     // SOURCE store — that is what export packages for the target store.
-    store.put_evaluation_profile("quality", 3, "devai", "version: 3\nproject: devai\n", &now()).unwrap();
+    store
+        .put_evaluation_profile(
+            "quality",
+            3,
+            "devai",
+            "version: 3\nproject: devai\n",
+            &now(),
+        )
+        .unwrap();
 
     // export captures the current events, THEN appends its own EXPORTED event,
     // so compare the manifest against a pre-export snapshot.
@@ -223,8 +319,14 @@ fn export_import_roundtrip_restores_everything() {
     assert_eq!(t2.state, t.state);
     assert_eq!(t2.requirements_seq, t.requirements_seq);
     assert_eq!(t2.lock_version, t.lock_version);
-    assert_eq!(store2.artifacts(t2.id).unwrap().len(), store.artifacts(t.id).unwrap().len());
-    assert_eq!(store2.events(t2.id, None).unwrap().len(), store.events(t.id, None).unwrap().len());
+    assert_eq!(
+        store2.artifacts(t2.id).unwrap().len(),
+        store.artifacts(t.id).unwrap().len()
+    );
+    assert_eq!(
+        store2.events(t2.id, None).unwrap().len(),
+        store.events(t.id, None).unwrap().len()
+    );
     let execs2 = store2.list_executions(Some(t2.id)).unwrap();
     assert_eq!(execs2.len(), 1);
     assert_eq!(
@@ -234,11 +336,30 @@ fn export_import_roundtrip_restores_everything() {
     );
     // REQ-SW-03 AC3: the owner identity travels with the row (ratified
     // OQ-2 — columns, so bundle export/import carries them verbatim).
-    assert_eq!(execs2[0].owner_pid, Some(4242), "owner pid survives the roundtrip: {:?}", execs2[0]);
-    assert_eq!(execs2[0].owner_host.as_deref(), Some("fixture-host"), "owner host survives the roundtrip");
-    assert_eq!(execs2[0].owner_process_start, Some(1_730_000_000), "owner process start survives the roundtrip");
+    assert_eq!(
+        execs2[0].owner_pid,
+        Some(4242),
+        "owner pid survives the roundtrip: {:?}",
+        execs2[0]
+    );
+    assert_eq!(
+        execs2[0].owner_host.as_deref(),
+        Some("fixture-host"),
+        "owner host survives the roundtrip"
+    );
+    assert_eq!(
+        execs2[0].owner_process_start,
+        Some(1_730_000_000),
+        "owner process start survives the roundtrip"
+    );
     // And the cited profile identity resolves in the fresh store too.
-    assert!(store2.get_evaluation_profile("quality", 3).unwrap().is_some(), "imported bundle re-seeds the profile history its revisions reference");
+    assert!(
+        store2
+            .get_evaluation_profile("quality", 3)
+            .unwrap()
+            .is_some(),
+        "imported bundle re-seeds the profile history its revisions reference"
+    );
     let q2 = store2.get_question(&q.id.to_string()).unwrap();
     assert_eq!(q2.status, QuestionStatus::Answered);
     // blobs carried over and verifiable
@@ -265,7 +386,10 @@ fn corrupted_bundle_is_rejected() {
     let (_d2, store2) = open();
     let err = bundle::import(&store2, bundle_dir.path()).unwrap_err();
     assert!(format!("{err}").contains("checksum mismatch"), "{err}");
-    assert!(store2.list_tasks().unwrap().is_empty(), "failed import must leave no partial state");
+    assert!(
+        store2.list_tasks().unwrap().is_empty(),
+        "failed import must leave no partial state"
+    );
 }
 
 /// REQ-007: evaluation profile identities recorded in old executions stay
@@ -290,25 +414,66 @@ fn profile_history_is_insert_only_and_survives_in_place_edits() {
         .get_evaluation_profile(&name, factory_version)
         .unwrap()
         .expect("factory profile identity resolvable");
-    assert!(original.contains("version:"), "body is the real profile YAML");
+    assert!(
+        original.contains("version:"),
+        "body is the real profile YAML"
+    );
 
     // A user edits the YAML in place WITHOUT bumping the version and re-inits:
     // the snapshot must NOT be clobbered — old revisions still resolve exactly.
-    let path = dir.path().join("config").join("evaluation").join("quality.yaml");
+    let path = dir
+        .path()
+        .join("config")
+        .join("evaluation")
+        .join("quality.yaml");
     let edited = format!("{original}\n# edited in place, version kept\n");
     std::fs::write(&path, edited.as_bytes()).unwrap();
     seed::seed_from(&store, &dir.path().join("config"), now()).unwrap();
-    let (_p, body_after) = store.get_evaluation_profile(&name, factory_version).unwrap().unwrap();
-    assert_eq!(body_after, original, "in-place edit without a version bump never rewrites history");
+    let (_p, body_after) = store
+        .get_evaluation_profile(&name, factory_version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        body_after, original,
+        "in-place edit without a version bump never rewrites history"
+    );
 
     // A proper version bump lands as a NEW row; both stay resolvable.
     let next = factory_version + 1;
     let bumped_body = format!("version: {next}\n# bumped definition\n");
-    assert!(store.put_evaluation_profile(&name, next, "devai", &bumped_body, &now()).unwrap());
-    assert!(!store.put_evaluation_profile(&name, next, "devai", "tampered", &now()).unwrap(), "second put for the same identity is ignored");
-    assert_eq!(store.get_evaluation_profile(&name, next).unwrap().unwrap().1, bumped_body);
-    assert!(store.get_evaluation_profile(&name, factory_version).unwrap().is_some(), "the old identity still resolves");
-    assert!(store.get_evaluation_profile(&name, factory_version + 90).unwrap().is_none(), "unknown identities do not resolve — never fabricated");
+    assert!(
+        store
+            .put_evaluation_profile(&name, next, "devai", &bumped_body, &now())
+            .unwrap()
+    );
+    assert!(
+        !store
+            .put_evaluation_profile(&name, next, "devai", "tampered", &now())
+            .unwrap(),
+        "second put for the same identity is ignored"
+    );
+    assert_eq!(
+        store
+            .get_evaluation_profile(&name, next)
+            .unwrap()
+            .unwrap()
+            .1,
+        bumped_body
+    );
+    assert!(
+        store
+            .get_evaluation_profile(&name, factory_version)
+            .unwrap()
+            .is_some(),
+        "the old identity still resolves"
+    );
+    assert!(
+        store
+            .get_evaluation_profile(&name, factory_version + 90)
+            .unwrap()
+            .is_none(),
+        "unknown identities do not resolve — never fabricated"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -341,8 +506,16 @@ fn first_version_of_each_kind_supersedes_nothing() {
         let a = publish(&store, &t, kind, b"v1", vec![]);
         assert_eq!(a.status, ArtifactStatus::Current);
         let arts = store.artifacts(t.id).unwrap();
-        assert_eq!(arts.iter().filter(|x| x.kind == kind && x.status == ArtifactStatus::Current).count(), 1);
-        assert!(supersession_events(&store, t.id).is_empty(), "the first version of a kind must produce zero SUPERSEDED rows and zero events");
+        assert_eq!(
+            arts.iter()
+                .filter(|x| x.kind == kind && x.status == ArtifactStatus::Current)
+                .count(),
+            1
+        );
+        assert!(
+            supersession_events(&store, t.id).is_empty(),
+            "the first version of a kind must produce zero SUPERSEDED rows and zero events"
+        );
     }
 }
 
@@ -362,19 +535,49 @@ fn second_version_supersedes_the_first_for_each_named_kind() {
 
         let arts = store.artifacts(t.id).unwrap();
         let group: Vec<_> = arts.iter().filter(|a| a.kind == kind).collect();
-        assert_eq!(group.iter().filter(|a| a.status == ArtifactStatus::Current).count(), 1, "exactly one CURRENT for this kind");
-        assert_eq!(group.iter().filter(|a| a.status == ArtifactStatus::Current).next().unwrap().id, v2.id);
-        assert_eq!(store.get_artifact(&v1.id.to_string()).unwrap().status, ArtifactStatus::Superseded, "the previous version is marked, never deleted");
-        assert_eq!(v2.seq, v1.seq + 1, "per-group seq numbering is unchanged (REQ-001 constraint)");
+        assert_eq!(
+            group
+                .iter()
+                .filter(|a| a.status == ArtifactStatus::Current)
+                .count(),
+            1,
+            "exactly one CURRENT for this kind"
+        );
+        assert_eq!(
+            group
+                .iter()
+                .filter(|a| a.status == ArtifactStatus::Current)
+                .next()
+                .unwrap()
+                .id,
+            v2.id
+        );
+        assert_eq!(
+            store.get_artifact(&v1.id.to_string()).unwrap().status,
+            ArtifactStatus::Superseded,
+            "the previous version is marked, never deleted"
+        );
+        assert_eq!(
+            v2.seq,
+            v1.seq + 1,
+            "per-group seq numbering is unchanged (REQ-001 constraint)"
+        );
 
         // REQ-002: exactly one batched event naming new id, flipped ids, kind, task.
         let evs = supersession_events(&store, t.id);
-        assert_eq!(evs.len(), before + 1, "one supersession event for this kind");
+        assert_eq!(
+            evs.len(),
+            before + 1,
+            "one supersession event for this kind"
+        );
         let ev = evs.last().unwrap();
         assert_eq!(ev.payload[json_field::ARTIFACT_ID], v2.id.to_string());
         assert_eq!(ev.payload[json_field::KIND], kind.as_str());
         assert_eq!(ev.payload[json_field::TASK_ID], t.id.to_string());
-        assert_eq!(ev.payload[json_field::SUPERSEDED].as_array().unwrap().len(), 1);
+        assert_eq!(
+            ev.payload[json_field::SUPERSEDED].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(ev.payload[json_field::SUPERSEDED][0], v1.id.to_string());
     }
 }
@@ -390,9 +593,19 @@ fn supersession_is_per_group_and_survives_a_long_series() {
     let spec2 = publish(&store, &t1, ArtifactKind::RequirementsSpec, b"s2", vec![]);
     let _patch2 = publish(&store, &t2, ArtifactKind::Patch, b"p2", vec![]);
 
-    assert_eq!(store.get_artifact(&spec1.id.to_string()).unwrap().status, ArtifactStatus::Superseded);
-    assert_eq!(store.get_artifact(&patch1.id.to_string()).unwrap().status, ArtifactStatus::Current, "another task's publication never touches this group");
-    assert_eq!(store.get_artifact(&spec2.id.to_string()).unwrap().status, ArtifactStatus::Current);
+    assert_eq!(
+        store.get_artifact(&spec1.id.to_string()).unwrap().status,
+        ArtifactStatus::Superseded
+    );
+    assert_eq!(
+        store.get_artifact(&patch1.id.to_string()).unwrap().status,
+        ArtifactStatus::Current,
+        "another task's publication never touches this group"
+    );
+    assert_eq!(
+        store.get_artifact(&spec2.id.to_string()).unwrap().status,
+        ArtifactStatus::Current
+    );
 
     // REQ-001 AC2: no (task, kind) holds more than one CURRENT row.
     for task in [t1.id, t2.id] {
@@ -418,7 +631,10 @@ fn supersession_is_per_group_and_survives_a_long_series() {
         execution_id: None,
         depends_on: vec![],
     });
-    assert!(again.is_ok(), "publication supersedes inside its own transaction");
+    assert!(
+        again.is_ok(),
+        "publication supersedes inside its own transaction"
+    );
 }
 
 #[test]
@@ -429,9 +645,19 @@ fn supersession_events_are_batched_per_publication() {
     let v2 = publish(&store, &t, ArtifactKind::QualityReport, b"2", vec![]);
     let _v3 = publish(&store, &t, ArtifactKind::QualityReport, b"3", vec![]);
     let evs = supersession_events(&store, t.id);
-    assert_eq!(evs.len(), 2, "one event per superseding publication: versions 2 and 3");
-    assert_eq!(evs[0].payload[json_field::SUPERSEDED].as_array().unwrap()[0], v1.id.to_string());
-    assert_eq!(evs[1].payload[json_field::SUPERSEDED].as_array().unwrap()[0], v2.id.to_string());
+    assert_eq!(
+        evs.len(),
+        2,
+        "one event per superseding publication: versions 2 and 3"
+    );
+    assert_eq!(
+        evs[0].payload[json_field::SUPERSEDED].as_array().unwrap()[0],
+        v1.id.to_string()
+    );
+    assert_eq!(
+        evs[1].payload[json_field::SUPERSEDED].as_array().unwrap()[0],
+        v2.id.to_string()
+    );
     // Nothing deleted: all three rows still readable, two marked.
     assert_eq!(store.artifacts(t.id).unwrap().len(), 3);
 }

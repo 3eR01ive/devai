@@ -41,25 +41,66 @@ fn main() {
     println!("cargo:rerun-if-changed=migrations");
     println!("cargo:rerun-if-changed=schema.sql");
 
-    let raw = fs::read_to_string(&manifest_path).unwrap_or_else(|e| panic!("cannot read the schema ladder manifest {}: {e}", manifest_path.display()));
-    let doc: serde_json::Value = serde_json::from_str(&raw).expect("migrations/manifest.json must be valid JSON");
-    let rungs = doc.get("rungs").and_then(|v| v.as_array()).expect("migrations/manifest.json must carry a non-empty `rungs` array");
+    let raw = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the schema ladder manifest {}: {e}",
+            manifest_path.display()
+        )
+    });
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).expect("migrations/manifest.json must be valid JSON");
+    let rungs = doc
+        .get("rungs")
+        .and_then(|v| v.as_array())
+        .expect("migrations/manifest.json must carry a non-empty `rungs` array");
     assert!(!rungs.is_empty(), "the schema ladder manifest has no rungs");
 
     let mut rows = String::new();
     let mut prev_to: i64 = 1; // the ladder must start at version 1 (fresh homes run schema.sql)
     for r in rungs {
-        let id = r.get("id").and_then(|v| v.as_str()).expect("every rung needs a stable string `id`");
-        let from = r.get("from").and_then(|v| v.as_i64()).expect("rung `from` must be an integer");
-        let to = r.get("to").and_then(|v| v.as_i64()).expect("rung `to` must be an integer");
-        let script = r.get("script").and_then(|v| v.as_str()).expect("rung `script` must be a repository-relative path");
-        let apply = r.get("apply").and_then(|v| v.as_str()).expect("rung `apply` must name the apply handler tag");
-        assert_eq!(from, prev_to, "ladder discontinuity before rung `{id}`: expected from={prev_to}, manifest says {from}");
-        assert_eq!(to, from + 1, "rung `{id}` must advance exactly one version (from {from}), manifest says to={to}");
+        let id = r
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("every rung needs a stable string `id`");
+        let from = r
+            .get("from")
+            .and_then(|v| v.as_i64())
+            .expect("rung `from` must be an integer");
+        let to = r
+            .get("to")
+            .and_then(|v| v.as_i64())
+            .expect("rung `to` must be an integer");
+        let script = r
+            .get("script")
+            .and_then(|v| v.as_str())
+            .expect("rung `script` must be a repository-relative path");
+        let apply = r
+            .get("apply")
+            .and_then(|v| v.as_str())
+            .expect("rung `apply` must name the apply handler tag");
+        assert_eq!(
+            from, prev_to,
+            "ladder discontinuity before rung `{id}`: expected from={prev_to}, manifest says {from}"
+        );
+        assert_eq!(
+            to,
+            from + 1,
+            "rung `{id}` must advance exactly one version (from {from}), manifest says to={to}"
+        );
         prev_to = to;
-        let sql = fs::read_to_string(root.join(script)).unwrap_or_else(|e| panic!("rung `{id}` cites script `{script}` which cannot be read: {e}"));
+        let sql = fs::read_to_string(root.join(script)).unwrap_or_else(|e| {
+            panic!("rung `{id}` cites script `{script}` which cannot be read: {e}")
+        });
         let lit = rust_string_literal;
-        rows.push_str(&format!("    ({}, {}, {}, {}, {}, {}),\n", lit(id), from, to, lit(script), lit(apply), lit(&sql)));
+        rows.push_str(&format!(
+            "    ({}, {}, {}, {}, {}, {}),\n",
+            lit(id),
+            from,
+            to,
+            lit(script),
+            lit(apply),
+            lit(&sql)
+        ));
     }
 
     let generated = format!(

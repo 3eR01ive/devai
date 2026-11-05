@@ -128,7 +128,14 @@ fn exec_probe(cmd: &str, workspace: &Path, pass_exit: &[i64]) -> ProbeOutcome {
             };
             ProbeOutcome {
                 state,
-                detail: format!("`{cmd}` -> exit {code}{}", if snippet.is_empty() { String::new() } else { format!(": {snippet}") }),
+                detail: format!(
+                    "`{cmd}` -> exit {code}{}",
+                    if snippet.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {snippet}")
+                    }
+                ),
                 output: text.to_string(),
             }
         }
@@ -139,24 +146,53 @@ fn exec_probe(cmd: &str, workspace: &Path, pass_exit: &[i64]) -> ProbeOutcome {
 pub fn execute(profile: &Profile, workspace: &Path) -> EvalRun {
     let mut gates = Vec::new();
     for g in &profile.gates {
-        let outs: Vec<ProbeOutcome> = g.probes.iter().map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit)).collect();
+        let outs: Vec<ProbeOutcome> = g
+            .probes
+            .iter()
+            .map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit))
+            .collect();
         let state = reduce_state(&outs);
-        let detail = outs.iter().map(|o| o.detail.clone()).collect::<Vec<_>>().join("; ");
-        gates.push(GateOutcome { id: g.id.clone(), state, detail });
+        let detail = outs
+            .iter()
+            .map(|o| o.detail.clone())
+            .collect::<Vec<_>>()
+            .join("; ");
+        gates.push(GateOutcome {
+            id: g.id.clone(),
+            state,
+            detail,
+        });
     }
 
     let mut mech: HashMap<String, ProbeOutcome> = HashMap::new();
     let mut hybrid: HashMap<String, Vec<ProbeOutcome>> = HashMap::new();
     let mut lines: Vec<String> = Vec::new();
     for g in &gates {
-        lines.push(format!("gate {}: {} ({})", g.id, state_name(g.state), g.detail));
+        lines.push(format!(
+            "gate {}: {} ({})",
+            g.id,
+            state_name(g.state),
+            g.detail
+        ));
     }
     for c in profile.checks() {
         if c.verify == "mechanical" {
-            let outs: Vec<ProbeOutcome> = c.probes.iter().map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit)).collect();
+            let outs: Vec<ProbeOutcome> = c
+                .probes
+                .iter()
+                .map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit))
+                .collect();
             let state = reduce_state(&outs);
-            let detail = outs.iter().map(|o| o.detail.clone()).collect::<Vec<_>>().join("; ");
-            let output = outs.iter().map(|o| o.output.clone()).collect::<Vec<_>>().join("\n");
+            let detail = outs
+                .iter()
+                .map(|o| o.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let output = outs
+                .iter()
+                .map(|o| o.output.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
             if matches!(state, ProbeState::Fail) {
                 lines.push(format!("check {}: FAILED — {detail}", c.id));
             } else {
@@ -172,22 +208,39 @@ pub fn execute(profile: &Profile, workspace: &Path) -> EvalRun {
             );
         } else if c.verify == "hybrid" {
             // The probe only proposes candidates; the rubric decides.
-            let outs: Vec<ProbeOutcome> = c.probes.iter().map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit)).collect();
+            let outs: Vec<ProbeOutcome> = c
+                .probes
+                .iter()
+                .map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit))
+                .collect();
             let mut kept = Vec::new();
             for o in &outs {
                 let out: String = o.output.trim().chars().take(2000).collect();
                 if o.state == ProbeState::Pass && !out.is_empty() {
                     lines.push(format!("candidates for {}: \n{}", c.id, out));
                 } else {
-                    lines.push(format!("candidates for {}: {} ({})", c.id, state_name(o.state), o.detail));
+                    lines.push(format!(
+                        "candidates for {}: {} ({})",
+                        c.id,
+                        state_name(o.state),
+                        o.detail
+                    ));
                 }
-                kept.push(ProbeOutcome { output: out, ..o.clone() });
+                kept.push(ProbeOutcome {
+                    output: out,
+                    ..o.clone()
+                });
             }
             hybrid.insert(c.id.clone(), kept);
         }
     }
 
-    EvalRun { gates, mech, hybrid, evidence_text: lines.join("\n") }
+    EvalRun {
+        gates,
+        mech,
+        hybrid,
+        evidence_text: lines.join("\n"),
+    }
 }
 
 fn reduce_state(outs: &[ProbeOutcome]) -> ProbeState {
@@ -223,7 +276,9 @@ fn guarantee_evidence(c: &mut CheckOutcome, assessment_execution: &str) {
         } else {
             format!(
                 "auditor assessment execution {assessment_execution}: score {} recorded for `{}` with no finding cited",
-                c.score.map(|s| format!("{s:.2}")).unwrap_or_else(|| "n/a".into()),
+                c.score
+                    .map(|s| format!("{s:.2}"))
+                    .unwrap_or_else(|| "n/a".into()),
                 c.id
             )
         };
@@ -304,18 +359,33 @@ pub struct Assembled {
 /// apply the deterministic verdict function (§2.5). `revision` is the
 /// workspace state the PLATFORM captured at execution start — embedded
 /// verbatim so every file:line finding is traceable to a bound workspace.
-pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment_execution: &str, revision: &devai_core::types::WorkspaceRevision) -> Assembled {
+pub fn assemble(
+    profile: &Profile,
+    run: &EvalRun,
+    assessment: &Value,
+    assessment_execution: &str,
+    revision: &devai_core::types::WorkspaceRevision,
+) -> Assembled {
     let scores: HashMap<String, f64> = assessment
         .get("scores")
         .and_then(|s| s.as_object())
-        .map(|o| o.iter().filter_map(|(k, v)| v.as_f64().map(|x| (k.clone(), x))).collect())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_f64().map(|x| (k.clone(), x)))
+                .collect()
+        })
         .unwrap_or_default();
     let gap_reasons: HashMap<String, String> = assessment
         .get("gaps")
         .and_then(|g| g.as_array())
         .map(|a| {
             a.iter()
-                .filter_map(|g| Some((g.get("check")?.as_str()?.to_string(), g.get("reason")?.as_str()?.to_string())))
+                .filter_map(|g| {
+                    Some((
+                        g.get("check")?.as_str()?.to_string(),
+                        g.get("reason")?.as_str()?.to_string(),
+                    ))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -330,7 +400,11 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
                         f.get("text")?.as_str()?.to_string(),
                         f.get("evidence")
                             .and_then(|e| e.as_array())
-                            .map(|e| e.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .map(|e| {
+                                e.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                     ))
                 })
@@ -347,13 +421,20 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
         let weight = profile.weight_of(&c.id);
         let floor = profile.floor_for(c);
         let find_ev = |id: &str, probe_out: Option<&Vec<ProbeOutcome>>| -> Vec<String> {
-            let mut ev: Vec<String> =
-                findings.iter().filter(|(cid, _, _)| cid == id).flat_map(|(_, _, e)| e.clone()).collect();
+            let mut ev: Vec<String> = findings
+                .iter()
+                .filter(|(cid, _, _)| cid == id)
+                .flat_map(|(_, _, e)| e.clone())
+                .collect();
             if let Some(outs) = probe_out {
-                ev.extend(outs.iter().filter(|o| !o.output.trim().is_empty()).map(|o| {
-                    let head: String = o.output.trim().chars().take(160).collect();
-                    head
-                }));
+                ev.extend(
+                    outs.iter()
+                        .filter(|o| !o.output.trim().is_empty())
+                        .map(|o| {
+                            let head: String = o.output.trim().chars().take(160).collect();
+                            head
+                        }),
+                );
             }
             ev
         };
@@ -364,13 +445,13 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
                     // Platform-run results count into S exactly like rubric ones.
                     scored.push((c.id.clone(), 1.0, weight));
                     CheckOutcome {
-                    id: c.id.clone(),
-                    verify: c.verify.clone(),
-                    state: "MECHANICAL_PASS".into(),
-                    score: Some(1.0),
-                    floor,
-                    weight,
-                    detects: c.detects.clone(),
+                        id: c.id.clone(),
+                        verify: c.verify.clone(),
+                        state: "MECHANICAL_PASS".into(),
+                        score: Some(1.0),
+                        floor,
+                        weight,
+                        detects: c.detects.clone(),
                         violations: vec![],
                         evidence: vec![o.detail.clone()],
                         reason: String::new(),
@@ -481,7 +562,10 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
                     // proc/evidence-completeness (meta, weight 0.0) enforced
                     // HERE: a sub-1.0 rubric score without evidence is not a
                     // score at all.
-                    if *s < 1.0 && c.evidence == "required" && evidence.iter().all(|e| e.trim().is_empty()) {
+                    if *s < 1.0
+                        && c.evidence == "required"
+                        && evidence.iter().all(|e| e.trim().is_empty())
+                    {
                         blocked_weight += weight;
                         CheckOutcome {
                             id: c.id.clone(),
@@ -493,11 +577,16 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
                             detects: c.detects.clone(),
                             violations: vec![],
                             evidence: vec![],
-                            reason: format!("score {s} without evidence — discarded (proc/evidence-completeness)"),
+                            reason: format!(
+                                "score {s} without evidence — discarded (proc/evidence-completeness)"
+                            ),
                         }
                     } else {
-                        let violations: Vec<String> =
-                            findings.iter().filter(|(cid, _, _)| cid == &c.id).map(|(_, t, _)| t.clone()).collect();
+                        let violations: Vec<String> = findings
+                            .iter()
+                            .filter(|(cid, _, _)| cid == &c.id)
+                            .map(|(_, t, _)| t.clone())
+                            .collect();
                         scored.push((c.id.clone(), *s, weight));
                         CheckOutcome {
                             id: c.id.clone(),
@@ -543,22 +632,58 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
     // Deterministic verdict function — the ORDER is the calibration fix:
     // pending signature outranks any S comparison.
     let (verdict, rec, basis) = if let Some(g) = gate_fail {
-        ("FAIL", "RETURN", format!("gate `{}` не пройден: {}", g.id, g.detail))
+        (
+            "FAIL",
+            "RETURN",
+            format!("gate `{}` не пройден: {}", g.id, g.detail),
+        )
     } else if let Some(g) = gate_blocked {
-        ("INCONCLUSIVE", "ESCALATE", format!("gate `{}` не выполнен: {}", g.id, g.detail))
+        (
+            "INCONCLUSIVE",
+            "ESCALATE",
+            format!("gate `{}` не выполнен: {}", g.id, g.detail),
+        )
     } else if !pending.is_empty() {
-        ("INCONCLUSIVE", "ESCALATE", format!("нет человеческой подписи: {} — вердикт не готов, черновик балла не финализируется", pending.join(", ")))
+        (
+            "INCONCLUSIVE",
+            "ESCALATE",
+            format!(
+                "нет человеческой подписи: {} — вердикт не готов, черновик балла не финализируется",
+                pending.join(", ")
+            ),
+        )
     } else if blocked_weight > cap {
-        ("INCONCLUSIVE", "ESCALATE", format!("невыполненных проверок на вес {blocked_weight:.2} > {cap}"))
+        (
+            "INCONCLUSIVE",
+            "ESCALATE",
+            format!("невыполненных проверок на вес {blocked_weight:.2} > {cap}"),
+        )
     } else if !floors_breached.is_empty() {
-        ("FAIL", "RETURN", format!("красные линии: {}", floors_breached.join(", ")))
+        (
+            "FAIL",
+            "RETURN",
+            format!("красные линии: {}", floors_breached.join(", ")),
+        )
     } else if score < theta {
         ("FAIL", "RETURN", format!("S={:.3} < порога {theta}", score))
     } else {
-        ("PASS", "ACCEPT", format!("шлюзы зелёные, полы целы, S={:.3} ≥ {theta}", score))
+        (
+            "PASS",
+            "ACCEPT",
+            format!("шлюзы зелёные, полы целы, S={:.3} ≥ {theta}", score),
+        )
     };
 
-    let report_text = render(profile, verdict, score, basis.clone(), &checks, &run.gates, &pending, blocked_weight);
+    let report_text = render(
+        profile,
+        verdict,
+        score,
+        basis.clone(),
+        &checks,
+        &run.gates,
+        &pending,
+        blocked_weight,
+    );
     // ONE shape model for both sides (R-003): the producer writes the stored
     // document THROUGH the same type every reader parses it back into — the
     // keys and their order are exactly what `assemble` has always emitted,
@@ -570,7 +695,10 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
         recommendation_basis: basis,
         report_text: report_text.clone(),
         assessment_execution: assessment_execution.into(),
-        profile: ProfileIdentity { project: profile.project.clone(), version: profile.version },
+        profile: ProfileIdentity {
+            project: profile.project.clone(),
+            version: profile.version,
+        },
         workspace_revision: Some(revision.clone()),
         evaluation: EvaluationBlock {
             verdict: verdict.into(),
@@ -584,8 +712,15 @@ pub fn assemble(profile: &Profile, run: &EvalRun, assessment: &Value, assessment
             checks,
         },
     };
-    let json = serde_json::to_value(&doc).expect("the typed quality-report model serialises by construction");
-    Assembled { json, recommendation: rec, evaluation_verdict: verdict, score, report_text }
+    let json = serde_json::to_value(&doc)
+        .expect("the typed quality-report model serialises by construction");
+    Assembled {
+        json,
+        recommendation: rec,
+        evaluation_verdict: verdict,
+        score,
+        report_text,
+    }
 }
 
 /// §2.6 rendering: number first, then only complaints, worst-first;
@@ -605,7 +740,10 @@ fn render(
         "FAIL" => "НЕ ПРОШЁЛ",
         _ => "ВЕРДИКТ НЕ ГОТОВ",
     };
-    let mut lines = vec![format!("ВЕРДИКТ: {head} (S={score:.3}/1.00, порог {}, {basis})", profile.scoring.theta)];
+    let mut lines = vec![format!(
+        "ВЕРДИКТ: {head} (S={score:.3}/1.00, порог {}, {basis})",
+        profile.scoring.theta
+    )];
     if let Some(g) = gates.iter().find(|g| g.state != ProbeState::Pass) {
         lines.push(format!("ШЛЮЗ: {} — {}", g.id, state_name(g.state)));
     }
@@ -613,7 +751,9 @@ fn render(
     // Worst-first by the severity of the check's heaviest detectable type.
     let rank = |id: &str| -> usize {
         let c = profile.checks().into_iter().find(|c| c.id == id);
-        c.and_then(|c| profile.worst_severity(c)).map(|s| SEV_RANK[s]).unwrap_or(usize::MAX)
+        c.and_then(|c| profile.worst_severity(c))
+            .map(|s| SEV_RANK[s])
+            .unwrap_or(usize::MAX)
     };
     let mut complaints: Vec<(usize, String)> = Vec::new();
     for c in checks {
@@ -637,17 +777,31 @@ fn render(
         .collect();
     if !blocked.is_empty() {
         lines.push(String::new());
-        lines.push(format!("НЕ ПРОВЕРЕНО (вес {:.2}): {}", blocked_weight, blocked.join("; ")));
+        lines.push(format!(
+            "НЕ ПРОВЕРЕНО (вес {:.2}): {}",
+            blocked_weight,
+            blocked.join("; ")
+        ));
     }
     if !pending.is_empty() {
         lines.push(String::new());
-        lines.push(format!("ЖДЁТ ЧЕЛОВЕКА: {} — подпись нужна до того, как вердикт станет готов", pending.join(", ")));
+        lines.push(format!(
+            "ЖДЁТ ЧЕЛОВЕКА: {} — подпись нужна до того, как вердикт станет готов",
+            pending.join(", ")
+        ));
     }
     lines.join("\n")
 }
 
 static SEV_RANK: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {
-    [("catastrophic", 0), ("major", 1), ("minor", 2), ("cosmetic", 3)].into_iter().collect()
+    [
+        ("catastrophic", 0),
+        ("major", 1),
+        ("minor", 2),
+        ("cosmetic", 3),
+    ]
+    .into_iter()
+    .collect()
 });
 
 #[cfg(test)]
@@ -710,7 +864,11 @@ scoring:
         serde_yaml::from_str(&yaml).expect("tiny profile parses")
     }
 
-    fn assessment(pairs: &[(&str, f64)], gaps: &[(&str, &str)], findings: &[(&str, &str, &[&str])]) -> Value {
+    fn assessment(
+        pairs: &[(&str, f64)],
+        gaps: &[(&str, &str)],
+        findings: &[(&str, &str, &[&str])],
+    ) -> Value {
         serde_json::json!({
             "scores": pairs.iter().map(|(k, v)| (k.to_string(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
             "findings": findings.iter().map(|(c, t, e)| serde_json::json!({"check": c, "text": t, "evidence": e})).collect::<Vec<_>>(),
@@ -743,7 +901,11 @@ scoring:
         let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         assert_eq!(out.recommendation, "ESCALATE");
-        assert!(out.report_text.contains("ЖДЁТ ЧЕЛОВЕКА: hum/c"), "{}", out.report_text);
+        assert!(
+            out.report_text.contains("ЖДЁТ ЧЕЛОВЕКА: hum/c"),
+            "{}",
+            out.report_text
+        );
         assert!(out.report_text.starts_with("ВЕРДИКТ: ВЕРДИКТ НЕ ГОТОВ"));
     }
 
@@ -773,12 +935,18 @@ scoring:
         // pending human fires first here; drop hum/c to test the cap path:
         let mut p2 = p.clone();
         p2.evaluations[0].checks.retain(|c| c.id != "hum/c");
-        p2.scoring.weights = vec![("mech/a".into(), 0.5), ("rub/b".into(), 0.3)].into_iter().collect();
+        p2.scoring.weights = vec![("mech/a".into(), 0.5), ("rub/b".into(), 0.3)]
+            .into_iter()
+            .collect();
         // V7 sum != 1 by design for this check path — validate isn't called here.
         let run2 = execute(&p2, Path::new(env!("CARGO_MANIFEST_DIR")));
         let out2 = assemble(&p2, &run2, &a, "exec-1", &fixture_revision());
         assert_eq!(out2.evaluation_verdict, "INCONCLUSIVE");
-        assert!(out2.report_text.contains("НЕ ПРОВЕРЕНО"), "{}", out2.report_text);
+        assert!(
+            out2.report_text.contains("НЕ ПРОВЕРЕНО"),
+            "{}",
+            out2.report_text
+        );
     }
 
     #[test]
@@ -806,12 +974,24 @@ scoring:
         p.evaluations[0].checks.retain(|c| c.id != "hum/c");
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         // 0.9 < 1.0 must carry evidence, or our own meta-check discards it.
-        let a = assessment(&[("rub/b", 0.9)], &[], &[("rub/b", "single style drift", &["x.rs:1"])]);
+        let a = assessment(
+            &[("rub/b", 0.9)],
+            &[],
+            &[("rub/b", "single style drift", &["x.rs:1"])],
+        );
         let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         assert_eq!(out.evaluation_verdict, "PASS");
         assert_eq!(out.recommendation, "ACCEPT");
-        assert!((out.score - (0.5 * 1.0 + 0.3 * 0.9) / 0.8).abs() < 1e-6, "S={}", out.score);
-        assert!(out.report_text.starts_with("ВЕРДИКТ: ПРОШЁЛ"), "{}", out.report_text);
+        assert!(
+            (out.score - (0.5 * 1.0 + 0.3 * 0.9) / 0.8).abs() < 1e-6,
+            "S={}",
+            out.score
+        );
+        assert!(
+            out.report_text.starts_with("ВЕРДИКТ: ПРОШЁЛ"),
+            "{}",
+            out.report_text
+        );
         // Floor breach: catastrophic floor 0.7 on a 0.4-scored major-detecting
         // check does not exist here (minor), so push rub/b below its floor via
         // a catastrophic detects swap.
@@ -820,7 +1000,11 @@ scoring:
         let a = assessment(&[("rub/b", 0.4)], &[], &[("rub/b", "leak", &["x.rs:1"])]);
         let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
         assert_eq!(out.evaluation_verdict, "FAIL");
-        assert!(out.report_text.contains("красные линии"), "{}", out.report_text);
+        assert!(
+            out.report_text.contains("красные линии"),
+            "{}",
+            out.report_text
+        );
         // findings render worst-first with the complaint text.
         assert!(out.report_text.contains("[rub/b] leak"));
     }
@@ -835,7 +1019,11 @@ scoring:
         let out = exec_probe("exit 1", Path::new(env!("CARGO_MANIFEST_DIR")), &[0, 1]);
         assert_eq!(out.state, ProbeState::Pass);
         // hybrid probes that find candidates still PASS; output is carried.
-        let out = exec_probe("echo candidate.rs:10", Path::new(env!("CARGO_MANIFEST_DIR")), &[0]);
+        let out = exec_probe(
+            "echo candidate.rs:10",
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &[0],
+        );
         assert_eq!(out.state, ProbeState::Pass);
         assert!(out.output.contains("candidate.rs:10"));
     }
@@ -864,17 +1052,26 @@ scoring:
             let ev = c["evidence"]
                 .as_array()
                 .unwrap_or_else(|| panic!("check {} must serialize evidence", c["id"]));
-            assert!(!ev.is_empty(), "check {} must cite at least one concrete evidence item", c["id"]);
             assert!(
-                ev.iter().all(|e| e.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+                !ev.is_empty(),
+                "check {} must cite at least one concrete evidence item",
+                c["id"]
+            );
+            assert!(
+                ev.iter()
+                    .all(|e| e.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
                 "check {} evidence entries must be non-blank strings: {ev:?}",
                 c["id"]
             );
         }
         let b = checks.iter().find(|c| c["id"] == "rub/b").unwrap();
-        assert!(b["evidence"][0].as_str().unwrap().contains("exec-42"), "uncited score stays traceable");
+        assert!(
+            b["evidence"][0].as_str().unwrap().contains("exec-42"),
+            "uncited score stays traceable"
+        );
         assert_eq!(
-            out.json["workspace_revision"], serde_json::json!(fixture_revision()),
+            out.json["workspace_revision"],
+            serde_json::json!(fixture_revision()),
             "assemble must embed the platform revision verbatim"
         );
         crate::adapters::validate_against_contract(&out.json.to_string(), Some(schema))
@@ -886,7 +1083,12 @@ scoring:
         let out2 = assemble(&p, &run, &a2, "exec-43", &fixture_revision());
         for c in out2.json["evaluation"]["checks"].as_array().unwrap() {
             let ev = c["evidence"].as_array().unwrap();
-            assert!(!ev.is_empty(), "state {} of {} must still cite evidence", c["state"], c["id"]);
+            assert!(
+                !ev.is_empty(),
+                "state {} of {} must still cite evidence",
+                c["state"],
+                c["id"]
+            );
         }
         crate::adapters::validate_against_contract(&out2.json.to_string(), Some(schema))
             .expect("blocked-mix report must satisfy quality-report@4");

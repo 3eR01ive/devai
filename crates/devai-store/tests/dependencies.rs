@@ -5,8 +5,8 @@
 
 use chrono::Utc;
 use devai_core::types::*;
-use devai_store::bundle;
 use devai_store::Store;
+use devai_store::bundle;
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
@@ -43,25 +43,45 @@ fn typed_edges_are_stored_many_to_many_and_survive_reopen() {
         let c = task(&store, "derived authority task");
         let d = task(&store, "second blocker");
         // The business case verbatim: one parent spawned two children.
-        store.link_task_dependency(b.id, a.id, DependencyKind::Parent, "operator", Utc::now()).unwrap();
-        let edge = store.link_task_dependency(c.id, a.id, DependencyKind::Parent, "operator", Utc::now()).unwrap();
+        store
+            .link_task_dependency(b.id, a.id, DependencyKind::Parent, "operator", Utc::now())
+            .unwrap();
+        let edge = store
+            .link_task_dependency(c.id, a.id, DependencyKind::Parent, "operator", Utc::now())
+            .unwrap();
         // Attribution and time on the edge itself (REQ-07 AC3, decisions.actor precedent).
         assert_eq!(edge.actor, "operator");
         assert!(edge.created_at <= Utc::now());
         // Both kinds on ONE pair, simultaneously.
-        store.link_task_dependency(b.id, a.id, DependencyKind::Blocks, "operator", Utc::now()).unwrap();
+        store
+            .link_task_dependency(b.id, a.id, DependencyKind::Blocks, "operator", Utc::now())
+            .unwrap();
         // And a second blocker for the same task.
-        store.link_task_dependency(b.id, d.id, DependencyKind::Blocks, "operator", Utc::now()).unwrap();
+        store
+            .link_task_dependency(b.id, d.id, DependencyKind::Blocks, "operator", Utc::now())
+            .unwrap();
         (a_id, b_id, c_id, d_id) = (a.id, b.id, c.id, d.id);
     }
 
     // Restart the "process": fresh Store handle over the same directory.
     let store = Store::open(dir.path()).unwrap();
     let out = store.task_dependencies(b_id).unwrap();
-    assert_eq!(out.len(), 3, "parent + blocks(a) + blocks(d) all stored and distinguishable");
-    let parents: Vec<Id> = out.iter().filter(|d| d.kind == DependencyKind::Parent).map(|d| d.depends_on_id).collect();
+    assert_eq!(
+        out.len(),
+        3,
+        "parent + blocks(a) + blocks(d) all stored and distinguishable"
+    );
+    let parents: Vec<Id> = out
+        .iter()
+        .filter(|d| d.kind == DependencyKind::Parent)
+        .map(|d| d.depends_on_id)
+        .collect();
     assert_eq!(parents, vec![a_id]);
-    let mut blockers: Vec<String> = out.iter().filter(|d| d.kind == DependencyKind::Blocks).map(|d| d.depends_on_id.to_string()).collect();
+    let mut blockers: Vec<String> = out
+        .iter()
+        .filter(|d| d.kind == DependencyKind::Blocks)
+        .map(|d| d.depends_on_id.to_string())
+        .collect();
     blockers.sort();
     let mut expected = vec![a_id.to_string(), d_id.to_string()];
     expected.sort();
@@ -72,9 +92,21 @@ fn typed_edges_are_stored_many_to_many_and_survive_reopen() {
     // Two children of ONE parent (the spawning case) read from the parent
     // side — incoming shows EVERY edge landing on it, of any kind.
     let incoming = store.incoming_dependencies(a_id).unwrap();
-    assert_eq!(incoming.len(), 3, "two 'parent' edges + one 'blocks' edge land on the parent");
-    assert_eq!(incoming.iter().filter(|d| d.kind == DependencyKind::Parent).count(), 2);
-    assert!(incoming.iter().any(|d| d.task_id == b_id) && incoming.iter().any(|d| d.task_id == c_id));
+    assert_eq!(
+        incoming.len(),
+        3,
+        "two 'parent' edges + one 'blocks' edge land on the parent"
+    );
+    assert_eq!(
+        incoming
+            .iter()
+            .filter(|d| d.kind == DependencyKind::Parent)
+            .count(),
+        2
+    );
+    assert!(
+        incoming.iter().any(|d| d.task_id == b_id) && incoming.iter().any(|d| d.task_id == c_id)
+    );
 }
 
 /// REQ-07 AC2: integrity is LOUD AT WRITE. Self-dependency, a dangling
@@ -85,20 +117,44 @@ fn bad_edges_are_rejected_at_write() {
     let a = task(&store, "a");
     let b = task(&store, "b");
 
-    let err = store.link_task_dependency(a.id, a.id, DependencyKind::Parent, "op", Utc::now()).unwrap_err();
-    assert!(format!("{err}").contains("itself"), "self-dependency rejected: {err}");
+    let err = store
+        .link_task_dependency(a.id, a.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("itself"),
+        "self-dependency rejected: {err}"
+    );
 
     let ghost = new_id();
-    let err = store.link_task_dependency(a.id, ghost, DependencyKind::Blocks, "op", Utc::now()).unwrap_err();
-    assert!(format!("{err}").contains("not found"), "dangling reference rejected: {err}");
-    let err = store.link_task_dependency(ghost, b.id, DependencyKind::Parent, "op", Utc::now()).unwrap_err();
-    assert!(format!("{err}").contains("not found"), "dangling dependent rejected: {err}");
+    let err = store
+        .link_task_dependency(a.id, ghost, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("not found"),
+        "dangling reference rejected: {err}"
+    );
+    let err = store
+        .link_task_dependency(ghost, b.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("not found"),
+        "dangling dependent rejected: {err}"
+    );
 
-    store.link_task_dependency(b.id, a.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    let err = store.link_task_dependency(b.id, a.id, DependencyKind::Parent, "op", Utc::now()).unwrap_err();
-    assert!(format!("{err}").contains("already exists"), "duplicate edge rejected: {err}");
+    store
+        .link_task_dependency(b.id, a.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    let err = store
+        .link_task_dependency(b.id, a.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("already exists"),
+        "duplicate edge rejected: {err}"
+    );
     // The other kind of the same pair is NOT a duplicate (REQ-02 AC1).
-    store.link_task_dependency(b.id, a.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
+    store
+        .link_task_dependency(b.id, a.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
 
     // Nothing bad landed: exactly the two good edges remain.
     assert_eq!(store.task_dependencies(b.id).unwrap().len(), 2);
@@ -115,27 +171,66 @@ fn one_query_yields_edges_and_states_epic_role_included() {
     let epic = task(&store, "epic: visible progress");
     let child1 = task(&store, "child one");
     let child2 = task(&store, "child two");
-    store.link_task_dependency(child1.id, epic.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    store.link_task_dependency(child2.id, epic.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    store.link_task_dependency(child1.id, child2.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
+    store
+        .link_task_dependency(child1.id, epic.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    store
+        .link_task_dependency(child2.id, epic.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    store
+        .link_task_dependency(
+            child1.id,
+            child2.id,
+            DependencyKind::Blocks,
+            "op",
+            Utc::now(),
+        )
+        .unwrap();
 
     let graph = store.dependency_graph().unwrap();
-    assert_eq!(graph.len(), 3, "every task is a node — even with zero edges");
+    assert_eq!(
+        graph.len(),
+        3,
+        "every task is a node — even with zero edges"
+    );
     let epic_node = graph.iter().find(|n| n.task.id == epic.id).unwrap();
-    assert!(epic_node.dependencies.is_empty(), "the epic itself declared no dependencies");
+    assert!(
+        epic_node.dependencies.is_empty(),
+        "the epic itself declared no dependencies"
+    );
     let c1 = graph.iter().find(|n| n.task.id == child1.id).unwrap();
     assert_eq!(c1.dependencies.len(), 2);
-    assert_eq!(c1.task.state, TaskState::Draft, "node state is in the same query");
-    assert!(c1.dependencies.iter().all(|x| x.task_id == child1.id && x.task_state == TaskState::Draft));
-    assert!(c1.dependencies.iter().any(|x| x.kind == DependencyKind::Blocks && x.depends_on_id == child2.id));
+    assert_eq!(
+        c1.task.state,
+        TaskState::Draft,
+        "node state is in the same query"
+    );
+    assert!(
+        c1.dependencies
+            .iter()
+            .all(|x| x.task_id == child1.id && x.task_state == TaskState::Draft)
+    );
+    assert!(
+        c1.dependencies
+            .iter()
+            .any(|x| x.kind == DependencyKind::Blocks && x.depends_on_id == child2.id)
+    );
 
     // REQ-06 AC1/AC2: no epic table — and `epic` is named as a vertex by the
     // very same dependency query used for any other edge.
     let has_epic_table: i64 = raw(&d)
-        .query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%epic%'", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%epic%'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(has_epic_table, 0);
-    assert_eq!(store.incoming_dependencies(epic.id).unwrap().len(), 2, "epic = vertex with incoming edges");
+    assert_eq!(
+        store.incoming_dependencies(epic.id).unwrap().len(),
+        2,
+        "epic = vertex with incoming edges"
+    );
 }
 
 /// REQ-08: the v4 rung is ADDITIVE over a real v3 database with existing
@@ -159,16 +254,35 @@ fn v3_database_gains_the_graph_additively() {
             .unwrap();
     }
     let store = Store::open(dir.path()).unwrap();
-    let version: i64 = raw(&dir).query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, devai_store::SCHEMA_VERSION, "open migrated v3 forward through v4 and v5");
-    assert_eq!(devai_store::SCHEMA_VERSION, 7, "the ladder top is now v7 (the single-writer rung 007)");
+    let version: i64 = raw(&dir)
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version,
+        devai_store::SCHEMA_VERSION,
+        "open migrated v3 forward through v4 and v5"
+    );
+    assert_eq!(
+        devai_store::SCHEMA_VERSION,
+        7,
+        "the ladder top is now v7 (the single-writer rung 007)"
+    );
 
     let t = store.get_task(&t_id.to_string()).unwrap();
     assert_eq!(t.title, title, "the pre-existing task row is byte-intact");
-    assert_eq!(store.task_dependencies(t_id).unwrap().len(), 0, "absent edges read as the empty set");
+    assert_eq!(
+        store.task_dependencies(t_id).unwrap().len(),
+        0,
+        "absent edges read as the empty set"
+    );
     // REQ-08 AC2: identical behavior to a task with an explicit empty set —
     // a graph node with zero edges, no error, no special-casing.
-    let node = store.dependency_graph().unwrap().into_iter().find(|n| n.task.id == t_id).unwrap();
+    let node = store
+        .dependency_graph()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.task.id == t_id)
+        .unwrap();
     assert!(node.dependencies.is_empty());
 
     // And the new surface works on the migrated database — including the
@@ -182,13 +296,23 @@ fn v3_database_gains_the_graph_additively() {
             .unwrap()
     };
     for needed in ["status", "superseded_actor", "superseded_at"] {
-        assert!(cols.iter().any(|x| x == needed), "migrated v4 table carries {needed}: {cols:?}");
+        assert!(
+            cols.iter().any(|x| x == needed),
+            "migrated v4 table carries {needed}: {cols:?}"
+        );
     }
     let other = task(&store, "pre-v4 too");
-    store.link_task_dependency(t_id, other.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
+    store
+        .link_task_dependency(t_id, other.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
     assert_eq!(store.task_dependencies(t_id).unwrap().len(), 1);
-    store.supersede_task_dependency(t_id, other.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
-    assert!(store.task_dependencies(t_id).unwrap().is_empty(), "supersession works on a migrated base");
+    store
+        .supersede_task_dependency(t_id, other.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
+    assert!(
+        store.task_dependencies(t_id).unwrap().is_empty(),
+        "supersession works on a migrated base"
+    );
 }
 
 /// REQ-01 AC3: dependencies enter bundle export/restore like the other
@@ -199,36 +323,65 @@ fn bundles_carry_dependency_edges() {
     let (_d1, store) = open();
     let a = task(&store, "parent/backfill");
     let b = task(&store, "derived gate");
-    store.link_task_dependency(b.id, a.id, DependencyKind::Parent, "operator", Utc::now()).unwrap();
-    store.link_task_dependency(b.id, a.id, DependencyKind::Blocks, "operator", Utc::now()).unwrap();
+    store
+        .link_task_dependency(b.id, a.id, DependencyKind::Parent, "operator", Utc::now())
+        .unwrap();
+    store
+        .link_task_dependency(b.id, a.id, DependencyKind::Blocks, "operator", Utc::now())
+        .unwrap();
 
     let bundle_dir = TempDir::new().unwrap();
     let manifest = bundle::export(&store, &b, &bundle_dir.path().join("b")).unwrap();
-    assert_eq!(manifest.counts.dependencies, 2, "the bundle carries the task's declared edges");
-    assert!(bundle_dir.path().join("b").join("dependencies.jsonl").exists());
+    assert_eq!(
+        manifest.counts.dependencies, 2,
+        "the bundle carries the task's declared edges"
+    );
+    assert!(
+        bundle_dir
+            .path()
+            .join("b")
+            .join("dependencies.jsonl")
+            .exists()
+    );
 
     // Fresh store: importing ONLY the child would leave the edge dangling —
     // refused loudly, transaction rolled back, no partial state.
     let (_d2, store2) = open();
     let err = bundle::import(&store2, &bundle_dir.path().join("b")).unwrap_err();
     let msg = format!("{err}").to_lowercase();
-    assert!(msg.contains("foreign key") || msg.contains("constraint"), "dangling edge import fails loud: {err}");
-    assert!(store2.list_tasks().unwrap().is_empty(), "failed import left nothing behind");
+    assert!(
+        msg.contains("foreign key") || msg.contains("constraint"),
+        "dangling edge import fails loud: {err}"
+    );
+    assert!(
+        store2.list_tasks().unwrap().is_empty(),
+        "failed import left nothing behind"
+    );
 
     // Import the parent bundle first, then the child: the graph lands intact.
     let m_a = bundle::export(&store, &a, &bundle_dir.path().join("a")).unwrap();
-    assert_eq!(m_a.counts.dependencies, 0, "a task that declared none exports an empty set");
+    assert_eq!(
+        m_a.counts.dependencies, 0,
+        "a task that declared none exports an empty set"
+    );
     bundle::import(&store2, &bundle_dir.path().join("a")).unwrap();
     let outcome = bundle::import(&store2, &bundle_dir.path().join("b")).unwrap();
     assert!(!outcome.skipped_existing);
     let edges = store2.task_dependencies(b.id).unwrap();
     assert_eq!(edges.len(), 2, "both kinds restored on the other machine");
-    assert!(edges.iter().any(|d| d.kind == DependencyKind::Parent) && edges.iter().any(|d| d.kind == DependencyKind::Blocks));
+    assert!(
+        edges.iter().any(|d| d.kind == DependencyKind::Parent)
+            && edges.iter().any(|d| d.kind == DependencyKind::Blocks)
+    );
     assert_eq!(edges[0].actor, "operator", "attribution restored");
 
     // The linked event history is part of the child's task and restored too.
     let evs = store2.events(b.id, None).unwrap();
-    assert!(evs.iter().any(|e| e.kind == event_kind::TASK_DEPENDENCY_LINKED), "link provenance travels with the task");
+    assert!(
+        evs.iter()
+            .any(|e| e.kind == event_kind::TASK_DEPENDENCY_LINKED),
+        "link provenance travels with the task"
+    );
 }
 
 /// REQ-07: the act of linking is itself an attributed platform event, so
@@ -238,11 +391,19 @@ fn linking_records_an_attributable_event() {
     let (_d, store) = open();
     let a = task(&store, "a");
     let b = task(&store, "b");
-    let edge = store.link_task_dependency(b.id, a.id, DependencyKind::Parent, "operator", Utc::now()).unwrap();
+    let edge = store
+        .link_task_dependency(b.id, a.id, DependencyKind::Parent, "operator", Utc::now())
+        .unwrap();
     let evs = store.events(b.id, None).unwrap();
-    let linked = evs.iter().find(|e| e.kind == event_kind::TASK_DEPENDENCY_LINKED).expect("link event recorded");
+    let linked = evs
+        .iter()
+        .find(|e| e.kind == event_kind::TASK_DEPENDENCY_LINKED)
+        .expect("link event recorded");
     assert_eq!(linked.actor, "operator");
-    assert_eq!(linked.payload[json_field::DEPENDENCY_ID], edge.id.to_string());
+    assert_eq!(
+        linked.payload[json_field::DEPENDENCY_ID],
+        edge.id.to_string()
+    );
     assert_eq!(linked.payload[json_field::DEPENDS_ON_ID], a.id.to_string());
     assert_eq!(linked.payload[json_field::DEPENDENCY_KIND], "parent");
 }
@@ -259,27 +420,52 @@ fn cycles_are_rejected_within_each_kind_and_mixed_cycles_stay_legal() {
     let c = task(&store, "third");
 
     // parent-chain a←b←c, then closing the loop must fail loudly.
-    store.link_task_dependency(b.id, a.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    store.link_task_dependency(c.id, b.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    let err = store.link_task_dependency(a.id, c.id, DependencyKind::Parent, "op", Utc::now()).unwrap_err();
-    assert!(format!("{err}").contains("cycle"), "transitive parent cycle refused: {err}");
-    assert!(store.task_dependencies(a.id).unwrap().is_empty(), "the refused edge was never stored");
+    store
+        .link_task_dependency(b.id, a.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    store
+        .link_task_dependency(c.id, b.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    let err = store
+        .link_task_dependency(a.id, c.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("cycle"),
+        "transitive parent cycle refused: {err}"
+    );
+    assert!(
+        store.task_dependencies(a.id).unwrap().is_empty(),
+        "the refused edge was never stored"
+    );
 
     // blocks-kind cycle, same refusal — reachability walks 'blocks' only.
-    store.link_task_dependency(b.id, c.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
-    let err = store.link_task_dependency(c.id, b.id, DependencyKind::Blocks, "op", Utc::now()).unwrap_err();
-    assert!(format!("{err}").contains("cycle"), "blocks cycle refused: {err}");
+    store
+        .link_task_dependency(b.id, c.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
+    let err = store
+        .link_task_dependency(c.id, b.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("cycle"),
+        "blocks cycle refused: {err}"
+    );
     // A 'blocks' edge may still point from `a` toward `b` even though the
     // PARENT chain runs the other way: reachability is per kind, the two
     // graphs are independent.
-    store.link_task_dependency(a.id, b.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
+    store
+        .link_task_dependency(a.id, b.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
 
     // The business case verbatim: parent one way, blocks back the other —
     // mixed cycles are legal (approved OQ4, the 01a1a14e ↔ gate example).
     let x = task(&store, "paused parent");
     let y = task(&store, "its gate child");
-    store.link_task_dependency(y.id, x.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    store.link_task_dependency(x.id, y.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
+    store
+        .link_task_dependency(y.id, x.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    store
+        .link_task_dependency(x.id, y.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
     assert_eq!(store.task_dependencies(x.id).unwrap().len(), 1);
     assert_eq!(store.task_dependencies(y.id).unwrap().len(), 1);
 }
@@ -294,21 +480,44 @@ fn superseded_edges_leave_the_live_graph_and_stay_as_history() {
     let (d, store) = open();
     let a = task(&store, "blocker");
     let b = task(&store, "blocked");
-    let first = store.link_task_dependency(b.id, a.id, DependencyKind::Blocks, "author-1", Utc::now()).unwrap();
+    let first = store
+        .link_task_dependency(b.id, a.id, DependencyKind::Blocks, "author-1", Utc::now())
+        .unwrap();
 
-    let removed = store.supersede_task_dependency(b.id, a.id, DependencyKind::Blocks, "remover-2", Utc::now()).unwrap();
-    assert_eq!(removed.id, first.id, "the superseded edge is the ACTIVE one found");
-    assert!(store.task_dependencies(b.id).unwrap().is_empty(), "live read sees no edges");
-    assert!(store.incoming_dependencies(a.id).unwrap().is_empty(), "incoming read sees no edges either");
+    let removed = store
+        .supersede_task_dependency(b.id, a.id, DependencyKind::Blocks, "remover-2", Utc::now())
+        .unwrap();
+    assert_eq!(
+        removed.id, first.id,
+        "the superseded edge is the ACTIVE one found"
+    );
+    assert!(
+        store.task_dependencies(b.id).unwrap().is_empty(),
+        "live read sees no edges"
+    );
+    assert!(
+        store.incoming_dependencies(a.id).unwrap().is_empty(),
+        "incoming read sees no edges either"
+    );
 
     // Superseding twice fails loudly — there is no ACTIVE edge left to mark.
-    let err = store.supersede_task_dependency(b.id, a.id, DependencyKind::Blocks, "op", Utc::now()).unwrap_err();
-    assert!(format!("{err}").contains("no active"), "second supersede refuses: {err}");
+    let err = store
+        .supersede_task_dependency(b.id, a.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("no active"),
+        "second supersede refuses: {err}"
+    );
 
     // Re-registration lands as a NEW row; the partial unique index covers
     // ACTIVE only, so history and live edge coexist.
-    let second = store.link_task_dependency(b.id, a.id, DependencyKind::Blocks, "author-3", Utc::now()).unwrap();
-    assert_ne!(second.id, first.id, "a superseded relation returns as a new edge");
+    let second = store
+        .link_task_dependency(b.id, a.id, DependencyKind::Blocks, "author-3", Utc::now())
+        .unwrap();
+    assert_ne!(
+        second.id, first.id,
+        "a superseded relation returns as a new edge"
+    );
     let rows: Vec<(String, String, Option<String>, Option<String>)> = {
         let c = raw(&d);
         let mut stmt = c.prepare("SELECT id, status, superseded_actor, superseded_at FROM task_dependencies ORDER BY created_at, id").unwrap();
@@ -320,17 +529,32 @@ fn superseded_edges_leave_the_live_graph_and_stay_as_history() {
         out
     };
     assert_eq!(rows.len(), 2, "full history: the old row is never deleted");
-    let old = rows.iter().find(|(id, ..)| id == &first.id.to_string()).unwrap();
+    let old = rows
+        .iter()
+        .find(|(id, ..)| id == &first.id.to_string())
+        .unwrap();
     assert_eq!(old.1, "SUPERSEDED");
-    assert_eq!(old.2.as_deref(), Some("remover-2"), "who superseded is attributed");
+    assert_eq!(
+        old.2.as_deref(),
+        Some("remover-2"),
+        "who superseded is attributed"
+    );
     assert!(old.3.is_some(), "when superseded is timed");
-    rows.iter().find(|(id, ..)| id == &second.id.to_string()).unwrap();
+    rows.iter()
+        .find(|(id, ..)| id == &second.id.to_string())
+        .unwrap();
 
     // And the act itself is platform history, both directions visible.
     let evs = store.events(b.id, None).unwrap();
-    let unlinked = evs.iter().find(|e| e.kind == event_kind::TASK_DEPENDENCY_UNLINKED).expect("unlinked event");
+    let unlinked = evs
+        .iter()
+        .find(|e| e.kind == event_kind::TASK_DEPENDENCY_UNLINKED)
+        .expect("unlinked event");
     assert_eq!(unlinked.actor, "remover-2");
-    assert_eq!(unlinked.payload[json_field::DEPENDENCY_ID], first.id.to_string());
+    assert_eq!(
+        unlinked.payload[json_field::DEPENDENCY_ID],
+        first.id.to_string()
+    );
     // The gate input is the LIVE graph: one ACTIVE edge again after re-link.
     assert_eq!(store.task_dependencies(b.id).unwrap().len(), 1);
 }
@@ -346,20 +570,39 @@ fn epic_registry_is_a_view_named_by_the_dependency_query() {
     let mid = task(&store, "mid derived");
     let leaf = task(&store, "child of mid");
     let other = task(&store, "unrelated");
-    store.link_task_dependency(mid.id, epic.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    store.link_task_dependency(leaf.id, mid.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
-    store.link_task_dependency(mid.id, other.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
+    store
+        .link_task_dependency(mid.id, epic.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    store
+        .link_task_dependency(leaf.id, mid.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
+    store
+        .link_task_dependency(mid.id, other.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
 
     let epics = store.epic_heads().unwrap();
-    assert_eq!(epics.len(), 1, "only the parent-less vertex WITH children is an epic");
+    assert_eq!(
+        epics.len(),
+        1,
+        "only the parent-less vertex WITH children is an epic"
+    );
     assert_eq!(epics[0].task.id, epic.id);
-    assert_eq!(epics[0].derived_children, 1, "direct 'parent' children only");
+    assert_eq!(
+        epics[0].derived_children, 1,
+        "direct 'parent' children only"
+    );
 
     // Superseding the incoming parent edge un-names the epic (live view),
     // while nothing about the epic lives in a separate structure.
-    store.supersede_task_dependency(mid.id, epic.id, DependencyKind::Parent, "op", Utc::now()).unwrap();
+    store
+        .supersede_task_dependency(mid.id, epic.id, DependencyKind::Parent, "op", Utc::now())
+        .unwrap();
     let epics = store.epic_heads().unwrap();
-    assert_eq!(epics.len(), 1, "now `mid` is parent-less with a child `leaf`");
+    assert_eq!(
+        epics.len(),
+        1,
+        "now `mid` is parent-less with a child `leaf`"
+    );
     assert_eq!(epics[0].task.id, mid.id);
 }
 
@@ -372,11 +615,17 @@ fn edges_follow_their_tasks_on_delete() {
     let (d, store) = open();
     let a = task(&store, "a");
     let b = task(&store, "b");
-    store.link_task_dependency(b.id, a.id, DependencyKind::Blocks, "op", Utc::now()).unwrap();
+    store
+        .link_task_dependency(b.id, a.id, DependencyKind::Blocks, "op", Utc::now())
+        .unwrap();
     // Delete the parent through a connection with FK enforcement ON (the
     // platform has no task-delete API; this pins the storage invariant).
     let c = raw(&d);
     c.pragma_update(None, "foreign_keys", "ON").unwrap();
-    c.execute("DELETE FROM tasks WHERE id=?1", params![a.id.to_string()]).unwrap();
-    assert!(store.task_dependencies(b.id).unwrap().is_empty(), "edge to a deleted task is gone, not dangling");
+    c.execute("DELETE FROM tasks WHERE id=?1", params![a.id.to_string()])
+        .unwrap();
+    assert!(
+        store.task_dependencies(b.id).unwrap().is_empty(),
+        "edge to a deleted task is gone, not dangling"
+    );
 }

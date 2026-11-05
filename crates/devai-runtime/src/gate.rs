@@ -8,7 +8,7 @@
 //! the CLI `artifact publish` call the same collector, so neither producer can
 //! hand the gate a different view of the facts.
 
-use devai_core::types::{decision_kind, event_kind, Artifact, ArtifactKind, Decision, Id};
+use devai_core::types::{Artifact, ArtifactKind, Decision, Id, decision_kind, event_kind};
 use devai_core::workflow::{ImplementationReportFacts, PriorImplementationReport};
 use devai_store::Store;
 
@@ -22,7 +22,9 @@ use crate::engine::RuntimeResult;
 fn stamped_commit(store: &Store, a: &Artifact) -> Option<String> {
     let body = store.read_blob(&a.sha256).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
-    v.get("commit").and_then(|c| c.as_str()).map(|s| s.to_string())
+    v.get("commit")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Assemble the gate facts for publishing `current` as a task's
@@ -38,7 +40,11 @@ pub fn collect_implementation_report_facts(
     let priors: Vec<PriorImplementationReport> = artifacts
         .iter()
         .filter(|a| a.kind == ArtifactKind::ImplementationReport && a.id != current.id)
-        .map(|a| PriorImplementationReport { artifact_id: a.id, seq: a.seq, commit: stamped_commit(store, a) })
+        .map(|a| PriorImplementationReport {
+            artifact_id: a.id,
+            seq: a.seq,
+            commit: stamped_commit(store, a),
+        })
         .collect();
     let ratifications: Vec<Decision> = store
         .list_decisions(task_id)?
@@ -53,7 +59,12 @@ pub fn collect_implementation_report_facts(
         .into_iter()
         .rev()
         .find(|e| e.kind == event_kind::QUALITY_RETURNED)
-        .and_then(|e| e.payload.get("rationale").and_then(|r| r.as_str()).map(|s| s.to_string()));
+        .and_then(|e| {
+            e.payload
+                .get("rationale")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+        });
     Ok(ImplementationReportFacts {
         summary,
         current_report: current.id,

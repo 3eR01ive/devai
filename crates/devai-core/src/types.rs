@@ -140,7 +140,12 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn new(name: impl Into<String>, description: impl Into<String>, repos: Vec<String>, now: Timestamp) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        repos: Vec<String>,
+        now: Timestamp,
+    ) -> Self {
         Self {
             id: new_id(),
             name: name.into(),
@@ -171,7 +176,12 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(title: impl Into<String>, business_description: impl Into<String>, project_id: Option<Id>, now: Timestamp) -> Self {
+    pub fn new(
+        title: impl Into<String>,
+        business_description: impl Into<String>,
+        project_id: Option<Id>,
+        now: Timestamp,
+    ) -> Self {
         Self {
             id: new_id(),
             project_id,
@@ -314,7 +324,10 @@ impl ArtifactKind {
     /// new advancing kind is declared exactly once and can never silently
     /// skip the advance in one of the consumers).
     pub fn advances_state(self) -> bool {
-        matches!(self, Self::RequirementsSpec | Self::ReviewReport | Self::ImplementationReport)
+        matches!(
+            self,
+            Self::RequirementsSpec | Self::ReviewReport | Self::ImplementationReport
+        )
     }
 
     /// Kinds derived from the approved requirements spec: they are marked
@@ -392,13 +405,16 @@ pub struct ContractRef {
 
 impl ContractRef {
     pub fn parse(s: &str) -> CoreResult<Self> {
-        let (name, ver) = s
-            .rsplit_once('@')
-            .ok_or_else(|| CoreError::guard(format!("contract ref must be `name@version`, got `{s}`")))?;
+        let (name, ver) = s.rsplit_once('@').ok_or_else(|| {
+            CoreError::guard(format!("contract ref must be `name@version`, got `{s}`"))
+        })?;
         let version = ver
             .parse::<u32>()
             .map_err(|_| CoreError::guard(format!("contract version is not a number: `{ver}`")))?;
-        Ok(Self { name: name.to_string(), version })
+        Ok(Self {
+            name: name.to_string(),
+            version,
+        })
     }
 }
 
@@ -630,7 +646,11 @@ impl Verdict {
     /// from the enum itself (primary token per variant, lowercase) so the
     /// hint cannot drift from the vocabulary it documents.
     pub fn token_hint() -> String {
-        Self::ALL.iter().map(|v| v.as_str().to_ascii_lowercase()).collect::<Vec<_>>().join("|")
+        Self::ALL
+            .iter()
+            .map(|v| v.as_str().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("|")
     }
 }
 

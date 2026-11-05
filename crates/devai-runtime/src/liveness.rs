@@ -65,7 +65,11 @@ pub struct OwnerInfo {
 /// the CLI and the engine — platform-side, never model-side).
 pub fn current_owner() -> OwnerInfo {
     let pid = std::process::id() as i64;
-    OwnerInfo { pid, host: current_host(), process_start: proc_start_epoch(pid) }
+    OwnerInfo {
+        pid,
+        host: current_host(),
+        process_start: proc_start_epoch(pid),
+    }
 }
 
 impl OwnerInfo {
@@ -84,7 +88,9 @@ pub fn check_owner(pid: Option<i64>, host: Option<&str>, process_start: Option<i
     };
     // Ratified OQ-3: liveness is checked on the LOCAL host only; any other
     // host is not observable here and must never be guessed dead.
-    let Some(current_host) = current_host() else { return Liveness::Unknown };
+    let Some(current_host) = current_host() else {
+        return Liveness::Unknown;
+    };
     if host.map(|h| h != current_host.as_str()).unwrap_or(true) {
         return Liveness::Unknown;
     }
@@ -104,7 +110,9 @@ pub fn check_owner(pid: Option<i64>, host: Option<&str>, process_start: Option<i
         // Tolerance absorbs a clock step (NTP/manual) between write and
         // check; both sides otherwise derive from the same boot-fixed
         // sources and agree exactly. A REUSED pid differs by far more.
-        (Some(recorded), Some(now)) if (recorded - now).abs() > START_TOLERANCE_SECS => Liveness::Dead,
+        (Some(recorded), Some(now)) if (recorded - now).abs() > START_TOLERANCE_SECS => {
+            Liveness::Dead
+        }
         _ => Liveness::Alive, // matching start, or an uncomparable clock source
     }
 }
@@ -146,7 +154,9 @@ const USER_HZ: i64 = 100;
 
 fn boot_epoch_secs() -> Option<i64> {
     let stat = fs::read_to_string("/proc/stat").ok()?;
-    stat.lines().find_map(|l| l.strip_prefix("btime ")).and_then(|v| v.trim().parse().ok())
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 #[cfg(test)]
@@ -158,7 +168,11 @@ mod tests {
         let owner = current_owner();
         assert!(owner.pid > 0);
         let (pid, host, start) = (Some(owner.pid), owner.host.as_deref(), owner.process_start);
-        assert_eq!(check_owner(pid, host, start), Liveness::Alive, "the test process is its own live owner");
+        assert_eq!(
+            check_owner(pid, host, start),
+            Liveness::Alive,
+            "the test process is its own live owner"
+        );
     }
 
     #[test]
@@ -166,7 +180,10 @@ mod tests {
         // No pid near i64::MAX exists; /proc answers "not there" — the ONE
         // provable death.
         let owner = current_owner();
-        assert_eq!(check_owner(Some(i64::MAX), owner.host.as_deref(), owner.process_start), Liveness::Dead);
+        assert_eq!(
+            check_owner(Some(i64::MAX), owner.host.as_deref(), owner.process_start),
+            Liveness::Dead
+        );
     }
 
     #[test]
@@ -177,13 +194,23 @@ mod tests {
         let owner = current_owner();
         assert!(owner.process_start.is_some(), "/proc-backed environment");
         let reused = owner.process_start.unwrap() - 3600;
-        assert_eq!(check_owner(Some(owner.pid), owner.host.as_deref(), Some(reused)), Liveness::Dead);
+        assert_eq!(
+            check_owner(Some(owner.pid), owner.host.as_deref(), Some(reused)),
+            Liveness::Dead
+        );
     }
 
     #[test]
     fn other_host_is_unknown_never_dead() {
         let owner = current_owner();
-        assert_eq!(check_owner(Some(owner.pid), Some("some-remote-host"), owner.process_start), Liveness::Unknown);
+        assert_eq!(
+            check_owner(
+                Some(owner.pid),
+                Some("some-remote-host"),
+                owner.process_start
+            ),
+            Liveness::Unknown
+        );
     }
 
     #[test]

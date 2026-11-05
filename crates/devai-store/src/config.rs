@@ -19,24 +19,59 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use devai_core::types::{ContractRef, RoleDefinition, Timestamp, Verdict, event_kind, json_field, new_id};
+use devai_core::types::{
+    ContractRef, RoleDefinition, Timestamp, Verdict, event_kind, json_field, new_id,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{Store, StoreError, StoreResult};
 
 // Embedded factory defaults — written into the home config on first init.
 const DEFAULT_FILES: &[(&str, &str)] = &[
-    ("prompts/common.yaml", include_str!("../../../config/prompts/common.yaml")),
-    ("criteria/review.yaml", include_str!("../../../config/criteria/review.yaml")),
-    ("evaluation/quality.yaml", include_str!("../../../config/evaluation/quality.yaml")),
-    ("roles/project-intelligence.yaml", include_str!("../../../config/roles/project-intelligence.yaml")),
-    ("roles/requirements-analyst.yaml", include_str!("../../../config/roles/requirements-analyst.yaml")),
-    ("roles/requirements-reviewer.yaml", include_str!("../../../config/roles/requirements-reviewer.yaml")),
-    ("roles/implementation-agent.yaml", include_str!("../../../config/roles/implementation-agent.yaml")),
-    ("roles/quality-auditor.yaml", include_str!("../../../config/roles/quality-auditor.yaml")),
-    ("roles/quality-aggregator.yaml", include_str!("../../../config/roles/quality-aggregator.yaml")),
-    ("workflow/response-form-loop.yaml", include_str!("../../../config/workflow/response-form-loop.yaml")),
-    ("workflow/rework-context.yaml", include_str!("../../../config/workflow/rework-context.yaml")),
+    (
+        "prompts/common.yaml",
+        include_str!("../../../config/prompts/common.yaml"),
+    ),
+    (
+        "criteria/review.yaml",
+        include_str!("../../../config/criteria/review.yaml"),
+    ),
+    (
+        "evaluation/quality.yaml",
+        include_str!("../../../config/evaluation/quality.yaml"),
+    ),
+    (
+        "roles/project-intelligence.yaml",
+        include_str!("../../../config/roles/project-intelligence.yaml"),
+    ),
+    (
+        "roles/requirements-analyst.yaml",
+        include_str!("../../../config/roles/requirements-analyst.yaml"),
+    ),
+    (
+        "roles/requirements-reviewer.yaml",
+        include_str!("../../../config/roles/requirements-reviewer.yaml"),
+    ),
+    (
+        "roles/implementation-agent.yaml",
+        include_str!("../../../config/roles/implementation-agent.yaml"),
+    ),
+    (
+        "roles/quality-auditor.yaml",
+        include_str!("../../../config/roles/quality-auditor.yaml"),
+    ),
+    (
+        "roles/quality-aggregator.yaml",
+        include_str!("../../../config/roles/quality-aggregator.yaml"),
+    ),
+    (
+        "workflow/response-form-loop.yaml",
+        include_str!("../../../config/workflow/response-form-loop.yaml"),
+    ),
+    (
+        "workflow/rework-context.yaml",
+        include_str!("../../../config/workflow/rework-context.yaml"),
+    ),
 ];
 
 fn cfg_err(msg: impl Into<String>) -> StoreError {
@@ -183,13 +218,20 @@ const REVIEWERS: [&str; 4] = ["human", "agent", "either", "tool"];
 
 impl Profile {
     pub fn checks(&self) -> Vec<&CheckDef> {
-        self.evaluations.iter().flat_map(|e| e.checks.iter()).collect()
+        self.evaluations
+            .iter()
+            .flat_map(|e| e.checks.iter())
+            .collect()
     }
 
     /// Provenance identity `name@version` recorded in every workspace
     /// revision. Falls back to `project` when no name is declared anywhere.
     pub fn identity(&self) -> String {
-        format!("{}@{}", self.name.as_deref().unwrap_or(&self.project), self.version)
+        format!(
+            "{}@{}",
+            self.name.as_deref().unwrap_or(&self.project),
+            self.version
+        )
     }
 
     /// Highest severity among the check's detectable error types (V8 source).
@@ -198,7 +240,9 @@ impl Profile {
         let rank = |s: &str| SEVERITIES.iter().position(|x| *x == s);
         let mut best: Option<&str> = None;
         for t in &c.detects {
-            let Some(sev) = self.error_types.get(t).map(|e| e.severity.as_str()) else { continue };
+            let Some(sev) = self.error_types.get(t).map(|e| e.severity.as_str()) else {
+                continue;
+            };
             let replace = match best {
                 None => true,
                 Some(b) => match (rank(sev), rank(b)) {
@@ -215,7 +259,8 @@ impl Profile {
 
     /// Floor for a check: min score derived from max severity of detects.
     pub fn floor_for(&self, c: &CheckDef) -> Option<f64> {
-        self.worst_severity(c).and_then(|sev| self.scoring.floors.get(sev).and_then(|v| *v))
+        self.worst_severity(c)
+            .and_then(|sev| self.scoring.floors.get(sev).and_then(|v| *v))
     }
 
     pub fn weight_of(&self, id: &str) -> f64 {
@@ -238,7 +283,10 @@ impl Profile {
         }
         for (t, e) in &self.error_types {
             if !SEVERITIES.contains(&e.severity.as_str()) {
-                return Err(format!("error_type `{t}`: severity `{}` not in {SEVERITIES:?}", e.severity));
+                return Err(format!(
+                    "error_type `{t}`: severity `{}` not in {SEVERITIES:?}",
+                    e.severity
+                ));
             }
         }
         for s in self.scoring.floors.keys() {
@@ -268,22 +316,37 @@ impl Profile {
                 return Err(format!("check `{}`: verify `{}` invalid", c.id, c.verify));
             }
             if !REVIEWERS.contains(&c.reviewer.as_str()) {
-                return Err(format!("check `{}`: reviewer `{}` invalid", c.id, c.reviewer));
+                return Err(format!(
+                    "check `{}`: reviewer `{}` invalid",
+                    c.id, c.reviewer
+                ));
             }
             // V1: every detected error type must be declared.
             for t in &c.detects {
                 if !self.error_types.contains_key(t) {
-                    return Err(format!("check `{}` detects undeclared error type `{t}` (V1)", c.id));
+                    return Err(format!(
+                        "check `{}` detects undeclared error type `{t}` (V1)",
+                        c.id
+                    ));
                 }
             }
             // V3: mechanical/hybrid need at least one probe.
             if matches!(c.verify.as_str(), "mechanical" | "hybrid") && c.probes.is_empty() {
-                return Err(format!("check `{}` is {} without probe (V3)", c.id, c.verify));
+                return Err(format!(
+                    "check `{}` is {} without probe (V3)",
+                    c.id, c.verify
+                ));
             }
             // V4: rubric/hybrid need >=3 anchors incl. 1.0 and 0.0.
             if matches!(c.verify.as_str(), "rubric" | "hybrid") {
-                if c.anchors.len() < 3 || !c.anchors.contains_key("1.0") || !c.anchors.contains_key("0.0") {
-                    return Err(format!("check `{}`: anchors must have >=3 gradations incl. \"1.0\" and \"0.0\" (V4)", c.id));
+                if c.anchors.len() < 3
+                    || !c.anchors.contains_key("1.0")
+                    || !c.anchors.contains_key("0.0")
+                {
+                    return Err(format!(
+                        "check `{}`: anchors must have >=3 gradations incl. \"1.0\" and \"0.0\" (V4)",
+                        c.id
+                    ));
                 }
             }
             // V7: weights must cover exactly the check set and sum to 1.0.
@@ -351,7 +414,9 @@ impl Config {
     }
 
     pub fn profile_for(&self, slug: &str) -> Option<&Profile> {
-        self.profiles.iter().find(|p| p.applies_to_roles.iter().any(|r| r == slug))
+        self.profiles
+            .iter()
+            .find(|p| p.applies_to_roles.iter().any(|r| r == slug))
     }
 
     /// Compile an applied profile into the role's checklist text: the agent
@@ -376,7 +441,14 @@ impl Config {
             if !profile.agent_scoreable(c) {
                 continue;
             }
-            let _ = writeln!(ins, "\n[{}] ({}; detects {}; weight {})", c.id, c.verify, c.detects.join(", "), profile.weight_of(&c.id));
+            let _ = writeln!(
+                ins,
+                "\n[{}] ({}; detects {}; weight {})",
+                c.id,
+                c.verify,
+                c.detects.join(", "),
+                profile.weight_of(&c.id)
+            );
             let _ = writeln!(ins, "  statement: {}", c.statement.trim());
             if !c.anchors.is_empty() {
                 // Best score first — the reviewer reads the ladder top-down.
@@ -387,7 +459,10 @@ impl Config {
                     };
                     y.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal)
                 });
-                let rendered: Vec<String> = anchors.into_iter().map(|(k, v)| format!("{k} — {}", v.trim())).collect();
+                let rendered: Vec<String> = anchors
+                    .into_iter()
+                    .map(|(k, v)| format!("{k} — {}", v.trim()))
+                    .collect();
                 let _ = writeln!(ins, "  anchors: {}", rendered.join(" | "));
             }
             if c.evidence == "required" {
@@ -413,7 +488,12 @@ impl Config {
                     .scoring
                     .floors
                     .iter()
-                    .map(|(s, v)| format!("{s}: {}", v.map(|x| x.to_string()).unwrap_or_else(|| "none".into())))
+                    .map(|(s, v)| {
+                        format!(
+                            "{s}: {}",
+                            v.map(|x| x.to_string()).unwrap_or_else(|| "none".into())
+                        )
+                    })
                     .collect();
                 f.join(", ")
             }
@@ -476,7 +556,10 @@ pub fn materialize_if_absent(dir: &Path) -> StoreResult<Vec<PathBuf>> {
     let mut written = Vec::new();
     for (rel, text) in DEFAULT_FILES {
         let path = dir.join(rel);
-        fs::create_dir_all(path.parent().ok_or_else(|| cfg_err(format!("config path `{rel}` has no parent")))?)?;
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| cfg_err(format!("config path `{rel}` has no parent")))?,
+        )?;
         if path.exists() {
             continue;
         }
@@ -506,7 +589,9 @@ pub fn load_profiles(dir: &Path) -> StoreResult<Vec<Profile>> {
         if profile.name.is_none() {
             profile.name = p.file_stem().map(|s| s.to_string_lossy().into_owned());
         }
-        profile.validate().map_err(|e| cfg_err(format!("{}: {e}", p.display())))?;
+        profile
+            .validate()
+            .map_err(|e| cfg_err(format!("{}: {e}", p.display())))?;
         profiles.push(profile);
     }
     Ok(profiles)
@@ -536,7 +621,9 @@ impl Default for ResponseFormPolicy {
     /// exactly like one that has it at defaults (same idiom as the embedded
     /// workflow config materialisation — never a second copy of the policy).
     fn default() -> Self {
-        ResponseFormPolicy { max_repair_attempts: default_max_repair_attempts() }
+        ResponseFormPolicy {
+            max_repair_attempts: default_max_repair_attempts(),
+        }
     }
 }
 
@@ -557,8 +644,10 @@ pub fn load_response_form_policy(dir: &Path) -> StoreResult<ResponseFormPolicy> 
         .collect();
     paths.sort();
     for p in &paths {
-        let text = fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
-        let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
         if let Some(section) = doc.get("response_form") {
             // The loud message names the field and its meaning: a typo in a
             // budget must tell the operator exactly what to fix.
@@ -636,9 +725,15 @@ impl ReworkPolicy {
                 ));
             }
             if !seen.insert(t.event.as_str()) {
-                return Err(format!("role `{}`: duplicate trigger event `{}`", self.role, t.event));
+                return Err(format!(
+                    "role `{}`: duplicate trigger event `{}`",
+                    self.role, t.event
+                ));
             }
-            for (field, value) in [("rationale_field", &t.rationale_field), ("verdict_field", &t.verdict_field)] {
+            for (field, value) in [
+                ("rationale_field", &t.rationale_field),
+                ("verdict_field", &t.verdict_field),
+            ] {
                 if !json_field::ALL.contains(&value.as_str()) {
                     return Err(format!(
                         "role `{}`: {field} `{value}` is not a payload field the platform writes — delivery would silently read NOTHING",
@@ -692,16 +787,22 @@ pub fn load_rework_policies(dir: &Path) -> StoreResult<Vec<ReworkPolicy>> {
     let mut by_role: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut policies = Vec::new();
     for p in &paths {
-        let text = fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
-        let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
         if doc.is_mapping() {
             continue;
         }
         let file_policies: Vec<ReworkPolicy> = serde_yaml::from_value(doc).map_err(|e| {
-            cfg_err(format!("{}: a REWORK-context policy file must be a list of `{{role, triggers}}` rows: {e}", p.display()))
+            cfg_err(format!(
+                "{}: a REWORK-context policy file must be a list of `{{role, triggers}}` rows: {e}",
+                p.display()
+            ))
         })?;
         for pol in file_policies {
-            pol.validate().map_err(|e| cfg_err(format!("{}: {e}", p.display())))?;
+            pol.validate()
+                .map_err(|e| cfg_err(format!("{}: {e}", p.display())))?;
             if let Some(prev) = by_role.get(&pol.role) {
                 return Err(cfg_err(format!(
                     "{}: role `{}` is already declared in {} — a role has exactly one rework policy row",
@@ -725,7 +826,8 @@ pub fn factory_rework_policies() -> Vec<ReworkPolicy> {
         .iter()
         .find(|(rel, _)| *rel == "workflow/rework-context.yaml")
         .expect("factory rework-context.yaml is embedded in DEFAULT_FILES");
-    let policies: Vec<ReworkPolicy> = serde_yaml::from_str(text).expect("factory rework-context.yaml parses");
+    let policies: Vec<ReworkPolicy> =
+        serde_yaml::from_str(text).expect("factory rework-context.yaml parses");
     for p in &policies {
         p.validate().expect("factory rework-context.yaml validates");
     }
@@ -733,7 +835,8 @@ pub fn factory_rework_policies() -> Vec<ReworkPolicy> {
 }
 
 fn parse_yaml<T: DeserializeOwnedPlus>(path: &Path) -> StoreResult<T> {
-    let text = fs::read_to_string(path).map_err(|e| cfg_err(format!("read {}: {e}", path.display())))?;
+    let text =
+        fs::read_to_string(path).map_err(|e| cfg_err(format!("read {}: {e}", path.display())))?;
     serde_yaml::from_str(&text).map_err(|e| cfg_err(format!("parse {}: {e}", path.display())))
 }
 
@@ -774,7 +877,12 @@ pub fn load(dir: &Path) -> StoreResult<Config> {
 
     let common: Common = parse_yaml(&dir.join("prompts/common.yaml"))?;
     let profiles = load_profiles(&dir.join("evaluation"))?;
-    Ok(Config { roles, criteria, common, profiles })
+    Ok(Config {
+        roles,
+        criteria,
+        common,
+        profiles,
+    })
 }
 
 /// Upsert config roles into the store, versioning on content change.
@@ -818,17 +926,32 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         materialize_if_absent(dir.path()).unwrap();
         let cfg = load(dir.path()).unwrap();
-        let rf = cfg.roles.iter().find(|r| r.slug == "requirements-reviewer").unwrap();
+        let rf = cfg
+            .roles
+            .iter()
+            .find(|r| r.slug == "requirements-reviewer")
+            .unwrap();
         let role = cfg.build_role(rf, Utc::now()).unwrap();
-        assert!(role.instructions.contains("[RV1|blocker]"), "{}", role.instructions);
+        assert!(
+            role.instructions.contains("[RV1|blocker]"),
+            "{}",
+            role.instructions
+        );
         assert!(role.instructions.contains("Verdict rule:"));
         assert!(role.instructions.contains("Workflow rules:"));
         // Analyst has no criteria — only the common rules block.
-        let arf = cfg.roles.iter().find(|r| r.slug == "requirements-analyst").unwrap();
+        let arf = cfg
+            .roles
+            .iter()
+            .find(|r| r.slug == "requirements-analyst")
+            .unwrap();
         let arole = cfg.build_role(arf, Utc::now()).unwrap();
         assert!(!arole.instructions.contains("Verdict rule:"));
         assert!(arole.instructions.contains("Workflow rules:"));
-        assert_eq!(arole.output_contract.as_ref().unwrap().name, "requirements-specification");
+        assert_eq!(
+            arole.output_contract.as_ref().unwrap().name,
+            "requirements-specification"
+        );
     }
 
     /// QA return7 п.(г): a malformed role `contract:` must surface as a
@@ -839,10 +962,18 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         materialize_if_absent(dir.path()).unwrap();
         let cfg = load(dir.path()).unwrap();
-        let mut rf = cfg.roles.iter().find(|r| r.slug == "requirements-analyst").unwrap().clone();
+        let mut rf = cfg
+            .roles
+            .iter()
+            .find(|r| r.slug == "requirements-analyst")
+            .unwrap()
+            .clone();
         rf.output_contract = Some("requirements-specification@notanumber".into());
         let err = cfg.build_role(&rf, Utc::now()).unwrap_err();
-        assert!(format!("{err}").contains("contract"), "the error names the field: {err}");
+        assert!(
+            format!("{err}").contains("contract"),
+            "the error names the field: {err}"
+        );
         // A well-formed ref still compiles.
         rf.output_contract = Some("requirements-specification@2".into());
         let role = cfg.build_role(&rf, Utc::now()).unwrap();
@@ -861,14 +992,26 @@ mod tests {
         assert_eq!(p.gates.len(), 4);
         assert!(p.checks().iter().any(|c| c.id == "arch/principles"));
         // Floors are derived from error_type severity, never declared per check.
-        let lb = p.checks().into_iter().find(|c| c.id == "arch/layer-boundaries").unwrap();
+        let lb = p
+            .checks()
+            .into_iter()
+            .find(|c| c.id == "arch/layer-boundaries")
+            .unwrap();
         assert_eq!(p.worst_severity(lb), Some("catastrophic"));
         assert_eq!(p.floor_for(lb), Some(0.7));
         // Auditor instructions carry the profile-compiled rubric checklist.
-        let rf = cfg.roles.iter().find(|r| r.slug == "quality-auditor").unwrap();
+        let rf = cfg
+            .roles
+            .iter()
+            .find(|r| r.slug == "quality-auditor")
+            .unwrap();
         let role = cfg.build_role(rf, Utc::now()).unwrap();
         assert!(role.instructions.contains("Evaluation profile `devai`"));
-        assert!(role.instructions.contains("[arch/idiom-consistency]"), "{}", role.instructions);
+        assert!(
+            role.instructions.contains("[arch/idiom-consistency]"),
+            "{}",
+            role.instructions
+        );
         assert!(role.instructions.contains("anchors: 1.0"));
         // Human-signed checks are named but excluded from agent scoring.
         assert!(role.instructions.contains("Human-signed checks"));
@@ -886,7 +1029,11 @@ mod tests {
         let mut cfg = load(dir.path()).unwrap();
         let p = cfg.profiles.first_mut().unwrap();
         // V7: dropping one weight breaks the sum and the coverage set.
-        let restored = p.scoring.weights.remove("arch/no-magic").expect("weight present");
+        let restored = p
+            .scoring
+            .weights
+            .remove("arch/no-magic")
+            .expect("weight present");
         assert!(p.validate().unwrap_err().contains("V7"));
         // V1: an undeclared detected type is rejected.
         p.scoring.weights.insert("arch/no-magic".into(), restored);
@@ -905,12 +1052,21 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let now = Utc::now();
         assert_eq!(seed_roles(&store, &cfg, now).unwrap(), 6);
-        assert_eq!(seed_roles(&store, &cfg, now).unwrap(), 0, "idempotent re-seed");
+        assert_eq!(
+            seed_roles(&store, &cfg, now).unwrap(),
+            0,
+            "idempotent re-seed"
+        );
 
         // The factory YAML declares its own role version (71d416b moved
         // quality-auditor to @2): the assertions track THAT declared number,
         // never a hardcoded literal that rots on the next declarative bump.
-        let declared = cfg.roles.iter().find(|r| r.slug == "quality-auditor").unwrap().version;
+        let declared = cfg
+            .roles
+            .iter()
+            .find(|r| r.slug == "quality-auditor")
+            .unwrap()
+            .version;
 
         // Edit the evaluation profile (raise theta) → next seed bumps just the auditor.
         let mut cfg2 = cfg.clone();
@@ -918,12 +1074,22 @@ mod tests {
         assert_eq!(seed_roles(&store, &cfg2, now).unwrap(), 1);
 
         let q = store.get_role("quality-auditor").unwrap().unwrap();
-        assert_eq!(q.version, declared + 1, "latest version wins for new executions");
+        assert_eq!(
+            q.version,
+            declared + 1,
+            "latest version wins for new executions"
+        );
         assert!(q.instructions.contains("theta 0.85"), "{}", q.instructions);
         // The factory-declared row remains in the table — history is never overwritten.
         let all = store.list_roles().unwrap();
-        assert!(all.iter().any(|r| r.slug == "quality-auditor" && r.version == declared));
-        assert!(all.iter().any(|r| r.slug == "quality-auditor" && r.version == declared + 1));
+        assert!(
+            all.iter()
+                .any(|r| r.slug == "quality-auditor" && r.version == declared)
+        );
+        assert!(
+            all.iter()
+                .any(|r| r.slug == "quality-auditor" && r.version == declared + 1)
+        );
     }
 
     #[test]
@@ -961,7 +1127,9 @@ mod tests {
                 let props = obj.get("properties").and_then(|p| p.as_object());
                 for k in req.iter().filter_map(|r| r.as_str()) {
                     if !props.is_some_and(|p| p.contains_key(k)) {
-                        bad.push(format!("{label}: required key `{k}` is not declared in properties"));
+                        bad.push(format!(
+                            "{label}: required key `{k}` is not declared in properties"
+                        ));
                     }
                 }
             }
@@ -976,10 +1144,15 @@ mod tests {
         }
         let mut bad = Vec::new();
         for (name, (version, schema)) in &latest {
-            let v: serde_json::Value = serde_json::from_str(schema).unwrap_or_else(|e| panic!("{name}@{version} must parse: {e}"));
+            let v: serde_json::Value = serde_json::from_str(schema)
+                .unwrap_or_else(|e| panic!("{name}@{version} must parse: {e}"));
             walk(&format!("{name}@{version}"), &v, &mut bad);
         }
-        assert!(bad.is_empty(), "contract schema-authority audit failed:\n{}", bad.join("\n"));
+        assert!(
+            bad.is_empty(),
+            "contract schema-authority audit failed:\n{}",
+            bad.join("\n")
+        );
     }
 
     /// The ratified reply-shape of @2: echo fields the platform stamps are no
@@ -992,12 +1165,35 @@ mod tests {
             .find(|(name, ver, _)| *name == "requirements-specification" && *ver == 2)
             .expect("requirements-specification@2 is seeded");
         let doc: serde_json::Value = serde_json::from_str(&schema).unwrap();
-        let required: Vec<&str> = doc["required"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
-        assert!(!required.contains(&"task_id"), "task_id is platform-stamped, not role-carried");
-        assert!(!required.contains(&"business_description"), "business_description is platform-completed when skipped");
-        assert!(required.contains(&"version"), "version stays role-owned (rework semantics)");
-        for k in ["task_id", "business_description", "source", "open_questions", "change_history"] {
-            assert!(doc["properties"][k].is_object(), "{k} declared in properties");
+        let required: Vec<&str> = doc["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert!(
+            !required.contains(&"task_id"),
+            "task_id is platform-stamped, not role-carried"
+        );
+        assert!(
+            !required.contains(&"business_description"),
+            "business_description is platform-completed when skipped"
+        );
+        assert!(
+            required.contains(&"version"),
+            "version stays role-owned (rework semantics)"
+        );
+        for k in [
+            "task_id",
+            "business_description",
+            "source",
+            "open_questions",
+            "change_history",
+        ] {
+            assert!(
+                doc["properties"][k].is_object(),
+                "{k} declared in properties"
+            );
         }
     }
 
@@ -1016,20 +1212,47 @@ mod tests {
         assert_eq!(pol.max_repair_attempts, 2, "factory budget");
         // A home predating the file: same factory bytes as fallback.
         fs::remove_file(wf.join("response-form-loop.yaml")).unwrap();
-        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 2);
+        assert_eq!(
+            load_response_form_policy(&wf).unwrap().max_repair_attempts,
+            2
+        );
         fs::remove_dir_all(&wf).unwrap();
-        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 2, "absent dir is not an error");
+        assert_eq!(
+            load_response_form_policy(&wf).unwrap().max_repair_attempts,
+            2,
+            "absent dir is not an error"
+        );
         // Operator edit — no rebuild (REQ-FG-04 AC1).
         fs::create_dir_all(&wf).unwrap();
-        fs::write(wf.join("response-form-loop.yaml"), "response_form:\n  max_repair_attempts: 0\n").unwrap();
-        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 0, "0 is valid: loop off, today's behavior");
+        fs::write(
+            wf.join("response-form-loop.yaml"),
+            "response_form:\n  max_repair_attempts: 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_response_form_policy(&wf).unwrap().max_repair_attempts,
+            0,
+            "0 is valid: loop off, today's behavior"
+        );
         // A non-participating workflow file is left alone (rework-context.yaml
         // is a top-level list; it carries no response_form section).
         fs::write(wf.join("other-list.yaml"), "- role: x\n  triggers: []\n").unwrap();
-        assert_eq!(load_response_form_policy(&wf).unwrap().max_repair_attempts, 0);
+        assert_eq!(
+            load_response_form_policy(&wf).unwrap().max_repair_attempts,
+            0
+        );
         // A broken declaration is a loud config error, never a silent default.
-        fs::write(wf.join("response-form-loop.yaml"), "response_form:\n  max_repair_attempts: -1\n").unwrap();
-        assert!(load_response_form_policy(&wf).unwrap_err().to_string().contains("max_repair_attempts"));
+        fs::write(
+            wf.join("response-form-loop.yaml"),
+            "response_form:\n  max_repair_attempts: -1\n",
+        )
+        .unwrap();
+        assert!(
+            load_response_form_policy(&wf)
+                .unwrap_err()
+                .to_string()
+                .contains("max_repair_attempts")
+        );
     }
 
     /// R-007 AC1 + one-table invariant: `init` materialises the policy file,
@@ -1043,25 +1266,57 @@ mod tests {
         let cfgdir = dir.path().join("config");
         let written = materialize_if_absent(&cfgdir).unwrap();
         assert!(
-            written.iter().any(|p| p.file_name().is_some_and(|n| n == "rework-context.yaml")),
+            written
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "rework-context.yaml")),
             "init must materialise the REWORK-context policy: {written:?}"
         );
         let loaded = load_rework_policies(&cfgdir.join("workflow")).unwrap();
-        assert_eq!(loaded, factory_rework_policies(), "home file and embedded factory bytes are one table, not two");
-        let impl_role = loaded.iter().find(|p| p.role == "implementation-agent").expect("implementation-agent row");
-        let gate = impl_role.triggers.iter().find(|t| t.event == "qa.rework_gate_tripped").expect("gate trigger declared in factory policy");
+        assert_eq!(
+            loaded,
+            factory_rework_policies(),
+            "home file and embedded factory bytes are one table, not two"
+        );
+        let impl_role = loaded
+            .iter()
+            .find(|p| p.role == "implementation-agent")
+            .expect("implementation-agent row");
+        let gate = impl_role
+            .triggers
+            .iter()
+            .find(|t| t.event == "qa.rework_gate_tripped")
+            .expect("gate trigger declared in factory policy");
         assert_eq!(gate.rationale_field, "qa_return_rationale");
-        assert!(!gate.attach_findings, "the gate quotes no findings — only the QA return flow does");
-        let returned = impl_role.triggers.iter().find(|t| t.event == "quality.returned").unwrap();
+        assert!(
+            !gate.attach_findings,
+            "the gate quotes no findings — only the QA return flow does"
+        );
+        let returned = impl_role
+            .triggers
+            .iter()
+            .find(|t| t.event == "quality.returned")
+            .unwrap();
         assert!(returned.attach_findings);
         assert!(
-            !impl_role.triggers.iter().any(|t| t.event == "qa.rework_gate_incomparable"),
+            !impl_role
+                .triggers
+                .iter()
+                .any(|t| t.event == "qa.rework_gate_incomparable"),
             "OQ-2: qa.rework_gate_incomparable deliberately feeds nothing"
         );
         // Removing the file re-reads the SAME table from embedded bytes.
         fs::remove_dir_all(cfgdir.join("workflow")).unwrap();
-        assert!(load_rework_policies(&cfgdir.join("workflow")).unwrap().is_empty(), "absent dir is the caller's fallback signal, not an error");
-        assert_eq!(factory_rework_policies(), loaded, "fallback is the factory bytes themselves");
+        assert!(
+            load_rework_policies(&cfgdir.join("workflow"))
+                .unwrap()
+                .is_empty(),
+            "absent dir is the caller's fallback signal, not an error"
+        );
+        assert_eq!(
+            factory_rework_policies(),
+            loaded,
+            "fallback is the factory bytes themselves"
+        );
     }
 
     /// Every human-authored selector is checked against the platform's own
@@ -1073,31 +1328,78 @@ mod tests {
         fs::create_dir_all(&wf).unwrap();
         let write = |body: &str| fs::write(wf.join("zz-policy.yaml"), body).unwrap();
         // unknown event kind — a never-written kind silently matches nothing
-        write("- role: implementation-agent\n  triggers:\n    - event: quality.retruned\n      rationale_field: rationale\n");
+        write(
+            "- role: implementation-agent\n  triggers:\n    - event: quality.retruned\n      rationale_field: rationale\n",
+        );
         let err = load_rework_policies(&wf).unwrap_err().to_string();
-        assert!(err.contains("quality.retruned") && err.contains("zz-policy.yaml"), "{err}");
+        assert!(
+            err.contains("quality.retruned") && err.contains("zz-policy.yaml"),
+            "{err}"
+        );
         // unknown rationale field — would silently read NOTHING
-        write("- role: implementation-agent\n  triggers:\n    - event: quality.returned\n      rationale_field: rational\n");
+        write(
+            "- role: implementation-agent\n  triggers:\n    - event: quality.returned\n      rationale_field: rational\n",
+        );
         let err = load_rework_policies(&wf).unwrap_err().to_string();
         assert!(err.contains("rationale_field"), "{err}");
         // unknown verdict field
-        write("- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      verdict_field: verdikt\n      only_if_verdict_not: APPROVED\n");
-        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("verdict_field"));
+        write(
+            "- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      verdict_field: verdikt\n      only_if_verdict_not: APPROVED\n",
+        );
+        assert!(
+            load_rework_policies(&wf)
+                .unwrap_err()
+                .to_string()
+                .contains("verdict_field")
+        );
         // broken literal — not a verdict at all (ratified 'APPR0VED' example)
-        write("- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      only_if_verdict_not: APPR0VED\n");
-        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("not a Verdict"));
+        write(
+            "- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      only_if_verdict_not: APPR0VED\n",
+        );
+        assert!(
+            load_rework_policies(&wf)
+                .unwrap_err()
+                .to_string()
+                .contains("not a Verdict")
+        );
         // parses but non-canonical: the stored-text comparison would never match
-        write("- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      only_if_verdict_not: approved\n");
-        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("canonical"));
+        write(
+            "- role: implementation-agent\n  triggers:\n    - event: review.recorded\n      rationale_field: summary\n      only_if_verdict_not: approved\n",
+        );
+        assert!(
+            load_rework_policies(&wf)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical")
+        );
         // duplicate event within one role row
-        write("- role: implementation-agent\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n    - event: quality.returned\n      rationale_field: rationale\n");
-        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("duplicate"));
+        write(
+            "- role: implementation-agent\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n    - event: quality.returned\n      rationale_field: rationale\n",
+        );
+        assert!(
+            load_rework_policies(&wf)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
         // empty triggers row
         write("- role: implementation-agent\n  triggers: []\n");
-        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("triggers` is empty"));
+        assert!(
+            load_rework_policies(&wf)
+                .unwrap_err()
+                .to_string()
+                .contains("triggers` is empty")
+        );
         // empty role slug
-        write("- role: \"\"\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n");
-        assert!(load_rework_policies(&wf).unwrap_err().to_string().contains("empty `role`"));
+        write(
+            "- role: \"\"\n  triggers:\n    - event: quality.returned\n      rationale_field: rationale\n",
+        );
+        assert!(
+            load_rework_policies(&wf)
+                .unwrap_err()
+                .to_string()
+                .contains("empty `role`")
+        );
     }
 
     /// Two rows for one role across files would make delivery order depend on
@@ -1111,7 +1413,12 @@ mod tests {
         fs::write(wf.join("aa-first.yaml"), row).unwrap();
         fs::write(wf.join("zz-second.yaml"), row).unwrap();
         let err = load_rework_policies(&wf).unwrap_err().to_string();
-        assert!(err.contains("implementation-agent") && err.contains("aa-first.yaml") && err.contains("zz-second.yaml"), "{err}");
+        assert!(
+            err.contains("implementation-agent")
+                && err.contains("aa-first.yaml")
+                && err.contains("zz-second.yaml"),
+            "{err}"
+        );
     }
 
     /// A top-level MAPPING is a different loader's business and must not
@@ -1127,10 +1434,16 @@ mod tests {
             wf.join("response-form-loop.yaml"),
         )
         .unwrap();
-        assert!(load_rework_policies(&wf).unwrap().is_empty(), "the mapping file is skipped, not parsed as rows");
+        assert!(
+            load_rework_policies(&wf).unwrap().is_empty(),
+            "the mapping file is skipped, not parsed as rows"
+        );
         fs::write(wf.join("broken.yaml"), "- not-a-row\n").unwrap();
         let err = load_rework_policies(&wf).unwrap_err().to_string();
-        assert!(err.contains("broken.yaml") && err.contains("role, triggers"), "{err}");
+        assert!(
+            err.contains("broken.yaml") && err.contains("role, triggers"),
+            "{err}"
+        );
     }
 
     /// REQ-006 sovereignty, pinned as a fact about the factory tree: role
@@ -1147,13 +1460,18 @@ mod tests {
             }
             let text = fs::read_to_string(&p).unwrap();
             assert!(
-                !text.contains("REWORK CONTEXT") && !text.contains("rework-context") && !text.contains("rationale_field"),
+                !text.contains("REWORK CONTEXT")
+                    && !text.contains("rework-context")
+                    && !text.contains("rationale_field"),
                 "{} leaks the delivery policy into a role config",
                 p.display()
             );
             seen += 1;
         }
-        assert!(seen >= 5, "the factory role set must be present (saw {seen} files)");
+        assert!(
+            seen >= 5,
+            "the factory role set must be present (saw {seen} files)"
+        );
     }
 
     #[test]
@@ -1166,10 +1484,16 @@ mod tests {
         fs::remove_dir_all(cfgdir.join("evaluation")).unwrap();
         let written = materialize_if_absent(&cfgdir).unwrap();
         assert!(
-            written.iter().any(|p| p.file_name().is_some_and(|n| n == "quality.yaml")
-                && p.parent().is_some_and(|d| d.file_name().is_some_and(|n| n == "evaluation"))),
+            written
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "quality.yaml")
+                    && p.parent()
+                        .is_some_and(|d| d.file_name().is_some_and(|n| n == "evaluation"))),
             "re-init must bring the new factory profile into an old home: {written:?}"
         );
-        assert_eq!(fs::read_to_string(cfgdir.join("criteria/review.yaml")).unwrap(), "mine");
+        assert_eq!(
+            fs::read_to_string(cfgdir.join("criteria/review.yaml")).unwrap(),
+            "mine"
+        );
     }
 }

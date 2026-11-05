@@ -26,7 +26,11 @@ fn devai(home: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .expect("the devai binary is runnable");
-    assert!(out.status.success(), "devai {args:?}:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "devai {args:?}:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -68,16 +72,38 @@ fn run_then_close_reader(home: &Path, args: &[&str], read_lines: usize) -> (Opti
 }
 
 fn assert_quiet_pipe_death(code: Option<i32>, stderr: &str, case: &str) {
-    assert_eq!(code, Some(0), "{case}: closed stdout must exit quietly (code 0), got {code:?}");
-    assert!(!stderr.contains("panicked"), "{case}: no panic text on stderr:\n{stderr}");
-    assert!(!stderr.contains("Broken pipe"), "{case}: no BrokenPipe chatter:\n{stderr}");
-    assert!(stderr.trim().is_empty(), "{case}: stderr must be silent:\n{stderr}");
+    assert_eq!(
+        code,
+        Some(0),
+        "{case}: closed stdout must exit quietly (code 0), got {code:?}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "{case}: no panic text on stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe"),
+        "{case}: no BrokenPipe chatter:\n{stderr}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "{case}: stderr must be silent:\n{stderr}"
+    );
 }
 
 /// Setup: home + one task in ANALYSIS, returning its id.
 fn seeded(home: &Path) -> String {
     devai(home, &["init"]);
-    devai(home, &["task", "new", "Pipe smoke", "--description", "closed reader"]);
+    devai(
+        home,
+        &[
+            "task",
+            "new",
+            "Pipe smoke",
+            "--description",
+            "closed reader",
+        ],
+    );
     let id = devai(home, &["task", "list"])
         .lines()
         .find(|l| l.contains("Pipe smoke"))
@@ -103,11 +129,27 @@ fn huge_line_writer_on_closed_pipe_dies_quietly() {
     big.push_str("\"}");
     let file = home.path().join("big-contract.json");
     std::fs::write(&file, &big).unwrap();
-    devai(home.path(), &["contract", "add", "--name", "big", "--version", "1", "--file", &file.display().to_string()]);
+    devai(
+        home.path(),
+        &[
+            "contract",
+            "add",
+            "--name",
+            "big",
+            "--version",
+            "1",
+            "--file",
+            &file.display().to_string(),
+        ],
+    );
     let _ = &id;
     let (code, err) = run_then_close_reader(home.path(), &["contract", "get", "big"], 0);
     // NOTE: `contract get` is the println!-shaped path (formatted JSON line).
-    assert_quiet_pipe_death(code, &err, "contract get (300KiB pretty line, reader closed)");
+    assert_quiet_pipe_death(
+        code,
+        &err,
+        "contract get (300KiB pretty line, reader closed)",
+    );
 }
 
 #[test]
@@ -118,7 +160,18 @@ fn raw_bytes_path_on_closed_pipe_dies_quietly() {
     let id = seeded(home.path());
     let blob = home.path().join("blob.bin");
     std::fs::write(&blob, vec![b'x'; 300 * 1024]).unwrap();
-    let listed = devai(home.path(), &["artifact", "publish", &id, "--kind", "OTHER", "--file", &blob.display().to_string()]);
+    let listed = devai(
+        home.path(),
+        &[
+            "artifact",
+            "publish",
+            &id,
+            "--kind",
+            "OTHER",
+            "--file",
+            &blob.display().to_string(),
+        ],
+    );
     let art_id = listed.split_whitespace().nth(2).unwrap().to_string();
     let (code, err) = run_then_close_reader(home.path(), &["artifact", "cat", &art_id], 0);
     assert_quiet_pipe_death(code, &err, "artifact cat (300KiB raw, reader closed)");
@@ -149,13 +202,39 @@ fn literal_head_pipelines_exit_clean() {
     let id = seeded(home.path());
     let bin = env!("CARGO_BIN_EXE_devai");
     for (cmdline, case) in [
-        (format!("{bin} --home {} task status {id} | head -8; exit ${{PIPESTATUS[0]}}", home.path().display()), "task status | head -8"),
-        (format!("{bin} --home {} task progress {id} | head -1; exit ${{PIPESTATUS[0]}}", home.path().display()), "task progress | head -1"),
-        (format!("{bin} --home {} task --help | head -2; exit ${{PIPESTATUS[0]}}", home.path().display()), "task --help | head -2 (clap path)"),
+        (
+            format!(
+                "{bin} --home {} task status {id} | head -8; exit ${{PIPESTATUS[0]}}",
+                home.path().display()
+            ),
+            "task status | head -8",
+        ),
+        (
+            format!(
+                "{bin} --home {} task progress {id} | head -1; exit ${{PIPESTATUS[0]}}",
+                home.path().display()
+            ),
+            "task progress | head -1",
+        ),
+        (
+            format!(
+                "{bin} --home {} task --help | head -2; exit ${{PIPESTATUS[0]}}",
+                home.path().display()
+            ),
+            "task --help | head -2 (clap path)",
+        ),
     ] {
-        let out = Command::new("bash").arg("-c").arg(&cmdline).output().expect("bash is available");
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&cmdline)
+            .output()
+            .expect("bash is available");
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{case}: devai under `| head` must not fail: exit {:?}, stderr: {err}", out.status.code());
+        assert!(
+            out.status.success(),
+            "{case}: devai under `| head` must not fail: exit {:?}, stderr: {err}",
+            out.status.code()
+        );
         assert!(!err.contains("panicked"), "{case}: no panic text: {err}");
     }
 }
@@ -172,7 +251,7 @@ fn literal_head_pipelines_exit_clean() {
 /// 101).
 #[test]
 fn task_active_on_closed_pipe_dies_quietly() {
-    use devai_core::types::{new_id, ExecutionStatus, RoleExecution, Task};
+    use devai_core::types::{ExecutionStatus, RoleExecution, Task, new_id};
     use devai_store::Store;
 
     let home = TempDir::new().unwrap();
@@ -211,9 +290,17 @@ fn task_active_on_closed_pipe_dies_quietly() {
     }
 
     let (code, err) = run_then_close_reader(home.path(), &["task", "active"], 1);
-    assert_quiet_pipe_death(code, &err, "task active (1000 RUNNING lines, reader closed)");
+    assert_quiet_pipe_death(
+        code,
+        &err,
+        "task active (1000 RUNNING lines, reader closed)",
+    );
     let (code, err) = run_then_close_reader(home.path(), &["--json", "task", "active"], 0);
-    assert_quiet_pipe_death(code, &err, "task active --json (one oversized line, reader closed)");
+    assert_quiet_pipe_death(
+        code,
+        &err,
+        "task active --json (one oversized line, reader closed)",
+    );
 }
 
 #[test]
@@ -223,12 +310,17 @@ fn logical_errors_stay_loud() {
     let home = TempDir::new().unwrap();
     devai(home.path(), &["init"]);
     let out = Command::new(env!("CARGO_BIN_EXE_devai"))
-        .arg("--home").arg(home.path())
-        .env_remove("DEVAI_HOME").env_remove("DEVAI_CONFIG")
+        .arg("--home")
+        .arg(home.path())
+        .env_remove("DEVAI_HOME")
+        .env_remove("DEVAI_CONFIG")
         .args(["task", "status", "no-such-task-id"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "logical error keeps exit 1");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("not found"), "and stays visible on stderr: {err}");
+    assert!(
+        err.contains("not found"),
+        "and stays visible on stderr: {err}"
+    );
 }
