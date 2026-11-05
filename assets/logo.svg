@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="g" x1="0" y1="180" x2="0" y2="844" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- squircle field -->
+  <rect x="40" y="40" width="944" height="944" rx="200" fill="#0d1424"/>
+  <rect x="40" y="40" width="944" height="944" rx="200" fill="none" stroke="#1c2942" stroke-width="12"/>
+
+  <!-- lowercase d: bowl left, ascender right -->
+  <circle cx="452" cy="616" r="210" fill="none" stroke="url(#g)" stroke-width="84"/>
+  <rect x="632" y="180" width="84" height="664" rx="42" fill="url(#g)"/>
+
+  <!-- accepted task inside the loop -->
+  <circle cx="452" cy="616" r="54" fill="#22c55e"/>
+</svg>
