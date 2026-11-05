@@ -28,17 +28,16 @@ anything merges.
 
 ## Install (Linux)
 
-### Release binary
-
-Grab the `devai-vX.Y.Z-linux-x86_64.tar.gz` asset (plus its `.sha256`) from the
-[latest release](https://github.com/3eR01ive/devai/releases/latest):
+### Install script (no sudo)
 
 ```sh
-curl -LO https://github.com/3eR01ive/devai/releases/latest/download/devai-v0.1.0-linux-x86_64.tar.gz
-echo "$(cat devai-v0.1.0-linux-x86_64.tar.gz.sha256)  devai-v0.1.0-linux-x86_64.tar.gz" | sha256sum -c -
-tar xzf devai-v0.1.0-linux-x86_64.tar.gz
-sudo install devai-v0.1.0-linux-x86_64/devai /usr/local/bin/devai
+curl -fsSL https://raw.githubusercontent.com/3eR01ive/devai/main/install.sh | sh
 ```
+
+It fetches the latest linux-x86_64 release, verifies its sha256 and installs
+`devai` into `~/.local/bin`. Overrides: `DEVAI_VERSION` (pin a tag),
+`DEVAI_INSTALL_DIR` (target directory). If `~/.local/bin` is not already on
+your `PATH`, the script will tell you the one line to add to your shell profile.
 
 ### From source
 
