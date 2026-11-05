@@ -1,0 +1,31 @@
+# devai-ui-content-snapshot v1
+# captured_at: 2026-11-05T19:42:39.422367+00:00
+# window_filter: devai-ui  picked: first  pid: 2152979
+# nodes: 26
+# --- axtree ---
+[application] 'devai-ui'
+  [frame] 'devai-ui'
+    [filler] ''
+      [filler] ''
+        [filler] ''
+          [scroll pane] ''
+            [document web] 'devai-ui'
+              [landmark] ''
+                [landmark] ''
+                  [link] 'Проекты'
+                  [link] 'Задачи'
+                  [link] 'Активные'
+                  [link] 'Вопросы'
+                  [link] 'Операции API'
+                [section] ''
+              [landmark] ''
+                [heading] 'Проекты'
+                [button] 'Обновить'
+                [section] ''
+                [button] 'Задачи проекта'
+                [paragraph] ''
+                [paragraph] ''
+                [section] ''
+                [button] 'Задачи проекта'
+                [paragraph] ''
+                [paragraph] ''
