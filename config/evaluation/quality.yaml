@@ -76,7 +76,20 @@
 # Иерархия тяжестей сохранена: продуктовые инварианты суммарно 0.62,
 # абстрактный корпус 0.38, сумма ровно 1.00 (V7).
 
-version: 12
+# v13 (D1 задачи 01a1acec, 2026-11-05): гейт «содержимое окна» ui-content —
+# UI-задача не проходит QA без пары артефактов прогона (скриншот окна +
+# AX-дерево) и с error-page/белым содержимым внутри них. Критерий и пороги:
+# docs/ui-content-criteria.md; исполнитель пробы — crates/devai-ui/tools/
+# ui_content.py (selftest+auto), ожидания поверхности —
+# crates/devai-ui/tools/ui_expectations.json, регрессионные образцы —
+# crates/devai-ui/qa-samples (known-bad 05.11 «Operation was cancelled» /
+# known-good живой dev-прогон). Применимость — по UI-поверхности задачи
+# (маркеры tauri.conf.json / .ui-audit-surface.json + пары в evidence),
+# не-UI задачи дают N/A; отсутствие харнесса съёмки = 127 = BLOCKED по
+# семантике Probe{pass_exit} выше, не FAIL. Веса проверок не тронуты
+# (гейты бинарны, V7 sum=1.00 сохранён).
+
+version: 13
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -252,6 +265,20 @@ gates:
     # --exclude: сам профиль хранит regex-паттерны — не даём шлюзу матчиться на себя
     probes:
       - { cmd: "test -z \"$(grep -RIlE 'api[_-]?key|BEGIN.*PRIVATE KEY' crates config --exclude=quality.yaml 2>/dev/null)\"", pass_exit: [0] }
+  - id: ui-content
+    desc: >
+      Критерий «содержимое окна» (docs/ui-content-criteria.md, D1 01a1acec):
+      если задача затрагивает UI-поверхность (tauri.conf.json/.ui-audit-surface.json
+      в diff или пара артефактов в evidence), аудит принимает только прогон с
+      парой скриншот+AX-дерево: ни одного error-page текста («Operation was
+      cancelled» и семейство), дерево заполнено (белый экран отсекается),
+      обязательные навигационные элементы на месте. Перед вердиктом —
+      selftest харнесса на qa-samples (known-bad обязан валиться, иначе
+      гейт сломан). Нет UI-поверхности у задачи → N/A (выход 0).
+      Отсутствие харнесса/тулинга съёмки → shell 127 → BLOCKED (не FAIL):
+      невыполненная проба не притворяется проверенной.
+    probes:
+      - { cmd: "f=crates/devai-ui/tools/ui_content.py; if [ -f \"$f\" ]; then python3 \"$f\" gate; else ui-audit-harness-absent-guard; fi", pass_exit: [0] }
 
 evaluations:
   - id: readability
