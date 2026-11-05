@@ -13,7 +13,7 @@ use chrono::Utc;
 use devai_core::error::CoreError;
 use devai_core::types::*;
 use devai_core::workflow;
-use devai_store::config::{Profile, ResponseFormPolicy, ReworkPolicy};
+use devai_store::config::{HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy};
 use devai_store::{ArtifactDraft, Store, StoreError};
 
 use crate::adapters::{
@@ -308,6 +308,17 @@ pub struct Engine<'a> {
     /// platform-owned `config/workflow/*.yaml` data, never hardcoded at a
     /// call site. `max_repair_attempts = 0` keeps today's one-shot behavior.
     response_form: ResponseFormPolicy,
+    /// Declarative humanization template (task 01a1acfe, REQ-HP-04): the
+    /// paragraph's volume window, explanation slots, register and detector
+    /// thresholds — `config/workflow/humanize.yaml`, loaded once per run,
+    /// handed to the gate and to the role prompt as data.
+    humanize: HumanizePolicy,
+    /// A present-but-broken humanization template is LOUD at the next stage
+    /// (same held-error discipline as the delivery table): `Engine::new`
+    /// stays infallible, `run_stage` refuses to proceed on config the
+    /// operator can still fix — the factory default never masquerades as
+    /// the project's declared template (REQ-HP-04 AC2).
+    humanize_config_error: Option<String>,
     /// REWORK-context delivery table (R-001): which recorded decision events
     /// feed which role. Platform workflow data, loaded from
     /// `config/workflow/rework-context.yaml`; a home without it falls back
@@ -341,6 +352,20 @@ impl<'a> Engine<'a> {
         let response_form =
             devai_store::config::load_response_form_policy(&cfg_dir.join("workflow"))
                 .unwrap_or_default();
+        // Humanization template (REQ-HP-04). Absent file/dir => the embedded
+        // factory bytes (`Default` — the same values `humanize.yaml`
+        // declares). Present-but-broken => the error is HELD and raised
+        // loudly at the next stage: a typo'd threshold must never degrade
+        // into a silent factory policy while the YAML on disk claims
+        // otherwise (loud-degrade discipline of the delivery table).
+        let mut humanize_config_error = None;
+        let humanize = match devai_store::config::load_humanize_policy(&cfg_dir.join("workflow")) {
+            Ok(policy) => policy,
+            Err(e) => {
+                humanize_config_error = Some(e.to_string());
+                devai_store::config::HumanizePolicy::default()
+            }
+        };
         // REWORK delivery table. Unlike the form budget, the table cannot
         // degrade quietly — a silently empty table would disable delivery
         // while the YAML on disk claims otherwise. Absent file/dir =>
@@ -365,6 +390,8 @@ impl<'a> Engine<'a> {
             workspace,
             force_reaudit: false,
             response_form,
+            humanize,
+            humanize_config_error,
             rework,
             rework_config_error,
         }
@@ -394,6 +421,36 @@ impl<'a> Engine<'a> {
     /// value comes from `config/workflow/response-form-loop.yaml`).
     pub fn with_max_repair_attempts(mut self, max_repair_attempts: u32) -> Self {
         self.response_form.max_repair_attempts = max_repair_attempts;
+        self
+    }
+
+    /// Provide the humanization template explicitly (tests; the production
+    /// value comes from `config/workflow/humanize.yaml`, falling back to the
+    /// embedded factory bytes). Replacing it clears any held load error —
+    /// the caller has just supplied a valid template.
+    pub fn with_humanize_policy(mut self, humanize: HumanizePolicy) -> Self {
+        self.humanize = humanize;
+        self.humanize_config_error = None;
+        self
+    }
+
+    /// Re-read the humanization template from an explicit `workflow/`
+    /// directory, applying the exact resolution of `new` (declared file wins,
+    /// absence => factory bytes, present-but-broken => HELD loud error).
+    /// Deterministic test seam for config-resolution proofs (the delivery
+    /// table precedent) — including REQ-HP-04 AC1: a project editing the
+    /// volume window in the YAML changes the gate WITHOUT a code change.
+    pub fn with_humanize_config_dir(mut self, dir: &std::path::Path) -> Self {
+        match devai_store::config::load_humanize_policy(dir) {
+            Ok(policy) => {
+                self.humanize = policy;
+                self.humanize_config_error = None;
+            }
+            Err(e) => {
+                self.humanize = HumanizePolicy::default();
+                self.humanize_config_error = Some(e.to_string());
+            }
+        }
         self
     }
 
@@ -827,6 +884,12 @@ impl<'a> Engine<'a> {
         if let Some(err) = &self.rework_config_error {
             return Err(RuntimeError::Store(StoreError::Config(err.clone())));
         }
+        // REQ-HP-04 AC2: a broken humanization template stops the stage
+        // LOUDLY — the factory default never silently replaces what the
+        // project's `humanize.yaml` declares.
+        if let Some(err) = &self.humanize_config_error {
+            return Err(RuntimeError::Store(StoreError::Config(err.clone())));
+        }
         if let Some(section) =
             crate::context::rework_context(self.store, task, role_slug, &self.rework)?
         {
@@ -1112,6 +1175,9 @@ impl<'a> Engine<'a> {
             // Attempt 1 answers the ORIGINAL question; the loop fills this
             // in for re-prompts (REQ-FG-02 AC2).
             repair: None,
+            // REQ-HP-04: the loaded template rides with the request — the
+            // gate and the prompt read the same values, one per run.
+            humanize: self.humanize.clone(),
         };
 
         // THE response-form correction loop (REQ-FG-02..04, OQ-FG-06/08/09):
@@ -1283,7 +1349,7 @@ impl<'a> Engine<'a> {
                                 QUALITY_REPORT_CONTRACT.1,
                             )
                         })?;
-                    if let Err(e) = adapters::validate_against_contract(&text, Some(&schema)) {
+                    if let Err(e) = adapters::validate_reply(&text, Some(&schema), &self.humanize) {
                         let _ = self.store.finish_execution_classified(
                             &execution,
                             ExecutionStatus::Failed,
@@ -1458,8 +1524,10 @@ impl<'a> Engine<'a> {
         let text = serde_json::to_string_pretty(&body)
             .map_err(|e| AdapterError::Platform(format!("cannot serialize stamped spec: {e}")))?;
         // Re-validate the STAMPED body: the platform never loosens its own
-        // gate after touching the reply.
-        adapters::validate_against_contract(&text, contract_schema).map_err(|e| {
+        // gate after touching the reply — the FULL gate, human paragraph
+        // included (REQ-HP-02: no bypass door; the echo stamping must not
+        // break what the role wrote).
+        adapters::validate_reply(&text, contract_schema, &self.humanize).map_err(|e| {
             AdapterError::Platform(format!("platform stamping broke the spec contract: {e}"))
         })?;
         Ok(ExecOutput {
@@ -1516,9 +1584,10 @@ impl<'a> Engine<'a> {
         let text = serde_json::to_string_pretty(&body)
             .map_err(|e| AdapterError::Platform(format!("cannot serialize stamped report: {e}")))?;
         // Re-validate the STAMPED body against the role's contract (the
-        // mechanical half of implementation-report@2: the guarantee is
-        // engine-side, not a promise to the model).
-        adapters::validate_against_contract(&text, contract_schema)?;
+        // mechanical half of implementation-report@3: the guarantee is
+        // engine-side, not a promise to the model) — the FULL gate, so the
+        // human paragraph survives platform stamping unchanged (REQ-HP-07).
+        adapters::validate_reply(&text, contract_schema, &self.humanize)?;
         self.store.insert_event(
             Some(task.id),
             event_kind::WORKTREE_COMMITTED,

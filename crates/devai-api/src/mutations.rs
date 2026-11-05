@@ -146,6 +146,15 @@ pub struct RunOutcome {
     pub current_quality_report: Option<Artifact>,
     /// The stored §2.6 rendering shown at the human gates, when present.
     pub gate_report_text: Option<String>,
+    /// REQ-HP-05: the human paragraphs the gate presents FIRST, before any
+    /// formal structure — `(artifact label, stored paragraph)` pairs read
+    /// verbatim from the CURRENT artifacts' bodies (REQ-HP-07: the gate
+    /// shows exactly the text that passed the detector, no read-time
+    /// re-translation). Approval/review gates carry the spec + review
+    /// paragraphs; acceptance gates carry the implementation-report
+    /// paragraph (ratified OQ-HP-1: it is what the operator reads there).
+    /// Additive to the machine surface — `--json` keeps rendering `report`.
+    pub gate_human_paragraphs: Vec<(String, String)>,
     pub allowed_operations: Vec<String>,
 }
 
@@ -610,11 +619,41 @@ impl Api {
             ),
             _ => (None, None),
         };
+        // REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
+        // presentation — approval/review reads spec + review, acceptance
+        // reads the implementation-report. Stored fields, verbatim; absence
+        // (a legacy @1/@2 CURRENT, a non-JSON body) renders as NO paragraph,
+        // never as a broken gate (REQ-HP-06 non-retroactivity in the render
+        // half too).
+        let mut gate_human_paragraphs: Vec<(String, String)> = Vec::new();
+        match report.gate {
+            Gate::WaitingApproval => {
+                for (kind, label) in [
+                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
+                    (ArtifactKind::ReviewReport, "review-report"),
+                ] {
+                    if let Some(p) = self.stored_human_paragraph(report.task_id, kind, label)? {
+                        gate_human_paragraphs.push(p);
+                    }
+                }
+            }
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                if let Some(p) = self.stored_human_paragraph(
+                    report.task_id,
+                    ArtifactKind::ImplementationReport,
+                    "implementation-report",
+                )? {
+                    gate_human_paragraphs.push(p);
+                }
+            }
+            _ => {}
+        }
         let t = self.store.get_task(&report.task_id.to_string())?;
         Ok(RunOutcome {
             report,
             current_quality_report,
             gate_report_text,
+            gate_human_paragraphs,
             allowed_operations: workflow::allowed_ops(&t)
                 .into_iter()
                 .map(|s| s.to_string())
@@ -873,10 +912,17 @@ impl Api {
             // Gate parity (ratified OQ-FG-05, REQ-FG-08): the manual path
             // runs the SAME contract gate as the engine loop; enforcement
             // is the API's, the presentation (warning + full list) the
-            // consumer's.
-            let violations = devai_runtime::contract_violations(
+            // consumer's. REQ-HP-02 closes the last door: the paragraph
+            // halves (presence via `required`, edibility via the
+            // deterministic detector) live in this one call, and it reads
+            // the project's loaded `humanize.yaml` fresh — config stays
+            // the source of truth, a broken template is a LOUD refusal,
+            // never a silent factory fallback on the manual path.
+            let humanize = self.humanize_policy()?;
+            let violations = devai_runtime::artifact_violations(
                 String::from_utf8_lossy(&content).as_ref(),
                 Some(schema.as_str()),
+                &humanize,
             )?;
             if !violations.is_empty() {
                 return Err(ApiError::ContractRejected {
@@ -1436,6 +1482,50 @@ impl Api {
         ))
     }
 
+    /// The project's humanization template, resolved the same way the engine
+    /// resolves `DEVAI_CONFIG`/home config (REQ-HP-04): loaded per call, so
+    /// a value edit lands on the very next publication without a rebuild,
+    /// and a broken file refuses LOUD — the manual publish path never
+    /// silently falls back to the factory while the YAML claims otherwise.
+    fn humanize_policy(&self) -> ApiResult<devai_store::config::HumanizePolicy> {
+        let cfg_dir = std::env::var_os("DEVAI_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.store.root().join("config"));
+        Ok(devai_store::config::load_humanize_policy(
+            &cfg_dir.join("workflow"),
+        )?)
+    }
+
+    /// REQ-HP-05/07: the stored human paragraph of the CURRENT artifact of
+    /// `kind`, verbatim — the gate renders exactly the bytes the detector
+    /// accepted, no read-time retranslation. Honest `Ok(None)` cases: no
+    /// CURRENT row of the kind, a legacy body under @1/@2 without the
+    /// field, a non-JSON body (manual free-form artifacts stay publishable
+    /// under no contract — they simply render no paragraph). A store
+    /// failure propagates; the gate never fabricates prose.
+    fn stored_human_paragraph(
+        &self,
+        task_id: Id,
+        kind: ArtifactKind,
+        label: &str,
+    ) -> ApiResult<Option<(String, String)>> {
+        let arts = self.store.artifacts(task_id)?;
+        let Some(a) = arts
+            .iter()
+            .find(|a| a.kind == kind && a.status == ArtifactStatus::Current)
+        else {
+            return Ok(None);
+        };
+        let blob = self.store.read_blob(&a.sha256)?;
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&blob) else {
+            return Ok(None);
+        };
+        let Some(paragraph) = v.get("human_paragraph").and_then(|t| t.as_str()) else {
+            return Ok(None);
+        };
+        Ok(Some((format!("{label} v{}", a.seq), paragraph.to_string())))
+    }
+
     /// The §2.6 rendering of the CURRENT quality report, when one is
     /// present (the human gate's viewing channel; reports assembled before
     /// @2 render the placeholder the old CLI printed). `Ok(None)` is the
@@ -1793,5 +1883,260 @@ mod tests {
             !api.role_list().unwrap().is_empty(),
             "seeded roles are visible through the read plane"
         );
+    }
+
+    // ---- human paragraph (task 01a1acfe) ---------------------------------
+    //
+    // The manual `artifact publish` half of REQ-HP-02/03: the SAME gate as
+    // the engine (one function, loaded project policy), rejection with the
+    // FULL violation list and no side effects — the rejected body never
+    // becomes an artifact, there is no failure_class naming and no re-prompt
+    // (the manual path has no form loop; parity ratified OQ-FG-05).
+
+    fn seeded_api(dir: &Path) -> Api {
+        let api = api(dir);
+        api.seed_config(None).unwrap();
+        api
+    }
+
+    /// REQ-HP-01/02 (manual half): @3 publication without the paragraph is
+    /// refused with the field named at its json path; nothing lands.
+    #[test]
+    fn manual_publish_refuses_a_spec_without_the_paragraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "no-paragraph");
+        let id = t.to_string();
+        api.task_start(&id).unwrap();
+        let e = api
+            .artifact_publish_row(PublishReq {
+                id: id.clone(),
+                kind: ArtifactKind::RequirementsSpec,
+                name: "spec.json".into(),
+                content: br#"{"version":1,"requirements":[],"unknowns":[],"assumptions":[]}"#
+                    .to_vec(),
+                depends: vec![],
+                contract: Some("requirements-specification@3".into()),
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode("contract_violation"));
+        let text = format!("{e}");
+        assert!(
+            text.contains("$.human_paragraph: missing required key"),
+            "the refusal names the paragraph: {text}"
+        );
+        // No failure-class taxonomy on the manual door (there is no loop to
+        // classify — the CLI consumer prints `warning:` lines per cause).
+        assert!(!text.contains("response_form"), "{text}");
+        // And the refusal wrote NOTHING: the rejected body is not an artifact.
+        assert_eq!(api.task_get(&id).unwrap().state, TaskState::Analysis);
+        let arts = api.store.artifacts(t).unwrap();
+        assert!(
+            !arts
+                .iter()
+                .any(|a| a.kind == ArtifactKind::RequirementsSpec),
+            "rejected bodies never become artifacts"
+        );
+    }
+
+    /// REQ-HP-03 (manual half): an unreadable paragraph — «всё хорошо,
+    /// работа выполнена» — is refused by the detector with the plain-words
+    /// cause; the same body under the OLD @2 contract passes unchanged
+    /// (REQ-HP-06 non-retroactivity on the publication door).
+    #[test]
+    fn manual_publish_detector_and_non_retroactivity() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "chatter");
+        let id = t.to_string();
+        api.task_start(&id).unwrap();
+        let chatter = serde_json::json!({
+            "version": 1,
+            "requirements": [{"id": "R1", "statement": "Требование."}],
+            "unknowns": [],
+            "assumptions": [],
+            "human_paragraph": "всё хорошо, работа выполнена"
+        });
+        let e = api
+            .artifact_publish_row(PublishReq {
+                id: id.clone(),
+                kind: ArtifactKind::RequirementsSpec,
+                name: "spec.json".into(),
+                content: chatter.to_string().into_bytes(),
+                depends: vec![],
+                contract: Some("requirements-specification@3".into()),
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode("contract_violation"));
+        let text = format!("{e}");
+        assert!(
+            text.contains("below the configured minimum") || text.contains("explanation slot"),
+            "detector cause in plain words: {text}"
+        );
+        // The SAME body is legal under @2 — no paragraph obligation there.
+        api.artifact_publish_row(PublishReq {
+            id: id.clone(),
+            kind: ArtifactKind::RequirementsSpec,
+            name: "spec-v2.json".into(),
+            content: chatter.to_string().into_bytes(),
+            depends: vec![],
+            contract: Some("requirements-specification@2".into()),
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .expect("REQ-HP-06: the obligation is not retroactive");
+    }
+
+    /// REQ-HP-03 AC5: publishing the platform-assembled quality-report never
+    /// runs the detector on its report_text — the §2.6 render is exempt by
+    /// construction (its schema has no paragraph field).
+    #[test]
+    fn quality_report_publish_never_meets_the_paragraph_detector() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "qa-exempt");
+        let id = t.to_string();
+        api.task_start(&id).unwrap();
+        // A report_text that would FAIL the detector as a role field —
+        // publish must accept it untouched.
+        let body = serde_json::json!({
+            "verdict": "ACCEPT",
+            "recommendation_basis": "all gates passed",
+            "report_text": "ок",
+            "profile": { "project": "p", "version": 1 },
+            "workspace_revision": {
+                "git_head": null, "dirty_digest": null, "profile": null, "roles": []
+            },
+            "evaluation": { "verdict": "PASS", "score": 0.9, "theta": 0.8, "gates": [], "checks": [] }
+        });
+        api.artifact_publish_row(PublishReq {
+            id: id.clone(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr.json".into(),
+            content: body.to_string().into_bytes(),
+            depends: vec![],
+            contract: Some("quality-report@4".into()),
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .expect("report_text is exempt from the detector (REQ-HP-03)");
+    }
+
+    /// REQ-HP-04 AC1 on the manual door: the project EDITS humanize.yaml
+    /// (no rebuild) and the very next publication resolves the new values —
+    /// the same paragraph rejected at the factory minimum passes the second
+    /// the window is lowered in the config tree.
+    #[test]
+    fn manual_publish_reads_the_edited_template_without_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "config-window");
+        let id = t.to_string();
+        api.task_start(&id).unwrap();
+        let body = serde_json::json!({
+            "version": 1,
+            "requirements": [{"id": "R1", "statement": "Требование."}],
+            "unknowns": [],
+            "assumptions": [],
+            "human_paragraph": "абзац длиной ровно в проектную норму"
+        })
+        .to_string();
+        let publish = |api: &Api, contract: &str| {
+            api.artifact_publish_row(PublishReq {
+                id: id.clone(),
+                kind: ArtifactKind::RequirementsSpec,
+                name: "spec.json".into(),
+                content: body.clone().into_bytes(),
+                depends: vec![],
+                contract: Some(contract.into()),
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
+        };
+        // Factory min 200: refused…
+        let e = publish(&api, "requirements-specification@3").unwrap_err();
+        assert!(
+            format!("{e}").contains("below the configured minimum"),
+            "{e}"
+        );
+        // …the project lowers the window in the FILE — no code, no rebuild…
+        std::fs::write(
+            dir.path()
+                .join("config/workflow/humanize.yaml"),
+            "humanize:\n  min_chars: 20\n  max_chars: 400\n  ngram: 2\n  overlap_max_ratio: 0.95\n  forbidden_markers: []\n  slots: []\n",
+        )
+        .unwrap();
+        // …and the next publication accepts the same bytes.
+        publish(&api, "requirements-specification@3").expect("config is the source of truth");
+    }
+
+    /// REQ-HP-05/07: `task_run` stopping at the approval gate carries the
+    /// human paragraphs of the CURRENT spec and review — the stored field
+    /// verbatim, read without any re-translation, while the machine report
+    /// surface (`--json` renders `report`) keeps its exact shape.
+    #[test]
+    fn approval_gate_presents_the_stored_paragraphs_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let o = api
+            .task_run(RunReq {
+                id: api
+                    .task_create(TaskCreateReq {
+                        title: "show-me".into(),
+                        project_id: None,
+                        description: "Показать абзац на гейте".into(),
+                        parent: vec![],
+                        blocked_by: vec![],
+                    })
+                    .unwrap()
+                    .task
+                    .id
+                    .to_string(),
+                agent: "mock".into(),
+                workspace: None,
+                force_reaudit: false,
+            })
+            .unwrap();
+        assert_eq!(o.report.gate, Gate::WaitingApproval);
+        let labels: Vec<&str> = o
+            .gate_human_paragraphs
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["requirements-specification v1", "review-report v1"],
+            "spec first, review second — the reading order of the gate"
+        );
+        // REQ-HP-07: what the gate shows IS what the detector accepted and
+        // what the store holds — byte-for-byte, no generation at read time.
+        let arts = o.report.steps.clone();
+        assert_eq!(arts.len(), 2, "analyst + reviewer ran");
+        for (label, text) in &o.gate_human_paragraphs {
+            let kind = if label.starts_with("requirements") {
+                ArtifactKind::RequirementsSpec
+            } else {
+                ArtifactKind::ReviewReport
+            };
+            let a = api
+                .store
+                .artifacts(o.report.task_id)
+                .unwrap()
+                .into_iter()
+                .find(|x| x.kind == kind && x.status == ArtifactStatus::Current)
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&api.store.read_blob(&a.sha256).unwrap()).unwrap();
+            assert_eq!(body["human_paragraph"].as_str().unwrap(), text.as_str());
+        }
     }
 }

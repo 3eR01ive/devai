@@ -1093,3 +1093,84 @@ fn pipeline_projection_maps_states_to_their_spine_position() {
         let _ = workflow::allowed_ops(&t);
     }
 }
+
+/// Ratified OQ-HP-5: the form-loop escalation is the MOST human place in
+/// the protocol — the blocking question it parks must carry a plain-words
+/// retelling of WHY the platform refused, before and alongside the formal
+/// violation list (which stays whole: the paragraph adds the readable half,
+/// it never replaces the machine facts).
+#[test]
+fn form_escalation_carries_a_human_retelling_of_the_refusal() {
+    let mut t = draft_task();
+    t = workflow::start(&t, "tester", now()).unwrap().task; // active stage
+    let violations = vec![
+        "$.human_paragraph: missing required key".to_string(),
+        "$.version: expected integer, got string".to_string(),
+    ];
+    let m = workflow::escalate_form_rejection(
+        &t,
+        new_id(),
+        "requirements-analyst",
+        3,
+        &violations,
+        "tester",
+        now(),
+    )
+    .unwrap();
+    assert_eq!(m.task.state, TaskState::WaitingForInput);
+    assert_eq!(m.questions.len(), 1);
+    let q = &m.questions[0];
+    assert!(q.blocking);
+    // The human half: simple words, role, attempts, the shape of the
+    // defect named in ordinary language — the field is called out where it
+    // lives in the machine list too.
+    assert!(q.text.starts_with("Простыми словами:"), "{}", q.text);
+    assert!(q.text.contains("requirements-analyst"));
+    assert!(q.text.contains("3 раз"));
+    assert!(
+        q.text.contains("human_paragraph"),
+        "the retelling names the missing field: {}",
+        q.text
+    );
+    assert!(
+        q.text.contains("не было обязательных полей"),
+        "absence in plain words: {}",
+        q.text
+    );
+    assert!(
+        q.text.contains("не того типа"),
+        "the type mismatch retold in its own words: {}",
+        q.text
+    );
+    // The formal half survives verbatim: FULL list, never the first item.
+    for v in &violations {
+        assert!(q.text.contains(v.as_str()), "full list kept: {v}");
+    }
+}
+
+/// The unreadable-paragraph refusal class gets its own human phrase (the
+/// detector rejections are NOT "missing fields" — conflating them would
+/// retell the wrong cause).
+#[test]
+fn form_escalation_retells_an_unreadable_paragraph_in_plain_words() {
+    let mut t = draft_task();
+    t = workflow::start(&t, "tester", now()).unwrap().task;
+    let violations = vec![
+        "$.human_paragraph: paragraph is 57 chars, below the configured minimum 200 — write in plain words what happens now and what will change (empty filler is rejected)".to_string(),
+    ];
+    let m = workflow::escalate_form_rejection(
+        &t,
+        new_id(),
+        "requirements-reviewer",
+        2,
+        &violations,
+        "tester",
+        now(),
+    )
+    .unwrap();
+    assert!(
+        m.questions[0]
+            .text
+            .contains("человеческий абзац не прошёл проверку читаемости")
+    );
+}

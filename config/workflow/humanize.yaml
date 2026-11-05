@@ -1,0 +1,82 @@
+# Humanization template of the role artifacts (task 01a1acfe, REQ-HP-04).
+# Platform protocol data — the same idiom as `response_form:` above: a
+# merge-scan of `workflow/*.yaml` for the `humanize:` section
+# (`devai_store::config::load_humanize_policy`). A home without this file
+# behaves exactly like these factory bytes (`HumanizePolicy::default()`);
+# editing a value needs no rebuild. A typo'd key or an out-of-range value
+# is a LOUD config error at `devai init` and at every engine run / manual
+# publish — never a silently ignored default.
+#
+# The mechanical edibility detector (REQ-HP-03) runs ONLY on contracts whose
+# stored schema REQUIRES `field` as a top-level field — role-borne artifacts
+# (requirements-specification@3, review-report@2, implementation-report@3).
+# Platform-assembled report_text of quality-report has no `field` in its
+# schema: exempt by construction, no code branch.
+humanize:
+  # Ratified OQ-HP-6: the field name is fixed by the spec, not by the
+  # implementation; it is declared in the contract schemas themselves.
+  field: human_paragraph
+  # Ratified OQ-HP-3: the paragraph language follows the language of the
+  # task's business description; this value is the fallback for statements
+  # with no expressed language. Feeds the prompt template, not the gate.
+  language: ru
+  # Volume discipline (REQ-HP-08): the factory max keeps the full role
+  # reply inside the physical response limit together with the complete
+  # schema skeleton.
+  min_chars: 200
+  max_chars: 1200
+  # Detector of «restatement of formalism»: the fraction of the paragraph's
+  # word n-grams already present in the formal body of the same artifact
+  # (echo fields excluded — see overlap_ignore). Above the ratio: reject.
+  # Factory stance is conservative per the QA review: presence and min/max
+  # are hard, overlap fires only on blatant copy-retelling.
+  overlap_max_ratio: 0.6
+  ngram: 3
+  # Body fields excluded from the overlap corpus: human echo prose is not
+  # the formal structure the paragraph must not restate.
+  overlap_ignore:
+    - business_description
+  # Register (регистрация): literal markers of the formal protocol that a
+  # plain-words paragraph must not carry (case-insensitive substrings).
+  forbidden_markers:
+    - REQ-
+    - OQ-
+    - ASM-
+    - acceptance_criteria
+  # Required explanation structure (REQ-HP-03 «пустая болтовня»): each slot
+  # is filled when ANY of its marker phrases appears (case-insensitive).
+  slots:
+    - name: "что происходит"
+      markers:
+        - сейчас
+        - сегодня
+        - раньше
+        - ранее
+        - до сих пор
+        - происходит
+        - работает
+        - работало
+        - было
+        - now
+        - currently
+        - today
+    - name: "что изменится"
+      markers:
+        - изменится
+        - изменят
+        - изменит
+        - будет
+        - станут
+        - станет
+        - добавит
+        - появится
+        - теперь
+        - начнёт
+        - начнут
+        - чинит
+        - заменит
+        - после
+        - will
+        - becomes
+        - adds
+        - now checks

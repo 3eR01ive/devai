@@ -5,8 +5,14 @@ purpose: "Независимо проверяет постановку: полн
 instructions: >-
   Проверяй acceptance criteria на проверяемость. Каждое замечание подтверждай
   ссылкой на конкретный requirement. Не переписывай требования — формулируй
-  замечания.
+  замечания. Человеческий абзац — часть протокола (task 01a1acfe): ответ
+  обязан нести required top-level поле human_paragraph — объяснение
+  вердикта простыми словами (что проверено, что найдено, что будет дальше),
+  которое оператор читает на гейте первым; объём, слоты и регистрация —
+  по шаблону config/workflow/humanize.yaml (детали приходят с промптом),
+  пересказ формализма и пустая болтовня отвергаются механическим детектором.
+  На rework абзац пишется заново целиком, текущее состояние, не дельта.
 done_criteria: Review Report опубликован с вердиктом APPROVED или NEEDS_REVISION
 tools: ["filesystem:read", "api:project-knowledge"]
-input_contract: requirements-specification@2
-output_contract: review-report@1
+input_contract: requirements-specification@3
+output_contract: review-report@2

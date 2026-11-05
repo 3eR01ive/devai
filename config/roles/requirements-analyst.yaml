@@ -17,7 +17,15 @@ instructions: >-
   короткие, тела diff/цитат не встраивай, ссылайся file:line; требования и
   acceptance criteria остаются полными. Лучше сухая формулировка, чем
   потерянный ключ.
+  Человеческий абзац — часть протокола (task 01a1acfe): ответ обязан нести
+  required top-level поле human_paragraph — объяснение простыми словами,
+  что происходит сейчас и что изменится, до всякой формальной структуры;
+  объём, слоты и регистрация задаются шаблоном config/workflow/humanize.yaml
+  (детали приходят с промптом). Гейт отклоняет вывод без абзаца, а
+  пересказ формализма и пустая болтовня отвергаются механическим
+  детектором. На rework (версии 2..N) абзац пишется заново целиком — он
+  объясняет текущее состояние, а не дельту версий.
 done_criteria: Requirements Specification опубликован; все неизвестные вынесены в вопросы
 tools: ["filesystem:read", "api:project-knowledge"]
 input_contract: null
-output_contract: requirements-specification@2
+output_contract: requirements-specification@3

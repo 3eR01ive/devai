@@ -758,9 +758,23 @@ fn task_run(
     }
     match report.gate {
         Gate::WaitingApproval => {
+            // REQ-HP-05: the human paragraphs open the gate view — the
+            // operator reads «what happens / what will change» BEFORE any
+            // formal structure, verbatim from the stored artifacts.
+            for (label, text) in &o.gate_human_paragraphs {
+                outln!("── {label}: человеческий абзац ──");
+                outln!("{text}");
+            }
             outln!("⏸ APPROVAL is a human gate — approve or reject the requirements")
         }
         Gate::WaitingAccept => {
+            // The paragraph of the code the operator is accepting comes
+            // first (ratified OQ-HP-1: implementation-report is read at
+            // this gate); the §2.6 rendering follows as the machine half.
+            for (label, text) in &o.gate_human_paragraphs {
+                outln!("── {label}: человеческий абзац ──");
+                outln!("{text}");
+            }
             // The §2.6 rendering is for the human at the gate.
             if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
@@ -772,6 +786,12 @@ fn task_run(
             // The freshness gate stopped the run: no auditor execution was
             // started, no artifact was published. The human decides.
             // REQ-005: CURRENT-by-status selection lives in the API.
+            // REQ-HP-05: the paragraph of the implementation being judged
+            // opens the view here too, before the machine rendering.
+            for (label, text) in &o.gate_human_paragraphs {
+                outln!("── {label}: человеческий абзац ──");
+                outln!("{text}");
+            }
             if let Some(a) = &o.current_quality_report {
                 outln!(
                     "⏸ quality report v{} ({}) is FRESH — it is bound to exactly the recomputed workspace revision; the auditor was NOT re-run",

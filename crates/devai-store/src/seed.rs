@@ -59,6 +59,10 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
     // silently ignored policy (the engine itself falls back to factory
     // defaults — the home has been proven here by then).
     config::load_response_form_policy(&dir.join("workflow"))?;
+    // REQ-HP-04 AC2: the humanization template is validated with the same
+    // loudness — a typo'd key or an inverted volume window fails `devai
+    // init`, it is never a silent default.
+    config::load_humanize_policy(&dir.join("workflow"))?;
     let inserted = config::seed_roles(store, &cfg, now)?;
 
     for (name, version, schema) in contracts() {
@@ -188,6 +192,54 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
         (
+            // @3 — the human paragraph becomes protocol (task 01a1acfe,
+            // REQ-HP-01, ratified OQ-HP-1/6). @2 stays seeded as history,
+            // insert-only, and stays enforced for artifacts published
+            // under it (REQ-HP-06: the obligation is not retroactive).
+            // `human_paragraph` is the single ratified field name across
+            // all role-borne gate artifacts; presence is enforced here by
+            // `required`, edibility by the mechanical detector driven by
+            // `config/workflow/humanize.yaml` (REQ-HP-03/04) — the schema
+            // deliberately carries NO minLength/maxLength literals, the
+            // volume window is config, not code.
+            "requirements-specification",
+            3,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Requirements Specification v3 — the human paragraph is protocol",
+  "description": "Reply-shape contract of the requirements analyst. Same shape as @2 (every required key declared in properties; WRITE: omit optional fields you cannot fill, never null; READ: an explicit null on an optional field reads as absence) plus the ratified OQ-HP-6 obligation: `human_paragraph` is a REQUIRED top-level string — the plain-words explanation the operator reads FIRST, before any formal structure (REQ-HP-05 presentation). Ratified OQ-HP-3: its language follows the task's business description (the template config holds the fallback); OQ-HP-4: on rework (versions 2..N) it is rewritten whole — it explains the CURRENT state, not the version delta. A copy-retelling of the formal body or empty filler is rejected by the deterministic platform detector, never by a model (OQ-HP-2). `task_id` is stamped by the platform from stored data; `business_description` is completed from the stored task description when skipped; `version` is role-owned (rework bumps it).",
+  "type": "object",
+  "required": ["version", "requirements", "unknowns", "assumptions", "human_paragraph"],
+  "properties": {
+    "task_id": { "type": ["string", "null"], "description": "optional in the reply — the platform stamps the stored task id before publishing" },
+    "version": { "type": "integer", "minimum": 1 },
+    "source": { "type": ["string", "null"], "description": "initial description or reference" },
+    "business_description": { "type": ["string", "null"], "description": "optional in the reply — the platform completes it from the stored task description when absent" },
+    "human_paragraph": { "type": "string", "description": "the human explanation of the artifact, in plain words: what happens now and what will change (required slots, volume window and overlap limits come from config/workflow/humanize.yaml — never restated here)" },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "statement"],
+        "properties": {
+          "id": { "type": "string" },
+          "statement": { "type": "string" },
+          "acceptance_criteria": { "type": ["array", "null"], "items": { "type": "string" } },
+          "constraints": { "type": ["array", "null"], "items": { "type": "string" } },
+          "depends_on": { "type": ["array", "null"], "items": { "type": "string" } },
+          "source": { "type": ["object", "null"], "properties": { "file": { "type": "string" }, "commit_sha": { "type": "string" }, "checked_at": { "type": "string" } } },
+          "unverified": { "type": ["boolean", "null"] }
+        }
+      }
+    },
+    "open_questions": { "type": ["array", "null"], "items": { "type": "string" } },
+    "unknowns": { "type": "array", "items": { "type": "string" } },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "change_history": { "type": ["array", "null"], "items": { "type": "object" } }
+  }
+}"#,
+        ),
+        (
             "review-report",
             1,
             r#"{
@@ -198,6 +250,40 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
   "properties": {
     "verdict": { "type": "string", "enum": ["APPROVED", "NEEDS_REVISION", "REJECTED"] },
     "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "description"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["blocker", "major", "minor", "info"] },
+          "description": { "type": "string" },
+          "requirement_ref": { "type": "string" }
+        }
+      }
+    }
+  }
+}"#,
+        ),
+        (
+            // @2 — the human paragraph becomes protocol for the reviewer
+            // too (task 01a1acfe, REQ-HP-01, ratified OQ-HP-1/6). @1 stays
+            // seeded insert-only and enforced for what was published under
+            // it (REQ-HP-06); its `required verdict` precedent — the gate
+            // controls protocol mechanically, "не уговорами" — is what the
+            // paragraph inherits.
+            "review-report",
+            2,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Review Report v2 — the human paragraph is protocol",
+  "description": "Same shape as @1 (verdict enum, summary, findings) plus the ratified OQ-HP-6 obligation: `human_paragraph` is a REQUIRED top-level string — the plain-words explanation of what the review found and what it means for the task, the first thing the operator reads at the gate (REQ-HP-05). Volume window, explanation slots and overlap limits come from config/workflow/humanize.yaml and are enforced by the deterministic detector (OQ-HP-2), never restated in this schema. On rework the paragraph is rewritten whole (OQ-HP-4).",
+  "type": "object",
+  "required": ["verdict", "summary", "findings", "human_paragraph"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["APPROVED", "NEEDS_REVISION", "REJECTED"] },
+    "summary": { "type": "string" },
+    "human_paragraph": { "type": "string", "description": "the human explanation of the verdict in plain words: what the review checked, what it found, what happens next" },
     "findings": {
       "type": "array",
       "items": {
@@ -245,6 +331,34 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
     "worktree": { "type": "string", "description": "the isolation worktree directory under DEVAI_HOME the execution ran in (stamped)" },
     "commit": { "type": "string", "description": "full SHA of the resulting platform commit on that branch (stamped)" },
     "patch": { "type": "string", "description": "artifact id or reference to diff" },
+    "test_results": { "type": "object", "description": "real outcomes of build/tests" },
+    "requirement_coverage": { "type": "array", "items": { "type": "object" } },
+    "notes": { "type": "string" }
+  }
+}"#,
+        ),
+        (
+            // @3 — the human paragraph is protocol on the code-acceptance
+            // gate too (task 01a1acfe, ratified OQ-HP-1: the operator reads
+            // exactly this artifact when accepting code — it carries the
+            // paragraph наравне). @1/@2 stay seeded insert-only (REQ-HP-06).
+            // Same stamping discipline as @2: `branch`/`worktree`/`commit`
+            // are platform-stamped ground truth; `human_paragraph` is
+            // role-owned and must survive the post-stamp re-validation.
+            "implementation-report",
+            3,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Implementation Report v3 — the human paragraph is protocol",
+  "description": "Same required set as @2 plus the ratified OQ-HP-1/6 obligation: `human_paragraph` is a REQUIRED top-level string — the plain-words explanation the operator reads FIRST at the acceptance gate: what was actually done in this run and what changed in the code (REQ-HP-05 presentation; volume window, explanation slots and overlap limits live in config/workflow/humanize.yaml and are enforced by the deterministic detector, never restated here). @2's stamping is unchanged: after a writing execution the engine STAMPS `branch`, `worktree` and `commit` with ground-truth repository state and re-validates the published body — the paragraph written by the role must pass that re-validation untouched (no read-time rewriting, REQ-HP-07).",
+  "type": "object",
+  "required": ["branch", "patch", "test_results", "human_paragraph"],
+  "properties": {
+    "branch": { "type": "string", "description": "the platform-created `rework/<task-id>` branch (stamped)" },
+    "worktree": { "type": "string", "description": "the isolation worktree directory under DEVAI_HOME the execution ran in (stamped)" },
+    "commit": { "type": "string", "description": "full SHA of the resulting platform commit on that branch (stamped)" },
+    "patch": { "type": "string", "description": "artifact id or reference to diff" },
+    "human_paragraph": { "type": "string", "description": "the human explanation of the implementation in plain words: what happens now and what changed" },
     "test_results": { "type": "object", "description": "real outcomes of build/tests" },
     "requirement_coverage": { "type": "array", "items": { "type": "object" } },
     "notes": { "type": "string" }
