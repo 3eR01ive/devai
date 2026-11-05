@@ -780,10 +780,22 @@ fn artifact_and_question_resolvers_fail_loudly_on_ambiguity() {
     store.create_question(&q2).unwrap();
     let err = store.get_question("019e4444-0000").unwrap_err();
     assert!(matches!(err, StoreError::Ambiguous(_)), "{err}");
-    assert_eq!(store.get_question("019e4444-0000-7000-8000-0000000000ab").unwrap().id, q2.id);
+    assert_eq!(
+        store
+            .get_question("019e4444-0000-7000-8000-0000000000ab")
+            .unwrap()
+            .id,
+        q2.id
+    );
     // Exact ids still resolve. (These fixtures differ only in the LAST
     // character, so every shorter prefix is shared — and must stay
     // ambiguous; a genuinely unique prefix still resolving is pinned by the
     // get_execution ambiguity test above.)
-    assert_eq!(store.get_question("019e4444-0000-7000-8000-0000000000aa").unwrap().id, q1.id);
+    assert_eq!(
+        store
+            .get_question("019e4444-0000-7000-8000-0000000000aa")
+            .unwrap()
+            .id,
+        q1.id
+    );
 }

@@ -382,6 +382,20 @@ impl Api {
     // ---- task: creation ---------------------------------------------------
 
     pub fn task_create(&self, req: TaskCreateReq) -> ApiResult<TaskCreated> {
+        // R2 QA (input-validation): an empty/whitespace-only key must never
+        // reach the registry — once stored, `''` would become a SHARED key
+        // and the second empty-keyed call would silently return the first
+        // task. The typed refusal happens BEFORE the first store touch
+        // (including the registry lookup below): it can neither read nor
+        // write, so a refusal leaves the store byte-identical.
+        if let Some(key) = req.idempotency_key.as_deref() {
+            if key.trim().is_empty() {
+                return Err(ApiError::InvalidInput {
+                    field: "idempotency_key",
+                    message: "must not be empty or whitespace-only".into(),
+                });
+            }
+        }
         // REQ-API-02 (ratified OQ-1): a retry carrying the key of an
         // ALREADY COMMITTED create returns the registered task and its
         // stored ACTIVE edges — the lost-response retry never duplicates
@@ -1658,6 +1672,69 @@ mod tests {
         api.task_create(req(None)).unwrap();
         api.task_create(req(None)).unwrap();
         assert_eq!(children(), 4);
+    }
+
+    /// R2 QA (input-validation): an empty/whitespace-only idempotency key
+    /// is refused with the typed `InvalidInput` (machine code
+    /// `invalid_input`) BEFORE any store touch — it must never return the
+    /// task a previous call registered, and the repeated refusals leave
+    /// the store identical (before == after, direct reads). Pre-guard the
+    /// CLI passed `''` through: the first empty-keyed create registered a
+    /// row under the shared key, the second returned it — exit 0.
+    #[test]
+    fn empty_idempotency_key_is_typed_refusal_with_zero_store_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        // A REAL keyed create first: the shared-`''` trap would have let an
+        // empty-keyed call resolve against the registry and return it.
+        api.task_create(TaskCreateReq {
+            title: "keyed-real".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![],
+            blocked_by: vec![],
+            idempotency_key: Some("real-key".into()),
+        })
+        .expect("non-empty key creates");
+        let before = api.store.list_tasks().unwrap().len();
+
+        let empty_req = |key: &str| TaskCreateReq {
+            title: "keyed-empty".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![],
+            blocked_by: vec![],
+            idempotency_key: Some(key.into()),
+        };
+        // Repeat each degenerate key: every attempt is a refusal, not the
+        // shared-key return of the first task.
+        for key in ["", "   ", "\t"] {
+            for attempt in 1..=2 {
+                let e = api
+                    .task_create(empty_req(key))
+                    .expect_err("empty/whitespace key must refuse");
+                assert_eq!(
+                    e.code(),
+                    ErrorCode("invalid_input"),
+                    "{key:?} #{attempt}: {e}"
+                );
+                assert_eq!(
+                    api.store.list_tasks().unwrap().len(),
+                    before,
+                    "refusal of {key:?} #{attempt} touched nothing"
+                );
+            }
+        }
+        // The refusal must not poison later REAL keyed calls either.
+        api.task_create(TaskCreateReq {
+            title: "keyed-after".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![],
+            blocked_by: vec![],
+            idempotency_key: Some("real-key-2".into()),
+        })
+        .expect("guard refuses degenerate keys only");
     }
 
     /// REQ-MUT-05 AC3: the named operation and the `task_op` dispatch run

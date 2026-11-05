@@ -330,7 +330,10 @@ fn task_active_lifecycle_through_the_real_binary() {
     // normal path afterwards.
     devai(h, &["exec", "finish", &exec_a, "--summary", "done"]);
     let v = devai(h, &["task", "active"]);
-    assert!(!v.contains(&display_a), "COMPLETED rows drop out (AC2): {v}");
+    assert!(
+        !v.contains(&display_a),
+        "COMPLETED rows drop out (AC2): {v}"
+    );
     assert!(v.contains(&display_b));
     let plain = devai(h, &["exec", "list"]);
     assert!(

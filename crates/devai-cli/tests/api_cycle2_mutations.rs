@@ -482,15 +482,18 @@ fn task_new_with_ambiguous_ref_leaves_no_orphan() {
     // REQ-API-02 AC1: the identical retry with resolvable refs succeeds and
     // adds EXACTLY one task plus exactly its requested edge pair — the
     // refused attempt contributed nothing that could double.
-    ok(home, &[
-        "task",
-        "new",
-        "orphan-candidate",
-        "--parent",
-        &a.id.to_string(),
-        "--blocked-by",
-        &b.id.to_string(),
-    ]);
+    ok(
+        home,
+        &[
+            "task",
+            "new",
+            "orphan-candidate",
+            "--parent",
+            &a.id.to_string(),
+            "--blocked-by",
+            &b.id.to_string(),
+        ],
+    );
     let store = Store::open(home).unwrap();
     let all = store.list_tasks().unwrap();
     assert_eq!(all.len(), 3);
@@ -511,15 +514,32 @@ fn task_new_idempotency_key_retry_does_not_duplicate() {
     ok(home, &["init"]);
     let first: serde_json::Value = serde_json::from_str(&ok(
         home,
-        &["--json", "task", "new", "dup-guard", "--idempotency-key", "retry-42"],
+        &[
+            "--json",
+            "task",
+            "new",
+            "dup-guard",
+            "--idempotency-key",
+            "retry-42",
+        ],
     ))
     .unwrap();
     let again: serde_json::Value = serde_json::from_str(&ok(
         home,
-        &["--json", "task", "new", "dup-guard", "--idempotency-key", "retry-42"],
+        &[
+            "--json",
+            "task",
+            "new",
+            "dup-guard",
+            "--idempotency-key",
+            "retry-42",
+        ],
     ))
     .unwrap();
-    assert_eq!(first["id"], again["id"], "same key must return the SAME task");
+    assert_eq!(
+        first["id"], again["id"],
+        "same key must return the SAME task"
+    );
     assert_eq!(
         Store::open(home)
             .unwrap()
@@ -533,7 +553,17 @@ fn task_new_idempotency_key_retry_does_not_duplicate() {
     );
 
     // A different key is a different command — it creates.
-    ok(home, &["--json", "task", "new", "dup-guard", "--idempotency-key", "retry-43"]);
+    ok(
+        home,
+        &[
+            "--json",
+            "task",
+            "new",
+            "dup-guard",
+            "--idempotency-key",
+            "retry-43",
+        ],
+    );
     assert_eq!(
         Store::open(home)
             .unwrap()
@@ -556,4 +586,38 @@ fn task_new_idempotency_key_retry_does_not_duplicate() {
             .count(),
         3
     );
+}
+
+/// R2 QA (input-validation, the shared-empty-key trap): `task new` with an
+/// empty/whitespace-only `--idempotency-key` exits nonzero on EVERY attempt
+/// and a DIRECT store read proves nothing landed (before == after).
+/// Pre-guard the CLI passed `''` through (commands.rs:265): the first call
+/// created a task registered under the shared key, the second RETURNED it
+/// with exit 0 — shared behaviour the ratification forbids to canonize.
+#[test]
+fn task_new_empty_idempotency_key_refused_and_store_untouched() {
+    use devai_store::Store;
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    ok(home, &["init"]);
+    let before = Store::open(home).unwrap().list_tasks().unwrap().len();
+
+    for key in ["", "   "] {
+        for attempt in 1..=2 {
+            let (so, se) = fail(
+                home,
+                &["task", "new", "empty-key", "--idempotency-key", key],
+            );
+            assert!(
+                se.contains("invalid input"),
+                "typed refusal expected for {key:?} #{attempt}, stderr: {se}"
+            );
+            assert!(so.is_empty(), "stdout stays clean on refusal: {so}");
+            assert_eq!(
+                Store::open(home).unwrap().list_tasks().unwrap().len(),
+                before,
+                "refusal of {key:?} #{attempt} must not touch the store"
+            );
+        }
+    }
 }

@@ -240,10 +240,7 @@ fn progress_lifecycle_through_the_real_binary() {
     devai(h, &["task", "resume", &id]);
 
     // QA → REWORK: the loop state re-enters QA (engine knowledge, not CLI).
-    devai(
-        h,
-        &["task", "return", &id, "--rationale", "rework smoke"],
-    );
+    devai(h, &["task", "return", &id, "--rationale", "rework smoke"]);
     let v = devai(h, &["task", "progress", &id]);
     assert!(
         v.contains("note:  REWORK is off the spine — it returns to [QA]"),

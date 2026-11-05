@@ -130,7 +130,6 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
     devai(h, &["init"]);
     let id = analysis_task(h, "guard double start");
 
-
     devai(
         h,
         &[
@@ -179,15 +178,7 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
     let ws_str = ws.path().to_str().unwrap();
     let err = devai_refused(
         h,
-        &[
-            "task",
-            "run",
-            &id,
-            "--agent",
-            "mock",
-            "--workspace",
-            ws_str,
-        ],
+        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
     );
     assert!(
         err.contains("single-writer guard") && err.contains(&exec_a),
@@ -208,15 +199,7 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
     );
     let r = devai_json(
         h,
-        &[
-            "task",
-            "run",
-            &id,
-            "--agent",
-            "mock",
-            "--workspace",
-            ws_str,
-        ],
+        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
     );
     assert_eq!(
         r["gate"], "WAITING_APPROVAL",
@@ -230,7 +213,6 @@ fn live_owner_task_run_refusal_is_labeled_live_not_orphan() {
     let h = home.path();
     devai(h, &["init"]);
     let id = analysis_task(h, "guard live owner");
-
 
     // A RUNNING row whose owner is THIS test process — a live writer. The
     // refusal must say so (the ratified three-way distinction), never call
