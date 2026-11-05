@@ -748,20 +748,19 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
             } else {
                 outln!("artifact {} {} v{} ({})", a.kind.as_str(), short(&a.id), a.seq, a.name);
             }
-            // Some kinds carry the workflow forward.
-            match kind {
-                ArtifactKind::RequirementsSpec | ArtifactKind::ReviewReport | ArtifactKind::ImplementationReport => {
-                    let adv = ctx.api().artifact_advance(AdvanceReq { id, artifact_id: a.id.to_string(), kind, verdict }).map_err(render_api_error)?;
-                    outln!("state: {} → {}", adv.from.as_str(), adv.to.as_str());
-                    if kind == ArtifactKind::ImplementationReport && adv.rework_gate {
-                        outln!("⏸ EMPTY-REWORK GATE: report {} names the SAME commit as the previous one — the rework captured no new work; QA is withheld.", short(&a.id));
-                        outln!("   operator: ratify the no-op explicitly with `devai task ratify-empty-rework {} --rationale \"...\"`, or answer the question and re-run the implementation with real fixes", short(&a.task_id));
-                    }
+            // Some kinds carry the workflow forward — the advancing set is
+            // owned by core (`ArtifactKind::advances_state`, QA R4): this
+            // render derives membership from the SAME single source the
+            // API compound and the standalone advance use.
+            if kind.advances_state() {
+                let adv = ctx.api().artifact_advance(AdvanceReq { id, artifact_id: a.id.to_string(), kind, verdict }).map_err(render_api_error)?;
+                outln!("state: {} → {}", adv.from.as_str(), adv.to.as_str());
+                if kind == ArtifactKind::ImplementationReport && adv.rework_gate {
+                    outln!("⏸ EMPTY-REWORK GATE: report {} names the SAME commit as the previous one — the rework captured no new work; QA is withheld.", short(&a.id));
+                    outln!("   operator: ratify the no-op explicitly with `devai task ratify-empty-rework {} --rationale \"...\"`, or answer the question and re-run the implementation with real fixes", short(&a.task_id));
                 }
-                ArtifactKind::QualityReport => {
-                    outln!("quality report recorded; user decides via `devai task accept|return`");
-                }
-                _ => {}
+            } else if kind == ArtifactKind::QualityReport {
+                outln!("quality report recorded; user decides via `devai task accept|return`");
             }
         }
         ArtifactCmd::List { id } => {
@@ -896,7 +895,11 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
                 if json {
                     outln!("{s}");
                 } else {
-                    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                    // QA R1b: no unwrap — a corrupt stored schema propagates
+                    // through the render path as an operator-visible error
+                    // instead of panicking the binary.
+                    let v: serde_json::Value = serde_json::from_str(&s)
+                        .with_context(|| format!("stored contract {name}@{version} schema is not valid JSON — re-register it with `devai contract add`"))?;
                     outln!("{}", serde_json::to_string_pretty(&v)?);
                 }
             }

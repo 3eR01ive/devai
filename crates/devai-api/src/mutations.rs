@@ -511,10 +511,10 @@ impl Api {
         // The gate renderings read the CURRENT quality report — the same
         // status-only selection (REQ-005) the old handler performed.
         let (current_quality_report, gate_report_text) = match report.gate {
-            Gate::WaitingAccept => (None, self.quality_report_text(report.task_id)),
+            Gate::WaitingAccept => (None, self.quality_report_text(report.task_id)?),
             Gate::ReportFresh => (
                 self.store.artifacts(report.task_id)?.into_iter().find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current),
-                self.quality_report_text(report.task_id),
+                self.quality_report_text(report.task_id)?,
             ),
             _ => (None, None),
         };
@@ -555,7 +555,7 @@ impl Api {
         // Downstream role results are implicitly children of the current
         // approved specification (a later requirements revision marks them
         // STALE through the dependency graph — unless deps were given).
-        if req.depends.is_empty() && is_downstream_of_spec(req.kind) {
+        if req.depends.is_empty() && req.kind.is_downstream_of_spec() {
             if let Some(spec) = self.store.artifacts(task.id)?.iter().find(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current).map(|a| a.id) {
                 depends_ids.push(spec);
             }
@@ -575,10 +575,7 @@ impl Api {
             }
             None => None,
         };
-        let created_by = match &execution_id {
-            Some(_) => Some(format!("execution:{}", execution_id.unwrap())),
-            None => None,
-        };
+        let created_by = execution_id.map(|id| format!("execution:{}", id));
         // The contract reference parses AFTER the execution check — the
         // exact position the pre-cycle-2 CLI held (error-order parity).
         let contract = match req.contract.as_deref() {
@@ -591,8 +588,12 @@ impl Api {
 
     /// The workflow advance certain artifact kinds carry — the SAME core
     /// commands the engine runs (REQ-RG-01: no producer path bypasses the
-    /// empty-rework gate). Only the three advancing kinds are meaningful
-    /// here; other kinds return `from == to` untouched.
+    /// empty-rework gate). Membership of the advancing set is owned by
+    /// core (`ArtifactKind::advances_state`, QA R4); a standalone call for
+    /// a NON-advancing kind refuses fail-closed with a machine code
+    /// (QA R5) — the silent `from == to` no-op is gone, so a kind that
+    /// later joins the advancing set can only be dispatched loudly (arm
+    /// below) or refused loudly, never quietly skipped.
     pub fn artifact_advance(&self, req: AdvanceReq) -> ApiResult<AdvanceOutcome> {
         let task = self.store.resolve_task(&req.id)?;
         let a = self.store.get_artifact(&req.artifact_id)?;
@@ -621,37 +622,41 @@ impl Api {
                 self.store.commit(task.lock_version, &m)?;
                 Ok(AdvanceOutcome { from: task.state, to: m.task.state, rework_gate: m.task.state == TaskState::WaitingForInput })
             }
-            _ => Ok(AdvanceOutcome { from: task.state, to: task.state, rework_gate: false }),
+            // Fail-closed (QA R5): the kind carries no advance. The refusal
+            // lists the advancing kinds DERIVED from the core predicate —
+            // never a hand-copied set that could drift (QA R4).
+            other => Err(ApiError::refused("artifact_kind_not_advancing", format!(
+                "{} carries no workflow advance — the advancing kinds are {} (the row alone lands via `artifact.publish_row`; publish through `artifact.publish` to get the row and its advance in one call)",
+                other.as_str(),
+                ArtifactKind::ALL.iter().filter(|k| k.advances_state()).map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+            ))),
         }
     }
 
     /// `artifact.publish` — the compound operation: the row through the
     /// contract gate, then the kind-carried advance. Identical store
-    /// effects to the two phases called in sequence.
+    /// effects to the two phases called in sequence. Membership of the
+    /// advancing set comes from the core predicate (`advances_state`,
+    /// QA R4) — the same single source the standalone advance and the
+    /// consumer render derive from.
     pub fn artifact_publish(&self, req: PublishReq) -> ApiResult<PublishOutcome> {
         let kind = req.kind;
         let verdict = req.verdict.clone();
         let publish = self.artifact_publish_row(req)?;
-        let advanced = match kind {
-            ArtifactKind::RequirementsSpec | ArtifactKind::ReviewReport | ArtifactKind::ImplementationReport => {
-                Some(self.artifact_advance(AdvanceReq { id: publish.task.id.to_string(), artifact_id: publish.artifact.id.to_string(), kind, verdict })?)
-            }
-            _ => None,
+        let advanced = if kind.advances_state() {
+            Some(self.artifact_advance(AdvanceReq { id: publish.task.id.to_string(), artifact_id: publish.artifact.id.to_string(), kind, verdict })?)
+        } else {
+            None
         };
         Ok(PublishOutcome { publish, advanced })
     }
 
-    /// The verdict token map (`Verdict::parse` has no total string form;
-    /// the CLI arguments accepted these synonyms before the API owned the
-    /// path, and the refusal text is pinned by parity).
+    /// Parse an operator verdict token. The synonym dictionary is core
+    /// vocabulary (`Verdict::from_token`, QA R3 — the API owns NO business
+    /// rules, only delegation); the API maps the miss to the machine-coded
+    /// refusal carrying the exact CLI text pinned by parity (REQ-MUT-06).
     pub fn parse_verdict(s: &str) -> ApiResult<Verdict> {
-        Ok(match s.to_ascii_lowercase().as_str() {
-            "approved" | "approve" | "pass" => Verdict::Approved,
-            "needs_revision" | "revision" | "changes" => Verdict::NeedsRevision,
-            "rejected" | "reject" => Verdict::Rejected,
-            "returned" | "return" => Verdict::Returned,
-            other => return Err(ApiError::refused("unknown_variant", format!("unknown verdict `{other}` (approved|needs_revision|rejected|returned)"))),
-        })
+        Verdict::from_token(s).ok_or_else(|| ApiError::refused("unknown_variant", format!("unknown verdict `{}` ({})", s.to_ascii_lowercase(), Verdict::token_hint())))
     }
 
     /// The old CLI `publish_raw`: unregistered contract and contract-gate
@@ -1085,35 +1090,29 @@ impl Api {
         )))
     }
 
-    /// The §2.6 rendering of the CURRENT quality report, if one is
-    /// present and readable (the human gate's viewing channel; reports
-    /// assembled before @2 render the placeholder the old CLI printed).
-    pub fn quality_report_text(&self, task_id: Id) -> Option<String> {
-        let arts = self.store.artifacts(task_id).ok()?;
+    /// The §2.6 rendering of the CURRENT quality report, when one is
+    /// present (the human gate's viewing channel; reports assembled before
+    /// @2 render the placeholder the old CLI printed). `Ok(None)` is the
+    /// honest «no CURRENT quality report»; a store failure or an unreadable
+    /// (non-JSON) blob propagates as `Err` with its machine code — never a
+    /// silent «absence» (QA R2: `.ok()?` swallowed corrupt data into None,
+    /// indistinguishable from «no report»).
+    pub fn quality_report_text(&self, task_id: Id) -> ApiResult<Option<String>> {
+        let arts = self.store.artifacts(task_id)?;
         // REQ-005: status-only selection (single CURRENT pinned at v3).
-        let a = arts.iter().find(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)?;
-        let blob = self.store.read_blob(&a.sha256).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&blob).ok()?;
-        v.get("report_text")
+        let Some(a) = arts.iter().find(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current) else {
+            return Ok(None);
+        };
+        let blob = self.store.read_blob(&a.sha256)?;
+        let v: serde_json::Value = serde_json::from_slice(&blob).map_err(|e| ApiError::refused("corrupt", format!(
+            "the CURRENT quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
+            short_id(&a.id)
+        )))?;
+        Ok(v.get("report_text")
             .and_then(|t| t.as_str())
             .map(|s| s.to_string())
-            .or_else(|| Some("(report assembled before @2 — no rendering)".into()))
+            .or_else(|| Some("(report assembled before @2 — no rendering)".into())))
     }
-}
-
-/// Kinds that are derived from the approved requirements and should be
-/// marked STALE when requirements are revised (the dependency implicit of
-/// the manual publish path — a domain rule, never CLI-local).
-fn is_downstream_of_spec(kind: ArtifactKind) -> bool {
-    matches!(
-        kind,
-        ArtifactKind::ReviewReport
-            | ArtifactKind::ImplementationPlan
-            | ArtifactKind::ImplementationReport
-            | ArtifactKind::Patch
-            | ArtifactKind::TestReport
-            | ArtifactKind::QualityReport
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,6 +1247,51 @@ mod tests {
         assert!(text.contains("`devai exec finish|fail|cancel "), "{text}");
         // Only one RUNNING row exists — the refusal wrote nothing.
         assert_eq!(api.exec_list(Some(&id)).unwrap().iter().filter(|x| x.status == ExecutionStatus::Running).count(), 1);
+    }
+
+    /// QA R5: the standalone advance of a NON-advancing kind refuses
+    /// fail-closed with a machine code — no silent `from == to` no-op.
+    /// The refusal enumerates the advancing kinds DERIVED from the core
+    /// predicate (QA R4): the message can never list a stale set.
+    #[test]
+    fn advance_refuses_non_advancing_kind_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let t = fresh_task(&api, "advance-refuse");
+        api.task_start(&t.to_string()).unwrap();
+        let row = api
+            .artifact_publish_row(PublishReq { id: t.to_string(), kind: ArtifactKind::TestReport, name: "tests".into(), content: b"ok".to_vec(), depends: vec![], contract: None, execution: None, category: DataCategory::Artifact, verdict: None })
+            .unwrap();
+        let e = api.artifact_advance(AdvanceReq { id: t.to_string(), artifact_id: row.artifact.id.to_string(), kind: ArtifactKind::TestReport, verdict: None }).unwrap_err();
+        assert_eq!(e.code(), ErrorCode("artifact_kind_not_advancing"));
+        let text = format!("{e}");
+        assert!(text.contains("TEST_REPORT carries no workflow advance"), "{text}");
+        assert!(text.contains("REQUIREMENTS_SPEC, REVIEW_REPORT, IMPLEMENTATION_REPORT"), "advancing set derived from the core predicate: {text}");
+        // The refusal wrote nothing: the task is where the row phase left it.
+        assert_eq!(api.task_get(&t.to_string()).unwrap().state, TaskState::Analysis);
+    }
+
+    /// QA R2: `quality_report_text` distinguishes «no report» (Ok(None))
+    /// from «report unreadable» (Err with a machine code). A corrupt CURRENT
+    /// blob must never be silently rendered as absence of a report.
+    #[test]
+    fn quality_report_text_distinguishes_absence_from_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let t = fresh_task(&api, "gate-text");
+        assert_eq!(api.quality_report_text(t).unwrap(), None, "no report yet — honest absence");
+
+        let row = api
+            .artifact_publish_row(PublishReq { id: t.to_string(), kind: ArtifactKind::QualityReport, name: "qr".into(), content: br#"{"report_text":"all good"}"#.to_vec(), depends: vec![], contract: None, execution: None, category: DataCategory::Artifact, verdict: None })
+            .unwrap();
+        assert_eq!(api.quality_report_text(t).unwrap().as_deref(), Some("all good"));
+
+        // Corrupt the stored blob under the CURRENT row: the next read must
+        // fail loudly, not fall through to None.
+        std::fs::write(api.store.blob_path(&row.artifact.sha256), b"not-json-at-all").unwrap();
+        let e = api.quality_report_text(t).unwrap_err();
+        assert_eq!(e.code(), ErrorCode("corrupt"));
+        assert!(format!("{e}").contains("does not parse as JSON"), "{e}");
     }
 
     /// REQ-MUT-03/04 + human Q2: `Api::open` is the only bootstrap entry —
