@@ -76,7 +76,7 @@
 # Иерархия тяжестей сохранена: продуктовые инварианты суммарно 0.62,
 # абстрактный корпус 0.38, сумма ровно 1.00 (V7).
 
-version: 11
+version: 12
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -235,12 +235,18 @@ gates:
       КОСВЕННЫЙ, а не абсолютный: fetch/HTTP из кода проекта — моветон и валится
       сюда; но вызов внешних инструментов, которые по архитектуре сами ходят в
       сеть (адаптер-субпроцесс вроде `claude`), — легитимный паттерн и шлюзом
-      НЕ штрафуется. Грейп смотрит сетевые crate/API в коде, не subprocess.
-    blind_spot: subprocess-адаптеры — по дизайну; см. architecture/sovereignty-by-proxy (зарезервирован как наблюдение, не нарушение)
+      НЕ штрафуется. Грейп смотрит сетевые crate/API в коде проекта.
+      v12 (ратификация оператора 05.11, прецедент devai-ui): область — СОБСТВЕННЫЙ
+      код; vendored-поставки (node_modules) и реестр зависимостей (Cargo.lock) из
+      литерального скана исключены — матчить чужие бандлы и транзитивные имена
+      означает шлюзу матчиться на чужом дереве, а desktop-инфраструктуре
+      (tauri localhost-serve/asset-протокол) по духу доктрины легитимна, как
+      subprocess-адаптер. Сетевой код СОБСТВЕННЫЙ по-прежнему валится сюда же.
+    blind_spot: subprocess-адаптеры и vendored/transitive графы (tauri/webview) — по ратифицированному дизайну; см. architecture/sovereignty-by-proxy
     probes:
       # --exclude-dir=tools: probe-скрипты оценщика хранят сетевые regex-паттерны —
       # не даём шлюзу матчиться на себя (тот же принцип, что --exclude у no-secrets)
-      - { cmd: "test -z \"$(grep -RIlE 'reqwest|hyper|ureq|TcpStream|UdpSocket' crates --exclude-dir=tools 2>/dev/null)\"", pass_exit: [0] }
+      - { cmd: "test -z \"$(grep -RIlE 'reqwest|hyper|ureq|TcpStream|UdpSocket' crates --exclude-dir=tools --exclude-dir=node_modules --exclude=Cargo.lock 2>/dev/null)\"", pass_exit: [0] }
   - id: no-secrets
     desc: Секретов в репозитории нет
     # --exclude: сам профиль хранит regex-паттерны — не даём шлюзу матчиться на себя
