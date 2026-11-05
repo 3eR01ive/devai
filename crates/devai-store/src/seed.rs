@@ -27,9 +27,14 @@ fn snapshot_profiles(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<u
     paths.sort();
     let mut snapshotted = 0;
     for p in paths {
-        let body = std::fs::read_to_string(&p).map_err(|e| StoreError::Config(format!("read {}: {e}", p.display())))?;
-        let profile: config::Profile = serde_yaml::from_str(&body).map_err(|e| StoreError::Config(format!("parse {}: {e}", p.display())))?;
-        let name = profile.name.clone().or_else(|| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+        let body = std::fs::read_to_string(&p)
+            .map_err(|e| StoreError::Config(format!("read {}: {e}", p.display())))?;
+        let profile: config::Profile = serde_yaml::from_str(&body)
+            .map_err(|e| StoreError::Config(format!("parse {}: {e}", p.display())))?;
+        let name = profile
+            .name
+            .clone()
+            .or_else(|| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
         let Some(name) = name else { continue };
         if store.put_evaluation_profile(&name, profile.version, &profile.project, &body, &now)? {
             snapshotted += 1;

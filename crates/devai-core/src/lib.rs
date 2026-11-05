@@ -15,5 +15,6 @@ pub use types::{
     Verdict, WorkflowEvent, json_array, json_field, json_parse, json_string, new_id,
 };
 pub use workflow::{
-    Mutation, allowed_ops, check_execution_allowed, effective_blockers, open_blockers, override_covers, role_allowed_states,
+    Mutation, allowed_ops, check_execution_allowed, effective_blockers, open_blockers,
+    override_covers, role_allowed_states,
 };

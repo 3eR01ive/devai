@@ -17,9 +17,10 @@ pub mod revision;
 pub mod worktree;
 
 pub use adapters::{
-    contract_violations, form_repair_section, validate_against_contract, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
+    AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
+    contract_violations, form_repair_section, validate_against_contract,
 };
-pub use context::{rework_context, REWORK_CONTEXT_LABEL};
+pub use context::{REWORK_CONTEXT_LABEL, rework_context};
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};
-pub use liveness::{check_owner, current_host, current_owner, Liveness, OwnerInfo};
+pub use liveness::{Liveness, OwnerInfo, check_owner, current_host, current_owner};
 pub use prompt::{build_system_prompt, build_user_prompt, extract_json_object};

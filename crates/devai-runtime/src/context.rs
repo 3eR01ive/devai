@@ -46,9 +46,11 @@
 //! is `workflow_events.seq` order (the store returns events ORDER BY seq),
 //! so assembly is deterministic and byte-stable for identical store state.
 
-use devai_core::types::{event_kind, json_field, ArtifactKind, ArtifactStatus, ExecutionStatus, Task};
-use devai_store::config::ReworkPolicy;
+use devai_core::types::{
+    ArtifactKind, ArtifactStatus, ExecutionStatus, Task, event_kind, json_field,
+};
 use devai_store::Store;
+use devai_store::config::ReworkPolicy;
 
 use crate::engine::RuntimeError;
 use crate::evaluation::{ProbeState, QualityReportDoc};
@@ -66,7 +68,12 @@ pub const REWORK_CONTEXT_LABEL: &str = "REWORK CONTEXT";
 /// Read-only: issues SELECTs only (`store.all_events_for_task`,
 /// `store.artifacts`, `store.read_blob`); writes nothing, moves no state,
 /// bumps no lock version (R-009).
-pub fn rework_context(store: &Store, task: &Task, role_slug: &str, policy: &[ReworkPolicy]) -> Result<Option<String>, RuntimeError> {
+pub fn rework_context(
+    store: &Store,
+    task: &Task,
+    role_slug: &str,
+    policy: &[ReworkPolicy],
+) -> Result<Option<String>, RuntimeError> {
     let Some(policy) = policy.iter().find(|p| p.role == role_slug) else {
         return Ok(None); // not declared in the table => this flow gets nothing
     };
@@ -81,7 +88,8 @@ pub fn rework_context(store: &Store, task: &Task, role_slug: &str, policy: &[Rew
         .rposition(|e| {
             e.kind == event_kind::EXECUTION_FINISHED
                 && e.payload.get(json_field::ROLE).and_then(|v| v.as_str()) == Some(role_slug)
-                && e.payload.get(json_field::STATUS).and_then(|v| v.as_str()) == Some(ExecutionStatus::Completed.as_str())
+                && e.payload.get(json_field::STATUS).and_then(|v| v.as_str())
+                    == Some(ExecutionStatus::Completed.as_str())
         })
         .map(|i| i + 1)
         .unwrap_or(0);
@@ -98,7 +106,11 @@ pub fn rework_context(store: &Store, task: &Task, role_slug: &str, policy: &[Rew
         // path is `summary` — ratified OQ-2, delivery reads what is
         // actually stored).
         if let Some(excluded) = &trigger.only_if_verdict_not {
-            let verdict = e.payload.get(&trigger.verdict_field).and_then(|v| v.as_str()).unwrap_or("");
+            let verdict = e
+                .payload
+                .get(&trigger.verdict_field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if verdict == excluded.as_str() {
                 continue;
             }
@@ -110,7 +122,11 @@ pub fn rework_context(store: &Store, task: &Task, role_slug: &str, policy: &[Rew
         }
         // The persisted payload field named by the table, read verbatim —
         // no reinterpretation.
-        if let Some(text) = e.payload.get(&trigger.rationale_field).and_then(|v| v.as_str()) {
+        if let Some(text) = e
+            .payload
+            .get(&trigger.rationale_field)
+            .and_then(|v| v.as_str())
+        {
             if !text.trim().is_empty() {
                 let stamp = e.created_at.to_rfc3339();
                 rationales.push(format!(
@@ -126,7 +142,11 @@ pub fn rework_context(store: &Store, task: &Task, role_slug: &str, policy: &[Rew
     // R-004: ONLY the trigger with `attach_findings: true` (the QA→REWORK
     // return, per the table) additionally quotes the CURRENT quality
     // report's failing items. Rejections on other flows get rationale only.
-    let findings = if attach_findings { quality_findings(store, task)? } else { None };
+    let findings = if attach_findings {
+        quality_findings(store, task)?
+    } else {
+        None
+    };
 
     if rationales.is_empty() && findings.is_none() {
         return Ok(None);
@@ -232,7 +252,10 @@ fn quality_findings(store: &Store, task: &Task) -> Result<Option<String>, Runtim
     if lines.is_empty() && doc.evaluation.verdict == "FAIL" {
         // FAIL with no per-item line is the S<theta case; §2.5 stored its
         // own explanation — quote it instead of recomputing the compare.
-        lines.push(format!("- verdict FAIL as stored: {}", doc.recommendation_basis));
+        lines.push(format!(
+            "- verdict FAIL as stored: {}",
+            doc.recommendation_basis
+        ));
     }
     if lines.is_empty() {
         // The stored document literally says nothing is failing (a human

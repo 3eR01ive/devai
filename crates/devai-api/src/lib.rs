@@ -25,10 +25,10 @@ mod registry;
 pub use error::{ApiError, ApiResult, ErrorCode};
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
-    ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted,
-    MergeRecordReq, MergeResult, MutationResult, OverrideResult, ProjectAddReq,
-    PublishOutcome, PublishReq, PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome,
-    ReviseReq, RunOutcome, RunReq, TaskCreateReq, TaskCreated, UnlinkResult, WorkflowOp,
+    ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
+    MergeResult, MutationResult, OverrideResult, ProjectAddReq, PublishOutcome, PublishReq,
+    PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome, ReviseReq, RunOutcome, RunReq,
+    TaskCreateReq, TaskCreated, UnlinkResult, WorkflowOp,
 };
 pub use registry::{OpClass, OpDescriptor, operations};
 
@@ -60,7 +60,11 @@ impl Api {
     /// the registry — it happens before the domain exists — but it is also
     /// no longer a consumer-side `Store::open`. The handle stays inside.
     pub fn open(home: &Path, actor: &str) -> ApiResult<Api> {
-        Ok(Api { store: Store::open(home)?, home: home.to_path_buf(), actor: actor.to_string() })
+        Ok(Api {
+            store: Store::open(home)?,
+            home: home.to_path_buf(),
+            actor: actor.to_string(),
+        })
     }
 
     pub fn actor(&self) -> &str {
@@ -108,14 +112,23 @@ impl Api {
         let t = self.store.resolve_task(id_prefix)?;
         // allowed_ops depends only on the task row — computed before the row
         // moves into the view (no re-derivation, one read each).
-        let ops: Vec<String> = workflow::allowed_ops(&t).into_iter().map(|s| s.to_string()).collect();
+        let ops: Vec<String> = workflow::allowed_ops(&t)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
         Ok(StatusView {
             task: t,
             allowed_operations: ops,
-            current_artifacts: artifacts.into_iter().filter(|a| a.status == ArtifactStatus::Current).collect(),
-            open_questions: questions.into_iter().filter(|q| q.status == QuestionStatus::Open).collect(),
+            current_artifacts: artifacts
+                .into_iter()
+                .filter(|a| a.status == ArtifactStatus::Current)
+                .collect(),
+            open_questions: questions
+                .into_iter()
+                .filter(|q| q.status == QuestionStatus::Open)
+                .collect(),
         })
     }
 
@@ -153,7 +166,10 @@ impl Api {
                 off_spine: workflow::pipeline_off_spine(&t),
                 terminal: t.state.is_terminal(),
             },
-            allowed_operations: workflow::allowed_ops(&t).into_iter().map(|s| s.to_string()).collect(),
+            allowed_operations: workflow::allowed_ops(&t)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
             running_executions: running,
         })
     }
@@ -191,7 +207,11 @@ impl Api {
             .iter()
             .map(|e| {
                 let (t, prepared) = &facts[&e.task_id];
-                let live = liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
+                let live = liveness::check_owner(
+                    e.owner_pid,
+                    e.owner_host.as_deref(),
+                    e.owner_process_start,
+                );
                 let terminal = t.state.is_terminal();
                 ActiveRow {
                     id: e.id.to_string(),
@@ -210,11 +230,18 @@ impl Api {
                     owner_host: e.owner_host.clone(),
                     owner_liveness: live.as_str().to_string(),
                     branch: prepared.then(|| devai_runtime::worktree::branch_name(e.task_id)),
-                    worktree: prepared.then(|| devai_runtime::worktree::path_for(&self.home, e.task_id).display().to_string()),
+                    worktree: prepared.then(|| {
+                        devai_runtime::worktree::path_for(&self.home, e.task_id)
+                            .display()
+                            .to_string()
+                    }),
                 }
             })
             .collect();
-        Ok(ActiveSnapshot { snapshot_at: now, rows })
+        Ok(ActiveSnapshot {
+            snapshot_at: now,
+            rows,
+        })
     }
 
     /// The CURRENT quality report the human signs at the QA gate — full
@@ -226,15 +253,27 @@ impl Api {
         let a = arts
             .iter()
             .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
-            .ok_or_else(|| ApiError::Store(devai_store::StoreError::NotFound("quality report".into(), format!("task {} has no CURRENT quality report — QA has not run", short_hint(&t.id)))))?;
+            .ok_or_else(|| {
+                ApiError::Store(devai_store::StoreError::NotFound(
+                    "quality report".into(),
+                    format!(
+                        "task {} has no CURRENT quality report — QA has not run",
+                        short_hint(&t.id)
+                    ),
+                ))
+            })?;
         let blob = self.store.read_blob(&a.sha256)?;
-        let value: serde_json::Value = serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
+        let value: serde_json::Value =
+            serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
         let contract = a
             .contract
             .as_ref()
             .map(|c| format!("{}@{}", c.name, c.version))
             .unwrap_or_else(|| "—".into());
-        let report_text = value.get("report_text").and_then(|s| s.as_str()).map(|s| s.to_string());
+        let report_text = value
+            .get("report_text")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
         Ok(QualityReportView {
             task: t.id.to_string(),
             artifact: a.id.to_string(),
@@ -247,7 +286,11 @@ impl Api {
         })
     }
 
-    pub fn task_events(&self, id_prefix: &str, limit: Option<usize>) -> ApiResult<Vec<WorkflowEvent>> {
+    pub fn task_events(
+        &self,
+        id_prefix: &str,
+        limit: Option<usize>,
+    ) -> ApiResult<Vec<WorkflowEvent>> {
         let t = self.store.resolve_task(id_prefix)?;
         Ok(self.store.events(t.id, limit)?)
     }
@@ -261,7 +304,11 @@ impl Api {
         let t = self.store.resolve_task(id_prefix)?;
         let outgoing = self.store.task_dependencies(t.id)?;
         let incoming = self.store.incoming_dependencies(t.id)?;
-        Ok(DependenciesView { task: t, outgoing, incoming })
+        Ok(DependenciesView {
+            task: t,
+            outgoing,
+            incoming,
+        })
     }
 
     pub fn task_epics(&self) -> ApiResult<Vec<EpicVertex>> {
@@ -272,10 +319,16 @@ impl Api {
         let nodes = self.store.dependency_graph()?;
         let ready: Vec<String> = nodes
             .iter()
-            .filter(|n| !n.task.state.is_terminal() && workflow::open_blockers(&n.task, &n.dependencies).is_empty())
+            .filter(|n| {
+                !n.task.state.is_terminal()
+                    && workflow::open_blockers(&n.task, &n.dependencies).is_empty()
+            })
             .map(|n| n.task.id.to_string())
             .collect();
-        Ok(GraphView { graph: nodes, ready })
+        Ok(GraphView {
+            graph: nodes,
+            ready,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -344,7 +397,8 @@ impl Api {
     /// never writes, never signals (REQ-SW-06).
     pub fn exec_liveness(&self, exec_id: &str) -> ApiResult<LivenessView> {
         let e = self.store.get_execution(exec_id)?;
-        let live = liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
+        let live =
+            liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
         Ok(LivenessView {
             id: e.id.to_string(),
             task_id: e.task_id.to_string(),
@@ -363,7 +417,11 @@ impl Api {
     /// The same bundle path the CLI used directly: identical data and
     /// artifact version identity through the API (REQ-API-02 AC3 — both
     /// paths converge on `bundle::export` over the same store).
-    pub fn export_bundle(&self, id_prefix: &str, out_dir: &Path) -> ApiResult<bundle::BundleManifest> {
+    pub fn export_bundle(
+        &self,
+        id_prefix: &str,
+        out_dir: &Path,
+    ) -> ApiResult<bundle::BundleManifest> {
         let t = self.store.resolve_task(id_prefix)?;
         Ok(bundle::export(&self.store, &t, out_dir)?)
     }

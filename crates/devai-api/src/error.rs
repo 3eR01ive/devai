@@ -56,13 +56,19 @@ pub enum ApiError {
     /// list — the presentation (warning per violation, then the refusal)
     /// belongs to the consumer, enforcement to the API.
     #[error("artifact does not satisfy contract {contract}: {violations:?}")]
-    ContractRejected { contract: String, violations: Vec<String> },
+    ContractRejected {
+        contract: String,
+        violations: Vec<String>,
+    },
 }
 
 impl ApiError {
     /// Internal constructor for the mutation surface's domain refusals.
     pub(crate) fn refused(code: &'static str, message: impl Into<String>) -> ApiError {
-        ApiError::Refused { code: ErrorCode(code), message: message.into() }
+        ApiError::Refused {
+            code: ErrorCode(code),
+            message: message.into(),
+        }
     }
 }
 
@@ -183,24 +189,66 @@ mod tests {
         // is distinguishable across the API boundary.
         let cases: Vec<(ApiError, &str)> = vec![
             (RuntimeError::MissingRole("x".into()).into(), "missing_role"),
-            (RuntimeError::MissingArtifact("spec").into(), "missing_artifact"),
+            (
+                RuntimeError::MissingArtifact("spec").into(),
+                "missing_artifact",
+            ),
             (RuntimeError::StepLimit(3, "QA").into(), "step_limit"),
-            (RuntimeError::MissingProfile("/p".into()).into(), "missing_profile"),
-            (RuntimeError::MissingContract("c".into(), 1).into(), "missing_contract"),
+            (
+                RuntimeError::MissingProfile("/p".into()).into(),
+                "missing_profile",
+            ),
+            (
+                RuntimeError::MissingContract("c".into(), 1).into(),
+                "missing_contract",
+            ),
             (RuntimeError::ReportShape("s".into()).into(), "report_shape"),
-            (RuntimeError::Worktree(devai_runtime::worktree::WorktreeError::NoBoundCommit).into(), "worktree_no_bound_commit"),
-            (AdapterError::UnknownProvider("q".into()).into(), "unknown_provider"),
+            (
+                RuntimeError::Worktree(devai_runtime::worktree::WorktreeError::NoBoundCommit)
+                    .into(),
+                "worktree_no_bound_commit",
+            ),
+            (
+                AdapterError::UnknownProvider("q".into()).into(),
+                "unknown_provider",
+            ),
             (AdapterError::Agent("boom".into()).into(), "agent_error"),
-            (AdapterError::BadOutput { violations: vec!["$.x".into()] }.into(), "contract_violation"),
-            (AdapterError::Platform("asm".into()).into(), "platform_contract"),
+            (
+                AdapterError::BadOutput {
+                    violations: vec!["$.x".into()],
+                }
+                .into(),
+                "contract_violation",
+            ),
+            (
+                AdapterError::Platform("asm".into()).into(),
+                "platform_contract",
+            ),
             // Transparent wrappers recurse into the inner family's mapping —
             // a store NotFound under Runtime is still `not_found`.
-            (RuntimeError::Store(StoreError::SingleWriterBusy { task_id: "t".into(), existing_id: "e".into(), started_at: "now".into(), owner_pid: None, owner_host: None }).into(), "single_writer_busy"),
+            (
+                RuntimeError::Store(StoreError::SingleWriterBusy {
+                    task_id: "t".into(),
+                    existing_id: "e".into(),
+                    started_at: "now".into(),
+                    owner_pid: None,
+                    owner_host: None,
+                })
+                .into(),
+                "single_writer_busy",
+            ),
             (RuntimeError::Core(CoreError::guard("g")).into(), "guard"),
-            (RuntimeError::Adapter(AdapterError::BadOutput { violations: vec!["v".into()] }).into(), "contract_violation"),
+            (
+                RuntimeError::Adapter(AdapterError::BadOutput {
+                    violations: vec!["v".into()],
+                })
+                .into(),
+                "contract_violation",
+            ),
         ];
         // Distinct expectations set — captured before `cases` moves into the loop.
-        let distinct_expected: std::collections::HashSet<&str> = cases.iter().map(|(_, c)| *c).collect();
+        let distinct_expected: std::collections::HashSet<&str> =
+            cases.iter().map(|(_, c)| *c).collect();
         let mut seen: Vec<&str> = Vec::new();
         for (e, want) in cases {
             assert_eq!(e.code(), ErrorCode(want), "code for {e}");
@@ -212,23 +260,41 @@ mod tests {
         let mut sorted = seen.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), distinct_expected.len(), "codes drift or collide");
+        assert_eq!(
+            sorted.len(),
+            distinct_expected.len(),
+            "codes drift or collide"
+        );
     }
 
     #[test]
     fn mutation_plane_refusals_carry_own_code_and_parity_text() {
         // Cycle 2 (REQ-MUT-01/08): a domain refusal keeps the exact
         // operator-facing text AND a machine token of its own.
-        let e = ApiError::refused("execution_not_running", "execution x is COMPLETED, not RUNNING");
+        let e = ApiError::refused(
+            "execution_not_running",
+            "execution x is COMPLETED, not RUNNING",
+        );
         assert_eq!(e.code(), ErrorCode("execution_not_running"));
         assert_eq!(format!("{e}"), "execution x is COMPLETED, not RUNNING");
         // The contract-gate family renders the same sentences the pre-API
         // CLI path bailed with (parity, REQ-MUT-06).
-        let e = ApiError::ContractRejected { contract: "c@1".into(), violations: vec!["$.a".into()] };
+        let e = ApiError::ContractRejected {
+            contract: "c@1".into(),
+            violations: vec!["$.a".into()],
+        };
         assert_eq!(e.code(), ErrorCode("contract_violation"));
-        assert_eq!(format!("{e}"), "artifact does not satisfy contract c@1: [\"$.a\"]");
-        let e = ApiError::ContractUnregistered { contract: "c@1".into() };
+        assert_eq!(
+            format!("{e}"),
+            "artifact does not satisfy contract c@1: [\"$.a\"]"
+        );
+        let e = ApiError::ContractUnregistered {
+            contract: "c@1".into(),
+        };
         assert_eq!(e.code(), ErrorCode("contract_unregistered"));
-        assert_eq!(format!("{e}"), "contract c@1 is not registered (devai contract add)");
+        assert_eq!(
+            format!("{e}"),
+            "contract c@1 is not registered (devai contract add)"
+        );
     }
 }

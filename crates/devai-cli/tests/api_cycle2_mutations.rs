@@ -39,19 +39,33 @@ fn devai(home: &Path, args: &[&str]) -> Out {
 
 fn ok(home: &Path, args: &[&str]) -> String {
     let o = devai(home, args);
-    assert!(o.code == Some(0), "devai {args:?} exited {:?}\nstdout: {}\nstderr: {}", o.code, o.stdout, o.stderr);
+    assert!(
+        o.code == Some(0),
+        "devai {args:?} exited {:?}\nstdout: {}\nstderr: {}",
+        o.code,
+        o.stdout,
+        o.stderr
+    );
     o.stdout
 }
 
 fn fail(home: &Path, args: &[&str]) -> (String, String) {
     let o = devai(home, args);
-    assert!(o.code != Some(0), "devai {args:?} unexpectedly succeeded:\n{}", o.stdout);
+    assert!(
+        o.code != Some(0),
+        "devai {args:?} unexpectedly succeeded:\n{}",
+        o.stdout
+    );
     (o.stdout, o.stderr)
 }
 
 /// The short id of the `task new` line (the print starts `task <id8> …`).
 fn new_id_of(stdout: &str) -> String {
-    stdout["task ".len()..].split_whitespace().next().unwrap().to_string()
+    stdout["task ".len()..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 /// The `op()` dispatch render lines the CLI printed for every workflow
@@ -62,7 +76,11 @@ fn workflow_mutation_render_parity() {
     let home = dir.path();
     ok(home, &["init"]);
     let out = ok(home, &["task", "new", "parity task"]);
-    assert!(out.starts_with("task ") && out.contains(" created in DRAFT — workflow is owned by devai\n"), "{out}");
+    assert!(
+        out.starts_with("task ")
+            && out.contains(" created in DRAFT — workflow is owned by devai\n"),
+        "{out}"
+    );
     assert!(out.contains("start it with: devai task start "), "{out}");
     let id = new_id_of(&out);
 
@@ -78,7 +96,10 @@ fn workflow_mutation_render_parity() {
     assert!(out.contains("state: PAUSED → ANALYSIS\n"), "{out}");
 
     let (so, se) = fail(home, &["task", "review", &id, "--verdict", "nope"]);
-    assert!(se.contains("devai: unknown verdict `nope` (approved|needs_revision|rejected|returned)"), "{se} | {so}");
+    assert!(
+        se.contains("devai: unknown verdict `nope` (approved|needs_revision|rejected|returned)"),
+        "{se} | {so}"
+    );
     assert!(so.is_empty(), "stdout must stay clean on refusal: {so}");
 
     // Approving outside APPROVAL refuses with the core guard sentence.
@@ -98,29 +119,88 @@ fn dependency_edges_render_and_refusal_parity() {
     let a = ok(home, &["task", "new", "dep-a"]);
     let aid = new_id_of(&a);
     let b = ok(home, &["task", "new", "dep-b", "--blocked-by", &aid]);
-    assert!(b.contains(&format!("  depends blocks {aid} (DRAFT in dep-a)")), "{b}");
+    assert!(
+        b.contains(&format!("  depends blocks {aid} (DRAFT in dep-a)")),
+        "{b}"
+    );
 
     // Self-reference stays loud (unchanged rule, unchanged text family).
-    let (so, se) = fail(home, &["task", "depend", &aid, "--on", &aid, "--kind", "parent"]);
+    let (so, se) = fail(
+        home,
+        &["task", "depend", &aid, "--on", &aid, "--kind", "parent"],
+    );
     assert!(se.contains("invalid task dependency"), "{se}");
     assert!(so.is_empty(), "{so}");
 
     // Duplicate registration is loud at write too.
-    let (_so, se) = fail(home, &["task", "depend", &b.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string(), "--on", &aid, "--kind", "blocks"]);
+    let (_so, se) = fail(
+        home,
+        &[
+            "task",
+            "depend",
+            &b.lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .to_string(),
+            "--on",
+            &aid,
+            "--kind",
+            "blocks",
+        ],
+    );
     assert!(se.contains("already exists"), "{se}");
 
-    let out = ok(home, &["task", "depend", &aid, "--on", &b.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string(), "--kind", "parent"]);
-    let bid = b.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
-    let line = format!("task {aid} —parent→ task {bid} recorded (DRAFT in dep-b, by parity-human, ");
+    let out = ok(
+        home,
+        &[
+            "task",
+            "depend",
+            &aid,
+            "--on",
+            &b.lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .to_string(),
+            "--kind",
+            "parent",
+        ],
+    );
+    let bid = b
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_string();
+    let line =
+        format!("task {aid} —parent→ task {bid} recorded (DRAFT in dep-b, by parity-human, ");
     assert!(out.starts_with(&line), "expected `{line}`…\ngot: {out}");
 
-    let out = ok(home, &["task", "unlink", &aid, "--on", &bid, "--kind", "parent"]);
-    assert!(out.contains("superseded (edge ") && out.ends_with("stays as history, by parity-human)\n"), "{out}");
+    let out = ok(
+        home,
+        &["task", "unlink", &aid, "--on", &bid, "--kind", "parent"],
+    );
+    assert!(
+        out.contains("superseded (edge ") && out.ends_with("stays as history, by parity-human)\n"),
+        "{out}"
+    );
 
     // Override with nothing to override keeps the refusal sentence
     // (dep-a has no outgoing blockers after the unlink above).
     let (_so, se) = fail(home, &["task", "override", &aid]);
-    assert!(se.contains(&format!("task {aid} has no open blocking dependencies — nothing to override")), "{se}");
+    assert!(
+        se.contains(&format!(
+            "task {aid} has no open blocking dependencies — nothing to override"
+        )),
+        "{se}"
+    );
 }
 
 /// The human-gate refusals that used to be CLI-internal `bail!` texts are
@@ -135,7 +215,10 @@ fn gate_refusal_texts_survive_the_move_to_api_errors() {
     let aid = new_id_of(&a);
 
     let (_so, se) = fail(home, &["task", "ratify-empty-rework", &aid]);
-    assert_eq!(se.trim(), "devai: ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in DRAFT");
+    assert_eq!(
+        se.trim(),
+        "devai: ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in DRAFT"
+    );
 
     // exec start in DRAFT refuses through the core role/stage matrix…
     let (_so, se) = fail(home, &["exec", "start", &aid, "--role", "quality-auditor"]);
@@ -148,9 +231,18 @@ fn gate_refusal_texts_survive_the_move_to_api_errors() {
     let v: serde_json::Value = serde_json::from_str(&listing).unwrap();
     let eid = v[0]["id"].as_str().unwrap().to_string();
     let out = ok(home, &["exec", "finish", &eid, "--summary", "done"]);
-    assert!(out.starts_with(&format!("execution {} completed", devai_core::types::short_id_str(&eid))), "{out}");
+    assert!(
+        out.starts_with(&format!(
+            "execution {} completed",
+            devai_core::types::short_id_str(&eid)
+        )),
+        "{out}"
+    );
     let (_so, se) = fail(home, &["exec", "finish", &eid, "--summary", "again"]);
-    assert_eq!(se.trim(), format!("devai: execution {eid} is COMPLETED, not RUNNING"));
+    assert_eq!(
+        se.trim(),
+        format!("devai: execution {eid} is COMPLETED, not RUNNING")
+    );
 }
 
 /// The contract gate (ratified OQ-FG-05): the API refuses with the machine
@@ -167,8 +259,24 @@ fn contract_gate_presentation_parity() {
     ok(home, &["init"]);
 
     let schema_path = home.join("contract.json");
-    std::fs::write(&schema_path, serde_json::json!({"type": "object", "required": ["must_exist"]}).to_string()).unwrap();
-    let out = ok(home, &["contract", "add", "--name", "parity-contract", "--version", "1", "--file", schema_path.to_str().unwrap()]);
+    std::fs::write(
+        &schema_path,
+        serde_json::json!({"type": "object", "required": ["must_exist"]}).to_string(),
+    )
+    .unwrap();
+    let out = ok(
+        home,
+        &[
+            "contract",
+            "add",
+            "--name",
+            "parity-contract",
+            "--version",
+            "1",
+            "--file",
+            schema_path.to_str().unwrap(),
+        ],
+    );
     assert_eq!(out, "contract parity-contract@1 registered\n");
 
     let body = home.join("body.json");
@@ -177,28 +285,93 @@ fn contract_gate_presentation_parity() {
     // Task ref resolves BEFORE the file read (old order): a dangling ref
     // is reported as the store's NotFound sentence even with a bad path.
     let bad_body = home.join("missing.json");
-    let (_so, se) = fail(home, &["artifact", "publish", "no-such-task", "--kind", "test_report", "--file", bad_body.to_str().unwrap()]);
-    assert!(se.starts_with("devai: task `no-such-task` not found"), "{se}");
+    let (_so, se) = fail(
+        home,
+        &[
+            "artifact",
+            "publish",
+            "no-such-task",
+            "--kind",
+            "test_report",
+            "--file",
+            bad_body.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        se.starts_with("devai: task `no-such-task` not found"),
+        "{se}"
+    );
 
     let a = ok(home, &["task", "new", "contract-gate"]);
     let aid = new_id_of(&a);
-    let (so, se) = fail(home, &["artifact", "publish", &aid, "--kind", "test_report", "--file", body.to_str().unwrap(), "--contract", "parity-contract@1"]);
-    assert!(so.is_empty(), "the contract gate refuses before any print/storage: {so}");
-    let warnings: Vec<&str> = se.lines().filter(|l| l.starts_with("warning: parity-contract@1 contract gate rejected this artifact: ")).collect();
+    let (so, se) = fail(
+        home,
+        &[
+            "artifact",
+            "publish",
+            &aid,
+            "--kind",
+            "test_report",
+            "--file",
+            body.to_str().unwrap(),
+            "--contract",
+            "parity-contract@1",
+        ],
+    );
+    assert!(
+        so.is_empty(),
+        "the contract gate refuses before any print/storage: {so}"
+    );
+    let warnings: Vec<&str> = se
+        .lines()
+        .filter(|l| {
+            l.starts_with("warning: parity-contract@1 contract gate rejected this artifact: ")
+        })
+        .collect();
     assert!(!warnings.is_empty(), "{se}");
     let last = se.lines().last().unwrap();
-    assert!(last.starts_with("devai: artifact does not satisfy contract parity-contract@1: ["), "{last}");
+    assert!(
+        last.starts_with("devai: artifact does not satisfy contract parity-contract@1: ["),
+        "{last}"
+    );
 
     // Unregistered contract — the same sentence as the pre-API bail.
-    let (_so, se) = fail(home, &["artifact", "publish", &aid, "--kind", "test_report", "--file", body.to_str().unwrap(), "--contract", "ghost@2"]);
-    assert_eq!(se.trim(), "devai: contract ghost@2 is not registered (devai contract add)");
+    let (_so, se) = fail(
+        home,
+        &[
+            "artifact",
+            "publish",
+            &aid,
+            "--kind",
+            "test_report",
+            "--file",
+            body.to_str().unwrap(),
+            "--contract",
+            "ghost@2",
+        ],
+    );
+    assert_eq!(
+        se.trim(),
+        "devai: contract ghost@2 is not registered (devai contract add)"
+    );
 
     // Phase order: the row lands and PRINTS, then the advance refuses
     // (requirements publication in DRAFT) — exactly the pre-cycle-2
     // interleaving, preserved by the phased operations.
     let spec = home.join("spec.json");
     std::fs::write(&spec, serde_json::json!({"body": "draft spec"}).to_string()).unwrap();
-    let (so, se) = fail(home, &["artifact", "publish", &aid, "--kind", "requirements_spec", "--file", spec.to_str().unwrap()]);
+    let (so, se) = fail(
+        home,
+        &[
+            "artifact",
+            "publish",
+            &aid,
+            "--kind",
+            "requirements_spec",
+            "--file",
+            spec.to_str().unwrap(),
+        ],
+    );
     assert!(so.starts_with("artifact REQUIREMENTS_SPEC "), "{so}");
     assert!(se.contains("run `devai task start` first"), "{se}");
 }
@@ -211,8 +384,18 @@ fn registry_output_covers_mutations() {
     let home = dir.path();
     ok(home, &["init"]);
     let out = ok(home, &["api", "registry"]);
-    for name in ["task.approve", "task.create", "artifact.publish", "exec.start", "question.answer", "task.merge"] {
-        assert!(out.contains(&format!("{name}  [mutation]")), "{name} missing from the registry output");
+    for name in [
+        "task.approve",
+        "task.create",
+        "artifact.publish",
+        "exec.start",
+        "question.answer",
+        "task.merge",
+    ] {
+        assert!(
+            out.contains(&format!("{name}  [mutation]")),
+            "{name} missing from the registry output"
+        );
     }
     assert!(!out.contains("init  ["), "init leaked into the registry");
     assert!(!out.contains("seed  ["), "seed leaked into the registry");
@@ -227,7 +410,11 @@ fn registry_output_covers_mutations() {
 #[test]
 fn cli_sources_touch_no_store() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = vec![src.join("main.rs"), src.join("commands.rs"), src.join("out.rs")];
+    let mut files = vec![
+        src.join("main.rs"),
+        src.join("commands.rs"),
+        src.join("out.rs"),
+    ];
     let mut violations: Vec<String> = Vec::new();
     while let Some(p) = files.pop() {
         if p.is_dir() {
@@ -237,11 +424,20 @@ fn cli_sources_touch_no_store() {
             continue;
         }
         let text = std::fs::read_to_string(&p).unwrap();
-        for needle in ["ctx.store", "devai_store", "Store::open", "Api::new", ".store()"] {
+        for needle in [
+            "ctx.store",
+            "devai_store",
+            "Store::open",
+            "Api::new",
+            ".store()",
+        ] {
             if text.contains(needle) {
                 violations.push(format!("{}: `{needle}`", p.display()));
             }
         }
     }
-    assert!(violations.is_empty(), "CLI sources reach the store again: {violations:?}");
+    assert!(
+        violations.is_empty(),
+        "CLI sources reach the store again: {violations:?}"
+    );
 }

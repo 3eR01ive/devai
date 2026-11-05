@@ -16,8 +16,14 @@ use devai_runtime::{Gate, worktree};
 use uuid::Uuid;
 
 use crate::outln;
-use crate::{ApiCmd, ArtifactCmd, AgentCmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd, TaskCmd, Cmd};
-use devai_api::{Api, ApiError, AdvanceReq, AgentAddReq, AskReq, ContractAddReq, DependReq, ExecStartReq, MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq};
+use crate::{
+    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd,
+    TaskCmd,
+};
+use devai_api::{
+    AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
+    MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq,
+};
 
 pub struct Ctx {
     api: Api,
@@ -28,11 +34,13 @@ impl Ctx {
         let dir = match home {
             Some(p) => p.to_path_buf(),
             None => {
-                let base = dirs::home_dir().context("no home directory; pass --home or set DEVAI_HOME")?;
+                let base =
+                    dirs::home_dir().context("no home directory; pass --home or set DEVAI_HOME")?;
                 base.join(".devai")
             }
         };
-        let actor = actor.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
+        let actor =
+            actor.unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".into()));
         // Cycle 2 (REQ-MUT-04, human-ratified Q2): the API opens the home
         // and OWNS the store handle — the bootstrap entry stays outside the
         // operation registry (RATIFIED OQ-10) but is no longer consumer-
@@ -102,7 +110,10 @@ fn api_registry(ctx: &Ctx, cmd: ApiCmd, json: bool) -> Result<()> {
                     outln!("{}  [{class}]  in={}  out={}", o.name, o.input, o.output);
                     outln!("    {}", o.description);
                 }
-                outln!("--- {} operations published (RATIFIED OQ-10 init/seed stay the bootstrap pair encapsulated behind the API, not operations of this registry)", ops.len());
+                outln!(
+                    "--- {} operations published (RATIFIED OQ-10 init/seed stay the bootstrap pair encapsulated behind the API, not operations of this registry)",
+                    ops.len()
+                );
             }
         }
     }
@@ -115,14 +126,20 @@ fn api_registry(ctx: &Ctx, cmd: ApiCmd, json: bool) -> Result<()> {
 
 fn init(ctx: &Ctx, config_dir: Option<&Path>, json: bool) -> Result<()> {
     let (seeded, cfg_path) = match config_dir {
-        Some(dir) => (ctx.api().seed_config(Some(dir)).map_err(render_api_error)?, dir.to_path_buf()),
+        Some(dir) => (
+            ctx.api().seed_config(Some(dir)).map_err(render_api_error)?,
+            dir.to_path_buf(),
+        ),
         None => {
             let dir = ctx.api().home().join("config");
             (ctx.api().seed_config(None).map_err(render_api_error)?, dir)
         }
     };
     if json {
-        outln!("{}", serde_json::json!({"home": ctx.api().home(), "config": cfg_path, "roles_seeded": seeded}));
+        outln!(
+            "{}",
+            serde_json::json!({"home": ctx.api().home(), "config": cfg_path, "roles_seeded": seeded})
+        );
     } else {
         outln!("devai home: {}", ctx.api().home().display());
         outln!("config tree: {}", cfg_path.display());
@@ -133,7 +150,10 @@ fn init(ctx: &Ctx, config_dir: Option<&Path>, json: bool) -> Result<()> {
                 cfg_path.display()
             );
             if config_dir.is_some() {
-                outln!("the engine reads evaluation profiles from $DEVAI_CONFIG — export DEVAI_CONFIG={}", cfg_path.display());
+                outln!(
+                    "the engine reads evaluation profiles from $DEVAI_CONFIG — export DEVAI_CONFIG={}",
+                    cfg_path.display()
+                );
             }
         } else {
             outln!("store already initialized (config unchanged)");
@@ -148,8 +168,19 @@ fn init(ctx: &Ctx, config_dir: Option<&Path>, json: bool) -> Result<()> {
 
 fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
     match cmd {
-        ProjectCmd::Add { name, description, repo } => {
-            let p = ctx.api().project_add(ProjectAddReq { name, description, repos: repo }).map_err(render_api_error)?;
+        ProjectCmd::Add {
+            name,
+            description,
+            repo,
+        } => {
+            let p = ctx
+                .api()
+                .project_add(ProjectAddReq {
+                    name,
+                    description,
+                    repos: repo,
+                })
+                .map_err(render_api_error)?;
             outln!("project {} ({})", p.name, short(&p.id));
         }
         ProjectCmd::List => {
@@ -192,30 +223,63 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
 /// cycle 1 — the CYCLE-2 PENDING marks are gone because the plane moved.
 fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::New { title, project, description, description_file, parent, blocked_by } => {
+        TaskCmd::New {
+            title,
+            project,
+            description,
+            description_file,
+            parent,
+            blocked_by,
+        } => {
             // The project name resolves through the API read FIRST, so its
             // not-found refusal keeps the exact position the command had.
             let project_id = match project.as_deref() {
-                Some(name) => Some(ctx.api().project_get(name).map_err(render_api_error)?.context(format!("project `{name}` not found"))?.id),
+                Some(name) => Some(
+                    ctx.api()
+                        .project_get(name)
+                        .map_err(render_api_error)?
+                        .context(format!("project `{name}` not found"))?
+                        .id,
+                ),
                 None => None,
             };
             let desc = match description_file {
-                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
+                Some(f) => {
+                    std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?
+                }
                 None => description,
             };
             // REQ-DEP-07: a derived task records WHY it exists at the moment
             // it is created — the genealogy/blocking never leaves for the
             // operator chat. Dangling references fail loudly in the
             // operation, exactly as they would via `task depend`.
-            let created = ctx.api().task_create(TaskCreateReq { title, project_id, description: desc, parent, blocked_by }).map_err(render_api_error)?;
+            let created = ctx
+                .api()
+                .task_create(TaskCreateReq {
+                    title,
+                    project_id,
+                    description: desc,
+                    parent,
+                    blocked_by,
+                })
+                .map_err(render_api_error)?;
             let t = created.task;
             let linked = created.linked;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&t)?);
             } else {
-                outln!("task {} created in DRAFT — workflow is owned by devai", short(&t.id));
+                outln!(
+                    "task {} created in DRAFT — workflow is owned by devai",
+                    short(&t.id)
+                );
                 for d in &linked {
-                    outln!("  depends {} {} ({} in {})", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title);
+                    outln!(
+                        "  depends {} {} ({} in {})",
+                        d.kind.as_str(),
+                        short(&d.depends_on_id),
+                        d.depends_on_state.as_str(),
+                        d.depends_on_title
+                    );
                 }
                 outln!("start it with: devai task start {}", short(&t.id));
             }
@@ -228,7 +292,13 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
                 outln!("(no tasks)");
             } else {
                 for t in ts {
-                    outln!("{}  {:<17}  v{:>2}  {}", short(&t.id), t.state.as_str(), t.requirements_seq, t.title);
+                    outln!(
+                        "{}  {:<17}  v{:>2}  {}",
+                        short(&t.id),
+                        t.state.as_str(),
+                        t.requirements_seq,
+                        t.title
+                    );
                 }
             }
         }
@@ -244,15 +314,37 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Progress { id } => progress(ctx, &id, json)?,
         TaskCmd::Active => active_overview(ctx, json)?,
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
-        TaskCmd::Start { id } => render_mutation(&ctx.api().task_start(&id).map_err(render_api_error)?)?,
-        TaskCmd::Run { id, agent, workspace, force_reaudit } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
+        TaskCmd::Start { id } => {
+            render_mutation(&ctx.api().task_start(&id).map_err(render_api_error)?)?
+        }
+        TaskCmd::Run {
+            id,
+            agent,
+            workspace,
+            force_reaudit,
+        } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
         TaskCmd::Revise { id, file, reason } => {
             let task_ref = ctx.api().task_get(&id).map_err(render_api_error)?;
-            let content = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-            let o = ctx.api().task_revise(ReviseReq { id: task_ref.id.to_string(), name: file.display().to_string(), content, reason }).map_err(render_api_error)?;
-            outln!("requirements v{} published → REVIEW", o.task.requirements_seq);
+            let content =
+                std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            let o = ctx
+                .api()
+                .task_revise(ReviseReq {
+                    id: task_ref.id.to_string(),
+                    name: file.display().to_string(),
+                    content,
+                    reason,
+                })
+                .map_err(render_api_error)?;
+            outln!(
+                "requirements v{} published → REVIEW",
+                o.task.requirements_seq
+            );
             if !o.staled_ids.is_empty() {
-                outln!("consequences: {} artifact(s) marked STALE:", o.staled_ids.len());
+                outln!(
+                    "consequences: {} artifact(s) marked STALE:",
+                    o.staled_ids.len()
+                );
                 for s in &o.staled_ids {
                     outln!("  stale  {s}");
                 }
@@ -260,9 +352,17 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             }
             outln!("next: {}", o.allowed_operations.join(" | "));
         }
-        TaskCmd::Review { id, verdict, summary } => {
+        TaskCmd::Review {
+            id,
+            verdict,
+            summary,
+        } => {
             let v = Api::parse_verdict(&verdict).map_err(render_api_error)?;
-            render_mutation(&ctx.api().task_review(&id, v, summary).map_err(render_api_error)?)?;
+            render_mutation(
+                &ctx.api()
+                    .task_review(&id, v, summary)
+                    .map_err(render_api_error)?,
+            )?;
         }
         TaskCmd::Approve { id, rationale } => {
             // The approve act is persisted like every other human-gate act:
@@ -270,22 +370,47 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // row — the row is what makes the rationale a fact the QA
             // auditor is fed (precedent 01a1a0b5-0fcf). The API operation
             // owns both writes in the old order.
-            let o = ctx.api().task_approve(&id, rationale).map_err(render_api_error)?;
+            let o = ctx
+                .api()
+                .task_approve(&id, rationale)
+                .map_err(render_api_error)?;
             render_mutation(&o.mutation)?;
         }
-        TaskCmd::Reject { id, rationale } => render_mutation(&ctx.api().task_reject(&id, rationale).map_err(render_api_error)?)?,
+        TaskCmd::Reject { id, rationale } => render_mutation(
+            &ctx.api()
+                .task_reject(&id, rationale)
+                .map_err(render_api_error)?,
+        )?,
         TaskCmd::Accept { id, rationale } => {
             // REQ-DEP-03: the human acceptance gate reads the stored
             // dependency graph — an open 'blocks' edge refuses the gate and
             // the refusal enumerates the blocking task ids as data. The one
             // release (RATIFIED DECISION OQ2) is the operator's explicit
             // `dependency_override` decision (see `task override` below).
-            render_mutation(&ctx.api().task_accept(&id, rationale).map_err(render_api_error)?)?;
+            render_mutation(
+                &ctx.api()
+                    .task_accept(&id, rationale)
+                    .map_err(render_api_error)?,
+            )?;
         }
-        TaskCmd::Return { id, rationale } => render_mutation(&ctx.api().task_return(&id, rationale).map_err(render_api_error)?)?,
-        TaskCmd::RatifyEmptyRework { id, rationale } => ratify_empty_rework(ctx, &id, rationale, json)?,
-        TaskCmd::Merge { id, workspace, rationale } => task_merge(ctx, &id, workspace.as_deref(), rationale, json)?,
-        TaskCmd::Pause { id, reason } => render_mutation(&ctx.api().task_pause(&id, reason).map_err(render_api_error)?)?,
+        TaskCmd::Return { id, rationale } => render_mutation(
+            &ctx.api()
+                .task_return(&id, rationale)
+                .map_err(render_api_error)?,
+        )?,
+        TaskCmd::RatifyEmptyRework { id, rationale } => {
+            ratify_empty_rework(ctx, &id, rationale, json)?
+        }
+        TaskCmd::Merge {
+            id,
+            workspace,
+            rationale,
+        } => task_merge(ctx, &id, workspace.as_deref(), rationale, json)?,
+        TaskCmd::Pause { id, reason } => render_mutation(
+            &ctx.api()
+                .task_pause(&id, reason)
+                .map_err(render_api_error)?,
+        )?,
         TaskCmd::Resume { id } => {
             // REQ-DEP-03: resume from a hold state consults the stored graph
             // (open blockers enumerate into the refusal; "closed" = blocker
@@ -295,16 +420,35 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // is forbidden, resume stays a human command.
             render_mutation(&ctx.api().task_resume(&id).map_err(render_api_error)?)?;
         }
-        TaskCmd::Block { id, reason } => render_mutation(&ctx.api().task_block(&id, reason).map_err(render_api_error)?)?,
-        TaskCmd::Cancel { id, reason } => render_mutation(&ctx.api().task_cancel(&id, reason).map_err(render_api_error)?)?,
-        TaskCmd::Fail { id, reason } => render_mutation(&ctx.api().task_fail(&id, reason).map_err(render_api_error)?)?,
+        TaskCmd::Block { id, reason } => render_mutation(
+            &ctx.api()
+                .task_block(&id, reason)
+                .map_err(render_api_error)?,
+        )?,
+        TaskCmd::Cancel { id, reason } => render_mutation(
+            &ctx.api()
+                .task_cancel(&id, reason)
+                .map_err(render_api_error)?,
+        )?,
+        TaskCmd::Fail { id, reason } => {
+            render_mutation(&ctx.api().task_fail(&id, reason).map_err(render_api_error)?)?
+        }
         TaskCmd::Events { id, limit } => {
-            let evs = ctx.api().task_events(&id, limit).map_err(render_api_error)?;
+            let evs = ctx
+                .api()
+                .task_events(&id, limit)
+                .map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&evs)?);
             } else {
                 for e in evs {
-                    outln!("{}  {:<28} {:<12} {}", e.created_at.format("%Y-%m-%d %H:%M:%S"), e.kind, e.actor, compact(&e.payload));
+                    outln!(
+                        "{}  {:<28} {:<12} {}",
+                        e.created_at.format("%Y-%m-%d %H:%M:%S"),
+                        e.kind,
+                        e.actor,
+                        compact(&e.payload)
+                    );
                 }
             }
         }
@@ -318,7 +462,14 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
                 outln!("(no decisions)");
             } else {
                 for d in ds {
-                    outln!("{}  {:<26} {:<10} by {}  {}", d.created_at.format("%Y-%m-%d %H:%M:%S"), d.kind, d.verdict.as_str(), d.actor, d.rationale.map(|s| ellipsis(&s, 100)).unwrap_or_default());
+                    outln!(
+                        "{}  {:<26} {:<10} by {}  {}",
+                        d.created_at.format("%Y-%m-%d %H:%M:%S"),
+                        d.kind,
+                        d.verdict.as_str(),
+                        d.actor,
+                        d.rationale.map(|s| ellipsis(&s, 100)).unwrap_or_default()
+                    );
                     if !d.refs.is_empty() {
                         outln!("    refs: {}", d.refs.join(", "));
                     }
@@ -332,12 +483,23 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // (ratified OQ4: parent-DAG and blocks-DAG; a mixed
             // parent↔blocks cycle — the standard backfill/gate case — is
             // legal) never land in the store.
-            let d = ctx.api().task_depend(DependReq { id, on, kind }).map_err(render_api_error)?;
+            let d = ctx
+                .api()
+                .task_depend(DependReq { id, on, kind })
+                .map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&d)?);
             } else {
-                outln!("task {} —{}→ task {} recorded ({} in {}, by {}, {})",
-                    short(&d.task_id), d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title, d.actor, d.created_at.format("%Y-%m-%d %H:%M:%S"));
+                outln!(
+                    "task {} —{}→ task {} recorded ({} in {}, by {}, {})",
+                    short(&d.task_id),
+                    d.kind.as_str(),
+                    short(&d.depends_on_id),
+                    d.depends_on_state.as_str(),
+                    d.depends_on_title,
+                    d.actor,
+                    d.created_at.format("%Y-%m-%d %H:%M:%S")
+                );
             }
         }
         TaskCmd::Dependencies { id } => {
@@ -346,26 +508,51 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             let outgoing = v.outgoing;
             let incoming = v.incoming;
             if json {
-                outln!("{}", serde_json::json!({"task": t.id.to_string(), "outgoing": outgoing, "incoming": incoming}));
+                outln!(
+                    "{}",
+                    serde_json::json!({"task": t.id.to_string(), "outgoing": outgoing, "incoming": incoming})
+                );
             } else {
                 print_task(&t);
                 outln!("---");
                 outln!("depends on (outgoing): {}", outgoing.len());
                 for d in &outgoing {
-                    outln!("  {:<7} {}  {:<13} {}  by {}", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title, d.actor);
+                    outln!(
+                        "  {:<7} {}  {:<13} {}  by {}",
+                        d.kind.as_str(),
+                        short(&d.depends_on_id),
+                        d.depends_on_state.as_str(),
+                        d.depends_on_title,
+                        d.actor
+                    );
                 }
                 outln!("dependents (incoming): {}", incoming.len());
                 for d in &incoming {
-                    outln!("  {:<7} {}  {:<13} {}  by {}", d.kind.as_str(), short(&d.task_id), d.task_state.as_str(), d.task_title, d.actor);
+                    outln!(
+                        "  {:<7} {}  {:<13} {}  by {}",
+                        d.kind.as_str(),
+                        short(&d.task_id),
+                        d.task_state.as_str(),
+                        d.task_title,
+                        d.actor
+                    );
                 }
                 // REQ-DEP-06 + RATIFIED DECISION OQ8: no epic entity exists —
                 // an epic VERTEX is a task with no outgoing ACTIVE 'parent'
                 // edge and at least one incoming one — named by this same
                 // dependency read; `task epics` lists the whole registry.
-                let epic_children = incoming.iter().filter(|d| d.kind == DependencyKind::Parent).count();
-                let own_parents = outgoing.iter().filter(|d| d.kind == DependencyKind::Parent).count();
+                let epic_children = incoming
+                    .iter()
+                    .filter(|d| d.kind == DependencyKind::Parent)
+                    .count();
+                let own_parents = outgoing
+                    .iter()
+                    .filter(|d| d.kind == DependencyKind::Parent)
+                    .count();
                 if epic_children > 0 && own_parents == 0 {
-                    outln!("epic role: {epic_children} task(s) carry a 'parent' edge into this vertex, the vertex has no parent of its own (the registry is this view, not a table)");
+                    outln!(
+                        "epic role: {epic_children} task(s) carry a 'parent' edge into this vertex, the vertex has no parent of its own (the registry is this view, not a table)"
+                    );
                 }
             }
         }
@@ -375,15 +562,28 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // and created_at, gains who/when superseded it, and stays in
             // the table forever; only the live graph stops seeing it.
             let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
-            let u = ctx.api().task_unlink(DependReq { id, on, kind }).map_err(render_api_error)?;
+            let u = ctx
+                .api()
+                .task_unlink(DependReq { id, on, kind })
+                .map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&u.edge)?);
             } else {
-                outln!("task {} —{}→ task {} superseded (edge {} stays as history, by {})",
-                    short(&u.edge.task_id), kind.as_str(), short(&u.edge.depends_on_id), short(&u.edge.id), u.superseded_by);
+                outln!(
+                    "task {} —{}→ task {} superseded (edge {} stays as history, by {})",
+                    short(&u.edge.task_id),
+                    kind.as_str(),
+                    short(&u.edge.depends_on_id),
+                    short(&u.edge.id),
+                    u.superseded_by
+                );
             }
         }
-        TaskCmd::Override { id, blocker, rationale } => {
+        TaskCmd::Override {
+            id,
+            blocker,
+            rationale,
+        } => {
             // RATIFIED DECISION OQ2 — the human-escape of the dependency
             // gate. The refusal of resume/acceptance is unconditional, the
             // ONE release is this explicit operator ratification ("continue
@@ -392,14 +592,26 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // covers, so a NEW blocker opened later is NOT covered by an
             // old decision; closing the last blocker never resumes the task
             // by itself (auto-unpause forbidden) — resume stays a human act.
-            let r = ctx.api().task_override(&id, blocker, rationale).map_err(render_api_error)?;
+            let r = ctx
+                .api()
+                .task_override(&id, blocker, rationale)
+                .map_err(render_api_error)?;
             let blockers = r.override_blockers;
             if json {
-                outln!("{}", serde_json::json!({"task": r.task.id.to_string(), "override_blockers": blockers}));
+                outln!(
+                    "{}",
+                    serde_json::json!({"task": r.task.id.to_string(), "override_blockers": blockers})
+                );
             } else {
-                outln!("override recorded for task {}: continuing despite {} — the gate stands for any NEW blocker",
-                    short(&r.task.id), blockers.join(", "));
-                outln!("the task stays in its hold state until a human runs `devai task resume {}`", short(&r.task.id));
+                outln!(
+                    "override recorded for task {}: continuing despite {} — the gate stands for any NEW blocker",
+                    short(&r.task.id),
+                    blockers.join(", ")
+                );
+                outln!(
+                    "the task stays in its hold state until a human runs `devai task resume {}`",
+                    short(&r.task.id)
+                );
             }
         }
         TaskCmd::Epics => {
@@ -413,8 +625,13 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
                 outln!("{}", serde_json::to_string_pretty(&epics)?);
             } else {
                 for e in &epics {
-                    outln!("{}  {:<13} {}  ({} derived child/ren via 'parent')",
-                        short(&e.task.id), e.task.state.as_str(), e.task.title, e.derived_children);
+                    outln!(
+                        "{}  {:<13} {}  ({} derived child/ren via 'parent')",
+                        short(&e.task.id),
+                        e.task.state.as_str(),
+                        e.task.title,
+                        e.derived_children
+                    );
                 }
                 if epics.is_empty() {
                     outln!("(no epic vertices — no 'parent' tree roots in the graph)");
@@ -444,9 +661,20 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
                     } else {
                         format!("open blockers: {}", blockers.join(", "))
                     };
-                    outln!("{}  {:<13} {}  [{mark}]", short(&n.task.id), n.task.state.as_str(), n.task.title);
+                    outln!(
+                        "{}  {:<13} {}  [{mark}]",
+                        short(&n.task.id),
+                        n.task.state.as_str(),
+                        n.task.title
+                    );
                     for d in &n.dependencies {
-                        outln!("    —{:<7}→ {}  {:<13} {}", d.kind.as_str(), short(&d.depends_on_id), d.depends_on_state.as_str(), d.depends_on_title);
+                        outln!(
+                            "    —{:<7}→ {}  {:<13} {}",
+                            d.kind.as_str(),
+                            short(&d.depends_on_id),
+                            d.depends_on_state.as_str(),
+                            d.depends_on_title
+                        );
                     }
                 }
                 if nodes.is_empty() {
@@ -465,12 +693,19 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
 /// proxy; REQ-MUT-08: one rendering path for success and refusal).
 fn render_mutation(m: &MutationResult) -> Result<()> {
     if m.task.state != m.previous_state {
-        outln!("state: {} → {}", m.previous_state.as_str(), m.task.state.as_str());
+        outln!(
+            "state: {} → {}",
+            m.previous_state.as_str(),
+            m.task.state.as_str()
+        );
     } else {
         outln!("recorded ({})", m.event_kinds[0]);
     }
     if m.staled > 0 {
-        outln!("marked STALE: {} dependent artifact(s) — history preserved", m.staled);
+        outln!(
+            "marked STALE: {} dependent artifact(s) — history preserved",
+            m.staled
+        );
     }
     if m.superseded > 0 {
         outln!("superseded: {}", m.superseded);
@@ -485,8 +720,23 @@ fn render_mutation(m: &MutationResult) -> Result<()> {
 /// execution (API `task.run` — the engine drive including the single-writer
 /// guard, which moved into the operation and keeps its labeled refusal
 /// text). Stops at human gates (APPROVAL, acceptance) — never past them.
-fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&Path>, force_reaudit: bool, json: bool) -> Result<()> {
-    let o = ctx.api().task_run(RunReq { id: id.to_string(), agent: agent.to_string(), workspace: workspace.map(|p| p.to_path_buf()), force_reaudit }).map_err(render_api_error)?;
+fn task_run(
+    ctx: &Ctx,
+    id: &str,
+    agent: &str,
+    workspace: Option<&Path>,
+    force_reaudit: bool,
+    json: bool,
+) -> Result<()> {
+    let o = ctx
+        .api()
+        .task_run(RunReq {
+            id: id.to_string(),
+            agent: agent.to_string(),
+            workspace: workspace.map(|p| p.to_path_buf()),
+            force_reaudit,
+        })
+        .map_err(render_api_error)?;
     let report = o.report;
     if json {
         outln!("{}", serde_json::to_string_pretty(&report)?);
@@ -507,7 +757,9 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&Path>, force_re
         }
     }
     match report.gate {
-        Gate::WaitingApproval => outln!("⏸ APPROVAL is a human gate — approve or reject the requirements"),
+        Gate::WaitingApproval => {
+            outln!("⏸ APPROVAL is a human gate — approve or reject the requirements")
+        }
         Gate::WaitingAccept => {
             // The §2.6 rendering is for the human at the gate.
             if let Some(text) = &o.gate_report_text {
@@ -527,7 +779,9 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&Path>, force_re
                     short(&a.id)
                 );
             } else {
-                outln!("⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run");
+                outln!(
+                    "⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run"
+                );
             }
             if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
@@ -561,39 +815,63 @@ fn task_run(ctx: &Ctx, id: &str, agent: &str, workspace: Option<&Path>, force_re
 /// act, recorded (API `task.merge`) as a decision + event, not a workflow
 /// transition. Cycle 2 moves the RECORDING behind the API; the repository
 /// act stays here exactly where REQ-WT-07 ratified it.
-fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<String>, json: bool) -> Result<()> {
+fn task_merge(
+    ctx: &Ctx,
+    id: &str,
+    workspace: Option<&Path>,
+    rationale: Option<String>,
+    json: bool,
+) -> Result<()> {
     let task = ctx.api().task_get(id).map_err(render_api_error)?;
     let repo = match workspace {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir().context("no current directory; pass --workspace")?,
     };
     if !worktree::is_git_repo(&repo) {
-        bail!("{} is not a git repository — nothing to merge into", repo.display());
+        bail!(
+            "{} is not a git repository — nothing to merge into",
+            repo.display()
+        );
     }
     let branch = worktree::branch_name(task.id);
     if !worktree::has_branch(&repo, task.id) {
-        bail!("task {} has no `{branch}` branch — a writing stage creates it via the platform worktree; there is nothing to merge", short(&task.id));
+        bail!(
+            "task {} has no `{branch}` branch — a writing stage creates it via the platform worktree; there is nothing to merge",
+            short(&task.id)
+        );
     }
-    let head_before = git_in(&repo, &["rev-parse", "--verify", "HEAD"]).context("baseline checkout has no commits to merge into")?;
+    let head_before = git_in(&repo, &["rev-parse", "--verify", "HEAD"])
+        .context("baseline checkout has no commits to merge into")?;
     git_in(&repo, &["merge", "--no-edit", &branch])?;
     let head_after = git_in(&repo, &["rev-parse", "HEAD"])?;
 
-    let r = ctx.api().task_merge_record(MergeRecordReq {
-        id: task.id.to_string(),
-        branch: branch.clone(),
-        workspace: repo.display().to_string(),
-        head_before: head_before.clone(),
-        head_after: head_after.clone(),
-        rationale,
-    }).map_err(render_api_error)?;
+    let r = ctx
+        .api()
+        .task_merge_record(MergeRecordReq {
+            id: task.id.to_string(),
+            branch: branch.clone(),
+            workspace: repo.display().to_string(),
+            head_before: head_before.clone(),
+            head_after: head_after.clone(),
+            rationale,
+        })
+        .map_err(render_api_error)?;
     if json {
-        outln!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "task": r.task_id.to_string(), "branch": r.branch, "workspace": r.workspace,
-            "head_before": r.head_before, "head_after": r.head_after,
-        }))?);
+        outln!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task": r.task_id.to_string(), "branch": r.branch, "workspace": r.workspace,
+                "head_before": r.head_before, "head_after": r.head_after,
+            }))?
+        );
     } else {
-        outln!("merged `{branch}` into {}  {head_before} → {head_after}", repo.display());
-        outln!("branch and worktree persist — their removal is a lifecycle decision the platform does not automate (OQ-1)");
+        outln!(
+            "merged `{branch}` into {}  {head_before} → {head_after}",
+            repo.display()
+        );
+        outln!(
+            "branch and worktree persist — their removal is a lifecycle decision the platform does not automate (OQ-1)"
+        );
     }
     Ok(())
 }
@@ -610,20 +888,41 @@ fn task_merge(ctx: &Ctx, id: &str, workspace: Option<&Path>, rationale: Option<S
 /// human invoking the CLI (AC2), and there is no timeout auto-pass (AC
 /// constraint): without the explicit act the task simply stays parked.
 fn ratify_empty_rework(ctx: &Ctx, id: &str, rationale: Option<String>, json: bool) -> Result<()> {
-    let r = ctx.api().task_ratify_empty_rework(id, rationale).map_err(render_api_error)?;
+    let r = ctx
+        .api()
+        .task_ratify_empty_rework(id, rationale)
+        .map_err(render_api_error)?;
     if json {
-        outln!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "task": r.task.id.to_string(),
-            "decision": r.decision.id.to_string(),
-            "recorded_now": r.recorded_now,
-            "prev_report": r.prev_report,
-            "current_report": r.current_report,
-            "state": r.state.as_str(),
-        }))?);
+        outln!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "task": r.task.id.to_string(),
+                "decision": r.decision.id.to_string(),
+                "recorded_now": r.recorded_now,
+                "prev_report": r.prev_report,
+                "current_report": r.current_report,
+                "state": r.state.as_str(),
+            }))?
+        );
     } else {
-        outln!("ratified: decision {} ({}) — the no-op rework is now a conscious operator passage", r.decision.id, if r.recorded_now { "recorded" } else { "reused stored" });
-        outln!("pair: report {} → report {} on the same commit", r.prev_report, r.current_report);
-        outln!("state: {} → QA; the transition event cites the decision", r.task.state.as_str());
+        outln!(
+            "ratified: decision {} ({}) — the no-op rework is now a conscious operator passage",
+            r.decision.id,
+            if r.recorded_now {
+                "recorded"
+            } else {
+                "reused stored"
+            }
+        );
+        outln!(
+            "pair: report {} → report {} on the same commit",
+            r.prev_report,
+            r.current_report
+        );
+        outln!(
+            "state: {} → QA; the transition event cites the decision",
+            r.task.state.as_str()
+        );
         outln!("next: {}", r.allowed_operations.join(" | "));
     }
     Ok(())
@@ -634,9 +933,17 @@ fn ratify_empty_rework(ctx: &Ctx, id: &str, rationale: Option<String>, json: boo
 /// (REQ-WT-07 — the git invocation stays CLI-side BY RATIFICATION; it is a
 /// repository act, not store access, and is out of the REQ-MUT-02 scope).
 fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = std::process::Command::new("git").args(args).current_dir(dir).output().with_context(|| format!("launch git in {}", dir.display()))?;
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("launch git in {}", dir.display()))?;
     if !out.status.success() {
-        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -663,14 +970,29 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         outln!("---");
         outln!("artifacts (current): {}", current.len());
         for a in &current {
-            outln!("  {:<22} v{:<3} {}  {}", a.kind.as_str(), a.seq, short(&a.id), a.name);
+            outln!(
+                "  {:<22} v{:<3} {}  {}",
+                a.kind.as_str(),
+                a.seq,
+                short(&a.id),
+                a.name
+            );
         }
         for q in &open_q {
-            outln!("open question {}: {}{}", short(&q.id), q.text, if q.blocking { " [BLOCKING]" } else { "" });
+            outln!(
+                "open question {}: {}{}",
+                short(&q.id),
+                q.text,
+                if q.blocking { " [BLOCKING]" } else { "" }
+            );
         }
         outln!(
             "allowed operations: {}",
-            if ops.is_empty() { "(none — task is terminal)".to_string() } else { ops.join(" | ") }
+            if ops.is_empty() {
+                "(none — task is terminal)".to_string()
+            } else {
+                ops.join(" | ")
+            }
         );
     }
     Ok(())
@@ -679,7 +1001,8 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
 /// The human gate's viewing channel: the CURRENT quality report. A verdict
 /// that must be signed must also be readable — after the run printed it, on
 /// demand, forever (history is never deleted; only CURRENT is shown).
-fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {    // (API task.report read — QualityReportView is the machine-complete
+fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    // (API task.report read — QualityReportView is the machine-complete
     // form; REQ-005 CURRENT-by-status selection lives in the API layer.)
     let v = ctx.api().task_report(id).map_err(render_api_error)?;
     if json {
@@ -691,14 +1014,20 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {    // (API task.
         v.seq,
         short_str(&v.artifact),
         v.contract,
-        v.execution.as_deref().map(short_str).unwrap_or_else(|| "-".to_string())
+        v.execution
+            .as_deref()
+            .map(short_str)
+            .unwrap_or_else(|| "-".to_string())
     );
     outln!("---");
     match v.report_text {
         Some(text) => outln!("{text}"),
         // Reports assembled before @2 carry no rendering: show the machine
         // JSON rather than pretend there is nothing to read.
-        None => outln!("{}", serde_json::to_string_pretty(&v.report).unwrap_or_default()),
+        None => outln!(
+            "{}",
+            serde_json::to_string_pretty(&v.report).unwrap_or_default()
+        ),
     }
     Ok(())
 }
@@ -709,55 +1038,95 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {    // (API task.
 
 fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
     match cmd {
-        ArtifactCmd::Publish { id, kind, file, name, depends, contract, execution, verdict, category } => {
+        ArtifactCmd::Publish {
+            id,
+            kind,
+            file,
+            name,
+            depends,
+            contract,
+            execution,
+            verdict,
+            category,
+        } => {
             let kind = ArtifactKind::parse(&kind.replace('-', "_")).map_err(anyhow::Error::new)?;
-            let category = DataCategory::parse(&category.replace('-', "_")).map_err(anyhow::Error::new)?;
+            let category =
+                DataCategory::parse(&category.replace('-', "_")).map_err(anyhow::Error::new)?;
             // The task ref resolves before the file read — the exact order
             // the pre-cycle-2 handler had (error-position parity).
             ctx.api().task_get(&id).map_err(render_api_error)?;
-            let content = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            let content =
+                std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
             // The publication runs in two API operations so the artifact
             // row prints BEFORE a failing advance — the store effects and
             // their order match the compound `artifact.publish` exactly.
-            let row = ctx.api().artifact_publish_row(PublishReq {
-                id: id.clone(),
-                kind,
-                name: name.unwrap_or_else(|| file.display().to_string()),
-                content,
-                depends,
-                contract,
-                execution,
-                verdict: verdict.clone(),
-                category,
-            })
-            .map_err(|e| {
-                // Gate parity (ratified OQ-FG-05, REQ-FG-08): the manual
-                // path runs the SAME contract gate as the engine loop — the
-                // API enforces, the CLI renders the ratified PRESENTATION:
-                // warning + the FULL violation list, then the refusal.
-                if let ApiError::ContractRejected { contract, violations } = &e {
-                    for v in violations {
-                        eprintln!("warning: {contract} contract gate rejected this artifact: {v}");
+            let row = ctx
+                .api()
+                .artifact_publish_row(PublishReq {
+                    id: id.clone(),
+                    kind,
+                    name: name.unwrap_or_else(|| file.display().to_string()),
+                    content,
+                    depends,
+                    contract,
+                    execution,
+                    verdict: verdict.clone(),
+                    category,
+                })
+                .map_err(|e| {
+                    // Gate parity (ratified OQ-FG-05, REQ-FG-08): the manual
+                    // path runs the SAME contract gate as the engine loop — the
+                    // API enforces, the CLI renders the ratified PRESENTATION:
+                    // warning + the FULL violation list, then the refusal.
+                    if let ApiError::ContractRejected {
+                        contract,
+                        violations,
+                    } = &e
+                    {
+                        for v in violations {
+                            eprintln!(
+                                "warning: {contract} contract gate rejected this artifact: {v}"
+                            );
+                        }
                     }
-                }
-                render_api_error(e)
-            })?;
+                    render_api_error(e)
+                })?;
             let a = row.artifact;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&a)?);
             } else {
-                outln!("artifact {} {} v{} ({})", a.kind.as_str(), short(&a.id), a.seq, a.name);
+                outln!(
+                    "artifact {} {} v{} ({})",
+                    a.kind.as_str(),
+                    short(&a.id),
+                    a.seq,
+                    a.name
+                );
             }
             // Some kinds carry the workflow forward — the advancing set is
             // owned by core (`ArtifactKind::advances_state`, QA R4): this
             // render derives membership from the SAME single source the
             // API compound and the standalone advance use.
             if kind.advances_state() {
-                let adv = ctx.api().artifact_advance(AdvanceReq { id, artifact_id: a.id.to_string(), kind, verdict }).map_err(render_api_error)?;
+                let adv = ctx
+                    .api()
+                    .artifact_advance(AdvanceReq {
+                        id,
+                        artifact_id: a.id.to_string(),
+                        kind,
+                        verdict,
+                    })
+                    .map_err(render_api_error)?;
                 outln!("state: {} → {}", adv.from.as_str(), adv.to.as_str());
                 if kind == ArtifactKind::ImplementationReport && adv.rework_gate {
-                    outln!("⏸ EMPTY-REWORK GATE: report {} names the SAME commit as the previous one — the rework captured no new work; QA is withheld.", short(&a.id));
-                    outln!("   operator: ratify the no-op explicitly with `devai task ratify-empty-rework {} --rationale \"...\"`, or answer the question and re-run the implementation with real fixes", short(&a.task_id));
+                    outln!(
+                        "⏸ EMPTY-REWORK GATE: report {} names the SAME commit as the previous one — the rework captured no new work; QA is withheld.",
+                        short(&a.id)
+                    );
+                    outln!(
+                        "   operator: ratify the no-op explicitly with `devai task ratify-empty-rework {} --rationale \"...\"`, or answer the question and re-run the implementation with real fixes",
+                        short(&a.task_id)
+                    );
                 }
             } else if kind == ArtifactKind::QualityReport {
                 outln!("quality report recorded; user decides via `devai task accept|return`");
@@ -772,7 +1141,15 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
                 outln!("(no artifacts)");
             } else {
                 for a in as_ {
-                    outln!("{}  {:<22} v{:<3} {:<12} {}  {}", short(&a.id), a.kind.as_str(), a.seq, a.status.as_str(), a.created_by, a.name);
+                    outln!(
+                        "{}  {:<22} v{:<3} {:<12} {}  {}",
+                        short(&a.id),
+                        a.kind.as_str(),
+                        a.seq,
+                        a.status.as_str(),
+                        a.created_by,
+                        a.name
+                    );
                 }
             }
         }
@@ -780,7 +1157,10 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
             // (API artifact.bytes read — the raw stored content, identical
             // bytes to the pre-API path; the central raw-bytes path stays a
             // closed reader dies quietly (REQ-PIPE-01).)
-            let bytes = ctx.api().artifact_bytes(&artifact_id).map_err(render_api_error)?;
+            let bytes = ctx
+                .api()
+                .artifact_bytes(&artifact_id)
+                .map_err(render_api_error)?;
             crate::out::write_bytes_all(&bytes)?;
         }
     }
@@ -793,19 +1173,46 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
 
 fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
     match cmd {
-        QuestionCmd::Ask { id, text, context, options, blocking, execution } => {
-            let asked = ctx.api().question_ask(AskReq { id, text, context, options, blocking, execution }).map_err(render_api_error)?;
+        QuestionCmd::Ask {
+            id,
+            text,
+            context,
+            options,
+            blocking,
+            execution,
+        } => {
+            let asked = ctx
+                .api()
+                .question_ask(AskReq {
+                    id,
+                    text,
+                    context,
+                    options,
+                    blocking,
+                    execution,
+                })
+                .map_err(render_api_error)?;
             let q = asked.question;
             if asked.parked {
-                outln!("question {} raised; task parked in WAITING_FOR_INPUT", short(&q.id));
+                outln!(
+                    "question {} raised; task parked in WAITING_FOR_INPUT",
+                    short(&q.id)
+                );
                 outln!("answer with: devai question answer {}", short(&q.id));
             } else {
                 outln!("question {} recorded", short(&q.id));
             }
         }
         QuestionCmd::Answer { question_id, text } => {
-            let o = ctx.api().question_answer(&question_id, &text).map_err(render_api_error)?;
-            outln!("answer recorded; state: {} → {}", o.from_state.as_str(), o.to_state.as_str());
+            let o = ctx
+                .api()
+                .question_answer(&question_id, &text)
+                .map_err(render_api_error)?;
+            outln!(
+                "answer recorded; state: {} → {}",
+                o.from_state.as_str(),
+                o.to_state.as_str()
+            );
         }
         QuestionCmd::List { id } => {
             // (API question.list read.)
@@ -816,7 +1223,17 @@ fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
                 outln!("(no questions)");
             } else {
                 for q in qs {
-                    outln!("{} {:<8} {}{}", short(&q.id), q.status.as_str(), q.text, if q.blocking && q.status == QuestionStatus::Open { " [BLOCKING]" } else { "" });
+                    outln!(
+                        "{} {:<8} {}{}",
+                        short(&q.id),
+                        q.status.as_str(),
+                        q.text,
+                        if q.blocking && q.status == QuestionStatus::Open {
+                            " [BLOCKING]"
+                        } else {
+                            ""
+                        }
+                    );
                 }
             }
         }
@@ -831,8 +1248,10 @@ fn question(ctx: &Ctx, cmd: QuestionCmd, json: bool) -> Result<()> {
 fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
     match cmd {
         RoleCmd::Add { file } => {
-            let body = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-            let r: RoleDefinition = serde_json::from_str(&body).context("invalid RoleDefinition JSON")?;
+            let body = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            let r: RoleDefinition =
+                serde_json::from_str(&body).context("invalid RoleDefinition JSON")?;
             // The version override (0 = latest+1 for the slug) and the
             // id/timestamp defaulting run inside the API `role.add`.
             let r = ctx.api().role_add(r).map_err(render_api_error)?;
@@ -847,9 +1266,18 @@ fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
                 outln!("(no roles — run `devai init`)");
             } else {
                 for r in rs {
-                    outln!("{:<24} v{:<3} {}  in={} out={}", r.slug, r.version, r.name,
-                        r.input_contract.map(|c| c.to_string()).unwrap_or("-".into()),
-                        r.output_contract.map(|c| c.to_string()).unwrap_or("-".into()));
+                    outln!(
+                        "{:<24} v{:<3} {}  in={} out={}",
+                        r.slug,
+                        r.version,
+                        r.name,
+                        r.input_contract
+                            .map(|c| c.to_string())
+                            .unwrap_or("-".into()),
+                        r.output_contract
+                            .map(|c| c.to_string())
+                            .unwrap_or("-".into())
+                    );
                 }
             }
         }
@@ -863,9 +1291,25 @@ fn role(ctx: &Ctx, cmd: RoleCmd, json: bool) -> Result<()> {
 
 fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
     match cmd {
-        AgentCmd::Add { name, provider, model, runtime } => {
-            let a = ctx.api().agent_add(AgentAddReq { name, provider, model, runtime }).map_err(render_api_error)?;
-            outln!("agent {} registered (credentials stay outside the store)", a.name);
+        AgentCmd::Add {
+            name,
+            provider,
+            model,
+            runtime,
+        } => {
+            let a = ctx
+                .api()
+                .agent_add(AgentAddReq {
+                    name,
+                    provider,
+                    model,
+                    runtime,
+                })
+                .map_err(render_api_error)?;
+            outln!(
+                "agent {} registered (credentials stay outside the store)",
+                a.name
+            );
         }
         AgentCmd::List => {
             // (API agent.list read.)
@@ -874,7 +1318,13 @@ fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
                 outln!("{}", serde_json::to_string_pretty(&as_)?);
             } else {
                 for a in as_ {
-                    outln!("{}  provider={}  model={}  runtime={}", a.name, a.provider, a.model, a.runtime);
+                    outln!(
+                        "{}  provider={}  model={}  runtime={}",
+                        a.name,
+                        a.provider,
+                        a.model,
+                        a.runtime
+                    );
                 }
             }
         }
@@ -884,13 +1334,30 @@ fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
 
 fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
     match cmd {
-        ContractCmd::Add { name, version, file } => {
-            let schema = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-            serde_json::from_str::<serde_json::Value>(&schema).context("contract file must be valid JSON")?;
-            let r = ctx.api().contract_add(ContractAddReq { name, version, schema }).map_err(render_api_error)?;
+        ContractCmd::Add {
+            name,
+            version,
+            file,
+        } => {
+            let schema = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            serde_json::from_str::<serde_json::Value>(&schema)
+                .context("contract file must be valid JSON")?;
+            let r = ctx
+                .api()
+                .contract_add(ContractAddReq {
+                    name,
+                    version,
+                    schema,
+                })
+                .map_err(render_api_error)?;
             outln!("contract {}@{} registered", r.name, r.version);
         }
-        ContractCmd::Get { name, version } => match ctx.api().contract_get(&name, version).map_err(render_api_error)? {
+        ContractCmd::Get { name, version } => match ctx
+            .api()
+            .contract_get(&name, version)
+            .map_err(render_api_error)?
+        {
             Some(s) => {
                 if json {
                     outln!("{s}");
@@ -915,7 +1382,12 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
 
 fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
-        ExecCmd::Start { id, role, agent, inputs } => {
+        ExecCmd::Start {
+            id,
+            role,
+            agent,
+            inputs,
+        } => {
             // The API `exec.start` operation validates the role/stage
             // matrix, runs the labeled single-writer refusal (REQ-SW-02
             // AC2 — the enforcement point stays the store index), computes
@@ -923,25 +1395,58 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
             // (REQ-001/REQ-006, REQ-SW-03) and opens the row as its own
             // root attempt (REQ-FG-06) — exactly the path the CLI drove
             // directly before cycle 2.
-            let s = ctx.api().exec_start(ExecStartReq { id, role, agent, inputs }).map_err(render_api_error)?;
-            outln!("execution {} for role {}@{} started in state {}", short(&s.execution.id), s.execution.role_slug, s.execution.role_version, s.task.state.as_str());
-            outln!("publish its output artifact with: devai artifact publish {} --execution {}", short(&s.task.id), short(&s.execution.id));
+            let s = ctx
+                .api()
+                .exec_start(ExecStartReq {
+                    id,
+                    role,
+                    agent,
+                    inputs,
+                })
+                .map_err(render_api_error)?;
+            outln!(
+                "execution {} for role {}@{} started in state {}",
+                short(&s.execution.id),
+                s.execution.role_slug,
+                s.execution.role_version,
+                s.task.state.as_str()
+            );
+            outln!(
+                "publish its output artifact with: devai artifact publish {} --execution {}",
+                short(&s.task.id),
+                short(&s.execution.id)
+            );
         }
         ExecCmd::Finish { exec_id, summary } => {
-            let e = ctx.api().exec_finish(&exec_id, summary).map_err(render_api_error)?;
+            let e = ctx
+                .api()
+                .exec_finish(&exec_id, summary)
+                .map_err(render_api_error)?;
             outln!("execution {} completed", short(&e.id));
         }
         ExecCmd::Fail { exec_id, error } => {
-            let e = ctx.api().exec_fail(&exec_id, &error).map_err(render_api_error)?;
-            outln!("execution {} failed (task workflow state unchanged; the stage may be retried)", short(&e.id));
+            let e = ctx
+                .api()
+                .exec_fail(&exec_id, &error)
+                .map_err(render_api_error)?;
+            outln!(
+                "execution {} failed (task workflow state unchanged; the stage may be retried)",
+                short(&e.id)
+            );
         }
         ExecCmd::Cancel { exec_id } => {
             let e = ctx.api().exec_cancel(&exec_id).map_err(render_api_error)?;
-            outln!("execution {} cancelled (cooperative stop acknowledged)", short(&e.id));
+            outln!(
+                "execution {} cancelled (cooperative stop acknowledged)",
+                short(&e.id)
+            );
         }
         ExecCmd::List { task } => {
             // (API exec.list read.)
-            let es = ctx.api().exec_list(task.as_deref()).map_err(render_api_error)?;
+            let es = ctx
+                .api()
+                .exec_list(task.as_deref())
+                .map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&es)?);
             } else if es.is_empty() {
@@ -958,8 +1463,19 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                     if let Some(fc) = &e.failure_class {
                         flags.push_str(&format!(" [{fc}]"));
                     }
-                    outln!("{}  {:<22} {:<12} {:<10}{} {}", short(&e.id), e.role_slug, short(&e.task_id), e.status.as_str(), flags,
-                        e.summary.as_deref().or(e.error.as_deref()).map(|s| ellipsis(s, 60)).unwrap_or_default());
+                    outln!(
+                        "{}  {:<22} {:<12} {:<10}{} {}",
+                        short(&e.id),
+                        e.role_slug,
+                        short(&e.task_id),
+                        e.status.as_str(),
+                        flags,
+                        e.summary
+                            .as_deref()
+                            .or(e.error.as_deref())
+                            .map(|s| ellipsis(s, 60))
+                            .unwrap_or_default()
+                    );
                 }
             }
         }
@@ -996,12 +1512,21 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
             // owner: alive | dead | unknown — an orphan RUNNING row is
             // distinguishable by stored data, not operator pgrep
             // (REQ-API-07 AC3). Never signals the process (REQ-SW-06).
-            let v = ctx.api().exec_liveness(&exec_id).map_err(render_api_error)?;
+            let v = ctx
+                .api()
+                .exec_liveness(&exec_id)
+                .map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&v)?);
             } else {
-                outln!("execution {}  status {}  owner pid={:?} host={:?}  liveness: {}",
-                    v.id, v.status, v.owner_pid, v.owner_host, v.liveness);
+                outln!(
+                    "execution {}  status {}  owner pid={:?} host={:?}  liveness: {}",
+                    v.id,
+                    v.status,
+                    v.owner_pid,
+                    v.owner_host,
+                    v.liveness
+                );
             }
         }
     }
@@ -1108,9 +1633,15 @@ fn export(ctx: &Ctx, id: &str, out: &Path, json: bool) -> Result<()> {
         outln!("{}", serde_json::to_string_pretty(&manifest)?);
     } else {
         outln!("bundle exported to {}", out.display());
-        outln!("task {} — {} events, {} artifacts, {} executions, {} roles, {} contracts",
-            short(&manifest.task_id), manifest.counts.events, manifest.counts.artifacts,
-            manifest.counts.executions, manifest.counts.roles, manifest.counts.contracts);
+        outln!(
+            "task {} — {} events, {} artifacts, {} executions, {} roles, {} contracts",
+            short(&manifest.task_id),
+            manifest.counts.events,
+            manifest.counts.artifacts,
+            manifest.counts.executions,
+            manifest.counts.roles,
+            manifest.counts.contracts
+        );
         outln!("manifest carries sha256 for every file; caches and credentials are never included");
     }
     Ok(())
@@ -1121,11 +1652,22 @@ fn import(ctx: &Ctx, dir: &Path, json: bool) -> Result<()> {
     // single-CURRENT and single-writer invariants are enforced inside.)
     let o = ctx.api().import_bundle(dir).map_err(render_api_error)?;
     if json {
-        outln!("{}", serde_json::json!({"task_id": o.task_id.to_string(), "artifacts": o.imported_artifacts, "events": o.imported_events, "skipped_existing": o.skipped_existing}));
+        outln!(
+            "{}",
+            serde_json::json!({"task_id": o.task_id.to_string(), "artifacts": o.imported_artifacts, "events": o.imported_events, "skipped_existing": o.skipped_existing})
+        );
     } else if o.skipped_existing {
-        outln!("task {} already present — nothing imported", short(&o.task_id));
+        outln!(
+            "task {} already present — nothing imported",
+            short(&o.task_id)
+        );
     } else {
-        outln!("task {} imported: {} artifacts, {} events restored", short(&o.task_id), o.imported_artifacts, o.imported_events);
+        outln!(
+            "task {} imported: {} artifacts, {} events restored",
+            short(&o.task_id),
+            o.imported_artifacts,
+            o.imported_events
+        );
     }
     Ok(())
 }
@@ -1137,11 +1679,26 @@ fn import(ctx: &Ctx, dir: &Path, json: bool) -> Result<()> {
 fn print_task(t: &Task) {
     outln!("id:        {}", t.id);
     outln!("title:     {}", t.title);
-    outln!("state:     {}{}", t.state.as_str(), t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default());
+    outln!(
+        "state:     {}{}",
+        t.state.as_str(),
+        t.return_state
+            .map(|r| format!(" (returns to {})", r.as_str()))
+            .unwrap_or_default()
+    );
     outln!("requirements: v{}", t.requirements_seq);
-    outln!("project:   {}", t.project_id.map(|i| short(&i)).unwrap_or_else(|| "-".into()));
+    outln!(
+        "project:   {}",
+        t.project_id
+            .map(|i| short(&i))
+            .unwrap_or_else(|| "-".into())
+    );
     outln!("lock:      {}", t.lock_version);
-    outln!("created:   {}  updated: {}", t.created_at.format("%Y-%m-%d %H:%M:%S"), t.updated_at.format("%Y-%m-%d %H:%M:%S"));
+    outln!(
+        "created:   {}  updated: {}",
+        t.created_at.format("%Y-%m-%d %H:%M:%S"),
+        t.updated_at.format("%Y-%m-%d %H:%M:%S")
+    );
     if !t.business_description.is_empty() {
         outln!("business:  {}", ellipsis(&t.business_description, 200));
     }
@@ -1172,7 +1729,9 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     outln!(
         "state: {}{}",
         t.state.as_str(),
-        t.return_state.map(|r| format!(" (returns to {})", r.as_str())).unwrap_or_default()
+        t.return_state
+            .map(|r| format!(" (returns to {})", r.as_str()))
+            .unwrap_or_default()
     );
     let mut nodes = Vec::with_capacity(order.len());
     for (i, name) in order.iter().enumerate() {
@@ -1186,12 +1745,22 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     }
     outln!("pipeline: {}", nodes.join(" → "));
     if t.state.is_terminal() {
-        outln!("cycle ended in {} — terminal state, no open pipeline step", t.state.as_str());
+        outln!(
+            "cycle ended in {} — terminal state, no open pipeline step",
+            t.state.as_str()
+        );
     } else if v.pipeline.off_spine {
         // REWORK loop / hold state: the bracket marks where it re-enters.
         match v.pipeline.position.as_deref() {
-            Some(p) => outln!("note:  {} is off the spine — it returns to [{}]", t.state.as_str(), p),
-            None => outln!("note:  {} holds no remembered stage (state corruption — check `devai task events`)", t.state.as_str()),
+            Some(p) => outln!(
+                "note:  {} is off the spine — it returns to [{}]",
+                t.state.as_str(),
+                p
+            ),
+            None => outln!(
+                "note:  {} holds no remembered stage (state corruption — check `devai task events`)",
+                t.state.as_str()
+            ),
         }
     }
     outln!("---");
@@ -1210,7 +1779,11 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     }
     outln!(
         "allowed operations: {}",
-        if ops.is_empty() { "(none — task is terminal)".to_string() } else { ops.join(" | ") }
+        if ops.is_empty() {
+            "(none — task is terminal)".to_string()
+        } else {
+            ops.join(" | ")
+        }
     );
     Ok(())
 }

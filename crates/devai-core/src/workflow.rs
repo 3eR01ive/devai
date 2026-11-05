@@ -41,7 +41,12 @@ const ACTIVE_STATES: &[TaskState] = &[
     TaskState::Rework,
 ];
 
-fn require_state(task: &Task, allowed: &[TaskState], op: &'static str, hint: Option<String>) -> CoreResult<()> {
+fn require_state(
+    task: &Task,
+    allowed: &[TaskState],
+    op: &'static str,
+    hint: Option<String>,
+) -> CoreResult<()> {
     if allowed.contains(&task.state) {
         Ok(())
     } else {
@@ -78,7 +83,11 @@ fn transition(
     }
     Mutation {
         task: next,
-        events: vec![EventDraft { kind, actor: actor.to_string(), payload }],
+        events: vec![EventDraft {
+            kind,
+            actor: actor.to_string(),
+            payload,
+        }],
         artifact_status: Vec::new(),
         questions: Vec::new(),
     }
@@ -86,13 +95,23 @@ fn transition(
 
 /// Builds a mutation for an event that does not change the workflow state
 /// (the lock version still advances: something happened to the aggregate).
-fn note(task: &Task, kind: &'static str, actor: &str, now: Timestamp, payload: serde_json::Value) -> Mutation {
+fn note(
+    task: &Task,
+    kind: &'static str,
+    actor: &str,
+    now: Timestamp,
+    payload: serde_json::Value,
+) -> Mutation {
     let mut next = task.clone();
     next.updated_at = now;
     next.lock_version += 1;
     Mutation {
         task: next,
-        events: vec![EventDraft { kind, actor: actor.to_string(), payload }],
+        events: vec![EventDraft {
+            kind,
+            actor: actor.to_string(),
+            payload,
+        }],
         artifact_status: Vec::new(),
         questions: Vec::new(),
     }
@@ -132,7 +151,11 @@ fn current_spec(artifacts: &[Artifact]) -> Option<&Artifact> {
 /// RATIFIED DECISION OQ3: `parent` edges NEVER gate — pure genealogy.
 pub fn open_blockers(task: &Task, deps: &[TaskDependency]) -> Vec<String> {
     deps.iter()
-        .filter(|d| d.task_id == task.id && d.kind == DependencyKind::Blocks && d.depends_on_state != TaskState::Accepted)
+        .filter(|d| {
+            d.task_id == task.id
+                && d.kind == DependencyKind::Blocks
+                && d.depends_on_state != TaskState::Accepted
+        })
         .map(|d| d.depends_on_id.to_string())
         .collect()
 }
@@ -161,7 +184,11 @@ pub fn override_covers(task: &Task, blockers: &[String], decisions: &[Decision])
 /// those covered by a human override decision (OQ2). An empty result lets
 /// resume/acceptance through; the non-empty result IS the refusal payload —
 /// blocking ids as data (REQ-03 AC1).
-pub fn effective_blockers(task: &Task, deps: &[TaskDependency], decisions: &[Decision]) -> Vec<String> {
+pub fn effective_blockers(
+    task: &Task,
+    deps: &[TaskDependency],
+    decisions: &[Decision],
+) -> Vec<String> {
     let open = open_blockers(task, deps);
     if override_covers(task, &open, decisions) {
         Vec::new()
@@ -175,8 +202,20 @@ pub fn effective_blockers(task: &Task, deps: &[TaskDependency], decisions: &[Dec
 // ---------------------------------------------------------------------------
 
 pub fn start(task: &Task, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::Draft], "start", CoreError::hint("task is created but its workflow not started"))?;
-    Ok(transition(task, TaskState::Analysis, event_kind::WORKFLOW_STARTED, actor, now, json!({})))
+    require_state(
+        task,
+        &[TaskState::Draft],
+        "start",
+        CoreError::hint("task is created but its workflow not started"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::Analysis,
+        event_kind::WORKFLOW_STARTED,
+        actor,
+        now,
+        json!({}),
+    ))
 }
 
 /// A new Requirements Specification version was published (by the Analyst
@@ -192,20 +231,46 @@ pub fn requirements_published(
 ) -> CoreResult<Mutation> {
     require_state(
         task,
-        &[TaskState::Analysis, TaskState::Review, TaskState::Approval, TaskState::Implementation, TaskState::Qa, TaskState::Rework],
-        if task.requirements_seq == 0 { "publish-requirements" } else { "revise" },
-        CoreError::hint("run `devai task start` first; a specification can only be published while the task is in ANALYSIS/REVIEW/APPROVAL/IMPLEMENTATION/QA/REWORK"),
+        &[
+            TaskState::Analysis,
+            TaskState::Review,
+            TaskState::Approval,
+            TaskState::Implementation,
+            TaskState::Qa,
+            TaskState::Rework,
+        ],
+        if task.requirements_seq == 0 {
+            "publish-requirements"
+        } else {
+            "revise"
+        },
+        CoreError::hint(
+            "run `devai task start` first; a specification can only be published while the task is in ANALYSIS/REVIEW/APPROVAL/IMPLEMENTATION/QA/REWORK",
+        ),
     )?;
     let Some(spec) = current_spec(artifacts) else {
-        return Err(CoreError::guard("no CURRENT REQUIREMENTS_SPEC artifact found"));
+        return Err(CoreError::guard(
+            "no CURRENT REQUIREMENTS_SPEC artifact found",
+        ));
     };
 
     let is_revise = task.requirements_seq > 0;
-    let mut m = transition(task, TaskState::Review, if is_revise { event_kind::REQUIREMENTS_REVISED } else { event_kind::REQUIREMENTS_PUBLISHED }, actor, now, json!({
-        (json_field::REQUIREMENTS_SEQ): spec.seq,
-        (json_field::SPEC_ID): spec.id.to_string(),
-        (json_field::REASON): reason,
-    }));
+    let mut m = transition(
+        task,
+        TaskState::Review,
+        if is_revise {
+            event_kind::REQUIREMENTS_REVISED
+        } else {
+            event_kind::REQUIREMENTS_PUBLISHED
+        },
+        actor,
+        now,
+        json!({
+            (json_field::REQUIREMENTS_SEQ): spec.seq,
+            (json_field::SPEC_ID): spec.id.to_string(),
+            (json_field::REASON): reason,
+        }),
+    );
     m.task.requirements_seq = spec.seq;
 
     // The predecessor specs this publication replaces. The set is keyed on
@@ -223,7 +288,10 @@ pub fn requirements_published(
         .filter(|a| a.kind == ArtifactKind::RequirementsSpec && a.id != spec.id && a.seq < spec.seq)
         .collect();
     let superseded: Vec<Id> = predecessors.iter().map(|a| a.id).collect();
-    for a in predecessors.iter().filter(|a| a.status != ArtifactStatus::Superseded) {
+    for a in predecessors
+        .iter()
+        .filter(|a| a.status != ArtifactStatus::Superseded)
+    {
         m.artifact_status.push((a.id, ArtifactStatus::Superseded));
     }
 
@@ -231,7 +299,8 @@ pub fn requirements_published(
     if is_revise {
         let staled = stale_closure(artifacts, &superseded);
         if !staled.is_empty() {
-            m.artifact_status.extend(staled.iter().map(|id| (*id, ArtifactStatus::Stale)));
+            m.artifact_status
+                .extend(staled.iter().map(|id| (*id, ArtifactStatus::Stale)));
             m.events.push(EventDraft {
                 kind: event_kind::ARTIFACTS_STALED,
                 actor: actor.to_string(),
@@ -249,30 +318,76 @@ pub fn review_recorded(
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::Review], "record-review", CoreError::hint("an independent review applies only in REVIEW"))?;
+    require_state(
+        task,
+        &[TaskState::Review],
+        "record-review",
+        CoreError::hint("an independent review applies only in REVIEW"),
+    )?;
     let to = match verdict {
         Verdict::Approved => TaskState::Approval,
         _ => TaskState::Analysis,
     };
-    Ok(transition(task, to, event_kind::REVIEW_RECORDED, actor, now, json!({ (json_field::VERDICT): verdict.as_str(), (json_field::SUMMARY): summary })))
+    Ok(transition(
+        task,
+        to,
+        event_kind::REVIEW_RECORDED,
+        actor,
+        now,
+        json!({ (json_field::VERDICT): verdict.as_str(), (json_field::SUMMARY): summary }),
+    ))
 }
 
-pub fn approve_requirements(task: &Task, rationale: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::Approval], "approve", CoreError::hint(
-        "implementation may only start after requirements were independently reviewed and approved here",
-    ))?;
+pub fn approve_requirements(
+    task: &Task,
+    rationale: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::Approval],
+        "approve",
+        CoreError::hint(
+            "implementation may only start after requirements were independently reviewed and approved here",
+        ),
+    )?;
     if task.requirements_seq == 0 {
         return Err(CoreError::guard("no requirements version to approve"));
     }
-    Ok(transition(task, TaskState::Implementation, event_kind::REQUIREMENTS_APPROVED, actor, now, json!({
-        "requirements_seq": task.requirements_seq,
-        "rationale": rationale,
-    })))
+    Ok(transition(
+        task,
+        TaskState::Implementation,
+        event_kind::REQUIREMENTS_APPROVED,
+        actor,
+        now,
+        json!({
+            "requirements_seq": task.requirements_seq,
+            "rationale": rationale,
+        }),
+    ))
 }
 
-pub fn reject_requirements(task: &Task, rationale: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::Approval], "reject", CoreError::hint("requirements can be rejected only while in APPROVAL"))?;
-    Ok(transition(task, TaskState::Analysis, event_kind::REQUIREMENTS_REJECTED, actor, now, json!({ (json_field::RATIONALE): rationale })))
+pub fn reject_requirements(
+    task: &Task,
+    rationale: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::Approval],
+        "reject",
+        CoreError::hint("requirements can be rejected only while in APPROVAL"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::Analysis,
+        event_kind::REQUIREMENTS_REJECTED,
+        actor,
+        now,
+        json!({ (json_field::RATIONALE): rationale }),
+    ))
 }
 
 /// One previous IMPLEMENTATION_REPORT as the producer read it from stored
@@ -317,7 +432,14 @@ impl ImplementationReportFacts {
     /// test fixture. A REWORK publication built from `bare` facts resolves to
     /// the distinct INCOMPARABLE outcome of REQ-RG-04, never to a silent pass.
     pub fn bare(current_report: Id) -> Self {
-        Self { summary: None, current_report, current_commit: None, priors: Vec::new(), ratifications: Vec::new(), qa_return_rationale: None }
+        Self {
+            summary: None,
+            current_report,
+            current_commit: None,
+            priors: Vec::new(),
+            ratifications: Vec::new(),
+            qa_return_rationale: None,
+        }
     }
 }
 
@@ -340,9 +462,12 @@ pub fn implementation_reported(
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::Implementation, TaskState::Rework], "publish-implementation-report", CoreError::hint(
-        "implementation reports are recorded in IMPLEMENTATION or REWORK",
-    ))?;
+    require_state(
+        task,
+        &[TaskState::Implementation, TaskState::Rework],
+        "publish-implementation-report",
+        CoreError::hint("implementation reports are recorded in IMPLEMENTATION or REWORK"),
+    )?;
 
     let mut payload = json!({ "summary": facts.summary });
     let mut incomparable: Option<(&'static str, Option<String>)> = None;
@@ -368,14 +493,19 @@ pub fn implementation_reported(
                             d.kind == decision_kind::REWORK_NOOP_RATIFIED
                                 && d.verdict == Verdict::Approved
                                 && d.refs.iter().any(|r| *r == prior.artifact_id.to_string())
-                                && d.refs.iter().any(|r| *r == facts.current_report.to_string())
+                                && d.refs
+                                    .iter()
+                                    .any(|r| *r == facts.current_report.to_string())
                         });
                         match ratified {
-                            None => return Ok(empty_rework_trip(task, facts, prior, p, c, actor, now)),
+                            None => {
+                                return Ok(empty_rework_trip(task, facts, prior, p, c, actor, now));
+                            }
                             Some(d) => {
                                 payload[json_field::GATE] = json!("empty-rework");
                                 payload[json_field::VERDICT] = json!("IDENTICAL_RATIFIED");
-                                payload[json_field::PREV_REPORT] = json!(prior.artifact_id.to_string());
+                                payload[json_field::PREV_REPORT] =
+                                    json!(prior.artifact_id.to_string());
                                 payload[json_field::PREV_COMMIT] = json!(p);
                                 payload[json_field::RATIFIED_BY] = json!(d.id.to_string());
                             }
@@ -408,7 +538,14 @@ pub fn implementation_reported(
         }
     }
 
-    let mut m = transition(task, TaskState::Qa, event_kind::IMPLEMENTATION_REPORTED, actor, now, payload);
+    let mut m = transition(
+        task,
+        TaskState::Qa,
+        event_kind::IMPLEMENTATION_REPORTED,
+        actor,
+        now,
+        payload,
+    );
     if let Some((reason, prev_report)) = incomparable {
         m.events.push(EventDraft {
             kind: event_kind::QA_REWORK_GATE_INCOMPARABLE,
@@ -489,7 +626,12 @@ pub fn accept(
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::Qa], "accept", CoreError::hint("acceptance applies only in QA"))?;
+    require_state(
+        task,
+        &[TaskState::Qa],
+        "accept",
+        CoreError::hint("acceptance applies only in QA"),
+    )?;
     // REQ-03: the human gate cannot pass a task an open blocker still
     // holds; the refusal enumerates the blocking ids. The only release is
     // the human's own `dependency_override` decision (ratified OQ2) —
@@ -506,12 +648,36 @@ pub fn accept(
             "acceptance requires a CURRENT QUALITY_REPORT artifact: checks must be independent of the implementation",
         ));
     }
-    Ok(transition(task, TaskState::Accepted, event_kind::TASK_ACCEPTED, actor, now, json!({ "rationale": rationale })))
+    Ok(transition(
+        task,
+        TaskState::Accepted,
+        event_kind::TASK_ACCEPTED,
+        actor,
+        now,
+        json!({ "rationale": rationale }),
+    ))
 }
 
-pub fn return_to_rework(task: &Task, rationale: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::Qa], "return", CoreError::hint("QA results can be returned only in QA"))?;
-    Ok(transition(task, TaskState::Rework, event_kind::QUALITY_RETURNED, actor, now, json!({ (json_field::RATIONALE): rationale })))
+pub fn return_to_rework(
+    task: &Task,
+    rationale: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::Qa],
+        "return",
+        CoreError::hint("QA results can be returned only in QA"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::Rework,
+        event_kind::QUALITY_RETURNED,
+        actor,
+        now,
+        json!({ (json_field::RATIONALE): rationale }),
+    ))
 }
 
 /// A role raises a question. Blocking questions move the task to
@@ -527,14 +693,45 @@ pub fn raise_question(
     if !blocking {
         return Ok(note(task, event_kind::QUESTION_RAISED, actor, now, payload));
     }
-    require_state(task, &ACTIVE_STATES, "raise-blocking-question", CoreError::hint("only an active stage can wait for input"))?;
-    Ok(transition(task, TaskState::WaitingForInput, event_kind::QUESTION_RAISED, actor, now, payload))
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "raise-blocking-question",
+        CoreError::hint("only an active stage can wait for input"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::WaitingForInput,
+        event_kind::QUESTION_RAISED,
+        actor,
+        now,
+        payload,
+    ))
 }
 
-pub fn answer_question(task: &Task, question_id: Id, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &[TaskState::WaitingForInput], "answer", CoreError::hint("the task is not waiting for input"))?;
-    let to = task.return_state.ok_or_else(|| CoreError::guard("WAITING_FOR_INPUT without a remembered stage is a state corruption"))?;
-    let mut m = transition(task, to, event_kind::QUESTION_ANSWERED, actor, now, json!({ "question_id": question_id.to_string() }));
+pub fn answer_question(
+    task: &Task,
+    question_id: Id,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::WaitingForInput],
+        "answer",
+        CoreError::hint("the task is not waiting for input"),
+    )?;
+    let to = task.return_state.ok_or_else(|| {
+        CoreError::guard("WAITING_FOR_INPUT without a remembered stage is a state corruption")
+    })?;
+    let mut m = transition(
+        task,
+        to,
+        event_kind::QUESTION_ANSWERED,
+        actor,
+        now,
+        json!({ "question_id": question_id.to_string() }),
+    );
     m.task.return_state = None;
     Ok(m)
 }
@@ -556,8 +753,16 @@ pub fn escalate_form_rejection(
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
-    require_state(task, &ACTIVE_STATES, "escalate-form-rejection", CoreError::hint("only an active stage can park on a form escalation"))?;
-    let bullet_list = violations.iter().map(|v| format!("\n  - {v}")).collect::<String>();
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "escalate-form-rejection",
+        CoreError::hint("only an active stage can park on a form escalation"),
+    )?;
+    let bullet_list = violations
+        .iter()
+        .map(|v| format!("\n  - {v}"))
+        .collect::<String>();
     let mut m = transition(
         task,
         TaskState::WaitingForInput,
@@ -601,19 +806,70 @@ pub fn escalate_form_rejection(
 // holds: pause / block / cancel / fail
 // ---------------------------------------------------------------------------
 
-pub fn pause(task: &Task, reason: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &ACTIVE_STATES, "pause", CoreError::hint("cannot pause a terminal or already-held task"))?;
-    Ok(transition(task, TaskState::Paused, event_kind::TASK_PAUSED, actor, now, json!({ "reason": reason })))
+pub fn pause(
+    task: &Task,
+    reason: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "pause",
+        CoreError::hint("cannot pause a terminal or already-held task"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::Paused,
+        event_kind::TASK_PAUSED,
+        actor,
+        now,
+        json!({ "reason": reason }),
+    ))
 }
 
-pub fn block(task: &Task, reason: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &ACTIVE_STATES, "block", CoreError::hint("cannot block a terminal or already-held task"))?;
-    Ok(transition(task, TaskState::Blocked, event_kind::TASK_BLOCKED, actor, now, json!({ "reason": reason })))
+pub fn block(
+    task: &Task,
+    reason: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "block",
+        CoreError::hint("cannot block a terminal or already-held task"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::Blocked,
+        event_kind::TASK_BLOCKED,
+        actor,
+        now,
+        json!({ "reason": reason }),
+    ))
 }
 
-pub fn cancel(task: &Task, reason: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &ACTIVE_STATES, "cancel", CoreError::hint("cannot cancel a terminal or already-held task"))?;
-    Ok(transition(task, TaskState::Cancelled, event_kind::TASK_CANCELLED, actor, now, json!({ "reason": reason })))
+pub fn cancel(
+    task: &Task,
+    reason: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "cancel",
+        CoreError::hint("cannot cancel a terminal or already-held task"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::Cancelled,
+        event_kind::TASK_CANCELLED,
+        actor,
+        now,
+        json!({ "reason": reason }),
+    ))
 }
 
 /// Releases a hold state (PAUSED / BLOCKED / FAILED → remembered stage).
@@ -625,7 +881,13 @@ pub fn cancel(task: &Task, reason: Option<&str>, actor: &str, now: Timestamp) ->
 /// function (or anywhere else in the platform) releases a hold state when
 /// the last blocker closes — resume stays a human act until a human issues
 /// it, the platform never decides on the operator's behalf.
-pub fn resume(task: &Task, deps: &[TaskDependency], decisions: &[Decision], actor: &str, now: Timestamp) -> CoreResult<Mutation> {
+pub fn resume(
+    task: &Task,
+    deps: &[TaskDependency],
+    decisions: &[Decision],
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
     require_state(
         task,
         &[TaskState::Paused, TaskState::Blocked, TaskState::Failed],
@@ -636,15 +898,34 @@ pub fn resume(task: &Task, deps: &[TaskDependency], decisions: &[Decision], acto
     if !blockers.is_empty() {
         return Err(CoreError::OpenBlockers { blockers });
     }
-    let to = task.return_state.ok_or_else(|| CoreError::guard("hold state without a remembered stage is a state corruption"))?;
+    let to = task.return_state.ok_or_else(|| {
+        CoreError::guard("hold state without a remembered stage is a state corruption")
+    })?;
     let mut m = transition(task, to, event_kind::TASK_RESUMED, actor, now, json!({}));
     m.task.return_state = None;
     Ok(m)
 }
 
-pub fn fail(task: &Task, reason: Option<&str>, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
-    require_state(task, &ACTIVE_STATES, "fail", CoreError::hint("only an active stage can fail"))?;
-    Ok(transition(task, TaskState::Failed, event_kind::TASK_FAILED, actor, now, json!({ "reason": reason })))
+pub fn fail(
+    task: &Task,
+    reason: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "fail",
+        CoreError::hint("only an active stage can fail"),
+    )?;
+    Ok(transition(
+        task,
+        TaskState::Failed,
+        event_kind::TASK_FAILED,
+        actor,
+        now,
+        json!({ "reason": reason }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +956,11 @@ pub fn check_execution_allowed(slug: &str, task: &Task) -> CoreResult<()> {
             from: task.state.as_str().to_string(),
             hint: Some(format!(
                 "role `{slug}` may only run in {}",
-                allowed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                allowed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         })
     }
@@ -687,8 +972,11 @@ pub fn execution_output_effect(slug: &str, kind: ArtifactKind) -> Option<&'stati
         ("requirements-analyst", ArtifactKind::RequirementsSpec) => Some("requirements_published"),
         ("requirements-reviewer", ArtifactKind::ReviewReport) => Some("review_recorded"),
         ("architecture-reviewer", ArtifactKind::ReviewReport) => Some("review_recorded"),
-        ("implementation-agent", ArtifactKind::ImplementationReport) => Some("implementation_reported"),
-        ("quality-auditor", ArtifactKind::QualityReport) | ("quality-aggregator", ArtifactKind::QualityReport) => Some("qa_report"),
+        ("implementation-agent", ArtifactKind::ImplementationReport) => {
+            Some("implementation_reported")
+        }
+        ("quality-auditor", ArtifactKind::QualityReport)
+        | ("quality-aggregator", ArtifactKind::QualityReport) => Some("qa_report"),
         _ => None,
     }
 }
@@ -779,15 +1067,40 @@ pub fn pipeline_off_spine(task: &Task) -> bool {
 pub fn allowed_ops(task: &Task) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = match task.state {
         TaskState::Draft => vec!["start"],
-        TaskState::Analysis => vec!["publish-requirements", "run-role-execution(requirements-analyst)", "raise-question"],
-        TaskState::Review => vec!["record-review", "run-role-execution(*-reviewer)", "revise", "raise-question"],
+        TaskState::Analysis => vec![
+            "publish-requirements",
+            "run-role-execution(requirements-analyst)",
+            "raise-question",
+        ],
+        TaskState::Review => vec![
+            "record-review",
+            "run-role-execution(*-reviewer)",
+            "revise",
+            "raise-question",
+        ],
         TaskState::Approval => vec!["approve", "reject", "revise"],
-        TaskState::Implementation => vec!["publish-implementation-report", "run-role-execution(implementation-agent)", "revise", "raise-question"],
-        TaskState::Qa => vec!["accept", "return", "run-role-execution(quality-auditor)", "run-role-execution(quality-aggregator)", "revise"],
+        TaskState::Implementation => vec![
+            "publish-implementation-report",
+            "run-role-execution(implementation-agent)",
+            "revise",
+            "raise-question",
+        ],
+        TaskState::Qa => vec![
+            "accept",
+            "return",
+            "run-role-execution(quality-auditor)",
+            "run-role-execution(quality-aggregator)",
+            "revise",
+        ],
         // REQ-RG-05: the empty-rework gate's loud primitive is the blocking
         // question, so the REWORK row of this table names it (the gate itself
         // raises it at publication; the listing is the operator's surface).
-        TaskState::Rework => vec!["publish-implementation-report", "run-role-execution(implementation-agent)", "revise", "raise-question"],
+        TaskState::Rework => vec![
+            "publish-implementation-report",
+            "run-role-execution(implementation-agent)",
+            "revise",
+            "raise-question",
+        ],
         TaskState::WaitingForInput => vec!["answer"],
         TaskState::Paused | TaskState::Failed => vec!["resume"],
         TaskState::Blocked => vec!["resume"],

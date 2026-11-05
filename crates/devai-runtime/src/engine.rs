@@ -16,7 +16,9 @@ use devai_core::workflow;
 use devai_store::config::{Profile, ResponseFormPolicy, ReworkPolicy};
 use devai_store::{ArtifactDraft, Store, StoreError};
 
-use crate::adapters::{self, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome};
+use crate::adapters::{
+    self, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
+};
 use crate::evaluation;
 use crate::gate;
 use crate::prompt::build_user_prompt;
@@ -239,7 +241,14 @@ impl FormLoopHost for StageAttempts<'_> {
         // an event payload — never truncated to the first violation.
         let err = self
             .store
-            .finish_execution_classified(&self.open, ExecutionStatus::Failed, None, Some(&violations.join("; ")), Some(failure_class::RESPONSE_FORM), Utc::now())
+            .finish_execution_classified(
+                &self.open,
+                ExecutionStatus::Failed,
+                None,
+                Some(&violations.join("; ")),
+                Some(failure_class::RESPONSE_FORM),
+                Utc::now(),
+            )
             .and_then(|_| {
                 self.store.insert_event(
                     Some(self.template.task_id),
@@ -308,14 +317,19 @@ impl<'a> Engine<'a> {
         let cfg_dir = std::env::var_os("DEVAI_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| store.root().join("config"));
-        let profiles = devai_store::config::load_profiles(&cfg_dir.join("evaluation")).unwrap_or_default();
-        let profile = profiles.into_iter().find(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"));
+        let profiles =
+            devai_store::config::load_profiles(&cfg_dir.join("evaluation")).unwrap_or_default();
+        let profile = profiles
+            .into_iter()
+            .find(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"));
         // Same loud-degrade discipline as profiles: an unreadable or invalid
         // form-loop config falls back to the declared default (2) rather than
         // silently zeroing the budget; `devai init` already validates it at
         // seed time (seed.rs), so this fallback only shields a broken manual
         // edit from taking the whole engine down.
-        let response_form = devai_store::config::load_response_form_policy(&cfg_dir.join("workflow")).unwrap_or_default();
+        let response_form =
+            devai_store::config::load_response_form_policy(&cfg_dir.join("workflow"))
+                .unwrap_or_default();
         // REWORK delivery table. Unlike the form budget, the table cannot
         // degrade quietly — a silently empty table would disable delivery
         // while the YAML on disk claims otherwise. Absent file/dir =>
@@ -331,7 +345,16 @@ impl<'a> Engine<'a> {
             }
         };
         let workspace = std::env::current_dir().unwrap_or_else(|_| store.root().to_path_buf());
-        Engine { store, max_steps: DEFAULT_MAX_STEPS, profile, workspace, force_reaudit: false, response_form, rework, rework_config_error }
+        Engine {
+            store,
+            max_steps: DEFAULT_MAX_STEPS,
+            profile,
+            workspace,
+            force_reaudit: false,
+            response_form,
+            rework,
+            rework_config_error,
+        }
     }
 
     /// Override the probe workspace (tests, monorepo subdirs).
@@ -414,7 +437,11 @@ impl<'a> Engine<'a> {
     /// workspace that execution actually evaluates.
     fn revision_at(&self, workspace: &Path) -> RuntimeResult<WorkspaceRevision> {
         let roles = self.current_roles()?;
-        Ok(crate::revision::compute(workspace, self.profile.as_ref(), &roles))
+        Ok(crate::revision::compute(
+            workspace,
+            self.profile.as_ref(),
+            &roles,
+        ))
     }
 
     /// The workspace a stage of THIS task evaluates against: the task's
@@ -436,7 +463,11 @@ impl<'a> Engine<'a> {
     /// Platform-declared run-artifact directory for one execution
     /// (`DEVAI_HOME/evidence/<task>/<execution>`, REQ-WT-05 AC1).
     fn evidence_dir(&self, task_id: Id, execution_id: Id) -> PathBuf {
-        self.store.root().join(EVIDENCE_SUBDIR).join(task_id.to_string()).join(execution_id.to_string())
+        self.store
+            .root()
+            .join(EVIDENCE_SUBDIR)
+            .join(task_id.to_string())
+            .join(execution_id.to_string())
     }
 
     /// Latest stored version per role slug, as sorted `slug@version` — the
@@ -449,13 +480,21 @@ impl<'a> Engine<'a> {
                 *e = r.version;
             }
         }
-        Ok(latest.iter().map(|(slug, v)| format!("{slug}@{v}")).collect())
+        Ok(latest
+            .iter()
+            .map(|(slug, v)| format!("{slug}@{v}"))
+            .collect())
     }
 
     /// Advance the task through every autonomous stage until a human gate,
     /// hold or terminal state. `agent_name` selects the `AgentInstance`
     /// (builtin fallbacks: `mock`, `claude`).
-    pub fn advance(&self, task_ref: &str, agent_name: &str, actor: &str) -> RuntimeResult<RunReport> {
+    pub fn advance(
+        &self,
+        task_ref: &str,
+        agent_name: &str,
+        actor: &str,
+    ) -> RuntimeResult<RunReport> {
         let mut steps = Vec::new();
         loop {
             let task = self.store.resolve_task(task_ref)?;
@@ -470,10 +509,14 @@ impl<'a> Engine<'a> {
             let (role_slug, kind) = match task.state {
                 TaskState::Analysis => ("requirements-analyst", ArtifactKind::RequirementsSpec),
                 TaskState::Review => ("requirements-reviewer", ArtifactKind::ReviewReport),
-                TaskState::Implementation | TaskState::Rework => ("implementation-agent", ArtifactKind::ImplementationReport),
+                TaskState::Implementation | TaskState::Rework => {
+                    ("implementation-agent", ArtifactKind::ImplementationReport)
+                }
                 TaskState::Qa => ("quality-auditor", ArtifactKind::QualityReport),
                 TaskState::Approval => return Ok(self.report(&task, steps, Gate::WaitingApproval)),
-                TaskState::Accepted | TaskState::Cancelled => return Ok(self.report(&task, steps, Gate::Terminal(task.state))),
+                TaskState::Accepted | TaskState::Cancelled => {
+                    return Ok(self.report(&task, steps, Gate::Terminal(task.state)));
+                }
                 s => return Ok(self.report(&task, steps, Gate::Hold(s))),
             };
 
@@ -554,7 +597,12 @@ impl<'a> Engine<'a> {
     }
 
     fn report(&self, task: &Task, steps: Vec<StepOutcome>, gate: Gate) -> RunReport {
-        RunReport { task_id: task.id, now: task.state, steps, gate }
+        RunReport {
+            task_id: task.id,
+            now: task.state,
+            steps,
+            gate,
+        }
     }
 
     /// Returns `Some((current_report_artifact, embedded_revision))` when the
@@ -565,7 +613,10 @@ impl<'a> Engine<'a> {
     /// are bound to no recorded state), a non-comparable revision (no git), or
     /// a genuine mismatch. Freshness requires ALL FOUR components to match
     /// (A-002): a profile or role version bump alone is stale, forcing re-audit.
-    fn fresh_bound_report(&self, task: &Task) -> RuntimeResult<Option<(Artifact, WorkspaceRevision)>> {
+    fn fresh_bound_report(
+        &self,
+        task: &Task,
+    ) -> RuntimeResult<Option<(Artifact, WorkspaceRevision)>> {
         let artifacts = self.store.artifacts(task.id)?;
         // Selection by status=CURRENT alone (REQ-005): schema v3 keeps at
         // most one CURRENT per (task_id, kind) — DB-pinned — so the filter
@@ -573,7 +624,9 @@ impl<'a> Engine<'a> {
         // belt for legacy-shape slices, not a UI-side workaround.
         let Some(report) = artifacts
             .iter()
-            .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
+            .filter(|a| {
+                a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current
+            })
             .max_by_key(|a| a.seq)
             .cloned()
         else {
@@ -606,11 +659,21 @@ impl<'a> Engine<'a> {
     /// the loop exhausted its budget: the task is then parked in
     /// WAITING_FOR_INPUT on a blocking question (OQ-FG-08), no artifact and
     /// no step were produced.
-    fn run_stage(&self, task: &Task, role_slug: &str, kind: ArtifactKind, agent_name: &str, actor: &str) -> RuntimeResult<StageResult> {
+    fn run_stage(
+        &self,
+        task: &Task,
+        role_slug: &str,
+        kind: ArtifactKind,
+        agent_name: &str,
+        actor: &str,
+    ) -> RuntimeResult<StageResult> {
         // Sovereignty check first: the role may only run in this stage.
         workflow::check_execution_allowed(role_slug, task)?;
 
-        let role = self.store.get_role(role_slug)?.ok_or_else(|| RuntimeError::MissingRole(role_slug.to_string()))?;
+        let role = self
+            .store
+            .get_role(role_slug)?
+            .ok_or_else(|| RuntimeError::MissingRole(role_slug.to_string()))?;
         let agent = self.resolve_agent(agent_name)?;
 
         let artifacts = self.store.artifacts(task.id)?;
@@ -619,7 +682,9 @@ impl<'a> Engine<'a> {
         // `fresh_bound_report` — never a substitute for the domain invariant.
         let spec = artifacts
             .iter()
-            .filter(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current)
+            .filter(|a| {
+                a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
+            })
             .max_by_key(|a| a.seq)
             .cloned();
 
@@ -629,13 +694,24 @@ impl<'a> Engine<'a> {
         match kind {
             ArtifactKind::RequirementsSpec => {}
             ArtifactKind::ReviewReport | ArtifactKind::ImplementationReport => {
-                input_arts.push(spec.as_ref().ok_or(RuntimeError::MissingArtifact("REQUIREMENTS_SPEC"))?.clone());
+                input_arts.push(
+                    spec.as_ref()
+                        .ok_or(RuntimeError::MissingArtifact("REQUIREMENTS_SPEC"))?
+                        .clone(),
+                );
             }
             ArtifactKind::QualityReport => {
-                input_arts.push(spec.as_ref().ok_or(RuntimeError::MissingArtifact("REQUIREMENTS_SPEC"))?.clone());
+                input_arts.push(
+                    spec.as_ref()
+                        .ok_or(RuntimeError::MissingArtifact("REQUIREMENTS_SPEC"))?
+                        .clone(),
+                );
                 if let Some(rep) = artifacts
                     .iter()
-                    .filter(|a| a.kind == ArtifactKind::ImplementationReport && a.status == ArtifactStatus::Current)
+                    .filter(|a| {
+                        a.kind == ArtifactKind::ImplementationReport
+                            && a.status == ArtifactStatus::Current
+                    })
                     .max_by_key(|a| a.seq)
                 {
                     input_arts.push(rep.clone());
@@ -654,7 +730,9 @@ impl<'a> Engine<'a> {
         }
         let mut inputs: Vec<(String, String)> = input_arts
             .iter()
-            .map(|a| -> RuntimeResult<(String, String)> { Ok((format!("{} v{}", a.kind.as_str(), a.seq), self.content(a)?)) })
+            .map(|a| -> RuntimeResult<(String, String)> {
+                Ok((format!("{} v{}", a.kind.as_str(), a.seq), self.content(a)?))
+            })
             .collect::<RuntimeResult<_>>()?;
 
         let is_qa = kind == ArtifactKind::QualityReport;
@@ -680,7 +758,9 @@ impl<'a> Engine<'a> {
         if let Some(err) = &self.rework_config_error {
             return Err(RuntimeError::Store(StoreError::Config(err.clone())));
         }
-        if let Some(section) = crate::context::rework_context(self.store, task, role_slug, &self.rework)? {
+        if let Some(section) =
+            crate::context::rework_context(self.store, task, role_slug, &self.rework)?
+        {
             inputs.push((crate::context::REWORK_CONTEXT_LABEL.to_string(), section));
         }
         // QA stage: the platform runs the profile's probes FIRST, so the
@@ -695,7 +775,11 @@ impl<'a> Engine<'a> {
             // REQ-WT-03: probes measure the task's evaluation workspace —
             // the isolation worktree once one is live for this task.
             let run = evaluation::execute(profile, &self.eval_workspace(task));
-            inputs.push(("MECHANICAL_EVIDENCE (platform-run probes; rubric scores are yours to confirm)".to_string(), run.evidence_text.clone()));
+            inputs.push((
+                "MECHANICAL_EVIDENCE (platform-run probes; rubric scores are yours to confirm)"
+                    .to_string(),
+                run.evidence_text.clone(),
+            ));
             Some(run)
         } else {
             None
@@ -707,7 +791,12 @@ impl<'a> Engine<'a> {
             Some(
                 self.store
                     .get_contract(ASSESSMENT_CONTRACT.0, ASSESSMENT_CONTRACT.1)?
-                    .ok_or_else(|| RuntimeError::MissingContract(ASSESSMENT_CONTRACT.0.into(), ASSESSMENT_CONTRACT.1))?,
+                    .ok_or_else(|| {
+                        RuntimeError::MissingContract(
+                            ASSESSMENT_CONTRACT.0.into(),
+                            ASSESSMENT_CONTRACT.1,
+                        )
+                    })?,
             )
         } else {
             // A declared-but-unloadable contract is an error, not a silent
@@ -735,7 +824,8 @@ impl<'a> Engine<'a> {
         // same process» without touching the OS at start (the row carries
         // it). Attempt rows cloned from this template inherit the same
         // owner — same process, same stage.
-        let (owner_pid, owner_host, owner_process_start) = crate::liveness::current_owner().into_columns();
+        let (owner_pid, owner_host, owner_process_start) =
+            crate::liveness::current_owner().into_columns();
         let execution = RoleExecution {
             id: new_id(),
             task_id: task.id,
@@ -779,14 +869,22 @@ impl<'a> Engine<'a> {
         let evidence = self.evidence_dir(task.id, execution.id);
         let mut isolated: Option<worktree::Worktree> = None;
         if writing {
-            match worktree::prepare(&self.workspace, self.store.root(), task.id, revision.git_head.as_deref()) {
+            match worktree::prepare(
+                &self.workspace,
+                self.store.root(),
+                task.id,
+                revision.git_head.as_deref(),
+            ) {
                 Ok(wt) => {
                     if let Err(e) = std::fs::create_dir_all(&evidence) {
                         let _ = self.store.finish_execution_classified(
                             &execution,
                             ExecutionStatus::Failed,
                             None,
-                            Some(&format!("cannot create platform evidence dir {}: {e}", evidence.display())),
+                            Some(&format!(
+                                "cannot create platform evidence dir {}: {e}",
+                                evidence.display()
+                            )),
                             Some(failure_class::PLATFORM),
                             Utc::now(),
                         );
@@ -806,7 +904,14 @@ impl<'a> Engine<'a> {
                     isolated = Some(wt);
                 }
                 Err(e) => {
-                    let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Some(failure_class::PLATFORM), Utc::now());
+                    let _ = self.store.finish_execution_classified(
+                        &execution,
+                        ExecutionStatus::Failed,
+                        None,
+                        Some(&e.to_string()),
+                        Some(failure_class::PLATFORM),
+                        Utc::now(),
+                    );
                     return Err(e.into());
                 }
             }
@@ -816,10 +921,20 @@ impl<'a> Engine<'a> {
         // under the platform-declared evidence root, referenced from the
         // prompt by path; never written into any checkout.
         if let Some(run) = &eval_run {
-            if let Err(e) = std::fs::create_dir_all(&evidence)
-                .and_then(|_| std::fs::write(evidence.join(PROBE_EVIDENCE_FILE), &run.evidence_text))
-            {
-                let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store probe evidence in {}: {e}", evidence.display())), Some(failure_class::PLATFORM), Utc::now());
+            if let Err(e) = std::fs::create_dir_all(&evidence).and_then(|_| {
+                std::fs::write(evidence.join(PROBE_EVIDENCE_FILE), &run.evidence_text)
+            }) {
+                let _ = self.store.finish_execution_classified(
+                    &execution,
+                    ExecutionStatus::Failed,
+                    None,
+                    Some(&format!(
+                        "cannot store probe evidence in {}: {e}",
+                        evidence.display()
+                    )),
+                    Some(failure_class::PLATFORM),
+                    Utc::now(),
+                );
                 return Err(RuntimeError::Store(e.into()));
             }
             inputs.push((
@@ -874,7 +989,17 @@ impl<'a> Engine<'a> {
                 contract_schema.as_deref(),
             );
             if let Err(e) = std::fs::write(evidence.join(AUDITOR_PROMPT_FILE), prompt) {
-                let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&format!("cannot store auditor prompt in {}: {e}", evidence.display())), Some(failure_class::PLATFORM), Utc::now());
+                let _ = self.store.finish_execution_classified(
+                    &execution,
+                    ExecutionStatus::Failed,
+                    None,
+                    Some(&format!(
+                        "cannot store auditor prompt in {}: {e}",
+                        evidence.display()
+                    )),
+                    Some(failure_class::PLATFORM),
+                    Utc::now(),
+                );
                 return Err(RuntimeError::Store(e.into()));
             }
         }
@@ -895,7 +1020,12 @@ impl<'a> Engine<'a> {
             contract_schema: contract_schema.clone(),
             // REQ-WT-02 AC1: a writing role is NEVER handed the main
             // checkout path — its workspace is the isolation worktree.
-            workspace: Some(isolated.as_ref().map(|w| w.dir.clone()).unwrap_or_else(|| self.workspace.clone())),
+            workspace: Some(
+                isolated
+                    .as_ref()
+                    .map(|w| w.dir.clone())
+                    .unwrap_or_else(|| self.workspace.clone()),
+            ),
             evidence: if writing { Some(evidence) } else { None },
             // Attempt 1 answers the ORIGINAL question; the loop fills this
             // in for re-prompts (REQ-FG-02 AC2).
@@ -950,7 +1080,10 @@ impl<'a> Engine<'a> {
                 // happened, workflow says nothing moved.
                 return Err(e.into());
             }
-            RunOutcome::FormExhausted { attempts, violations } => {
+            RunOutcome::FormExhausted {
+                attempts,
+                violations,
+            } => {
                 if let Some(se) = hook.store_err {
                     return Err(RuntimeError::Store(se));
                 }
@@ -958,14 +1091,24 @@ impl<'a> Engine<'a> {
                     // The loop is OFF by config: exactly the pre-loop
                     // behavior — one call, the form failure fails the
                     // execution, no escalation to invent (REQ-FG-04 AC2).
-                    return Err(RuntimeError::Adapter(AdapterError::BadOutput { violations }));
+                    return Err(RuntimeError::Adapter(AdapterError::BadOutput {
+                        violations,
+                    }));
                 }
                 // Exhaustion is LOUD and ANSWERABLE (OQ-FG-08): the core
                 // command parks the task in WAITING_FOR_INPUT with a blocking
                 // question carrying the full list; transition + event +
                 // question commit atomically. No artifact is published —
                 // rejected bodies never become artifacts (REQ-FG-07 AC2).
-                let m = workflow::escalate_form_rejection(task, new_id(), role_slug, attempts, &violations, actor, Utc::now())?;
+                let m = workflow::escalate_form_rejection(
+                    task,
+                    new_id(),
+                    role_slug,
+                    attempts,
+                    &violations,
+                    actor,
+                    Utc::now(),
+                )?;
                 self.store.commit(task.lock_version, &m)?;
                 return Ok(StageResult::Escalated);
             }
@@ -1003,61 +1146,106 @@ impl<'a> Engine<'a> {
             // a published implementation report cannot name a directory
             // that holds no committed state. Failure here is an honestly
             // FAILED execution, never an unstamped artifact.
-            match self.capture_writing_result(task, &execution, wt, contract_schema.as_deref(), &out) {
+            match self.capture_writing_result(
+                task,
+                &execution,
+                wt,
+                contract_schema.as_deref(),
+                &out,
+            ) {
                 Ok((content, summary)) => (content, Some(summary), role.output_contract.clone()),
                 Err(e) => {
                     // Post-loop capture is platform-side work (commit +
                     // stamp): its failure is classed `platform`, never
                     // replayed to the role as a form defect (REQ-FG-03 AC2).
-                    let _ = self.store.finish_execution_classified(&execution, ExecutionStatus::Failed, None, Some(&e.to_string()), Some(failure_class::PLATFORM), Utc::now());
+                    let _ = self.store.finish_execution_classified(
+                        &execution,
+                        ExecutionStatus::Failed,
+                        None,
+                        Some(&e.to_string()),
+                        Some(failure_class::PLATFORM),
+                        Utc::now(),
+                    );
                     return Err(e);
                 }
             }
         } else {
             match (&eval_run, is_qa) {
-            (Some(run), true) => {
-                let profile = self.profile.as_ref().expect("eval_run implies profile present");
-                // The adapter already gate-checked this reply; a re-parse
-                // failure here is the PLATFORM's assembly breaking, never a
-                // role form defect (REQ-FG-03 AC2).
-                let assessment: serde_json::Value = serde_json::from_slice(&out.content)
-                    .map_err(|e| AdapterError::Platform(format!("assessment reply is not valid JSON, cannot assemble: {e}")))?;
-                let assembled = evaluation::assemble(profile, run, &assessment, &execution.id.to_string(), &revision);
-                let text = serde_json::to_string_pretty(&assembled.json)
-                    .map_err(|e| AdapterError::Platform(format!("cannot serialize assembled report: {e}")))?;
-                let schema = self
-                    .store
-                    .get_contract(QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1)?
-                    .ok_or_else(|| RuntimeError::MissingContract(QUALITY_REPORT_CONTRACT.0.into(), QUALITY_REPORT_CONTRACT.1))?;
-                if let Err(e) = adapters::validate_against_contract(&text, Some(&schema)) {
-                    let _ = self.store.finish_execution_classified(
-                        &execution,
-                        ExecutionStatus::Failed,
-                        None,
-                        Some(&format!(
-                            "platform-assembled report violates {}@{}: {e}",
-                            QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1
-                        )),
-                        // The report was assembled by the platform — the
-                        // rejection is its own defect class, never the role's.
-                        Some(failure_class::PLATFORM),
-                        Utc::now(),
+                (Some(run), true) => {
+                    let profile = self
+                        .profile
+                        .as_ref()
+                        .expect("eval_run implies profile present");
+                    // The adapter already gate-checked this reply; a re-parse
+                    // failure here is the PLATFORM's assembly breaking, never a
+                    // role form defect (REQ-FG-03 AC2).
+                    let assessment: serde_json::Value = serde_json::from_slice(&out.content)
+                        .map_err(|e| {
+                            AdapterError::Platform(format!(
+                                "assessment reply is not valid JSON, cannot assemble: {e}"
+                            ))
+                        })?;
+                    let assembled = evaluation::assemble(
+                        profile,
+                        run,
+                        &assessment,
+                        &execution.id.to_string(),
+                        &revision,
                     );
-                    return Err(e.into());
+                    let text = serde_json::to_string_pretty(&assembled.json).map_err(|e| {
+                        AdapterError::Platform(format!("cannot serialize assembled report: {e}"))
+                    })?;
+                    let schema = self
+                        .store
+                        .get_contract(QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1)?
+                        .ok_or_else(|| {
+                            RuntimeError::MissingContract(
+                                QUALITY_REPORT_CONTRACT.0.into(),
+                                QUALITY_REPORT_CONTRACT.1,
+                            )
+                        })?;
+                    if let Err(e) = adapters::validate_against_contract(&text, Some(&schema)) {
+                        let _ = self.store.finish_execution_classified(
+                            &execution,
+                            ExecutionStatus::Failed,
+                            None,
+                            Some(&format!(
+                                "platform-assembled report violates {}@{}: {e}",
+                                QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1
+                            )),
+                            // The report was assembled by the platform — the
+                            // rejection is its own defect class, never the role's.
+                            Some(failure_class::PLATFORM),
+                            Utc::now(),
+                        );
+                        return Err(e.into());
+                    }
+                    (
+                        text.into_bytes(),
+                        Some(format!(
+                            "{} (evaluation {}, S={:.3})",
+                            assembled.recommendation, assembled.evaluation_verdict, assembled.score
+                        )),
+                        Some(ContractRef {
+                            name: QUALITY_REPORT_CONTRACT.0.into(),
+                            version: QUALITY_REPORT_CONTRACT.1,
+                        }),
+                    )
                 }
-                (
-                    text.into_bytes(),
-                    Some(format!(
-                        "{} (evaluation {}, S={:.3})",
-                        assembled.recommendation, assembled.evaluation_verdict, assembled.score
-                    )),
-                    Some(ContractRef { name: QUALITY_REPORT_CONTRACT.0.into(), version: QUALITY_REPORT_CONTRACT.1 }),
-                )
-            }
-            _ => (out.content.clone(), out.summary.clone(), role.output_contract.clone()),
+                _ => (
+                    out.content.clone(),
+                    out.summary.clone(),
+                    role.output_contract.clone(),
+                ),
             }
         };
-        self.store.finish_execution(&execution, ExecutionStatus::Completed, exec_summary.as_deref(), None, Utc::now())?;
+        self.store.finish_execution(
+            &execution,
+            ExecutionStatus::Completed,
+            exec_summary.as_deref(),
+            None,
+            Utc::now(),
+        )?;
 
         // Publish the result as a formal, content-addressed artifact.
         let depends: Vec<Id> = spec.iter().map(|s| s.id).collect();
@@ -1081,11 +1269,16 @@ impl<'a> Engine<'a> {
         // Commit the workflow effect through the core commands — the engine
         // cannot bypass the state machine.
         let fresh = self.store.artifacts(task.id)?;
-        let json: serde_json::Value = serde_json::from_slice(&content).unwrap_or(serde_json::Value::Null);
+        let json: serde_json::Value =
+            serde_json::from_slice(&content).unwrap_or(serde_json::Value::Null);
         let m = match kind {
-            ArtifactKind::RequirementsSpec => {
-                workflow::requirements_published(task, &fresh, Some(&format!("{role_slug} execution {}", execution.id)), actor, Utc::now())?
-            }
+            ArtifactKind::RequirementsSpec => workflow::requirements_published(
+                task,
+                &fresh,
+                Some(&format!("{role_slug} execution {}", execution.id)),
+                actor,
+                Utc::now(),
+            )?,
             ArtifactKind::ReviewReport => {
                 let verdict = json
                     .get("verdict")
@@ -1103,7 +1296,13 @@ impl<'a> Engine<'a> {
                 // parks the task in WAITING_FOR_INPUT on a blocking question
                 // instead of riding silently into QA; the engine creates no
                 // ratification of its own (REQ-RG-03 AC2).
-                let facts = gate::collect_implementation_report_facts(self.store, task.id, &artifact, &fresh, out.summary.clone())?;
+                let facts = gate::collect_implementation_report_facts(
+                    self.store,
+                    task.id,
+                    &artifact,
+                    &fresh,
+                    out.summary.clone(),
+                )?;
                 workflow::implementation_reported(task, &facts, actor, Utc::now())?
             }
             ArtifactKind::QualityReport => {
@@ -1121,7 +1320,10 @@ impl<'a> Engine<'a> {
                 }));
             }
             other => {
-                return Err(CoreError::guard(format!("engine produced an unexpected output kind {other:?}")).into());
+                return Err(CoreError::guard(format!(
+                    "engine produced an unexpected output kind {other:?}"
+                ))
+                .into());
             }
         };
         self.store.commit(task.lock_version, &m)?;
@@ -1147,28 +1349,44 @@ impl<'a> Engine<'a> {
     /// stands untouched; a skipped one (absent or null or blank) is filled
     /// from the task. Nothing here is ever implied silently: a body that
     /// cannot be stamped fails LOUDLY as a platform error.
-    fn stamp_spec_echo(&self, task: &Task, contract_schema: Option<&str>, out: ExecOutput) -> RuntimeResult<ExecOutput> {
-        let mut body: serde_json::Value = serde_json::from_slice(&out.content)
-            .map_err(|e| AdapterError::Platform(format!("spec reply is not valid JSON, cannot stamp: {e}")))?;
-        let obj = body
-            .as_object_mut()
-            .ok_or_else(|| AdapterError::Platform("spec reply is not one JSON object".to_string()))?;
-        obj.insert("task_id".to_string(), serde_json::json!(task.id.to_string()));
+    fn stamp_spec_echo(
+        &self,
+        task: &Task,
+        contract_schema: Option<&str>,
+        out: ExecOutput,
+    ) -> RuntimeResult<ExecOutput> {
+        let mut body: serde_json::Value = serde_json::from_slice(&out.content).map_err(|e| {
+            AdapterError::Platform(format!("spec reply is not valid JSON, cannot stamp: {e}"))
+        })?;
+        let obj = body.as_object_mut().ok_or_else(|| {
+            AdapterError::Platform("spec reply is not one JSON object".to_string())
+        })?;
+        obj.insert(
+            "task_id".to_string(),
+            serde_json::json!(task.id.to_string()),
+        );
         let skipped = match obj.get("business_description") {
             None | Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::String(s)) => s.trim().is_empty(),
             Some(_) => false,
         };
         if skipped {
-            obj.insert("business_description".to_string(), serde_json::json!(task.business_description));
+            obj.insert(
+                "business_description".to_string(),
+                serde_json::json!(task.business_description),
+            );
         }
         let text = serde_json::to_string_pretty(&body)
             .map_err(|e| AdapterError::Platform(format!("cannot serialize stamped spec: {e}")))?;
         // Re-validate the STAMPED body: the platform never loosens its own
         // gate after touching the reply.
-        adapters::validate_against_contract(&text, contract_schema)
-            .map_err(|e| AdapterError::Platform(format!("platform stamping broke the spec contract: {e}")))?;
-        Ok(ExecOutput { content: text.into_bytes(), summary: out.summary })
+        adapters::validate_against_contract(&text, contract_schema).map_err(|e| {
+            AdapterError::Platform(format!("platform stamping broke the spec contract: {e}"))
+        })?;
+        Ok(ExecOutput {
+            content: text.into_bytes(),
+            summary: out.summary,
+        })
     }
 
     /// Commit + stamp for one completed writing execution (REQ-WT-06,
@@ -1190,18 +1408,31 @@ impl<'a> Engine<'a> {
         out: &ExecOutput,
     ) -> Result<(Vec<u8>, String), RuntimeError> {
         let one_line: String = task.title.split_whitespace().collect::<Vec<_>>().join(" ");
-        let sha = worktree::commit_platform_work(&wt.dir, &format!("{}: {one_line}", worktree::COMMIT_SUBJECT_PREFIX), task.id, execution.id)?;
+        let sha = worktree::commit_platform_work(
+            &wt.dir,
+            &format!("{}: {one_line}", worktree::COMMIT_SUBJECT_PREFIX),
+            task.id,
+            execution.id,
+        )?;
         // Stamping is platform-side work: a failure here is the PLATFORM's
         // (REQ-FG-03 AC2) — the role's reply already passed the form gate,
         // and re-prompting it for the platform's own serialization cannot
         // fix anything.
-        let mut body: serde_json::Value = serde_json::from_slice(&out.content)
-            .map_err(|e| AdapterError::Platform(format!("implementation report is not valid JSON, cannot stamp: {e}")))?;
-        let obj = body
-            .as_object_mut()
-            .ok_or_else(|| AdapterError::Platform("implementation report must be one JSON object — nothing to stamp".to_string()))?;
+        let mut body: serde_json::Value = serde_json::from_slice(&out.content).map_err(|e| {
+            AdapterError::Platform(format!(
+                "implementation report is not valid JSON, cannot stamp: {e}"
+            ))
+        })?;
+        let obj = body.as_object_mut().ok_or_else(|| {
+            AdapterError::Platform(
+                "implementation report must be one JSON object — nothing to stamp".to_string(),
+            )
+        })?;
         obj.insert("branch".to_string(), serde_json::json!(wt.branch));
-        obj.insert("worktree".to_string(), serde_json::json!(wt.dir.display().to_string()));
+        obj.insert(
+            "worktree".to_string(),
+            serde_json::json!(wt.dir.display().to_string()),
+        );
         obj.insert("commit".to_string(), serde_json::json!(sha));
         let text = serde_json::to_string_pretty(&body)
             .map_err(|e| AdapterError::Platform(format!("cannot serialize stamped report: {e}")))?;
@@ -1220,7 +1451,14 @@ impl<'a> Engine<'a> {
                 "commit": sha,
             }),
         )?;
-        Ok((text.into_bytes(), format!("branch {} @ {}", wt.branch, sha.chars().take(12).collect::<String>())))
+        Ok((
+            text.into_bytes(),
+            format!(
+                "branch {} @ {}",
+                wt.branch,
+                sha.chars().take(12).collect::<String>()
+            ),
+        ))
     }
 
     fn content(&self, a: &Artifact) -> RuntimeResult<String> {
@@ -1228,7 +1466,12 @@ impl<'a> Engine<'a> {
     }
 
     fn resolve_agent(&self, name: &str) -> RuntimeResult<AgentInstance> {
-        if let Some(a) = self.store.list_agents()?.into_iter().find(|a| a.name == name) {
+        if let Some(a) = self
+            .store
+            .list_agents()?
+            .into_iter()
+            .find(|a| a.name == name)
+        {
             return Ok(a);
         }
         // Builtin fallbacks so `devai task run --agent mock` works in a
@@ -1255,7 +1498,7 @@ impl<'a> Engine<'a> {
 #[cfg(test)]
 mod decisions_render_tests {
     use super::*;
-    use devai_core::types::{new_id, Decision, Verdict};
+    use devai_core::types::{Decision, Verdict, new_id};
 
     fn decision(kind: &str, verdict: Verdict, rationale: Option<&str>) -> Decision {
         Decision {
@@ -1272,7 +1515,10 @@ mod decisions_render_tests {
 
     #[test]
     fn empty_decisions_yield_constant_marker() {
-        assert_eq!(decisions_prompt_text(&[]), "(no decisions recorded for this task)\n");
+        assert_eq!(
+            decisions_prompt_text(&[]),
+            "(no decisions recorded for this task)\n"
+        );
     }
 
     #[test]
@@ -1280,7 +1526,10 @@ mod decisions_render_tests {
         let a = decision("requirements_approval", Verdict::Approved, Some("OQ1=X"));
         let b = decision("rework", Verdict::NeedsRevision, Some("line1\nline2"));
         let text = decisions_prompt_text(&[a.clone(), b.clone()]);
-        assert!(text.contains(&format!("- kind: {}\n  verdict: APPROVED\n  actor: {}\n", a.kind, a.actor)));
+        assert!(text.contains(&format!(
+            "- kind: {}\n  verdict: APPROVED\n  actor: {}\n",
+            a.kind, a.actor
+        )));
         assert!(text.contains("  rationale: OQ1=X\n"));
         assert!(text.contains(&format!("  verdict: {}\n", b.verdict.as_str())));
         assert!(text.contains("  rationale: line1\n  line2\n"));
@@ -1294,11 +1543,25 @@ mod decisions_render_tests {
     /// with the live rows (REQ-BF-006 AC3).
     #[test]
     fn backfilled_rejection_and_return_rows_render_too() {
-        let rej = decision("requirements_rejection", Verdict::Rejected, Some("split OQ1 before approving"));
-        let ret = decision("quality_return", Verdict::Returned, Some("ships the rejected alternative"));
+        let rej = decision(
+            "requirements_rejection",
+            Verdict::Rejected,
+            Some("split OQ1 before approving"),
+        );
+        let ret = decision(
+            "quality_return",
+            Verdict::Returned,
+            Some("ships the rejected alternative"),
+        );
         let text = decisions_prompt_text(&[rej, ret]);
-        assert!(text.contains("- kind: requirements_rejection\n  verdict: REJECTED\n"), "{text}");
-        assert!(text.contains("- kind: quality_return\n  verdict: RETURNED\n"), "{text}");
+        assert!(
+            text.contains("- kind: requirements_rejection\n  verdict: REJECTED\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- kind: quality_return\n  verdict: RETURNED\n"),
+            "{text}"
+        );
         assert!(text.contains("  rationale: split OQ1 before approving\n"));
     }
 

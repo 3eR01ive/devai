@@ -103,7 +103,17 @@ pub struct SchemaRung {
 /// Load the ladder as data: one `SchemaRung` per manifest record, in the
 /// manifest's order. The generic executor walks this; it knows no rung name.
 pub(crate) fn schema_rungs() -> Vec<SchemaRung> {
-    SCHEMA_RUNGS_RAW.iter().map(|(id, from, to, script_path, apply, script)| SchemaRung { id, from: *from, to: *to, script_path, apply, script }).collect()
+    SCHEMA_RUNGS_RAW
+        .iter()
+        .map(|(id, from, to, script_path, apply, script)| SchemaRung {
+            id,
+            from: *from,
+            to: *to,
+            script_path,
+            apply,
+            script,
+        })
+        .collect()
 }
 
 /// The apply-handler table — the single place where the ladder stays CODE,
@@ -119,7 +129,13 @@ pub(crate) fn schema_rungs() -> Vec<SchemaRung> {
 /// behavior appends a handler here. The tag NAME is manifest data; this
 /// table maps name → behavior, failing loud on a tag it cannot run.
 type RungApply = fn(&Transaction<'_>, &SchemaRung) -> StoreResult<()>;
-const RUNG_APPLIERS: &[(&str, RungApply)] = &[("script", apply_script), ("supersession_backfill", supersession_backfill), ("decisions_backfill", decisions_backfill), ("execution_form_columns", execution_form_columns), ("single_writer_repair", single_writer_repair)];
+const RUNG_APPLIERS: &[(&str, RungApply)] = &[
+    ("script", apply_script),
+    ("supersession_backfill", supersession_backfill),
+    ("decisions_backfill", decisions_backfill),
+    ("execution_form_columns", execution_form_columns),
+    ("single_writer_repair", single_writer_repair),
+];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
 pub struct Store {
@@ -142,7 +158,10 @@ impl Store {
             conn.execute_batch(include_str!("../schema.sql"))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version > SCHEMA_VERSION {
-            return Err(StoreError::SchemaVersion { found: version, expected: SCHEMA_VERSION });
+            return Err(StoreError::SchemaVersion {
+                found: version,
+                expected: SCHEMA_VERSION,
+            });
         } else {
             // Generic ladder executor (REQ-004, registry-in-data): walk the
             // manifest rungs from the stored version up to SCHEMA_VERSION.
@@ -159,7 +178,14 @@ impl Store {
             let rungs = schema_rungs();
             let mut from = version;
             while from < SCHEMA_VERSION {
-                let step = rungs.iter().find(|s| s.from == from).ok_or(StoreError::SchemaVersion { found: from, expected: SCHEMA_VERSION })?;
+                let step =
+                    rungs
+                        .iter()
+                        .find(|s| s.from == from)
+                        .ok_or(StoreError::SchemaVersion {
+                            found: from,
+                            expected: SCHEMA_VERSION,
+                        })?;
                 // Fail loud on a manifest tag with no behavior behind it —
                 // never silently skip a rung the catalog promised to run.
                 let apply = RUNG_APPLIERS.iter().find(|(name, _)| *name == step.apply).map(|(_, f)| *f).ok_or_else(|| StoreError::Corrupt(format!("manifest rung `{}` names unknown apply handler `{}` — refusing to run a migration it cannot describe", step.id, step.apply)))?;
@@ -170,7 +196,11 @@ impl Store {
                 from = step.to;
             }
         }
-        Ok(Store { conn, root: root.to_path_buf(), blobs })
+        Ok(Store {
+            conn,
+            root: root.to_path_buf(),
+            blobs,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -190,7 +220,9 @@ impl Store {
     }
 
     pub fn list_projects(&self) -> StoreResult<Vec<Project>> {
-        let mut stmt = self.conn.prepare("SELECT id,name,description,repos,created_at,updated_at FROM projects ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id,name,description,repos,created_at,updated_at FROM projects ORDER BY name",
+        )?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -277,7 +309,9 @@ impl Store {
             // invariant: found.len()==1 here — the match arm above guarantees
             // exactly one element, pop() cannot return None.
             1 => Ok(found.pop().unwrap()),
-            _ => Err(StoreError::Ambiguous(format!("task id prefix `{prefix}` matches multiple tasks"))),
+            _ => Err(StoreError::Ambiguous(format!(
+                "task id prefix `{prefix}` matches multiple tasks"
+            ))),
         }
     }
 
@@ -320,7 +354,10 @@ impl Store {
             });
         }
         for (id, status) in &m.artifact_status {
-            tx.execute("UPDATE artifacts SET status=?1 WHERE id=?2", params![status.as_str(), id.to_string()])?;
+            tx.execute(
+                "UPDATE artifacts SET status=?1 WHERE id=?2",
+                params![status.as_str(), id.to_string()],
+            )?;
         }
         for ev in &m.events {
             tx.execute(
@@ -410,7 +447,14 @@ impl Store {
     /// and creation time (the `decisions.actor` precedent) and lands in
     /// `workflow_events` as `task.dependency.linked` inside ONE transaction
     /// — the relation and its provenance are never half-written.
-    pub fn link_task_dependency(&self, task_id: Id, depends_on_id: Id, kind: DependencyKind, actor: &str, now: Timestamp) -> StoreResult<TaskDependency> {
+    pub fn link_task_dependency(
+        &self,
+        task_id: Id,
+        depends_on_id: Id,
+        kind: DependencyKind,
+        actor: &str,
+        now: Timestamp,
+    ) -> StoreResult<TaskDependency> {
         if task_id == depends_on_id {
             return Err(StoreError::InvalidDependency(format!(
                 "task `{task_id}` cannot depend on itself"
@@ -486,9 +530,10 @@ impl Store {
     /// EMPTY list, never an error (REQ-08 AC2). SUPERSEDED edges are
     /// history and never appear here (ratified OQ7).
     pub fn task_dependencies(&self, task_id: Id) -> StoreResult<Vec<TaskDependency>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{} WHERE d.status='ACTIVE' AND d.task_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{} WHERE d.status='ACTIVE' AND d.task_id=?1 ORDER BY d.created_at, d.id",
+            Self::DEPENDENCY_EDGE_SELECT
+        ))?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -502,9 +547,10 @@ impl Store {
     /// separate entity at all — ratified OQ8 names it by shape over this
     /// ordinary dependency relation (`epic_heads` below, REQ-06 AC2).
     pub fn incoming_dependencies(&self, task_id: Id) -> StoreResult<Vec<TaskDependency>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{} WHERE d.status='ACTIVE' AND d.depends_on_id=?1 ORDER BY d.created_at, d.id", Self::DEPENDENCY_EDGE_SELECT))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{} WHERE d.status='ACTIVE' AND d.depends_on_id=?1 ORDER BY d.created_at, d.id",
+            Self::DEPENDENCY_EDGE_SELECT
+        ))?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -522,7 +568,14 @@ impl Store {
     /// row (the partial unique index covers ACTIVE only), and both rows
     /// stay readable in the table forever. One transaction writes the flip
     /// and the `task.dependency.unlinked` event.
-    pub fn supersede_task_dependency(&self, task_id: Id, depends_on_id: Id, kind: DependencyKind, actor: &str, now: Timestamp) -> StoreResult<TaskDependency> {
+    pub fn supersede_task_dependency(
+        &self,
+        task_id: Id,
+        depends_on_id: Id,
+        kind: DependencyKind,
+        actor: &str,
+        now: Timestamp,
+    ) -> StoreResult<TaskDependency> {
         let found: Option<TaskDependency> = self
             .conn
             .query_row(
@@ -626,7 +679,10 @@ impl Store {
                         node.dependencies.push(e);
                     }
                 }
-                _ => out.push(DependencyNode { task, dependencies: edge.into_iter().collect() }),
+                _ => out.push(DependencyNode {
+                    task,
+                    dependencies: edge.into_iter().collect(),
+                }),
             }
         }
         Ok(out)
@@ -693,7 +749,10 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT id FROM artifacts WHERE task_id=?1 AND kind=?2 AND status='CURRENT' ORDER BY seq",
             )?;
-            let mut rows = stmt.query(params![artifact.task_id.to_string(), artifact.kind.as_str()])?;
+            let mut rows = stmt.query(params![
+                artifact.task_id.to_string(),
+                artifact.kind.as_str()
+            ])?;
             let mut ids = Vec::new();
             while let Some(r) = rows.next()? {
                 ids.push(r.get(0)?);
@@ -872,19 +931,33 @@ impl Store {
     pub fn get_role(&self, slug: &str) -> StoreResult<Option<RoleDefinition>> {
         // `slug` may be `name@version` or plain name (latest wins)
         let (name, version) = match slug.split_once('@') {
-            Some((n, v)) => (n.to_string(), Some(v.parse::<u32>().map_err(|e| StoreError::Corrupt(format!("bad role version: {e}")))?)),
+            Some((n, v)) => (
+                n.to_string(),
+                Some(
+                    v.parse::<u32>()
+                        .map_err(|e| StoreError::Corrupt(format!("bad role version: {e}")))?,
+                ),
+            ),
             None => (slug.to_string(), None),
         };
         // Both branches bind two params; the plain-name case passes NULL so the
         // `?2 IS NULL` clause matches every version and ORDER BY picks the latest.
         let sql = match version {
-            Some(_) => "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 AND version=?2",
-            None => "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 AND (?2 IS NULL OR version=?2) ORDER BY version DESC LIMIT 1",
+            Some(_) => {
+                "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 AND version=?2"
+            }
+            None => {
+                "SELECT id,slug,version,name,purpose,instructions,tools,input_contract,output_contract,done_criteria,created_at FROM role_definitions WHERE slug=?1 AND (?2 IS NULL OR version=?2) ORDER BY version DESC LIMIT 1"
+            }
         };
         let v = version.map(|x| x.to_string());
         rows::unwrap_row(
             self.conn
-                .query_row(sql, rusqlite::params_from_iter([Some(name), v].iter()), |r| rows::r2sql(rows::role_from_row(r)))
+                .query_row(
+                    sql,
+                    rusqlite::params_from_iter([Some(name), v].iter()),
+                    |r| rows::r2sql(rows::role_from_row(r)),
+                )
                 .optional(),
         )
     }
@@ -899,7 +972,9 @@ impl Store {
     }
 
     pub fn list_agents(&self) -> StoreResult<Vec<AgentInstance>> {
-        let mut stmt = self.conn.prepare("SELECT id,name,provider,model,runtime,created_at FROM agent_instances ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id,name,provider,model,runtime,created_at FROM agent_instances ORDER BY name",
+        )?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -920,12 +995,18 @@ impl Store {
     pub fn get_contract(&self, name: &str, version: u32) -> StoreResult<Option<String>> {
         Ok(self
             .conn
-            .query_row("SELECT schema FROM contracts WHERE name=?1 AND version=?2", params![name, version], |r| r.get(0))
+            .query_row(
+                "SELECT schema FROM contracts WHERE name=?1 AND version=?2",
+                params![name, version],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
     pub fn all_contracts(&self) -> StoreResult<Vec<(String, u32, String)>> {
-        let mut stmt = self.conn.prepare("SELECT name,version,schema FROM contracts ORDER BY name, version")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name,version,schema FROM contracts ORDER BY name, version")?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -942,7 +1023,14 @@ impl Store {
     /// stored text for `(name, version)` IS the definition of that version —
     /// later in-place edits bump the version and land as a new row, so every
     /// profile identity recorded in an old execution stays resolvable.
-    pub fn put_evaluation_profile(&self, name: &str, version: u32, project: &str, body: &str, created_at: &Timestamp) -> StoreResult<bool> {
+    pub fn put_evaluation_profile(
+        &self,
+        name: &str,
+        version: u32,
+        project: &str,
+        body: &str,
+        created_at: &Timestamp,
+    ) -> StoreResult<bool> {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO evaluation_profiles(name,version,project,body,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![name, version, project, body, rows::ts(created_at)],
@@ -951,15 +1039,25 @@ impl Store {
     }
 
     /// Resolve a recorded `name@version` profile identity to its stored body.
-    pub fn get_evaluation_profile(&self, name: &str, version: u32) -> StoreResult<Option<(String, String)>> {
+    pub fn get_evaluation_profile(
+        &self,
+        name: &str,
+        version: u32,
+    ) -> StoreResult<Option<(String, String)>> {
         Ok(self
             .conn
-            .query_row("SELECT project, body FROM evaluation_profiles WHERE name=?1 AND version=?2", params![name, version], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT project, body FROM evaluation_profiles WHERE name=?1 AND version=?2",
+                params![name, version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?)
     }
 
     pub fn list_evaluation_profiles(&self) -> StoreResult<Vec<(String, u32, String)>> {
-        let mut stmt = self.conn.prepare("SELECT name, version, project FROM evaluation_profiles ORDER BY name, version")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT name, version, project FROM evaluation_profiles ORDER BY name, version",
+        )?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -1049,7 +1147,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn finish_execution(&self, e: &RoleExecution, status: ExecutionStatus, summary: Option<&str>, error: Option<&str>, now: Timestamp) -> StoreResult<()> {
+    pub fn finish_execution(
+        &self,
+        e: &RoleExecution,
+        status: ExecutionStatus,
+        summary: Option<&str>,
+        error: Option<&str>,
+        now: Timestamp,
+    ) -> StoreResult<()> {
         self.finish_execution_classified(e, status, summary, error, None, now)
     }
 
@@ -1057,7 +1162,15 @@ impl Store {
     /// Failed row failed — `response_form` / `provider` / `platform` (the
     /// `failure_class` vocabulary in core) — so form-vs-content stays
     /// answerable as data, never by parsing the error text.
-    pub fn finish_execution_classified(&self, e: &RoleExecution, status: ExecutionStatus, summary: Option<&str>, error: Option<&str>, failure_class: Option<&str>, now: Timestamp) -> StoreResult<()> {
+    pub fn finish_execution_classified(
+        &self,
+        e: &RoleExecution,
+        status: ExecutionStatus,
+        summary: Option<&str>,
+        error: Option<&str>,
+        failure_class: Option<&str>,
+        now: Timestamp,
+    ) -> StoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE role_executions SET status=?1, summary=?2, error=?3, finished_at=?4, failure_class=COALESCE(?6, failure_class) WHERE id=?5",
@@ -1113,7 +1226,9 @@ impl Store {
             // invariant: found.len()==1 here — the match arm above guarantees
             // exactly one element, pop() cannot return None.
             1 => Ok(found.pop().unwrap()),
-            _ => Err(StoreError::Ambiguous(format!("execution id prefix `{id}` matches multiple executions"))),
+            _ => Err(StoreError::Ambiguous(format!(
+                "execution id prefix `{id}` matches multiple executions"
+            ))),
         }
     }
 
@@ -1193,7 +1308,13 @@ impl Store {
         .ok_or_else(|| StoreError::NotFound("question".into(), id.to_string()))
     }
 
-    pub fn answer_question(&self, id: Id, answer: &str, answered_by: &str, now: Timestamp) -> StoreResult<()> {
+    pub fn answer_question(
+        &self,
+        id: Id,
+        answer: &str,
+        answered_by: &str,
+        now: Timestamp,
+    ) -> StoreResult<()> {
         self.conn.execute(
             "UPDATE questions SET status='ANSWERED', answer=?1, answered_by=?2, answered_at=?3 WHERE id=?4",
             params![answer, answered_by, rows::ts(&now), id.to_string()],
@@ -1217,7 +1338,13 @@ impl Store {
     // helpers
     // ------------------------------------------------------------------
 
-    pub fn insert_event(&self, task_id: Option<Id>, kind: &str, actor: &str, payload: serde_json::Value) -> StoreResult<()> {
+    pub fn insert_event(
+        &self,
+        task_id: Option<Id>,
+        kind: &str,
+        actor: &str,
+        payload: serde_json::Value,
+    ) -> StoreResult<()> {
         self.conn.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![new_id().to_string(), task_id.map(|i| i.to_string()), kind, actor, payload.to_string(), rows::ts(&Utc::now())],
@@ -1228,7 +1355,9 @@ impl Store {
     pub fn store_blob(&self, sha: &str, content: &[u8]) -> StoreResult<()> {
         let computed = hex_encode(&Sha256::digest(content));
         if computed != sha {
-            return Err(StoreError::Corrupt(format!("blob checksum mismatch: expected {sha}, content hashes to {computed}")));
+            return Err(StoreError::Corrupt(format!(
+                "blob checksum mismatch: expected {sha}, content hashes to {computed}"
+            )));
         }
         let path = self.blob_path(sha);
         // invariant: why unreachable — `path` is `blob_path(sha)` =
@@ -1264,7 +1393,12 @@ fn apply_script(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
 /// PRIMARY KEY collision — stays the opaque `Sql` it honestly is.
 fn is_single_writer_violation(err: &rusqlite::Error) -> bool {
     match err {
-        rusqlite::Error::SqliteFailure(f, msg) => f.code == rusqlite::ErrorCode::ConstraintViolation && msg.as_deref().map_or(true, |m| m.contains("role_executions.task_id")),
+        rusqlite::Error::SqliteFailure(f, msg) => {
+            f.code == rusqlite::ErrorCode::ConstraintViolation
+                && msg
+                    .as_deref()
+                    .map_or(true, |m| m.contains("role_executions.task_id"))
+        }
         _ => false,
     }
 }
@@ -1361,7 +1495,10 @@ fn supersession_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult
     tx.execute_batch(step.script)?;
     let mut by_group: Vec<((String, String), Vec<String>)> = Vec::new();
     for (task_id, kind, id) in losers {
-        match by_group.iter_mut().find(|(g, _)| *g == (task_id.clone(), kind.clone())) {
+        match by_group
+            .iter_mut()
+            .find(|(g, _)| *g == (task_id.clone(), kind.clone()))
+        {
             Some((_, ids)) => ids.push(id),
             None => by_group.push(((task_id, kind), vec![id])),
         }
@@ -1473,8 +1610,21 @@ fn decisions_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()
                AND kind IN (?1, ?2, ?3) ORDER BY seq",
         )?;
         let rows = stmt.query_map(
-            params![event_kind::REQUIREMENTS_APPROVED, event_kind::REQUIREMENTS_REJECTED, event_kind::QUALITY_RETURNED],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            params![
+                event_kind::REQUIREMENTS_APPROVED,
+                event_kind::REQUIREMENTS_REJECTED,
+                event_kind::QUALITY_RETURNED
+            ],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
@@ -1487,9 +1637,15 @@ fn decisions_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()
     let mut groups: Vec<((String, String), Vec<String>, Vec<String>)> = Vec::new();
     for (event_id, task_id, kind, actor, payload, created_at) in candidates {
         let (dec_kind, verdict) = match kind.as_str() {
-            k if k == event_kind::REQUIREMENTS_APPROVED => (decision_kind::REQUIREMENTS_APPROVAL, Verdict::Approved),
-            k if k == event_kind::REQUIREMENTS_REJECTED => (decision_kind::REQUIREMENTS_REJECTION, Verdict::Rejected),
-            k if k == event_kind::QUALITY_RETURNED => (decision_kind::QUALITY_RETURN, Verdict::Returned),
+            k if k == event_kind::REQUIREMENTS_APPROVED => {
+                (decision_kind::REQUIREMENTS_APPROVAL, Verdict::Approved)
+            }
+            k if k == event_kind::REQUIREMENTS_REJECTED => {
+                (decision_kind::REQUIREMENTS_REJECTION, Verdict::Rejected)
+            }
+            k if k == event_kind::QUALITY_RETURNED => {
+                (decision_kind::QUALITY_RETURN, Verdict::Returned)
+            }
             _ => continue,
         };
         let parsed: serde_json::Value = serde_json::from_str(&payload).map_err(|e| {
@@ -1500,13 +1656,20 @@ fn decisions_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()
         // would lose the fact that the human acted; the reader renders
         // "(none stored)". Nothing is ever invented: the rationale column
         // stores the payload text verbatim, byte-identical, or NULL.
-        let rationale: Option<String> = parsed.get(json_field::RATIONALE).and_then(|v| v.as_str()).map(|s| s.to_string());
+        let rationale: Option<String> = parsed
+            .get(json_field::RATIONALE)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         // "Already disclosed" detection BEFORE any mutation (REQ-BF-005,
         // predicate style of 003), in the ratified OQ2/OQ6 order:
         // (a) a decision already citing THIS event id in refs — a
         //     re-applied rung matches nothing its own rows stored;
         let refs_json = json_string(&vec![event_id.clone()]);
-        let cited: i64 = tx.query_row("SELECT count(*) FROM decisions WHERE refs=?1", params![refs_json], |r| r.get(0))?;
+        let cited: i64 = tx.query_row(
+            "SELECT count(*) FROM decisions WHERE refs=?1",
+            params![refs_json],
+            |r| r.get(0),
+        )?;
         if cited > 0 {
             continue;
         }
@@ -1515,7 +1678,11 @@ fn decisions_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()
         //     never backfilled secondarily. NULL rationales have no text to
         //     match; (a) plus the deterministic id dedups them.
         if let Some(text) = &rationale {
-            let disclosed: i64 = tx.query_row("SELECT count(*) FROM decisions WHERE task_id=?1 AND rationale=?2", params![task_id, text], |r| r.get(0))?;
+            let disclosed: i64 = tx.query_row(
+                "SELECT count(*) FROM decisions WHERE task_id=?1 AND rationale=?2",
+                params![task_id, text],
+                |r| r.get(0),
+            )?;
             if disclosed > 0 {
                 continue;
             }
@@ -1533,7 +1700,10 @@ fn decisions_backfill(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()
         if inserted == 0 {
             continue;
         }
-        match groups.iter_mut().find(|((g_task, g_kind), _, _)| *g_task == task_id && *g_kind == kind) {
+        match groups
+            .iter_mut()
+            .find(|((g_task, g_kind), _, _)| *g_task == task_id && *g_kind == kind)
+        {
             Some((_, src, decs)) => {
                 src.push(event_id);
                 decs.push(decision_id);
@@ -1593,7 +1763,10 @@ fn single_writer_repair(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<
     };
     let now = rows::ts(&Utc::now());
     for (id, _) in &losers {
-        tx.execute("UPDATE role_executions SET status='FAILED', finished_at=?1, error=?2 WHERE id=?3", params![now, SINGLE_WRITER_REPAIR_REASON, id])?;
+        tx.execute(
+            "UPDATE role_executions SET status='FAILED', finished_at=?1, error=?2 WHERE id=?3",
+            params![now, SINGLE_WRITER_REPAIR_REASON, id],
+        )?;
     }
     // Columns + index DDL, idempotent (the 006 ADD COLUMN precedent): the
     // closure above already left every group with exactly one RUNNING row,
@@ -1664,7 +1837,12 @@ pub struct ArtifactDraft {
 
 /// Best-effort media type from a file name.
 pub fn guess_media_type(path: &Path) -> String {
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("md" | "markdown") => "text/markdown".into(),
         Some("json") => "application/json".into(),
         Some("txt") => "text/plain".into(),
@@ -1686,9 +1864,15 @@ mod trigger_tests {
         let t = Task::new("t", "d", None, Utc::now());
         store.create_task(&t).unwrap();
 
-        let upd = store.conn.execute("UPDATE workflow_events SET kind='forged' WHERE task_id=?1", params![t.id.to_string()]);
+        let upd = store.conn.execute(
+            "UPDATE workflow_events SET kind='forged' WHERE task_id=?1",
+            params![t.id.to_string()],
+        );
         assert!(upd.is_err(), "events must not be updatable");
-        let del = store.conn.execute("DELETE FROM workflow_events WHERE task_id=?1", params![t.id.to_string()]);
+        let del = store.conn.execute(
+            "DELETE FROM workflow_events WHERE task_id=?1",
+            params![t.id.to_string()],
+        );
         assert!(del.is_err(), "events must not be deletable");
         assert_eq!(store.events(t.id, None).unwrap().len(), 1);
     }
@@ -1741,14 +1925,27 @@ mod migration_tests {
         }
 
         let store = Store::open(dir.path()).unwrap();
-        let version: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version, SCHEMA_VERSION, "open must migrate v1 forward");
 
         let e = store.get_execution(&old_id).unwrap();
-        assert!(e.workspace_revision.is_none(), "history rows keep a NULL revision — never guessed");
-        assert_eq!(e.summary.as_deref(), Some("was old"), "the historical row is byte-intact");
+        assert!(
+            e.workspace_revision.is_none(),
+            "history rows keep a NULL revision — never guessed"
+        );
+        assert_eq!(
+            e.summary.as_deref(),
+            Some("was old"),
+            "the historical row is byte-intact"
+        );
 
-        let count: i64 = store.conn.query_row("SELECT count(*) FROM evaluation_profiles", [], |r| r.get(0)).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM evaluation_profiles", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0, "the new table exists and starts empty");
 
         // The new column accepts v2 writes (a NEW row — history is never
@@ -1762,9 +1959,15 @@ mod migration_tests {
             )
             .unwrap();
         let e = store.get_execution(&new_id_s).unwrap();
-        assert!(e.workspace_revision.is_some(), "v2 rows can carry a revision");
+        assert!(
+            e.workspace_revision.is_some(),
+            "v2 rows can carry a revision"
+        );
         let old = store.get_execution(&old_id).unwrap();
-        assert!(old.workspace_revision.is_none(), "the historical row was NOT rewritten by the v2 write");
+        assert!(
+            old.workspace_revision.is_none(),
+            "the historical row was NOT rewritten by the v2 write"
+        );
     }
 }
 
@@ -1800,7 +2003,12 @@ mod supersession_tests {
     }
 
     fn superseded_events(store: &Store, task_id: Id) -> Vec<WorkflowEvent> {
-        store.events(task_id, None).unwrap().into_iter().filter(|e| e.kind == event_kind::ARTIFACT_SUPERSEDED).collect()
+        store
+            .events(task_id, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == event_kind::ARTIFACT_SUPERSEDED)
+            .collect()
     }
 
     /// Only the events written by the v2→v3 rung (publish-path events share
@@ -1838,12 +2046,29 @@ mod supersession_tests {
             execution_id: None,
             depends_on: vec![],
         };
-        assert!(store.publish_artifact(draft).is_err(), "the aborted INSERT must surface");
-        store.conn.execute_batch("DROP TRIGGER test_fail_artifact_insert").unwrap();
+        assert!(
+            store.publish_artifact(draft).is_err(),
+            "the aborted INSERT must surface"
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER test_fail_artifact_insert")
+            .unwrap();
 
-        assert_eq!(status_of(&store, v1.id), ArtifactStatus::Current, "the rolled-back flip must leave exactly one CURRENT");
-        assert_eq!(store.artifacts(t.id).unwrap().len(), 1, "no half-published row survived");
-        assert!(superseded_events(&store, t.id).is_empty(), "a rolled-back transaction writes no event");
+        assert_eq!(
+            status_of(&store, v1.id),
+            ArtifactStatus::Current,
+            "the rolled-back flip must leave exactly one CURRENT"
+        );
+        assert_eq!(
+            store.artifacts(t.id).unwrap().len(),
+            1,
+            "no half-published row survived"
+        );
+        assert!(
+            superseded_events(&store, t.id).is_empty(),
+            "a rolled-back transaction writes no event"
+        );
     }
 
     /// REQ-001 acceptance (AC2), verbatim: the invariant query itself —
@@ -1883,7 +2108,10 @@ mod supersession_tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert!(offenders.is_empty(), "the single-CURRENT invariant query must be empty, found {offenders:?}");
+        assert!(
+            offenders.is_empty(),
+            "the single-CURRENT invariant query must be empty, found {offenders:?}"
+        );
         // History is never deleted: all 18 rows remain readable.
         assert_eq!(store.artifacts(t1.id).unwrap().len(), 12);
         assert_eq!(store.artifacts(t2.id).unwrap().len(), 6);
@@ -1917,34 +2145,88 @@ mod supersession_tests {
 
         let arts = store.artifacts(task_id).unwrap();
         // Exactly one CURRENT per group; max-seq survives; nothing deleted.
-        let current: Vec<Id> = arts.iter().filter(|a| a.status == ArtifactStatus::Current && a.kind == ArtifactKind::QualityReport).map(|a| a.id).collect();
+        let current: Vec<Id> = arts
+            .iter()
+            .filter(|a| {
+                a.status == ArtifactStatus::Current && a.kind == ArtifactKind::QualityReport
+            })
+            .map(|a| a.id)
+            .collect();
         assert_eq!(current, vec![ids[2]], "the max-seq row is kept CURRENT");
-        assert_eq!(arts.iter().filter(|a| a.status == ArtifactStatus::Superseded && a.kind == ArtifactKind::QualityReport).count(), 2);
-        assert_eq!(status_of(&store, patch_id), ArtifactStatus::Current, "an honest group is untouched");
+        assert_eq!(
+            arts.iter()
+                .filter(|a| a.status == ArtifactStatus::Superseded
+                    && a.kind == ArtifactKind::QualityReport)
+                .count(),
+            2
+        );
+        assert_eq!(
+            status_of(&store, patch_id),
+            ArtifactStatus::Current,
+            "an honest group is untouched"
+        );
         assert_eq!(arts.len(), 4, "backfill never deletes history");
 
         // One repair event citing winner + flipped ids, actor `migration:<id>`
         // (the two publish-path events of the seeding remain untouched).
         let evs = migration_events(&store, task_id);
         assert_eq!(evs.len(), 1, "one batched event per repaired group");
-        assert_eq!(superseded_events(&store, task_id).len(), 3, "history keeps the two publish-path events too");
+        assert_eq!(
+            superseded_events(&store, task_id).len(),
+            3,
+            "history keeps the two publish-path events too"
+        );
         let ev = &evs[0];
-        assert_eq!(ev.actor, format!("{MIGRATION_ACTOR_PREFIX}003_artifact_supersession"));
-        assert_eq!(ev.payload[json_field::BACKFILL], "003_artifact_supersession");
-        assert_eq!(ev.payload[json_field::SCRIPT_PATH], "migrations/003_artifact_supersession.sql");
+        assert_eq!(
+            ev.actor,
+            format!("{MIGRATION_ACTOR_PREFIX}003_artifact_supersession")
+        );
+        assert_eq!(
+            ev.payload[json_field::BACKFILL],
+            "003_artifact_supersession"
+        );
+        assert_eq!(
+            ev.payload[json_field::SCRIPT_PATH],
+            "migrations/003_artifact_supersession.sql"
+        );
         assert_eq!(ev.payload[json_field::KIND], "QUALITY_REPORT");
-        assert_eq!(ev.payload[json_field::CURRENT_ARTIFACT_ID], ids[2].to_string());
-        let flipped: Vec<String> = ev.payload[json_field::SUPERSEDED].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert_eq!(flipped, vec![ids[0].to_string(), ids[1].to_string()], "both older CURRENT rows are cited, in seq order");
-        assert!(ev.payload[json_field::REASON].as_str().unwrap().contains("nothing deleted"), "the why is recorded, not silent");
+        assert_eq!(
+            ev.payload[json_field::CURRENT_ARTIFACT_ID],
+            ids[2].to_string()
+        );
+        let flipped: Vec<String> = ev.payload[json_field::SUPERSEDED]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            flipped,
+            vec![ids[0].to_string(), ids[1].to_string()],
+            "both older CURRENT rows are cited, in seq order"
+        );
+        assert!(
+            ev.payload[json_field::REASON]
+                .as_str()
+                .unwrap()
+                .contains("nothing deleted"),
+            "the why is recorded, not silent"
+        );
 
         // Idempotence: a second open runs no rung (version already 3) and
         // re-opening on a forced-2 version repairs nothing / emits nothing.
-        let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         drop(store);
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(migration_events(&store, task_id).len(), 1, "re-open repeats no repair");
+        assert_eq!(
+            migration_events(&store, task_id).len(),
+            1,
+            "re-open repeats no repair"
+        );
     }
 
     /// REQ-003 edge (open question "equal-seq rungs"): the repair is
@@ -1972,8 +2254,16 @@ mod supersession_tests {
         // The winner is whichever id is lexicographically greater — the
         // same total order the SQL predicate uses, so the outcome is
         // deterministic per fixture and asserted as such, not guessed.
-        let (winner, loser) = if a1.id.to_string() > a2.id.to_string() { (a1.id, a2.id) } else { (a2.id, a1.id) };
-        assert_eq!(status_of(&store, winner), ArtifactStatus::Current, "equal (seq, created_at): the greater id wins");
+        let (winner, loser) = if a1.id.to_string() > a2.id.to_string() {
+            (a1.id, a2.id)
+        } else {
+            (a2.id, a1.id)
+        };
+        assert_eq!(
+            status_of(&store, winner),
+            ArtifactStatus::Current,
+            "equal (seq, created_at): the greater id wins"
+        );
         assert_eq!(status_of(&store, loser), ArtifactStatus::Superseded);
     }
 
@@ -1991,11 +2281,24 @@ mod supersession_tests {
             // Honest state (single CURRENT), but version pushed back to v2:
             // the rung must re-run and find nothing to repair.
             store.conn.execute_batch("PRAGMA user_version=2;").unwrap();
-            assert_eq!(store.events(t.id, None).unwrap().iter().filter(|e| e.kind == event_kind::ARTIFACT_SUPERSEDED).count(), 1, "the publish-path event of the second version is the only one");
+            assert_eq!(
+                store
+                    .events(t.id, None)
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.kind == event_kind::ARTIFACT_SUPERSEDED)
+                    .count(),
+                1,
+                "the publish-path event of the second version is the only one"
+            );
         }
         let store = Store::open(dir.path()).unwrap();
         let t = store.list_tasks().unwrap().pop().unwrap();
-        assert_eq!(superseded_events(&store, t.id).len(), 1, "the backfill added no event");
+        assert_eq!(
+            superseded_events(&store, t.id).len(),
+            1,
+            "the backfill added no event"
+        );
     }
 
     /// REQ-003 acceptance "сбой посреди ранга": a failure inside the rung
@@ -2014,7 +2317,10 @@ mod supersession_tests {
                 .execute_batch("DROP INDEX artifacts_single_current; UPDATE artifacts SET status='CURRENT'; PRAGMA user_version=2;")
                 .unwrap();
             // Hide the event table so the rung fails AFTER its UPDATE.
-            store.conn.execute_batch("ALTER TABLE workflow_events RENAME TO workflow_events_hidden;").unwrap();
+            store
+                .conn
+                .execute_batch("ALTER TABLE workflow_events RENAME TO workflow_events_hidden;")
+                .unwrap();
         }
         let err = Store::open(dir.path());
         assert!(err.is_err(), "a mid-rung failure must surface");
@@ -2024,23 +2330,45 @@ mod supersession_tests {
             let cur: i64 = conn
                 .query_row("SELECT count(*) FROM artifacts WHERE status='CURRENT' AND kind='QUALITY_REPORT'", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(cur, 2, "the rolled-back rung left the group exactly as found — half-repair is impossible");
-            let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(
+                cur, 2,
+                "the rolled-back rung left the group exactly as found — half-repair is impossible"
+            );
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(v, 2, "the version bump rolled back with the repair");
             let idx: i64 = conn
                 .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='artifacts_single_current'", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(idx, 0, "the rung's DDL rolled back too");
-            conn.execute_batch("ALTER TABLE workflow_events_hidden RENAME TO workflow_events;").unwrap();
+            conn.execute_batch("ALTER TABLE workflow_events_hidden RENAME TO workflow_events;")
+                .unwrap();
         }
         // With the table restored, the next open completes the repair.
         let store = Store::open(dir.path()).unwrap();
         let t = store.list_tasks().unwrap().pop().unwrap();
-        assert_eq!(migration_events(&store, t.id).len(), 1, "the retry performed exactly one recorded repair");
+        assert_eq!(
+            migration_events(&store, t.id).len(),
+            1,
+            "the retry performed exactly one recorded repair"
+        );
         let arts = store.artifacts(t.id).unwrap();
-        assert_eq!(arts.iter().filter(|a| a.status == ArtifactStatus::Current).count(), 1, "exactly one CURRENT after the retry");
-        let v: i64 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, SCHEMA_VERSION, "the version bump landed with the completed rung");
+        assert_eq!(
+            arts.iter()
+                .filter(|a| a.status == ArtifactStatus::Current)
+                .count(),
+            1,
+            "exactly one CURRENT after the retry"
+        );
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v, SCHEMA_VERSION,
+            "the version bump landed with the completed rung"
+        );
     }
 
     /// QA return7 п.(г): a corrupt JSON array column is a read error, not
@@ -2051,8 +2379,17 @@ mod supersession_tests {
         let store = Store::open(dir.path()).unwrap();
         let t = task(&store);
         let a = publish(&store, &t, ArtifactKind::Patch, b"p");
-        store.conn.execute("UPDATE artifacts SET depends_on='{broken' WHERE id=?1", params![a.id.to_string()]).unwrap();
-        assert!(store.get_artifact(&a.id.to_string()).is_err(), "corrupt depends_on must not read as `[]`");
+        store
+            .conn
+            .execute(
+                "UPDATE artifacts SET depends_on='{broken' WHERE id=?1",
+                params![a.id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            store.get_artifact(&a.id.to_string()).is_err(),
+            "corrupt depends_on must not read as `[]`"
+        );
         assert!(store.artifacts(t.id).is_err());
     }
 
@@ -2064,22 +2401,51 @@ mod supersession_tests {
     #[test]
     fn schema_registry_is_continuous_data() {
         let rungs = schema_rungs();
-        let doc: serde_json::Value = serde_json::from_str(include_str!("../migrations/manifest.json")).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../migrations/manifest.json")).unwrap();
         let records = doc["rungs"].as_array().unwrap();
-        assert_eq!(rungs.len(), records.len(), "one generated rung per manifest record, in manifest order");
+        assert_eq!(
+            rungs.len(),
+            records.len(),
+            "one generated rung per manifest record, in manifest order"
+        );
         let mut prev_to = 1; // the ladder starts at the fresh-install version (schema.sql)
         for (rung, r) in rungs.iter().zip(records) {
             assert_eq!(rung.from, prev_to, "ladder continuous 1→N");
-            assert_eq!(rung.to, rung.from + 1, "one rung advances exactly one version");
-            assert_eq!(rung.id, r["id"].as_str().unwrap(), "id is read from the manifest data");
-            assert_eq!(rung.script_path, r["script"].as_str().unwrap(), "script path is read from the manifest data");
-            assert_eq!(rung.apply, r["apply"].as_str().unwrap(), "apply tag is read from the manifest data");
+            assert_eq!(
+                rung.to,
+                rung.from + 1,
+                "one rung advances exactly one version"
+            );
+            assert_eq!(
+                rung.id,
+                r["id"].as_str().unwrap(),
+                "id is read from the manifest data"
+            );
+            assert_eq!(
+                rung.script_path,
+                r["script"].as_str().unwrap(),
+                "script path is read from the manifest data"
+            );
+            assert_eq!(
+                rung.apply,
+                r["apply"].as_str().unwrap(),
+                "apply tag is read from the manifest data"
+            );
             assert!(!rung.script.is_empty() && !rung.id.is_empty());
             // Fail-loud contract: a tag the executor cannot run must never be reachable.
-            assert!(RUNG_APPLIERS.iter().any(|(name, _)| *name == rung.apply), "apply tag `{}` of rung `{}` has no handler", rung.apply, rung.id);
+            assert!(
+                RUNG_APPLIERS.iter().any(|(name, _)| *name == rung.apply),
+                "apply tag `{}` of rung `{}` has no handler",
+                rung.apply,
+                rung.id
+            );
             prev_to = rung.to;
         }
-        assert_eq!(prev_to, SCHEMA_VERSION, "SCHEMA_VERSION is derived from the manifest top rung");
+        assert_eq!(
+            prev_to, SCHEMA_VERSION,
+            "SCHEMA_VERSION is derived from the manifest top rung"
+        );
     }
 }
 
@@ -2087,7 +2453,15 @@ mod supersession_tests {
 mod decisions_backfill_tests {
     use super::*;
 
-    fn seed_event(store: &Store, id: &str, task_id: &str, kind: &str, actor: &str, payload: &str, created_at: &str) {
+    fn seed_event(
+        store: &Store,
+        id: &str,
+        task_id: &str,
+        kind: &str,
+        actor: &str,
+        payload: &str,
+        created_at: &str,
+    ) {
         store.conn.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![id, task_id, kind, actor, payload, created_at],
@@ -2096,7 +2470,14 @@ mod decisions_backfill_tests {
     }
 
     fn payload_of(store: &Store, event_id: &str) -> String {
-        store.conn.query_row("SELECT payload FROM workflow_events WHERE id=?1", params![event_id], |r| r.get(0)).unwrap()
+        store
+            .conn
+            .query_row(
+                "SELECT payload FROM workflow_events WHERE id=?1",
+                params![event_id],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 
     /// REQ-BF-002/004/005 + REQ-BF-007 (store half): historical approve/
@@ -2112,7 +2493,13 @@ mod decisions_backfill_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let task_id: Id;
         // Real UUID strings: the event reader parses ids as UUIDs.
-        let (e_rej, e_appr, e_ret, e_null, e_modern) = (new_id().to_string(), new_id().to_string(), new_id().to_string(), new_id().to_string(), new_id().to_string());
+        let (e_rej, e_appr, e_ret, e_null, e_modern) = (
+            new_id().to_string(),
+            new_id().to_string(),
+            new_id().to_string(),
+            new_id().to_string(),
+            new_id().to_string(),
+        );
         {
             let store = Store::open(dir.path()).unwrap();
             let t = Task::new("backfill", "fixture", None, Utc::now());
@@ -2120,15 +2507,55 @@ mod decisions_backfill_tests {
             task_id = t.id;
             let tid = t.id.to_string();
             // Pre-REQ-QAD-001 shape: the rationale lives only in the payload.
-            seed_event(&store, &e_rej, &tid, event_kind::REQUIREMENTS_REJECTED, "human:legacy", r#"{"rationale":"split OQ1 before approving"}"#, "2026-09-01T00:00:00.000000Z");
-            seed_event(&store, &e_appr, &tid, event_kind::REQUIREMENTS_APPROVED, "human:legacy", r#"{"requirements_seq":2,"rationale":"OQ1: keep `task active`, do NOT ship `exec list --active`"}"#, "2026-10-01T00:00:00.000000Z");
-            seed_event(&store, &e_ret, &tid, event_kind::QUALITY_RETURNED, "human:legacy", r#"{"rationale":"ships the rejected alternative"}"#, "2026-10-05T00:00:00.000000Z");
+            seed_event(
+                &store,
+                &e_rej,
+                &tid,
+                event_kind::REQUIREMENTS_REJECTED,
+                "human:legacy",
+                r#"{"rationale":"split OQ1 before approving"}"#,
+                "2026-09-01T00:00:00.000000Z",
+            );
+            seed_event(
+                &store,
+                &e_appr,
+                &tid,
+                event_kind::REQUIREMENTS_APPROVED,
+                "human:legacy",
+                r#"{"requirements_seq":2,"rationale":"OQ1: keep `task active`, do NOT ship `exec list --active`"}"#,
+                "2026-10-01T00:00:00.000000Z",
+            );
+            seed_event(
+                &store,
+                &e_ret,
+                &tid,
+                event_kind::QUALITY_RETURNED,
+                "human:legacy",
+                r#"{"rationale":"ships the rejected alternative"}"#,
+                "2026-10-05T00:00:00.000000Z",
+            );
             // The NULL-rationale approve IS extracted (ratified OQ4: the
             // fact of the act must not be lost — NULL lands as a NULL row).
-            seed_event(&store, &e_null, &tid, event_kind::REQUIREMENTS_APPROVED, "human:legacy", r#"{"requirements_seq":1,"rationale":null}"#, "2026-08-01T00:00:00.000000Z");
+            seed_event(
+                &store,
+                &e_null,
+                &tid,
+                event_kind::REQUIREMENTS_APPROVED,
+                "human:legacy",
+                r#"{"requirements_seq":1,"rationale":null}"#,
+                "2026-08-01T00:00:00.000000Z",
+            );
             // The MODERN approve is the skip case: its decision row already
             // stands beside the event (the commands.rs write-path shape).
-            seed_event(&store, &e_modern, &tid, event_kind::REQUIREMENTS_APPROVED, "human:now", r#"{"rationale":"already a stored decision"}"#, "2026-10-06T00:00:00.000000Z");
+            seed_event(
+                &store,
+                &e_modern,
+                &tid,
+                event_kind::REQUIREMENTS_APPROVED,
+                "human:now",
+                r#"{"rationale":"already a stored decision"}"#,
+                "2026-10-06T00:00:00.000000Z",
+            );
             store
                 .record_decision(&Decision {
                     id: new_id(),
@@ -2145,66 +2572,161 @@ mod decisions_backfill_tests {
             store.conn.execute_batch("PRAGMA user_version=3;").unwrap();
         }
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION, "open migrates v3 forward");
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "open migrates v3 forward"
+        );
         let idx: i64 = store
             .conn
             .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(idx, 2, "the rung landed both indexes — the partial unique one pins the ratified OQ2 dedup at the database level");
+        assert_eq!(
+            idx, 2,
+            "the rung landed both indexes — the partial unique one pins the ratified OQ2 dedup at the database level"
+        );
 
         let decisions = store.list_decisions(task_id).unwrap();
         // The one pre-existing row + all four undisclosed events, the
         // NULL-rationale one included (ratified OQ4); only the modern
         // approve is skipped — its rationale is already disclosed.
-        assert_eq!(decisions.len(), 5, "1 existing + 4 backfilled (NULL included), e-modern skipped: {decisions:?}");
-        assert!(decisions.iter().all(|d| d.refs.iter().all(|r| *r != e_modern)), "the modern approve event is not extracted secondarily (REQ-BF-005 AC)");
+        assert_eq!(
+            decisions.len(),
+            5,
+            "1 existing + 4 backfilled (NULL included), e-modern skipped: {decisions:?}"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|d| d.refs.iter().all(|r| *r != e_modern)),
+            "the modern approve event is not extracted secondarily (REQ-BF-005 AC)"
+        );
         // Stored chronology (ORDER BY created_at): Aug NULL-approve, Sep
         // reject, Oct approve, Oct return, then the pre-existing live row.
-        for (event, row) in [(&e_null, &decisions[0]), (&e_rej, &decisions[1]), (&e_appr, &decisions[2]), (&e_ret, &decisions[3])] {
-            assert_eq!(row.id, backfill_decision_id(event), "decision id is DETERMINISTICALLY derived from the source event id (ratified OQ2)");
-            assert_eq!(row.refs, vec![event.clone()], "the row cites its source event id in refs (ratified OQ6)");
+        for (event, row) in [
+            (&e_null, &decisions[0]),
+            (&e_rej, &decisions[1]),
+            (&e_appr, &decisions[2]),
+            (&e_ret, &decisions[3]),
+        ] {
+            assert_eq!(
+                row.id,
+                backfill_decision_id(event),
+                "decision id is DETERMINISTICALLY derived from the source event id (ratified OQ2)"
+            );
+            assert_eq!(
+                row.refs,
+                vec![event.clone()],
+                "the row cites its source event id in refs (ratified OQ6)"
+            );
         }
         assert_eq!(decisions[0].kind, decision_kind::REQUIREMENTS_APPROVAL);
         assert_eq!(decisions[0].verdict, Verdict::Approved);
-        assert!(decisions[0].rationale.is_none(), "OQ4: the NULL payload rationale lands as a NULL row, not a skip");
+        assert!(
+            decisions[0].rationale.is_none(),
+            "OQ4: the NULL payload rationale lands as a NULL row, not a skip"
+        );
         assert_eq!(decisions[1].kind, decision_kind::REQUIREMENTS_REJECTION);
         assert_eq!(decisions[1].verdict, Verdict::Rejected);
         let appr = &decisions[2];
         assert_eq!(appr.verdict, Verdict::Approved);
-        assert_eq!(appr.rationale.as_deref().unwrap(), "OQ1: keep `task active`, do NOT ship `exec list --active`", "rationale copied byte-identical — never paraphrased");
-        assert!(appr.rationale.as_deref().unwrap().contains("task active"), "the acceptance string is visible to readers");
-        assert_eq!(appr.actor, "human:legacy", "actor comes from the event column");
+        assert_eq!(
+            appr.rationale.as_deref().unwrap(),
+            "OQ1: keep `task active`, do NOT ship `exec list --active`",
+            "rationale copied byte-identical — never paraphrased"
+        );
+        assert!(
+            appr.rationale.as_deref().unwrap().contains("task active"),
+            "the acceptance string is visible to readers"
+        );
+        assert_eq!(
+            appr.actor, "human:legacy",
+            "actor comes from the event column"
+        );
         let ret = &decisions[3];
         assert_eq!(ret.kind, decision_kind::QUALITY_RETURN);
         assert_eq!(ret.verdict, Verdict::Returned);
-        assert_eq!(ret.created_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true), "2026-10-05T00:00:00.000000Z", "created_at preserved from the event");
+        assert_eq!(
+            ret.created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2026-10-05T00:00:00.000000Z",
+            "created_at preserved from the event"
+        );
 
         // created_at byte-identity at the column level too (the reader
         // reproduces the stored text, not a re-format).
         let raw: String = store
             .conn
-            .query_row("SELECT created_at FROM decisions WHERE id=?1", params![backfill_decision_id(&e_appr).to_string()], |r| r.get(0))
+            .query_row(
+                "SELECT created_at FROM decisions WHERE id=?1",
+                params![backfill_decision_id(&e_appr).to_string()],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(raw, "2026-10-01T00:00:00.000000Z");
 
         // One fact event per (task, source kind) group (ratified OQ5) —
         // actor migration:004, payload naming rung/script/reason and the
         // ids of both sides.
-        let facts: Vec<WorkflowEvent> = store.events(task_id, None).unwrap().into_iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).collect();
+        let facts: Vec<WorkflowEvent> = store
+            .events(task_id, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED)
+            .collect();
         assert_eq!(facts.len(), 3, "one event per group: {facts:?}");
         for f in &facts {
-            assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}005_decisions_backfill"));
+            assert_eq!(
+                f.actor,
+                format!("{MIGRATION_ACTOR_PREFIX}005_decisions_backfill")
+            );
             assert_eq!(f.payload[json_field::BACKFILL], "005_decisions_backfill");
-            assert_eq!(f.payload[json_field::SCRIPT_PATH], "migrations/005_decisions_backfill.sql");
-            assert!(f.payload[json_field::REASON].as_str().unwrap().contains("VERBATIM"), "the why is recorded, not silent");
+            assert_eq!(
+                f.payload[json_field::SCRIPT_PATH],
+                "migrations/005_decisions_backfill.sql"
+            );
+            assert!(
+                f.payload[json_field::REASON]
+                    .as_str()
+                    .unwrap()
+                    .contains("VERBATIM"),
+                "the why is recorded, not silent"
+            );
         }
-        let appr_fact = facts.iter().find(|f| f.payload[json_field::KIND] == serde_json::json!(event_kind::REQUIREMENTS_APPROVED)).unwrap();
-        assert_eq!(appr_fact.payload[json_field::SOURCE_EVENTS].as_array().unwrap().len(), 2, "e-appr AND e-null were extracted for the approve group");
-        assert_eq!(appr_fact.payload[json_field::DECISION_IDS].as_array().unwrap().len(), 2);
+        let appr_fact = facts
+            .iter()
+            .find(|f| {
+                f.payload[json_field::KIND] == serde_json::json!(event_kind::REQUIREMENTS_APPROVED)
+            })
+            .unwrap();
+        assert_eq!(
+            appr_fact.payload[json_field::SOURCE_EVENTS]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "e-appr AND e-null were extracted for the approve group"
+        );
+        assert_eq!(
+            appr_fact.payload[json_field::DECISION_IDS]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
 
         // REQ-BF-003: the source events are untouched history.
-        assert_eq!(payload_of(&store, &e_appr), r#"{"requirements_seq":2,"rationale":"OQ1: keep `task active`, do NOT ship `exec list --active`"}"#);
-        assert_eq!(payload_of(&store, &e_modern), r#"{"rationale":"already a stored decision"}"#);
+        assert_eq!(
+            payload_of(&store, &e_appr),
+            r#"{"requirements_seq":2,"rationale":"OQ1: keep `task active`, do NOT ship `exec list --active`"}"#
+        );
+        assert_eq!(
+            payload_of(&store, &e_modern),
+            r#"{"rationale":"already a stored decision"}"#
+        );
 
         // Idempotence (REQ-BF-005, ratified OQ2): force the version back,
         // re-open — the deterministic ids recompute identically, the ON
@@ -2216,8 +2738,21 @@ mod decisions_backfill_tests {
             conn.execute_batch("PRAGMA user_version=3;").unwrap();
         }
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.list_decisions(task_id).unwrap().len(), 5, "a re-applied rung creates no decision row");
-        assert_eq!(store.events(task_id, None).unwrap().iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).count(), 3, "a re-applied rung creates no fact event");
+        assert_eq!(
+            store.list_decisions(task_id).unwrap().len(),
+            5,
+            "a re-applied rung creates no decision row"
+        );
+        assert_eq!(
+            store
+                .events(task_id, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED)
+                .count(),
+            3,
+            "a re-applied rung creates no fact event"
+        );
     }
 
     /// The ratified OQ2 mechanism, pinned: the backfill id is a pure
@@ -2228,11 +2763,27 @@ mod decisions_backfill_tests {
     fn backfill_decision_id_is_deterministic_and_lives_in_the_indexed_space() {
         let a = new_id().to_string();
         let b = new_id().to_string();
-        assert_eq!(backfill_decision_id(&a), backfill_decision_id(&a), "the same event recomputes the same id");
-        assert_ne!(backfill_decision_id(&a), backfill_decision_id(&b), "distinct events get distinct ids");
+        assert_eq!(
+            backfill_decision_id(&a),
+            backfill_decision_id(&a),
+            "the same event recomputes the same id"
+        );
+        assert_ne!(
+            backfill_decision_id(&a),
+            backfill_decision_id(&b),
+            "distinct events get distinct ids"
+        );
         let id = backfill_decision_id(&a).to_string();
-        assert_eq!(&id[14..15], "5", "backfilled ids enter the v5 space the index selects (substr(id,15,1)='5')");
-        assert_eq!(&new_id().to_string()[14..15], "7", "live ids stay OUTSIDE that space — the index never constrains the write-path");
+        assert_eq!(
+            &id[14..15],
+            "5",
+            "backfilled ids enter the v5 space the index selects (substr(id,15,1)='5')"
+        );
+        assert_eq!(
+            &new_id().to_string()[14..15],
+            "7",
+            "live ids stay OUTSIDE that space — the index never constrains the write-path"
+        );
     }
 
     /// REQ-BF-007 (clean database): no candidate events → zero rows, zero
@@ -2250,7 +2801,15 @@ mod decisions_backfill_tests {
         }
         let store = Store::open(dir.path()).unwrap();
         assert!(store.list_decisions(task_id).unwrap().is_empty());
-        assert_eq!(store.events(task_id, None).unwrap().iter().filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED).count(), 0);
+        assert_eq!(
+            store
+                .events(task_id, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == event_kind::DECISIONS_BACKFILLED)
+                .count(),
+            0
+        );
     }
 
     /// REQ-BF-003 AC3 (atomicity, the 003 precedent): if the fact-event
@@ -2267,19 +2826,34 @@ mod decisions_backfill_tests {
             let t = Task::new("atomic", "fixture", None, Utc::now());
             store.create_task(&t).unwrap();
             tid = t.id.to_string();
-            seed_event(&store, &e_a, &tid, event_kind::REQUIREMENTS_APPROVED, "human:legacy", r#"{"rationale":"keep task active"}"#, "2026-10-01T00:00:00.000000Z");
+            seed_event(
+                &store,
+                &e_a,
+                &tid,
+                event_kind::REQUIREMENTS_APPROVED,
+                "human:legacy",
+                r#"{"rationale":"keep task active"}"#,
+                "2026-10-01T00:00:00.000000Z",
+            );
             // Block every event INSERT — the rung must fail AFTER its rows.
             store.conn.execute_batch("CREATE TRIGGER test_fail_event_insert BEFORE INSERT ON workflow_events BEGIN SELECT RAISE(ABORT,'boom'); END;").unwrap();
             // Drop the fresh-install copies of the rung's indexes so the
             // rollback check below observes the RUNG's DDL, not schema.sql's.
             store.conn.execute_batch("DROP INDEX decisions_task; DROP INDEX decisions_backfill_source_event; PRAGMA user_version=4;").unwrap();
         }
-        assert!(Store::open(dir.path()).is_err(), "a mid-rung failure must surface");
+        assert!(
+            Store::open(dir.path()).is_err(),
+            "a mid-rung failure must surface"
+        );
         {
             let conn = Connection::open(dir.path().join("devai.db")).unwrap();
-            let n: i64 = conn.query_row("SELECT count(*) FROM decisions", [], |r| r.get(0)).unwrap();
+            let n: i64 = conn
+                .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(n, 0, "the rolled-back rung left no decision row");
-            let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            let v: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
             // After renumber the decisions rung is 005 (4→5): the ladder first
             // completes 004_task_dependencies, and the mid-rung failure rolls
             // back to the FAILED rung's `from` — 4, not 3.
@@ -2288,13 +2862,42 @@ mod decisions_backfill_tests {
                 .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(idx, 0, "the rung's DDL rolled back too");
-            conn.execute_batch("DROP TRIGGER test_fail_event_insert;").unwrap();
+            conn.execute_batch("DROP TRIGGER test_fail_event_insert;")
+                .unwrap();
         }
         // With writes restored, the next open completes the backfill once.
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.conn.query_row("SELECT count(*) FROM decisions WHERE refs LIKE '%' || ?1 || '%'", params![e_a], |r| r.get::<_, i64>(0)).unwrap(), 1, "the retry created exactly one row");
-        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
-        assert_eq!(store.conn.query_row("SELECT count(*) FROM decisions WHERE id=?1", params![backfill_decision_id(&e_a).to_string()], |r| r.get::<_, i64>(0)).unwrap(), 1, "the retried row carries the SAME deterministic id — the retry cannot fork a second row for one event");
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM decisions WHERE refs LIKE '%' || ?1 || '%'",
+                    params![e_a],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1,
+            "the retry created exactly one row"
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM decisions WHERE id=?1",
+                    params![backfill_decision_id(&e_a).to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1,
+            "the retried row carries the SAME deterministic id — the retry cannot fork a second row for one event"
+        );
         let idx: i64 = store
             .conn
             .query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('decisions_task','decisions_backfill_source_event')", [], |r| r.get(0))
@@ -2352,7 +2955,10 @@ mod single_writer_tests {
     /// end-to-end; dropping/re-adding them here would only re-test the
     /// column-skip path that re-application asserts directly below.
     fn downgrade_to_v6(store: &Store) {
-        store.conn.execute_batch("DROP INDEX role_executions_single_writer; PRAGMA user_version=6;").unwrap();
+        store
+            .conn
+            .execute_batch("DROP INDEX role_executions_single_writer; PRAGMA user_version=6;")
+            .unwrap();
     }
 
     /// Seed a RUNNING row at an explicit started_at on an old-shape database
@@ -2374,7 +2980,11 @@ mod single_writer_tests {
     fn the_index_itself_rejects_a_second_running_row() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(index_count(&store.conn), 1, "the guard index ships in schema.sql");
+        assert_eq!(
+            index_count(&store.conn),
+            1,
+            "the guard index ships in schema.sql"
+        );
         let t = task(&store, "index");
         store.start_execution(&exec_for(t, Utc::now())).unwrap();
         let raw = store.conn.execute(
@@ -2383,7 +2993,10 @@ mod single_writer_tests {
         );
         let err = raw.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("UNIQUE constraint failed: role_executions.task_id"), "the DATABASE refuses, not the code: {msg}");
+        assert!(
+            msg.contains("UNIQUE constraint failed: role_executions.task_id"),
+            "the DATABASE refuses, not the code: {msg}"
+        );
     }
 
     /// REQ-SW-01/02 + OQ-2/REQ-SW-03: the named error cites the blocking
@@ -2411,22 +3024,50 @@ mod single_writer_tests {
         // an opaque Sql error, and it names both ids.
         let err = store.start_execution(&exec_for(t, Utc::now())).unwrap_err();
         match &err {
-            StoreError::SingleWriterBusy { task_id, existing_id, owner_pid, owner_host, .. } => {
+            StoreError::SingleWriterBusy {
+                task_id,
+                existing_id,
+                owner_pid,
+                owner_host,
+                ..
+            } => {
                 assert_eq!(*task_id, t.to_string(), "the busy task is named");
-                assert_eq!(*existing_id, first.id.to_string(), "the LIVE row is named by full id");
-                assert_eq!(*owner_pid, Some(4242), "the blocker's owner is cited for triage");
+                assert_eq!(
+                    *existing_id,
+                    first.id.to_string(),
+                    "the LIVE row is named by full id"
+                );
+                assert_eq!(
+                    *owner_pid,
+                    Some(4242),
+                    "the blocker's owner is cited for triage"
+                );
                 assert_eq!(owner_host.as_deref(), Some("fixture-host"));
             }
             other => panic!("expected SingleWriterBusy, got {other:?}"),
         }
-        assert!(err.to_string().contains("single-writer guard"), "the message is self-describing: {err}");
+        assert!(
+            err.to_string().contains("single-writer guard"),
+            "the message is self-describing: {err}"
+        );
 
         // Closing the live row re-opens the writer slot — one RUNNING per
         // task is the invariant, not one-ever (AC4: attempts are sequential).
-        store.finish_execution(&first, ExecutionStatus::Completed, Some("done"), None, Utc::now()).unwrap();
+        store
+            .finish_execution(
+                &first,
+                ExecutionStatus::Completed,
+                Some("done"),
+                None,
+                Utc::now(),
+            )
+            .unwrap();
         let second = exec_for(t, Utc::now());
         store.start_execution(&second).unwrap();
-        assert!(store.start_execution(&exec_for(t, Utc::now())).is_err(), "and the new RUNNING row blocks again");
+        assert!(
+            store.start_execution(&exec_for(t, Utc::now())).is_err(),
+            "and the new RUNNING row blocks again"
+        );
     }
 
     /// REQ-SW-03 AC2 / OQ-2: rows written without owner columns (direct
@@ -2439,7 +3080,10 @@ mod single_writer_tests {
         let t = task(&store, "ownerless");
         store.start_execution(&exec_for(t, Utc::now())).unwrap();
         let e = store.list_executions(Some(t)).unwrap().pop().unwrap();
-        assert_eq!((e.owner_pid, e.owner_host.clone(), e.owner_process_start), (None, None, None));
+        assert_eq!(
+            (e.owner_pid, e.owner_host.clone(), e.owner_process_start),
+            (None, None, None)
+        );
     }
 
     /// REQ-SW-07 + ratified OQ-1: opening a v6-shaped store that already
@@ -2478,40 +3122,132 @@ mod single_writer_tests {
             seed_running_v6(&store, &clean_row, &tb_s, "2026-10-01T00:00:00.000000Z");
         }
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION, "open runs the ladder to v7");
-        assert_eq!(index_count(&store.conn), 1, "the guard index landed after the closure");
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "open runs the ladder to v7"
+        );
+        assert_eq!(
+            index_count(&store.conn),
+            1,
+            "the guard index landed after the closure"
+        );
 
         let rows = store.list_executions(Some(ta)).unwrap();
-        let by = |id: &str| rows.iter().find(|e| e.id.to_string() == id).unwrap_or_else(|| panic!("row {id} missing from {rows:?}"));
-        assert_eq!(by(&winner).status, ExecutionStatus::Running, "the NEWEST started_at keeps the single-writer slot (OQ-1)");
+        let by = |id: &str| {
+            rows.iter()
+                .find(|e| e.id.to_string() == id)
+                .unwrap_or_else(|| panic!("row {id} missing from {rows:?}"))
+        };
+        assert_eq!(
+            by(&winner).status,
+            ExecutionStatus::Running,
+            "the NEWEST started_at keeps the single-writer slot (OQ-1)"
+        );
         for loser in [&old1, &old2] {
             let e = by(loser);
-            assert_eq!(e.status, ExecutionStatus::Failed, "the older duplicate closes FAILED (OQ-1)");
-            assert!(e.error.as_deref().unwrap().starts_with("single-writer migration"), "the explicit marker is in the row itself: {:?}", e.error);
-            assert!(e.finished_at.is_some(), "a closed row carries its close time");
+            assert_eq!(
+                e.status,
+                ExecutionStatus::Failed,
+                "the older duplicate closes FAILED (OQ-1)"
+            );
+            assert!(
+                e.error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("single-writer migration"),
+                "the explicit marker is in the row itself: {:?}",
+                e.error
+            );
+            assert!(
+                e.finished_at.is_some(),
+                "a closed row carries its close time"
+            );
         }
         let e = by(&untouched);
-        assert_eq!(e.status, ExecutionStatus::Completed, "terminal history is never touched");
-        assert!(e.error.is_none(), "the repair wrote no marker into an unrelated row");
-        assert_eq!(e.finished_at.map(|f| f.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)).as_deref(), Some("2026-10-01T00:00:00.000000Z"), "its close time is byte-stable — the repair rewrote nothing");
+        assert_eq!(
+            e.status,
+            ExecutionStatus::Completed,
+            "terminal history is never touched"
+        );
+        assert!(
+            e.error.is_none(),
+            "the repair wrote no marker into an unrelated row"
+        );
+        assert_eq!(
+            e.finished_at
+                .map(|f| f.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+                .as_deref(),
+            Some("2026-10-01T00:00:00.000000Z"),
+            "its close time is byte-stable — the repair rewrote nothing"
+        );
 
         // The clean task keeps its RUNNING row and gets NO repair event.
         let clean = store.list_executions(Some(tb)).unwrap();
-        assert_eq!(clean[0].status, ExecutionStatus::Running, "a task without duplicates is untouched");
+        assert_eq!(
+            clean[0].status,
+            ExecutionStatus::Running,
+            "a task without duplicates is untouched"
+        );
         // One fact event for the duplicated task, naming both sides (003's
         // observe-before-mutate discipline).
-        let facts = store.events(ta, None).unwrap().into_iter().filter(|ev| ev.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).collect::<Vec<_>>();
-        assert_eq!(facts.len(), 1, "one repair event per duplicated task: {facts:?}");
-        let f = &facts[0];
-        assert_eq!(f.actor, format!("{MIGRATION_ACTOR_PREFIX}007_single_writer_guard"));
-        assert_eq!(f.payload[json_field::BACKFILL], serde_json::json!("007_single_writer_guard"));
-        assert_eq!(f.payload[json_field::SCRIPT_PATH], serde_json::json!("migrations/007_single_writer_guard.sql"));
-        assert_eq!(f.payload["kept_running"], serde_json::json!(winner), "the survivor is cited by id");
-        let closed: Vec<String> = f.payload["closed_executions"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-        assert_eq!(closed, vec![old1.clone(), old2.clone()], "every closed row is cited, in loser order");
-        assert!(f.payload[json_field::REASON].as_str().unwrap().contains("single-writer migration"), "the why is recorded, not silent");
+        let facts = store
+            .events(ta, None)
+            .unwrap()
+            .into_iter()
+            .filter(|ev| ev.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR)
+            .collect::<Vec<_>>();
         assert_eq!(
-            store.events(tb, None).unwrap().iter().filter(|ev| ev.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).count(),
+            facts.len(),
+            1,
+            "one repair event per duplicated task: {facts:?}"
+        );
+        let f = &facts[0];
+        assert_eq!(
+            f.actor,
+            format!("{MIGRATION_ACTOR_PREFIX}007_single_writer_guard")
+        );
+        assert_eq!(
+            f.payload[json_field::BACKFILL],
+            serde_json::json!("007_single_writer_guard")
+        );
+        assert_eq!(
+            f.payload[json_field::SCRIPT_PATH],
+            serde_json::json!("migrations/007_single_writer_guard.sql")
+        );
+        assert_eq!(
+            f.payload["kept_running"],
+            serde_json::json!(winner),
+            "the survivor is cited by id"
+        );
+        let closed: Vec<String> = f.payload["closed_executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            closed,
+            vec![old1.clone(), old2.clone()],
+            "every closed row is cited, in loser order"
+        );
+        assert!(
+            f.payload[json_field::REASON]
+                .as_str()
+                .unwrap()
+                .contains("single-writer migration"),
+            "the why is recorded, not silent"
+        );
+        assert_eq!(
+            store
+                .events(tb, None)
+                .unwrap()
+                .iter()
+                .filter(|ev| ev.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR)
+                .count(),
             0,
             "a clean database produces zero events (the 003 precedent)"
         );
@@ -2535,11 +3271,19 @@ mod single_writer_tests {
             seed_running_v6(&store, &lo, &ta_s, at);
             seed_running_v6(&store, &hi, &ta_s, at);
         }
-        let (winner, loser) = if lo > hi { (lo.clone(), hi.clone()) } else { (hi.clone(), lo.clone()) };
+        let (winner, loser) = if lo > hi {
+            (lo.clone(), hi.clone())
+        } else {
+            (hi.clone(), lo.clone())
+        };
         let store = Store::open(dir.path()).unwrap();
         let rows = store.list_executions(Some(ta)).unwrap();
         let by = |id: &str| rows.iter().find(|e| e.id.to_string() == id).unwrap();
-        assert_eq!(by(&winner).status, ExecutionStatus::Running, "the lexicographically greater id wins the tie");
+        assert_eq!(
+            by(&winner).status,
+            ExecutionStatus::Running,
+            "the lexicographically greater id wins the tie"
+        );
         assert_eq!(by(&loser).status, ExecutionStatus::Failed);
     }
 
@@ -2554,16 +3298,50 @@ mod single_writer_tests {
             let store = Store::open(dir.path()).unwrap();
             ta = task(&store, "twice");
             downgrade_to_v6(&store);
-            seed_running_v6(&store, &new_id().to_string(), &ta.to_string(), "2026-10-01T00:00:00.000000Z");
+            seed_running_v6(
+                &store,
+                &new_id().to_string(),
+                &ta.to_string(),
+                "2026-10-01T00:00:00.000000Z",
+            );
         }
         let store = Store::open(dir.path()).unwrap(); // heals
-        assert_eq!(store.events(ta, None).unwrap().iter().filter(|e| e.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).count(), 0, "a single RUNNING row was never a duplicate");
+        assert_eq!(
+            store
+                .events(ta, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR)
+                .count(),
+            0,
+            "a single RUNNING row was never a duplicate"
+        );
         store.conn.execute_batch("PRAGMA user_version=6;").unwrap();
         drop(store);
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION, "the re-applied rung still completes the ladder");
-        assert_eq!(store.events(ta, None).unwrap().iter().filter(|e| e.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR).count(), 0, "re-application writes no event");
-        assert_eq!(index_count(&store.conn), 1, "the IF NOT EXISTS DDL stays idempotent");
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "the re-applied rung still completes the ladder"
+        );
+        assert_eq!(
+            store
+                .events(ta, None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == event_kind::EXECUTION_SINGLE_WRITER_REPAIR)
+                .count(),
+            0,
+            "re-application writes no event"
+        );
+        assert_eq!(
+            index_count(&store.conn),
+            1,
+            "the IF NOT EXISTS DDL stays idempotent"
+        );
     }
 
     /// The full duplicate→repair→re-apply→verify loop on a store that also
@@ -2578,8 +3356,18 @@ mod single_writer_tests {
             ta = task(&store, "healed-then-live");
             let winner = new_id().to_string();
             downgrade_to_v6(&store);
-            seed_running_v6(&store, &new_id().to_string(), &ta.to_string(), "2026-10-01T00:00:00.000000Z");
-            seed_running_v6(&store, &winner, &ta.to_string(), "2026-10-02T00:00:00.000000Z");
+            seed_running_v6(
+                &store,
+                &new_id().to_string(),
+                &ta.to_string(),
+                "2026-10-01T00:00:00.000000Z",
+            );
+            seed_running_v6(
+                &store,
+                &winner,
+                &ta.to_string(),
+                "2026-10-02T00:00:00.000000Z",
+            );
         }
         let store = Store::open(dir.path()).unwrap();
         let survivor = store
@@ -2588,9 +3376,15 @@ mod single_writer_tests {
             .into_iter()
             .find(|e| e.status == ExecutionStatus::Running)
             .unwrap();
-        let err = store.start_execution(&exec_for(ta, Utc::now())).unwrap_err();
+        let err = store
+            .start_execution(&exec_for(ta, Utc::now()))
+            .unwrap_err();
         match &err {
-            StoreError::SingleWriterBusy { existing_id, .. } => assert_eq!(*existing_id, survivor.id.to_string(), "the kept winner is the named blocker"),
+            StoreError::SingleWriterBusy { existing_id, .. } => assert_eq!(
+                *existing_id,
+                survivor.id.to_string(),
+                "the kept winner is the named blocker"
+            ),
             other => panic!("expected SingleWriterBusy, got {other:?}"),
         }
     }
