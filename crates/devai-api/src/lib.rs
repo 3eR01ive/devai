@@ -28,7 +28,8 @@ pub use mutations::{
     ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
     MergeResult, MutationResult, OverrideResult, ProjectAddReq, PublishOutcome, PublishReq,
     PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome, ReviseReq, RunOutcome, RunReq,
-    TaskCreateReq, TaskCreated, UnlinkResult, WorkflowOp,
+    TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome, TaskProjectSetOutcome,
+    TaskProjectSetReq, UnlinkResult, WorkflowOp,
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 

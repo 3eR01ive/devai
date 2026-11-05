@@ -259,6 +259,27 @@ enum TaskCmd {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Assign or REPLACE the owning project of an existing task
+    /// (REQ-BIND-02, C5 D1): refs resolve first, an unknown task or
+    /// project refuses, a re-apply of the already-bound project is a
+    /// documented no-op. One append-only `task.project.set` event per
+    /// effective change; workflow state is not touched.
+    SetProject {
+        /// The task (id or unique prefix)
+        id: String,
+        /// The project (id or name)
+        project: String,
+    },
+    /// Backfill the project binding (REQ-BIND-03 under the ratified
+    /// OQ-BIND-2 rule): bind the given project to every task that lives
+    /// UNBOUND and NON-TERMINAL in this store. Terminal history keeps the
+    /// address it lived and judged at; tasks of another project are never
+    /// re-bound. Every binding goes through the `task.project.set`
+    /// operation; running it twice changes nothing the second time.
+    BackfillProject {
+        /// The project (id or name)
+        project: String,
+    },
     /// Show immutable event history
     Events {
         id: String,
