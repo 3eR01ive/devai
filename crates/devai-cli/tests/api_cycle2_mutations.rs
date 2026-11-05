@@ -392,6 +392,36 @@ fn registry_output_covers_mutations() {
     assert!(out.contains("operations published"), "footer line missing");
 }
 
+/// R3 QA (da/api-contract) parity: the machine-readable registry output
+/// carries the declared surface version, sourced from the ONE constant in
+/// devai-api — a publication without the stamp, or restamped elsewhere,
+/// fails here.
+#[test]
+fn registry_json_publishes_the_surface_version() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    ok(home, &["init"]);
+    let v: serde_json::Value = {
+        let out = ok(home, &["api", "registry", "--json"]);
+        serde_json::from_str(&out).expect("--json registry output parses")
+    };
+    assert_eq!(
+        v["surface_version"].as_str().unwrap(),
+        devai_api::SURFACE_VERSION,
+        "the registry publication names the single-source surface version"
+    );
+    assert!(
+        v["operations"].is_array(),
+        "the versioned publication wraps the operation table: {v}"
+    );
+    // The human view is byte-stable: NO version prose leaks into it.
+    let human = ok(home, &["api", "registry"]);
+    assert!(
+        !human.contains(devai_api::SURFACE_VERSION),
+        "the machine stamp must not enter operator prose"
+    );
+}
+
 /// REQ-MUT-02 AC1 / REQ-MUT-03 / human-ratified Q2 — the total prohibition:
 /// the CLI sources contain no store handle at all. No `ctx.store`, no
 /// `devai_store` import, no `Store::open` by name, no `Api::store()`/

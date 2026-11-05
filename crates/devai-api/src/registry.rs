@@ -37,6 +37,35 @@ pub struct OpDescriptor {
     pub description: &'static str,
 }
 
+/// R3 QA (da/api-contract): THE version of the published API surface —
+/// the single source every machine-readable registry publication stamps.
+/// `@2` names the cycle that moved the mutation plane onto the surface
+/// (REQ-MUT-*); a future breaking change to operation names, classes or
+/// shape contracts bumps this constant and nothing else (grep finds one
+/// declaration — there is no second copy to drift).
+pub const SURFACE_VERSION: &str = "api-surface@2";
+
+/// The published registry as ONE machine-readable artifact: the surface
+/// version beside the full operation table. `devai api registry --json`
+/// renders exactly this (R3: the version lands in the registry OUTPUT;
+/// no separate dump file is maintained — the registry IS the artifact).
+/// Output-only by shape: the descriptors carry `&'static str`, so the
+/// machine contract is the RENDERED JSON, not an ingestion type.
+#[derive(Serialize, Clone, Debug)]
+pub struct RegistryPublication {
+    pub surface_version: String,
+    pub operations: Vec<OpDescriptor>,
+}
+
+/// The publication assembled from the single-source constant and the
+/// single-source operation table — no consumer may restamp either.
+pub fn publication() -> RegistryPublication {
+    RegistryPublication {
+        surface_version: SURFACE_VERSION.to_string(),
+        operations: operations(),
+    }
+}
+
 /// The full registry of operations the API surface publishes. Cycle 1 ships
 /// the read plane as working code; every other entry names the operation
 /// whose implementation lands with the mutation plane (cycle 2).
@@ -534,6 +563,36 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), operations().len());
         assert_eq!(v[0]["class"].as_str().unwrap(), "mutation"); // lowercase tokens
         assert!(v[0]["name"].is_string() && v[0]["description"].is_string());
+    }
+
+    #[test]
+    fn publication_stamps_the_single_source_surface_version() {
+        // R3 QA (da/api-contract) parity: the machine-readable registry
+        // publication CARRIES the declared version, and the constant is
+        // its only source — a registry output without the version, or a
+        // version restated anywhere else in the published document,
+        // fails here.
+        let v: serde_json::Value = serde_json::to_value(publication()).unwrap();
+        assert_eq!(
+            v["surface_version"].as_str().unwrap(),
+            SURFACE_VERSION,
+            "the publication names the declared surface version"
+        );
+        assert_eq!(
+            v["operations"].as_array().unwrap().len(),
+            operations().len(),
+            "the versioned publication wraps the FULL operation table"
+        );
+        assert!(
+            !SURFACE_VERSION.is_empty(),
+            "the version constant must be a real contract stamp"
+        );
+        // The RENDERED document is machine-readable for second consumers:
+        // serialize → re-parse shows both contract fields as data.
+        let text = serde_json::to_string(&publication()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["surface_version"].as_str().unwrap(), SURFACE_VERSION);
+        assert!(doc["operations"].is_array());
     }
 
     #[test]

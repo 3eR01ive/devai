@@ -192,10 +192,12 @@ fn gate_facts(
         summary: Some("rework".into()),
         current_report: new_id(),
         current_commit: Some(current_commit.into()),
+        current_body: workflow::ReportBodyRead::Readable,
         priors: vec![workflow::PriorImplementationReport {
             artifact_id: *prev,
             seq: 1,
             commit: prev_commit.map(|s| s.to_string()),
+            body: workflow::ReportBodyRead::Readable,
         }],
         ratifications: vec![],
         qa_return_rationale: Some("п1; п2; п3".into()),
@@ -312,6 +314,7 @@ fn ratification_is_bound_to_its_cycle_pair_never_lifetime() {
         artifact_id: prev,
         seq: 2,
         commit: Some("c0ffee".into()),
+        body: workflow::ReportBodyRead::Readable,
     }];
     t2.current_report = new_id();
     let m = workflow::implementation_reported(&rework_task(), &t2, "impl", now()).unwrap();
@@ -352,6 +355,80 @@ fn incomparable_commits_warn_distinctly_and_claim_no_verdict() {
     none.current_commit = None;
     let m = workflow::implementation_reported(&rework_task(), &none, "impl", now()).unwrap();
     assert!(m.events[0].payload.get(json_field::VERDICT).is_none());
+}
+
+/// R5 QA (rl/error-handling/rel/error-context): the gate record for a side
+/// that could not be compared now NAMES the read outcome — a corrupt body
+/// ("битое тело") and an absent blob are distinct phrases, no longer the
+/// silent same text as a readable body that merely names no commit. The
+/// gate's DECISION is untouched (REQ-RG-04: proceed incomparable, never
+/// guess); only the record becomes honest.
+#[test]
+fn corrupt_and_missing_bodies_get_their_own_incomparable_phrases() {
+    let prev = new_id();
+
+    // (1) The PREVIOUS body is corrupt: distinct phrase, passage proceeds.
+    let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
+    facts.priors[0].commit = None;
+    facts.priors[0].body = workflow::ReportBodyRead::Corrupt;
+    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    assert_eq!(m.task.state, TaskState::Qa, "semantics unchanged: proceed");
+    let warn = m
+        .events
+        .iter()
+        .find(|e| e.kind == event_kind::QA_REWORK_GATE_INCOMPARABLE)
+        .expect("a distinct event");
+    let reason = warn.payload[json_field::REASON].as_str().unwrap();
+    assert!(
+        reason.contains("corrupt"),
+        "a broken body must be named as corruption, not as a missing commit: {reason}"
+    );
+    assert!(reason.contains("previous"));
+
+    // (2) The CURRENT body is corrupt — the other side names the other fact.
+    let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
+    facts.current_commit = None;
+    facts.current_body = workflow::ReportBodyRead::Corrupt;
+    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    let warn = m
+        .events
+        .iter()
+        .find(|e| e.kind == event_kind::QA_REWORK_GATE_INCOMPARABLE)
+        .expect("a distinct event");
+    let reason = warn.payload[json_field::REASON].as_str().unwrap();
+    assert!(
+        reason.contains("corrupt") && reason.contains("published"),
+        "{reason}"
+    );
+
+    // (3) A MISSING blob on the prior side: absent, not "names no commit".
+    let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
+    facts.priors[0].commit = None;
+    facts.priors[0].body = workflow::ReportBodyRead::Missing;
+    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    let warn = m
+        .events
+        .iter()
+        .find(|e| e.kind == event_kind::QA_REWORK_GATE_INCOMPARABLE)
+        .expect("a distinct event");
+    let reason = warn.payload[json_field::REASON].as_str().unwrap();
+    assert!(reason.contains("absent"), "{reason}");
+
+    // (4) Non-drift: the readable-but-unnamed keeps its historical phrase —
+    // the new vocabulary REFINES the record, it does not rewrite it.
+    let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
+    facts.current_commit = None;
+    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    let warn = m
+        .events
+        .iter()
+        .find(|e| e.kind == event_kind::QA_REWORK_GATE_INCOMPARABLE)
+        .expect("a distinct event");
+    assert_eq!(
+        warn.payload[json_field::REASON].as_str().unwrap(),
+        "the published report names no stamped commit",
+        "the silent-None case keeps its exact historical text"
+    );
 }
 
 #[test]

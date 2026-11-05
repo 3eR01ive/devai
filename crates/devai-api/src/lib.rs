@@ -30,7 +30,7 @@ pub use mutations::{
     PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome, ReviseReq, RunOutcome, RunReq,
     TaskCreateReq, TaskCreated, UnlinkResult, WorkflowOp,
 };
-pub use registry::{OpClass, OpDescriptor, operations};
+pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,6 +81,14 @@ impl Api {
 
     pub fn api_registry(&self) -> Vec<OpDescriptor> {
         registry::operations()
+    }
+
+    /// R3 QA (da/api-contract): the versioned machine-readable publication
+    /// — `devai api registry --json` renders exactly this document. The
+    /// surface version has ONE source (`registry::SURFACE_VERSION`); no
+    /// consumer restamps it.
+    pub fn api_registry_publication(&self) -> RegistryPublication {
+        registry::publication()
     }
 
     // ------------------------------------------------------------------

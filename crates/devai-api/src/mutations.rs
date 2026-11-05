@@ -1069,13 +1069,46 @@ impl Api {
     /// gate: records (or reuses) the pair-bound `rework_noop_ratified`
     /// decision, releases the gate's blocking question, and runs the
     /// withheld REWORK → QA transition through the same core command —
-    // which now finds the ratification and cites its decision id (AC3).
+    /// which now finds the ratification and cites its decision id (AC3).
+    /// R4 QA (cl/short-units): the phases live in the private units below;
+    /// the act SEQUENCE and every refusal text are unchanged (this is
+    /// layout, not domain — statements moved verbatim).
     pub fn task_ratify_empty_rework(
         &self,
         id: &str,
         rationale: Option<String>,
     ) -> ApiResult<RatifyResult> {
         let task = self.store.resolve_task(id)?;
+        Self::ratify_gate_state(&task)?;
+        let (current, trip, prev_report) = self.ratify_current_trip(&task)?;
+        let current_id_s = current.id.to_string();
+        let (decision, recorded_now) =
+            self.ratify_decision_row(task.id, &prev_report, &current_id_s, rationale)?;
+        let cur = self.ratify_release_question(&task, &trip, &decision)?;
+        let m = self.ratify_withheld_passage(&cur, &current, &decision)?;
+        self.store.commit(cur.lock_version, &m)?;
+        Ok(RatifyResult {
+            task: cur,
+            decision,
+            recorded_now,
+            prev_report,
+            current_report: current_id_s,
+            state: m.task.state,
+            allowed_operations: workflow::allowed_ops(&m.task)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        })
+    }
+
+    /// One refusal in the gate's error family (code `empty_rework_gate`).
+    fn empty_rework_refused(message: impl Into<String>) -> ApiError {
+        ApiError::refused("empty_rework_gate", message)
+    }
+
+    /// Phase 1 — the state guard: only the gate hold (WAITING_FOR_INPUT
+    /// returning to REWORK) or the released REWORK itself may ratify.
+    fn ratify_gate_state(task: &Task) -> Result<(), ApiError> {
         match task.state {
             // The gate hold is WAITING_FOR_INPUT returning to REWORK. If
             // the operator answered the question first (back to REWORK, no
@@ -1084,39 +1117,44 @@ impl Api {
             TaskState::WaitingForInput if task.return_state == Some(TaskState::Rework) => {}
             TaskState::Rework => {}
             s => {
-                return Err(ApiError::refused(
-                    "empty_rework_gate",
-                    format!(
-                        "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
-                        s.as_str()
-                    ),
-                ));
+                return Err(Self::empty_rework_refused(format!(
+                    "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
+                    s.as_str()
+                )));
             }
         }
+        Ok(())
+    }
+
+    /// Phase 2 — the CURRENT report and the gate trip that binds it: the
+    /// newest implementation report must have a recorded
+    /// `qa.rework_gate_tripped` event, and that trip must name a previous
+    /// report (only the trip of the LATEST report is ratifiable, REQ-RG-03
+    /// AC4). Returns (current report, trip payload, previous report id).
+    fn ratify_current_trip(&self, task: &Task) -> ApiResult<(Artifact, serde_json::Value, String)> {
         let arts = self.store.artifacts(task.id)?;
         let Some(current) = arts
             .iter()
             .filter(|a| a.kind == ArtifactKind::ImplementationReport)
             .max_by_key(|a| a.seq)
+            .cloned()
         else {
-            return Err(ApiError::refused(
-                "empty_rework_gate",
+            return Err(Self::empty_rework_refused(
                 "the task has no implementation report — nothing to ratify",
             ));
         };
         let events = self.store.all_events_for_task(task.id)?;
         let current_id_s = current.id.to_string();
-        // Only the trip of the LATEST report is ratifiable (REQ-RG-03 AC4).
         let trip = events
             .iter()
             .rev()
             .find(|e| e.kind == event_kind::QA_REWORK_GATE_TRIPPED && e.payload.get(json_field::CURRENT_REPORT).and_then(|v| v.as_str()) == Some(current_id_s.as_str()))
-            .ok_or_else(|| ApiError::refused("empty_rework_gate", format!(
+            .map(|e| e.payload.clone())
+            .ok_or_else(|| Self::empty_rework_refused(format!(
                 "no empty-rework gate recorded for report {} — the gate fires when a REWORK publication names the unchanged commit; if the latest report is newer, let the engine publish it from REWORK first",
                 short_id(&current.id)
             )))?;
         let prev_report = trip
-            .payload
             .get(json_field::PREV_REPORT)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -1127,41 +1165,58 @@ impl Api {
                 )
             })?
             .to_string();
+        Ok((current, trip, prev_report))
+    }
 
-        // The ratification for exactly this pair, recorded once; a retry
-        // reuses the stored row (never a double-written judgment).
-        let decisions = self.store.list_decisions(task.id)?;
+    /// Phase 3 — the ratification for exactly this pair, recorded once; a
+    /// retry reuses the stored row (never a double-written judgment).
+    fn ratify_decision_row(
+        &self,
+        task_id: Id,
+        prev_report: &str,
+        current_id: &str,
+        rationale: Option<String>,
+    ) -> ApiResult<(Decision, bool)> {
+        let decisions = self.store.list_decisions(task_id)?;
         let existing = decisions
             .iter()
             .find(|d| {
                 d.kind == decision_kind::REWORK_NOOP_RATIFIED
-                    && d.refs.iter().any(|r| r == &prev_report)
-                    && d.refs.iter().any(|r| r == &current_id_s)
+                    && d.refs.iter().any(|r| r == prev_report)
+                    && d.refs.iter().any(|r| r == current_id)
             })
             .cloned();
-        let (decision, recorded_now) = match existing {
-            Some(d) => (d, false),
+        match existing {
+            Some(d) => Ok((d, false)),
             None => {
                 let d = Decision {
                     id: new_id(),
-                    task_id: task.id,
+                    task_id,
                     kind: decision_kind::REWORK_NOOP_RATIFIED.into(),
                     verdict: Verdict::Approved,
                     actor: self.actor.clone(),
                     rationale,
-                    refs: vec![prev_report.clone(), current_id_s.clone()],
+                    refs: vec![prev_report.to_string(), current_id.to_string()],
                     created_at: Utc::now(),
                 };
                 self.store.record_decision(&d)?;
-                (d, true)
+                Ok((d, true))
             }
-        };
+        }
+    }
 
-        // Release the blocking gate question while the hold is still up.
+    /// Phase 4 — release the blocking gate question while the hold is still
+    /// up. Returns the task as it stands after the release, or unchanged
+    /// when there was no hold to release (the operator answered first).
+    fn ratify_release_question(
+        &self,
+        task: &Task,
+        trip: &serde_json::Value,
+        decision: &Decision,
+    ) -> ApiResult<Task> {
         let mut cur = task.clone();
         if cur.state == TaskState::WaitingForInput {
             let q_ref = trip
-                .payload
                 .get(json_field::QUESTION_ID)
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
@@ -1181,10 +1236,18 @@ impl Api {
             self.store.commit(cur.lock_version, &m)?;
             cur = self.store.get_task(&cur.id.to_string())?;
         }
+        Ok(cur)
+    }
 
-        // Run the withheld transition through the single serialization
-        // point; with the stored ratification in the facts, the core
-        // command admits REWORK → QA and puts `ratified_by` on the event.
+    /// Phase 5 — run the withheld transition through the single
+    /// serialization point; with the stored ratification in the facts, the
+    /// core command admits REWORK → QA and puts `ratified_by` on the event.
+    fn ratify_withheld_passage(
+        &self,
+        cur: &Task,
+        current: &Artifact,
+        decision: &Decision,
+    ) -> ApiResult<Mutation> {
         let arts = self.store.artifacts(cur.id)?;
         let facts = devai_runtime::gate::collect_implementation_report_facts(
             &self.store,
@@ -1193,31 +1256,16 @@ impl Api {
             &arts,
             Some(format!("empty rework ratified by decision {}", decision.id)),
         )?;
-        let m = workflow::implementation_reported(&cur, &facts, &self.actor, Utc::now())?;
+        let m = workflow::implementation_reported(cur, &facts, &self.actor, Utc::now())?;
         if m.task.state != TaskState::Qa {
-            return Err(ApiError::refused(
-                "empty_rework_gate",
-                format!(
-                    "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
-                    m.task.state.as_str(),
-                    decision.id,
-                    short_id(&cur.id)
-                ),
-            ));
+            return Err(Self::empty_rework_refused(format!(
+                "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
+                m.task.state.as_str(),
+                decision.id,
+                short_id(&cur.id)
+            )));
         }
-        self.store.commit(cur.lock_version, &m)?;
-        Ok(RatifyResult {
-            task: cur,
-            decision,
-            recorded_now,
-            prev_report,
-            current_report: current_id_s,
-            state: m.task.state,
-            allowed_operations: workflow::allowed_ops(&m.task)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
-        })
+        Ok(m)
     }
 
     // ---- questions --------------------------------------------------------

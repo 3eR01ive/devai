@@ -289,6 +289,37 @@ impl Store {
         Ok(())
     }
 
+    /// One ACTIVE dependency edge row and its `task.dependency.linked`
+    /// event, inserted into the CALLER's transaction — the single INSERT
+    /// path shared by the atomic compound (`create_task_with_dependencies`)
+    /// and the retroactive `task depend` (`link_task_dependency`). R1 QA
+    /// (mt/dry): the two paths duplicated these statements byte-for-byte;
+    /// drift here would let them store different facts while both claiming
+    /// "an edge was linked", so the insertion lives on exactly one line
+    /// per statement for the whole crate.
+    fn insert_dependency_edge(tx: &Transaction<'_>, e: &TaskDependency) -> StoreResult<()> {
+        tx.execute(
+            "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,status,actor,created_at) VALUES(?1,?2,?3,?4,'ACTIVE',?5,?6)",
+            params![e.id.to_string(), e.task_id.to_string(), e.depends_on_id.to_string(), e.kind.as_str(), e.actor, rows::ts(&e.created_at)],
+        )?;
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                e.task_id.to_string(),
+                event_kind::TASK_DEPENDENCY_LINKED,
+                e.actor,
+                json_string(&serde_json::json!({
+                    (json_field::DEPENDENCY_ID): e.id.to_string(),
+                    (json_field::DEPENDS_ON_ID): e.depends_on_id.to_string(),
+                    (json_field::DEPENDENCY_KIND): e.kind.as_str(),
+                })),
+                rows::ts(&e.created_at),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// REQ-API-01: the ATOMIC compound creation — the task row and event,
     /// every dependency edge and its `task.dependency.linked` event, and
     /// the creation-key registration (REQ-API-02) land in ONE transaction.
@@ -346,25 +377,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         Self::insert_task_row(&tx, t)?;
         for e in &edges {
-            tx.execute(
-                "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,status,actor,created_at) VALUES(?1,?2,?3,?4,'ACTIVE',?5,?6)",
-                params![e.id.to_string(), e.task_id.to_string(), e.depends_on_id.to_string(), e.kind.as_str(), e.actor, rows::ts(&e.created_at)],
-            )?;
-            tx.execute(
-                "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    new_id().to_string(),
-                    e.task_id.to_string(),
-                    event_kind::TASK_DEPENDENCY_LINKED,
-                    e.actor,
-                    json_string(&serde_json::json!({
-                        (json_field::DEPENDENCY_ID): e.id.to_string(),
-                        (json_field::DEPENDS_ON_ID): e.depends_on_id.to_string(),
-                        (json_field::DEPENDENCY_KIND): e.kind.as_str(),
-                    })),
-                    rows::ts(&e.created_at),
-                ],
-            )?;
+            Self::insert_dependency_edge(&tx, e)?;
         }
         if let Some(key) = idempotency_key {
             tx.execute(
@@ -615,25 +628,7 @@ impl Store {
             created_at: now,
         };
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,status,actor,created_at) VALUES(?1,?2,?3,?4,'ACTIVE',?5,?6)",
-            params![edge.id.to_string(), edge.task_id.to_string(), edge.depends_on_id.to_string(), kind.as_str(), edge.actor, rows::ts(&edge.created_at)],
-        )?;
-        tx.execute(
-            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                new_id().to_string(),
-                edge.task_id.to_string(),
-                event_kind::TASK_DEPENDENCY_LINKED,
-                edge.actor,
-                json_string(&serde_json::json!({
-                    (json_field::DEPENDENCY_ID): edge.id.to_string(),
-                    (json_field::DEPENDS_ON_ID): edge.depends_on_id.to_string(),
-                    (json_field::DEPENDENCY_KIND): edge.kind.as_str(),
-                })),
-                rows::ts(&edge.created_at),
-            ],
-        )?;
+        Self::insert_dependency_edge(&tx, &edge)?;
         tx.commit()?;
         Ok(edge)
     }
@@ -2043,6 +2038,98 @@ mod trigger_tests {
 }
 
 #[cfg(test)]
+mod dependency_atomicity_tests {
+    use super::*;
+
+    /// R1 QA (mt/dry): the atomic compound and the retroactive `task depend`
+    /// path share ONE edge-insert helper — so the REFUSAL family must not
+    /// drift either. For the shapes both paths can produce, the two errors
+    /// are the same variant with byte-identical text, verified by direct
+    /// string comparison (drift in either format string fails this test).
+    #[test]
+    fn compound_and_link_paths_refuse_with_identical_error_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let blocker = Task::new("blocker", "fixture", None, Utc::now());
+        store.create_task(&blocker).unwrap();
+
+        // (1) Self-reference: the compound refuses a task depending on
+        // itself with the same text the link path produces.
+        let mut self_dep = Task::new("selfish", "fixture", None, Utc::now());
+        self_dep.id = blocker.id; // forces the `t.id == dep.id` guard
+        let compound_self = store
+            .create_task_with_dependencies(
+                &self_dep,
+                &[(&blocker, DependencyKind::Parent)],
+                "op",
+                Utc::now(),
+                None,
+            )
+            .unwrap_err();
+        let link_self = store
+            .link_task_dependency(
+                blocker.id,
+                blocker.id,
+                DependencyKind::Parent,
+                "op",
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(compound_self, StoreError::InvalidDependency(_)));
+        assert_eq!(
+            compound_self.to_string(),
+            link_self.to_string(),
+            "self-reference refusal must be byte-identical across paths"
+        );
+
+        // (2) Duplicate edge: within-request duplicate in the compound vs
+        // a stored duplicate on the link path — same task pair, same kind.
+        let fresh = Task::new("fresh", "fixture", None, Utc::now());
+        let compound_dup = store
+            .create_task_with_dependencies(
+                &fresh,
+                &[
+                    (&blocker, DependencyKind::Parent),
+                    (&blocker, DependencyKind::Parent),
+                ],
+                "op",
+                Utc::now(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            store
+                .create_task_with_dependencies(
+                    &fresh,
+                    &[(&blocker, DependencyKind::Parent)],
+                    "op",
+                    Utc::now(),
+                    None
+                )
+                .unwrap()
+                .len(),
+            1,
+            "the refusal above left nothing behind — the compound create now lands exactly one edge"
+        );
+        let link_dup = store
+            .link_task_dependency(
+                fresh.id,
+                blocker.id,
+                DependencyKind::Parent,
+                "op",
+                Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(link_dup, StoreError::InvalidDependency(_)));
+        assert_eq!(
+            compound_dup.to_string(),
+            link_dup.to_string(),
+            "duplicate-edge refusal must be byte-identical across paths"
+        );
+    }
+}
+
+#[cfg(test)]
 mod migration_tests {
     use super::*;
 
@@ -2131,6 +2218,122 @@ mod migration_tests {
         assert!(
             old.workspace_revision.is_none(),
             "the historical row was NOT rewritten by the v2 write"
+        );
+    }
+
+    /// A structural fingerprint of one table as the DATABASE sees it:
+    /// column shapes, every index (name, uniqueness, origin, partial
+    /// predicate, indexed column order) and declared foreign keys — all
+    /// read through PRAGMAs, never from the DDL text (schema.sql writes
+    /// the statements with comments and `IF NOT EXISTS` variants that are
+    /// not part of the stored structure). Deterministically ordered.
+    fn structural_fingerprint(conn: &Connection, table: &str) -> Vec<String> {
+        let pragma = |sql: String| -> Vec<String> {
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let ncols = stmt.column_count();
+            let mut rows = stmt.query([]).unwrap();
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().unwrap() {
+                let cols: Vec<String> = (0..ncols)
+                    .map(|i| {
+                        let v: rusqlite::types::Value = r.get(i).unwrap();
+                        format!("{v:?}")
+                    })
+                    .collect();
+                out.push(cols.join("|"));
+            }
+            out.sort();
+            out
+        };
+        let mut lines = Vec::new();
+        for row in pragma(format!("PRAGMA table_info({table})")) {
+            lines.push(format!("column:{row}"));
+        }
+        for row in pragma(format!("PRAGMA foreign_key_list({table})")) {
+            lines.push(format!("fk:{row}"));
+        }
+        for row in pragma(format!("PRAGMA index_list({table})")) {
+            lines.push(format!("index:{row}"));
+            // `row` is seq|name|unique|origin|partial — expand the columns
+            // the index covers (2nd field is the index name).
+            let name = row.split('|').nth(1).unwrap().trim_matches('"');
+            for col in pragma(format!("PRAGMA index_info('{name}')")) {
+                lines.push(format!("index:{name}:col:{col}"));
+            }
+        }
+        lines
+    }
+
+    /// R2 QA (mt/change-isolation): a new rung requires THREE sites —
+    /// manifest.json, migrations/*.sql and the schema.sql mirror — and a
+    /// skipped mirror edit was only catchable indirectly. This test is the
+    /// loud mirror check in the style of the guard-index precedent
+    /// (`the_index_itself_rejects_a_second_running_row`), extended to the
+    /// FULL object set of rung 008: the fresh home (schema.sql executed
+    /// whole) and the migrated home (hand-built v1 shape walked by
+    /// `open()` through every manifest rung to v8) must agree on the
+    /// structure fingerprint of `task_creation_keys` and every index on
+    /// it. Divergent DDL between the mirror and the ladder fails here,
+    /// byte-for-byte visible in the diff of the two line sets.
+    #[test]
+    fn rung_008_object_set_is_identical_on_fresh_and_migrated_homes() {
+        // Fresh home: the declarative mirror.
+        let fresh_dir = tempfile::TempDir::new().unwrap();
+        let fresh = Store::open(fresh_dir.path()).unwrap();
+        assert_eq!(
+            fresh
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "a fresh home lands on the top rung"
+        );
+
+        // Migrated home: the v1 shape from the precedent above, carried to
+        // v8 by the generic ladder executor — rung 008 runs from DATA.
+        let mig_dir = tempfile::TempDir::new().unwrap();
+        {
+            let conn = Connection::open(mig_dir.path().join("devai.db")).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version=1;
+                 CREATE TABLE role_executions(
+                   id TEXT PRIMARY KEY, task_id TEXT NOT NULL, role_slug TEXT NOT NULL,
+                   role_version INTEGER NOT NULL, agent_name TEXT NULL, status TEXT NOT NULL,
+                   inputs TEXT NOT NULL DEFAULT '[]', summary TEXT NULL, error TEXT NULL,
+                   started_at TEXT NOT NULL, finished_at TEXT NULL);
+                 CREATE TABLE artifacts(
+                   id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL,
+                   name TEXT NOT NULL, seq INTEGER NOT NULL, category TEXT NOT NULL,
+                   status TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
+                   media_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                   contract_name TEXT NULL, contract_version INTEGER NULL,
+                   created_by TEXT NOT NULL, execution_id TEXT NULL,
+                   depends_on TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+        let migrated = Store::open(mig_dir.path()).unwrap();
+        assert_eq!(
+            migrated
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "the ladder carried the migrated home to the top rung"
+        );
+
+        let fp_fresh = structural_fingerprint(&fresh.conn, "task_creation_keys");
+        let fp_migrated = structural_fingerprint(&migrated.conn, "task_creation_keys");
+        assert!(
+            fp_fresh.iter().any(|l| l.starts_with("column:"))
+                && fp_fresh
+                    .iter()
+                    .any(|l| l.contains("task_creation_keys_task")),
+            "the fingerprint is non-vacuous: the rung 008 table AND its named index are present on the fresh home — got {fp_fresh:?}"
+        );
+        assert_eq!(
+            fp_fresh, fp_migrated,
+            "schema.sql and the migration ladder must land the SAME rung-008 structure (mirror drift)"
         );
     }
 }
