@@ -1,0 +1,223 @@
+/* devai-ui: каркас-тема по палитре лого (REQ-UI-13).
+   уголь-фон: градиент #202833 → #111820 (assets/logo.svg:6-7),
+   крем #F4F1EA (:23), оранж #F36A16 (:37), сланец #71808D (:51).
+   «Прикинут», без полировки — это заявленный объём итерации. */
+
+:root {
+  --coal-hi: #202833;
+  --coal-lo: #111820;
+  --cream: #f4f1ea;
+  --orange: #f36a16;
+  --slate: #71808d;
+  --panel: rgba(113, 128, 141, 0.1);
+  --panel-border: rgba(113, 128, 141, 0.35);
+  --mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: linear-gradient(135deg, var(--coal-hi), var(--coal-lo));
+  background-attachment: fixed;
+  color: var(--cream);
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+}
+
+a {
+  color: var(--cream);
+  text-decoration: none;
+}
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+header.topbar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--panel-border);
+  background: rgba(17, 24, 32, 0.75);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.brand {
+  font-weight: 800;
+  font-size: 17px;
+  letter-spacing: -0.02em;
+}
+.brand em {
+  color: var(--orange);
+  font-style: normal;
+}
+
+nav.modes {
+  display: flex;
+  gap: 4px;
+}
+nav.modes a {
+  padding: 4px 10px;
+  border-radius: 6px;
+  color: var(--slate);
+}
+nav.modes a.router-link-active {
+  color: var(--coal-lo);
+  background: var(--orange);
+  font-weight: 600;
+}
+
+.statusbar {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--slate);
+  text-align: right;
+}
+.statusbar b {
+  color: var(--cream);
+  font-weight: 600;
+}
+
+main.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px;
+  max-width: 1240px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.panel {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--panel);
+  margin-bottom: 14px;
+}
+.panel > h3 {
+  margin: 0;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--panel-border);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--slate);
+}
+.panel > .body {
+  padding: 12px 14px;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+}
+table.data th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--slate);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--panel-border);
+}
+table.data td {
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(113, 128, 141, 0.15);
+  vertical-align: top;
+}
+table.data tr:last-child td {
+  border-bottom: none;
+}
+
+button {
+  background: transparent;
+  border: 1px solid var(--slate);
+  color: var(--cream);
+  border-radius: 6px;
+  padding: 3px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+select,
+input[type="number"] {
+  background: var(--coal-lo);
+  color: var(--cream);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font: inherit;
+}
+
+.muted {
+  color: var(--slate);
+}
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.title-link {
+  color: var(--cream);
+}
+.title-link:hover {
+  color: var(--orange);
+}
+.empty {
+  padding: 28px;
+  text-align: center;
+  color: var(--slate);
+  border: 1px dashed var(--panel-border);
+  border-radius: 8px;
+}
+.errorbox {
+  border: 1px solid var(--orange);
+  border-radius: 8px;
+  background: rgba(243, 106, 22, 0.08);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.errorbox .code {
+  font-family: var(--mono);
+  color: var(--orange);
+  font-size: 12px;
+  margin-right: 8px;
+}
+pre.content {
+  background: rgba(17, 24, 32, 0.7);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 10px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 420px;
+  margin: 8px 0;
+}
+.rowflex {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.spacer {
+  flex: 1;
+}

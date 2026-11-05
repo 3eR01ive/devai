@@ -1,0 +1,22 @@
+[package]
+name = "devai-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "devai-ui: Tauri desktop consumer of the platform API — read-only operator surface (dogfoods REQ-API-08: a second consumer with no store access)"
+
+# REQ-UI-02 (AC1): the UI depends ONLY on the published API surface.
+# devai-store and rusqlite are absent from this graph BY CONSTRUCTION —
+# direct deps below are the whole surface the crate can reach. devai-core
+# supplies the domain vocabulary types (Task/TaskState tokens) for the
+# inbox filter; it performs no IO (core's own doctrine).
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+dirs.workspace = true
+devai-core.workspace = true
+devai-api.workspace = true
+tauri = "2"
+
+[build-dependencies]
+tauri-build = "2"

@@ -1,5 +1,11 @@
 /target
 *.devai-bundle/
 
+# devai-ui frontend build artifacts (npm install / vite build outputs)
+crates/devai-ui/frontend/node_modules/
+crates/devai-ui/frontend/dist/
+# tauri-build generated schemas (regenerated on every cargo build)
+crates/devai-ui/gen/
+
 # внутренние документы: конкурентные разборы и глоссарий антипаттернов — не в паблик
 docs/internal/
