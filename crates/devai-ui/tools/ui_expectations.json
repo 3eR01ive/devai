@@ -1,12 +1,12 @@
 {
-  "_comment": "Ожидания критерия «содержимое окна» для поверхности devai-ui (REQ-QA-01). Набор обязательных элементов зафиксирован по frontend/src: App.vue (nav-ссылки) и router.ts (routes/views). Пороги механичны: text-match на дампе AX-дерева, case-insensitive. Новые error-page тексты добавляются сюда же.",
+  "_comment": "Ожидания критерия «содержимое окна» для поверхности devai-ui (REQ-QA-01). Набор обязательных элементов зафиксирован по frontend/src: App.vue (nav-ссылки) и router.ts (routes/views). Пороги механичны: text-match на дампе AX-дерева, case-insensitive. Новые error-page тексты добавляются сюда же. min_ax_nodes=12 — измеренный край (R3): пустой по данным дом живой devai-ui даёт 19 узлов (qa-samples/edge-sparse, 05.11.2026), белый экран/known-bad — 3–7; порог ниже тонкого живого UI (+7 маржа) и выше верхней границы белого экрана; прежние 20 давали ложный FAIL на легитимном пустом доме.",
   "error_texts": [
     "Operation was cancelled",
     "not managed successfully",
     "Page not found",
     "Web Content process crashed"
   ],
-  "min_ax_nodes": 20,
+  "min_ax_nodes": 12,
   "required_elements": [
     { "id": "nav-projects", "any_of": ["Проекты", "#/projects"] },
     { "id": "nav-tasks", "any_of": ["Задачи", "#/tasks"] },

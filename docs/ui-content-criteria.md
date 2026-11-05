@@ -25,10 +25,15 @@ standalone (tauri://localhost + release-бинарь) дают одно и то 
     (case-insensitive подстроки): «Operation was cancelled»,
     «not managed successfully», «Page not found»,
     «Web Content process crashed». Список расширяется данными файла.
-(b) Дерево заполнено: ≥ 20 AX-узлов (белый экран даёт 3–7 — отсекается и
-    при отсутствии известного error-page текста; на этой машине webkit
-    2.52.6 при отмене навигации текст в дерево уже не кладёт — порог (b)
-    ловит именно это).
+(b) Дерево заполнено: ≥ 12 AX-узлов. Белый экран/error-page даёт 3–7
+    (known-bad 05.11 — 3; на этой машине webkit 2.52.6 при отмене навигации
+    текст в дерево уже не кладёт — порог (b) ловит именно это). Порог —
+    измеренный край запаса (R3): живой дом БЕЗ данных («пустые проекты»,
+    fixture qa-samples/edge-sparse, 05.11.2026 20:49 UTC) даёт 19 узлов —
+    маржа +7 над порогом; порог на 5 выше верхней границы белого экрана.
+    Прежние 20 съехали бы ложным FAIL на легитимный тонкий UI — 12
+    зафиксирована по замеру, не на глаз; поверхность с более богатым
+    ожиданием поднимает min_ax_nodes в СВОИМ ui_expectations.json.
 (c) Обязательные навигационные элементы присутствуют. Набор зафиксирован
     исполнителем по `crates/devai-ui/frontend/src` (App.vue nav +
     router.ts/routes): nav-projects Проекты|#/projects, nav-tasks
@@ -64,17 +69,26 @@ standalone (tauri://localhost + release-бинарь) дают одно и то 
 - `snap --out DIR [--window S] [--pid P]` — снять пару с ЖИВОГО окна
   (AT-SPI gi + xdotool + import/scrot). Зависимости: python3(gi,Atspi),
   scrot/ImageMagick import, xdotool — только для съёмки; проверка пары
-  зависимостей кроме stdlib не имеет. Отсутствие харнесса съёмки →
-  exit 127 → платформенный BLOCKED (config.rs:124-141), не FAIL.
+  зависимостей кроме stdlib не имеет.
 - `check DIR` — пороги по паре; 0 PASS / 1 FAIL.
-- `selftest` — прогон порогов на регрессионных образцах `qa-samples/`
-  (known-good обязан давать PASS, known-bad — FAIL; иначе харнессу
-  нельзя верить).
+- `selftest` — прогон порогов на регрессионных образцах `qa-samples/`:
+  known-good обязан давать PASS, known-bad — FAIL, edge-sparse (бедный
+  живой UI) — PASS и отличаться от known-bad; иначе харнессу нельзя верить.
 - `auto` — применимость + поиск пар в `<evidence>/ui/**` задачи
   (DEVAI_EVIDENCE_DIR текущих execution + все execution задачи в
   `<DEVAI_HOME>/evidence/<task>/`).
 - `gate` — selftest + auto; точка входа платформенного гейта
   (quality.yaml v13, гейт `ui-content`).
+
+Коды выхода (R1: обещанный класс = фактический код во всех die-пути):
+0 PASS/N/A; 1 FAIL — вердикт по содержимому; 2 BLOCKED продюсера съёмки
+(нет живого окна / gi / инструмента захвата — «не по чему оценивать»,
+различим от FAIL); 127 BLOCKED платформенной пробы — невыполнимая проба
+(битый/невалидный expectations-файл, неполная QA-база образцов,
+провалившийся самоконтроль гейта): 126/127 → BLOCKED по config.rs:124-141,
+не FAIL и не молчаливый пропуск. Файл ожиданий проходит fail-closed
+валидацию при загрузке (R2): обязательные ключи error_texts, min_ax_nodes,
+required_elements; потеря ключа — loud-ошибка 127, дефолтов нет.
 
 Ritual producer'а (implementation-agent на UI-задаче): поднять окно,
 `snap --out $DEVAI_EVIDENCE_DIR/ui/<run>`, проверить `check`, оставить
@@ -85,5 +99,10 @@ Ritual producer'а (implementation-agent на UI-задаче): поднять �
 `crates/devai-ui/qa-samples/known-bad` (подлинный вечерний AX-дамп +
 воспроизведение белой страницы, provenance в README каталога) и
 `known-good` (живой dev-прогон devai-fe4/devai-ui-dev4, 05.11.2026).
+Третий, обязательный для различения края (R3): `edge-sparse` — живой
+дом devai-ui без данных («пустые проекты», fresh DEVAI_HOME, тот же
+dev-путь, 05.11.2026 20:49 UTC): 19 узлов AX-дерева при пороге 12 —
+критерий различает бедный живой интерфейс (PASS) и known-bad error-page
+(FAIL), а не ставит оба в один вердикт.
 Повторный прогон `selftest` даёт тот же вердикт — samples в репозитории,
 источник истины порога — expectations-файл.
