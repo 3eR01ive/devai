@@ -1,0 +1,363 @@
+<script setup lang="ts">
+// Детали задачи (REQ-UI-05…REQ-UI-08, REQ-UI-10, REQ-UI-11): состояние,
+// пайплайн, артефакты, отчёт качества, решения/события, зависимости,
+// исполнения и воркспейс — каждое поле из готовой typed-view платформы.
+// UI не хранит свою очерёдность стадий, не переприсваивает статусы
+// артефактов и не выдумывает строки воркспейсов.
+import { onMounted, ref } from "vue";
+import { api, toUiError } from "../api";
+import { fmtElapsed, fmtTime, shortId } from "../settings";
+import StateChip from "../components/StateChip.vue";
+import type {
+  ActiveRow,
+  Artifact,
+  ArtifactContent,
+  Decision,
+  DependenciesView,
+  LivenessView,
+  ProgressView,
+  QualityReportView,
+  RoleExecution,
+  StatusView,
+  UiError,
+  WorkflowEvent,
+} from "../types";
+
+const props = defineProps<{ id: string }>();
+
+const status = ref<StatusView | null>(null);
+const progress = ref<ProgressView | null>(null);
+const deps = ref<DependenciesView | null>(null);
+const artifacts = ref<Artifact[]>([]);
+const decisions = ref<Decision[]>([]);
+const events = ref<WorkflowEvent[]>([]);
+const executions = ref<RoleExecution[]>([]);
+const activeRows = ref<ActiveRow[]>([]);
+const liveness = ref<Record<string, LivenessView>>({});
+const report = ref<QualityReportView | null>(null);
+const reportError = ref<UiError | null>(null);
+const error = ref<UiError | null>(null);
+const content = ref<ArtifactContent | null>(null);
+const contentFor = ref<string | null>(null);
+const eventsLimit = ref(50);
+
+async function loadAll() {
+  error.value = null;
+  try {
+    const [s, p, d, arts, decs, execs, snap] = await Promise.all([
+      api.taskStatus(props.id),
+      api.taskProgress(props.id),
+      api.taskDependencies(props.id),
+      api.artifactsList(props.id),
+      api.taskDecisions(props.id),
+      api.executionsList(props.id),
+      api.taskActive(),
+    ]);
+    status.value = s;
+    progress.value = p;
+    deps.value = d;
+    artifacts.value = arts;
+    decisions.value = decs;
+    executions.value = execs;
+    activeRows.value = snap.rows.filter((r) => r.task_id === props.id || r.task_id.startsWith(props.id));
+    // Liveness — наблюдение (REQ-SW-06): только read exec.liveness по RUNNING-строкам.
+    for (const e of execs.filter((x) => x.status === "RUNNING")) {
+      try {
+        liveness.value[e.id] = await api.executionLiveness(e.id);
+      } catch (err) {
+        liveness.value[e.id] = {
+          id: e.id, task_id: e.task_id, status: e.status, owner_pid: null,
+          owner_host: null, owner_process_start: null, liveness: "unknown",
+        } satisfies LivenessView;
+        void err;
+      }
+    }
+    await loadEvents();
+    await loadReport();
+  } catch (e) {
+    error.value = toUiError(e);
+  }
+}
+
+async function loadEvents() {
+  try {
+    events.value = await api.taskEvents(props.id, eventsLimit.value);
+  } catch (e) {
+    error.value = toUiError(e);
+  }
+}
+
+async function loadReport() {
+  report.value = null;
+  reportError.value = null;
+  try {
+    report.value = await api.taskReport(props.id);
+  } catch (e) {
+    reportError.value = toUiError(e); // NotFound «QA has not run» — platform text as-is (REQ-UI-07 AC2)
+  }
+}
+
+async function openContent(a: Artifact) {
+  contentFor.value = a.id;
+  content.value = null;
+  try {
+    content.value = await api.artifactContent(a.id);
+  } catch (e) {
+    error.value = toUiError(e);
+  }
+}
+
+onMounted(loadAll);
+</script>
+
+<template>
+  <section v-if="error" class="errorbox">
+    <span class="code">{{ error.code }}</span>{{ error.message }}
+  </section>
+
+  <section v-if="status">
+    <div class="rowflex" style="margin-bottom: 12px">
+      <h2 style="margin: 0">{{ status.task.title }}</h2>
+      <StateChip :token="status.task.state" />
+      <StateChip v-if="status.task.return_state" :token="status.task.return_state" />
+      <div class="spacer" />
+      <span class="mono muted">{{ status.task.id }}</span>
+      <button @click="loadAll">Обновить</button>
+    </div>
+    <p class="muted" style="white-space: pre-wrap">{{ status.task.business_description }}</p>
+
+    <!-- Пайплайн: порядок отдаёт платформа (PipelineView), UI не хранит свой -->
+    <div v-if="progress" class="panel">
+      <h3>Пайплайн · снимок {{ fmtTime(progress.snapshot_at) }}</h3>
+      <div class="body">
+        <div class="rowflex">
+          <template v-for="(stage, i) in progress.pipeline.order" :key="stage">
+            <span
+              class="chip-stage"
+              :class="{ here: progress.pipeline.position_index === i }"
+            >{{ stage }}</span>
+            <span v-if="i < progress.pipeline.order.length - 1" class="muted">→</span>
+          </template>
+        </div>
+        <p v-if="progress.pipeline.off_spine || progress.pipeline.position === null" class="muted" style="margin: 8px 0 0">
+          вне линейки стадий; текущее состояние — <b class="mono">{{ progress.pipeline.current }}</b>
+          <template v-if="progress.pipeline.terminal"> (терминальное)</template>
+        </p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Разрешённые операции (данные workflow::allowed_ops)</h3>
+      <div class="body rowflex">
+        <span v-for="op in status.allowed_operations" :key="op" class="mono chip-op">{{ op }}</span>
+        <span v-if="!status.allowed_operations.length" class="muted">—</span>
+      </div>
+    </div>
+
+    <div v-if="status.open_questions.length" class="panel">
+      <h3>Открытые вопросы</h3>
+      <div class="body">
+        <div v-for="q in status.open_questions" :key="q.id" style="margin-bottom: 10px">
+          <div class="rowflex">
+            <StateChip token="OPEN" />
+            <span v-if="q.blocking" class="chip-att">● блокирует линию</span>
+          </div>
+          <p style="margin: 4px 0">{{ q.text }}</p>
+          <p v-if="q.context" class="muted" style="margin: 0 0 4px; white-space: pre-wrap">{{ q.context }}</p>
+          <div v-if="q.options.length" class="rowflex">
+            <span v-for="o in q.options" :key="o" class="mono chip-op">{{ o }}</span>
+          </div>
+        </div>
+        <p class="muted">Ответ на вопрос — из CLI (<span class="mono">devai question answer</span>); GUI этой итерации наблюдает.</p>
+      </div>
+    </div>
+
+    <!-- Воркспейс: branch/worktree только там, где их опубликовала платформа
+         (ActiveRow для RUNNING + событие worktree.prepared) — REQ-UI-11 -->
+    <div class="panel">
+      <h3>Воркспейс (worktree задачи)</h3>
+      <div class="body">
+        <template v-if="activeRows.length">
+          <div v-for="r in activeRows" :key="r.id" class="rowflex" style="margin-bottom: 6px">
+            <StateChip :token="r.state" />
+            <span class="mono">{{ r.role }}</span>
+            <span v-if="r.branch" class="mono muted">branch {{ r.branch }}</span>
+            <span v-if="r.worktree" class="mono muted">{{ r.worktree }}</span>
+          </div>
+        </template>
+        <template v-else>
+          <p v-if="events.some((e) => e.kind === 'worktree.prepared')" class="muted" style="margin: 0">
+            Событие <span class="mono">worktree.prepared</span> есть; RUNNING-исполнения нет —
+            строку worktree платформа не публикует отдельно (известный гэп API, следующий срез).
+          </p>
+          <p v-else class="muted" style="margin: 0">Нет RUNNING-исполнения и события worktree.prepared — воркспейс не показываем (ничего не изобретаем).</p>
+        </template>
+      </div>
+    </div>
+
+    <div v-if="deps && (deps.outgoing.length || deps.incoming.length)" class="panel">
+      <h3>Зависимости</h3>
+      <div class="body">
+        <div v-for="d in deps.outgoing" :key="d.id" class="rowflex" style="margin-bottom: 4px">
+          <span class="mono muted">→ {{ d.kind }}</span>
+          <RouterLink class="title-link" :to="`/task/${d.depends_on_id}`">{{ d.depends_on_title }}</RouterLink>
+          <StateChip :token="d.depends_on_state" />
+        </div>
+        <div v-for="d in deps.incoming" :key="d.id" class="rowflex" style="margin-bottom: 4px">
+          <span class="mono muted">← {{ d.kind }}</span>
+          <RouterLink class="title-link" :to="`/task/${d.task_id}`">{{ d.task_title }}</RouterLink>
+          <StateChip :token="d.task_state" />
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Артефакты (kind · seq · статус — статусы хранимые)</h3>
+      <div class="body">
+        <table class="data">
+          <thead>
+            <tr><th>Вид</th><th>Имя</th><th>Seq</th><th>Статус</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="a in artifacts" :key="a.id">
+              <td class="mono">{{ a.kind }}</td>
+              <td>{{ a.name }} <span class="muted mono">{{ shortId(a.id) }}</span></td>
+              <td>{{ a.seq }}</td>
+              <td><StateChip :token="a.status" /></td>
+              <td><button @click="openContent(a)">содержимое</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="contentFor">
+          <p class="mono muted" style="margin: 8px 0 0">artifact: {{ shortId(contentFor) }}</p>
+          <pre v-if="content && content.shape === 'text'" class="content">{{ content.text }}</pre>
+          <p v-else-if="content && content.shape === 'binary'" class="muted">
+            Бинарное содержимое ({{ content.size }} байт) — платформа ответила NotUtf8, не рендерим.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Отчёт качества (task.report · CURRENT)</h3>
+      <div class="body">
+        <div v-if="reportError" class="errorbox" style="margin-bottom: 0">
+          <span class="code">{{ reportError.code }}</span>{{ reportError.message }}
+        </div>
+        <template v-else-if="report">
+          <div class="rowflex" style="margin-bottom: 6px">
+            <span class="mono muted">artifact {{ shortId(report.artifact) }} · seq {{ report.seq }} · {{ report.contract }}</span>
+            <span class="mono muted">создан {{ fmtTime(report.created_at) }}</span>
+          </div>
+          <pre v-if="report.report_text" class="content">{{ report.report_text }}</pre>
+          <details>
+            <summary class="muted">machine-тело отчёта</summary>
+            <pre class="content">{{ JSON.stringify(report.report, null, 2) }}</pre>
+          </details>
+        </template>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Исполнения ролей (exec.list; живые — exec.liveness)</h3>
+      <div class="body">
+        <table class="data">
+          <thead>
+            <tr><th>Роль@вер</th><th>Агент</th><th>Статус</th><th>Live</th><th>Старт / финиш</th><th>Класс сбоя</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="e in executions" :key="e.id">
+              <td class="mono">{{ e.role_slug }}@{{ e.role_version }} <span class="muted">·{{ e.attempt ?? 1 }}</span></td>
+              <td>{{ e.agent_name ?? "—" }}</td>
+              <td><StateChip :token="e.status" /></td>
+              <td>
+                <StateChip v-if="liveness[e.id]" :token="liveness[e.id].liveness" />
+                <span v-else class="muted">—</span>
+              </td>
+              <td class="mono muted">{{ fmtTime(e.started_at) }} → {{ fmtTime(e.finished_at) }}</td>
+              <td class="mono muted">{{ e.failure_class ?? "—" }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-if="progress && progress.running_executions.length" class="muted" style="margin: 8px 0 0">
+          <span v-for="r in progress.running_executions" :key="r.id" style="margin-right: 14px">
+            {{ r.role }} · {{ r.agent_name ?? "?" }} · {{ fmtElapsed(r.elapsed_seconds) }}
+          </span>
+        </p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Решения (task.decisions)</h3>
+      <div class="body">
+        <div v-for="d in decisions" :key="d.id" style="margin-bottom: 8px">
+          <div class="rowflex">
+            <span class="mono">{{ d.kind }}</span>
+            <StateChip :token="d.verdict" />
+            <span class="muted">{{ d.actor }} · {{ fmtTime(d.created_at) }}</span>
+          </div>
+          <details v-if="d.rationale">
+            <summary class="muted">rationale</summary>
+            <pre class="content">{{ d.rationale }}</pre>
+          </details>
+        </div>
+        <p v-if="!decisions.length" class="muted" style="margin: 0">Решений пока нет.</p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>События (task.events, newest tail) · limit</h3>
+      <div class="body">
+        <div class="rowflex" style="margin-bottom: 8px">
+          <input v-model.number="eventsLimit" type="number" min="1" max="500" style="width: 80px" />
+          <button @click="loadEvents">применить</button>
+        </div>
+        <table class="data">
+          <tbody>
+            <tr v-for="ev in events" :key="ev.id">
+              <td class="mono">{{ ev.kind }}</td>
+              <td class="muted">{{ ev.actor }}</td>
+              <td class="mono muted">{{ fmtTime(ev.created_at) }}</td>
+              <td>
+                <details v-if="ev.payload && JSON.stringify(ev.payload) !== '{}'">
+                  <summary class="muted mono">payload</summary>
+                  <pre class="content">{{ JSON.stringify(ev.payload, null, 2) }}</pre>
+                </details>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-if="!events.length" class="muted" style="margin: 0">Событий нет.</p>
+      </div>
+    </div>
+  </section>
+  <section v-else-if="!error" class="empty">Загрузка…</section>
+</template>
+
+<style scoped>
+.chip-stage {
+  padding: 2px 8px;
+  border: 1px solid var(--slate);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--slate);
+}
+.chip-stage.here {
+  border-color: var(--orange);
+  background: var(--orange);
+  color: var(--coal-lo);
+  font-weight: 700;
+}
+.chip-op {
+  padding: 1px 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.chip-att {
+  color: var(--orange);
+  font-weight: 700;
+  font-size: 12px;
+}
+</style>

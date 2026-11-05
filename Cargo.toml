@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/devai-core", "crates/devai-store", "crates/devai-api", "crates/devai-runtime", "crates/devai-cli"]
+members = ["crates/devai-core", "crates/devai-store", "crates/devai-api", "crates/devai-runtime", "crates/devai-cli", "crates/devai-ui"]
 resolver = "2"
 
 [workspace.package]
