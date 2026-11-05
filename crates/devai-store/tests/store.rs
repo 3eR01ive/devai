@@ -711,3 +711,79 @@ fn execution_id_prefix_resolution_fails_loudly_on_ambiguity() {
     assert_eq!(store.get_execution("01a1a5db-3ba0").unwrap().id, a.id);
     assert_eq!(store.get_execution(&b.id.to_string()).unwrap().id, b.id);
 }
+
+/// OQ-3 (ratified): ONE rule across every entity resolver — a prefix that
+/// matches several rows fails LOUDLY (Ambiguous), the store never guesses.
+/// `get_artifact` and `get_question` used `LIMIT 1`: whichever colliding row
+/// the scan met first was silently returned (the UUIDv7 same-millisecond
+/// collision class of the QA 01a1acab-18b1 flake). The `get_execution`
+/// discipline above is now law across the whole surface; a UNIQUE prefix
+/// still resolves — the human-friendly convenience is preserved.
+#[test]
+fn artifact_and_question_resolvers_fail_loudly_on_ambiguity() {
+    let (d, store) = open();
+    let t = draft(&store);
+    let a1 = publish(&store, &t, ArtifactKind::TestReport, b"one", vec![]);
+    let a2 = publish(&store, &t, ArtifactKind::QualityReport, b"two", vec![]);
+    // Hand-picked ids sharing the FULL canonical display prefix — the
+    // collision is a fixture of the resolver rule, not of clock luck.
+    {
+        let raw = rusqlite::Connection::open(d.path().join("devai.db")).unwrap();
+        raw.execute(
+            "UPDATE artifacts SET id=?1 WHERE id=?2",
+            rusqlite::params!["019e3333-0000-7000-8000-0000000000aa", a1.id.to_string()],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE artifacts SET id=?1 WHERE id=?2",
+            rusqlite::params!["019e3333-0000-7000-8000-0000000000ab", a2.id.to_string()],
+        )
+        .unwrap();
+    }
+    let err = store.get_artifact("019e3333-0000").unwrap_err();
+    assert!(matches!(err, StoreError::Ambiguous(_)), "{err}");
+    // A full or uniquely-prefixed lookup still resolves.
+    assert_eq!(
+        store
+            .get_artifact("019e3333-0000-7000-8000-0000000000aa")
+            .unwrap()
+            .id
+            .to_string(),
+        "019e3333-0000-7000-8000-0000000000aa"
+    );
+    let unknown = store
+        .get_artifact("019e3333-0000-7000-8000-0000000000b")
+        .unwrap_err();
+    assert!(
+        unknown.to_string().contains("not found"),
+        "an unknown prefix is the SAME NotFound sentence as before: {unknown}"
+    );
+
+    let q1 = Question {
+        id: Id::parse_str("019e4444-0000-7000-8000-0000000000aa").unwrap(),
+        task_id: t.id,
+        execution_id: None,
+        text: "question one".into(),
+        context: None,
+        options: vec![],
+        blocking: false,
+        status: QuestionStatus::Open,
+        answer: None,
+        answered_by: None,
+        answered_at: None,
+        created_at: now(),
+    };
+    let mut q2 = q1.clone();
+    q2.id = Id::parse_str("019e4444-0000-7000-8000-0000000000ab").unwrap();
+    q2.text = "question two".into();
+    store.create_question(&q1).unwrap();
+    store.create_question(&q2).unwrap();
+    let err = store.get_question("019e4444-0000").unwrap_err();
+    assert!(matches!(err, StoreError::Ambiguous(_)), "{err}");
+    assert_eq!(store.get_question("019e4444-0000-7000-8000-0000000000ab").unwrap().id, q2.id);
+    // Exact ids still resolve. (These fixtures differ only in the LAST
+    // character, so every shorter prefix is shared — and must stay
+    // ambiguous; a genuinely unique prefix still resolving is pinned by the
+    // get_execution ambiguity test above.)
+    assert_eq!(store.get_question("019e4444-0000-7000-8000-0000000000aa").unwrap().id, q1.id);
+}

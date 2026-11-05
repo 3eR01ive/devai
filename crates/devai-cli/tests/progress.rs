@@ -98,24 +98,24 @@ fn progress_lifecycle_through_the_real_binary() {
     assert!(err.contains("not found"), "and name the failure: {err}");
 
     // Drive DRAFT → … → IMPLEMENTATION.
-    devai(h, &["task", "start", prefix]);
+    devai(h, &["task", "start", &id]);
     let spec = write(h, "spec.json", "{\"requirements\": []}");
     devai(
         h,
         &[
             "artifact",
             "publish",
-            prefix,
+            &id,
             "--kind",
             "REQUIREMENTS_SPEC",
             "--file",
             &spec,
         ],
     );
-    devai(h, &["task", "review", prefix, "--verdict", "approved"]);
-    devai(h, &["task", "approve", prefix]);
+    devai(h, &["task", "review", &id, "--verdict", "approved"]);
+    devai(h, &["task", "approve", &id]);
 
-    let v = devai(h, &["task", "progress", prefix]);
+    let v = devai(h, &["task", "progress", &id]);
     assert!(
         v.contains(
             "✓ DRAFT → ✓ ANALYSIS → ✓ REVIEW → ✓ APPROVAL → [IMPLEMENTATION] → QA → ACCEPTED"
@@ -124,7 +124,7 @@ fn progress_lifecycle_through_the_real_binary() {
     );
 
     // REQ-PROG-03 AC2: what the view offers equals what the engine allows.
-    let j = devai_json(h, &["task", "progress", prefix]);
+    let j = devai_json(h, &["task", "progress", &id]);
     let task: Task = serde_json::from_value(j["task"].clone()).unwrap();
     assert_eq!(
         j["allowed_operations"],
@@ -146,27 +146,33 @@ fn progress_lifecycle_through_the_real_binary() {
     assert_eq!(j["pipeline"]["off_spine"], false);
 
     // REQ-PROG-04: running executions snapshot (role, short id, elapsed).
-    let started = devai(
+    devai(
         h,
         &[
             "exec",
             "start",
-            prefix,
+            &id,
             "--role",
             "implementation-agent",
             "--agent",
             "mock",
         ],
     );
-    let exec_short = started.split_whitespace().nth(1).unwrap().to_string();
+    // REQ-E2E-01 (OQ-3 ratified): the execution is ADDRESSED below by the
+    // FULL uuid from `--json`, never the truncated stdout token; the
+    // snapshot's printed short stays a rendering fact, pinned through the
+    // canonical accessor (one width source, types.rs).
+    let runs_listing = devai_json(h, &["exec", "list", "--task", &id]);
+    let exec_id = runs_listing[0]["id"].as_str().unwrap().to_string();
+    let exec_short = devai_core::types::short_id_str(&exec_id);
     // (role version comes from the seeded config — assert the pair, not the digit)
-    let v = devai(h, &["task", "progress", prefix]);
+    let v = devai(h, &["task", "progress", &id]);
     assert!(
         v.contains("implementation-agent@") && v.contains(&exec_short) && v.contains("elapsed "),
         "running row visible:\n{v}"
     );
     assert!(!v.contains("(no running executions)"));
-    let j = devai_json(h, &["task", "progress", prefix]);
+    let j = devai_json(h, &["task", "progress", &id]);
     let runs = j["running_executions"].as_array().unwrap();
     assert_eq!(
         runs.len(),
@@ -184,14 +190,14 @@ fn progress_lifecycle_through_the_real_binary() {
     );
     assert!(runs[0]["elapsed_seconds"].as_i64().unwrap() >= 0);
     assert!(runs[0]["started_at"].is_string());
-    devai(h, &["exec", "finish", &exec_short, "--summary", "done"]);
-    let v = devai(h, &["task", "progress", prefix]);
+    devai(h, &["exec", "finish", &exec_id, "--summary", "done"]);
+    let v = devai(h, &["task", "progress", &id]);
     assert!(
         v.contains("(no running executions)"),
         "finished rows drop out:\n{v}"
     );
     assert_eq!(
-        devai_json(h, &["task", "progress", prefix])["running_executions"]
+        devai_json(h, &["task", "progress", &id])["running_executions"]
             .as_array()
             .unwrap()
             .len(),
@@ -209,15 +215,15 @@ fn progress_lifecycle_through_the_real_binary() {
         &[
             "artifact",
             "publish",
-            prefix,
+            &id,
             "--kind",
             "IMPLEMENTATION_REPORT",
             "--file",
             &rep,
         ],
     );
-    devai(h, &["task", "pause", prefix, "--reason", "hold smoke"]);
-    let v = devai(h, &["task", "progress", prefix]);
+    devai(h, &["task", "pause", &id, "--reason", "hold smoke"]);
+    let v = devai(h, &["task", "progress", &id]);
     assert!(
         v.contains("PAUSED") && v.contains("(returns to QA)") && v.contains("[QA]"),
         "hold visible with its return stage:\n{v}"
@@ -226,19 +232,19 @@ fn progress_lifecycle_through_the_real_binary() {
         v.contains("note:  PAUSED is off the spine"),
         "the off-spine marker is explicit:\n{v}"
     );
-    let j = devai_json(h, &["task", "progress", prefix]);
+    let j = devai_json(h, &["task", "progress", &id]);
     assert_eq!(j["pipeline"]["current"], "PAUSED");
     assert_eq!(j["pipeline"]["position"], "QA");
     assert_eq!(j["pipeline"]["position_index"], 5);
     assert_eq!(j["pipeline"]["off_spine"], true);
-    devai(h, &["task", "resume", prefix]);
+    devai(h, &["task", "resume", &id]);
 
     // QA → REWORK: the loop state re-enters QA (engine knowledge, not CLI).
     devai(
         h,
-        &["task", "return", prefix, "--rationale", "rework smoke"],
+        &["task", "return", &id, "--rationale", "rework smoke"],
     );
-    let v = devai(h, &["task", "progress", prefix]);
+    let v = devai(h, &["task", "progress", &id]);
     assert!(
         v.contains("note:  REWORK is off the spine — it returns to [QA]"),
         "REWORK annotated as the QA loop:\n{v}"
@@ -253,7 +259,7 @@ fn progress_lifecycle_through_the_real_binary() {
         &[
             "artifact",
             "publish",
-            prefix,
+            &id,
             "--kind",
             "IMPLEMENTATION_REPORT",
             "--file",
@@ -268,15 +274,15 @@ fn progress_lifecycle_through_the_real_binary() {
         &[
             "artifact",
             "publish",
-            prefix,
+            &id,
             "--kind",
             "QUALITY_REPORT",
             "--file",
             &qr,
         ],
     );
-    devai(h, &["task", "accept", prefix]);
-    let v = devai(h, &["task", "progress", prefix]);
+    devai(h, &["task", "accept", &id]);
+    let v = devai(h, &["task", "progress", &id]);
     assert!(
         v.contains("cycle ended in ACCEPTED"),
         "terminal shown as end of cycle:\n{v}"
@@ -289,7 +295,7 @@ fn progress_lifecycle_through_the_real_binary() {
         v.contains("(none — task is terminal)"),
         "ops come from the engine's empty ACCEPTED set:\n{v}"
     );
-    let j = devai_json(h, &["task", "progress", prefix]);
+    let j = devai_json(h, &["task", "progress", &id]);
     assert_eq!(j["pipeline"]["terminal"], true);
     assert_eq!(j["pipeline"]["position_index"], 6);
 

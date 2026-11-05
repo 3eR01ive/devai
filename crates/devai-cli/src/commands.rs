@@ -230,6 +230,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             description_file,
             parent,
             blocked_by,
+            idempotency_key,
         } => {
             // The project name resolves through the API read FIRST, so its
             // not-found refusal keeps the exact position the command had.
@@ -261,6 +262,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
                     description: desc,
                     parent,
                     blocked_by,
+                    idempotency_key,
                 })
                 .map_err(render_api_error)?;
             let t = created.task;

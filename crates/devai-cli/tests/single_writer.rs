@@ -119,8 +119,7 @@ fn running_exec_id(home: &Path, task_id: &str) -> String {
 fn analysis_task(home: &Path, title: &str) -> String {
     let t = devai_json(home, &["task", "new", title, "--description", ""]);
     let id = t["id"].as_str().unwrap().to_string();
-    devai(home, &["task", "start", &id[..12].to_string()]);
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    devai(home, &["task", "start", &id]);
     id
 }
 
@@ -130,14 +129,14 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
     let h = home.path();
     devai(h, &["init"]);
     let id = analysis_task(h, "guard double start");
-    let short = id[..12].to_string();
+
 
     devai(
         h,
         &[
             "exec",
             "start",
-            &short,
+            &id,
             "--role",
             "requirements-analyst",
             "--agent",
@@ -154,7 +153,7 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
         &[
             "exec",
             "start",
-            &short,
+            &id,
             "--role",
             "requirements-analyst",
             "--agent",
@@ -183,7 +182,7 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
         &[
             "task",
             "run",
-            &short,
+            &id,
             "--agent",
             "mock",
             "--workspace",
@@ -212,7 +211,7 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
         &[
             "task",
             "run",
-            &short,
+            &id,
             "--agent",
             "mock",
             "--workspace",
@@ -231,7 +230,7 @@ fn live_owner_task_run_refusal_is_labeled_live_not_orphan() {
     let h = home.path();
     devai(h, &["init"]);
     let id = analysis_task(h, "guard live owner");
-    let short = id[..12].to_string();
+
 
     // A RUNNING row whose owner is THIS test process — a live writer. The
     // refusal must say so (the ratified three-way distinction), never call
@@ -269,7 +268,7 @@ fn live_owner_task_run_refusal_is_labeled_live_not_orphan() {
         &[
             "task",
             "run",
-            &short,
+            &id,
             "--agent",
             "mock",
             "--workspace",
@@ -293,7 +292,7 @@ fn publication_into_a_closed_row_is_refused() {
     let h = home.path();
     devai(h, &["init"]);
     let id = analysis_task(h, "guard zombie publish");
-    let short = id[..12].to_string();
+
     let spec = h.join("spec.json");
     std::fs::write(&spec, "{\"requirements\": []}").unwrap();
     let spec_str = spec.to_str().unwrap();
@@ -303,7 +302,7 @@ fn publication_into_a_closed_row_is_refused() {
         &[
             "exec",
             "start",
-            &short,
+            &id,
             "--role",
             "requirements-analyst",
             "--agent",
@@ -317,7 +316,7 @@ fn publication_into_a_closed_row_is_refused() {
         &[
             "artifact",
             "publish",
-            &short,
+            &id,
             "--kind",
             "REQUIREMENTS_SPEC",
             "--file",
@@ -333,7 +332,7 @@ fn publication_into_a_closed_row_is_refused() {
         &[
             "artifact",
             "publish",
-            &short,
+            &id,
             "--kind",
             "REQUIREMENTS_SPEC",
             "--file",
@@ -448,13 +447,13 @@ fn init_heals_a_v6_store_with_duplicate_running_history() {
     );
 
     // And the guard is ACTIVE immediately on the healed store.
-    let short = id[..12].to_string();
+
     let err = devai_refused(
         h,
         &[
             "exec",
             "start",
-            &short,
+            &id,
             "--role",
             "requirements-analyst",
             "--agent",
@@ -484,7 +483,7 @@ fn detection_never_writes_and_never_touches_a_process() {
         &[
             "exec",
             "start",
-            &id[..12].to_string(),
+            &id,
             "--role",
             "requirements-analyst",
             "--agent",
@@ -501,7 +500,7 @@ fn detection_never_writes_and_never_touches_a_process() {
         &[
             "exec",
             "start",
-            &id[..12].to_string(),
+            &id,
             "--role",
             "requirements-analyst",
             "--agent",

@@ -250,6 +250,15 @@ impl Store {
 
     pub fn create_task(&self, t: &Task) -> StoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
+        Self::insert_task_row(&tx, t)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The task row + its `task.created` event, as ONE statement pair a
+    /// caller can fold into its own transaction (shared by `create_task`
+    /// and the atomic compound below — the insert SQL stays in one place).
+    fn insert_task_row(tx: &Transaction<'_>, t: &Task) -> StoreResult<()> {
         tx.execute(
             "INSERT INTO tasks(id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -277,8 +286,112 @@ impl Store {
                 rows::ts(&t.created_at),
             ],
         )?;
-        tx.commit()?;
         Ok(())
+    }
+
+    /// REQ-API-01: the ATOMIC compound creation — the task row and event,
+    /// every dependency edge and its `task.dependency.linked` event, and
+    /// the creation-key registration (REQ-API-02) land in ONE transaction.
+    /// Any failure (constraint violation, IO error, a second registration
+    /// of the same key) rolls the ENTIRE effect back: a caller can never
+    /// observe an orphan task or a partially linked one. Endpoints arrive
+    /// ALREADY RESOLVED — ref resolution is `resolve_task`'s job and the
+    /// API does it before calling here, so a refused Ambiguous/NotFound
+    /// leaves this method (and the store) untouched.
+    ///
+    /// The task is brand-new, so the shape checks of `link_task_dependency`
+    /// reduce: it has no edge rows (stored duplicates impossible) and no
+    /// incoming edges (a cycle through it is un-closeable) — only WITHIN
+    /// this request can two identical refs collide, rejected with the exact
+    /// error family the retroactive `task depend` path produces.
+    pub fn create_task_with_dependencies(
+        &self,
+        t: &Task,
+        deps: &[(&Task, DependencyKind)],
+        actor: &str,
+        now: Timestamp,
+        idempotency_key: Option<&str>,
+    ) -> StoreResult<Vec<TaskDependency>> {
+        let mut edges: Vec<TaskDependency> = Vec::new();
+        let mut seen: Vec<(Id, DependencyKind)> = Vec::new();
+        for (dep, kind) in deps {
+            if t.id == dep.id {
+                return Err(StoreError::InvalidDependency(format!(
+                    "task `{}` cannot depend on itself",
+                    t.id
+                )));
+            }
+            if seen.contains(&(dep.id, *kind)) {
+                return Err(StoreError::InvalidDependency(format!(
+                    "dependency `{}` —{}→ `{}` already exists",
+                    t.id,
+                    kind.as_str(),
+                    dep.id
+                )));
+            }
+            seen.push((dep.id, *kind));
+            edges.push(TaskDependency {
+                id: new_id(),
+                task_id: t.id,
+                task_state: t.state,
+                task_title: t.title.clone(),
+                depends_on_id: dep.id,
+                depends_on_state: dep.state,
+                depends_on_title: dep.title.clone(),
+                kind: *kind,
+                actor: actor.to_string(),
+                created_at: now,
+            });
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        Self::insert_task_row(&tx, t)?;
+        for e in &edges {
+            tx.execute(
+                "INSERT INTO task_dependencies(id,task_id,depends_on_id,kind,status,actor,created_at) VALUES(?1,?2,?3,?4,'ACTIVE',?5,?6)",
+                params![e.id.to_string(), e.task_id.to_string(), e.depends_on_id.to_string(), e.kind.as_str(), e.actor, rows::ts(&e.created_at)],
+            )?;
+            tx.execute(
+                "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    new_id().to_string(),
+                    e.task_id.to_string(),
+                    event_kind::TASK_DEPENDENCY_LINKED,
+                    e.actor,
+                    json_string(&serde_json::json!({
+                        (json_field::DEPENDENCY_ID): e.id.to_string(),
+                        (json_field::DEPENDS_ON_ID): e.depends_on_id.to_string(),
+                        (json_field::DEPENDENCY_KIND): e.kind.as_str(),
+                    })),
+                    rows::ts(&e.created_at),
+                ],
+            )?;
+        }
+        if let Some(key) = idempotency_key {
+            tx.execute(
+                "INSERT INTO task_creation_keys(idempotency_key,task_id,created_at) VALUES(?1,?2,?3)",
+                params![key, t.id.to_string(), rows::ts(&now)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(edges)
+    }
+
+    /// REQ-API-02 (ratified OQ-1): the task a committed idempotency key
+    /// already registered, if any. The registry row is written inside the
+    /// creation transaction, so it is the PROOF of a successful create:
+    /// a lost-response retry asks here instead of minting a duplicate.
+    pub fn task_by_creation_key(&self, key: &str) -> StoreResult<Option<Task>> {
+        Ok(rows::unwrap_row(
+            self.conn
+                .query_row(
+                    "SELECT t.id,t.project_id,t.title,t.business_description,t.state,t.return_state,t.requirements_seq,t.lock_version,t.created_at,t.updated_at
+                     FROM task_creation_keys k JOIN tasks t ON t.id = k.task_id
+                     WHERE k.idempotency_key = ?1",
+                    params![key],
+                    |r| rows::r2sql(rows::task_from_row(r)),
+                )
+                .optional(),
+        )?)
     }
 
     pub fn get_task(&self, id: &str) -> StoreResult<Task> {
@@ -853,18 +966,32 @@ impl Store {
         Ok(out)
     }
 
+    /// Resolve an artifact by full id or unique prefix (OQ-3, ratified:
+    /// EVERY entity resolver keeps ONE rule — a unique prefix resolves, a
+    /// prefix matching several rows fails LOUDLY, the `resolve_task` /
+    /// `get_execution` discipline). The old `LIMIT 1` silently picked
+    /// whichever colliding row SQLite met first; UUIDv7 display-prefixes
+    /// collide for same-instant rows, and guessing between two artifacts
+    /// reads the WRONG one.
     pub fn get_artifact(&self, id: &str) -> StoreResult<Artifact> {
-        rows::unwrap_row(
-            self.conn
-                .query_row(
-                    "SELECT id,task_id,kind,name,seq,category,status,sha256,size,media_type,contract_name,contract_version,created_by,execution_id,depends_on,created_at
-                 FROM artifacts WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 1",
-                    params![id.to_lowercase()],
-                    |r| rows::r2sql(rows::artifact_from_row(r)),
-                )
-                .optional(),
-        )?
-        .ok_or_else(|| StoreError::NotFound("artifact".into(), id.to_string()))
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,kind,name,seq,category,status,sha256,size,media_type,contract_name,contract_version,created_by,execution_id,depends_on,created_at
+             FROM artifacts WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 2",
+        )?;
+        let mut rows = stmt.query(params![id.to_lowercase()])?;
+        let mut found: Vec<Artifact> = Vec::new();
+        while let Some(r) = rows.next()? {
+            found.push(rows::artifact_from_row(r)?);
+        }
+        match found.len() {
+            0 => Err(StoreError::NotFound("artifact".into(), id.to_string())),
+            // invariant: found.len()==1 here — the match arm above guarantees
+            // exactly one element, pop() cannot return None.
+            1 => Ok(found.pop().unwrap()),
+            _ => Err(StoreError::Ambiguous(format!(
+                "artifact id prefix `{id}` matches multiple artifacts"
+            ))),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1320,17 +1447,29 @@ impl Store {
         Ok(())
     }
 
+    /// Resolve a question by full id or unique prefix — same SINGLE
+    /// resolver rule as `resolve_task`/`get_execution`/`get_artifact`
+    /// (OQ-3, ratified): multiple prefix matches fail LOUDLY, the store
+    /// never guesses which row the caller meant.
     pub fn get_question(&self, id: &str) -> StoreResult<Question> {
-        rows::unwrap_row(
-            self.conn
-                .query_row(
-                    "SELECT id,task_id,execution_id,text,context,options,blocking,status,answer,answered_by,answered_at,created_at FROM questions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 1",
-                    params![id.to_lowercase()],
-                    |r| rows::r2sql(rows::question_from_row(r)),
-                )
-                .optional(),
-        )?
-        .ok_or_else(|| StoreError::NotFound("question".into(), id.to_string()))
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,execution_id,text,context,options,blocking,status,answer,answered_by,answered_at,created_at
+             FROM questions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 2",
+        )?;
+        let mut rows = stmt.query(params![id.to_lowercase()])?;
+        let mut found: Vec<Question> = Vec::new();
+        while let Some(r) = rows.next()? {
+            found.push(rows::question_from_row(r)?);
+        }
+        match found.len() {
+            0 => Err(StoreError::NotFound("question".into(), id.to_string())),
+            // invariant: found.len()==1 here — the match arm above guarantees
+            // exactly one element, pop() cannot return None.
+            1 => Ok(found.pop().unwrap()),
+            _ => Err(StoreError::Ambiguous(format!(
+                "question id prefix `{id}` matches multiple questions"
+            ))),
+        }
     }
 
     pub fn answer_question(

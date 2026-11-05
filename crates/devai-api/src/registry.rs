@@ -70,7 +70,7 @@ pub fn operations() -> Vec<OpDescriptor> {
         OpDescriptor {
             name: "task.create",
             class: OpClass::Mutation,
-            input: "TaskCreateReq{title, project_id, description, parent, blocked_by}",
+            input: "TaskCreateReq{title, project_id, description, parent, blocked_by, idempotency_key}",
             output: "TaskCreated{task, linked}",
             description: "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. The project name resolves through the `project.get` read, so its not-found refusal keeps the exact position the command had.",
         },

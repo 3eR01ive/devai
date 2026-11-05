@@ -51,6 +51,11 @@ pub struct ProjectAddReq {
 /// READ, so the not-found refusal text keeps its exact position in the
 /// command's error order); parent/blocked_by are task refs registered as
 /// edges at the moment of creation (REQ-DEP-07).
+/// `idempotency_key` (REQ-API-02, ratified OQ-1): the caller-declared
+/// identity of THIS CREATE COMMAND. A repeated call with a key whose
+/// commit is already registered returns the original task and its edges
+/// — the recovery path when a successful create's response was lost.
+/// `None` keeps the plain every-call-creates semantics.
 #[derive(Debug, Clone)]
 pub struct TaskCreateReq {
     pub title: String,
@@ -58,6 +63,7 @@ pub struct TaskCreateReq {
     pub description: String,
     pub parent: Vec<String>,
     pub blocked_by: Vec<String>,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -376,32 +382,55 @@ impl Api {
     // ---- task: creation ---------------------------------------------------
 
     pub fn task_create(&self, req: TaskCreateReq) -> ApiResult<TaskCreated> {
-        let t = Task::new(req.title, req.description, req.project_id, Utc::now());
-        self.store.create_task(&t)?;
+        // REQ-API-02 (ratified OQ-1): a retry carrying the key of an
+        // ALREADY COMMITTED create returns the registered task and its
+        // stored ACTIVE edges — the lost-response retry never duplicates
+        // the effect. The registry row lands inside the creation
+        // transaction, so finding it is proof the first create committed.
+        if let Some(key) = req.idempotency_key.as_deref() {
+            if let Some(existing) = self.store.task_by_creation_key(key)? {
+                return Ok(TaskCreated {
+                    linked: self.store.task_dependencies(existing.id)?,
+                    task: existing,
+                });
+            }
+        }
         // REQ-DEP-07: a derived task records WHY it exists at the moment it
-        // is created; dangling references fail loudly on resolve, exactly
-        // as they would via `task.depend`.
-        let mut linked: Vec<TaskDependency> = Vec::new();
+        // is created; dangling references fail loudly on resolve, exactly as
+        // they would via `task depend`.
+        // REQ-API-01 (the QA-01a1acab-18b1 fix): EVERY ref is resolved
+        // BEFORE anything is written. The pre-fix order inserted the task,
+        // then resolved parent and blocked_by in loops — an Ambiguous or
+        // NotFound halfway left an ORPHAN task (and possibly a partial
+        // parent edge set) in the store, and the retry doubled the effect.
+        // Resolution order stays parents-then-blockers, so the first
+        // failing ref produces the identical error text of the old path.
+        let mut parents: Vec<Task> = Vec::new();
         for p in &req.parent {
-            let pt = self.store.resolve_task(p)?;
-            linked.push(self.store.link_task_dependency(
-                t.id,
-                pt.id,
-                DependencyKind::Parent,
-                &self.actor,
-                Utc::now(),
-            )?);
+            parents.push(self.store.resolve_task(p)?);
         }
+        let mut blockers: Vec<Task> = Vec::new();
         for b in &req.blocked_by {
-            let bt = self.store.resolve_task(b)?;
-            linked.push(self.store.link_task_dependency(
-                t.id,
-                bt.id,
-                DependencyKind::Blocks,
-                &self.actor,
-                Utc::now(),
-            )?);
+            blockers.push(self.store.resolve_task(b)?);
         }
+        let mut deps: Vec<(&Task, DependencyKind)> = Vec::new();
+        for t in &parents {
+            deps.push((t, DependencyKind::Parent));
+        }
+        for t in &blockers {
+            deps.push((t, DependencyKind::Blocks));
+        }
+        // The task, its edges and the key registration land in ONE store
+        // transaction (REQ-API-01: all effects of this call, or none), so
+        // `TaskCreated` can never describe an edge absent from the store.
+        let t = Task::new(req.title, req.description, req.project_id, Utc::now());
+        let linked = self.store.create_task_with_dependencies(
+            &t,
+            &deps,
+            &self.actor,
+            Utc::now(),
+            req.idempotency_key.as_deref(),
+        )?;
         Ok(TaskCreated { task: t, linked })
     }
 
@@ -1484,10 +1513,151 @@ mod tests {
             description: String::new(),
             parent: vec![],
             blocked_by: vec![],
+            idempotency_key: None,
         })
         .expect("create")
         .task
         .id
+    }
+
+    // --- REQ-API-01 / REQ-API-02 (QA artifact 01a1acab-18b1, ratified
+    // OQ-1): task_create atomicity and the lost-response retry. Stores
+    // are checked by DIRECT reads — never through command stdout. ---
+
+    /// A task with a HAND-PICKED id (deterministic prefix-collision setups
+    /// must not depend on wall-clock luck — the flake class this task
+    /// retires).
+    fn task_with_id(id: &str, title: &str) -> Task {
+        let mut t = Task::new(title, String::new(), None, Utc::now());
+        t.id = Uuid::parse_str(id).expect("crafted fixture id");
+        t
+    }
+
+    /// REQ-API-01 AC3 (regression): a create whose blocked_by ref is
+    /// AMBIGUOUS refuses — and the store keeps NEITHER the task NOR any
+    /// edge. Pre-fix, `create_task` inserted the task BEFORE the resolve
+    /// loops, so this exact call left an orphan task plus a committed
+    /// parent edge (the partially-successful shape).
+    #[test]
+    fn ambiguous_refusal_leaves_no_orphan_task_or_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        // Two ids sharing the FULL canonical 13-char display prefix —
+        // a genuine ambiguity resolve_task must (and does) refuse.
+        let a = task_with_id("019e0000-0000-7000-8000-0000000000aa", "collision-a");
+        let b = task_with_id("019e0000-0000-7000-8000-0000000000ab", "collision-b");
+        api.store.create_task(&a).unwrap();
+        api.store.create_task(&b).unwrap();
+        let before = api.store.list_tasks().unwrap().len();
+
+        let e = api
+            .task_create(TaskCreateReq {
+                title: "orphan-candidate".into(),
+                project_id: None,
+                description: String::new(),
+                // the resolvable parent would have been linked BEFORE the
+                // failing ref by the old per-loop order — it must be gone too
+                parent: vec![a.id.to_string()],
+                blocked_by: vec!["019e0000-0000".into()], // matches BOTH
+                idempotency_key: None,
+            })
+            .expect_err("ambiguous ref must refuse");
+        assert!(format!("{e}").contains("ambiguous"), "{e}");
+
+        // DIRECT store reads: nothing landed at all.
+        assert_eq!(api.store.list_tasks().unwrap().len(), before);
+        assert!(
+            !api.store
+                .list_tasks()
+                .unwrap()
+                .iter()
+                .any(|t| t.title == "orphan-candidate")
+        );
+        assert!(api.store.incoming_dependencies(a.id).unwrap().is_empty());
+        assert!(api.store.incoming_dependencies(b.id).unwrap().is_empty());
+
+        // REQ-API-02 AC1: an identical retry with resolvable refs succeeds
+        // and leaves EXACTLY one new task plus exactly its edges — the
+        // refused attempt contributed nothing to double.
+        api.task_create(TaskCreateReq {
+            title: "orphan-candidate".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![a.id.to_string()],
+            blocked_by: vec![b.id.to_string()],
+            idempotency_key: None,
+        })
+        .expect("retry after refused resolve must not be poisoned");
+        let all = api.store.list_tasks().unwrap();
+        assert_eq!(all.len(), before + 1);
+        let child = all.iter().find(|t| t.title == "orphan-candidate").unwrap();
+        assert_eq!(api.store.task_dependencies(child.id).unwrap().len(), 2);
+    }
+
+    /// REQ-API-01: a refusal raised by the store's own write-shape checks
+    /// (duplicate ref WITHIN one request) also rolls the whole effect back.
+    #[test]
+    fn duplicate_ref_in_one_request_rolls_back_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let p = fresh_task(&api, "dup-parent");
+        let before = api.store.list_tasks().unwrap().len();
+        let e = api
+            .task_create(TaskCreateReq {
+                title: "dup-child".into(),
+                project_id: None,
+                description: String::new(),
+                parent: vec![],
+                blocked_by: vec![p.to_string(), p.to_string()],
+                idempotency_key: None,
+            })
+            .expect_err("duplicate edge is loud at write");
+        assert!(format!("{e}").contains("already exists"), "{e}");
+        assert_eq!(api.store.list_tasks().unwrap().len(), before);
+    }
+
+    /// REQ-API-02 / ratified OQ-1: a retry carrying the SAME idempotency
+    /// key returns the committed task and its edges — direct store reads
+    /// prove one task, one edge set. A keyless call keeps the
+    /// every-call-creates-a-task semantics; a DIFFERENT key creates.
+    #[test]
+    fn idempotency_key_retry_never_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let parent = fresh_task(&api, "idem-parent");
+        let req = |key: Option<&str>| TaskCreateReq {
+            title: "idem-child".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![parent.to_string()],
+            blocked_by: vec![],
+            idempotency_key: key.map(str::to_string),
+        };
+
+        let first = api.task_create(req(Some("retry-1"))).unwrap();
+        let again = api.task_create(req(Some("retry-1"))).unwrap();
+        assert_eq!(first.task.id, again.task.id, "same key = same task");
+        assert_eq!(again.linked.len(), 1, "and exactly its one parent edge");
+
+        let children = || {
+            api.store
+                .list_tasks()
+                .unwrap()
+                .iter()
+                .filter(|t| t.title == "idem-child")
+                .count()
+        };
+        assert_eq!(children(), 1, "direct read: no duplicate task");
+        assert_eq!(api.store.task_dependencies(first.task.id).unwrap().len(), 1);
+
+        // A different key is a different command — it creates.
+        let other = api.task_create(req(Some("retry-2"))).unwrap();
+        assert_ne!(other.task.id, first.task.id);
+        assert_eq!(children(), 2);
+        // No key at all: the plain per-call semantics stay.
+        api.task_create(req(None)).unwrap();
+        api.task_create(req(None)).unwrap();
+        assert_eq!(children(), 4);
     }
 
     /// REQ-MUT-05 AC3: the named operation and the `task_op` dispatch run

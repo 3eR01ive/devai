@@ -103,38 +103,34 @@ fn task_active_lifecycle_through_the_real_binary() {
     // Two tasks driven to DIFFERENT engine states: ANALYSIS and IMPLEMENTATION.
     let a = devai_json(h, &["task", "new", "Alpha active", "--description", ""]);
     let id_a = a["id"].as_str().unwrap().to_string();
-    let short_a = id_a[..12].to_string();
-    devai(h, &["task", "start", &short_a]); // DRAFT → ANALYSIS
-
-    // UUIDv7's leading bits are the creation timestamp; the 12-char display
-    // short therefore covers one 16ms bucket. Two tasks created back-to-back
-    // can share it, and the whole lifecycle below addresses tasks by that
-    // short — separate the creations past one bucket so shorts provably
-    // differ and prefix resolution stays deterministic.
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // REQ-E2E-01: the whole lifecycle below addresses tasks by the FULL
+    // uuid taken from --json output — the display short stays a live-operator
+    // convenience and is only ever compared through the canonical accessor
+    // (single width source, types.rs). The old sleep separating 12-char
+    // collision windows retired with the shortened handles (QA 01a1acab-18b1:
+    // UUIDv7 prefixes collide inside one millisecond window — full ids do
+    // not).
+    devai(h, &["task", "start", &id_a]); // DRAFT → ANALYSIS
     let b = devai_json(h, &["task", "new", "Beta active", "--description", ""]);
     let id_b = b["id"].as_str().unwrap().to_string();
-    let short_b = id_b[..12].to_string();
-    assert_ne!(
-        short_a, short_b,
-        "task display shorts must be distinct to drive the lifecycle"
-    );
-    devai(h, &["task", "start", &short_b]);
+    let display_a = devai_core::types::short_id_str(&id_a);
+    let display_b = devai_core::types::short_id_str(&id_b);
+    devai(h, &["task", "start", &id_b]);
     let spec = write(h, "spec.json", "{\"requirements\": []}");
     devai(
         h,
         &[
             "artifact",
             "publish",
-            &short_b,
+            &id_b,
             "--kind",
             "REQUIREMENTS_SPEC",
             "--file",
             &spec,
         ],
     );
-    devai(h, &["task", "review", &short_b, "--verdict", "approved"]);
-    devai(h, &["task", "approve", &short_b]); // → IMPLEMENTATION
+    devai(h, &["task", "review", &id_b, "--verdict", "approved"]);
+    devai(h, &["task", "approve", &id_b]); // → IMPLEMENTATION
 
     // REQ-ACT-01: one command, RUNNING rows across ALL tasks, no caller
     // filter. A is started first → larger elapsed → must lead the view
@@ -144,7 +140,7 @@ fn task_active_lifecycle_through_the_real_binary() {
         &[
             "exec",
             "start",
-            &short_a,
+            &id_a,
             "--role",
             "requirements-analyst",
             "--agent",
@@ -161,7 +157,7 @@ fn task_active_lifecycle_through_the_real_binary() {
         &[
             "exec",
             "start",
-            &short_b,
+            &id_b,
             "--role",
             "implementation-agent",
             "--agent",
@@ -192,11 +188,11 @@ fn task_active_lifecycle_through_the_real_binary() {
 
     let v = devai(h, &["task", "active"]);
     assert!(
-        v.contains(&short_a) && v.contains("requirements-analyst@") && v.contains("elapsed"),
+        v.contains(&display_a) && v.contains("requirements-analyst@") && v.contains("elapsed"),
         "alpha row present:\n{v}"
     );
     assert!(
-        v.contains(&short_b) && v.contains("implementation-agent@"),
+        v.contains(&display_b) && v.contains("implementation-agent@"),
         "beta row present:\n{v}"
     );
     // REQ-ACT-02/05: stage is the task's live engine state, per task.
@@ -234,7 +230,7 @@ fn task_active_lifecycle_through_the_real_binary() {
         "dead-owner orphan rows are marked:\n{v}"
     );
     // REQ-ACT-06 AC2: the row's task id is sufficient to drill down.
-    let p = devai(h, &["task", "progress", &short_b]);
+    let p = devai(h, &["task", "progress", &display_b]);
     assert!(
         p.contains("Beta active"),
         "short id from the active view resolves in progress:\n{p}"
@@ -334,8 +330,8 @@ fn task_active_lifecycle_through_the_real_binary() {
     // normal path afterwards.
     devai(h, &["exec", "finish", &exec_a, "--summary", "done"]);
     let v = devai(h, &["task", "active"]);
-    assert!(!v.contains(&short_a), "COMPLETED rows drop out (AC2): {v}");
-    assert!(v.contains(&short_b));
+    assert!(!v.contains(&display_a), "COMPLETED rows drop out (AC2): {v}");
+    assert!(v.contains(&display_b));
     let plain = devai(h, &["exec", "list"]);
     assert!(
         plain.contains("COMPLETED"),
@@ -397,7 +393,7 @@ fn task_active_lifecycle_through_the_real_binary() {
         &[
             "task",
             "cancel",
-            &short_b,
+            &id_b,
             "--reason",
             "human cancel with work in flight",
         ],
@@ -446,11 +442,10 @@ fn task_active_lifecycle_through_the_real_binary() {
     // the separate `owner?` triage mark and `owner_liveness: "unknown"`,
     // never `stale?`. Written straight through the store: the CLI paths
     // always stamp an owner (REQ-SW-03).
-    std::thread::sleep(std::time::Duration::from_millis(20));
     use devai_core::types::{ExecutionStatus, RoleExecution, new_id};
     let g = devai_json(h, &["task", "new", "Gamma ownerless", "--description", ""]);
     let id_g = g["id"].as_str().unwrap().to_string();
-    devai(h, &["task", "start", &id_g[..12].to_string()]);
+    devai(h, &["task", "start", &id_g]);
     {
         let store = Store::open(h).unwrap();
         store
