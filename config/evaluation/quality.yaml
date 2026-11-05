@@ -53,7 +53,30 @@
 # словарное правило в config/criteria/review.yaml (RV1–RV5) — отложены по
 # OQ-RAT-5 до явного решения человека; в этой таске не добавлены осознанно,
 # не молча.
-version: 10
+#
+# v11 (постановка оператора 2026-11-05, «подсунем нашу проверилку в качестве
+# основной»): корпус профиля заменён на абстрактный внешний набор
+# (docs/internal/criteria-generic-draft.yaml v0.2-abstract: читаемость,
+# поддерживаемость, надёжность+безопасность, производительность, тестируемость,
+# документация+архитектура) — его слоты {{...}} завязаны на команды devai, сам
+# абстрактный исходник остаётся в docs/internal как база без конкретики языка.
+# Из v10 сохранён блок platform-invariants с продуктовыми инвариантами и
+# tool-пробами: corr/transitions, corr/concurrency, corr/data-immutability,
+# ux/json-stability, log/dead-ends, log/completeness, arch/layer-boundaries,
+# arch/idiom-consistency, arch/no-magic, arch/sequence-as-data,
+# arch/registry-in-data, arch/principles (человеческий гейт подписи),
+# rel/error-context, corr/spec-fidelity (id и формулировка не менялись — к
+# ним привязаны APPROVED_DECISIONS промпта аудитора).
+# rel/no-panic заменён абстрактным rl/crash-free с РАСШИРЕННОЙ пробой (все
+# crate'ы, раньше grep не видел devai-cli — два unwrap'а в CLI жили незамеченными
+# до внешнего прогона 05.11). Новые проверки, принёсшие реальные находки на
+# первом же внешнем прогоне: cl/style-consistency (fmt-дрейф 939→1007 блоков),
+# da/run-docs (README отсутствовал), ux/contract-stability (mut-плоскость без
+# parity-пробы — закрыта циклом 2), mt/dry, rl/error-handling.
+# Иерархия тяжестей сохранена: продуктовые инварианты суммарно 0.62,
+# абстрактный корпус 0.38, сумма ровно 1.00 (V7).
+
+version: 11
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -79,18 +102,105 @@ error_types:
   architecture/registry-in-code:
     desc: "Перечислимый каталог предметной области (ступени миграций, имена/версии/пути файлов, карты ролей, наборы инцидентов-прецедентов) живёт const-таблицей в коде: цепочка типизована, но каждый новый доменный шаг требует правки кода; каталог должен быть декларативными данными, в коде — только generic исполнитель и загрузчик."
     severity: minor
+  clarity/naming:
+    desc: Имя не отражает назначение (x, tmp, data1, абстракция без контекста).
+    severity: minor
+  clarity/stale-comment:
+    desc: Комментарий устарел относительно кода или не несёт информации.
+    severity: minor
+  clarity/what-comment:
+    desc: Комментарий пересказывает «что» вместо «почему».
+    severity: minor
+  clarity/oversized-unit:
+    desc: Единица кода заметно длиннее порога разборности (40 строк тела).
+    severity: minor
+  clarity/deep-nesting:
+    desc: Пирамида условного потока, не читаемая без внешнего источника.
+    severity: minor
+  clarity/style-drift:
+    desc: Дрейф форматирования/линтеров дерева относительно принятого инструмента стиля.
+    severity: minor
+  maintainability/principle-violation:
+    desc: Нарушение принципа разделения ответственности/интерфейсов в форме данного стека.
+    severity: minor
+  maintainability/low-cohesion:
+    desc: В модуле живут несвязанные по смыслу сущности.
+    severity: minor
+  maintainability/dependency-inversion:
+    desc: Верхний слой зависит от конкретной реализации нижнего вопреки заявленной границе.
+    severity: major
+  maintainability/tight-coupling:
+    desc: Модуль знает детали другого модуля, не входящие в его контракт.
+    severity: minor
+  maintainability/duplication:
+    desc: Одна логика реализована в нескольких местах без общего источника.
+    severity: minor
+  maintainability/fragile-change:
+    desc: Добавление доменного варианта требует правок в нескольких несвязанных местах.
+    severity: minor
+  reliability/error-wash:
+    desc: Потеря контекста ошибки (глотание, stringly-typed, одинаковый текст на разных причинах).
+    severity: minor
   reliability/panic-path:
     desc: Паника достижима из library-кода на валидных, но редких данных.
     severity: major
+  reliability/unvalidated-input:
+    desc: Внешний ввод не проходит типизированную границу с fail-closed отказом.
+    severity: major
+  reliability/edge-case-failure:
+    desc: Пустое/нулевое/битое значение ведёт себя неверно или неоднозначно.
+    severity: major
+  reliability/non-idempotent:
+    desc: Повтор операции даёт нежелательные побочные эффекты.
+    severity: major
+  security/injection:
+    desc: Внешняя строка попадает в исполняемый канал (запрос/eval/shell) мимо параметризации.
+    severity: catastrophic
+  performance/algorithmic:
+    desc: Избыточная сложность обхода на непривязанном по размеру входе.
+    severity: minor
+  performance/io-churn:
+    desc: Попарный I/O там, где декларируемый масштаб требует пакетного.
+    severity: minor
+  performance/unbounded-growth:
+    desc: Неограниченный рост памяти/дескрипторов в долгоживущих процессах.
+    severity: minor
+  performance/parallelism-miss:
+    desc: Сериализация там, где параллелизм уместен и безопасен.
+    severity: minor
+  testability/global-state:
+    desc: Разделяемое изменяемое глобальное состояние мешает изоляции тестов.
+    severity: minor
+  testability/untestable-design:
+    desc: Нет шва подмены зависимости там, где изоляция теста разумна.
+    severity: minor
+  testability/coverage-gap:
+    desc: Новая ветка логики без теста, её накрывающего.
+    severity: minor
+  testability/order-dependent:
+    desc: Тест зависит от порядка/параллелизма выполнения набора.
+    severity: minor
+  ux/cli-contract-break:
+    desc: Сломан существующий флаг/формат вывода CLI без версионирования.
+    severity: major
+  ux/output-drift:
+    desc: Машиночитаемая поверхность ломает потребителя без версионирования или фиксации parity-тестом.
+    severity: major
+  documentation/architecture-drift:
+    desc: Код расходится с задекларированной архитектурой слоёв проекта.
+    severity: major
+  documentation/api-contract-missing:
+    desc: Публичная поверхность без явного контракта.
+    severity: minor
+  documentation/run-docs-stale:
+    desc: Нет или устарели инструкции запуска/сборки.
+    severity: minor
   correctness/spec-deviation:
     desc: Реализация отклоняется от утверждённой спеки — включая зафиксированные
       в approve-rationale решения открытых вопросов (выбранная поверхность CLI,
       форматы, границы объёма). Отступление без документированного человеческого
       решения = нарушение, даже если функционально "то же самое".
     severity: major
-  reliability/error-wash:
-    desc: Потеря контекста ошибки (глотание, stringly-typed, одинаковый текст на разных причинах).
-    severity: minor
   correctness/state-transition:
     desc: Поведение transition-функции расходится с workflow-спекой.
     severity: catastrophic
@@ -100,20 +210,14 @@ error_types:
   data/immutability-breach:
     desc: Удалено/изменено вместо append-only (события, артефакты).
     severity: catastrophic
-  ux/cli-contract-break:
-    desc: Сломан существующий флаг/формат вывода CLI без версионирования.
-    severity: major
-  process/untested-branch:
-    desc: Новая ветка логики без теста, её накрывающего.
-    severity: minor
-  process/no-evidence:
-    desc: Rubric-нарушение выставлено без обязательного evidence.
-    severity: minor
   logic/dead-end:
     desc: "Логический или циклический тупик: состоянию/пути некуда выйти, цикл возврата не ограничен, обработка ошибки возвращается в породившую её точку."
     severity: major
   logic/unhandled-case:
     desc: "Неполное ветвление: `_ =>` молча глотает доменные значения, достижимая ветка без семантики, unknown трактуется как успех."
+    severity: minor
+  process/no-evidence:
+    desc: Rubric-нарушение выставлено без обязательного evidence.
     severity: minor
 
 gates:
@@ -144,26 +248,337 @@ gates:
       - { cmd: "test -z \"$(grep -RIlE 'api[_-]?key|BEGIN.*PRIVATE KEY' crates config --exclude=quality.yaml 2>/dev/null)\"", pass_exit: [0] }
 
 evaluations:
-  - id: architecture
-    title: Архитектурная оценка
+  - id: readability
+    title: Читаемость и понятность
     checks:
-      - id: arch/idiom-consistency
-        statement: >
-          Каждый crate соблюдает свою идиому: core — чистые функции-трансформеры
-          (Task + данные -> Mutation), store — сериализация/SQL без бизнес-правил,
-          runtime — адаптеры/движок без решений об истории, cli — ввод/вывод без
-          решений о домене.
-        detects: [architecture/idiom-misuse, architecture/idiom-inapplicable]
+      - id: cl/meaningful-names
+        statement: Имена сущностей отражают назначение и читаются без пояснения.
+        detects: [clarity/naming]
         verify: rubric
         anchors:
-          "1.0": "все модули в своих идиомах"
-          "0.7": "единичные отклонения стиля, роль модуля ясна"
-          "0.4": "идиома нарушена системно, но локализовано"
-          "0.1": "идеома слоя подменена другой, читатель вводится в заблуждение"
-          "0.0": "границы как классы ответственности не соблюдаются"
+          "1.0": кандидатов нет
+          "0.7": единичные размытые имена на второстепенных путях
+          "0.4": размытые имена в доменной логике
+          "0.0": имена не несут смысла
+        evidence: required
+        reviewer: either
+      - id: cl/comments-explain-why
+        statement: Комментарии объясняют почему (инварианты, обоснования); пересказов кода и устаревших нет.
+        detects: [clarity/stale-comment, clarity/what-comment]
+        verify: rubric
+        anchors:
+          "1.0": все комментарии «почему»
+          "0.7": локальные пересказы кода
+          "0.4": устаревшие комментарии в горячих местах
+          "0.0": комментарии врут о коде
+        evidence: required
+        reviewer: either
+      - id: cl/short-units
+        statement: Единицы кода читаются целиком (порог 40 строк тела); вложенность управляющего потока ограничена.
+        detects: [clarity/oversized-unit, clarity/deep-nesting]
+        verify: hybrid
+        probes:
+          - { cmd: "python3 crates/devai-store/tools/fn_size.py | head -20", pass_exit: [0, 1] }
+        anchors:
+          "1.0": кандидатов нет или все с ролевым обоснованием (константные таблицы, данные)
+          "0.7": единичные длинные с обоснованием роли
+          "0.4": длинные несут доменную логику, есть пирамиды вложенности
+          "0.0": структура не читается
+        evidence: required
+        reviewer: either
+      - id: cl/style-consistency
+        statement: Дерево проходит cargo fmt без исключений-без-обоснования.
+        detects: [clarity/style-drift]
+        verify: mechanical
+        probes:
+          - { cmd: "cargo fmt --all -- --check", pass_exit: [0] }
         evidence: required
         reviewer: either
 
+  - id: maintainability
+    title: Поддерживаемость и расширяемость
+    checks:
+      - id: mt/single-responsibility
+        statement: Каждая единица отвечает одному из заявленных проектом ролей/уровней; элементы модуля связаны по смыслу.
+        detects: [maintainability/principle-violation, maintainability/low-cohesion]
+        verify: rubric
+        anchors:
+          "1.0": роли соблюдены
+          "0.7": единичная перегруженная единица-обёртка
+          "0.4": роль размывается системно
+          "0.0": god-модуль на всё
+        evidence: required
+        reviewer: either
+      - id: mt/dependency-direction
+        statement: Потребители зависят от граничного контракта (devai-api), а не от реализации (devai-store) напрямую.
+        detects: [maintainability/dependency-inversion, maintainability/tight-coupling]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -RnE 'devai_store::|Store::open|ctx\\.store' crates/devai-cli/src | grep -v '// '", pass_exit: [0, 1] }
+        anchors:
+          "1.0": обходов границы нет
+          "0.7": остаточные обращения ратифицированы как граница цикла
+          "0.4": нератифицированные обращения к реализации
+          "0.0": границы как класса ответственности нет
+        evidence: required
+        reviewer: either
+        suppression: "// eval-ignore: mt/dependency-direction — <обоснование>"
+      - id: mt/dry
+        statement: Общий смысл имеет один источник; параллельных копий одной семантики с расходящейся обработкой ошибок нет.
+        detects: [maintainability/duplication]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -Rn 'read_blob' crates/*/src/ | grep -v 'fn read_blob' | grep -v '///'", pass_exit: [0, 1] }
+        anchors:
+          "1.0": копий нет
+          "0.7": две-три локализованные копии с мелким дрейфом
+          "0.4": три и более несвязанных копии одной семантики
+          "0.0": логика размазана по дереву
+        evidence: required
+        reviewer: either
+      - id: mt/change-isolation
+        statement: Добавление доменного варианта — один явный источник правки; пропуск места не молчит (компилятор/тест/валидатор ловит).
+        detects: [maintainability/fragile-change]
+        verify: rubric
+        anchors:
+          "1.0": один источник
+          "0.7": два места со связанной проверкой
+          "0.4": три и более несвязанных места, пропуск молчалив
+          "0.0": места правки угадываются
+        evidence: required
+        reviewer: either
+
+  - id: reliability-security
+    title: Надёжность и безопасность
+    checks:
+      - id: rl/error-handling
+        statement: Ошибки не теряются; «нет данных» отличимо от «данные повреждены».
+        detects: [reliability/error-wash]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -Rn '\\.ok()?' crates/*/src/ | grep -v tests | grep -v '///'", pass_exit: [0, 1] }
+        anchors:
+          "1.0": глотания нет
+          "0.7": единичные обоснованные best-effort места
+          "0.4": повреждённые данные неотличимы от отсутствия
+          "0.0": ошибки теряются системно
+        evidence: required
+        reviewer: either
+      - id: rl/crash-free
+        statement: Аварийный выход library-кода на валидных редких данных отсутствует; исключения несут локальное "// invariant:"-обоснование.
+        detects: [reliability/panic-path]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -Rn '\\.unwrap()\\|\\.expect(' crates/devai-core/src crates/devai-store/src crates/devai-runtime/src crates/devai-api/src crates/devai-cli/src | grep -v '#\\[cfg(test)\\]' | head -30", pass_exit: [0, 1] }
+        anchors:
+          "1.0": все места обоснованы
+          "0.7": единицы без комментария, структурно недостижимы
+          "0.4": достижимый аварийный выход на редких данных
+          "0.0": аварийный выход как стратегия
+        evidence: required
+        reviewer: either
+      - id: rl/input-validation
+        statement: Внешний ввод проходит типизированную границу со словарём значений и fail-closed отказом на неизвестном.
+        detects: [reliability/unvalidated-input]
+        verify: rubric
+        anchors:
+          "1.0": все границы валидированы
+          "0.7": мелочи на внутреннем вводе
+          "0.4": невалидированный внешний путь
+          "0.0": ввод исполняется как есть
+        evidence: required
+        reviewer: either
+      - id: rl/edge-cases
+        statement: Пустое/нулевое/битое/экстремальное поведение различимо и корректно, покрыто явными ветками или тестами.
+        detects: [reliability/edge-case-failure]
+        verify: rubric
+        anchors:
+          "1.0": границы покрыты
+          "0.7": единичная неотличимая граница
+          "0.4": битый вход молча деградирует
+          "0.0": падение на пустом входе
+        evidence: required
+        reviewer: either
+      - id: rl/idempotency
+        statement: Повтор команды/события не имеет побочных эффектов; конфликт параллели защищён заявленным механизмом.
+        detects: [reliability/non-idempotent]
+        verify: rubric
+        anchors:
+          "1.0": повтор безопасен и проверен
+          "0.7": безопасен по конструкции, без теста
+          "0.4": повтор может удвоить эффект
+          "0.0": повтор ломает состояние
+        evidence: required
+        reviewer: either
+      - id: sec/injection
+        statement: SQL собирается только из констант схемы и привязанных параметров (?N); внешняя строка в текст запроса не попадает.
+        detects: [security/injection]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -Rn 'format!' crates/devai-store/src/ | grep -iE 'SELECT|INSERT|UPDATE|DELETE|WHERE'", pass_exit: [0, 1] }
+        anchors:
+          "1.0": кандидатов нет, либо только константы схемы при ?N-привязке
+          "0.4": спорная сборка запроса
+          "0.0": внешняя строка в исполняемом канале
+        evidence: required
+        reviewer: either
+
+  - id: performance
+    title: Производительность
+    checks:
+      - id: pf/algorithmic
+        statement: Нет сверхлинейного обхода структур, растущих без верхней границы.
+        detects: [performance/algorithmic]
+        verify: rubric
+        anchors:
+          "1.0": линейно/логарифмически
+          "0.7": квадратично только на заведомо малых множествах с явной оценкой
+          "0.4": квадратично на растущем входе
+          "0.0": взрывная сложность
+        evidence: required
+        reviewer: either
+      - id: pf/io-churn
+        statement: I/O к внешним хранилищам пакетный там, где масштаб проекта это оправдывает.
+        detects: [performance/io-churn]
+        verify: rubric
+        anchors:
+          "1.0": churn нет
+          "0.7": поштучное на малых масштабах
+          "0.4": N+1 на растущем входе
+          "0.0": деградация прямо от объёма
+        evidence: required
+        reviewer: either
+      - id: pf/resource-growth
+        statement: Долгоживущие процессы имеют явные именованные ограничители роста.
+        detects: [performance/unbounded-growth]
+        verify: mechanical
+        probes:
+          - { cmd: "grep -Rn 'max_steps\\|DEFAULT_MAX_STEPS' crates/devai-runtime/src/engine.rs", pass_exit: [0] }
+        evidence: required
+        reviewer: either
+      - id: pf/hot-path-measure
+        statement: Утверждения о производительности опираются на измерения (bench), не на глаз.
+        detects: [performance/algorithmic]
+        verify: mechanical
+        probes:
+          # guard-бинарь заведомо отсутствует: отсутствие bench-тулинга = BLOCKED
+          # (невыполненная проба, печатается в gaps), а не fake-FAIL и не fake-PASS.
+          - { cmd: "ls -d crates/*/benches 2>/dev/null | grep . || bench-targets-absent-guard", pass_exit: [0] }
+        evidence: optional
+        reviewer: either
+      - id: pf/parallelism
+        statement: Параллелизм применяется где уместно; сериализация только по заявленным причинам (single-writer guard — заявленная причина).
+        detects: [performance/parallelism-miss]
+        verify: rubric
+        anchors:
+          "1.0": обоснованно
+          "0.7": известные потери низкого приоритета
+          "0.4": сериализация без обоснования
+          "0.0": параллельные данные блокируют друг друга
+        evidence: required
+        reviewer: either
+
+  - id: testability
+    title: Тестируемость
+    checks:
+      - id: ts/global-state
+        statement: Разделяемого изменяемого глобального состояния в исполняемом коде нет.
+        detects: [testability/global-state]
+        verify: mechanical
+        probes:
+          - { cmd: "test -z \"$(grep -Rn 'static mut\\|thread_local!\\|lazy_static' crates/*/src/)\"", pass_exit: [0] }
+        evidence: required
+        reviewer: either
+      - id: ts/di-seams
+        statement: Внешние зависимости входят параметром (Store/Adapter/home/actor); тест собирает систему с контролируемыми экземплярами.
+        detects: [testability/untestable-design]
+        verify: rubric
+        anchors:
+          "1.0": швы везде, тесты пользуются
+          "0.7": швы через реальные tmp-инстансы вместо моков — осознанный выбор
+          "0.4": часть путей тестируется только через реальные внешние процессы
+          "0.0": зависимость не подменить
+        evidence: required
+        reviewer: either
+      - id: ts/coverage-static
+        statement: Ключевая логика и взаимодействия модулей накрыты тестами; метрика покрытия не измеряется (llvm-cov запрещён политикой), плотность статическая.
+        detects: [testability/coverage-gap]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -Rc '#\\[test\\]' crates/*/src/*.rs crates/*/tests/*.rs 2>/dev/null | awk -F: '{s+=$2} END{print s}'", pass_exit: [0] }
+        anchors:
+          "1.0": новое и гейты с parity-тестами на настоящем бинаре
+          "0.7": плотность высокая, отдельные render-ветки без тестов
+          "0.4": доменная ветка без теста
+          "0.0": тестов нет
+        evidence: required
+        reviewer: either
+      - id: ts/test-independence
+        statement: Тесты не зависят от порядка и не мутируют окружение процесса (set_var); e2e резолвят сущности полными id.
+        detects: [testability/order-dependent]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -Rn 'set_var' crates/*/src/ crates/*/tests/ 2>/dev/null", pass_exit: [0, 1] }
+        anchors:
+          "1.0": независимость доказана структурой (tmp-сторы, полные id)
+          "0.7": есть зацепки порядка без задокументированного механизма
+          "0.4": тесты делят состояние по умолчанию
+          "0.0": набор зелёный только в одном порядке
+        evidence: required
+        reviewer: either
+
+  - id: documentation-architecture
+    title: Документация и архитектура
+    checks:
+      - id: da/architecture-consistency
+        statement: Код соответствует задекларированной архитектуре (cli→api→store→core, правила только в core); оркестрация переходов не живёт в слое вывода.
+        detects: [documentation/architecture-drift]
+        verify: rubric
+        anchors:
+          "1.0": соответствует
+          "0.7": единичная оркестрация не на своём месте, ратифицированно
+          "0.4": расхождение системное
+          "0.0": архитектура только на бумаге
+        evidence: required
+        reviewer: either
+      - id: da/api-contract
+        statement: Публичная поверхность типизирована (Req/Outcome/ErrorCode с машинокодами) и описана в реестре операций; версия контракта объявлена.
+        detects: [documentation/api-contract-missing]
+        verify: rubric
+        anchors:
+          "1.0": контракт + реестр + машинокоды
+          "0.7": контракт есть, версионирование неполное
+          "0.4": утки и stringly-выходы
+          "0.0": контракт это сам код
+        evidence: required
+        reviewer: either
+      - id: da/run-docs
+        statement: README/инструкции сборки-запуска существуют и точны.
+        detects: [documentation/run-docs-stale]
+        verify: mechanical
+        probes:
+          - { cmd: "test -f README.md && grep -q 'cargo build' README.md", pass_exit: [0] }
+        evidence: required
+        reviewer: either
+      - id: ux/contract-stability
+        statement: Машиночитаемая поверхность обратно совместна для существующего потребителя либо слом явно версионирован; parity-тесты фиксируют тексты оператора.
+        detects: [ux/output-drift]
+        verify: hybrid
+        probes:
+          - { cmd: "ls docs/cli-snapshot* >/dev/null 2>&1; grep -Rln 'parity' crates/devai-cli/tests/ >/dev/null 2>&1", pass_exit: [0] }
+        anchors:
+          "1.0": совместность зафиксирована тестами на обе плоскости
+          "0.7": фиксирующая проба не на все поверхности
+          "0.4": молчаливый ломающий дрейф
+          "0.0": потребители падают
+        evidence: required
+        reviewer: either
+
+  - id: platform-invariants
+    title: Продуктовые инварианты платформы
+    applies_to:
+      paths: ["crates/**"]
+    checks:
       - id: arch/layer-boundaries
         statement: >
           Зависимости идут только cli -> runtime -> store -> core; core не знает
@@ -181,6 +596,23 @@ evaluations:
         evidence: required
         reviewer: either
         suppression: "// eval-ignore: arch/layer-boundaries — <обоснование>"
+
+      - id: arch/idiom-consistency
+        statement: >
+          Каждый crate соблюдает свою идиому: core — чистые функции-трансформеры
+          (Task + данные -> Mutation), store — сериализация/SQL без бизнес-правил,
+          runtime — адаптеры/движок без решений об истории, cli — ввод/вывод без
+          решений о домене.
+        detects: [architecture/idiom-misuse, architecture/idiom-inapplicable]
+        verify: rubric
+        anchors:
+          "1.0": "все модули в своих идиомах"
+          "0.7": "единичные отклонения стиля, роль модуля ясна"
+          "0.4": "идиома нарушена системно, но локализовано"
+          "0.1": "идеома слоя подменена другой, читатель вводится в заблуждение"
+          "0.0": "границы как классы ответственности не соблюдаются"
+        evidence: required
+        reviewer: either
 
       - id: arch/no-magic
         statement: >
@@ -268,24 +700,6 @@ evaluations:
         evidence: required
         reviewer: human
 
-  - id: reliability
-    title: Надёжность и ошибки
-    checks:
-      - id: rel/no-panic
-        statement: Library-код (core/store) не паникует на валидных данных; unwrap/expect допустимы только на инвариантах с комментарием "// invariant:".
-        detects: [reliability/panic-path]
-        verify: hybrid
-        probes:
-          - { cmd: "grep -RIn '\\.unwrap()\\|\\.expect(' crates/devai-core/src crates/devai-store/src crates/devai-runtime/src", pass_exit: [0, 1] }
-        anchors:
-          "1.0": "ноль неквалифицированных"
-          "0.7": "недостижимые ветки без invariant-комментария"
-          "0.4": "есть, но на физически невозможных ветвях с комментарием"
-          "0.1": "достижимая panic-тропа на валидных данных"
-          "0.0": "unwrap в основном потоке ошибок"
-        evidence: required
-        reviewer: either
-
       - id: rel/error-context
         statement: Все ошибки типизированы thiserror и несут контекст; нет String-ошибок на границах; .ok().flatten() не прячет реальный сбой загрузки.
         detects: [reliability/error-wash]
@@ -295,6 +709,41 @@ evaluations:
           "0.4": "один потерянный контекст"
           "0.1": "ошибка глотается/превращается в generic"
           "0.0": "систематически"
+        evidence: required
+        reviewer: either
+
+      - id: log/dead-ends
+        statement: >
+          Из каждого не-терминального состояния/пути есть выход; циклы переходов
+          (QA -> REWORK -> QA, retry-петли) ограничены явного (max_steps, счётчик,
+          явный выход из loop); обработка ошибки не возвращает управление в
+          породившую её точку бесконечно; у каждого loop/while — достижимый
+          условие выхода, а не только break «на всякий случай».
+        detects: [logic/dead-end]
+        verify: hybrid
+        probes:
+          - { cmd: "grep -RInE 'loop \\{|while true' crates/*/src", pass_exit: [0, 1] }
+        anchors:
+          "1.0": "кандидаты проверены: все циклы/циклы переходов ограничены или терминальны по замыслу"
+          "0.7": "ограниченность не эксплицирована, но выход очевиден из структуры кода"
+          "0.4": "потенциальный цикл ре-входа без явного выхода"
+          "0.0": "достижимый тупик: состояние/путь без выхода или неограниченный возврат"
+        evidence: required
+        reviewer: either
+
+      - id: log/completeness
+        statement: >
+          Ветвление полное: каждый match по enum/доменной лексике покрыт явными
+          ветками; `_ =>` допустим только fail-closed с обоснованием (не «тихое
+          swallow»); вердикт-функции и валидаторы покрывают все значения своих
+          словарей; unknown не трактуется как успех/пропуск.
+        detects: [logic/unhandled-case]
+        verify: rubric
+        anchors:
+          "1.0": "все ветки явные, catch-all'ов нет или каждый обоснован"
+          "0.7": "1–2 fail-closed catch-all с ясной семантикой"
+          "0.4": "catch-all молча глотает доменное значение"
+          "0.0": "отсутствующая ветка достижима на валидных данных"
         evidence: required
         reviewer: either
 
@@ -357,57 +806,6 @@ evaluations:
         evidence: required
         reviewer: either
 
-  - id: ux
-    title: CLI-контракт и пользовательский опыт
-    applies_to:
-      paths: ["crates/devai-cli/**"]
-    checks:
-      - id: ux/json-stability
-        statement: --json вывод парсится; help описывает флаги подкоманд; существующие флаги не сломаны.
-        detects: [ux/cli-contract-break]
-        verify: mechanical
-        probes:
-          - { cmd: "./target/debug/devai task --help >/dev/null", pass_exit: [0] }
-        reviewer: tool
-
-  - id: logic
-    title: Логическая полнота и тупики
-    checks:
-      - id: log/dead-ends
-        statement: >
-          Из каждого не-терминального состояния/пути есть выход; циклы переходов
-          (QA -> REWORK -> QA, retry-петли) ограничены явного (max_steps, счётчик,
-          явный выход из loop); обработка ошибки не возвращает управление в
-          породившую её точку бесконечно; у каждого loop/while — достижимый
-          условие выхода, а не только break «на всякий случай».
-        detects: [logic/dead-end]
-        verify: hybrid
-        probes:
-          - { cmd: "grep -RInE 'loop \\{|while true|break|return' crates/*/src", pass_exit: [0, 1] }
-        anchors:
-          "1.0": "кандидаты проверены: все циклы/циклы переходов ограничены или терминальны по замыслу"
-          "0.7": "ограниченность не эксплицирована, но выход очевиден из структуры кода"
-          "0.4": "потенциальный цикл ре-входа без явного выхода"
-          "0.0": "достижимый тупик: состояние/путь без выхода или неограниченный возврат"
-        evidence: required
-        reviewer: either
-
-      - id: log/completeness
-        statement: >
-          Ветвление полное: каждый match по enum/доменной лексике покрыт явными
-          ветками; `_ =>` допустим только fail-closed с обоснованием (не «тихое
-          swallow»); вердикт-функции и валидаторы покрывают все значения своих
-          словарей; unknown не трактуется как успех/пропуск.
-        detects: [logic/unhandled-case]
-        verify: rubric
-        anchors:
-          "1.0": "все ветки явные, catch-all'ов нет или каждый обоснован"
-          "0.7": "1–2 fail-closed catch-all с ясной семантикой"
-          "0.4": "catch-all молча глотает доменное значение"
-          "0.0": "отсутствующая ветка достижима на валидных данных"
-        evidence: required
-        reviewer: either
-
 # proc/evidence-completeness (meta-проверка веса 0.0) исполняется не shell-пробой,
 # а платформой при сборке отчёта: rubric/hybrid-оценка < 1.0 без evidence
 # превращается в BLOCKED (gap), а не в балл. process/no-evidence остаётся в
@@ -423,26 +821,51 @@ scoring:
   blocked_policy:
     max_blocked_weight: 0.20
   weights:
-    # v2: сумма 1.00 покрывает ровно 13 проверок; место уступили новому
-    # семейству logic (0.10 + 0.06) — лёгкое смещение, иерархия смыслов та же.
-    # v5: +arch/registry-in-data 0.04 (инцидент 2026-11-02: миграционные имена
-    # const-таблицей в store/lib.rs); снято по 0.01 с четырёх тяжеловесов,
-    # иерархия весов не нарушена.
-    # v6: proc/diff-coverage УДАЛЁН по требованию пользователя (2026-11-03):
-    # cargo llvm-cov запускает массовый перекомпилятор, который вешает машину
-    # через OOM. Освободившийся 0.08 распределён по тяжёлым проверкам.
-    corr/transitions: 0.10
-    corr/data-immutability: 0.10
-    corr/concurrency: 0.08
-    corr/spec-fidelity: 0.05
-    arch/layer-boundaries: 0.11
-    arch/idiom-consistency: 0.04
-    arch/sequence-as-data: 0.04
-    arch/registry-in-data: 0.04
-    arch/principles: 0.07
+    # v11: абстрактный корпус 0.38 (readability/maintainability/reliability-
+    # security/performance/testability/documentation-architecture) + продуктовый
+    # блок platform-invariants/correctness 0.62. Иерархия тяжестей v10 сохранена
+    # (transitions/immutability/layer-boundaries/spec-fidelity — самые
+    # дорогие), hygiene-слой получил доли, снятые пропорционально. Сумма 1.00 (V7).
+    cl/meaningful-names: 0.01
+    cl/comments-explain-why: 0.01
+    cl/short-units: 0.02
+    cl/style-consistency: 0.02
+    mt/single-responsibility: 0.02
+    mt/dependency-direction: 0.02
+    mt/dry: 0.02
+    mt/change-isolation: 0.02
+    rl/error-handling: 0.02
+    rl/crash-free: 0.03
+    rl/input-validation: 0.02
+    # edge-cases/idempotency по 0.01: их существо частично дублируют тяжёлые
+    # log/completeness (необработанные ветки) и tool-проба corr/concurrency
+    # (идемпотентность событий) — hygiene-слой не перетягивает иерархию.
+    rl/edge-cases: 0.01
+    rl/idempotency: 0.01
+    sec/injection: 0.02
+    pf/algorithmic: 0.01
+    pf/io-churn: 0.01
+    pf/resource-growth: 0.01
+    pf/hot-path-measure: 0.01
+    pf/parallelism: 0.01
+    ts/global-state: 0.01
+    ts/di-seams: 0.01
+    ts/coverage-static: 0.02
+    ts/test-independence: 0.02
+    da/architecture-consistency: 0.02
+    da/api-contract: 0.02
+    da/run-docs: 0.01
+    ux/contract-stability: 0.02
+    arch/layer-boundaries: 0.08
+    arch/idiom-consistency: 0.03
     arch/no-magic: 0.02
-    rel/no-panic: 0.09
-    rel/error-context: 0.06
-    ux/json-stability: 0.06
-    log/dead-ends: 0.10
-    log/completeness: 0.04
+    arch/sequence-as-data: 0.03
+    arch/registry-in-data: 0.03
+    arch/principles: 0.04
+    rel/error-context: 0.04
+    log/dead-ends: 0.05
+    log/completeness: 0.03
+    corr/transitions: 0.07
+    corr/concurrency: 0.05
+    corr/data-immutability: 0.06
+    corr/spec-fidelity: 0.04
