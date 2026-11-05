@@ -275,8 +275,8 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
     );
     assert_eq!(
         impl_a["contract"]["version"].as_i64(),
-        Some(2),
-        "report published under implementation-report@2: {impl_a}"
+        Some(3),
+        "report published under implementation-report@3: {impl_a}"
     );
 
     // REQ-004 + no-drift: the @4 report embeds the exact revision of its execution row.

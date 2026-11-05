@@ -83,6 +83,10 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         "workflow/rework-context.yaml",
         include_str!("../../../config/workflow/rework-context.yaml"),
     ),
+    (
+        "workflow/humanize.yaml",
+        include_str!("../../../config/workflow/humanize.yaml"),
+    ),
 ];
 
 fn cfg_err(msg: impl Into<String>) -> StoreError {
@@ -1384,9 +1388,225 @@ pub fn load_response_form_policy(dir: &Path) -> StoreResult<ResponseFormPolicy> 
 }
 
 // ---------------------------------------------------------------------------
-// REWORK CONTEXT delivery policy (R-001..R-007) — platform workflow data.
+// Humanization template of role artifacts (task 01a1acfe, REQ-HP-04) —
+// platform protocol data.
 // ---------------------------------------------------------------------------
 
+/// One declared explanation slot of the human paragraph (REQ-HP-03: the
+/// paragraph is not «empty chatter» only when every slot is filled — a slot
+/// is filled when ANY of its marker phrases appears in the paragraph,
+/// case-insensitive substring, deterministic).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HumanizeSlot {
+    pub name: String,
+    pub markers: Vec<String>,
+}
+
+/// Declarative humanization template of the role-borne artifacts (REQ-HP-04):
+/// register, language, min/max volume, required explanation structure and
+/// the edibility-detector thresholds live in `config/workflow/humanize.yaml`
+/// (the `humanize:` section) — project-tunable data, never code literals.
+/// The mechanical detector (`devai_runtime::humanize`) reads this policy on
+/// every publication path; the factory `Default` is the embedded file's
+/// meaning verbatim, so a home without the file behaves exactly like one
+/// that has it at defaults (the `ResponseFormPolicy` idiom).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct HumanizePolicy {
+    /// Ratified OQ-HP-6: the field name fixed by the spec — declared as a
+    /// required top-level field in the role-borne contract schemas; the
+    /// detector fires only on contracts whose schema requires this field.
+    pub field: String,
+    /// Ratified OQ-HP-3: fallback language for statements with no expressed
+    /// language (the paragraph otherwise follows the business description).
+    /// Feeds the prompt template — the gate is language-independent.
+    pub language: String,
+    pub min_chars: usize,
+    pub max_chars: usize,
+    /// «Restatement of formalism» threshold: the fraction of the paragraph's
+    /// word n-grams already present in the artifact's formal body.
+    pub overlap_max_ratio: f64,
+    pub ngram: usize,
+    /// Body fields excluded from the overlap corpus (human echo prose is
+    /// not the formal structure the paragraph must not restate).
+    pub overlap_ignore: Vec<String>,
+    /// Register: literal markers of the formal protocol a plain-words
+    /// paragraph must not carry (case-insensitive substrings).
+    pub forbidden_markers: Vec<String>,
+    /// Required explanation structure (what happens / what will change).
+    pub slots: Vec<HumanizeSlot>,
+}
+
+impl Default for HumanizePolicy {
+    /// The factory bytes (`config/workflow/humanize.yaml`) are the fallback:
+    /// presence, min/max are hard, overlap fires only on blatant
+    /// copy-retelling — the conservative calibration stance of the review.
+    fn default() -> Self {
+        HumanizePolicy {
+            field: default_humanize_field(),
+            language: default_humanize_language(),
+            min_chars: default_humanize_min(),
+            max_chars: default_humanize_max(),
+            overlap_max_ratio: default_humanize_overlap(),
+            ngram: default_humanize_ngram(),
+            overlap_ignore: vec!["business_description".into()],
+            forbidden_markers: vec![
+                "REQ-".into(),
+                "OQ-".into(),
+                "ASM-".into(),
+                "acceptance_criteria".into(),
+            ],
+            slots: default_humanize_slots(),
+        }
+    }
+}
+
+fn default_humanize_field() -> String {
+    "human_paragraph".into()
+}
+fn default_humanize_language() -> String {
+    "ru".into()
+}
+fn default_humanize_min() -> usize {
+    200
+}
+fn default_humanize_max() -> usize {
+    1200
+}
+fn default_humanize_overlap() -> f64 {
+    0.6
+}
+fn default_humanize_ngram() -> usize {
+    3
+}
+fn default_humanize_slots() -> Vec<HumanizeSlot> {
+    vec![
+        HumanizeSlot {
+            name: "что происходит".into(),
+            markers: [
+                "сейчас",
+                "сегодня",
+                "раньше",
+                "ранее",
+                "до сих пор",
+                "происходит",
+                "работает",
+                "работало",
+                "было",
+                "now",
+                "currently",
+                "today",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        },
+        HumanizeSlot {
+            name: "что изменится".into(),
+            markers: [
+                "изменится",
+                "изменят",
+                "изменит",
+                "будет",
+                "станут",
+                "станет",
+                "добавит",
+                "появится",
+                "теперь",
+                "начнёт",
+                "начнут",
+                "чинит",
+                "заменит",
+                "после",
+                "will",
+                "becomes",
+                "adds",
+                "now checks",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        },
+    ]
+}
+
+impl HumanizePolicy {
+    /// Bounds are checked LOUD at load: an inverted min/max or a ratio
+    /// outside (0,1] would silently reject (or never reject) every
+    /// paragraph — the operator gets the file, the key and the meaning.
+    fn validate(&self, where_: &str) -> StoreResult<()> {
+        if self.field.trim().is_empty() {
+            return Err(cfg_err(format!(
+                "{where_}: humanize.field must name the paragraph field (ratified OQ-HP-6: `human_paragraph`)"
+            )));
+        }
+        if self.min_chars > self.max_chars {
+            return Err(cfg_err(format!(
+                "{}: humanize.min_chars ({}) must not exceed humanize.max_chars ({}) — the volume window is empty",
+                where_, self.min_chars, self.max_chars
+            )));
+        }
+        if !(self.overlap_max_ratio > 0.0 && self.overlap_max_ratio <= 1.0) {
+            return Err(cfg_err(format!(
+                "{}: humanize.overlap_max_ratio must be in (0, 1] (got {}) — the fraction of paragraph n-grams allowed to repeat the formal body",
+                where_, self.overlap_max_ratio
+            )));
+        }
+        if self.ngram == 0 {
+            return Err(cfg_err(format!(
+                "{where_}: humanize.ngram must be >= 1 (word n-gram size of the overlap detector)"
+            )));
+        }
+        for s in &self.slots {
+            if s.name.trim().is_empty() {
+                return Err(cfg_err(format!(
+                    "{where_}: humanize.slots entry has an empty `name` — a slot must be declared to be checked"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Merge-scan `workflow/*.yaml` for the `humanize:` key, exactly the
+/// `load_response_form_policy` idiom: files without the section are inert,
+/// the LAST declared section wins, a malformed declaration or a typo'd key
+/// is a LOUD config error naming the file (REQ-HP-04 AC2 — never a
+/// default-silence). An absent directory/file returns the factory defaults.
+pub fn load_humanize_policy(dir: &Path) -> StoreResult<HumanizePolicy> {
+    let mut policy = HumanizePolicy::default();
+    if !dir.is_dir() {
+        return Ok(policy);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    for p in &paths {
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if let Some(section) = doc.get("humanize") {
+            // deny_unknown_fields: a typo'd key names itself here.
+            policy = serde_yaml::from_value::<HumanizePolicy>(section.clone()).map_err(|e| {
+                cfg_err(format!(
+                    "{}: humanize section is invalid (keys: field, language, min_chars, max_chars, overlap_max_ratio, ngram, overlap_ignore, forbidden_markers, slots): {e}",
+                    p.display()
+                ))
+            })?;
+            policy.validate(&p.display().to_string())?;
+        }
+    }
+    Ok(policy)
+}
+
+// ---------------------------------------------------------------------------
+// REWORK CONTEXT delivery policy (R-001..R-007) — platform workflow data.
+// ---------------------------------------------------------------------------
 fn default_verdict_field() -> String {
     "verdict".into()
 }

@@ -1510,7 +1510,9 @@ fn writing_stage_is_isolated_in_platform_worktree() {
 
     // REQ-WT-04: the published report names branch+worktree+commit STAMPED
     // by the platform — the agent's own claims are overwritten with ground
-    // truth and the stamped body must pass implementation-report@2 again.
+    // truth and the stamped body must pass implementation-report@3 again
+    // (the @3 half of task 01a1acfe: the human paragraph rides the stamp
+    // unchanged — REQ-HP-07, the re-validation is the FULL gate).
     let arts = store.artifacts(t.id).unwrap();
     let impl_a = arts
         .iter()
@@ -1521,13 +1523,21 @@ fn writing_stage_is_isolated_in_platform_worktree() {
             .contract
             .as_ref()
             .map(|c| (c.name.as_str(), c.version)),
-        Some(("implementation-report", 2)),
-        "the role's declared @2 contract is what got published"
+        Some(("implementation-report", 3)),
+        "the role's declared @3 contract is what got published"
     );
     let body: serde_json::Value =
         serde_json::from_slice(&store.read_blob(&impl_a.sha256).unwrap()).unwrap();
     assert_eq!(body["branch"], branch);
     assert_eq!(body["worktree"], wt.display().to_string());
+    // REQ-HP-01/07: the paragraph the role wrote is stored and survives the
+    // platform stamp verbatim.
+    assert!(
+        body["human_paragraph"]
+            .as_str()
+            .is_some_and(|p| !p.trim().is_empty()),
+        "the stamped @3 body keeps the human paragraph"
+    );
     // The mock changed nothing: the commit that captures the work is the
     // tip that already equals it — no empty commit is faked (REQ-WT-04 AC3).
     assert_eq!(

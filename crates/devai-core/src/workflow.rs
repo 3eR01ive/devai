@@ -763,6 +763,12 @@ pub fn escalate_form_rejection(
         .iter()
         .map(|v| format!("\n  - {v}"))
         .collect::<String>();
+    // Ratified OQ-HP-5: the escalation is the MOST human place in the loop —
+    // it must carry a plain-words retelling of WHY the platform refused, not
+    // only the formal violation paths. Deterministic template over the
+    // machine list (no model): the shape of the failure is classified from
+    // the violation texts themselves, which are platform-owned literals.
+    let retelling = form_escalation_retelling(role_slug, attempts, violations);
     let mut m = transition(
         task,
         TaskState::WaitingForInput,
@@ -790,7 +796,7 @@ pub fn escalate_form_rejection(
     m.questions.push(QuestionDraft {
         id: question_id,
         text: format!(
-            "Role `{role_slug}` failed its reply-shape contract gate on ALL {attempts} attempt(s) of the response-form correction loop — the task is parked, nothing was published. Full violation list of the last attempt:{bullet_list}\n\nFix the FORM source (the stored contract, the role prompt, or `config/workflow/response-form-loop.yaml`) and answer this question, then re-run `devai task run`: the remembered stage replays from the answer. This is protocol noise, not a content judgement — do NOT count it as the role failing its task.",
+            "{retelling}\nRole `{role_slug}` failed its reply-shape contract gate on ALL {attempts} attempt(s) of the response-form correction loop — the task is parked, nothing was published. Full violation list of the last attempt:{bullet_list}\n\nFix the FORM source (the stored contract, the role prompt, or `config/workflow/response-form-loop.yaml`) and answer this question, then re-run `devai task run`: the remembered stage replays from the answer. This is protocol noise, not a content judgement — do NOT count it as the role failing its task.",
         ),
         context: Some(format!("gate=response-form-loop role={role_slug} attempts={attempts}")),
         options: vec![
@@ -800,6 +806,74 @@ pub fn escalate_form_rejection(
         blocking: true,
     });
     Ok(m)
+}
+
+/// The human retelling of a form exhaustion (ratified OQ-HP-5): simple
+/// words, what happened and what changes, BEFORE the formal violation list.
+/// Deterministic by construction — categories are classified from the
+/// platform's OWN violation literals (adapters/humanize texts), never from
+/// a model and never from free-form role output. The bullet list stays
+/// below: the paragraph adds the readable half, it hides no machine fact.
+fn form_escalation_retelling(role_slug: &str, attempts: u32, violations: &[String]) -> String {
+    let mut missing: Vec<&str> = Vec::new();
+    let mut paragraph = false;
+    let mut mistyped = false;
+    let mut not_json = false;
+    for v in violations {
+        if let Some(path) = v
+            .strip_prefix("$.")
+            .and_then(|s| s.strip_suffix(": missing required key"))
+        {
+            missing.push(path);
+        } else if v.starts_with("$.")
+            && (v.contains("paragraph is")
+                || v.contains("explanation slot")
+                || v.contains("repeat the formal body")
+                || v.contains("formal-protocol marker"))
+        {
+            paragraph = true;
+        } else if v.contains("expected object, got")
+            || v.contains("expected string, got")
+            || v.contains("expected array, got")
+            || v.contains("expected integer, got")
+            || v.contains("expected number, got")
+            || v.contains("not in enum")
+            || v.contains(", minimum")
+        {
+            // A declared field carries the wrong shape (type/enum/cardinality).
+            mistyped = true;
+        } else {
+            // The whole-reply literals of the gate: not JSON at all, or
+            // JSON but not one object (OQ-FG-02).
+            not_json = true;
+        }
+    }
+    let mut causes: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        causes.push(format!(
+            "в ответе не было обязательных полей ({})",
+            missing.join(", ")
+        ));
+    }
+    if paragraph {
+        causes.push(
+            "человеческий абзац не прошёл проверку читаемости (пустая болтовня или пересказ формализма)"
+                .into(),
+        );
+    }
+    if mistyped {
+        causes.push("часть полей была заполнена не того типа или вне разрешённых значений".into());
+    }
+    if not_json {
+        causes.push("ответ вообще не читался как один JSON-объект".into());
+    }
+    if causes.is_empty() {
+        causes.push("форма ответа не совпала с хранящимся контрактом".into());
+    }
+    format!(
+        "Простыми словами: роль «{role_slug}» {attempts} раз подряд не смогла отдать ответ нужной формы — платформа не сохранила ни одного артефакта и ждёт твоего решения. Отклонена ФОРМА ответа, а не содержание: {}. Полный список формальных причин — ниже. Что изменится после твоего ответа: та же стадия будет сыграна заново с учётом ответа; чинить нужно источник формы (хранящийся контракт, промпт роли или config/workflow) — не работу роли по существу.",
+        causes.join("; ")
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -93,3 +93,57 @@ engine (commands.rs `publish_raw`): violations are printed one `warning:`
 line each — the complete list — and the publish is REJECTED. The contract is
 authority regardless of the publication path; choosing the CLI is not a way
 around the gate.
+
+## The human paragraph gate (task 01a1acfe, REQ-HP-01..09)
+
+Every role-borne artifact a human reads at a gate must carry a plain-words
+paragraph, and the platform enforces it mechanically — the same "не
+уговорами" discipline as the verdict fields.
+
+* **Field** — ratified OQ-HP-6: required top-level `human_paragraph` in
+  `requirements-specification@3`, `review-report@2` and
+  `implementation-report@3` (OQ-HP-1: four artifacts, acceptance included;
+  the `quality-report` paragraph slot is its existing required
+  `report_text` — no duplicate field). Contracts bump insert-only; old
+  versions stay enforced for what was published under them (REQ-HP-06,
+  non-retroactive).
+* **Gate** — one gate on every publication path: presence is the schema's
+  `required` (engine loop → `response_form` + re-prompt; manual publish →
+  `warning:` lines + refusal, no re-prompt there). Edibility is the
+  deterministic detector inside `devai_runtime::artifact_violations`
+  (crates/devai-runtime/src/humanize.rs): volume window, explanation slots
+  («что происходит» / «что изменится»), formal-protocol markers and the
+  n-gram overlap of the paragraph with the artifact's own formal body.
+  No provider call is on the gate path at all (ratified OQ-HP-2: strictly
+  mechanical).
+* **Scope by construction** — the detector fires ONLY when the stored
+  schema requires the configured field. The platform-assembled
+  `report_text` of quality-report carries no such field in its schema:
+  exempt, exactly per docs/response-form-loop.md:19 (never replay a
+  platform-class form onto a role).
+* **Template is config** — `config/workflow/humanize.yaml` (the
+  `humanize:` section, merge-scan like `response_form:`): field name,
+  language default (OQ-HP-3: the paragraph follows the language of the
+  task's business description; the file value is the fallback),
+  `min_chars`/`max_chars` (factory 200/1200 — the size discipline of
+  REQ-HP-08), `overlap_max_ratio`/`ngram`, `overlap_ignore`,
+  `forbidden_markers` (register) and `slots` (required explanation
+  structure). Absent file => factory bytes; a typo'd key or broken bounds
+  are a LOUD error at `devai init`, at engine stages (held error, the
+  delivery-table discipline) and at every manual publish — never a silent
+  default. Editing a value needs no rebuild.
+* **Presentation (REQ-HP-05)** — the gate prints the stored paragraph
+  FIRST (`RunOutcome.gate_human_paragraphs`, CLI `task run`): spec + review
+  at approval, implementation-report at acceptance, before the §2.6 quality
+  rendering. `--json` and `artifact cat` keep their machine-exact shapes.
+  What the gate shows is the stored field verbatim (REQ-HP-07
+  store-is-cache — no read-time retranslation).
+* **Rework and escalation** — on versions 2..N the paragraph is rewritten
+  whole, explaining the CURRENT state, never a diff (ratified OQ-HP-4);
+  the form-loop exhaustion question now opens with a deterministic
+  plain-words retelling of WHY the platform refused, above the full
+  violation list (ratified OQ-HP-5).
+* **Layers** — the paragraph belongs to the artifact protocol
+  (reply-shape + form-loop), NOT to the evaluation profile (REQ-HP-09):
+  profile weights, error_types and the QA gates judge the verdict function
+  unchanged; OQ-HP-2 ratified against a model-scored paragraph check.

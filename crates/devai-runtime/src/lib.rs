@@ -11,6 +11,7 @@ pub mod context;
 mod engine;
 pub mod evaluation;
 pub mod gate;
+pub mod humanize;
 pub mod liveness;
 mod prompt;
 pub mod revision;
@@ -18,7 +19,8 @@ pub mod worktree;
 
 pub use adapters::{
     AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
-    contract_violations, form_repair_section, validate_against_contract,
+    artifact_violations, contract_violations, form_repair_section, validate_against_contract,
+    validate_reply,
 };
 pub use context::{REWORK_CONTEXT_LABEL, rework_context};
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};

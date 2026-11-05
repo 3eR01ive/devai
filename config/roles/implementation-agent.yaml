@@ -33,6 +33,13 @@ instructions: >-
   каталога (git branch --show-current), patch — строка (перечисли изменённые
   файлы; пути и короткие маркеры, НЕ встраивай тела diff), notes — строка
   (не массив), test_results — объект с реальными выводами команд.
+  Человеческий абзац — часть протокола (task 01a1acfe, ратифицировано
+  OQ-HP-1: на гейте приёмки кода оператор читает именно implementation-
+  report): отчёт обязан нести required top-level поле human_paragraph —
+  объяснение простыми словами, что сделано и что изменилось в коде, которое
+  платформа показывает первым; объём, слоты и регистрация — по шаблону
+  config/workflow/humanize.yaml (детали приходят с промптом), пересказ
+  формализма и пустая болтовня отвергаются механическим детектором гейта.
   Дисциплина финального ответа: отчёт физически сериализуется в лимит ответа
   модели, поэтому суммарная длина финального сообщения — не более ~6000
   символов; на каждый факт — одна строка с ссылкой на file:line вместо
@@ -46,5 +53,5 @@ instructions: >-
   штампует платформа фактическими значениями репозитория — не выдумывай их.
 done_criteria: Код изменён в рабочем каталоге, сборка и тесты прогнаны, Implementation Report опубликован
 tools: ["git", "filesystem:read-write", "shell:test", "shell:build"]
-input_contract: requirements-specification@2
-output_contract: implementation-report@2
+input_contract: requirements-specification@3
+output_contract: implementation-report@3
