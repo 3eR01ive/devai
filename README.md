@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo-180.png" alt="devai" width="120" />
+<img src="assets/logo.svg" alt="devai" width="128" />
 
 ## devai
 
