@@ -306,6 +306,34 @@ str_enum!(ArtifactKind,
     Other => "OTHER",
 );
 
+impl ArtifactKind {
+    /// The SINGLE source of the advancing-kind set: kinds whose publication
+    /// carries the workflow forward (QA R4: the set was duplicated in the
+    /// API compound publish, the API standalone advance and the CLI render —
+    /// all three consumers now derive membership from this predicate, so a
+    /// new advancing kind is declared exactly once and can never silently
+    /// skip the advance in one of the consumers).
+    pub fn advances_state(self) -> bool {
+        matches!(self, Self::RequirementsSpec | Self::ReviewReport | Self::ImplementationReport)
+    }
+
+    /// Kinds derived from the approved requirements spec: they are marked
+    /// STALE when the requirements are revised (the dependency implicit of
+    /// the manual publish path — a domain rule, never consumer-local;
+    /// QA R3 moved it out of devai-api next to its owner).
+    pub fn is_downstream_of_spec(self) -> bool {
+        matches!(
+            self,
+            Self::ReviewReport
+                | Self::ImplementationPlan
+                | Self::ImplementationReport
+                | Self::Patch
+                | Self::TestReport
+                | Self::QualityReport
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ArtifactStatus {
@@ -580,6 +608,31 @@ str_enum!(Verdict,
     Rejected => "REJECTED",
     Returned => "RETURNED",
 );
+
+impl Verdict {
+    /// The operator-facing verdict vocabulary: `Verdict::parse` (from the
+    /// str_enum) covers the canonical SCREAMING_SNAKE form; humans and CLI
+    /// arguments type lowercase synonyms. The dictionary is domain
+    /// vocabulary, owned here beside `parse` (QA R3: it lived in
+    /// devai-api, which declares it owns NO business rules). Consumers map
+    /// `None` to their own machine-coded refusal.
+    pub fn from_token(s: &str) -> Option<Verdict> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "approved" | "approve" | "pass" => Self::Approved,
+            "needs_revision" | "revision" | "changes" => Self::NeedsRevision,
+            "rejected" | "reject" => Self::Rejected,
+            "returned" | "return" => Self::Returned,
+            _ => return None,
+        })
+    }
+
+    /// The refusal hint listing the accepted canonical tokens — DERIVED
+    /// from the enum itself (primary token per variant, lowercase) so the
+    /// hint cannot drift from the vocabulary it documents.
+    pub fn token_hint() -> String {
+        Self::ALL.iter().map(|v| v.as_str().to_ascii_lowercase()).collect::<Vec<_>>().join("|")
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Decision {
