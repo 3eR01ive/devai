@@ -21,3 +21,6 @@ jobs:
         run: cargo build --workspace
       - name: tests
         run: cargo test --workspace
+      - name: capture failure output (for public step summary)
+        if: failure()
+        run: cargo test --workspace 2>&1 | tail -60 >> "$GITHUB_STEP_SUMMARY"
