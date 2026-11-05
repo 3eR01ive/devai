@@ -16,7 +16,7 @@ use std::process::Command;
 
 use std::sync::LazyLock;
 
-use devai_store::config::Profile;
+use devai_store::config::{Probe, Profile, unresolved_slot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -142,15 +142,43 @@ fn exec_probe(cmd: &str, workspace: &Path, pass_exit: &[i64]) -> ProbeOutcome {
     }
 }
 
+/// REQ-SP-105 (verdict semantics ratified in OQ-SP-7): the unresolved-slot
+/// predicate is MECHANICAL and SYNTACTIC — a probe command that still
+/// contains an open `{{...}}` binding token after composition is never
+/// spawned, and its outcome is BLOCKED regardless of what the command would
+/// have returned. Not a fake-FAIL, not a fake-PASS; an unperformed check
+/// cannot fabricate either. The SAME predicate covers check probes and gate
+/// probes: gates are binary (V6), so counting an unbound gate as gate=0
+/// would forge a rejected-gate, and as gate=1 would forge a pass — the
+/// verdict function already turns a BLOCKED gate into INCONCLUSIVE (§2.5),
+/// never into FAIL.
+fn slot_blocked_probe(p: &Probe) -> Option<ProbeOutcome> {
+    unresolved_slot(&p.cmd).map(|tok| ProbeOutcome {
+        state: ProbeState::Blocked,
+        detail: format!(
+            "probe `{}`: binding slot `{tok}` is unresolved — not executed (BLOCKED: neither fake-FAIL nor fake-PASS, REQ-SP-105)",
+            p.cmd
+        ),
+        output: String::new(),
+    })
+}
+
+/// Run a probe list: slot predicate FIRST (no spawn), then the process.
+fn run_probes(probes: &[Probe], workspace: &Path) -> Vec<ProbeOutcome> {
+    probes
+        .iter()
+        .map(|p| match slot_blocked_probe(p) {
+            Some(b) => b,
+            None => exec_probe(&p.cmd, workspace, &p.pass_exit),
+        })
+        .collect()
+}
+
 /// Run all gates and every mechanical/hybrid probe of the profile.
 pub fn execute(profile: &Profile, workspace: &Path) -> EvalRun {
     let mut gates = Vec::new();
     for g in &profile.gates {
-        let outs: Vec<ProbeOutcome> = g
-            .probes
-            .iter()
-            .map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit))
-            .collect();
+        let outs: Vec<ProbeOutcome> = run_probes(&g.probes, workspace);
         let state = reduce_state(&outs);
         let detail = outs
             .iter()
@@ -177,11 +205,7 @@ pub fn execute(profile: &Profile, workspace: &Path) -> EvalRun {
     }
     for c in profile.checks() {
         if c.verify == "mechanical" {
-            let outs: Vec<ProbeOutcome> = c
-                .probes
-                .iter()
-                .map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit))
-                .collect();
+            let outs: Vec<ProbeOutcome> = run_probes(&c.probes, workspace);
             let state = reduce_state(&outs);
             let detail = outs
                 .iter()
@@ -208,11 +232,7 @@ pub fn execute(profile: &Profile, workspace: &Path) -> EvalRun {
             );
         } else if c.verify == "hybrid" {
             // The probe only proposes candidates; the rubric decides.
-            let outs: Vec<ProbeOutcome> = c
-                .probes
-                .iter()
-                .map(|p| exec_probe(&p.cmd, workspace, &p.pass_exit))
-                .collect();
+            let outs: Vec<ProbeOutcome> = run_probes(&c.probes, workspace);
             let mut kept = Vec::new();
             for o in &outs {
                 let out: String = o.output.trim().chars().take(2000).collect();
@@ -1026,6 +1046,87 @@ scoring:
         );
         assert_eq!(out.state, ProbeState::Pass);
         assert!(out.output.contains("candidate.rs:10"));
+    }
+
+    #[test]
+    fn unresolved_slot_probe_is_blocked_without_spawn() {
+        // REQ-SP-105: the predicate is syntactic and fires BEFORE the
+        // process — the command never spawns (side effect absent) and the
+        // outcome is BLOCKED, not FAIL whatever the command would return.
+        // Covers gate probes and check probes identically (R1/RV3-2).
+        let ws = tempfile::TempDir::new().unwrap();
+        let marker = ws.path().join("spawned");
+        let mut p = tiny_profile("true", "true");
+        p.gates[0].probes[0].cmd = format!("touch {}; echo {{{{build_cmd}}}}", marker.display());
+        let run = execute(&p, ws.path());
+        assert_eq!(run.gates[0].state, ProbeState::Blocked);
+        assert!(!marker.exists(), "an unresolved probe must never spawn");
+        assert!(run.evidence_text.contains("gate gate-1: BLOCKED"));
+
+        // Same predicate on a mechanical check probe: blocked, no spawn.
+        let marker2 = ws.path().join("spawned2");
+        let mut p2 = tiny_profile("true", "true");
+        p2.evaluations[0].checks[0].probes[0].cmd = format!("touch {}; true", marker2.display());
+        p2.evaluations[0].checks[0].probes[0].cmd.push_str(" {{x}}");
+        let run2 = execute(&p2, ws.path());
+        assert_eq!(run2.mech["mech/a"].state, ProbeState::Blocked);
+        assert!(!marker2.exists());
+    }
+
+    #[test]
+    fn blocked_slot_gate_never_forges_fail_or_pass() {
+        // Ratified OQ-SP-7: a gate with an unresolved slot is not gate=0
+        // (no rejected-gate FAIL) and not gate=1 — the verdict is
+        // INCONCLUSIVE, exactly like an unperformed check budget.
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut p = tiny_profile("true", "true");
+        p.evaluations[0].checks.retain(|c| c.id != "hum/c");
+        p.scoring.weights = vec![("mech/a".into(), 0.5), ("rub/b".into(), 0.5)]
+            .into_iter()
+            .collect();
+        p.gates[0].probes[0].cmd = "{{build_cmd}}".into();
+        let run = execute(&p, ws.path());
+        let a = assessment(&[("rub/b", 1.0)], &[], &[]);
+        let out = assemble(&p, &run, &a, "exec-slot", &fixture_revision());
+        assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
+        assert_eq!(out.recommendation, "ESCALATE");
+        // The gate outcome is BLOCKED — not FAIL/gate=0, not PASS/gate=1.
+        assert_eq!(run.gates[0].state, ProbeState::Blocked);
+        assert!(
+            out.report_text.contains("ШЛЮЗ: gate-1 — BLOCKED"),
+            "the unbound gate is announced as BLOCKED, never rejected: {}",
+            out.report_text
+        );
+        assert!(
+            !out.report_text.starts_with("ВЕРДИКТ: НЕ ПРОШЁЛ"),
+            "no fake-FAIL verdict may come from an unbound gate: {}",
+            out.report_text
+        );
+        // mech/a stays a real PASS here — the block is the gate's own.
+        assert!(
+            out.report_text.contains("ВЕРДИКТ НЕ ГОТОВ"),
+            "{}",
+            out.report_text
+        );
+    }
+
+    #[test]
+    fn blocked_slot_check_weight_joins_blocked_policy() {
+        // REQ-SP-105 AC: the blocked weight of an unbound mechanical check
+        // goes under max_blocked_weight and the existing policy decides.
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut p = tiny_profile("true", "true");
+        p.evaluations[0]
+            .checks
+            .retain(|c| c.id == "mech/a" || c.id == "rub/b");
+        p.evaluations[0].checks[0].probes[0].cmd = "{{unbound}}".into();
+        let run = execute(&p, ws.path());
+        let a = assessment(&[("rub/b", 1.0)], &[], &[]);
+        let out = assemble(&p, &run, &a, "exec-w", &fixture_revision());
+        let bw = out.json["evaluation"]["blocked_weight"].as_f64().unwrap();
+        assert!((bw - 0.5).abs() < 1e-9, "blocked weight carried: {bw}");
+        // 0.5 > cap 0.2 → INCONCLUSIVE per the existing blocked policy.
+        assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
     }
 
     #[test]

@@ -406,10 +406,10 @@ fn profile_history_is_insert_only_and_survives_in_place_edits() {
     let profiles = store.list_evaluation_profiles().unwrap();
     let (name, factory_version, project) = profiles
         .iter()
-        .find(|(n, _, _)| n == "quality")
+        .find(|(n, _, _)| n == "base")
         .cloned()
-        .unwrap_or_else(|| panic!("quality profile snapshotted on seed: {profiles:?}"));
-    assert_eq!(project, "devai");
+        .unwrap_or_else(|| panic!("factory base profile snapshotted on seed: {profiles:?}"));
+    assert_eq!(project, "base");
     let (_p, original) = store
         .get_evaluation_profile(&name, factory_version)
         .unwrap()
@@ -425,7 +425,7 @@ fn profile_history_is_insert_only_and_survives_in_place_edits() {
         .path()
         .join("config")
         .join("evaluation")
-        .join("quality.yaml");
+        .join("base.yaml");
     let edited = format!("{original}\n# edited in place, version kept\n");
     std::fs::write(&path, edited.as_bytes()).unwrap();
     seed::seed_from(&store, &dir.path().join("config"), now()).unwrap();

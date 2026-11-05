@@ -1,0 +1,567 @@
+# Фабричный БАЗОВЫЙ профиль оценки (REQ-SP-101/102, цикл C1 задачи 01a1ab88).
+# Языконезависимая база: ни путей, ни имён модулей, ни команд конкретного
+# проекта — механические пробы и гейты выражены слотами привязки {{...}}
+# (docs/internal/criteria-generic-draft.yaml 0.2-abstract как материал;
+# нормализация draft->Profile — probes/pass_exit вместо probe/map, якоря V4,
+# version u32, applies_to_roles).
+#
+# Семантика неразрешённого слота (REQ-SP-105 + ратификация OQ-SP-7) — проба с
+# открытым токеном {{...}} НЕ исполняется и даёт BLOCKED: ни fake-FAIL, ни
+# fake-PASS; гейт с BLOCKED-пробой не gate=0 и не gate=1, вердикт при нём
+# INCONCLUSIVE. Дом без оверлея судится этой чистой базой.
+#
+# Конкретика проекта (привязки слотов к инструментам и доменные проверки)
+# входит в силу только через human-гейт ратификации и живёт в дельте
+# profiles/<projects.id>.overlay.yaml (REQ-SP-106) — НЕ в этом файле и не в
+# evaluation/. Веса effective-профиля пересчитывает композиция по
+# REQ-SP-107; база сама валидна как Profile с sum=1.00 (V7).
+#
+# Нормализации при переносе из draft 0.2-abstract (структура, не смысл):
+#   - da/run-docs и proc/evidence-completeness получили недостающие якоря V4;
+#   - pass_exit проставлен по схеме проб (mechanical [0], hybrid [0,1]).
+
+version: 1
+name: base
+project: base
+applies_to_roles: [quality-auditor]
+
+error_types:
+  clarity/naming:
+    desc: Имя не отражает назначение (x, tmp, data1, абстракция без контекста).
+    severity: minor
+  clarity/stale-comment:
+    desc: Комментарий устарел относительно кода или не несёт информации.
+    severity: minor
+  clarity/what-comment:
+    desc: Комментарий пересказывает «что» вместо «почему».
+    severity: minor
+  clarity/oversized-unit:
+    desc: Единица кода заметно длиннее порога разборности (порог задаёт оверлей).
+    severity: minor
+  clarity/deep-nesting:
+    desc: Пирамида условного потока, читаемая только с внешнего источника.
+    severity: minor
+  clarity/style-drift:
+    desc: Дрейф форматирования/линтеров дерева относительно принятого инструмента стиля.
+    severity: minor
+  architecture/magic:
+    desc: Немотивированное значение с доменным смыслом, не выраженное именованной константой с объяснением.
+    severity: minor
+  maintainability/principle-violation:
+    desc: Нарушение принципа разделения ответственности/интерфейсов в форме данного стека.
+    severity: minor
+  maintainability/low-cohesion:
+    desc: В модуле живут несвязанные по смыслу сущности.
+    severity: minor
+  maintainability/dependency-inversion:
+    desc: Верхний слой зависит от конкретной реализации нижнего вопреки заявленной границе.
+    severity: major
+  maintainability/tight-coupling:
+    desc: Модуль знает детали другого модуля, не входящие в его контракт.
+    severity: minor
+  maintainability/duplication:
+    desc: Одна логика реализована в нескольких местах без общего источника.
+    severity: minor
+  maintainability/fragile-change:
+    desc: Добавление одного доменного варианта требует правок в нескольких несвязанных местах.
+    severity: minor
+  reliability/error-wash:
+    desc: Потеря ошибки (тихий no-result вместо различимого отказа), различие «нет данных» и «битые данные» стёрто.
+    severity: minor
+  reliability/abnormal-exit:
+    desc: Аварийный выход исполняемого кода на валидных, но редких данных без локального обоснования недостижимости.
+    severity: major
+  reliability/unvalidated-input:
+    desc: Внешний ввод не проходит типизированную границу с отказом на неизвестном значении.
+    severity: major
+  reliability/edge-case-failure:
+    desc: Пустое/нулевое/битое значение ведёт себя неверно или неоднозначно.
+    severity: major
+  reliability/non-idempotent:
+    desc: Повтор операции даёт нежелательные побочные эффекты.
+    severity: major
+  security/injection:
+    desc: Внешняя строка попадает в исполняемый канал (запрос/eval/shell) мимо параметризации.
+    severity: catastrophic
+  security/secret-exposure:
+    desc: Секрет зашит в дерево как литерал.
+    severity: catastrophic
+  performance/algorithmic:
+    desc: Избыточная сложность обхода на непривязанном по размеру входе.
+    severity: minor
+  performance/io-churn:
+    desc: Попарный I/O там, где декларируемый масштаб требует пакетного.
+    severity: minor
+  performance/unbounded-growth:
+    desc: Неограниченный рост памяти/дескрипторов в долгоживущих процессах.
+    severity: minor
+  performance/parallelism-miss:
+    desc: Последовательное выполнение там, где параллелизм уместен и безопасен.
+    severity: minor
+  testability/global-state:
+    desc: Разделяемое изменяемое глобальное состояние мешает изоляции тестов.
+    severity: minor
+  testability/untestable-design:
+    desc: Нет шва подмены зависимости там, где изоляция теста разумна.
+    severity: minor
+  testability/coverage-gap:
+    desc: Новая ветка логики без теста, её накрывающего.
+    severity: minor
+  testability/order-dependent:
+    desc: Тест зависит от порядка/параллелизма выполнения набора.
+    severity: minor
+  ux/output-drift:
+    desc: Машиночитаемая поверхность ломает существующего потребителя без версионирования или обоснования.
+    severity: major
+  documentation/architecture-drift:
+    desc: Код расходится с задекларированной архитектурой слоёв проекта.
+    severity: major
+  documentation/api-contract-missing:
+    desc: Публичная поверхность без явного контракта.
+    severity: minor
+  documentation/run-docs-stale:
+    desc: Нет или устарели инструкции запуска/сборки и записи ключевых решений.
+    severity: minor
+  correctness/spec-deviation:
+    desc: Реализация расходится с принятой спецификацией (включая ратификации).
+    severity: major
+  process/no-evidence:
+    desc: Rubric-нарушение или балл выставлены без обязательного evidence.
+    severity: minor
+
+gates:
+  - id: build-green
+    desc: "проект собирается командой сборки (bind — слот {{build_cmd}})"
+    probes:
+      - { cmd: "{{build_cmd}}", pass_exit: [0] }
+  - id: tests-green
+    desc: "тестовый набор проекта зелёный (bind — слот {{test_cmd}})"
+    probes:
+      - { cmd: "{{test_cmd}}", pass_exit: [0] }
+  - id: no-secrets
+    desc: "нет секретов-литералов в дереве (bind — сканер {{secret_scan_cmd}}, exit 0 = чисто)"
+    probes:
+      - { cmd: "{{secret_scan_cmd}}", pass_exit: [0] }
+
+evaluations:
+  - id: readability
+    title: Читаемость и понятность
+    checks:
+      - id: cl/meaningful-names
+        statement: Имена сущностей отражают назначение и читаются без пояснения.
+        detects: [clarity/naming]
+        verify: rubric
+        anchors:
+          "1.0": кандидатов нет
+          "0.7": единичные размытые имена на второстепенных путях
+          "0.4": размытые имена в доменной логике
+          "0.0": имена не несут смысла
+        evidence: required
+        reviewer: either
+      - id: cl/comments-explain-why
+        statement: Комментарии объясняют почему (инварианты, обоснования), не пересказывают код; устаревших нет.
+        detects: [clarity/stale-comment, clarity/what-comment]
+        verify: rubric
+        anchors:
+          "1.0": комментарии только «почему»
+          "0.7": локальные пересказы кода
+          "0.4": устаревшие комментарии в горячих местах
+          "0.0": комментарии врут о коде
+        evidence: required
+        reviewer: either
+      - id: cl/short-units
+        statement: Единицы кода читаются целиком в рамках порога оверлея; вложенность управляющего потока ограничена.
+        detects: [clarity/oversized-unit, clarity/deep-nesting]
+        verify: hybrid
+        probes:
+          - { cmd: "{{size_nesting_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": кандидатов нет или все с ролевым обоснованием
+          "0.7": единичные длинные с обоснованием роли
+          "0.4": длинные несут доменную логику, есть пирамиды
+          "0.0": структура не читается
+        evidence: required
+        reviewer: either
+      - id: cl/style-consistency
+        statement: Дерево проходит штатный инструмент стиля проекта без исключений-без-обоснования.
+        detects: [clarity/style-drift]
+        verify: mechanical
+        probes:
+          - { cmd: "{{style_check_cmd}}", pass_exit: [0] }
+        evidence: required
+        reviewer: either
+
+  - id: maintainability
+    title: Поддерживаемость и расширяемость
+    checks:
+      - id: mt/no-magic
+        statement: Литералы с доменным смыслом (лимиты, состояния, пороги) вынесены в именованные сущности с обоснованием; в тестах не считаются.
+        detects: [architecture/magic]
+        verify: hybrid
+        probes:
+          - { cmd: "{{magic_candidates_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": кандидатов нет или все обоснованы
+          "0.7": до двух незначительных
+          "0.4": magic на второстепенном пути
+          "0.1": magic в правилах домена
+          "0.0": системно
+        evidence: required
+        reviewer: either
+      - id: mt/single-responsibility
+        statement: Каждая единица (модуль/класс/функция) отвечает одному из заявленных проектом ролей/уровней.
+        detects: [maintainability/principle-violation, maintainability/low-cohesion]
+        verify: rubric
+        anchors:
+          "1.0": роли соблюдены
+          "0.7": единичная перегруженная единица-обёртка
+          "0.4": роль размывается системно
+          "0.0": god-модуль на всё
+        evidence: required
+        reviewer: either
+      - id: mt/dependency-direction
+        statement: Потребители зависят от заявленной границы (контрактного слоя), а не от реализации внутреннего слоя в обход неё.
+        detects: [maintainability/dependency-inversion, maintainability/tight-coupling]
+        verify: hybrid
+        probes:
+          - { cmd: "{{boundary_bypass_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": обходов границы нет
+          "0.7": остаточные обращения явно ратифицированы как граница этапа
+          "0.4": нератифицированные обращения к внутренней реализации
+          "0.0": границы как класса ответственности нет
+        evidence: required
+        reviewer: either
+      - id: mt/dry
+        statement: Общий смысл имеет один источник; параллельных копий одной семантики без общего источника нет.
+        detects: [maintainability/duplication]
+        verify: hybrid
+        probes:
+          - { cmd: "{{duplication_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": копий нет
+          "0.7": две-три локализованные копии с мелким дрейфом
+          "0.4": три и более несвязанных копий одной семантики
+          "0.0": логика размазана по дереву
+        evidence: required
+        reviewer: either
+      - id: mt/change-isolation
+        statement: Добавление доменного варианта — один явный источник правки; пропуск места не молчит (компилятор/тест/валидатор ловит).
+        detects: [maintainability/fragile-change]
+        verify: rubric
+        anchors:
+          "1.0": один источник
+          "0.7": два места со связанной проверкой
+          "0.4": три и более несвязанных места, пропуск молчалив
+          "0.0": места правки угадываются
+        evidence: required
+        reviewer: either
+
+  - id: reliability-security
+    title: Надёжность и безопасность
+    checks:
+      - id: rl/error-handling
+        statement: Ошибки не теряются; состояние «нет данных» отличимо от «данные повреждены».
+        detects: [reliability/error-wash]
+        verify: hybrid
+        probes:
+          - { cmd: "{{silent_failure_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": глотания нет
+          "0.7": единичные обоснованные места
+          "0.4": повреждённые данные неотличимы от отсутствия
+          "0.0": ошибки теряются системно
+        evidence: required
+        reviewer: either
+      - id: rl/crash-free
+        statement: Аварийный выход library-кода на валидных редких данных отсутствует; исключения из правила несут локальное обоснование недостижимости.
+        detects: [reliability/abnormal-exit]
+        verify: hybrid
+        probes:
+          - { cmd: "{{abnormal_exit_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": все места обоснованы
+          "0.7": единицы без обоснования, структурно недостижимы
+          "0.4": достижимый аварийный выход на редких данных
+          "0.0": аварийный выход как стратегия
+        evidence: required
+        reviewer: either
+      - id: rl/input-validation
+        statement: Внешний ввод проходит типизированную границу со словарём значений и fail-closed отказом на неизвестном.
+        detects: [reliability/unvalidated-input]
+        verify: rubric
+        anchors:
+          "1.0": все границы валидированы
+          "0.7": мелочи на внутреннем вводе
+          "0.4": невалидированный внешний путь
+          "0.0": ввод исполняется как есть
+        evidence: required
+        reviewer: either
+      - id: rl/edge-cases
+        statement: Пустое/нулевое/битое/экстремальное поведение различимо и корректно, покрыто явными ветками или тестами.
+        detects: [reliability/edge-case-failure]
+        verify: rubric
+        anchors:
+          "1.0": границы покрыты
+          "0.7": единичная неотличимая граница
+          "0.4": битый вход молча деградирует
+          "0.0": падение на пустом входе
+        evidence: required
+        reviewer: either
+      - id: rl/idempotency
+        statement: Повтор команды/события не имеет побочных эффектов; конфликт параллели защищён заявленным механизмом.
+        detects: [reliability/non-idempotent]
+        verify: rubric
+        anchors:
+          "1.0": повтор безопасен и проверен
+          "0.7": безопасен по конструкции, без теста
+          "0.4": повтор может удвоить эффект
+          "0.0": повтор ломает состояние
+        evidence: required
+        reviewer: either
+      - id: sec/injection
+        statement: Внешняя строка попадает в исполняемый канал только через параметризацию; константы схемы — единственный не-связанный интерполяции источник.
+        detects: [security/injection]
+        verify: hybrid
+        probes:
+          - { cmd: "{{injection_candidates_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": кандидатов нет или все — константы при параметризации
+          "0.4": спорная сборка
+          "0.0": внешняя строка в исполняемом канале
+        evidence: required
+        reviewer: either
+      - id: sec/secrets-hygiene
+        statement: Секретов-литералов в дереве нет; внешние креды читаются из окружения/файлов вне репозитория.
+        detects: [security/secret-exposure]
+        verify: hybrid
+        probes:
+          - { cmd: "{{secret_scan_cmd}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": чисто
+          "0.4": закомментированный секрет
+          "0.0": живой секрет в дереве
+        evidence: required
+        reviewer: either
+
+  - id: performance
+    title: Производительность
+    checks:
+      - id: pf/algorithmic
+        statement: Нет сверхлинейного обхода структур, растущих без верхней границы.
+        detects: [performance/algorithmic]
+        verify: rubric
+        anchors:
+          "1.0": линейно/логарифмически
+          "0.7": квадратично только на заведомо малых множествах с явной оценкой
+          "0.4": квадратично на растущем входе
+          "0.0": взрывная сложность
+        evidence: required
+        reviewer: either
+      - id: pf/io-churn
+        statement: I/O к внешним хранилищам пакетный там, где масштаб проекта это оправдывает; поштучное чтение — обоснованный выбор.
+        detects: [performance/io-churn]
+        verify: rubric
+        anchors:
+          "1.0": churn нет
+          "0.7": поштучное на малых масштабах
+          "0.4": N+1 на растущем входе
+          "0.0": деградация прямо от объёма
+        evidence: required
+        reviewer: either
+      - id: pf/resource-growth
+        statement: Долгоживущие процессы имеют явные ограничители роста (шаги, буферы, соединения) — именованные с обоснованием.
+        detects: [performance/unbounded-growth]
+        verify: hybrid
+        probes:
+          - { cmd: "{{growth_guard_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": все циклы ограничены
+          "0.7": ограничения есть, обоснование единиц неполное
+          "0.4": незащищённый рост
+          "0.0": исчерпаемость при штатной эксплуатации
+        evidence: required
+        reviewer: either
+      - id: pf/hot-path-measure
+        statement: Утверждения о производительности опираются на измерения (bench-тулинг оверлея), не на глаз.
+        detects: [performance/algorithmic]
+        verify: mechanical
+        probes:
+          - { cmd: "{{bench_check_cmd}}", pass_exit: [0] }
+        evidence: optional
+        reviewer: either
+      - id: pf/parallelism
+        statement: Параллелизм применяется где уместно; сериализация только по заявленным причинам (конкурентные гарантии, порядок событий).
+        detects: [performance/parallelism-miss]
+        verify: rubric
+        anchors:
+          "1.0": обоснованно
+          "0.7": известные потери низкого приоритета
+          "0.4": сериализация без обоснования
+          "0.0": взаимная блокировка независимых данных
+        evidence: required
+        reviewer: either
+
+  - id: testability
+    title: Тестируемость
+    checks:
+      - id: ts/global-state
+        statement: Разделяемого изменяемого глобального состояния в исполняемом коде нет.
+        detects: [testability/global-state]
+        verify: mechanical
+        probes:
+          - { cmd: "{{global_state_probe}}", pass_exit: [0] }
+        evidence: required
+        reviewer: either
+      - id: ts/di-seams
+        statement: Внешние зависимости входят параметром (инициализация/конструктор), тест собирает систему с контролируемыми экземплярами.
+        detects: [testability/untestable-design]
+        verify: rubric
+        anchors:
+          "1.0": швы везде, тесты пользуются
+          "0.7": швы через реальные инстансы в песочнице — осознанный выбор
+          "0.4": часть путей тестируется только через реальные внешние процессы
+          "0.0": зависимость не подменить
+        evidence: required
+        reviewer: either
+      - id: ts/coverage-static
+        statement: Ключевая логика и взаимодействия модулей накрыты тестами; метрика покрытия — на усмотрение оверлея, при её отсутствии плотность статическая.
+        detects: [testability/coverage-gap]
+        verify: hybrid
+        probes:
+          - { cmd: "{{test_density_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": новое и гейты с parity-тестами
+          "0.7": плотность высокая, отдельные ветки без тестов
+          "0.4": доменная ветка без теста
+          "0.0": тестов нет
+        evidence: required
+        reviewer: either
+      - id: ts/test-independence
+        statement: Набор зелёный при смене порядка/распараллеливания; тесты не мутируют окружение процесса и не ссылаются на общий порядок.
+        detects: [testability/order-dependent]
+        verify: mechanical
+        probes:
+          - { cmd: "{{serial_test_cmd}}", pass_exit: [0] }
+          - { cmd: "{{env_mutation_probe}}", pass_exit: [0] }
+        evidence: required
+        reviewer: either
+
+  - id: documentation-architecture
+    title: Документация и архитектура
+    checks:
+      - id: da/architecture-consistency
+        statement: Код соответствует задекларированной в проекте архитектуре; правила домена и оркестрация живут в объявленных слоях, не в слое представления.
+        detects: [documentation/architecture-drift]
+        verify: rubric
+        anchors:
+          "1.0": соответствует
+          "0.7": единичная оркестрация не на своём месте, ратифицированно
+          "0.4": расхождение системное
+          "0.0": архитектура только на бумаге
+        evidence: required
+        reviewer: human
+      - id: da/api-contract
+        statement: Публичная поверхность типизирована (вход/выход/ошибки машиночитаемо) и описана в каталоге; версия контракта объявлена.
+        detects: [documentation/api-contract-missing]
+        verify: rubric
+        anchors:
+          "1.0": контракт + каталог + машиночитаемые ошибки
+          "0.7": контракт есть, версионирование неполное
+          "0.4": утки и stringly-выходы
+          "0.0": контракт это сам код
+        evidence: required
+        reviewer: either
+      - id: da/run-docs
+        statement: Инструкции сборки/запуска существуют и точны; ключевые решения и обходные пути задокументированы.
+        detects: [documentation/run-docs-stale]
+        verify: hybrid
+        probes:
+          - { cmd: "{{run_docs_probe}}", pass_exit: [0, 1] }
+        anchors:
+          "1.0": точные инструкции и записанные решения
+          "0.7": инструкции есть, решения не записаны
+          "0.4": инструкции расходятся с реальным запуском
+          "0.0": запустить проект по документации нельзя
+        evidence: required
+        reviewer: either
+      - id: ux/contract-stability
+        statement: Машиночитаемая поверхность (форматы вывода, флаги, payload событий) обратно совместна для существующего потребителя, либо слом явно версионирован.
+        detects: [ux/output-drift]
+        verify: rubric
+        anchors:
+          "1.0": совместность зафиксирована тестом/снапшотом
+          "0.7": фиксирующая проба есть, не на все поверхности
+          "0.4": молчаливый ломающий дрейф
+          "0.0": потребители падают
+        evidence: required
+        reviewer: either
+
+  - id: fidelity
+    title: Соответствие спецификации
+    checks:
+      - id: pr/spec-fidelity
+        statement: Поведение HEAD соответствует принятой спеке вместе с ратификациями решений человека; «функционально эквивалентно в другом месте» — deviation.
+        detects: [correctness/spec-deviation]
+        verify: rubric
+        anchors:
+          "1.0": один-в-один со спекой и ратификациями
+          "0.7": отклонения зафиксированы ратификацией
+          "0.4": нератифицированное отклонение
+          "0.0": спека проигнорирована
+        evidence: required
+        reviewer: human
+      - id: proc/evidence-completeness
+        statement: Мета-проверка отчёта (не кода) — каждый rubric-балл с цитатой evidence; нарушение => вердикт не выдаётся. Вес 0 по схеме.
+        detects: [process/no-evidence]
+        verify: rubric
+        anchors:
+          "1.0": всё подкреплено
+          "0.4": единичный балл без цитаты
+          "0.0": есть баллы без evidence — отчёт невалиден
+        evidence: required
+        reviewer: either
+
+scoring:
+  aggregation: per-check
+  theta: 0.80
+  floors:
+    catastrophic: 0.7
+    major: 0.4
+    minor: null
+  blocked_policy:
+    max_blocked_weight: 0.20
+  weights:
+    # Сумма ровно 1.00 (V7). Иерархия — из draft 0.2-abstract: fidelity и
+    # direction/dry/coverage выше hygiene-слоя; meta-проверка весом 0.
+    cl/meaningful-names: 0.03
+    cl/comments-explain-why: 0.03
+    cl/short-units: 0.04
+    cl/style-consistency: 0.04
+    mt/no-magic: 0.03
+    mt/single-responsibility: 0.04
+    mt/dependency-direction: 0.04
+    mt/dry: 0.04
+    mt/change-isolation: 0.03
+    rl/error-handling: 0.04
+    rl/crash-free: 0.04
+    rl/input-validation: 0.04
+    rl/edge-cases: 0.04
+    rl/idempotency: 0.04
+    sec/injection: 0.04
+    sec/secrets-hygiene: 0.03
+    pf/algorithmic: 0.03
+    pf/io-churn: 0.02
+    pf/resource-growth: 0.02
+    pf/hot-path-measure: 0.02
+    pf/parallelism: 0.02
+    ts/global-state: 0.02
+    ts/di-seams: 0.03
+    ts/coverage-static: 0.04
+    ts/test-independence: 0.02
+    da/architecture-consistency: 0.04
+    da/api-contract: 0.03
+    da/run-docs: 0.03
+    ux/contract-stability: 0.03
+    pr/spec-fidelity: 0.06
+    proc/evidence-completeness: 0.00

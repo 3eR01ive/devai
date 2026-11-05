@@ -14,6 +14,7 @@ pub mod seed;
 pub use bundle::{BundleManifest, ImportOutcome};
 pub use error::{StoreError, StoreResult};
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -1274,6 +1275,30 @@ impl Store {
             out.push(rows::decision_from_row(r)?);
         }
         Ok(out)
+    }
+
+    /// The ratification index for profile overlays (REQ-SP-106 layer (b)):
+    /// every decisions row of kind `profile_ratification` with verdict
+    /// APPROVED, as decision-id -> refs. The delta loader cross-checks each
+    /// item's `ratified_by` against this map — only rows that EXIST, are of
+    /// that kind and APPROVED, and whose refs cover the item, give it force
+    /// (A-5: a manual edit without a valid decision reference never enters
+    /// force, and this works already in C1-without-C3, where the table holds
+    /// no such rows). Rejected/other-kind rows are absent by construction.
+    pub fn ratified_profile_refs(&self) -> StoreResult<BTreeMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,kind,verdict,actor,rationale,refs,created_at FROM decisions WHERE kind=?1 AND verdict=?2 ORDER BY created_at",
+        )?;
+        let mut rows = stmt.query(params![
+            decision_kind::PROFILE_RATIFICATION,
+            Verdict::Approved.as_str()
+        ])?;
+        let mut map = BTreeMap::new();
+        while let Some(r) = rows.next()? {
+            let d = rows::decision_from_row(r)?;
+            map.insert(d.id.to_string(), d.refs);
+        }
+        Ok(map)
     }
 
     pub fn create_question(&self, q: &Question) -> StoreResult<()> {

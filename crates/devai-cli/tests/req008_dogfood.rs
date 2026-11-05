@@ -158,13 +158,15 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
     // real, comparable revision of the same shape (no model involvement).
     // The profile identity is the seeded evaluation file's stem@version:
     // derived from the declarative config, so a factory bump never rots it.
+    // (REQ-SP-101: the factory ships the abstract BASE, so that identity is
+    // `base@<version>`.)
     let qyaml = std::fs::read_to_string(
         home.path()
             .join("config")
             .join("evaluation")
-            .join("quality.yaml"),
+            .join("base.yaml"),
     )
-    .expect("`devai init` materializes the factory evaluation profile into the home");
+    .expect("`devai init` materializes the factory base profile into the home");
     let prof_ver = qyaml
         .lines()
         .map(str::trim)
@@ -172,7 +174,7 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
         .expect("the profile declares its version")
         .trim()
         .to_string();
-    let want_profile = format!("quality@{prof_ver}");
+    let want_profile = format!("base@{prof_ver}");
 
     let execs = devai_json(home.path(), &["exec", "list", "--task", &id]);
     let execs = execs.as_array().unwrap();
