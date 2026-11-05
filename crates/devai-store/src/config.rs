@@ -27,6 +27,14 @@ use serde::{Deserialize, Serialize};
 use crate::{Store, StoreError, StoreResult};
 
 // Embedded factory defaults — written into the home config on first init.
+// REQ-SP-101 (cycle C1): the factory distributes the ABSTRACT BASE profile
+// only — no project paths, crate names, single-project commands, no
+// platform-invariants block. Project specifics enter force solely through a
+// ratified overlay delta (`profiles/<projects.id>.overlay.yaml`, REQ-SP-106),
+// which is NOT part of DEFAULT_FILES and never lives in `evaluation/`. The
+// devai v11 profile stays in the repo (config/evaluation/quality.yaml) as the
+// C5 migration material; per-file materialisation means existing homes keep
+// their own untouched copy (config.rs `materialize_if_absent`).
 const DEFAULT_FILES: &[(&str, &str)] = &[
     (
         "prompts/common.yaml",
@@ -37,8 +45,8 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         include_str!("../../../config/criteria/review.yaml"),
     ),
     (
-        "evaluation/quality.yaml",
-        include_str!("../../../config/evaluation/quality.yaml"),
+        "evaluation/base.yaml",
+        include_str!("../../../config/evaluation/base.yaml"),
     ),
     (
         "roles/project-intelligence.yaml",
@@ -413,10 +421,24 @@ impl Config {
         self.criteria.iter().find(|c| c.applies_to == slug)
     }
 
+    /// The profile compiled into a role's checklist. C1 transition rule
+    /// (REQ-SP-101 × operator decision "no working profile breaks before
+    /// C5"): when a home carries the factory base ALONGSIDE an owned legacy
+    /// full profile (an existing home gained `base.yaml` on re-init while
+    /// its `quality.yaml` is preserved by per-file materialisation), role
+    /// compilation keeps preferring the LEGACY-OWNED profile — the factory
+    /// swap must not silently rewrite the auditor's checklist under a home
+    /// that has not been migrated to base+overlay (C5). A clean home with
+    /// only the base compiles the base (REQ-SP-101 AC2).
     pub fn profile_for(&self, slug: &str) -> Option<&Profile> {
-        self.profiles
+        let mut applicable = self
+            .profiles
             .iter()
-            .find(|p| p.applies_to_roles.iter().any(|r| r == slug))
+            .filter(|p| p.applies_to_roles.iter().any(|r| r == slug));
+        let mut legacy = applicable.clone();
+        legacy
+            .find(|p| p.name.as_deref() != Some("base") && p.project != "base")
+            .or_else(|| applicable.next())
     }
 
     /// Compile an applied profile into the role's checklist text: the agent
@@ -595,6 +617,516 @@ pub fn load_profiles(dir: &Path) -> StoreResult<Vec<Profile>> {
         profiles.push(profile);
     }
     Ok(profiles)
+}
+
+// ---------------------------------------------------------------------------
+// Project overlay DELTA (REQ-SP-104/106/107, cycle C1) — base + ratified
+// specifics -> effective profile.
+// ---------------------------------------------------------------------------
+
+/// Binding-slot token grammar: a literal `{{name}}` inside `Probe.cmd`.
+/// After composition, any token still present means the slot is UNRESOLVED —
+/// the probe is BLOCKED before spawn (REQ-SP-105), never fake-FAIL/fake-PASS.
+pub fn unresolved_slot(cmd: &str) -> Option<String> {
+    let open = cmd.find("{{")?;
+    let rest = &cmd[open + 2..];
+    let close = rest.find("}}")?;
+    Some(format!("{{{{{}}}}}", &rest[..close]))
+}
+
+/// Collect every `{{name}}` token name in a command (deduplicated, sorted).
+fn slot_names(cmd: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut hay = cmd;
+    while let Some(o) = hay.find("{{") {
+        let rest = &hay[o + 2..];
+        let Some(c) = rest.find("}}") else { break };
+        let name = rest[..c].trim().to_string();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+        hay = &rest[c + 2..];
+    }
+    names.sort();
+    names
+}
+
+/// One item of the delta file: `bind` fills the slots of a base target
+/// (check OR gate — REQ-SP-104), `add` contributes a new project check with
+/// a declared weight. `ratified_by` is the data-field link to the human
+/// decision that gives the item force (REQ-SP-106, A-5).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OverlayAddPayload {
+    pub statement: String,
+    #[serde(default)]
+    pub detects: Vec<String>,
+    /// mechanical | rubric | hybrid
+    pub verify: String,
+    #[serde(default)]
+    pub probes: Vec<Probe>,
+    #[serde(default)]
+    pub anchors: BTreeMap<String, String>,
+    #[serde(default = "yes")]
+    pub evidence: String,
+    #[serde(default = "either")]
+    pub reviewer: String,
+    #[serde(default)]
+    pub suppression: Option<String>,
+    /// Declared weight, ratified per item (REQ-SP-107); 0 < w < 1.
+    pub weight: f64,
+    /// New error types the added check declares (V1 coverage).
+    #[serde(default)]
+    pub error_types: BTreeMap<String, ErrorTypeDef>,
+    /// Section (evaluation) to place the check in; new sections allowed
+    /// (REQ-SP-104 "add may bring new sections").
+    #[serde(default)]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub section_title: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OverlayItem {
+    /// bind | add
+    pub kind: String,
+    /// bind: an existing base id (check or gate). add: a NEW id.
+    pub target_id: String,
+    /// id of a decisions row (kind=profile_ratification, verdict=APPROVED)
+    /// whose refs cover `target_id`. Non-empty is structural; force is the
+    /// cross-check (A-5) — a dangling/foreign/unapproved ref drops the item.
+    #[serde(default)]
+    pub ratified_by: String,
+    /// bind: slot name -> bound value (replaces `{{name}}` in target probes).
+    #[serde(default)]
+    pub slots: BTreeMap<String, String>,
+    /// bind: the explicitly ratified refinement of the base wording
+    /// (REQ-SP-104 — the only way a bind may restate a target).
+    #[serde(default)]
+    pub refine_statement: Option<String>,
+    /// add: the full check payload.
+    #[serde(default)]
+    pub add: Option<OverlayAddPayload>,
+}
+
+/// The delta file: NOT a Profile — parsing it as one must fail, and the
+/// composition loader reads it with THIS type only (REQ-SP-106, closing RV2:
+/// `evaluation/*.yaml` keeps its "full Profile" semantics untouched).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProfileOverlay {
+    /// projects.id the overlay is keyed by (stable PK, not display name).
+    pub project_id: String,
+    /// The base this delta was authored against, `name@version` — kept as a
+    /// divergence signal (ratified OQ-SP-4: never silently re-drops bindings).
+    pub base_identity: String,
+    pub overlay_version: u32,
+    #[serde(default)]
+    pub items: Vec<OverlayItem>,
+}
+
+/// Outcome of composing base + ratified items.
+#[derive(Clone, Debug)]
+pub struct Composition {
+    pub effective: Profile,
+    /// target_ids of items that entered force.
+    pub applied: Vec<String>,
+    /// target_ids dropped by the force cross-check (announced loudly —
+    /// REQ-SP-106 "не прошедший item не входит в композицию и оглашается").
+    pub dropped: Vec<String>,
+    /// Non-fatal signals (e.g. base-form divergence per ratified OQ-SP-4:
+    /// a bound slot whose token no longer exists in the target — the item
+    /// stays in force, nothing is reset silently; re-ratification is the
+    /// C3 surface's call).
+    pub warnings: Vec<String>,
+}
+
+/// The conventional delta path for one project (single file per projects.id
+/// — REQ-SP-106 AC "два оверлея на один id невозможны (один путь)").
+pub fn overlay_path(cfg_dir: &Path, project_id: &str) -> PathBuf {
+    cfg_dir
+        .join("profiles")
+        .join(format!("{project_id}.overlay.yaml"))
+}
+
+/// Read and structurally validate the delta (layer (a) of REQ-SP-106)
+/// BEFORE any composition. Structural violations are hard errors naming
+/// the item: unknown kind, bind on a missing target, add colliding with a
+/// base id or another item, weight out of (0,1), empty ratified_by.
+pub fn load_overlay(path: &Path) -> StoreResult<ProfileOverlay> {
+    let overlay: ProfileOverlay = parse_yaml(path)?;
+    Ok(overlay)
+}
+
+fn base_target_ids(base: &Profile) -> HashSet<&str> {
+    let mut ids: HashSet<&str> = HashSet::new();
+    for g in &base.gates {
+        ids.insert(g.id.as_str());
+    }
+    for c in base.checks() {
+        ids.insert(c.id.as_str());
+    }
+    ids
+}
+
+/// Structural validation of the delta against the base (layer (a)).
+pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> Result<(), String> {
+    let base_ids = base_target_ids(base);
+    let mut seen: HashSet<&str> = HashSet::new();
+    for item in &overlay.items {
+        let who = format!("overlay item `{}`", item.target_id);
+        if item.ratified_by.trim().is_empty() {
+            return Err(format!(
+                "{who}: `ratified_by` is empty — an item without a human decision reference has no force path (A-5/REQ-SP-106)"
+            ));
+        }
+        match item.kind.as_str() {
+            "bind" => {
+                if !base_ids.contains(item.target_id.as_str()) {
+                    return Err(format!(
+                        "{who}: bind target `{}` does not exist in the base (checks or gates) — nothing to bind",
+                        item.target_id
+                    ));
+                }
+            }
+            "add" => {
+                if base_ids.contains(item.target_id.as_str()) {
+                    return Err(format!(
+                        "{who}: add target collides with an existing base id — a new project check must carry a NEW id (REQ-SP-104/V2)"
+                    ));
+                }
+                let Some(a) = &item.add else {
+                    return Err(format!("{who}: kind=add requires the `add` payload"));
+                };
+                if !(0.0 < a.weight && a.weight < 1.0) {
+                    return Err(format!(
+                        "{who}: declared weight {} must be 0 < w < 1 (REQ-SP-106)",
+                        a.weight
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "{who}: kind `{other}` is not one of bind|add (REQ-SP-106)"
+                ));
+            }
+        }
+        if !seen.insert(item.target_id.as_str()) {
+            return Err(format!("{who}: duplicate target_id among overlay items"));
+        }
+    }
+    Ok(())
+}
+
+/// Compose the effective profile: base + the RATIFIED subset of the delta.
+/// `ratified` maps decision id -> refs (only rows with
+/// kind=profile_ratification, verdict=APPROVED reach it — the force
+/// cross-check, layer (b)). Items whose `ratified_by` does not resolve to
+/// such a row whose refs cover the item are DROPPED and announced, so a
+/// manual edit without a valid decision reference never enters force —
+/// already in C1-without-C3, where the table has no such rows and every
+/// overlay resolves to the pure base (A-5).
+///
+/// Weights follow REQ-SP-107 exactly: W = Σ ratified add weights;
+/// W >= 1 rejects the composition naming the items; otherwise base weights
+/// scale by (1−W) and adds carry their declared weight. Bind never touches
+/// weights (REQ-SP-107 AC). Application order is sorted by target id, so
+/// one base@version + overlay@version yields a byte-identical effective
+/// profile (REQ-SP-103 AC) regardless of file order.
+pub fn compose_profile(
+    base: &Profile,
+    overlay: &ProfileOverlay,
+    ratified: &BTreeMap<String, Vec<String>>,
+) -> Result<Composition, String> {
+    validate_overlay(overlay, base)?;
+
+    let mut applied: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Deterministic processing order: items sorted by target_id.
+    let mut ordered: Vec<&OverlayItem> = overlay.items.iter().collect();
+    ordered.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+    let in_force: Vec<&OverlayItem> = ordered
+        .into_iter()
+        .filter(|item| {
+            let force = ratified
+                .get(&item.ratified_by)
+                .is_some_and(|refs| refs.iter().any(|r| r == &item.target_id));
+            if force {
+                applied.push(item.target_id.clone());
+            } else {
+                dropped.push(item.target_id.clone());
+            }
+            force
+        })
+        .collect();
+
+    let mut eff = base.clone();
+
+    // Binds: fill slot tokens of the target — check OR gate (REQ-SP-104).
+    // The target stays the same single id; no second check/gate appears.
+    for item in in_force.iter().filter(|i| i.kind == "bind") {
+        // Token form read BEFORE substitution: the ratified OQ-SP-4
+        // divergence signal is a declared slot that is not part of the
+        // target's current form (the base drifted under a ratified
+        // binding). The binding is NOT silently dropped — it is announced.
+        let mut tokens: Vec<String> = eff
+            .gates
+            .iter()
+            .filter(|g| g.id == item.target_id)
+            .flat_map(|g| g.probes.iter().flat_map(|p| slot_names(&p.cmd)))
+            .collect();
+        for e in &eff.evaluations {
+            for c in e.checks.iter().filter(|c| c.id == item.target_id) {
+                tokens.extend(c.probes.iter().flat_map(|p| slot_names(&p.cmd)));
+            }
+        }
+        tokens.sort();
+        tokens.dedup();
+
+        for g in &mut eff.gates {
+            if g.id != item.target_id {
+                continue;
+            }
+            if let Some(r) = &item.refine_statement {
+                g.desc = r.clone();
+            }
+            for p in &mut g.probes {
+                for (name, value) in &item.slots {
+                    p.cmd = p.cmd.replace(&format!("{{{{{name}}}}}"), value);
+                }
+            }
+        }
+        for e in &mut eff.evaluations {
+            for c in &mut e.checks {
+                if c.id != item.target_id {
+                    continue;
+                }
+                if let Some(r) = &item.refine_statement {
+                    c.statement = r.clone();
+                }
+                for p in &mut c.probes {
+                    for (name, value) in &item.slots {
+                        p.cmd = p.cmd.replace(&format!("{{{{{name}}}}}"), value);
+                    }
+                }
+            }
+        }
+        for name in item.slots.keys() {
+            if !tokens.contains(name) {
+                warnings.push(format!(
+                    "bind `{}`: slot `{{{{{name}}}}}` is absent from the base target's probe form — the base has diverged; the ratified binding is retained and re-ratification is required (OQ-SP-4)",
+                    item.target_id
+                ));
+            }
+        }
+    }
+
+    // Adds: new project checks under NEW ids, with their declared weights
+    // and any new error types / sections (REQ-SP-104).
+    let mut add_weights: Vec<(String, f64)> = Vec::new();
+    for item in in_force.iter().filter(|i| i.kind == "add") {
+        let who = format!("add `{}`", item.target_id);
+        let a = item
+            .add
+            .as_ref()
+            .ok_or_else(|| format!("{who}: kind=add requires the `add` payload"))?;
+        for (t, def) in &a.error_types {
+            match eff.error_types.get(t) {
+                Some(existing)
+                    if existing.desc == def.desc && existing.severity == def.severity => {}
+                Some(_) => {
+                    return Err(format!(
+                        "{who}: error type `{t}` collides with a different declaration in the base"
+                    ));
+                }
+                None => {
+                    eff.error_types.insert(t.clone(), def.clone());
+                }
+            }
+        }
+        let check = CheckDef {
+            id: item.target_id.clone(),
+            statement: a.statement.clone(),
+            detects: a.detects.clone(),
+            verify: a.verify.clone(),
+            probes: a.probes.clone(),
+            anchors: a.anchors.clone(),
+            evidence: a.evidence.clone(),
+            reviewer: a.reviewer.clone(),
+            suppression: a.suppression.clone(),
+        };
+        let section = a
+            .section
+            .clone()
+            .unwrap_or_else(|| "project-overlay".into());
+        if let Some(e) = eff.evaluations.iter_mut().find(|e| e.id == section) {
+            e.checks.push(check);
+        } else {
+            eff.evaluations.push(EvaluationDef {
+                id: section.clone(),
+                title: a
+                    .section_title
+                    .clone()
+                    .unwrap_or_else(|| "Project specifics (ratified overlay)".into()),
+                applies_to: None,
+                checks: vec![check],
+            });
+        }
+        add_weights.push((item.target_id.clone(), a.weight));
+    }
+
+    // Weights (REQ-SP-107): proportional rescaling of the base preserves
+    // its hierarchy; only the declared add weights are human-ratified
+    // numbers. Sums run over sorted ids so the result is order-independent.
+    let w_add: f64 = add_weights.iter().map(|(_, w)| w).sum();
+    if w_add >= 1.0 {
+        let ids: Vec<String> = add_weights.iter().map(|(i, _)| i.clone()).collect();
+        return Err(format!(
+            "overlay rejected (REQ-SP-107): ratified add weights sum {w_add} >= 1 — items: {}",
+            ids.join(", ")
+        ));
+    }
+    if w_add > 0.0 {
+        // `eff.scoring.weights` still holds ONLY base weights here (adds
+        // are inserted below), so scaling every entry scales the base.
+        for w in eff.scoring.weights.values_mut() {
+            *w *= 1.0 - w_add;
+        }
+    }
+    for (id, w) in add_weights {
+        eff.scoring.weights.insert(id, w);
+    }
+
+    // Grammar V1-V8 checks the EFFECTIVE profile (REQ-SP-106: not each
+    // file separately); V2 uniqueness covers base ids + applied adds.
+    eff.validate()
+        .map_err(|e| format!("effective profile invalid after composition: {e}"))?;
+
+    Ok(Composition {
+        effective: eff,
+        applied,
+        dropped,
+        warnings,
+    })
+}
+
+/// Outcome of resolving the factory layers for one task/project: the
+/// effective profile plus the loader's announcements (dropped non-ratified
+/// items and divergence warnings — REQ-SP-106 "оглашается загрузчиком").
+#[derive(Clone, Debug)]
+pub struct Resolution {
+    pub profile: Option<Profile>,
+    pub warnings: Vec<String>,
+}
+
+/// Deterministic per-project resolution (REQ-SP-103, replaces the old
+/// "first profile that mentions quality-auditor"):
+/// 1. the task's project id selects the delta `profiles/<projects.id>.overlay.yaml`;
+///    its `base_identity` names the base inside `evaluation/`. Force is decided
+///    by the decisions cross-check, so C1-without-C3 (no `profile_ratification`
+///    rows yet) composes to the PURE BASE — expected intermediate behavior (A-5).
+/// 2. without an overlay: a profile OWNED by the project (`project:` equals the
+///    projects.name — the pre-overlay full-profile path, kept working for the
+///    existing v11 home until C5 migrates it; a task of project A never runs
+///    under project B's profile), else the factory base — the first
+///    quality-auditor profile of the sorted evaluation/ namespace.
+pub fn resolve_effective_profile(
+    store: &Store,
+    cfg_dir: &Path,
+    project_id: Option<&str>,
+) -> StoreResult<Resolution> {
+    let profiles = load_profiles(&cfg_dir.join("evaluation"))?;
+    let fallback = profiles
+        .iter()
+        .find(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"));
+    let Some(pid) = project_id else {
+        // No project: judged on the base (a clean home carries exactly it).
+        return Ok(Resolution {
+            profile: fallback.cloned(),
+            warnings: Vec::new(),
+        });
+    };
+    let path = overlay_path(cfg_dir, pid);
+    if path.is_file() {
+        let overlay = load_overlay(&path).map_err(|e| match e {
+            StoreError::Config(m) => cfg_err(format!("{}: {m}", path.display())),
+            other => other,
+        })?;
+        if overlay.project_id != pid {
+            return Err(cfg_err(format!(
+                "{}: header project_id `{}` does not match the key `{pid}` — the overlay is keyed by projects.id (REQ-SP-103/106)",
+                path.display(),
+                overlay.project_id
+            )));
+        }
+        // OQ-SP-4 (ratified): the base is matched by NAME; a version drift
+        // does not reset bindings — composition proceeds and only genuinely
+        // unresolvable slot forms surface as warnings above.
+        let base_name = overlay.base_identity.split('@').next().unwrap_or("");
+        let base = profiles
+            .iter()
+            .find(|p| p.name.as_deref() == Some(base_name) && !p.applies_to_roles.is_empty())
+            .or_else(|| {
+                profiles
+                    .iter()
+                    .find(|p| p.name.as_deref() == Some(base_name))
+            })
+            .ok_or_else(|| {
+                cfg_err(format!(
+                    "{}: base `{}` named by base_identity is not in {} — the overlay references a base this home does not have",
+                    path.display(),
+                    overlay.base_identity,
+                    cfg_dir.join("evaluation").display()
+                ))
+            })?;
+        let ratified = store.ratified_profile_refs()?;
+        let comp = compose_profile(base, &overlay, &ratified)
+            .map_err(|e| cfg_err(format!("{}: {e}", path.display())))?;
+        let mut warnings: Vec<String> = comp
+            .dropped
+            .iter()
+            .map(|id| {
+                format!(
+                    "overlay item `{id}` has no valid profile_ratification/APPROVED decision covering it — NOT in force, project judged without it (A-5)"
+                )
+            })
+            .chain(comp.warnings)
+            .collect();
+        warnings.sort();
+        Ok(Resolution {
+            profile: Some(comp.effective),
+            warnings,
+        })
+    } else {
+        // No overlay for this project (REQ-SP-103).
+        // 1. A profile OWNED by the task's project (`project:` equals the
+        //    projects.name) keeps the pre-overlay full-profile path working
+        //    — the existing devai v11 home judges devai tasks until C5
+        //    migrates it (operator decision: no working profile breaks now).
+        // 2. Otherwise prefer a NEUTRAL profile — one whose `project` is not
+        //    the name of any registered project. A profile owned by another
+        //    project must never judge this one: "задача проекта A не
+        //    исполняется ни по одной проверке проекта B" cuts both ways.
+        // 3. Legacy homes without a neutral profile keep today's fallback.
+        let projects: Vec<String> = store.list_projects()?.into_iter().map(|p| p.name).collect();
+        let auditors: Vec<&Profile> = profiles
+            .iter()
+            .filter(|p| p.applies_to_roles.iter().any(|r| r == "quality-auditor"))
+            .collect();
+        let task_project = store.get_project(pid)?.map(|p| p.name);
+        let owned: Option<&Profile> = task_project
+            .as_deref()
+            .and_then(|name| auditors.iter().copied().find(|p| p.project == name));
+        let neutral: Option<&Profile> = auditors
+            .iter()
+            .copied()
+            .find(|p| !projects.contains(&p.project));
+        let chosen = owned.or(neutral).or(fallback).cloned();
+        Ok(Resolution {
+            profile: chosen,
+            warnings: Vec::new(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -980,6 +1512,9 @@ mod tests {
         assert_eq!(role.output_contract.unwrap().version, 2);
     }
 
+    /// REQ-SP-101/102 (cycle C1): the factory ships the ABSTRACT BASE only —
+    /// one profile, no project specifics anywhere, binding slots open, and it
+    /// compiles into the auditor exactly like any full Profile.
     #[test]
     fn factory_profile_loads_valid_and_compiles_into_auditor() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -988,17 +1523,57 @@ mod tests {
         // The factory profile passes grammar validation on load.
         assert_eq!(cfg.profiles.len(), 1);
         let p = &cfg.profiles[0];
-        assert_eq!(p.project, "devai");
-        assert_eq!(p.gates.len(), 4);
-        assert!(p.checks().iter().any(|c| c.id == "arch/principles"));
+        assert_eq!(p.project, "base");
+        assert_eq!(p.identity(), "base@1");
+        assert!(
+            p.applies_to_roles.iter().any(|r| r == "quality-auditor"),
+            "the engine must find the base for the auditor"
+        );
+        assert_eq!(p.gates.len(), 3);
+        assert!(p.checks().iter().any(|c| c.id == "cl/meaningful-names"));
+        assert!(p.checks().iter().any(|c| c.id == "pr/spec-fidelity"));
+        // AC REQ-SP-101: no devai specifics at start — no block, no name.
+        assert!(
+            !p.evaluations.iter().any(|e| e.id == "platform-invariants"),
+            "the base carries no platform-invariants block"
+        );
+        let text = fs::read_to_string(dir.path().join("evaluation/base.yaml")).unwrap();
+        for leak in ["devai", "cargo", "crates", "rusqlite", "thiserror"] {
+            assert!(
+                !text.contains(leak),
+                "the factory base mentions concrete-stack token `{leak}`"
+            );
+        }
+        // AC REQ-SP-102: every probe of the base is a pure binding slot —
+        // no concrete command lives outside {{...}} syntax (checks AND gates).
+        for g in &p.gates {
+            for pr in &g.probes {
+                assert!(
+                    unresolved_slot(&pr.cmd).is_some(),
+                    "gate `{}` probe `{}` must be an open slot in the base",
+                    g.id,
+                    pr.cmd
+                );
+            }
+        }
+        for c in p.checks() {
+            for pr in &c.probes {
+                assert!(
+                    unresolved_slot(&pr.cmd).is_some(),
+                    "check `{}` probe `{}` must be an open slot in the base",
+                    c.id,
+                    pr.cmd
+                );
+            }
+        }
         // Floors are derived from error_type severity, never declared per check.
-        let lb = p
+        let inj = p
             .checks()
             .into_iter()
-            .find(|c| c.id == "arch/layer-boundaries")
+            .find(|c| c.id == "sec/injection")
             .unwrap();
-        assert_eq!(p.worst_severity(lb), Some("catastrophic"));
-        assert_eq!(p.floor_for(lb), Some(0.7));
+        assert_eq!(p.worst_severity(inj), Some("catastrophic"));
+        assert_eq!(p.floor_for(inj), Some(0.7));
         // Auditor instructions carry the profile-compiled rubric checklist.
         let rf = cfg
             .roles
@@ -1006,18 +1581,22 @@ mod tests {
             .find(|r| r.slug == "quality-auditor")
             .unwrap();
         let role = cfg.build_role(rf, Utc::now()).unwrap();
-        assert!(role.instructions.contains("Evaluation profile `devai`"));
+        assert!(role.instructions.contains("Evaluation profile `base`"));
         assert!(
-            role.instructions.contains("[arch/idiom-consistency]"),
+            role.instructions.contains("[mt/dry]"),
             "{}",
             role.instructions
         );
         assert!(role.instructions.contains("anchors: 1.0"));
         // Human-signed checks are named but excluded from agent scoring.
         assert!(role.instructions.contains("Human-signed checks"));
-        assert!(role.instructions.contains("arch/principles"));
+        assert!(role.instructions.contains("pr/spec-fidelity"));
         // Mechanical checks never appear in the agent's checklist.
-        assert!(!role.instructions.contains("[corr/transitions] (mechanical"));
+        assert!(
+            !role
+                .instructions
+                .contains("[cl/style-consistency] (mechanical")
+        );
         // Flat criteria no longer apply to the auditor (profile supersedes).
         assert!(!role.instructions.contains("Verdict rule:"));
     }
@@ -1029,14 +1608,10 @@ mod tests {
         let mut cfg = load(dir.path()).unwrap();
         let p = cfg.profiles.first_mut().unwrap();
         // V7: dropping one weight breaks the sum and the coverage set.
-        let restored = p
-            .scoring
-            .weights
-            .remove("arch/no-magic")
-            .expect("weight present");
+        let restored = p.scoring.weights.remove("mt/dry").expect("weight present");
         assert!(p.validate().unwrap_err().contains("V7"));
         // V1: an undeclared detected type is rejected.
-        p.scoring.weights.insert("arch/no-magic".into(), restored);
+        p.scoring.weights.insert("mt/dry".into(), restored);
         let c = p.evaluations[0].checks[0].clone();
         p.evaluations[0].checks[0].detects = vec!["nonexistent/type".into()];
         assert!(p.validate().unwrap_err().contains("V1"));
@@ -1089,6 +1664,69 @@ mod tests {
         assert!(
             all.iter()
                 .any(|r| r.slug == "quality-auditor" && r.version == declared + 1)
+        );
+    }
+
+    /// C1 transition precedence (REQ-SP-101 × the operator's approved
+    /// decision "до C5 механизм не должен ломать работающий профиль"):
+    /// re-init adds `base.yaml` to an existing home, and the auditor role
+    /// must NOT silently swap its checklist from the home's owned legacy
+    /// full profile to the factory base — legacy wins while such a profile
+    /// exists; with base alone (a clean home) the base compiles.
+    #[test]
+    fn legacy_owned_profile_outlives_the_factory_base_until_c5() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfgdir = dir.path().join("config");
+        materialize_if_absent(&cfgdir).unwrap();
+        let cfg = load(&cfgdir).unwrap();
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(
+            cfg.profile_for("quality-auditor").unwrap().identity(),
+            "base@1"
+        );
+        // Simulate the existing home: quality.yaml v11 alongside the new base.
+        fs::write(
+            cfgdir.join("evaluation/quality.yaml"),
+            r#"version: 11
+project: devai
+applies_to_roles: [quality-auditor]
+error_types:
+  architecture/layer-leak: { desc: d, severity: catastrophic }
+gates:
+  - id: build-green
+    probes: [{ cmd: "cargo build --workspace", pass_exit: [0] }]
+evaluations:
+  - id: platform-invariants
+    title: Продуктовые инварианты
+    checks:
+      - id: arch/legacy-check
+        statement: legacy invariant
+        detects: [architecture/layer-leak]
+        verify: rubric
+        anchors: { "1.0": a, "0.5": b, "0.0": c }
+        reviewer: human
+scoring:
+  theta: 0.8
+  floors: { catastrophic: 0.7 }
+  blocked_policy: { max_blocked_weight: 0.2 }
+  weights: { arch/legacy-check: 1.0 }
+"#,
+        )
+        .unwrap();
+        let cfg = load(&cfgdir).unwrap();
+        assert_eq!(cfg.profiles.len(), 2);
+        let p = cfg.profile_for("quality-auditor").unwrap();
+        assert_eq!(p.project, "devai");
+        assert_eq!(p.version, 11);
+        let rf = cfg
+            .roles
+            .iter()
+            .find(|r| r.slug == "quality-auditor")
+            .unwrap();
+        let role = cfg.build_role(rf, Utc::now()).unwrap();
+        assert!(
+            role.instructions.contains("Evaluation profile `devai`"),
+            "the legacy checklist survives re-init of an existing home"
         );
     }
 
@@ -1486,7 +2124,7 @@ mod tests {
         assert!(
             written
                 .iter()
-                .any(|p| p.file_name().is_some_and(|n| n == "quality.yaml")
+                .any(|p| p.file_name().is_some_and(|n| n == "base.yaml")
                     && p.parent()
                         .is_some_and(|d| d.file_name().is_some_and(|n| n == "evaluation"))),
             "re-init must bring the new factory profile into an old home: {written:?}"

@@ -2760,3 +2760,83 @@ fn the_empty_rework_gate_trips_the_return_text_into_the_next_window() {
         "exactly one carrier — the old quality.returned is cut, the gate supplies its text (no double-quote)"
     );
 }
+
+/// REQ-SP-103 (cycle C1): `Engine::new` no longer takes "the first profile
+/// mentioning quality-auditor" — an unpinned engine resolves the EFFECTIVE
+/// profile per bound task: factory base + the project's RATIFIED overlay
+/// items, keyed by projects.id; a sibling project with no overlay judges on
+/// the pure base. Store-level composition tests pin the delta mechanics
+/// (`devai-store/tests/overlay.rs`); this pins the engine's wiring to the
+/// same resolution.
+#[test]
+fn engine_binds_tasks_to_their_projects_effective_profile() {
+    let (d, store) = store(); // factory home: evaluation/base.yaml materialised
+    let cfg = d.path().join("config");
+    let alpha = Project::new("engine-alpha", "", vec![], Utc::now());
+    store.create_project(&alpha).unwrap();
+    let beta = Project::new("engine-beta", "", vec![], Utc::now());
+    store.create_project(&beta).unwrap();
+    let ta = Task::new("alpha task", "d", Some(alpha.id), Utc::now());
+    store.create_task(&ta).unwrap();
+    let tb = Task::new("beta task", "d", Some(beta.id), Utc::now());
+    store.create_task(&tb).unwrap();
+
+    // Human ratification covering BOTH overlay items of alpha.
+    let dec = Decision {
+        id: new_id(),
+        task_id: ta.id,
+        kind: decision_kind::PROFILE_RATIFICATION.into(),
+        verdict: Verdict::Approved,
+        actor: "operator".into(),
+        rationale: Some("section ratified".into()),
+        refs: vec!["build-green".into(), "dom/x".into()],
+        created_at: Utc::now(),
+    };
+    store.record_decision(&dec).unwrap();
+    let overlay_dir = cfg.join("profiles");
+    std::fs::create_dir_all(&overlay_dir).unwrap();
+    std::fs::write(
+        overlay_dir.join(format!("{}.overlay.yaml", alpha.id)),
+        format!(
+            r#"project_id: "{}"
+base_identity: base@1
+overlay_version: 1
+items:
+  - {{kind: bind, target_id: build-green, ratified_by: {}, slots: {{build_cmd: "true"}}}}
+  - {{kind: add, target_id: dom/x, ratified_by: {}, add: {{statement: domain invariant x, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.10}}}}
+"#,
+            alpha.id, dec.id, dec.id
+        ),
+    )
+    .unwrap();
+
+    let engine = Engine::new(&store);
+    let (pa, wa) = engine.effective_profile(&ta).unwrap();
+    let pa = pa.expect("alpha resolves to a profile");
+    assert!(wa.is_empty(), "{wa:?}");
+    assert_eq!(pa.identity(), "base@1", "the delta layers onto the base");
+    let bg = pa.gates.iter().find(|g| g.id == "build-green").unwrap();
+    assert_eq!(
+        bg.probes[0].cmd, "true",
+        "ratified bind reached the engine's resolution"
+    );
+    assert!(
+        pa.checks().iter().any(|c| c.id == "dom/x"),
+        "ratified add reached the engine's resolution"
+    );
+    assert!(
+        (pa.scoring.weights["pr/spec-fidelity"] - 0.06 * 0.9).abs() < 1e-12,
+        "REQ-SP-107 rescaling is visible through the engine too"
+    );
+
+    let (pb, wb) = engine.effective_profile(&tb).unwrap();
+    let pb = pb.expect("beta resolves to a profile");
+    assert!(wb.is_empty(), "{wb:?}");
+    assert!(
+        pb.gates
+            .iter()
+            .any(|g| g.probes[0].cmd.contains("{{build_cmd}}")),
+        "beta keeps the pure base — alpha's binding must not leak"
+    );
+    assert!(!pb.checks().iter().any(|c| c.id == "dom/x"));
+}

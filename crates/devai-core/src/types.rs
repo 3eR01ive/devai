@@ -742,6 +742,17 @@ pub mod decision_kind {
     /// auditor scoring spec-fidelity never saw the rejected alternative).
     /// Recorded by the human-invoked CLI `task approve` only.
     pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
+    /// Profile overlay ratification (REQ-SP-301 schema, load-side mechanism
+    /// already in C1 per REQ-SP-106/A-5): a human decision confirming one
+    /// overlay item (or a section of items) — `refs` carry the item target
+    /// ids it covers, and ONLY rows of this kind with verdict APPROVED give
+    /// a `profiles/<projects.id>.overlay.yaml` item force. The store-side
+    /// read is `Store::ratified_profile_refs`; the human surface (generic
+    /// decide) is cycle C4 (ratified OQ-SP-6) — the kind exists now so the
+    /// load cross-check and the future surface read the same vocabulary.
+    /// A distinct kind (not requirements_approval/rework_merge) keeps the
+    /// decision history distinguishable by purpose (spec v3 RV5 note).
+    pub const PROFILE_RATIFICATION: &str = "profile_ratification";
     /// The empty-rework gate (REQ-RG-03): the operator's explicit ratification
     /// that a QA return needed NO new changes — `refs` carry the pair
     /// (previous report id, current report id) of exactly one rework cycle, so

@@ -285,9 +285,20 @@ impl FormLoopHost for StageAttempts<'_> {
 pub struct Engine<'a> {
     store: &'a Store,
     max_steps: usize,
-    /// Declarative QA rules: the first assessment profile applying to
-    /// `quality-auditor`, loaded from the home config tree.
+    /// Default assessment profile for task-less callers: the first profile
+    /// of the home applying to `quality-auditor`. Since REQ-SP-103 a TASK's
+    /// audit resolves its EFFECTIVE profile per project (base + ratified
+    /// overlay) via `effective_profile`; this field stays the no-project
+    /// fallback and the slot for an explicit `with_profile` pin.
     profile: Option<Profile>,
+    /// Config tree directory recorded at construction (`$DEVAI_CONFIG` or
+    /// `<home>/config`): the base of per-task profile resolution
+    /// (REQ-SP-103) — resolution never re-reads the ambient environment.
+    cfg_dir: PathBuf,
+    /// True when a caller pinned the profile explicitly (`with_profile`,
+    /// tests, overrides): resolution then stays on the pinned profile and
+    /// does not compose the project's overlay.
+    profile_explicit: bool,
     /// Directory where the platform executes probes (the project workspace).
     workspace: PathBuf,
     /// Explicit human override of the QA freshness gate: re-audit despite a
@@ -349,6 +360,8 @@ impl<'a> Engine<'a> {
             store,
             max_steps: DEFAULT_MAX_STEPS,
             profile,
+            cfg_dir,
+            profile_explicit: false,
             workspace,
             force_reaudit: false,
             response_form,
@@ -373,6 +386,7 @@ impl<'a> Engine<'a> {
     /// Provide the profile explicitly instead of loading it from the home.
     pub fn with_profile(mut self, profile: Profile) -> Self {
         self.profile = Some(profile);
+        self.profile_explicit = true;
         self
     }
 
@@ -429,19 +443,43 @@ impl<'a> Engine<'a> {
     /// dirty-tree digest, the loaded evaluation profile `name@version`, and
     /// every current role definition `slug@version` from the store.
     pub fn current_revision(&self) -> RuntimeResult<WorkspaceRevision> {
-        self.revision_at(&self.workspace)
+        self.revision_at(&self.workspace, self.profile.as_ref())
     }
 
     /// Revision computed against an explicit directory (same four
     /// components); the engine binds an execution to the revision of the
-    /// workspace that execution actually evaluates.
-    fn revision_at(&self, workspace: &Path) -> RuntimeResult<WorkspaceRevision> {
+    /// workspace that execution actually evaluates. The profile component is
+    /// the EFFECTIVE profile resolved for the bound task (REQ-SP-103), not
+    /// a re-derived default.
+    fn revision_at(
+        &self,
+        workspace: &Path,
+        profile: Option<&Profile>,
+    ) -> RuntimeResult<WorkspaceRevision> {
         let roles = self.current_roles()?;
-        Ok(crate::revision::compute(
-            workspace,
-            self.profile.as_ref(),
-            &roles,
-        ))
+        Ok(crate::revision::compute(workspace, profile, &roles))
+    }
+
+    /// The effective assessment profile of one task (REQ-SP-103/106): the
+    /// factory base composed with the project's RATIFIED overlay delta,
+    /// keyed by projects.id. An explicitly pinned profile (tests, overrides)
+    /// bypasses resolution. A present-but-broken overlay is a LOUD error:
+    /// judging a project under silently different rules is exactly what the
+    /// human ratification gate forbids, so the stage refuses to run.
+    /// Public because the layer view (C4 `devai profile show` surface) and
+    /// verification both read the SAME resolution the stages bind to — one
+    /// source of truth, never a second derivation.
+    pub fn effective_profile(&self, task: &Task) -> RuntimeResult<(Option<Profile>, Vec<String>)> {
+        if self.profile_explicit {
+            return Ok((self.profile.clone(), Vec::new()));
+        }
+        let pid = task.project_id.map(|i| i.to_string());
+        let r = devai_store::config::resolve_effective_profile(
+            self.store,
+            &self.cfg_dir,
+            pid.as_deref(),
+        )?;
+        Ok((r.profile, r.warnings))
     }
 
     /// The workspace a stage of THIS task evaluates against: the task's
@@ -645,7 +683,10 @@ impl<'a> Engine<'a> {
         if !bound.is_comparable() {
             return Ok(None); // no git HEAD/digest: never report fresh
         }
-        let fresh = self.revision_at(&self.eval_workspace(task))?;
+        let fresh = {
+            let (profile, _) = self.effective_profile(task)?;
+            self.revision_at(&self.eval_workspace(task), profile.as_ref())?
+        };
         if fresh == bound {
             Ok(Some((report, bound)))
         } else {
@@ -763,18 +804,31 @@ impl<'a> Engine<'a> {
         {
             inputs.push((crate::context::REWORK_CONTEXT_LABEL.to_string(), section));
         }
+        // REQ-SP-103: the stage is bound to the task's project EFFECTIVE
+        // profile — factory base composed with the ratified overlay delta
+        // (keyed by projects.id). The SAME profile feeds the workspace
+        // revision below and the QA assembly, so freshness and judgement
+        // read one ruleset, never the ambient first-match of the past.
+        let (profile, binding_warnings) = self.effective_profile(task)?;
         // QA stage: the platform runs the profile's probes FIRST, so the
         // auditor sees real mechanical evidence and cannot invent any.
         let eval_run = if is_qa {
-            let profile = self.profile.as_ref().ok_or_else(|| {
-                let dir = std::env::var_os("DEVAI_CONFIG")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| self.store.root().join("config"));
-                RuntimeError::MissingProfile(dir.join("evaluation").display().to_string())
+            let profile = profile.as_ref().ok_or_else(|| {
+                RuntimeError::MissingProfile(self.cfg_dir.join("evaluation").display().to_string())
             })?;
             // REQ-WT-03: probes measure the task's evaluation workspace —
             // the isolation worktree once one is live for this task.
-            let run = evaluation::execute(profile, &self.eval_workspace(task));
+            let mut run = evaluation::execute(profile, &self.eval_workspace(task));
+            if !binding_warnings.is_empty() {
+                // REQ-SP-106: the delta loader ANNOUNCES the items it
+                // dropped (no valid ratification) and base-divergence
+                // signals — platform-side facts the auditor must see;
+                // never a silent narrowing of the ruleset.
+                run.evidence_text.push_str(&format!(
+                    "\nOVERLAY LOADER ANNOUNCEMENTS (cross-check, not probe results): {}",
+                    binding_warnings.join("; ")
+                ));
+            }
             inputs.push((
                 "MECHANICAL_EVIDENCE (platform-run probes; rubric scores are yours to confirm)"
                     .to_string(),
@@ -816,7 +870,7 @@ impl<'a> Engine<'a> {
         // The computation targets the task's EVALUATION workspace: main
         // checkout before any worktree exists, the worktree once one does
         // (the row then binds exactly what the stage measures, REQ-WT-03).
-        let revision = self.revision_at(&self.eval_workspace(task))?;
+        let revision = self.revision_at(&self.eval_workspace(task), profile.as_ref())?;
         // The single-writer owner identity (REQ-SW-03): the process opening
         // THIS row — the engine's own `task run` process, observed
         // platform-side exactly like the revision above, never supplied by
@@ -1172,10 +1226,7 @@ impl<'a> Engine<'a> {
         } else {
             match (&eval_run, is_qa) {
                 (Some(run), true) => {
-                    let profile = self
-                        .profile
-                        .as_ref()
-                        .expect("eval_run implies profile present");
+                    let profile = profile.as_ref().expect("eval_run implies profile present");
                     // The adapter already gate-checked this reply; a re-parse
                     // failure here is the PLATFORM's assembly breaking, never a
                     // role form defect (REQ-FG-03 AC2).
