@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: style gate (cl/style-consistency)
+        run: cargo fmt --all -- --check
+      - name: build
+        run: cargo build --workspace
+      - name: tests
+        run: cargo test --workspace

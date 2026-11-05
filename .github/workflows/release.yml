@@ -1,0 +1,34 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build (release)
+        run: cargo build --release --workspace
+      - name: package
+        run: |
+          set -euo pipefail
+          pkg="devai-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "dist/$pkg"
+          cp target/release/devai "dist/$pkg/"
+          cp README.md "dist/$pkg/"
+          if [ -f LICENSE ]; then cp LICENSE "dist/$pkg/"; fi
+          tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
+          (cd dist && sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/devai-*.tar.gz
+            dist/devai-*.sha256
+          fail_on_missing_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
