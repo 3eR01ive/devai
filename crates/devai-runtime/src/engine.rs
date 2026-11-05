@@ -562,6 +562,14 @@ impl<'a> Engine<'a> {
                 return Err(RuntimeError::StepLimit(self.max_steps, task.state.as_str()));
             }
 
+            // REQ-SP-103 + R6 (pf/io-churn): resolve the task's effective
+            // profile ONCE per stage iteration and pass the result down.
+            // The QA freshness gate and the stage execution used to run
+            // two full reads+parses of the config tree for one stage; both
+            // now consume this single resolution — one source of truth for
+            // freshness AND for judgement.
+            let (profile, binding_warnings) = self.effective_profile(&task)?;
+
             // QA freshness gate (REQ-005): BEFORE launching any auditor run,
             // compare the freshly computed workspace revision with the one
             // embedded in the CURRENT quality report. If the workspace is
@@ -571,7 +579,9 @@ impl<'a> Engine<'a> {
             // An unbound report (@1..@3, or a non-git workspace) can never be
             // proven fresh: the gate is inert and the audit proceeds.
             if kind == ArtifactKind::QualityReport {
-                if let Some((report, revision)) = self.fresh_bound_report(&task)? {
+                if let Some((report, revision)) =
+                    self.fresh_bound_report(&task, profile.as_ref())?
+                {
                     if self.force_reaudit {
                         // Explicit human override: honor it, persist the
                         // decision + event so the re-audit is attributable.
@@ -612,7 +622,15 @@ impl<'a> Engine<'a> {
                 }
             }
 
-            let step = match self.run_stage(&task, role_slug, kind, agent_name, actor)? {
+            let step = match self.run_stage(
+                &task,
+                role_slug,
+                kind,
+                agent_name,
+                actor,
+                profile,
+                binding_warnings,
+            )? {
                 StageResult::Stepped(step) => step,
                 StageResult::Escalated => {
                     // The form loop exhausted: the task is parked in
@@ -651,9 +669,14 @@ impl<'a> Engine<'a> {
     /// are bound to no recorded state), a non-comparable revision (no git), or
     /// a genuine mismatch. Freshness requires ALL FOUR components to match
     /// (A-002): a profile or role version bump alone is stale, forcing re-audit.
+    /// `profile` is the CALLER's single resolution of the task's effective
+    /// profile for this stage (R6): freshness must be computed against the
+    /// SAME ruleset the stage will run under, and the config tree is read
+    /// once per stage, not once per consumer.
     fn fresh_bound_report(
         &self,
         task: &Task,
+        profile: Option<&Profile>,
     ) -> RuntimeResult<Option<(Artifact, WorkspaceRevision)>> {
         let artifacts = self.store.artifacts(task.id)?;
         // Selection by status=CURRENT alone (REQ-005): schema v3 keeps at
@@ -683,10 +706,10 @@ impl<'a> Engine<'a> {
         if !bound.is_comparable() {
             return Ok(None); // no git HEAD/digest: never report fresh
         }
-        let fresh = {
-            let (profile, _) = self.effective_profile(task)?;
-            self.revision_at(&self.eval_workspace(task), profile.as_ref())?
-        };
+        // R6: no second resolution here — the caller's single per-stage
+        // effective profile is the freshness basis, identical to what the
+        // stage execution will run under.
+        let fresh = self.revision_at(&self.eval_workspace(task), profile)?;
         if fresh == bound {
             Ok(Some((report, bound)))
         } else {
@@ -700,6 +723,9 @@ impl<'a> Engine<'a> {
     /// the loop exhausted its budget: the task is then parked in
     /// WAITING_FOR_INPUT on a blocking question (OQ-FG-08), no artifact and
     /// no step were produced.
+    /// `profile`/`binding_warnings` are the caller's SINGLE effective-
+    /// profile resolution for this stage (R6) — run_stage never re-reads
+    /// the config tree itself.
     fn run_stage(
         &self,
         task: &Task,
@@ -707,6 +733,8 @@ impl<'a> Engine<'a> {
         kind: ArtifactKind,
         agent_name: &str,
         actor: &str,
+        profile: Option<Profile>,
+        binding_warnings: Vec<String>,
     ) -> RuntimeResult<StageResult> {
         // Sovereignty check first: the role may only run in this stage.
         workflow::check_execution_allowed(role_slug, task)?;
@@ -806,10 +834,10 @@ impl<'a> Engine<'a> {
         }
         // REQ-SP-103: the stage is bound to the task's project EFFECTIVE
         // profile — factory base composed with the ratified overlay delta
-        // (keyed by projects.id). The SAME profile feeds the workspace
-        // revision below and the QA assembly, so freshness and judgement
-        // read one ruleset, never the ambient first-match of the past.
-        let (profile, binding_warnings) = self.effective_profile(task)?;
+        // (keyed by projects.id) — carried in as the caller's single
+        // resolution (R6). The SAME profile feeds the workspace revision
+        // below and the QA assembly, so freshness and judgement read one
+        // ruleset, never the ambient first-match of the past.
         // QA stage: the platform runs the profile's probes FIRST, so the
         // auditor sees real mechanical evidence and cannot invent any.
         let eval_run = if is_qa {
