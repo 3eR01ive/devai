@@ -190,8 +190,8 @@ fn backfill_runs_on_open_lands_deterministic_rows_and_progress_stays_clean() {
     devai(home.path(), &["task", "events", &id]);
     assert_eq!(
         version_of(home.path()),
-        7,
-        "fresh install lands at the ladder top (v7 with the single-writer rung)"
+        8,
+        "fresh install lands at the ladder top (v8 with the task-creation-key registry)"
     );
 
     // The human view stays exactly as it was (ratified OQ1 variant (б)):
@@ -445,8 +445,8 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     );
     assert_eq!(
         version_of(home.path()),
-        7,
-        "the walked ladder ends at the v7 top"
+        8,
+        "the walked ladder ends at the v8 top"
     );
     println!("──── dogfood evidence: APPROVED_DECISIONS with backfilled rows ────\n{section}");
 }

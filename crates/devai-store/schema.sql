@@ -100,6 +100,20 @@ CREATE UNIQUE INDEX task_dependencies_single_active
   ON task_dependencies(task_id, depends_on_id, kind)
   WHERE status = 'ACTIVE';
 
+-- v8: the task-creation command registry (REQ-API-02, ratified OQ-1). An
+-- --idempotency-key create records its key → task binding HERE, inside the
+-- same transaction as the task and its edges: a lost-response retry finds
+-- the original task under the key and returns it instead of duplicating.
+-- The PRIMARY KEY IS the dedup guard — a second create racing to register
+-- the same key violates it and its whole transaction rolls back. Tasks
+-- created without a key have no row; create-one-task-per-call is unchanged.
+CREATE TABLE task_creation_keys(
+  idempotency_key TEXT PRIMARY KEY,
+  task_id         TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at      TEXT NOT NULL
+);
+CREATE INDEX task_creation_keys_task ON task_creation_keys(task_id);
+
 CREATE TABLE artifacts(
   id               TEXT PRIMARY KEY,
   task_id          TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

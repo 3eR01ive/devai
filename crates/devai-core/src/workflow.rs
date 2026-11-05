@@ -390,16 +390,36 @@ pub fn reject_requirements(
     ))
 }
 
+/// R5 QA (rl/error-handling/rel/error-context): the TYPED outcome of
+/// reading one stored report body — the honest vocabulary the gate records
+/// when a side cannot be compared. A missing blob and a corrupt (unparse-
+/// able) body were previously collapsed into the same silent `None` as a
+/// readable body without a `commit` field; the gate's SEMANTICS stay
+/// unchanged (REQ-RG-04: never guess, proceed incomparable), only the
+/// record becomes distinguishable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportBodyRead {
+    /// The body read and parsed; the optional commit is what it names.
+    Readable,
+    /// The blob bytes are absent/unreadable from the store.
+    Missing,
+    /// The blob bytes exist but are not parseable JSON — corruption.
+    Corrupt,
+}
+
 /// One previous IMPLEMENTATION_REPORT as the producer read it from stored
 /// values: identity + version order + the platform-stamped `commit` the body
 /// carries (engine-side stamp of implementation-report@2). `None` commit means
 /// "this report names no comparable commit" (read-only producer, pre-@2 body,
 /// manual publication without the field) — a fact the gate must SEE, not guess.
+/// `body` says WHY the commit could be absent (R5): readable-but-unnamed,
+/// missing, or corrupt.
 #[derive(Clone, Debug)]
 pub struct PriorImplementationReport {
     pub artifact_id: Id,
     pub seq: u32,
     pub commit: Option<String>,
+    pub body: ReportBodyRead,
 }
 
 /// The stored facts a producer assembles AT PUBLICATION TIME for
@@ -414,6 +434,10 @@ pub struct ImplementationReportFacts {
     pub current_report: Id,
     /// Its stamped `commit`, read from the stored body.
     pub current_commit: Option<String>,
+    /// R5 QA (rl/error-handling): WHY the current commit could be absent —
+    /// the typed read outcome of the same body read that produced
+    /// `current_commit` (readable-but-unnamed / missing / corrupt).
+    pub current_body: ReportBodyRead,
     /// Every other IMPLEMENTATION_REPORT of the task; the gate compares
     /// against the one with the highest `seq`.
     pub priors: Vec<PriorImplementationReport>,
@@ -436,6 +460,7 @@ impl ImplementationReportFacts {
             summary: None,
             current_report,
             current_commit: None,
+            current_body: ReportBodyRead::Readable,
             priors: Vec::new(),
             ratifications: Vec::new(),
             qa_return_rationale: None,
@@ -524,12 +549,41 @@ pub fn implementation_reported(
                         // optional by construction — forcing it would punish
                         // the legitimate read-only producer), but the record
                         // says the comparison NEVER RAN.
-                        let side = if prev_sha.is_none() && cur_sha.is_none() {
-                            "neither report names a stamped commit"
-                        } else if prev_sha.is_none() {
-                            "the previous report names no stamped commit"
-                        } else {
-                            "the published report names no stamped commit"
+                        // R5 QA (rl/error-handling/rel/error-context): the
+                        // record now NAMES WHY the commit could not be read —
+                        // a corrupt body and an absent blob are distinct
+                        // facts, no longer collapsed into the silent same
+                        // phrase as a readable body that names no commit.
+                        // Semantics unchanged: never guess, proceed
+                        // incomparable.
+                        let side: &'static str = match (prior.body, facts.current_body) {
+                            (ReportBodyRead::Corrupt, ReportBodyRead::Corrupt) => {
+                                "both report bodies are corrupt (unreadable as JSON)"
+                            }
+                            (ReportBodyRead::Corrupt, _) => {
+                                "the previous report body is corrupt (unreadable as JSON)"
+                            }
+                            (_, ReportBodyRead::Corrupt) => {
+                                "the published report body is corrupt (unreadable as JSON)"
+                            }
+                            (ReportBodyRead::Missing, ReportBodyRead::Missing) => {
+                                "neither report body is present in the store"
+                            }
+                            (ReportBodyRead::Missing, _) => {
+                                "the previous report body is absent from the store"
+                            }
+                            (_, ReportBodyRead::Missing) => {
+                                "the published report body is absent from the store"
+                            }
+                            (ReportBodyRead::Readable, ReportBodyRead::Readable) => {
+                                if prev_sha.is_none() && cur_sha.is_none() {
+                                    "neither report names a stamped commit"
+                                } else if prev_sha.is_none() {
+                                    "the previous report names no stamped commit"
+                                } else {
+                                    "the published report names no stamped commit"
+                                }
+                            }
                         };
                         incomparable = Some((side, Some(prior.artifact_id.to_string())));
                     }

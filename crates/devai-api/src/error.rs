@@ -33,6 +33,16 @@ pub enum ApiError {
     /// A caller-supplied argument the API rejected before touching the store.
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// The value of a caller-supplied field failed the operation's input
+    /// shape (R2 QA, input-validation): typed, so a consumer branches on
+    /// `code()` (`invalid_input`) and on the structured `field`, never on
+    /// the text. Distinct from the free-form `BadRequest` path and from a
+    /// domain `Refused` verdict.
+    #[error("invalid input ({field}): {message}")]
+    InvalidInput {
+        field: &'static str,
+        message: String,
+    },
     /// Artifact content that cannot be presented to a human as text.
     #[error("artifact content is not valid UTF-8")]
     NotUtf8,
@@ -154,6 +164,7 @@ impl ApiError {
             Self::Runtime(e) => runtime_code(e),
             Self::Adapter(e) => adapter_code(e),
             Self::BadRequest(..) => ErrorCode("bad_request"),
+            Self::InvalidInput { .. } => ErrorCode("invalid_input"),
             Self::NotUtf8 => ErrorCode("not_utf8"),
             Self::Io(..) => ErrorCode("io"),
             Self::Refused { code, .. } => *code,
@@ -178,6 +189,11 @@ mod tests {
         assert_eq!(e2.code(), ErrorCode("guard"));
         let e3 = ApiError::BadRequest("x".into());
         assert_eq!(e3.code(), ErrorCode("bad_request"));
+        let e4 = ApiError::InvalidInput {
+            field: "idempotency_key",
+            message: "empty".into(),
+        };
+        assert_eq!(e4.code(), ErrorCode("invalid_input"));
         // Display stays human-readable and carries the inner text (CLI parity).
         assert!(format!("{e}").contains("task `deadbeef` not found"));
     }

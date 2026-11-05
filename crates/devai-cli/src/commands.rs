@@ -98,10 +98,15 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
 fn api_registry(ctx: &Ctx, cmd: ApiCmd, json: bool) -> Result<()> {
     match cmd {
         ApiCmd::Registry => {
-            let ops = ctx.api().api_registry();
+            // R3 QA (da/api-contract): the machine-readable rendering is
+            // the versioned PUBLICATION (single source SURFACE_VERSION);
+            // the human view stays byte-identical — the version belongs to
+            // the contract artifact, not to operator prose.
+            let publication = ctx.api().api_registry_publication();
             if json {
-                outln!("{}", serde_json::to_string_pretty(&ops)?);
+                outln!("{}", serde_json::to_string_pretty(&publication)?);
             } else {
+                let ops = publication.operations;
                 for o in &ops {
                     let class = match o.class {
                         devai_api::OpClass::Read => "read",
@@ -221,148 +226,247 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
 /// Cycle 2 (REQ-MUT-02): every mutation arm below calls an `Api` operation;
 /// the handler owns only presentation. Reads were routed the same way since
 /// cycle 1 — the CYCLE-2 PENDING marks are gone because the plane moved.
+/// R4 QA (cl/short-units): the arm bodies live in private handlers grouped
+/// by subcommand plane — intake, reads, lifecycle, requirements revision,
+/// execution, the dependency plane. This is the routing table only; every
+/// statement moved VERBATIM, stdout is unchanged (the cli-snapshot parity
+/// pins that).
 fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
-        TaskCmd::New {
-            title,
-            project,
-            description,
-            description_file,
-            parent,
-            blocked_by,
-        } => {
-            // The project name resolves through the API read FIRST, so its
-            // not-found refusal keeps the exact position the command had.
-            let project_id = match project.as_deref() {
-                Some(name) => Some(
-                    ctx.api()
-                        .project_get(name)
-                        .map_err(render_api_error)?
-                        .context(format!("project `{name}` not found"))?
-                        .id,
-                ),
-                None => None,
-            };
-            let desc = match description_file {
-                Some(f) => {
-                    std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?
-                }
-                None => description,
-            };
-            // REQ-DEP-07: a derived task records WHY it exists at the moment
-            // it is created — the genealogy/blocking never leaves for the
-            // operator chat. Dangling references fail loudly in the
-            // operation, exactly as they would via `task depend`.
-            let created = ctx
-                .api()
-                .task_create(TaskCreateReq {
-                    title,
-                    project_id,
-                    description: desc,
-                    parent,
-                    blocked_by,
-                })
-                .map_err(render_api_error)?;
-            let t = created.task;
-            let linked = created.linked;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&t)?);
-            } else {
-                outln!(
-                    "task {} created in DRAFT — workflow is owned by devai",
-                    short(&t.id)
-                );
-                for d in &linked {
-                    outln!(
-                        "  depends {} {} ({} in {})",
-                        d.kind.as_str(),
-                        short(&d.depends_on_id),
-                        d.depends_on_state.as_str(),
-                        d.depends_on_title
-                    );
-                }
-                outln!("start it with: devai task start {}", short(&t.id));
-            }
-        }
-        TaskCmd::List => {
-            let ts = ctx.api().task_list().map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&ts)?);
-            } else if ts.is_empty() {
-                outln!("(no tasks)");
-            } else {
-                for t in ts {
-                    outln!(
-                        "{}  {:<17}  v{:>2}  {}",
-                        short(&t.id),
-                        t.state.as_str(),
-                        t.requirements_seq,
-                        t.title
-                    );
-                }
-            }
-        }
-        TaskCmd::Get { id } => {
-            let t = ctx.api().task_get(&id).map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&t)?);
-            } else {
-                print_task(&t);
-            }
-        }
+        cmd @ TaskCmd::New { .. } => task_new(ctx, cmd, json)?,
+        TaskCmd::List => task_list(ctx, json)?,
+        TaskCmd::Get { id } => task_get(ctx, &id, json)?,
         TaskCmd::Status { id } => status(ctx, &id, json)?,
         TaskCmd::Progress { id } => progress(ctx, &id, json)?,
         TaskCmd::Active => active_overview(ctx, json)?,
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
-        TaskCmd::Start { id } => {
-            render_mutation(&ctx.api().task_start(&id).map_err(render_api_error)?)?
+        TaskCmd::Events { id, limit } => task_events(ctx, &id, limit, json)?,
+        TaskCmd::Decisions { id } => task_decisions(ctx, &id, json)?,
+        cmd @ TaskCmd::Revise { .. } => task_revise(ctx, cmd)?,
+        // — execution, ratification, merge (one group handler) —
+        cmd @ (TaskCmd::Run { .. } | TaskCmd::Merge { .. } | TaskCmd::RatifyEmptyRework { .. }) => {
+            task_execution(ctx, cmd, json)?
         }
+        // — human gate verdicts (one group handler) —
+        cmd @ (TaskCmd::Review { .. }
+        | TaskCmd::Approve { .. }
+        | TaskCmd::Reject { .. }
+        | TaskCmd::Accept { .. }
+        | TaskCmd::Return { .. }) => task_verdicts(ctx, cmd)?,
+        // — lifecycle transitions and holds (one group handler) —
+        cmd @ (TaskCmd::Start { .. }
+        | TaskCmd::Pause { .. }
+        | TaskCmd::Resume { .. }
+        | TaskCmd::Block { .. }
+        | TaskCmd::Cancel { .. }
+        | TaskCmd::Fail { .. }) => task_state_ops(ctx, cmd)?,
+        // — the dependency plane (one group handler) —
+        cmd @ (TaskCmd::Depend { .. }
+        | TaskCmd::Dependencies { .. }
+        | TaskCmd::Unlink { .. }
+        | TaskCmd::Override { .. }
+        | TaskCmd::Epics
+        | TaskCmd::Graph) => task_dependency_plane(ctx, cmd, json)?,
+    }
+    Ok(())
+}
+
+/// The `task new` intake arm: project resolution, description source, the
+/// ATOMIC compound create (REQ-API-01), and presentation.
+fn task_new(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
+    let TaskCmd::New {
+        title,
+        project,
+        description,
+        description_file,
+        parent,
+        blocked_by,
+        idempotency_key,
+    } = cmd
+    else {
+        unreachable!("the dispatcher routes only the New arm to `task_new`");
+    };
+    // REQ-DEP-07: a derived task records WHY it exists at the moment
+    // it is created — the genealogy/blocking never leaves for the
+    // operator chat. Dangling references fail loudly in the
+    // operation, exactly as they would via `task depend`.
+    let created = ctx
+        .api()
+        .task_create(TaskCreateReq {
+            title,
+            project_id: resolve_new_task_project(ctx, project.as_deref())?,
+            description: read_task_description(description, description_file)?,
+            parent,
+            blocked_by,
+            idempotency_key,
+        })
+        .map_err(render_api_error)?;
+    render_task_created(&created.task, &created.linked, json)
+}
+
+/// The project name resolves through the API read FIRST, so its
+/// not-found refusal keeps the exact position the command had.
+fn resolve_new_task_project(ctx: &Ctx, project: Option<&str>) -> Result<Option<Id>> {
+    let id = match project {
+        Some(name) => Some(
+            ctx.api()
+                .project_get(name)
+                .map_err(render_api_error)?
+                .context(format!("project `{name}` not found"))?
+                .id,
+        ),
+        None => None,
+    };
+    Ok(id)
+}
+
+/// Description source: `--description-file` wins over `--description`.
+fn read_task_description(description: String, file: Option<std::path::PathBuf>) -> Result<String> {
+    match file {
+        Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display())),
+        None => Ok(description),
+    }
+}
+
+/// The `task new` rendering, both output modes (stdout parity).
+fn render_task_created(t: &Task, linked: &[TaskDependency], json: bool) -> Result<()> {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&t)?);
+    } else {
+        outln!(
+            "task {} created in DRAFT — workflow is owned by devai",
+            short(&t.id)
+        );
+        for d in linked {
+            outln!(
+                "  depends {} {} ({} in {})",
+                d.kind.as_str(),
+                short(&d.depends_on_id),
+                d.depends_on_state.as_str(),
+                d.depends_on_title
+            );
+        }
+        outln!("start it with: devai task start {}", short(&t.id));
+    }
+    Ok(())
+}
+
+fn task_list(ctx: &Ctx, json: bool) -> Result<()> {
+    let ts = ctx.api().task_list().map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&ts)?);
+    } else if ts.is_empty() {
+        outln!("(no tasks)");
+    } else {
+        for t in ts {
+            outln!(
+                "{}  {:<17}  v{:>2}  {}",
+                short(&t.id),
+                t.state.as_str(),
+                t.requirements_seq,
+                t.title
+            );
+        }
+    }
+    Ok(())
+}
+
+fn task_get(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    let t = ctx.api().task_get(id).map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&t)?);
+    } else {
+        print_task(&t);
+    }
+    Ok(())
+}
+
+fn task_events(ctx: &Ctx, id: &str, limit: Option<usize>, json: bool) -> Result<()> {
+    let evs = ctx.api().task_events(id, limit).map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&evs)?);
+    } else {
+        for e in evs {
+            outln!(
+                "{}  {:<28} {:<12} {}",
+                e.created_at.format("%Y-%m-%d %H:%M:%S"),
+                e.kind,
+                e.actor,
+                compact(&e.payload)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn task_decisions(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    // New CLI surface over the API task.decisions read: the human
+    // decision rows as data, available to any consumer.
+    let ds = ctx.api().task_decisions(id).map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&ds)?);
+    } else if ds.is_empty() {
+        outln!("(no decisions)");
+    } else {
+        for d in ds {
+            outln!(
+                "{}  {:<26} {:<10} by {}  {}",
+                d.created_at.format("%Y-%m-%d %H:%M:%S"),
+                d.kind,
+                d.verdict.as_str(),
+                d.actor,
+                d.rationale.map(|s| ellipsis(&s, 100)).unwrap_or_default()
+            );
+            if !d.refs.is_empty() {
+                outln!("    refs: {}", d.refs.join(", "));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Execution arms: role runs, the merge gate, the empty-rework ratification.
+/// Each forwards to its existing dedicated handler (bodies untouched).
+fn task_execution(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
+    match cmd {
         TaskCmd::Run {
             id,
             agent,
             workspace,
             force_reaudit,
         } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
-        TaskCmd::Revise { id, file, reason } => {
-            let task_ref = ctx.api().task_get(&id).map_err(render_api_error)?;
-            let content =
-                std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
-            let o = ctx
-                .api()
-                .task_revise(ReviseReq {
-                    id: task_ref.id.to_string(),
-                    name: file.display().to_string(),
-                    content,
-                    reason,
-                })
-                .map_err(render_api_error)?;
-            outln!(
-                "requirements v{} published → REVIEW",
-                o.task.requirements_seq
-            );
-            if !o.staled_ids.is_empty() {
-                outln!(
-                    "consequences: {} artifact(s) marked STALE:",
-                    o.staled_ids.len()
-                );
-                for s in &o.staled_ids {
-                    outln!("  stale  {s}");
-                }
-                outln!("old versions are kept in history; nothing was deleted");
-            }
-            outln!("next: {}", o.allowed_operations.join(" | "));
+        TaskCmd::Merge {
+            id,
+            workspace,
+            rationale,
+        } => task_merge(ctx, &id, workspace.as_deref(), rationale, json)?,
+        TaskCmd::RatifyEmptyRework { id, rationale } => {
+            ratify_empty_rework(ctx, &id, rationale, json)?
         }
+        _ => unreachable!("the dispatcher routes only execution arms here"),
+    }
+    Ok(())
+}
+
+/// The single error path of an `Api` call in the task handlers — identical
+/// rendering to the inline `.map_err(render_api_error)` the arms had before
+/// (REQ-MUT-08: refusals keep the operator text and machine code).
+fn op<T>(r: std::result::Result<T, ApiError>) -> Result<T> {
+    r.map_err(render_api_error)
+}
+
+/// The human gate verdicts: review, approve, reject, accept, return — every
+/// one is a single `Api` mutation rendered through `render_mutation`
+/// (bodies moved verbatim).
+fn task_verdicts(ctx: &Ctx, cmd: TaskCmd) -> Result<()> {
+    match cmd {
         TaskCmd::Review {
             id,
             verdict,
             summary,
         } => {
             let v = Api::parse_verdict(&verdict).map_err(render_api_error)?;
-            render_mutation(
-                &ctx.api()
-                    .task_review(&id, v, summary)
-                    .map_err(render_api_error)?,
-            )?;
+            render_mutation(&op(ctx.api().task_review(&id, v, summary))?)?;
         }
         TaskCmd::Approve { id, rationale } => {
             // The approve act is persisted like every other human-gate act:
@@ -370,47 +474,34 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // row — the row is what makes the rationale a fact the QA
             // auditor is fed (precedent 01a1a0b5-0fcf). The API operation
             // owns both writes in the old order.
-            let o = ctx
-                .api()
-                .task_approve(&id, rationale)
-                .map_err(render_api_error)?;
+            let o = op(ctx.api().task_approve(&id, rationale))?;
             render_mutation(&o.mutation)?;
         }
-        TaskCmd::Reject { id, rationale } => render_mutation(
-            &ctx.api()
-                .task_reject(&id, rationale)
-                .map_err(render_api_error)?,
-        )?,
+        TaskCmd::Reject { id, rationale } => {
+            render_mutation(&op(ctx.api().task_reject(&id, rationale))?)?
+        }
         TaskCmd::Accept { id, rationale } => {
             // REQ-DEP-03: the human acceptance gate reads the stored
             // dependency graph — an open 'blocks' edge refuses the gate and
             // the refusal enumerates the blocking task ids as data. The one
             // release (RATIFIED DECISION OQ2) is the operator's explicit
             // `dependency_override` decision (see `task override` below).
-            render_mutation(
-                &ctx.api()
-                    .task_accept(&id, rationale)
-                    .map_err(render_api_error)?,
-            )?;
+            render_mutation(&op(ctx.api().task_accept(&id, rationale))?)?;
         }
-        TaskCmd::Return { id, rationale } => render_mutation(
-            &ctx.api()
-                .task_return(&id, rationale)
-                .map_err(render_api_error)?,
-        )?,
-        TaskCmd::RatifyEmptyRework { id, rationale } => {
-            ratify_empty_rework(ctx, &id, rationale, json)?
+        TaskCmd::Return { id, rationale } => {
+            render_mutation(&op(ctx.api().task_return(&id, rationale))?)?
         }
-        TaskCmd::Merge {
-            id,
-            workspace,
-            rationale,
-        } => task_merge(ctx, &id, workspace.as_deref(), rationale, json)?,
-        TaskCmd::Pause { id, reason } => render_mutation(
-            &ctx.api()
-                .task_pause(&id, reason)
-                .map_err(render_api_error)?,
-        )?,
+        _ => unreachable!("the dispatcher routes only verdict arms here"),
+    }
+    Ok(())
+}
+
+/// The lifecycle transitions and holds: start, pause, resume, block, cancel,
+/// fail (bodies moved verbatim).
+fn task_state_ops(ctx: &Ctx, cmd: TaskCmd) -> Result<()> {
+    match cmd {
+        TaskCmd::Start { id } => render_mutation(&op(ctx.api().task_start(&id))?)?,
+        TaskCmd::Pause { id, reason } => render_mutation(&op(ctx.api().task_pause(&id, reason))?)?,
         TaskCmd::Resume { id } => {
             // REQ-DEP-03: resume from a hold state consults the stored graph
             // (open blockers enumerate into the refusal; "closed" = blocker
@@ -418,270 +509,302 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             // own `task override` ratification (ratified OQ2). Closing the
             // last blocker does NOT resume the task by itself — auto-unpause
             // is forbidden, resume stays a human command.
-            render_mutation(&ctx.api().task_resume(&id).map_err(render_api_error)?)?;
+            render_mutation(&op(ctx.api().task_resume(&id))?)?;
         }
-        TaskCmd::Block { id, reason } => render_mutation(
-            &ctx.api()
-                .task_block(&id, reason)
-                .map_err(render_api_error)?,
-        )?,
-        TaskCmd::Cancel { id, reason } => render_mutation(
-            &ctx.api()
-                .task_cancel(&id, reason)
-                .map_err(render_api_error)?,
-        )?,
-        TaskCmd::Fail { id, reason } => {
-            render_mutation(&ctx.api().task_fail(&id, reason).map_err(render_api_error)?)?
+        TaskCmd::Block { id, reason } => render_mutation(&op(ctx.api().task_block(&id, reason))?)?,
+        TaskCmd::Cancel { id, reason } => {
+            render_mutation(&op(ctx.api().task_cancel(&id, reason))?)?
         }
-        TaskCmd::Events { id, limit } => {
-            let evs = ctx
-                .api()
-                .task_events(&id, limit)
-                .map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&evs)?);
-            } else {
-                for e in evs {
-                    outln!(
-                        "{}  {:<28} {:<12} {}",
-                        e.created_at.format("%Y-%m-%d %H:%M:%S"),
-                        e.kind,
-                        e.actor,
-                        compact(&e.payload)
-                    );
-                }
-            }
+        TaskCmd::Fail { id, reason } => render_mutation(&op(ctx.api().task_fail(&id, reason))?)?,
+        _ => unreachable!("the dispatcher routes only state arms here"),
+    }
+    Ok(())
+}
+
+/// The `task revise` arm: publish a new REQUIREMENTS_SPEC version.
+fn task_revise(ctx: &Ctx, cmd: TaskCmd) -> Result<()> {
+    let TaskCmd::Revise { id, file, reason } = cmd else {
+        unreachable!("the dispatcher routes only the Revise arm to `task_revise`");
+    };
+    let task_ref = ctx.api().task_get(&id).map_err(render_api_error)?;
+    let content = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+    let o = ctx
+        .api()
+        .task_revise(ReviseReq {
+            id: task_ref.id.to_string(),
+            name: file.display().to_string(),
+            content,
+            reason,
+        })
+        .map_err(render_api_error)?;
+    outln!(
+        "requirements v{} published → REVIEW",
+        o.task.requirements_seq
+    );
+    if !o.staled_ids.is_empty() {
+        outln!(
+            "consequences: {} artifact(s) marked STALE:",
+            o.staled_ids.len()
+        );
+        for s in &o.staled_ids {
+            outln!("  stale  {s}");
         }
-        TaskCmd::Decisions { id } => {
-            // New CLI surface over the API task.decisions read: the human
-            // decision rows as data, available to any consumer.
-            let ds = ctx.api().task_decisions(&id).map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&ds)?);
-            } else if ds.is_empty() {
-                outln!("(no decisions)");
-            } else {
-                for d in ds {
-                    outln!(
-                        "{}  {:<26} {:<10} by {}  {}",
-                        d.created_at.format("%Y-%m-%d %H:%M:%S"),
-                        d.kind,
-                        d.verdict.as_str(),
-                        d.actor,
-                        d.rationale.map(|s| ellipsis(&s, 100)).unwrap_or_default()
-                    );
-                    if !d.refs.is_empty() {
-                        outln!("    refs: {}", d.refs.join(", "));
-                    }
-                }
-            }
-        }
-        TaskCmd::Depend { id, on, kind } => {
-            let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
-            // Registration is LOUD at write (REQ-DEP-07 AC2): self-reference,
-            // a duplicate edge, a dangling id or a cycle WITHIN one kind
-            // (ratified OQ4: parent-DAG and blocks-DAG; a mixed
-            // parent↔blocks cycle — the standard backfill/gate case — is
-            // legal) never land in the store.
-            let d = ctx
-                .api()
-                .task_depend(DependReq { id, on, kind })
-                .map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&d)?);
-            } else {
-                outln!(
-                    "task {} —{}→ task {} recorded ({} in {}, by {}, {})",
-                    short(&d.task_id),
-                    d.kind.as_str(),
-                    short(&d.depends_on_id),
-                    d.depends_on_state.as_str(),
-                    d.depends_on_title,
-                    d.actor,
-                    d.created_at.format("%Y-%m-%d %H:%M:%S")
-                );
-            }
-        }
-        TaskCmd::Dependencies { id } => {
-            let v = ctx.api().task_dependencies(&id).map_err(render_api_error)?;
-            let t = v.task;
-            let outgoing = v.outgoing;
-            let incoming = v.incoming;
-            if json {
-                outln!(
-                    "{}",
-                    serde_json::json!({"task": t.id.to_string(), "outgoing": outgoing, "incoming": incoming})
-                );
-            } else {
-                print_task(&t);
-                outln!("---");
-                outln!("depends on (outgoing): {}", outgoing.len());
-                for d in &outgoing {
-                    outln!(
-                        "  {:<7} {}  {:<13} {}  by {}",
-                        d.kind.as_str(),
-                        short(&d.depends_on_id),
-                        d.depends_on_state.as_str(),
-                        d.depends_on_title,
-                        d.actor
-                    );
-                }
-                outln!("dependents (incoming): {}", incoming.len());
-                for d in &incoming {
-                    outln!(
-                        "  {:<7} {}  {:<13} {}  by {}",
-                        d.kind.as_str(),
-                        short(&d.task_id),
-                        d.task_state.as_str(),
-                        d.task_title,
-                        d.actor
-                    );
-                }
-                // REQ-DEP-06 + RATIFIED DECISION OQ8: no epic entity exists —
-                // an epic VERTEX is a task with no outgoing ACTIVE 'parent'
-                // edge and at least one incoming one — named by this same
-                // dependency read; `task epics` lists the whole registry.
-                let epic_children = incoming
-                    .iter()
-                    .filter(|d| d.kind == DependencyKind::Parent)
-                    .count();
-                let own_parents = outgoing
-                    .iter()
-                    .filter(|d| d.kind == DependencyKind::Parent)
-                    .count();
-                if epic_children > 0 && own_parents == 0 {
-                    outln!(
-                        "epic role: {epic_children} task(s) carry a 'parent' edge into this vertex, the vertex has no parent of its own (the registry is this view, not a table)"
-                    );
-                }
-            }
-        }
-        TaskCmd::Unlink { id, on, kind } => {
-            // RATIFIED DECISION OQ7: dependency edges are IMMUTABLE —
-            // "removal" is a SUPERSEDED marker. The edge row keeps author
-            // and created_at, gains who/when superseded it, and stays in
-            // the table forever; only the live graph stops seeing it.
-            let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
-            let u = ctx
-                .api()
-                .task_unlink(DependReq { id, on, kind })
-                .map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&u.edge)?);
-            } else {
-                outln!(
-                    "task {} —{}→ task {} superseded (edge {} stays as history, by {})",
-                    short(&u.edge.task_id),
-                    kind.as_str(),
-                    short(&u.edge.depends_on_id),
-                    short(&u.edge.id),
-                    u.superseded_by
-                );
-            }
-        }
+        outln!("old versions are kept in history; nothing was deleted");
+    }
+    outln!("next: {}", o.allowed_operations.join(" | "));
+    Ok(())
+}
+
+/// The dependency plane: edge registration, views, supersession, the
+/// operator override, the epic registry and the graph (bodies moved
+/// verbatim).
+fn task_dependency_plane(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
+    match cmd {
+        TaskCmd::Depend { id, on, kind } => task_depend(ctx, id, on, kind, json),
+        TaskCmd::Dependencies { id } => task_dependencies_view(ctx, &id, json),
+        TaskCmd::Unlink { id, on, kind } => task_unlink(ctx, id, on, kind, json),
         TaskCmd::Override {
             id,
             blocker,
             rationale,
-        } => {
-            // RATIFIED DECISION OQ2 — the human-escape of the dependency
-            // gate. The refusal of resume/acceptance is unconditional, the
-            // ONE release is this explicit operator ratification ("continue
-            // despite"), recorded with the same decisions mechanism every
-            // other human gate act uses. `refs` = the FULL task ids it
-            // covers, so a NEW blocker opened later is NOT covered by an
-            // old decision; closing the last blocker never resumes the task
-            // by itself (auto-unpause forbidden) — resume stays a human act.
-            let r = ctx
-                .api()
-                .task_override(&id, blocker, rationale)
-                .map_err(render_api_error)?;
-            let blockers = r.override_blockers;
-            if json {
-                outln!(
-                    "{}",
-                    serde_json::json!({"task": r.task.id.to_string(), "override_blockers": blockers})
-                );
-            } else {
-                outln!(
-                    "override recorded for task {}: continuing despite {} — the gate stands for any NEW blocker",
-                    short(&r.task.id),
-                    blockers.join(", ")
-                );
-                outln!(
-                    "the task stays in its hold state until a human runs `devai task resume {}`",
-                    short(&r.task.id)
-                );
-            }
+        } => task_override(ctx, &id, blocker, rationale, json),
+        TaskCmd::Epics => task_epics(ctx, json),
+        TaskCmd::Graph => task_graph_view(ctx, json),
+        _ => unreachable!("the dispatcher routes only dependency arms here"),
+    }
+}
+
+fn task_depend(ctx: &Ctx, id: String, on: String, kind: String, json: bool) -> Result<()> {
+    let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
+    // Registration is LOUD at write (REQ-DEP-07 AC2): self-reference,
+    // a duplicate edge, a dangling id or a cycle WITHIN one kind
+    // (ratified OQ4: parent-DAG and blocks-DAG; a mixed
+    // parent↔blocks cycle — the standard backfill/gate case — is
+    // legal) never land in the store.
+    let d = ctx
+        .api()
+        .task_depend(DependReq { id, on, kind })
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&d)?);
+    } else {
+        outln!(
+            "task {} —{}→ task {} recorded ({} in {}, by {}, {})",
+            short(&d.task_id),
+            d.kind.as_str(),
+            short(&d.depends_on_id),
+            d.depends_on_state.as_str(),
+            d.depends_on_title,
+            d.actor,
+            d.created_at.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+    Ok(())
+}
+
+fn task_dependencies_view(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    let v = ctx.api().task_dependencies(id).map_err(render_api_error)?;
+    let t = v.task;
+    let outgoing = v.outgoing;
+    let incoming = v.incoming;
+    if json {
+        outln!(
+            "{}",
+            serde_json::json!({"task": t.id.to_string(), "outgoing": outgoing, "incoming": incoming})
+        );
+    } else {
+        print_task(&t);
+        outln!("---");
+        print_dependency_edges(&outgoing, &incoming)?;
+        print_epic_role(&outgoing, &incoming)?;
+    }
+    Ok(())
+}
+
+fn print_dependency_edges(outgoing: &[TaskDependency], incoming: &[TaskDependency]) -> Result<()> {
+    outln!("depends on (outgoing): {}", outgoing.len());
+    for d in outgoing {
+        outln!(
+            "  {:<7} {}  {:<13} {}  by {}",
+            d.kind.as_str(),
+            short(&d.depends_on_id),
+            d.depends_on_state.as_str(),
+            d.depends_on_title,
+            d.actor
+        );
+    }
+    outln!("dependents (incoming): {}", incoming.len());
+    for d in incoming {
+        outln!(
+            "  {:<7} {}  {:<13} {}  by {}",
+            d.kind.as_str(),
+            short(&d.task_id),
+            d.task_state.as_str(),
+            d.task_title,
+            d.actor
+        );
+    }
+    Ok(())
+}
+
+fn print_epic_role(outgoing: &[TaskDependency], incoming: &[TaskDependency]) -> Result<()> {
+    // REQ-DEP-06 + RATIFIED DECISION OQ8: no epic entity exists —
+    // an epic VERTEX is a task with no outgoing ACTIVE 'parent'
+    // edge and at least one incoming one — named by this same
+    // dependency read; `task epics` lists the whole registry.
+    let epic_children = incoming
+        .iter()
+        .filter(|d| d.kind == DependencyKind::Parent)
+        .count();
+    let own_parents = outgoing
+        .iter()
+        .filter(|d| d.kind == DependencyKind::Parent)
+        .count();
+    if epic_children > 0 && own_parents == 0 {
+        outln!(
+            "epic role: {epic_children} task(s) carry a 'parent' edge into this vertex, the vertex has no parent of its own (the registry is this view, not a table)"
+        );
+    }
+    Ok(())
+}
+
+fn task_unlink(ctx: &Ctx, id: String, on: String, kind: String, json: bool) -> Result<()> {
+    // RATIFIED DECISION OQ7: dependency edges are IMMUTABLE —
+    // "removal" is a SUPERSEDED marker. The edge row keeps author
+    // and created_at, gains who/when superseded it, and stays in
+    // the table forever; only the live graph stops seeing it.
+    let kind = DependencyKind::parse(&kind).map_err(anyhow::Error::new)?;
+    let u = ctx
+        .api()
+        .task_unlink(DependReq { id, on, kind })
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&u.edge)?);
+    } else {
+        outln!(
+            "task {} —{}→ task {} superseded (edge {} stays as history, by {})",
+            short(&u.edge.task_id),
+            kind.as_str(),
+            short(&u.edge.depends_on_id),
+            short(&u.edge.id),
+            u.superseded_by
+        );
+    }
+    Ok(())
+}
+
+fn task_override(
+    ctx: &Ctx,
+    id: &str,
+    blocker: Vec<String>,
+    rationale: Option<String>,
+    json: bool,
+) -> Result<()> {
+    // RATIFIED DECISION OQ2 — the human-escape of the dependency
+    // gate. The refusal of resume/acceptance is unconditional, the
+    // ONE release is this explicit operator ratification ("continue
+    // despite"), recorded with the same decisions mechanism every
+    // other human gate act uses. `refs` = the FULL task ids it
+    // covers, so a NEW blocker opened later is NOT covered by an
+    // old decision; closing the last blocker never resumes the task
+    // by itself (auto-unpause forbidden) — resume stays a human act.
+    let r = ctx
+        .api()
+        .task_override(id, blocker, rationale)
+        .map_err(render_api_error)?;
+    let blockers = r.override_blockers;
+    if json {
+        outln!(
+            "{}",
+            serde_json::json!({"task": r.task.id.to_string(), "override_blockers": blockers})
+        );
+    } else {
+        outln!(
+            "override recorded for task {}: continuing despite {} — the gate stands for any NEW blocker",
+            short(&r.task.id),
+            blockers.join(", ")
+        );
+        outln!(
+            "the task stays in its hold state until a human runs `devai task resume {}`",
+            short(&r.task.id)
+        );
+    }
+    Ok(())
+}
+
+fn task_epics(ctx: &Ctx, json: bool) -> Result<()> {
+    // REQ-DEP-06 + RATIFIED DECISION OQ8: the epic registry is a
+    // VIEW over the same stored graph — epic = a task vertex with no
+    // outgoing ACTIVE 'parent' edge and at least one incoming one,
+    // derived by one dependency-table query. No epic entity exists.
+    // (API task.epics read.)
+    let epics = ctx.api().task_epics().map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&epics)?);
+    } else {
+        for e in &epics {
+            outln!(
+                "{}  {:<13} {}  ({} derived child/ren via 'parent')",
+                short(&e.task.id),
+                e.task.state.as_str(),
+                e.task.title,
+                e.derived_children
+            );
         }
-        TaskCmd::Epics => {
-            // REQ-DEP-06 + RATIFIED DECISION OQ8: the epic registry is a
-            // VIEW over the same stored graph — epic = a task vertex with no
-            // outgoing ACTIVE 'parent' edge and at least one incoming one,
-            // derived by one dependency-table query. No epic entity exists.
-            // (API task.epics read.)
-            let epics = ctx.api().task_epics().map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&epics)?);
-            } else {
-                for e in &epics {
-                    outln!(
-                        "{}  {:<13} {}  ({} derived child/ren via 'parent')",
-                        short(&e.task.id),
-                        e.task.state.as_str(),
-                        e.task.title,
-                        e.derived_children
-                    );
-                }
-                if epics.is_empty() {
-                    outln!("(no epic vertices — no 'parent' tree roots in the graph)");
-                }
-            }
+        if epics.is_empty() {
+            outln!("(no epic vertices — no 'parent' tree roots in the graph)");
         }
-        TaskCmd::Graph => {
-            // REQ-DEP-04/05: the planning-level "what is happening" is built
-            // purely from the stored graph in ONE query — node = task +
-            // state, edge = typed dependency; readiness needs no external
-            // information. The epic registry (OQ8) is the same data shaped
-            // by `task epics`; the READY mark below is blocker-purity (an
-            // operator override releases the GATE, not the readiness view —
-            // the blockers stay open until the blocker is ACCEPTED, OQ1).
-            // (API task.graph read.)
-            let gv = ctx.api().task_graph().map_err(render_api_error)?;
-            let nodes = gv.graph;
-            if json {
-                outln!("{}", serde_json::json!({"graph": nodes, "ready": gv.ready}));
-            } else {
-                for n in &nodes {
-                    let blockers = workflow::open_blockers(&n.task, &n.dependencies);
-                    let mark = if n.task.state.is_terminal() {
-                        "terminal".to_string()
-                    } else if blockers.is_empty() {
-                        "ready".to_string()
-                    } else {
-                        format!("open blockers: {}", blockers.join(", "))
-                    };
-                    outln!(
-                        "{}  {:<13} {}  [{mark}]",
-                        short(&n.task.id),
-                        n.task.state.as_str(),
-                        n.task.title
-                    );
-                    for d in &n.dependencies {
-                        outln!(
-                            "    —{:<7}→ {}  {:<13} {}",
-                            d.kind.as_str(),
-                            short(&d.depends_on_id),
-                            d.depends_on_state.as_str(),
-                            d.depends_on_title
-                        );
-                    }
-                }
-                if nodes.is_empty() {
-                    outln!("(no tasks)");
-                }
-            }
+    }
+    Ok(())
+}
+
+fn task_graph_view(ctx: &Ctx, json: bool) -> Result<()> {
+    // REQ-DEP-04/05: the planning-level "what is happening" is built
+    // purely from the stored graph in ONE query — node = task +
+    // state, edge = typed dependency; readiness needs no external
+    // information. The epic registry (OQ8) is the same data shaped
+    // by `task epics`; the READY mark below is blocker-purity (an
+    // operator override releases the GATE, not the readiness view —
+    // the blockers stay open until the blocker is ACCEPTED, OQ1).
+    // (API task.graph read.)
+    let gv = ctx.api().task_graph().map_err(render_api_error)?;
+    let nodes = gv.graph;
+    if json {
+        outln!("{}", serde_json::json!({"graph": nodes, "ready": gv.ready}));
+    } else {
+        print_graph_human(&nodes)?;
+    }
+    Ok(())
+}
+
+fn print_graph_human(nodes: &[DependencyNode]) -> Result<()> {
+    for n in nodes {
+        let blockers = workflow::open_blockers(&n.task, &n.dependencies);
+        let mark = if n.task.state.is_terminal() {
+            "terminal".to_string()
+        } else if blockers.is_empty() {
+            "ready".to_string()
+        } else {
+            format!("open blockers: {}", blockers.join(", "))
+        };
+        outln!(
+            "{}  {:<13} {}  [{mark}]",
+            short(&n.task.id),
+            n.task.state.as_str(),
+            n.task.title
+        );
+        for d in &n.dependencies {
+            outln!(
+                "    —{:<7}→ {}  {:<13} {}",
+                d.kind.as_str(),
+                short(&d.depends_on_id),
+                d.depends_on_state.as_str(),
+                d.depends_on_title
+            );
         }
+    }
+    if nodes.is_empty() {
+        outln!("(no tasks)");
     }
     Ok(())
 }

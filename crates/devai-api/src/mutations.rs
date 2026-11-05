@@ -51,6 +51,11 @@ pub struct ProjectAddReq {
 /// READ, so the not-found refusal text keeps its exact position in the
 /// command's error order); parent/blocked_by are task refs registered as
 /// edges at the moment of creation (REQ-DEP-07).
+/// `idempotency_key` (REQ-API-02, ratified OQ-1): the caller-declared
+/// identity of THIS CREATE COMMAND. A repeated call with a key whose
+/// commit is already registered returns the original task and its edges
+/// — the recovery path when a successful create's response was lost.
+/// `None` keeps the plain every-call-creates semantics.
 #[derive(Debug, Clone)]
 pub struct TaskCreateReq {
     pub title: String,
@@ -58,6 +63,7 @@ pub struct TaskCreateReq {
     pub description: String,
     pub parent: Vec<String>,
     pub blocked_by: Vec<String>,
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -385,32 +391,69 @@ impl Api {
     // ---- task: creation ---------------------------------------------------
 
     pub fn task_create(&self, req: TaskCreateReq) -> ApiResult<TaskCreated> {
-        let t = Task::new(req.title, req.description, req.project_id, Utc::now());
-        self.store.create_task(&t)?;
+        // R2 QA (input-validation): an empty/whitespace-only key must never
+        // reach the registry — once stored, `''` would become a SHARED key
+        // and the second empty-keyed call would silently return the first
+        // task. The typed refusal happens BEFORE the first store touch
+        // (including the registry lookup below): it can neither read nor
+        // write, so a refusal leaves the store byte-identical.
+        if let Some(key) = req.idempotency_key.as_deref() {
+            if key.trim().is_empty() {
+                return Err(ApiError::InvalidInput {
+                    field: "idempotency_key",
+                    message: "must not be empty or whitespace-only".into(),
+                });
+            }
+        }
+        // REQ-API-02 (ratified OQ-1): a retry carrying the key of an
+        // ALREADY COMMITTED create returns the registered task and its
+        // stored ACTIVE edges — the lost-response retry never duplicates
+        // the effect. The registry row lands inside the creation
+        // transaction, so finding it is proof the first create committed.
+        if let Some(key) = req.idempotency_key.as_deref() {
+            if let Some(existing) = self.store.task_by_creation_key(key)? {
+                return Ok(TaskCreated {
+                    linked: self.store.task_dependencies(existing.id)?,
+                    task: existing,
+                });
+            }
+        }
         // REQ-DEP-07: a derived task records WHY it exists at the moment it
-        // is created; dangling references fail loudly on resolve, exactly
-        // as they would via `task.depend`.
-        let mut linked: Vec<TaskDependency> = Vec::new();
+        // is created; dangling references fail loudly on resolve, exactly as
+        // they would via `task depend`.
+        // REQ-API-01 (the QA-01a1acab-18b1 fix): EVERY ref is resolved
+        // BEFORE anything is written. The pre-fix order inserted the task,
+        // then resolved parent and blocked_by in loops — an Ambiguous or
+        // NotFound halfway left an ORPHAN task (and possibly a partial
+        // parent edge set) in the store, and the retry doubled the effect.
+        // Resolution order stays parents-then-blockers, so the first
+        // failing ref produces the identical error text of the old path.
+        let mut parents: Vec<Task> = Vec::new();
         for p in &req.parent {
-            let pt = self.store.resolve_task(p)?;
-            linked.push(self.store.link_task_dependency(
-                t.id,
-                pt.id,
-                DependencyKind::Parent,
-                &self.actor,
-                Utc::now(),
-            )?);
+            parents.push(self.store.resolve_task(p)?);
         }
+        let mut blockers: Vec<Task> = Vec::new();
         for b in &req.blocked_by {
-            let bt = self.store.resolve_task(b)?;
-            linked.push(self.store.link_task_dependency(
-                t.id,
-                bt.id,
-                DependencyKind::Blocks,
-                &self.actor,
-                Utc::now(),
-            )?);
+            blockers.push(self.store.resolve_task(b)?);
         }
+        let mut deps: Vec<(&Task, DependencyKind)> = Vec::new();
+        for t in &parents {
+            deps.push((t, DependencyKind::Parent));
+        }
+        for t in &blockers {
+            deps.push((t, DependencyKind::Blocks));
+        }
+        // The task, its edges and the key registration land in ONE store
+        // transaction (REQ-API-01: all effects of this call, or none), so
+        // `TaskCreated` can never describe an edge absent from the store.
+        let t = Task::new(req.title, req.description, req.project_id, Utc::now());
+        let linked = self.store.create_task_with_dependencies(
+            &t,
+            &deps,
+            &self.actor,
+            Utc::now(),
+            req.idempotency_key.as_deref(),
+        )?;
         Ok(TaskCreated { task: t, linked })
     }
 
@@ -1072,13 +1115,46 @@ impl Api {
     /// gate: records (or reuses) the pair-bound `rework_noop_ratified`
     /// decision, releases the gate's blocking question, and runs the
     /// withheld REWORK → QA transition through the same core command —
-    // which now finds the ratification and cites its decision id (AC3).
+    /// which now finds the ratification and cites its decision id (AC3).
+    /// R4 QA (cl/short-units): the phases live in the private units below;
+    /// the act SEQUENCE and every refusal text are unchanged (this is
+    /// layout, not domain — statements moved verbatim).
     pub fn task_ratify_empty_rework(
         &self,
         id: &str,
         rationale: Option<String>,
     ) -> ApiResult<RatifyResult> {
         let task = self.store.resolve_task(id)?;
+        Self::ratify_gate_state(&task)?;
+        let (current, trip, prev_report) = self.ratify_current_trip(&task)?;
+        let current_id_s = current.id.to_string();
+        let (decision, recorded_now) =
+            self.ratify_decision_row(task.id, &prev_report, &current_id_s, rationale)?;
+        let cur = self.ratify_release_question(&task, &trip, &decision)?;
+        let m = self.ratify_withheld_passage(&cur, &current, &decision)?;
+        self.store.commit(cur.lock_version, &m)?;
+        Ok(RatifyResult {
+            task: cur,
+            decision,
+            recorded_now,
+            prev_report,
+            current_report: current_id_s,
+            state: m.task.state,
+            allowed_operations: workflow::allowed_ops(&m.task)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        })
+    }
+
+    /// One refusal in the gate's error family (code `empty_rework_gate`).
+    fn empty_rework_refused(message: impl Into<String>) -> ApiError {
+        ApiError::refused("empty_rework_gate", message)
+    }
+
+    /// Phase 1 — the state guard: only the gate hold (WAITING_FOR_INPUT
+    /// returning to REWORK) or the released REWORK itself may ratify.
+    fn ratify_gate_state(task: &Task) -> Result<(), ApiError> {
         match task.state {
             // The gate hold is WAITING_FOR_INPUT returning to REWORK. If
             // the operator answered the question first (back to REWORK, no
@@ -1087,39 +1163,44 @@ impl Api {
             TaskState::WaitingForInput if task.return_state == Some(TaskState::Rework) => {}
             TaskState::Rework => {}
             s => {
-                return Err(ApiError::refused(
-                    "empty_rework_gate",
-                    format!(
-                        "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
-                        s.as_str()
-                    ),
-                ));
+                return Err(Self::empty_rework_refused(format!(
+                    "ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in {}",
+                    s.as_str()
+                )));
             }
         }
+        Ok(())
+    }
+
+    /// Phase 2 — the CURRENT report and the gate trip that binds it: the
+    /// newest implementation report must have a recorded
+    /// `qa.rework_gate_tripped` event, and that trip must name a previous
+    /// report (only the trip of the LATEST report is ratifiable, REQ-RG-03
+    /// AC4). Returns (current report, trip payload, previous report id).
+    fn ratify_current_trip(&self, task: &Task) -> ApiResult<(Artifact, serde_json::Value, String)> {
         let arts = self.store.artifacts(task.id)?;
         let Some(current) = arts
             .iter()
             .filter(|a| a.kind == ArtifactKind::ImplementationReport)
             .max_by_key(|a| a.seq)
+            .cloned()
         else {
-            return Err(ApiError::refused(
-                "empty_rework_gate",
+            return Err(Self::empty_rework_refused(
                 "the task has no implementation report — nothing to ratify",
             ));
         };
         let events = self.store.all_events_for_task(task.id)?;
         let current_id_s = current.id.to_string();
-        // Only the trip of the LATEST report is ratifiable (REQ-RG-03 AC4).
         let trip = events
             .iter()
             .rev()
             .find(|e| e.kind == event_kind::QA_REWORK_GATE_TRIPPED && e.payload.get(json_field::CURRENT_REPORT).and_then(|v| v.as_str()) == Some(current_id_s.as_str()))
-            .ok_or_else(|| ApiError::refused("empty_rework_gate", format!(
+            .map(|e| e.payload.clone())
+            .ok_or_else(|| Self::empty_rework_refused(format!(
                 "no empty-rework gate recorded for report {} — the gate fires when a REWORK publication names the unchanged commit; if the latest report is newer, let the engine publish it from REWORK first",
                 short_id(&current.id)
             )))?;
         let prev_report = trip
-            .payload
             .get(json_field::PREV_REPORT)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
@@ -1130,41 +1211,58 @@ impl Api {
                 )
             })?
             .to_string();
+        Ok((current, trip, prev_report))
+    }
 
-        // The ratification for exactly this pair, recorded once; a retry
-        // reuses the stored row (never a double-written judgment).
-        let decisions = self.store.list_decisions(task.id)?;
+    /// Phase 3 — the ratification for exactly this pair, recorded once; a
+    /// retry reuses the stored row (never a double-written judgment).
+    fn ratify_decision_row(
+        &self,
+        task_id: Id,
+        prev_report: &str,
+        current_id: &str,
+        rationale: Option<String>,
+    ) -> ApiResult<(Decision, bool)> {
+        let decisions = self.store.list_decisions(task_id)?;
         let existing = decisions
             .iter()
             .find(|d| {
                 d.kind == decision_kind::REWORK_NOOP_RATIFIED
-                    && d.refs.iter().any(|r| r == &prev_report)
-                    && d.refs.iter().any(|r| r == &current_id_s)
+                    && d.refs.iter().any(|r| r == prev_report)
+                    && d.refs.iter().any(|r| r == current_id)
             })
             .cloned();
-        let (decision, recorded_now) = match existing {
-            Some(d) => (d, false),
+        match existing {
+            Some(d) => Ok((d, false)),
             None => {
                 let d = Decision {
                     id: new_id(),
-                    task_id: task.id,
+                    task_id,
                     kind: decision_kind::REWORK_NOOP_RATIFIED.into(),
                     verdict: Verdict::Approved,
                     actor: self.actor.clone(),
                     rationale,
-                    refs: vec![prev_report.clone(), current_id_s.clone()],
+                    refs: vec![prev_report.to_string(), current_id.to_string()],
                     created_at: Utc::now(),
                 };
                 self.store.record_decision(&d)?;
-                (d, true)
+                Ok((d, true))
             }
-        };
+        }
+    }
 
-        // Release the blocking gate question while the hold is still up.
+    /// Phase 4 — release the blocking gate question while the hold is still
+    /// up. Returns the task as it stands after the release, or unchanged
+    /// when there was no hold to release (the operator answered first).
+    fn ratify_release_question(
+        &self,
+        task: &Task,
+        trip: &serde_json::Value,
+        decision: &Decision,
+    ) -> ApiResult<Task> {
         let mut cur = task.clone();
         if cur.state == TaskState::WaitingForInput {
             let q_ref = trip
-                .payload
                 .get(json_field::QUESTION_ID)
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
@@ -1184,10 +1282,18 @@ impl Api {
             self.store.commit(cur.lock_version, &m)?;
             cur = self.store.get_task(&cur.id.to_string())?;
         }
+        Ok(cur)
+    }
 
-        // Run the withheld transition through the single serialization
-        // point; with the stored ratification in the facts, the core
-        // command admits REWORK → QA and puts `ratified_by` on the event.
+    /// Phase 5 — run the withheld transition through the single
+    /// serialization point; with the stored ratification in the facts, the
+    /// core command admits REWORK → QA and puts `ratified_by` on the event.
+    fn ratify_withheld_passage(
+        &self,
+        cur: &Task,
+        current: &Artifact,
+        decision: &Decision,
+    ) -> ApiResult<Mutation> {
         let arts = self.store.artifacts(cur.id)?;
         let facts = devai_runtime::gate::collect_implementation_report_facts(
             &self.store,
@@ -1196,31 +1302,16 @@ impl Api {
             &arts,
             Some(format!("empty rework ratified by decision {}", decision.id)),
         )?;
-        let m = workflow::implementation_reported(&cur, &facts, &self.actor, Utc::now())?;
+        let m = workflow::implementation_reported(cur, &facts, &self.actor, Utc::now())?;
         if m.task.state != TaskState::Qa {
-            return Err(ApiError::refused(
-                "empty_rework_gate",
-                format!(
-                    "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
-                    m.task.state.as_str(),
-                    decision.id,
-                    short_id(&cur.id)
-                ),
-            ));
+            return Err(Self::empty_rework_refused(format!(
+                "the withheld transition did not land in QA (state {}); decision {} stands — inspect `devai task events {}`",
+                m.task.state.as_str(),
+                decision.id,
+                short_id(&cur.id)
+            )));
         }
-        self.store.commit(cur.lock_version, &m)?;
-        Ok(RatifyResult {
-            task: cur,
-            decision,
-            recorded_now,
-            prev_report,
-            current_report: current_id_s,
-            state: m.task.state,
-            allowed_operations: workflow::allowed_ops(&m.task)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
-        })
+        Ok(m)
     }
 
     // ---- questions --------------------------------------------------------
@@ -1574,10 +1665,214 @@ mod tests {
             description: String::new(),
             parent: vec![],
             blocked_by: vec![],
+            idempotency_key: None,
         })
         .expect("create")
         .task
         .id
+    }
+
+    // --- REQ-API-01 / REQ-API-02 (QA artifact 01a1acab-18b1, ratified
+    // OQ-1): task_create atomicity and the lost-response retry. Stores
+    // are checked by DIRECT reads — never through command stdout. ---
+
+    /// A task with a HAND-PICKED id (deterministic prefix-collision setups
+    /// must not depend on wall-clock luck — the flake class this task
+    /// retires).
+    fn task_with_id(id: &str, title: &str) -> Task {
+        let mut t = Task::new(title, String::new(), None, Utc::now());
+        t.id = Uuid::parse_str(id).expect("crafted fixture id");
+        t
+    }
+
+    /// REQ-API-01 AC3 (regression): a create whose blocked_by ref is
+    /// AMBIGUOUS refuses — and the store keeps NEITHER the task NOR any
+    /// edge. Pre-fix, `create_task` inserted the task BEFORE the resolve
+    /// loops, so this exact call left an orphan task plus a committed
+    /// parent edge (the partially-successful shape).
+    #[test]
+    fn ambiguous_refusal_leaves_no_orphan_task_or_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        // Two ids sharing the FULL canonical 13-char display prefix —
+        // a genuine ambiguity resolve_task must (and does) refuse.
+        let a = task_with_id("019e0000-0000-7000-8000-0000000000aa", "collision-a");
+        let b = task_with_id("019e0000-0000-7000-8000-0000000000ab", "collision-b");
+        api.store.create_task(&a).unwrap();
+        api.store.create_task(&b).unwrap();
+        let before = api.store.list_tasks().unwrap().len();
+
+        let e = api
+            .task_create(TaskCreateReq {
+                title: "orphan-candidate".into(),
+                project_id: None,
+                description: String::new(),
+                // the resolvable parent would have been linked BEFORE the
+                // failing ref by the old per-loop order — it must be gone too
+                parent: vec![a.id.to_string()],
+                blocked_by: vec!["019e0000-0000".into()], // matches BOTH
+                idempotency_key: None,
+            })
+            .expect_err("ambiguous ref must refuse");
+        assert!(format!("{e}").contains("ambiguous"), "{e}");
+
+        // DIRECT store reads: nothing landed at all.
+        assert_eq!(api.store.list_tasks().unwrap().len(), before);
+        assert!(
+            !api.store
+                .list_tasks()
+                .unwrap()
+                .iter()
+                .any(|t| t.title == "orphan-candidate")
+        );
+        assert!(api.store.incoming_dependencies(a.id).unwrap().is_empty());
+        assert!(api.store.incoming_dependencies(b.id).unwrap().is_empty());
+
+        // REQ-API-02 AC1: an identical retry with resolvable refs succeeds
+        // and leaves EXACTLY one new task plus exactly its edges — the
+        // refused attempt contributed nothing to double.
+        api.task_create(TaskCreateReq {
+            title: "orphan-candidate".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![a.id.to_string()],
+            blocked_by: vec![b.id.to_string()],
+            idempotency_key: None,
+        })
+        .expect("retry after refused resolve must not be poisoned");
+        let all = api.store.list_tasks().unwrap();
+        assert_eq!(all.len(), before + 1);
+        let child = all.iter().find(|t| t.title == "orphan-candidate").unwrap();
+        assert_eq!(api.store.task_dependencies(child.id).unwrap().len(), 2);
+    }
+
+    /// REQ-API-01: a refusal raised by the store's own write-shape checks
+    /// (duplicate ref WITHIN one request) also rolls the whole effect back.
+    #[test]
+    fn duplicate_ref_in_one_request_rolls_back_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let p = fresh_task(&api, "dup-parent");
+        let before = api.store.list_tasks().unwrap().len();
+        let e = api
+            .task_create(TaskCreateReq {
+                title: "dup-child".into(),
+                project_id: None,
+                description: String::new(),
+                parent: vec![],
+                blocked_by: vec![p.to_string(), p.to_string()],
+                idempotency_key: None,
+            })
+            .expect_err("duplicate edge is loud at write");
+        assert!(format!("{e}").contains("already exists"), "{e}");
+        assert_eq!(api.store.list_tasks().unwrap().len(), before);
+    }
+
+    /// REQ-API-02 / ratified OQ-1: a retry carrying the SAME idempotency
+    /// key returns the committed task and its edges — direct store reads
+    /// prove one task, one edge set. A keyless call keeps the
+    /// every-call-creates-a-task semantics; a DIFFERENT key creates.
+    #[test]
+    fn idempotency_key_retry_never_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let parent = fresh_task(&api, "idem-parent");
+        let req = |key: Option<&str>| TaskCreateReq {
+            title: "idem-child".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![parent.to_string()],
+            blocked_by: vec![],
+            idempotency_key: key.map(str::to_string),
+        };
+
+        let first = api.task_create(req(Some("retry-1"))).unwrap();
+        let again = api.task_create(req(Some("retry-1"))).unwrap();
+        assert_eq!(first.task.id, again.task.id, "same key = same task");
+        assert_eq!(again.linked.len(), 1, "and exactly its one parent edge");
+
+        let children = || {
+            api.store
+                .list_tasks()
+                .unwrap()
+                .iter()
+                .filter(|t| t.title == "idem-child")
+                .count()
+        };
+        assert_eq!(children(), 1, "direct read: no duplicate task");
+        assert_eq!(api.store.task_dependencies(first.task.id).unwrap().len(), 1);
+
+        // A different key is a different command — it creates.
+        let other = api.task_create(req(Some("retry-2"))).unwrap();
+        assert_ne!(other.task.id, first.task.id);
+        assert_eq!(children(), 2);
+        // No key at all: the plain per-call semantics stay.
+        api.task_create(req(None)).unwrap();
+        api.task_create(req(None)).unwrap();
+        assert_eq!(children(), 4);
+    }
+
+    /// R2 QA (input-validation): an empty/whitespace-only idempotency key
+    /// is refused with the typed `InvalidInput` (machine code
+    /// `invalid_input`) BEFORE any store touch — it must never return the
+    /// task a previous call registered, and the repeated refusals leave
+    /// the store identical (before == after, direct reads). Pre-guard the
+    /// CLI passed `''` through: the first empty-keyed create registered a
+    /// row under the shared key, the second returned it — exit 0.
+    #[test]
+    fn empty_idempotency_key_is_typed_refusal_with_zero_store_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        // A REAL keyed create first: the shared-`''` trap would have let an
+        // empty-keyed call resolve against the registry and return it.
+        api.task_create(TaskCreateReq {
+            title: "keyed-real".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![],
+            blocked_by: vec![],
+            idempotency_key: Some("real-key".into()),
+        })
+        .expect("non-empty key creates");
+        let before = api.store.list_tasks().unwrap().len();
+
+        let empty_req = |key: &str| TaskCreateReq {
+            title: "keyed-empty".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![],
+            blocked_by: vec![],
+            idempotency_key: Some(key.into()),
+        };
+        // Repeat each degenerate key: every attempt is a refusal, not the
+        // shared-key return of the first task.
+        for key in ["", "   ", "\t"] {
+            for attempt in 1..=2 {
+                let e = api
+                    .task_create(empty_req(key))
+                    .expect_err("empty/whitespace key must refuse");
+                assert_eq!(
+                    e.code(),
+                    ErrorCode("invalid_input"),
+                    "{key:?} #{attempt}: {e}"
+                );
+                assert_eq!(
+                    api.store.list_tasks().unwrap().len(),
+                    before,
+                    "refusal of {key:?} #{attempt} touched nothing"
+                );
+            }
+        }
+        // The refusal must not poison later REAL keyed calls either.
+        api.task_create(TaskCreateReq {
+            title: "keyed-after".into(),
+            project_id: None,
+            description: String::new(),
+            parent: vec![],
+            blocked_by: vec![],
+            idempotency_key: Some("real-key-2".into()),
+        })
+        .expect("guard refuses degenerate keys only");
     }
 
     /// REQ-MUT-05 AC3: the named operation and the `task_op` dispatch run

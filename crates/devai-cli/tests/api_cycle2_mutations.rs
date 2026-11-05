@@ -59,11 +59,23 @@ fn fail(home: &Path, args: &[&str]) -> (String, String) {
     (o.stdout, o.stderr)
 }
 
-/// The short id of the `task new` line (the print starts `task <id8> …`).
-fn new_id_of(stdout: &str) -> String {
-    stdout["task ".len()..]
-        .split_whitespace()
-        .next()
+/// The FULL uuid of a freshly created task, taken from the machine-readable
+/// `--json` view (REQ-E2E-01: cross-step references travel as full ids,
+/// never as human-stdout truncations — UUIDv7 display shorts collide inside
+/// one millisecond window, and that flake is what amplified into the QA
+/// 01a1acab-18b1 orphan finding). The human render itself stays unchanged:
+/// stdout still prints the canonical display short, and assertions compare
+/// it through the canonical accessor, never through a test-local width.
+fn full_id_of(home: &Path, title: &str) -> String {
+    let listing = ok(home, &["--json", "task", "list"]);
+    let v: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    v.as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["title"].as_str() == Some(title))
+        .unwrap_or_else(|| panic!("task `{title}` missing from `task list --json`:\n{listing}"))
+        ["id"]
+        .as_str()
         .unwrap()
         .to_string()
 }
@@ -82,7 +94,7 @@ fn workflow_mutation_render_parity() {
         "{out}"
     );
     assert!(out.contains("start it with: devai task start "), "{out}");
-    let id = new_id_of(&out);
+    let id = full_id_of(home, "parity task");
 
     let out = ok(home, &["task", "start", &id]);
     assert!(out.contains("state: DRAFT → ANALYSIS\n"), "{out}");
@@ -116,13 +128,20 @@ fn dependency_edges_render_and_refusal_parity() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
     ok(home, &["init"]);
-    let a = ok(home, &["task", "new", "dep-a"]);
-    let aid = new_id_of(&a);
+    ok(home, &["task", "new", "dep-a"]);
+    let aid = full_id_of(home, "dep-a");
+    // REQ-E2E-01: the cross-step reference travels as the FULL uuid from
+    // --json — the flaky 13-char stdout short (a fresh collision candidate
+    // in every same-millisecond window) is gone from this pass.
     let b = ok(home, &["task", "new", "dep-b", "--blocked-by", &aid]);
     assert!(
-        b.contains(&format!("  depends blocks {aid} (DRAFT in dep-a)")),
+        b.contains(&format!(
+            "  depends blocks {} (DRAFT in dep-a)",
+            devai_core::types::short_id_str(&aid)
+        )),
         "{b}"
     );
+    let bid = full_id_of(home, "dep-b");
 
     // Self-reference stays loud (unchanged rule, unchanged text family).
     let (so, se) = fail(
@@ -135,52 +154,21 @@ fn dependency_edges_render_and_refusal_parity() {
     // Duplicate registration is loud at write too.
     let (_so, se) = fail(
         home,
-        &[
-            "task",
-            "depend",
-            &b.lines()
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .to_string(),
-            "--on",
-            &aid,
-            "--kind",
-            "blocks",
-        ],
+        &["task", "depend", &bid, "--on", &aid, "--kind", "blocks"],
     );
     assert!(se.contains("already exists"), "{se}");
 
     let out = ok(
         home,
-        &[
-            "task",
-            "depend",
-            &aid,
-            "--on",
-            &b.lines()
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .to_string(),
-            "--kind",
-            "parent",
-        ],
+        &["task", "depend", &aid, "--on", &bid, "--kind", "parent"],
     );
-    let bid = b
-        .lines()
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .to_string();
-    let line =
-        format!("task {aid} —parent→ task {bid} recorded (DRAFT in dep-b, by parity-human, ");
+    // The human line still PRINTS the canonical display shorts — asserted
+    // through the shared accessor, not a test-local width (REQ-E2E-02 AC3).
+    let line = format!(
+        "task {} —parent→ task {} recorded (DRAFT in dep-b, by parity-human, ",
+        devai_core::types::short_id_str(&aid),
+        devai_core::types::short_id_str(&bid)
+    );
     assert!(out.starts_with(&line), "expected `{line}`…\ngot: {out}");
 
     let out = ok(
@@ -193,11 +181,13 @@ fn dependency_edges_render_and_refusal_parity() {
     );
 
     // Override with nothing to override keeps the refusal sentence
-    // (dep-a has no outgoing blockers after the unlink above).
+    // (dep-a has no outgoing blockers after the unlink above). The printed
+    // id in that sentence is the display short — compared canonically.
     let (_so, se) = fail(home, &["task", "override", &aid]);
     assert!(
         se.contains(&format!(
-            "task {aid} has no open blocking dependencies — nothing to override"
+            "task {} has no open blocking dependencies — nothing to override",
+            devai_core::types::short_id_str(&aid)
         )),
         "{se}"
     );
@@ -211,8 +201,8 @@ fn gate_refusal_texts_survive_the_move_to_api_errors() {
     let dir = TempDir::new().unwrap();
     let home = dir.path();
     ok(home, &["init"]);
-    let a = ok(home, &["task", "new", "gate-refusal"]);
-    let aid = new_id_of(&a);
+    ok(home, &["task", "new", "gate-refusal"]);
+    let aid = full_id_of(home, "gate-refusal");
 
     let (_so, se) = fail(home, &["task", "ratify-empty-rework", &aid]);
     assert_eq!(
@@ -302,8 +292,8 @@ fn contract_gate_presentation_parity() {
         "{se}"
     );
 
-    let a = ok(home, &["task", "new", "contract-gate"]);
-    let aid = new_id_of(&a);
+    ok(home, &["task", "new", "contract-gate"]);
+    let aid = full_id_of(home, "contract-gate");
     let (so, se) = fail(
         home,
         &[
@@ -402,6 +392,36 @@ fn registry_output_covers_mutations() {
     assert!(out.contains("operations published"), "footer line missing");
 }
 
+/// R3 QA (da/api-contract) parity: the machine-readable registry output
+/// carries the declared surface version, sourced from the ONE constant in
+/// devai-api — a publication without the stamp, or restamped elsewhere,
+/// fails here.
+#[test]
+fn registry_json_publishes_the_surface_version() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    ok(home, &["init"]);
+    let v: serde_json::Value = {
+        let out = ok(home, &["api", "registry", "--json"]);
+        serde_json::from_str(&out).expect("--json registry output parses")
+    };
+    assert_eq!(
+        v["surface_version"].as_str().unwrap(),
+        devai_api::SURFACE_VERSION,
+        "the registry publication names the single-source surface version"
+    );
+    assert!(
+        v["operations"].is_array(),
+        "the versioned publication wraps the operation table: {v}"
+    );
+    // The human view is byte-stable: NO version prose leaks into it.
+    let human = ok(home, &["api", "registry"]);
+    assert!(
+        !human.contains(devai_api::SURFACE_VERSION),
+        "the machine stamp must not enter operator prose"
+    );
+}
+
 /// REQ-MUT-02 AC1 / REQ-MUT-03 / human-ratified Q2 — the total prohibition:
 /// the CLI sources contain no store handle at all. No `ctx.store`, no
 /// `devai_store` import, no `Store::open` by name, no `Api::store()`/
@@ -440,4 +460,194 @@ fn cli_sources_touch_no_store() {
         violations.is_empty(),
         "CLI sources reach the store again: {violations:?}"
     );
+}
+
+/// REQ-API-01 regression at the CLI surface (QA artifact 01a1acab-18b1,
+/// rl/idempotency): `task new` with an AMBIGUOUS blocked_by ref refuses —
+/// and a DIRECT store read proves neither the task nor any of its edges
+/// landed. Pre-fix, the task was inserted BEFORE the refs resolved, so this
+/// exact call left an orphan task plus an already-committed parent edge.
+#[test]
+fn task_new_with_ambiguous_ref_leaves_no_orphan() {
+    use devai_core::types::Task;
+    use devai_store::Store;
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    ok(home, &["init"]);
+    // A genuine ambiguity, crafted without wall-clock luck: two rows whose
+    // ids share the FULL canonical 13-char display prefix.
+    let mut a = Task::new("collision-a", String::new(), None, chrono::Utc::now());
+    a.id = uuid::Uuid::parse_str("019e0000-0000-7000-8000-0000000000aa").unwrap();
+    let mut b = Task::new("collision-b", String::new(), None, chrono::Utc::now());
+    b.id = uuid::Uuid::parse_str("019e0000-0000-7000-8000-0000000000ab").unwrap();
+    {
+        let store = Store::open(home).unwrap();
+        store.create_task(&a).unwrap();
+        store.create_task(&b).unwrap();
+    }
+
+    let (so, se) = fail(
+        home,
+        &[
+            "task",
+            "new",
+            "orphan-candidate",
+            "--parent",
+            &a.id.to_string(),
+            "--blocked-by",
+            "019e0000-0000", // matches BOTH crafted rows
+        ],
+    );
+    assert!(se.contains("ambiguous identifier"), "{se}");
+    assert!(so.is_empty(), "stdout must stay clean on refusal: {so}");
+
+    // DIRECT read: nothing landed — not the task, not even the edge whose
+    // ref DID resolve (the pre-fix partial success).
+    let store = Store::open(home).unwrap();
+    let tasks = store.list_tasks().unwrap();
+    assert_eq!(tasks.len(), 2, "no orphan task after refusal: {tasks:?}");
+    assert!(store.incoming_dependencies(a.id).unwrap().is_empty());
+    assert!(store.incoming_dependencies(b.id).unwrap().is_empty());
+
+    // REQ-API-02 AC1: the identical retry with resolvable refs succeeds and
+    // adds EXACTLY one task plus exactly its requested edge pair — the
+    // refused attempt contributed nothing that could double.
+    ok(
+        home,
+        &[
+            "task",
+            "new",
+            "orphan-candidate",
+            "--parent",
+            &a.id.to_string(),
+            "--blocked-by",
+            &b.id.to_string(),
+        ],
+    );
+    let store = Store::open(home).unwrap();
+    let all = store.list_tasks().unwrap();
+    assert_eq!(all.len(), 3);
+    let child = all.iter().find(|t| t.title == "orphan-candidate").unwrap();
+    assert_eq!(store.task_dependencies(child.id).unwrap().len(), 2);
+}
+
+/// REQ-API-02 / ratified OQ-1 at the CLI surface: repeating `task new` with
+/// the SAME --idempotency-key returns the committed task — `--json` shows
+/// the identical id and a DIRECT store read proves exactly one row. The
+/// lost-response retry is thus a safe no-duplicate operation; keyless calls
+/// keep the per-call-creates semantics.
+#[test]
+fn task_new_idempotency_key_retry_does_not_duplicate() {
+    use devai_store::Store;
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    ok(home, &["init"]);
+    let first: serde_json::Value = serde_json::from_str(&ok(
+        home,
+        &[
+            "--json",
+            "task",
+            "new",
+            "dup-guard",
+            "--idempotency-key",
+            "retry-42",
+        ],
+    ))
+    .unwrap();
+    let again: serde_json::Value = serde_json::from_str(&ok(
+        home,
+        &[
+            "--json",
+            "task",
+            "new",
+            "dup-guard",
+            "--idempotency-key",
+            "retry-42",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(
+        first["id"], again["id"],
+        "same key must return the SAME task"
+    );
+    assert_eq!(
+        Store::open(home)
+            .unwrap()
+            .list_tasks()
+            .unwrap()
+            .iter()
+            .filter(|t| t.title == "dup-guard")
+            .count(),
+        1,
+        "direct read: the retry created no duplicate"
+    );
+
+    // A different key is a different command — it creates.
+    ok(
+        home,
+        &[
+            "--json",
+            "task",
+            "new",
+            "dup-guard",
+            "--idempotency-key",
+            "retry-43",
+        ],
+    );
+    assert_eq!(
+        Store::open(home)
+            .unwrap()
+            .list_tasks()
+            .unwrap()
+            .iter()
+            .filter(|t| t.title == "dup-guard")
+            .count(),
+        2
+    );
+    // Keyless calls: the plain per-call semantics stay untouched.
+    ok(home, &["task", "new", "dup-guard"]);
+    assert_eq!(
+        Store::open(home)
+            .unwrap()
+            .list_tasks()
+            .unwrap()
+            .iter()
+            .filter(|t| t.title == "dup-guard")
+            .count(),
+        3
+    );
+}
+
+/// R2 QA (input-validation, the shared-empty-key trap): `task new` with an
+/// empty/whitespace-only `--idempotency-key` exits nonzero on EVERY attempt
+/// and a DIRECT store read proves nothing landed (before == after).
+/// Pre-guard the CLI passed `''` through (commands.rs:265): the first call
+/// created a task registered under the shared key, the second RETURNED it
+/// with exit 0 — shared behaviour the ratification forbids to canonize.
+#[test]
+fn task_new_empty_idempotency_key_refused_and_store_untouched() {
+    use devai_store::Store;
+    let dir = TempDir::new().unwrap();
+    let home = dir.path();
+    ok(home, &["init"]);
+    let before = Store::open(home).unwrap().list_tasks().unwrap().len();
+
+    for key in ["", "   "] {
+        for attempt in 1..=2 {
+            let (so, se) = fail(
+                home,
+                &["task", "new", "empty-key", "--idempotency-key", key],
+            );
+            assert!(
+                se.contains("invalid input"),
+                "typed refusal expected for {key:?} #{attempt}, stderr: {se}"
+            );
+            assert!(so.is_empty(), "stdout stays clean on refusal: {so}");
+            assert_eq!(
+                Store::open(home).unwrap().list_tasks().unwrap().len(),
+                before,
+                "refusal of {key:?} #{attempt} must not touch the store"
+            );
+        }
+    }
 }

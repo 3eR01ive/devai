@@ -114,6 +114,12 @@ enum TaskCmd {
         /// stay refused until they close). Comma-separated prefixes ok.
         #[arg(long, value_delimiter = ',')]
         blocked_by: Vec<String>,
+        /// Retry guard (REQ-API-02, ratified OQ-1): a repeated `task new`
+        /// carrying the SAME key returns the task the first committed
+        /// create registered instead of duplicating it — the recovery path
+        /// when a successful create's response was lost.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     List,
     Get {

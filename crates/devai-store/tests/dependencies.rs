@@ -264,8 +264,8 @@ fn v3_database_gains_the_graph_additively() {
     );
     assert_eq!(
         devai_store::SCHEMA_VERSION,
-        7,
-        "the ladder top is now v7 (the single-writer rung 007)"
+        8,
+        "the ladder top is now v8 (the task-creation-key registry rung 008)"
     );
 
     let t = store.get_task(&t_id.to_string()).unwrap();
