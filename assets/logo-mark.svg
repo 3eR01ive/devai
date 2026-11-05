@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>devai mark</title>
+  <desc>Layered plates mark without wordmark, for small sizes.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#202833"/>
+      <stop offset="1" stop-color="#111820"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="32" y="32" width="960" height="960" rx="190" fill="url(#bg)"/>
+
+  <g transform="translate(0,116)">
+    <path d="M512 164 L704 274 Q720 283 704 293 L528 394 Q512 403 496 394 L320 293 Q304 283 320 274 Z" fill="#F4F1EA"/>
+    <path d="M320 346 L496 447 Q512 456 528 447 L704 346 L704 388 Q704 398 688 407 L528 499 Q512 508 496 499 L336 407 Q320 398 320 388 Z" fill="#F36A16"/>
+    <path d="M320 445 L496 546 Q512 555 528 546 L704 445 L704 487 Q704 497 688 506 L528 598 Q512 607 496 598 L336 506 Q320 497 320 487 Z" fill="#71808D"/>
+  </g>
+</svg>
