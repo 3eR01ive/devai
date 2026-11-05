@@ -2389,6 +2389,7 @@ mod tests {
                         title: "show-me".into(),
                         project_id: None,
                         description: "Показать абзац на гейте".into(),
+                        idempotency_key: None,
                         parent: vec![],
                         blocked_by: vec![],
                     })
