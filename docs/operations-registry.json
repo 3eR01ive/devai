@@ -23,9 +23,9 @@
   {
     "name": "task.create",
     "class": "mutation",
-    "input": "TaskCreateReq{title, project, description, description_file, parent, blocked_by}",
+    "input": "TaskCreateReq{title, project_id, description, parent, blocked_by}",
     "output": "TaskCreated{task, linked}",
-    "description": "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. Mirrors `task new`."
+    "description": "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. The project name resolves through the `project.get` read, so its not-found refusal keeps the exact position the command had."
   },
   {
     "name": "task.list",
@@ -61,6 +61,20 @@
     "input": "()",
     "output": "ActiveSnapshot{snapshot_at, rows}",
     "description": "Cross-task read-only snapshot of every RUNNING execution with liveness triage (alive/dead/unknown) and worktree link only where the platform recorded worktree.prepared. Mirrors `task active`."
+  },
+  {
+    "name": "task.workspace_changes",
+    "class": "read",
+    "input": "id_prefix",
+    "output": "WorkspaceChangesView{task, state, isolated, zero_changes, partial, branch, worktree, bound_head, tip, head_before, head_after, commits, files, note}",
+    "description": "The committed changeset of the task's isolated workspace: file list with A/M/D status markers between the stored bound baseline (the bound_head of the first worktree.prepared) and the branch tip — or, once the branch is gone, between the baseline and the last stored worktree.committed stamp when those shas still resolve (state 'historical', partial marker). Verdicts in data: no_isolation / live / historical / unavailable; a zero-change run is an empty list with the zero_changes marker, never an error. Read-only git plumbing over stored facts; nothing is written. Mirrors `task workspace`."
+  },
+  {
+    "name": "task.workspace_diff",
+    "class": "read",
+    "input": "id_prefix, path",
+    "output": "WorkspaceDiffView{task, path, state, branch, baseline, tip, binary, size_bytes, diff, note}",
+    "description": "Readable unified diff of ONE changeset-listed file of the task's rework branch between exactly the baseline and tip task.workspace_changes used (same resolution, so list and diff are consistent by construction). A path outside the changeset is a typed not_found the consumer branches on by code; binary content is a binary fact with the stored size — raw bytes are never rendered. Mirrors `task workspace-diff`."
   },
   {
     "name": "task.report",
@@ -108,106 +122,106 @@
     "name": "task.start",
     "class": "mutation",
     "input": "id_prefix",
-    "output": "MutationResult{task, state_changed, staled, superseded, event_kind, allowed_operations}",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "DRAFT → ANALYSIS through workflow::start. Mirrors `task start`."
   },
   {
     "name": "task.run",
     "class": "mutation",
     "input": "RunReq{id, agent, workspace, force_reaudit}",
-    "output": "RunReport (plus gate_report_text)",
+    "output": "RunOutcome{report, current_quality_report, gate_report_text, allowed_operations}",
     "description": "Drive assigned roles through all autonomous stages to the next human gate; refuses while a RUNNING execution exists (single writer). force_reaudit carries the --force-reaudit gate semantics. Mirrors `task run`."
   },
   {
     "name": "task.revise",
     "class": "mutation",
-    "input": "ReviseReq{id, file, reason}",
-    "output": "MutationResult",
+    "input": "ReviseReq{id, name, content, reason}",
+    "output": "ReviseOutcome{task, staled_ids, allowed_operations}",
     "description": "Publish/replace the REQUIREMENTS_SPEC and move to REVIEW through the contract gate. Mirrors `task revise`."
   },
   {
     "name": "task.review",
     "class": "mutation",
     "input": "id_prefix, verdict, summary",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "Record the reviewer verdict in REVIEW. Mirrors `task review`."
   },
   {
     "name": "task.approve",
     "class": "mutation",
     "input": "id_prefix, rationale",
-    "output": "MutationResult + Decision",
+    "output": "ApproveOutcome{mutation: MutationResult, decision: Decision}",
     "description": "APPROVAL → IMPLEMENTATION: requires a CURRENT REQUIREMENTS_SPEC; persists the workflow event AND a requirements_approval decision row. Mirrors `task approve`."
   },
   {
     "name": "task.reject",
     "class": "mutation",
     "input": "id_prefix, rationale",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "APPROVAL → ANALYSIS. Mirrors `task reject`."
   },
   {
     "name": "task.accept",
     "class": "mutation",
     "input": "id_prefix, rationale",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "QA → ACCEPTED; refuses while open 'blocks' dependencies stand unless a dependency_override decision covers every blocker. Mirrors `task accept`."
   },
   {
     "name": "task.return",
     "class": "mutation",
     "input": "id_prefix, rationale",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "QA → REWORK. Mirrors `task return`."
   },
   {
     "name": "task.pause",
     "class": "mutation",
     "input": "id_prefix, reason",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "Park the task in PAUSED. Mirrors `task pause`."
   },
   {
     "name": "task.resume",
     "class": "mutation",
     "input": "id_prefix",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "Resume a PAUSED/BLOCKED/FAILED task or answer-driven restore, subject to the dependency gate. Mirrors `task resume`."
   },
   {
     "name": "task.block",
     "class": "mutation",
     "input": "id_prefix, reason",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "Move the task to BLOCKED. Mirrors `task block`."
   },
   {
     "name": "task.cancel",
     "class": "mutation",
     "input": "id_prefix, reason",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "Terminal CANCELLED. Mirrors `task cancel`."
   },
   {
     "name": "task.fail",
     "class": "mutation",
     "input": "id_prefix, reason",
-    "output": "MutationResult",
+    "output": "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
     "description": "Record a runtime failure; the task parks in FAILED for `resume`. Mirrors `task fail`."
   },
   {
     "name": "task.depend",
     "class": "mutation",
-    "input": "id_prefix, on_prefix, kind",
+    "input": "DependReq{id, on, kind}",
     "output": "TaskDependency",
     "description": "Register a typed ACTIVE dependency edge, loud at write on self-reference, duplicate, dangling or intra-kind cycles. Mirrors `task depend`."
   },
   {
     "name": "task.unlink",
     "class": "mutation",
-    "input": "id_prefix, on_prefix, kind",
-    "output": "TaskDependency",
-    "description": "Supersede an ACTIVE edge; the row stays as history immutable (OQ7). Mirrors `task unlink`."
+    "input": "DependReq{id, on, kind}",
+    "output": "UnlinkResult{edge, superseded_by}",
+    "description": "Supersede an ACTIVE edge; the row stays as history immutable (OQ7) and the edge is returned AS IT WAS while ACTIVE — the row's own actor is the original author, the superseder is `superseded_by`. Mirrors `task unlink`."
   },
   {
     "name": "task.override",
@@ -220,22 +234,36 @@
     "name": "task.ratify_empty_rework",
     "class": "mutation",
     "input": "id_prefix, rationale",
-    "output": "RatifyResult{task, decision, recorded_now, prev_report, current_report, state}",
+    "output": "RatifyResult{task, decision, recorded_now, prev_report, current_report, state, allowed_operations}",
     "description": "HUMAN-ONLY (OQ-13): the EMPTY-REWORK GATE escape — records rework_noop_ratified for the exact report pair, releases the gate question, runs the withheld REWORK → QA transition. Mirrors `task ratify-empty-rework`."
   },
   {
     "name": "task.merge",
     "class": "mutation",
-    "input": "MergeReq{id, workspace, rationale}",
-    "output": "MergeResult{task, branch, workspace, head_before, head_after}",
-    "description": "HUMAN-ONLY (OQ-13): the single merge path — merges the platform rework/<task-id> branch into the checked-out baseline; records rework_merge decision + event, never touches task state. Mirrors `task merge`."
+    "input": "MergeRecordReq{id, branch, workspace, head_before, head_after, rationale}",
+    "output": "MergeResult{task_id, branch, workspace, head_before, head_after}",
+    "description": "HUMAN-ONLY (OQ-13): the persistence half of the single merge path — records the `rework_merge` decision and `rework.merged` event for a merge of the platform rework/<task-id> branch into the checked-out baseline. The repository act itself stays in the human-invoked command (REQ-WT-07 keeps the git invocation behind the CLI subcommand so no engine path reaches it); this operation never touches task state. Mirrors the recording inside `task merge`."
   },
   {
     "name": "artifact.publish",
     "class": "mutation",
-    "input": "PublishReq{id, kind, file, name, depends, contract, execution, verdict, category}",
-    "output": "PublishResult{artifact, state_changed, gate}",
-    "description": "Publish a versioned artifact through the contract gate; certain kinds advance the workflow through the SAME core commands. Requires a RUNNING execution row when --execution is given. Mirrors `artifact publish`."
+    "input": "PublishReq{id, kind, name, content, depends, contract, execution, verdict, category}",
+    "output": "PublishOutcome{publish: PublishedRow{artifact, task}, advanced: Option<AdvanceOutcome>}",
+    "description": "Publish a versioned artifact through the contract gate; certain kinds advance the workflow through the SAME core commands. Requires a RUNNING execution row when execution is given. Mirrors `artifact publish`."
+  },
+  {
+    "name": "artifact.publish_row",
+    "class": "mutation",
+    "input": "PublishReq{id, kind, name, content, depends, contract, execution, verdict, category}",
+    "output": "PublishedRow{artifact, task}",
+    "description": "The first phase of `artifact.publish` alone: the row through the contract gate, no workflow advance. Exists beside the compound so a consumer that renders between the phases (the CLI, printing the artifact row before the advance) keeps output parity even when the advance fails."
+  },
+  {
+    "name": "artifact.advance",
+    "class": "mutation",
+    "input": "AdvanceReq{id, artifact_id, kind, verdict}",
+    "output": "AdvanceOutcome{from, to, rework_gate}",
+    "description": "The second phase of `artifact.publish`: the workflow advance certain kinds carry (requirements → REVIEW, review report → gate, implementation report → QA through the empty-rework gate). Same core commands as the compound and the engine."
   },
   {
     "name": "artifact.list",
@@ -262,14 +290,14 @@
     "name": "question.ask",
     "class": "mutation",
     "input": "AskReq{id, text, context, options, blocking, execution}",
-    "output": "Question",
+    "output": "QuestionAsked{question, parked}",
     "description": "Raise a question; a blocking one parks the task in WAITING_FOR_INPUT through workflow::raise_question. Mirrors `question ask`."
   },
   {
     "name": "question.answer",
     "class": "mutation",
     "input": "question_id, text",
-    "output": "Question",
+    "output": "AnsweredOutcome{question_id, from_state, to_state}",
     "description": "Answer an OPEN question and run the answer-driven transition. Mirrors `question answer`."
   },
   {
@@ -317,8 +345,8 @@
   {
     "name": "contract.add",
     "class": "mutation",
-    "input": "name, version, file (JSON)",
-    "output": "()",
+    "input": "ContractAddReq{name, version, schema}",
+    "output": "ContractRegistration{name, version}",
     "description": "Register a versioned contract schema. Mirrors `contract add`."
   },
   {
@@ -331,8 +359,8 @@
   {
     "name": "exec.start",
     "class": "mutation",
-    "input": "id_prefix, role, agent, inputs",
-    "output": "RoleExecution",
+    "input": "ExecStartReq{id, role, agent, inputs}",
+    "output": "ExecStarted{execution, task}",
     "description": "Start a role execution: role/stage matrix validated, workspace revision and owner columns captured platform-side, single-writer guard enforced. Mirrors `exec start`."
   },
   {

@@ -110,6 +110,20 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "Cross-task read-only snapshot of every RUNNING execution with liveness triage (alive/dead/unknown) and worktree link only where the platform recorded worktree.prepared. Mirrors `task active`.",
         },
         OpDescriptor {
+            name: "task.workspace_changes",
+            class: OpClass::Read,
+            input: "id_prefix",
+            output: "WorkspaceChangesView{task, state, isolated, zero_changes, partial, branch, worktree, bound_head, tip, head_before, head_after, commits, files, note}",
+            description: "The committed changeset of the task's isolated workspace: file list with A/M/D status markers between the stored bound baseline (the bound_head of the first worktree.prepared) and the branch tip — or, once the branch is gone, between the baseline and the last stored worktree.committed stamp when those shas still resolve (state 'historical', partial marker). Verdicts in data: no_isolation / live / historical / unavailable; a zero-change run is an empty list with the zero_changes marker, never an error. Read-only git plumbing over stored facts; nothing is written. Mirrors `task workspace`.",
+        },
+        OpDescriptor {
+            name: "task.workspace_diff",
+            class: OpClass::Read,
+            input: "id_prefix, path",
+            output: "WorkspaceDiffView{task, path, state, branch, baseline, tip, binary, size_bytes, diff, note}",
+            description: "Readable unified diff of ONE changeset-listed file of the task's rework branch between exactly the baseline and tip task.workspace_changes used (same resolution, so list and diff are consistent by construction). A path outside the changeset is a typed not_found the consumer branches on by code; binary content is a binary fact with the stored size — raw bytes are never rendered. Mirrors `task workspace-diff`.",
+        },
+        OpDescriptor {
             name: "task.report",
             class: OpClass::Read,
             input: "id_prefix",

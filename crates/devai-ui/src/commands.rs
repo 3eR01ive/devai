@@ -14,6 +14,7 @@ use tauri::State;
 
 use devai_api::{ActiveSnapshot, DependenciesView, ProgressView, QualityReportView, StatusView};
 use devai_api::{Api, ApiError, OpDescriptor};
+use devai_api::{WorkspaceChangesView, WorkspaceDiffView};
 use devai_core::types::{
     Artifact, Decision, Project, Question, QuestionStatus, RoleExecution, Task, TaskState,
 };
@@ -93,6 +94,8 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("task_events", "task.events"),
     ("task_decisions", "task.decisions"),
     ("task_active", "task.active"),
+    ("task_workspace_changes", "task.workspace_changes"),
+    ("task_workspace_diff", "task.workspace_diff"),
     ("artifacts_list", "artifact.list"),
     ("artifact_content", "artifact.cat_text"),
     ("artifact_content", "artifact.cat"),
@@ -211,6 +214,31 @@ pub fn task_decisions(state: State<AppState>, id_prefix: String) -> Result<Vec<D
 #[tauri::command]
 pub fn task_active(state: State<AppState>) -> Result<ActiveSnapshot, UiError> {
     Ok(state.api().task_active()?)
+}
+
+/// The committed changeset of the task's isolated workspace against the
+/// stored bound baseline (REQ-WV-04): file list, status markers, the range
+/// and the per-run stamps — all platform-composed, the UI re-spells
+/// nothing. State verdicts arrive as data (REQ-WV-01 AC2, REQ-WV-07).
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_workspace_changes(
+    state: State<AppState>,
+    id_prefix: String,
+) -> Result<WorkspaceChangesView, UiError> {
+    Ok(state.api().task_workspace_changes(&id_prefix)?)
+}
+
+/// The readable unified diff of ONE changeset-listed file (REQ-WV-02):
+/// same baseline..tip range the list view used; a path outside the list is
+/// the platform's typed not_found — the frontend branches on UiError.code,
+/// never on text (AC2).
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_workspace_diff(
+    state: State<AppState>,
+    id_prefix: String,
+    path: String,
+) -> Result<WorkspaceDiffView, UiError> {
+    Ok(state.api().task_workspace_diff(&id_prefix, &path)?)
 }
 
 // ---------------------------------------------------------------------
@@ -365,6 +393,59 @@ mod tests {
             assert!(
                 !src.contains(needle.as_str()),
                 "{file}: direct store import — the API is the only door"
+            );
+        }
+    }
+
+    /// REQ-WV-04 AC1 + AC4 (mechanical half, the window-content criterion
+    /// itself is T7's harness): the frontend's data door is closed over
+    /// this table — EVERY `invoke("<name>")` in api.ts must
+    ///   1) appear in COMMAND_OPERATIONS mapped to a published Read op, and
+    ///   2) be registered in main.rs `generate_handler!` (no dead names).
+    /// A new frontend call that bypasses the registry mapping fails here,
+    /// so the workspace panel (and anything after it) cannot drift into
+    /// git knowledge or disk-path invention.
+    #[test]
+    fn frontend_invokes_are_exactly_mapped_reads() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let api_ts = std::fs::read_to_string(format!("{crate_dir}/frontend/src/api.ts")).unwrap();
+        let main_rs = std::fs::read_to_string(format!("{crate_dir}/src/main.rs")).unwrap();
+
+        // Extract every invoke("<name>") / invoke<X>("<name>") token:
+        // real calls are the ONLY occurrences of `invoke<` in api.ts
+        // (the import and the prose never carry the generic bracket).
+        let mut names: Vec<String> = Vec::new();
+        let mut rest = api_ts.as_str();
+        while let Some(i) = rest.find("invoke<") {
+            rest = &rest[i + "invoke<".len()..];
+            if let Some(q) = rest.find('"') {
+                rest = &rest[q + 1..];
+                if let Some(e) = rest.find('"') {
+                    names.push(rest[..e].to_string());
+                    rest = &rest[e..];
+                }
+            }
+        }
+        assert!(
+            names.iter().any(|n| n == "task_workspace_changes"),
+            "the workspace panel's changeset call is missing from api.ts"
+        );
+        assert!(
+            names.iter().any(|n| n == "task_workspace_diff"),
+            "the workspace panel's diff call is missing from api.ts"
+        );
+        for name in names {
+            // Bootstrap facts are the one ratified non-operation (OQ-10).
+            if name == "session_info" {
+                continue;
+            }
+            assert!(
+                COMMAND_OPERATIONS.iter().any(|(c, _)| *c == name),
+                "api.ts invokes `{name}` with no COMMAND_OPERATIONS mapping"
+            );
+            assert!(
+                main_rs.contains(&format!("commands::{name},")),
+                "`{name}` is not registered in the invoke_handler of main.rs"
             );
         }
     }

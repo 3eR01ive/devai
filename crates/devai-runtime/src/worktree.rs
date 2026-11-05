@@ -276,6 +276,89 @@ pub fn commit_platform_work(
     git(dir, &["rev-parse", "HEAD"])
 }
 
+// ---------------------------------------------------------------------------
+// Read-only view plumbing over the task's committed work (REQ-WV-01/02/07).
+// Every function below is `git diff` / `git rev-parse` class: it never
+// creates a ref, never writes the index, never touches a working tree —
+// the same discipline as [`has_branch`]/[`is_git_repo`], which already read
+// refs for lifecycle decisions.
+// ---------------------------------------------------------------------------
+
+/// Tip of the task's branch when the ref exists, `None` when it does not.
+/// The branch is the durable fact ([`has_branch`] is the gate); this only
+/// spells the answer as a full SHA for the view's range.
+pub fn branch_tip(repo: &Path, task_id: Id) -> Option<String> {
+    if !has_branch(repo, task_id) {
+        return None;
+    }
+    git(repo, &["rev-parse", &branch_name(task_id)]).ok()
+}
+
+/// True when `sha` names a commit object this repository can resolve.
+/// REQ-WV-07 AC3 pins that the (b)/(c) split is detected by sha
+/// RESOLVABILITY (the read-only `rev-parse --verify` precedent of
+/// [`prepare`]), never by whether a directory happens to exist.
+pub fn commit_resolvable(repo: &Path, sha: &str) -> bool {
+    git_ok(repo, &["rev-parse", "--verify", &format!("{sha}^0")])
+}
+
+/// `git diff --name-status --no-renames from..to` as (status, path) pairs.
+/// `--no-renames` is the canonical digest precedent (types.rs dirty_digest):
+/// a rename reads honestly as one D line plus one A line, no heuristic
+/// pairing the view would have to re-derive. Git already emits the list
+/// sorted by path (REQ-WV-05 AC2 keeps that order; nothing re-sorts).
+pub fn diff_name_status(
+    repo: &Path,
+    from: &str,
+    to: &str,
+) -> WorktreeResult<Vec<(String, String)>> {
+    let out = git(
+        repo,
+        &[
+            "diff",
+            "--name-status",
+            "--no-renames",
+            &format!("{from}..{to}"),
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let (status, path) = line.split_once('\t')?;
+            Some((status.chars().next()?.to_string(), path.to_string()))
+        })
+        .collect())
+}
+
+/// The unified-diff TEXT of one file between two commits
+/// (`git diff from..to -- path`). Empty output means the range does not
+/// touch this path — callers consult the changeset list first, so an empty
+/// text here is a consistent "no content delta" fact, not a miss.
+pub fn diff_text(repo: &Path, from: &str, to: &str, path: &str) -> WorktreeResult<String> {
+    git(repo, &["diff", &format!("{from}..{to}"), "--", path])
+}
+
+/// True when the range changes `path` with binary content: `git diff
+/// --numstat` reports `-\t-` instead of line counts for non-textual
+/// payloads. REQ-WV-02 AC3: the binary fact is carried as data, the raw
+/// bytes are never asked for.
+pub fn diff_is_binary(repo: &Path, from: &str, to: &str, path: &str) -> WorktreeResult<bool> {
+    let out = git(
+        repo,
+        &["diff", "--numstat", &format!("{from}..{to}"), "--", path],
+    )?;
+    Ok(out.lines().any(|l| l.starts_with("-\t-")))
+}
+
+/// Size in bytes of `path` as stored in `rev`'s tree (`git ls-tree` +
+/// `git cat-file -s`) — the honest size for the binary verdict, available
+/// at tip for additions/modifications and at the baseline for deletions.
+pub fn blob_size(repo: &Path, rev: &str, path: &str) -> Option<u64> {
+    let line = git(repo, &["ls-tree", rev, "--", path]).ok()?;
+    let sha = line.split_whitespace().nth(2)?;
+    git(repo, &["cat-file", "-s", sha]).ok()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

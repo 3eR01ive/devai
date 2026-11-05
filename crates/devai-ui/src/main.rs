@@ -48,6 +48,8 @@ fn main() {
             commands::task_events,
             commands::task_decisions,
             commands::task_active,
+            commands::task_workspace_changes,
+            commands::task_workspace_diff,
             commands::artifacts_list,
             commands::artifact_content,
             commands::questions_list,

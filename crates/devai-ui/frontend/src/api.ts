@@ -21,6 +21,8 @@ import type {
   Task,
   UiError,
   WorkflowEvent,
+  WorkspaceChangesView,
+  WorkspaceDiffView,
 } from "./types";
 
 export const api = {
@@ -46,6 +48,10 @@ export const api = {
   taskDecisions: (id_prefix: string) =>
     invoke<Decision[]>("task_decisions", { id_prefix }),
   taskActive: () => invoke<ActiveSnapshot>("task_active"),
+  taskWorkspaceChanges: (id_prefix: string) =>
+    invoke<WorkspaceChangesView>("task_workspace_changes", { id_prefix }),
+  taskWorkspaceDiff: (id_prefix: string, path: string) =>
+    invoke<WorkspaceDiffView>("task_workspace_diff", { id_prefix, path }),
 
   artifactsList: (id_prefix: string) =>
     invoke<Artifact[]>("artifacts_list", { id_prefix }),
