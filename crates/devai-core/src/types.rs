@@ -16,9 +16,15 @@ pub fn new_id() -> Id {
 /// duplicated as a wild literal in devai-api; one source, one number).
 /// Rationale carried from the CLI: UUIDv7's leading bytes encode the creation
 /// timestamp, so very short prefixes collide for tasks created in the same
-/// instant. 12 chars keep the display compact while remaining practically
-/// unique; `resolve_task` still fails loudly on any genuine ambiguity.
-pub const ID_PREFIX_CHARS: usize = 12;
+/// instant. 12 chars showed only the top 44 bits of the 48-bit millisecond
+/// timestamp — two tasks created within the same ~16 ms window then shared
+/// the display prefix, and a chained CLI reference (`task new --blocked-by
+/// <just-printed id>`) failed as `resolve_task` correctly reported the
+/// ambiguity (QA-observed flake of the api_cycle2 parity suite). 13 chars
+/// cover the FULL millisecond value: distinct display prefixes for tasks
+/// created in different milliseconds, collisions only within the same ms.
+/// `resolve_task` still fails loudly on any genuine ambiguity.
+pub const ID_PREFIX_CHARS: usize = 13;
 
 /// Typed accessor for the canonical short display of an id. Taking `&Uuid`
 /// (not a `&str`) guarantees the canonical 36-char `to_string` form, so the

@@ -11,7 +11,10 @@
 //! config/
 //!   prompts/common.yaml        # base role rules
 //!   criteria/review.yaml       # basic spec-acceptance checks (reviewer)
-//!   evaluation/quality.yaml    # assessment profile (QA): gates, checks, scoring
+//!   evaluation/base.yaml       # factory BASE profile (QA): gates, checks, scoring —
+//!                              #   abstract only; project specifics enter through the
+//!                              #   ratified overlay delta in `profiles/` (REQ-SP-101/106),
+//!                              #   never through `evaluation/` files
 //!   roles/<slug>.yaml          # role definitions
 //! ```
 
@@ -437,7 +440,9 @@ impl Config {
             .filter(|p| p.applies_to_roles.iter().any(|r| r == slug));
         let mut legacy = applicable.clone();
         legacy
-            .find(|p| p.name.as_deref() != Some("base") && p.project != "base")
+            .find(|p| {
+                p.name.as_deref() != Some(FACTORY_BASE_MARKER) && p.project != FACTORY_BASE_MARKER
+            })
             .or_else(|| applicable.next())
     }
 
@@ -624,6 +629,46 @@ pub fn load_profiles(dir: &Path) -> StoreResult<Vec<Profile>> {
 // specifics -> effective profile.
 // ---------------------------------------------------------------------------
 
+/// The factory base profile's name marker (R4). The base is identified by
+/// its name — the `base.yaml` file stem, filled by the loader — never by an
+/// anonymous first match. `Config::profile_for`'s legacy-preference rule
+/// excludes exactly this marker, so "the factory swap must not silently
+/// rewrite an unmigrated home's auditor checklist" (REQ-SP-101 transition)
+/// is expressed by name and intent, not a bare string literal.
+pub const FACTORY_BASE_MARKER: &str = "base";
+
+/// Default section id for a ratified `add` that does not name one (R4):
+/// REQ-SP-104 lets adds bring new sections; this is the conventional id
+/// the composition gives them.
+const OVERLAY_SECTION_ID: &str = "project-overlay";
+
+/// Default section title paired with `OVERLAY_SECTION_ID` (R4).
+const OVERLAY_SECTION_TITLE: &str = "Project specifics (ratified overlay)";
+
+/// Typed delta-layer failure (R8): every rejection names the violated rule
+/// (`code` — a spec/grammar identifier) and carries the full human text.
+/// String wrapping remains ONLY at the message boundary
+/// (`resolve_effective_profile` -> `StoreError::Config`); callers can branch
+/// on the code instead of matching error strings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("[{code}] {message}")]
+pub struct OverlayError {
+    /// Rule identifier the violation falls under (REQ-SP-106 / REQ-SP-107 /
+    /// V1-V8 effective-grammar rejection).
+    pub code: &'static str,
+    /// Fully rendered human message (includes the offending item where the
+    /// rule names one).
+    pub message: String,
+}
+
+impl OverlayError {
+    fn new(code: &'static str, message: String) -> Self {
+        OverlayError { code, message }
+    }
+}
+
+type OverlayResult<T> = Result<T, OverlayError>;
+
 /// Binding-slot token grammar: a literal `{{name}}` inside `Probe.cmd`.
 /// After composition, any token still present means the slot is UNRESOLVED —
 /// the probe is BLOCKED before spawn (REQ-SP-105), never fake-FAIL/fake-PASS.
@@ -685,10 +730,21 @@ pub struct OverlayAddPayload {
     pub section_title: Option<String>,
 }
 
+/// Item kind of the delta (REQ-SP-104/106). A SERDE ENUM, not a free
+/// string with a runtime dictionary (R3): an invalid `kind` in the delta
+/// file is rejected by the PARSER, before any validation-order logic runs.
+/// `rename_all = "lowercase"` keeps the stored dictionary exactly `bind`
+/// and `add`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OverlayKind {
+    Bind,
+    Add,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OverlayItem {
-    /// bind | add
-    pub kind: String,
+    pub kind: OverlayKind,
     /// bind: an existing base id (check or gate). add: a NEW id.
     pub target_id: String,
     /// id of a decisions row (kind=profile_ratification, verdict=APPROVED)
@@ -768,52 +824,179 @@ fn base_target_ids(base: &Profile) -> HashSet<&str> {
 }
 
 /// Structural validation of the delta against the base (layer (a)).
-pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> Result<(), String> {
+/// Typed failures (R8): each names its rule code; the `kind` dictionary
+/// itself is enforced by the serde enum at PARSE time (R3), so no runtime
+/// "unknown kind" branch survives here.
+pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> OverlayResult<()> {
     let base_ids = base_target_ids(base);
     let mut seen: HashSet<&str> = HashSet::new();
     for item in &overlay.items {
         let who = format!("overlay item `{}`", item.target_id);
         if item.ratified_by.trim().is_empty() {
-            return Err(format!(
-                "{who}: `ratified_by` is empty — an item without a human decision reference has no force path (A-5/REQ-SP-106)"
+            return Err(OverlayError::new(
+                "REQ-SP-106",
+                format!(
+                    "{who}: `ratified_by` is empty — an item without a human decision reference has no force path (A-5/REQ-SP-106)"
+                ),
             ));
         }
-        match item.kind.as_str() {
-            "bind" => {
+        match item.kind {
+            OverlayKind::Bind => {
                 if !base_ids.contains(item.target_id.as_str()) {
-                    return Err(format!(
-                        "{who}: bind target `{}` does not exist in the base (checks or gates) — nothing to bind",
-                        item.target_id
+                    return Err(OverlayError::new(
+                        "REQ-SP-104",
+                        format!(
+                            "{who}: bind target `{}` does not exist in the base (checks or gates) — nothing to bind",
+                            item.target_id
+                        ),
                     ));
                 }
             }
-            "add" => {
+            OverlayKind::Add => {
                 if base_ids.contains(item.target_id.as_str()) {
-                    return Err(format!(
-                        "{who}: add target collides with an existing base id — a new project check must carry a NEW id (REQ-SP-104/V2)"
+                    return Err(OverlayError::new(
+                        "REQ-SP-104",
+                        format!(
+                            "{who}: add target collides with an existing base id — a new project check must carry a NEW id (REQ-SP-104/V2)"
+                        ),
                     ));
                 }
                 let Some(a) = &item.add else {
-                    return Err(format!("{who}: kind=add requires the `add` payload"));
+                    return Err(OverlayError::new(
+                        "REQ-SP-106",
+                        format!("{who}: kind=add requires the `add` payload"),
+                    ));
                 };
                 if !(0.0 < a.weight && a.weight < 1.0) {
-                    return Err(format!(
-                        "{who}: declared weight {} must be 0 < w < 1 (REQ-SP-106)",
-                        a.weight
+                    return Err(OverlayError::new(
+                        "REQ-SP-106",
+                        format!(
+                            "{who}: declared weight {} must be 0 < w < 1 (REQ-SP-106)",
+                            a.weight
+                        ),
                     ));
                 }
             }
-            other => {
-                return Err(format!(
-                    "{who}: kind `{other}` is not one of bind|add (REQ-SP-106)"
-                ));
-            }
         }
         if !seen.insert(item.target_id.as_str()) {
-            return Err(format!("{who}: duplicate target_id among overlay items"));
+            return Err(OverlayError::new(
+                "REQ-SP-106",
+                format!("{who}: duplicate target_id among overlay items"),
+            ));
         }
     }
     Ok(())
+}
+
+/// View of BOTH bind-target sorts (REQ-SP-104: a bind points at a check
+/// id OR a gate id). Gates and checks share the only surface slot binding
+/// rewrites — `probes` — and each owns one restatable wording (gate `desc`,
+/// check `statement`), reachable solely through a ratified
+/// `refine_statement`. One substitution loop over this trait replaces the
+/// two gate/check copies that used to drift apart (R2).
+trait BindTarget {
+    fn id(&self) -> &str;
+    fn target_probes(&self) -> &[Probe];
+    fn probes_mut(&mut self) -> &mut Vec<Probe>;
+    /// The target's wording replaced by a ratified `refine_statement`.
+    fn set_wording(&mut self, wording: &str);
+    /// Names of every `{{slot}}` token currently in the target's form
+    /// (deduplicated) — the OQ-SP-4 divergence read.
+    fn slot_token_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for p in self.target_probes() {
+            for n in slot_names(&p.cmd) {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+}
+
+impl BindTarget for GateDef {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn target_probes(&self) -> &[Probe] {
+        &self.probes
+    }
+    fn probes_mut(&mut self) -> &mut Vec<Probe> {
+        &mut self.probes
+    }
+    fn set_wording(&mut self, wording: &str) {
+        self.desc = wording.to_string();
+    }
+}
+
+impl BindTarget for CheckDef {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn target_probes(&self) -> &[Probe] {
+        &self.probes
+    }
+    fn probes_mut(&mut self) -> &mut Vec<Probe> {
+        &mut self.probes
+    }
+    fn set_wording(&mut self, wording: &str) {
+        self.statement = wording.to_string();
+    }
+}
+
+/// The ONE slot-substitution step (R2): apply a ratified bind — explicit
+/// wording refinement, then replace every `{{name}}` token in every probe
+/// of the target — identically for gates and checks.
+fn apply_bind(target: &mut dyn BindTarget, item: &OverlayItem) {
+    if let Some(r) = &item.refine_statement {
+        target.set_wording(r);
+    }
+    for p in target.probes_mut() {
+        for (name, value) in &item.slots {
+            p.cmd = p.cmd.replace(&format!("{{{{{name}}}}}"), value);
+        }
+    }
+}
+
+/// The bind-target view of one profile: gates and checks through the
+/// shared `BindTarget` trait (REQ-SP-104 — a bind may name either sort).
+fn bind_targets<'a>(
+    profile: &'a Profile,
+    target_id: &'a str,
+) -> impl Iterator<Item = &'a dyn BindTarget> + 'a {
+    profile
+        .gates
+        .iter()
+        .map(|g| g as &dyn BindTarget)
+        .chain(
+            profile
+                .evaluations
+                .iter()
+                .flat_map(|e| e.checks.iter())
+                .map(|c| c as &dyn BindTarget),
+        )
+        .filter(move |t| t.id() == target_id)
+}
+
+/// The mutable bind-target view (see `bind_targets`).
+fn bind_targets_mut<'a>(
+    profile: &'a mut Profile,
+    target_id: &'a str,
+) -> impl Iterator<Item = &'a mut dyn BindTarget> + 'a {
+    profile
+        .gates
+        .iter_mut()
+        .map(|g| g as &mut dyn BindTarget)
+        .chain(
+            profile
+                .evaluations
+                .iter_mut()
+                .flat_map(|e| e.checks.iter_mut())
+                .map(|c| c as &mut dyn BindTarget),
+        )
+        .filter(move |t| t.id() == target_id)
 }
 
 /// Compose the effective profile: base + the RATIFIED subset of the delta.
@@ -835,7 +1018,7 @@ pub fn compose_profile(
     base: &Profile,
     overlay: &ProfileOverlay,
     ratified: &BTreeMap<String, Vec<String>>,
-) -> Result<Composition, String> {
+) -> OverlayResult<Composition> {
     validate_overlay(overlay, base)?;
 
     let mut applied: Vec<String> = Vec::new();
@@ -862,55 +1045,24 @@ pub fn compose_profile(
 
     let mut eff = base.clone();
 
-    // Binds: fill slot tokens of the target — check OR gate (REQ-SP-104).
-    // The target stays the same single id; no second check/gate appears.
-    for item in in_force.iter().filter(|i| i.kind == "bind") {
+    // Binds: fill slot tokens of the target — check OR gate (REQ-SP-104),
+    // through ONE substitution path (R2). The target stays the same single
+    // id; no second check/gate appears.
+    for item in in_force.iter().filter(|i| i.kind == OverlayKind::Bind) {
         // Token form read BEFORE substitution: the ratified OQ-SP-4
         // divergence signal is a declared slot that is not part of the
         // target's current form (the base drifted under a ratified
         // binding). The binding is NOT silently dropped — it is announced.
-        let mut tokens: Vec<String> = eff
-            .gates
-            .iter()
-            .filter(|g| g.id == item.target_id)
-            .flat_map(|g| g.probes.iter().flat_map(|p| slot_names(&p.cmd)))
+        let mut tokens: Vec<String> = bind_targets(&eff, &item.target_id)
+            .flat_map(|t| t.slot_token_names())
             .collect();
-        for e in &eff.evaluations {
-            for c in e.checks.iter().filter(|c| c.id == item.target_id) {
-                tokens.extend(c.probes.iter().flat_map(|p| slot_names(&p.cmd)));
-            }
-        }
         tokens.sort();
         tokens.dedup();
 
-        for g in &mut eff.gates {
-            if g.id != item.target_id {
-                continue;
-            }
-            if let Some(r) = &item.refine_statement {
-                g.desc = r.clone();
-            }
-            for p in &mut g.probes {
-                for (name, value) in &item.slots {
-                    p.cmd = p.cmd.replace(&format!("{{{{{name}}}}}"), value);
-                }
-            }
+        for t in bind_targets_mut(&mut eff, &item.target_id) {
+            apply_bind(t, item);
         }
-        for e in &mut eff.evaluations {
-            for c in &mut e.checks {
-                if c.id != item.target_id {
-                    continue;
-                }
-                if let Some(r) = &item.refine_statement {
-                    c.statement = r.clone();
-                }
-                for p in &mut c.probes {
-                    for (name, value) in &item.slots {
-                        p.cmd = p.cmd.replace(&format!("{{{{{name}}}}}"), value);
-                    }
-                }
-            }
-        }
+
         for name in item.slots.keys() {
             if !tokens.contains(name) {
                 warnings.push(format!(
@@ -924,19 +1076,24 @@ pub fn compose_profile(
     // Adds: new project checks under NEW ids, with their declared weights
     // and any new error types / sections (REQ-SP-104).
     let mut add_weights: Vec<(String, f64)> = Vec::new();
-    for item in in_force.iter().filter(|i| i.kind == "add") {
+    for item in in_force.iter().filter(|i| i.kind == OverlayKind::Add) {
         let who = format!("add `{}`", item.target_id);
-        let a = item
-            .add
-            .as_ref()
-            .ok_or_else(|| format!("{who}: kind=add requires the `add` payload"))?;
+        let a = item.add.as_ref().ok_or_else(|| {
+            OverlayError::new(
+                "REQ-SP-106",
+                format!("{who}: kind=add requires the `add` payload"),
+            )
+        })?;
         for (t, def) in &a.error_types {
             match eff.error_types.get(t) {
                 Some(existing)
                     if existing.desc == def.desc && existing.severity == def.severity => {}
                 Some(_) => {
-                    return Err(format!(
-                        "{who}: error type `{t}` collides with a different declaration in the base"
+                    return Err(OverlayError::new(
+                        "REQ-SP-104",
+                        format!(
+                            "{who}: error type `{t}` collides with a different declaration in the base"
+                        ),
                     ));
                 }
                 None => {
@@ -958,7 +1115,7 @@ pub fn compose_profile(
         let section = a
             .section
             .clone()
-            .unwrap_or_else(|| "project-overlay".into());
+            .unwrap_or_else(|| OVERLAY_SECTION_ID.into());
         if let Some(e) = eff.evaluations.iter_mut().find(|e| e.id == section) {
             e.checks.push(check);
         } else {
@@ -967,7 +1124,7 @@ pub fn compose_profile(
                 title: a
                     .section_title
                     .clone()
-                    .unwrap_or_else(|| "Project specifics (ratified overlay)".into()),
+                    .unwrap_or_else(|| OVERLAY_SECTION_TITLE.into()),
                 applies_to: None,
                 checks: vec![check],
             });
@@ -981,9 +1138,12 @@ pub fn compose_profile(
     let w_add: f64 = add_weights.iter().map(|(_, w)| w).sum();
     if w_add >= 1.0 {
         let ids: Vec<String> = add_weights.iter().map(|(i, _)| i.clone()).collect();
-        return Err(format!(
-            "overlay rejected (REQ-SP-107): ratified add weights sum {w_add} >= 1 — items: {}",
-            ids.join(", ")
+        return Err(OverlayError::new(
+            "REQ-SP-107",
+            format!(
+                "overlay rejected (REQ-SP-107): ratified add weights sum {w_add} >= 1 — items: {}",
+                ids.join(", ")
+            ),
         ));
     }
     if w_add > 0.0 {
@@ -999,8 +1159,12 @@ pub fn compose_profile(
 
     // Grammar V1-V8 checks the EFFECTIVE profile (REQ-SP-106: not each
     // file separately); V2 uniqueness covers base ids + applied adds.
-    eff.validate()
-        .map_err(|e| format!("effective profile invalid after composition: {e}"))?;
+    eff.validate().map_err(|e| {
+        OverlayError::new(
+            "V1-V8",
+            format!("effective profile invalid after composition: {e}"),
+        )
+    })?;
 
     Ok(Composition {
         effective: eff,

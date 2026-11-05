@@ -3,6 +3,12 @@
 //! (REQ-SP-107) and per-project resolution (REQ-SP-103). The tests run
 //! against a materialised factory home, so the base under composition is
 //! the SHIPPED base.yaml, not a fixture that could drift from it.
+//!
+//! FIXTURE DISCIPLINE (QA R1, evaluator collision): this repo IS judged by
+//! devai itself, whose devai-v11 profile greps `crates/` for network-stack
+//! literals. Illustrative probe patterns here must therefore stay NEUTRAL
+//! (`fakenet`, `othercrate`, …) — a fixture quoting a real gate's pattern
+//! makes that gate FAIL against its own test data.
 
 use chrono::Utc;
 use devai_core::types::*;
@@ -110,11 +116,11 @@ items:
     target_id: dom/sovereignty
     ratified_by: also-no-decision
     add:
-      statement: local-first — no direct network calls from platform code.
+      statement: local-first — nothing may reach out past the declared adapter.
       detects: [security/injection]
       verify: mechanical
       probes:
-        - {{ cmd: "grep -Rn reqwest src/", pass_exit: [0] }}
+        - {{ cmd: "grep -Rn fakenet src/", pass_exit: [0] }}
       weight: 0.30
 "#
         ),
@@ -165,11 +171,11 @@ items:
     target_id: dom/sovereignty
     ratified_by: {dec_add}
     add:
-      statement: local-first — the platform makes no direct network calls.
+      statement: local-first — nothing may reach out past the declared adapter.
       detects: [security/injection]
       verify: mechanical
       probes:
-        - {{ cmd: "test -z \"$(grep -RnE 'reqwest|TcpStream' crates --exclude-dir=tools)\"", pass_exit: [0] }}
+        - {{ cmd: "test -z \"$(grep -RnE 'fakenet|othercrate' crates --exclude-dir=tools)\"", pass_exit: [0] }}
       weight: 0.30
       error_types:
         architecture/sovereignty-leak:
@@ -583,4 +589,91 @@ fn task_without_project_judges_on_the_base() {
     let r = config::resolve_effective_profile(&store, &cfg, None).unwrap();
     assert_eq!(r.profile.unwrap().identity(), "base@1");
     let _ = t;
+}
+
+/// REQ-SP-104 (QA R7): a bind's ratified `refine_statement` is the ONLY
+/// way a bind restates its target's wording — `desc` on a gate,
+/// `statement` on a check — while slots still fill in place and the
+/// target is never duplicated. Bind also never touches weights (the one
+/// REQ-SP-107 AC asserted here).
+#[test]
+fn bind_refine_statement_restates_gate_desc_and_check_statement() {
+    let (_d, store, cfg) = home();
+    let prj = project(&store, "alpha");
+    let t = task(&store, Some(&prj));
+    let d_gate = ratify(&store, &t, &["no-secrets"]).to_string();
+    let d_check = ratify(&store, &t, &["sec/injection"]).to_string();
+    let pid = prj.id.to_string();
+    write_overlay(
+        &cfg,
+        &pid,
+        &format!(
+            r#"project_id: "{pid}"
+base_identity: base@1
+overlay_version: 1
+items:
+  - {{kind: bind, target_id: no-secrets, ratified_by: {d_gate}, refine_statement: "project scanner (ratified wording)", slots: {{secret_scan_cmd: "true"}}}}
+  - {{kind: bind, target_id: sec/injection, ratified_by: {d_check}, refine_statement: "project injection probe (ratified wording)", slots: {{injection_candidates_probe: "true"}}}}
+"#
+        ),
+    );
+    let r = config::resolve_effective_profile(&store, &cfg, Some(&pid)).unwrap();
+    let eff = r.profile.expect("effective profile");
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+    // Gate: wording restated, slot filled in place, still exactly one gate.
+    let gates: Vec<_> = eff.gates.iter().filter(|g| g.id == "no-secrets").collect();
+    assert_eq!(gates.len(), 1, "bind never duplicates its target");
+    assert_eq!(gates[0].desc, "project scanner (ratified wording)");
+    assert_eq!(gates[0].probes[0].cmd, "true");
+
+    // Check: statement restated, probe filled, still exactly one check.
+    let checks: Vec<_> = eff
+        .checks()
+        .into_iter()
+        .filter(|c| c.id == "sec/injection")
+        .collect();
+    assert_eq!(checks.len(), 1, "bind never duplicates its target");
+    assert_eq!(
+        checks[0].statement,
+        "project injection probe (ratified wording)"
+    );
+    assert_eq!(checks[0].probes[0].cmd, "true");
+
+    // Bind changes no weights (REQ-SP-107 AC4) and the result is valid.
+    let b = config::load_profiles(&cfg.join("evaluation"))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(eff.scoring.weights, b.scoring.weights);
+    eff.validate().expect("effective profile passes V1-V8");
+}
+
+/// R3 (QA): `kind` is a serde ENUM with the dictionary `bind|add` — an
+/// invalid value is rejected by the PARSER, before any validation-order
+/// logic could run (the old String+match let the check depend on call
+/// sequence).
+#[test]
+fn invalid_kind_is_rejected_at_parse_time() {
+    let (_d, store, cfg) = home();
+    let prj = project(&store, "alpha");
+    let pid = prj.id.to_string();
+    write_overlay(
+        &cfg,
+        &pid,
+        &format!(
+            r#"project_id: "{pid}"
+base_identity: base@1
+overlay_version: 1
+items:
+  - {{kind: delete, target_id: build-green, ratified_by: whatever, slots: {{build_cmd: "make"}}}}
+"#
+        ),
+    );
+    let err = config::resolve_effective_profile(&store, &cfg, Some(&pid))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown variant"), "{err}");
+    assert!(err.contains("delete"), "{err}");
 }
