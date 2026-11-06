@@ -374,7 +374,8 @@ pub struct QualityReportDoc {
 }
 
 pub struct Assembled {
-    /// Full quality-report@4 document (evidence rule from @3 + the
+    /// Full quality-report document of the contract pinned in
+    /// `QUALITY_REPORT_CONTRACT` (evidence rule from @3 + the
     /// platform-captured `workspace_revision` block).
     pub json: Value,
     /// ACCEPT | RETURN | ESCALATE — platform recommendation for the human.
@@ -385,7 +386,7 @@ pub struct Assembled {
     pub report_text: String,
 }
 
-/// Merge probe results + the auditor's assessment into quality-report@4 and
+/// Merge probe results + the auditor's assessment into the quality report and
 /// apply the deterministic verdict function (§2.5). `revision` is the
 /// workspace state the PLATFORM captured at execution start — embedded
 /// verbatim so every file:line finding is traceable to a bound workspace.
@@ -1282,7 +1283,13 @@ scoring:
             "assemble must embed the platform revision verbatim"
         );
         crate::adapters::validate_against_contract(&out.json.to_string(), Some(&schema))
-            .expect("assembled report must satisfy quality-report@4");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "assembled report must satisfy {}@{}: {e}",
+                    crate::human_view::QUALITY_REPORT_CONTRACT.0,
+                    crate::human_view::QUALITY_REPORT_CONTRACT.1
+                )
+            });
 
         // Gap-only assessment (mock-cycle shape): BLOCKED entries cite their
         // gap record, the report still satisfies the contract.
@@ -1305,6 +1312,12 @@ scoring:
             );
         }
         crate::adapters::validate_against_contract(&out2.json.to_string(), Some(&schema))
-            .expect("blocked-mix report must satisfy quality-report@4");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "blocked-mix report must satisfy {}@{}: {e}",
+                    crate::human_view::QUALITY_REPORT_CONTRACT.0,
+                    crate::human_view::QUALITY_REPORT_CONTRACT.1
+                )
+            });
     }
 }

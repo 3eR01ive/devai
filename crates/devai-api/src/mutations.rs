@@ -2475,9 +2475,10 @@ scoring:
         assert_eq!(p2.freshness.report_status, "STALE");
         assert_eq!(p2.freshness.task_state, "REWORK");
         let text = api.quality_report_text(t).unwrap().unwrap();
-        assert!(
-            text.starts_with("⚠ отчёт v1 УСТАРЕЛ — задача в REWORK"),
-            "{text}"
+        assert_eq!(
+            text.lines().next().unwrap_or(""),
+            "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит ещё не запущен",
+            "the full formulation is pinned: no execution exists, so none is named"
         );
         assert!(text.contains("НЕ текущее решение"), "{text}");
         assert!(text.contains("НЮАНСЫ"), "the stored form is still readable");
@@ -2485,6 +2486,120 @@ scoring:
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.status, "STALE");
         assert!(view.freshness.expect("freshness is part of the view").stale);
+    }
+
+    /// R1/R5: the freshness marker names the STORE fact. A return whose last
+    /// auditor run is the COMPLETED one that produced the report is NOT an
+    /// unfinished re-audit (the old code invented one), «в работе» appears
+    /// only with a live RUNNING row, and both formulations are pinned in full.
+    #[test]
+    fn freshness_marker_names_the_store_fact_not_an_invented_reaudit() {
+        fn auditor_exec(task_id: Id, started: Timestamp) -> RoleExecution {
+            RoleExecution {
+                id: new_id(),
+                task_id,
+                role_slug: present::AUDITOR_ROLE.into(),
+                role_version: 1,
+                agent_name: None,
+                status: ExecutionStatus::Running,
+                inputs: vec![],
+                summary: None,
+                error: None,
+                started_at: started,
+                finished_at: None,
+                workspace_revision: None,
+                attempt: 1,
+                parent_execution: None,
+                failure_class: None,
+                owner_pid: None,
+                owner_host: None,
+                owner_process_start: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "freshness-facts");
+        let body = assembled_report_doc();
+        let row = api
+            .artifact_publish_row(PublishReq {
+                id: t.to_string(),
+                kind: ArtifactKind::QualityReport,
+                name: "qr".into(),
+                content: serde_json::to_vec(&body).unwrap(),
+                depends: vec![],
+                contract: Some("quality-report@5".into()),
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
+            .unwrap();
+
+        // The COMPLETED auditor run that produced the report on screen.
+        let started = chrono::DateTime::parse_from_rfc3339("2026-11-06T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let done = auditor_exec(t, started);
+        api.store.start_execution(&done).unwrap();
+        api.store
+            .finish_execution(
+                &done,
+                ExecutionStatus::Completed,
+                Some("report published"),
+                None,
+                started + chrono::Duration::minutes(5),
+            )
+            .unwrap();
+
+        // Return to rework: the rejected report stops being CURRENT (OQ-QH-3).
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let mut m = Mutation {
+            task: task.clone(),
+            events: vec![],
+            artifact_status: vec![(row.artifact.id, ArtifactStatus::Stale)],
+            questions: vec![],
+        };
+        m.task.state = TaskState::Rework;
+        api.store.commit(task.lock_version, &m).unwrap();
+
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(
+            p.freshness.marker,
+            format!(
+                "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: возврат без ре-аудита; последний прогон {} COMPLETED 2026-11-06 10:05:00Z",
+                short_id(&done.id)
+            ),
+            "the completed run that produced the report is not an unfinished re-audit"
+        );
+        assert!(!p.freshness.marker.contains("в работе"));
+        assert!(!p.freshness.marker.contains("не завершён"));
+        // The text channel carries the same full marker, not a summary.
+        assert_eq!(
+            api.quality_report_text(t)
+                .unwrap()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap_or(""),
+            p.freshness.marker
+        );
+
+        // A live re-audit: only NOW is «в работе» a fact of the store.
+        let running = auditor_exec(t, Utc::now());
+        api.store.start_execution(&running).unwrap();
+        let p2 = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(
+            p2.freshness.marker,
+            format!(
+                "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: готовится ре-аудит (execution {}, в работе)",
+                short_id(&running.id)
+            )
+        );
+        assert_eq!(
+            p2.freshness.execution_status.as_deref(),
+            Some("RUNNING"),
+            "the view names the live execution, not a finished one"
+        );
     }
 
     /// QA R2 / rework R4: «no report» (Ok(None)), «damaged form» and «the blob

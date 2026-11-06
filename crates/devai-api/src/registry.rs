@@ -157,7 +157,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Read,
             input: "id_prefix",
             output: "QualityReportView",
-            description: "The CURRENT quality report the human signs at the QA gate: artifact identity, contract, machine body and rendering. Mirrors `task report`.",
+            description: "The quality report shown at the QA gate: the CURRENT report, or — when the task was returned to rework and no re-audit has published yet — the STALE predecessor under an explicit freshness marker (never passed off as the decision). Artifact identity, contract, machine body and the stored human rendering. Mirrors `task report`.",
         },
         OpDescriptor {
             name: "task.events",

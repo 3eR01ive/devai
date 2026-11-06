@@ -6,8 +6,8 @@
 // Run: `npm test` (node --test on the TS sources; Node strips the types).
 import assert from "node:assert/strict";
 import test from "node:test";
-import { anchorLine, fmtNum, presentReport, validateHumanForm } from "../src/report_view.ts";
-import type { QualityReportView } from "../src/types.ts";
+import { freshnessBanner, presentReport, validateHumanForm } from "../src/report_view.ts";
+import type { QualityReportView, ReportFreshness } from "../src/types.ts";
 
 function view(over: Partial<QualityReportView>): QualityReportView {
   return {
@@ -35,6 +35,7 @@ function form(): unknown {
       machine_verdict: "FAIL",
       score: 0.82,
       theta: 0.9,
+      numbers: "S=0.820/1.00, порог 0.900",
       basis: "красные линии: cl/fmt=0.0<floor 0.9",
       counts: { blocks: 1, nuances: 2, anchors: 1, unchecked: 1 },
     },
@@ -44,7 +45,7 @@ function form(): unknown {
         title: "БЬЁТ ПО ВЕРДИКТУ",
         lead: "решается тобой",
         items: [
-          { id: "cl/fmt", kind: "mechanical", summary: "cargo fmt дрейф", site: "a.rs:442", score: 0, weight: 0.05, importance: 0.05 },
+          { id: "cl/fmt", kind: "mechanical", summary: "cargo fmt дрейф", line: "cl/fmt · балл 0.000 · вес 0.050 · важность 0.050 · a.rs:442", site: "a.rs:442", score: 0, weight: 0.05, importance: 0.05 },
         ],
       },
       {
@@ -52,7 +53,7 @@ function form(): unknown {
         title: "НЮАНСЫ",
         lead: "",
         items: [
-          { id: "n/one", kind: "scored", summary: "мелочь", site: "b.rs:1", score: 0.9, weight: 0.1, importance: 0.01, evidence: ["x"] },
+          { id: "n/one", kind: "scored", summary: "мелочь", line: "n/one · балл 0.900 · вес 0.100 · важность 0.010 · b.rs:1", site: "b.rs:1", score: 0.9, weight: 0.1, importance: 0.01, evidence: ["x"] },
         ],
       },
       {
@@ -60,14 +61,14 @@ function form(): unknown {
         title: "ЯКОРЯ",
         lead: "",
         items: [
-          { id: "anch/a", kind: "anchor", summary: "закреплено", site: "", score: 1, weight: 0, importance: 0, ratified_by: "guerrero" },
+          { id: "anch/a", kind: "anchor", summary: "закреплено", line: "  · anch/a — закреплено: решение 01a1b1b8-dec (guerrero)", site: "", score: 1, weight: 0, importance: 0, ratified_by: "решение 01a1b1b8-dec (guerrero)" },
         ],
       },
       {
         key: "unchecked",
         title: "НЕ ПРОВЕРЕНО",
         lead: "",
-        items: [{ id: "brk/x", kind: "blocked", summary: "проба не прошла", site: "", score: null, weight: 0.1, importance: null, reason: "нет пробы" }],
+        items: [{ id: "brk/x", kind: "blocked", summary: "проба не прошла", line: "brk/x · балл — · вес 0.100", site: "", score: null, weight: 0.1, importance: null, reason: "нет пробы" }],
       },
     ],
     blocked_weight: 0.1,
@@ -127,14 +128,73 @@ test("an absent rendering keeps an explicit fact instead of an empty panel", () 
   assert.equal(body.kind, "absent");
 });
 
-test("the anchor row names the check and who ratified it", () => {
-  const anchor = form() as any;
-  const item = anchor.groups[2].items[0];
-  assert.equal(anchorLine(item), "anch/a — закреплено: guerrero");
-  assert.match(anchorLine({ ...item, ratified_by: undefined }), /отсылка на решение не указана/);
+function freshness(over: Partial<ReportFreshness>): ReportFreshness {
+  return {
+    stale: true,
+    marker: "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: возврат без ре-аудита; последний прогон 01a1b29e COMPLETED 2026-11-06 20:48:16Z",
+    report_seq: 1,
+    report_status: "STALE",
+    task_state: "REWORK",
+    execution: "01a1b29e-8adf-7113-9243-3d217f1a74a4",
+    execution_status: "RUNNING",
+    ...over,
+  };
+}
+
+test("a current report shows no stale banner", () => {
+  assert.deepEqual(freshnessBanner(null, "CURRENT"), { stale: false });
+  assert.deepEqual(
+    freshnessBanner(freshness({ stale: false }), "CURRENT"),
+    { stale: false },
+    "a non-stale fact never draws a banner, whatever its marker says",
+  );
 });
 
-test("one number precision for score, weight and importance", () => {
-  assert.equal(fmtNum(0.05), "0.050");
-  assert.equal(fmtNum(0.9), "0.900");
+// R5/R6: the panel's banner text is pinned byte-for-byte for the three
+// freshness formulations — a wording change is visible in the diff instead of
+// silently shipping.
+test("the stale banner pins the running re-audit wording", () => {
+  const b = freshnessBanner(freshness({}), "STALE");
+  assert.equal(b.stale, true);
+  if (!b.stale) return;
+  assert.equal(
+    b.head,
+    "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: возврат без ре-аудита; последний прогон 01a1b29e COMPLETED 2026-11-06 20:48:16Z",
+  );
+  assert.equal(
+    b.detail,
+    "статус отчёта STALE · фаза REWORK · execution 01a1b29e (RUNNING)",
+  );
+});
+
+test("the stale banner pins the «no execution» wording without an id", () => {
+  const b = freshnessBanner(
+    freshness({
+      marker: "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит ещё не запущен",
+      execution: null,
+      execution_status: null,
+    }),
+    "STALE",
+  );
+  assert.equal(b.stale, true);
+  if (!b.stale) return;
+  assert.equal(b.head, "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит ещё не запущен");
+  assert.equal(b.detail, "статус отчёта STALE · фаза REWORK");
+});
+
+// R6: the visible rows the panel prints ARE the stored Rust `line` strings —
+// the panel adds no wording of its own (no second anchor sentence, no second
+// number precision).
+test("the panel prints the stored item rows verbatim", () => {
+  const body = presentReport(view({ report: { human_view: form() } }));
+  assert.equal(body.kind, "form");
+  if (body.kind !== "form") return;
+  const lines = body.form.groups.flatMap((g) => g.items.map((it) => it.line));
+  assert.deepEqual(lines, [
+    "cl/fmt · балл 0.000 · вес 0.050 · важность 0.050 · a.rs:442",
+    "n/one · балл 0.900 · вес 0.100 · важность 0.010 · b.rs:1",
+    "  · anch/a — закреплено: решение 01a1b1b8-dec (guerrero)",
+    "brk/x · балл — · вес 0.100",
+  ]);
+  assert.equal(body.form.headline.numbers, "S=0.820/1.00, порог 0.900");
 });

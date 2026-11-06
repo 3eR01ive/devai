@@ -149,6 +149,9 @@ export interface HumanFormItem {
   id: string;
   kind: HumanItemKind;
   summary: string;
+  // The COMPLETE visible row, formatted once in Rust at assembly; the panel
+  // prints it verbatim (rework R3: no second wording, no second precision).
+  line: string;
   site: string;
   score: number | null;
   weight: number | null;
@@ -173,6 +176,8 @@ export interface HumanForm {
     machine_verdict: string;
     score: number;
     theta: number;
+    // «S=…/1.00, порог …» — already formatted by the one Rust formatter.
+    numbers: string;
     basis: string;
     counts: { blocks: number; nuances: number; anchors: number; unchecked: number };
   };

@@ -8,7 +8,7 @@ import { computed, onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
-import { anchorLine, fmtNum, presentReport, type ReportBody } from "../report_view";
+import { freshnessBanner, presentReport, type ReportBody } from "../report_view";
 import type {
   ActiveRow,
   Artifact,
@@ -145,6 +145,13 @@ async function loadReport() {
 // ветки покрыты tests/report_view.test.ts, R3).
 const reportBody = computed<ReportBody | null>(() =>
   report.value ? presentReport(report.value) : null,
+);
+
+// Баннер свежести (REQ-QH-05, rework R5): шапка — маркер платформы как есть,
+// строка факта — статус отчёта, фаза задачи и исполнение. Ветка живёт в
+// `report_view.ts` и покрыта тестом, шаблон только раскладывает готовое.
+const reportBanner = computed(() =>
+  freshnessBanner(report.value?.freshness, report.value?.status ?? ""),
 );
 
 async function openContent(a: Artifact) {
@@ -357,11 +364,9 @@ onMounted(loadAll);
           <span class="code">{{ reportError.code }}</span>{{ reportError.message }}
         </div>
         <template v-else-if="report">
-          <div v-if="report.freshness && report.freshness.stale" class="stale-banner">
-            <strong>{{ report.freshness.marker }}</strong>
-            <span class="mono muted">статус отчёта {{ report.status }} · фаза {{ report.freshness.task_state }}
-              <template v-if="report.freshness.execution"> · execution {{ shortId(report.freshness.execution) }} ({{ report.freshness.execution_status }})</template>
-            </span>
+          <div v-if="reportBanner.stale" class="stale-banner">
+            <strong>{{ reportBanner.head }}</strong>
+            <span class="mono muted">{{ reportBanner.detail }}</span>
           </div>
           <div class="rowflex" style="margin-bottom: 6px">
             <span class="mono muted">artifact {{ shortId(report.artifact) }} · seq {{ report.seq }} · {{ report.contract }}</span>
@@ -379,7 +384,7 @@ onMounted(loadAll);
           <template v-if="reportBody && reportBody.kind === 'form'">
             <div class="qr-headline">
               <span class="mono">ВЕРДИКТ: {{ reportBody.form.headline.verdict }} ({{ reportBody.form.headline.machine_verdict }})</span>
-              <span class="muted mono">S={{ fmtNum(reportBody.form.headline.score) }}/1.00 · порог {{ fmtNum(reportBody.form.headline.theta) }}</span>
+              <span class="muted mono">{{ reportBody.form.headline.numbers }}</span>
             </div>
             <p class="muted" style="margin: 2px 0 8px">{{ reportBody.form.headline.basis }}</p>
             <p class="mono muted" style="margin: 0 0 10px">
@@ -394,15 +399,11 @@ onMounted(loadAll);
               <ul class="qr-items">
                 <li v-for="it in g.items" :key="it.id">
                   <template v-if="g.key === 'anchors'">
-                    <span class="mono">{{ anchorLine(it) }}</span>
+                    <span class="mono">{{ it.line }}</span>
                   </template>
                   <template v-else>
                     <div class="qr-item-line">
-                      <span class="mono qr-id">{{ it.id }}</span>
-                      <span class="mono">балл {{ it.score === null ? "—" : fmtNum(it.score) }}</span>
-                      <span class="mono" v-if="it.weight !== null">вес {{ fmtNum(it.weight) }}</span>
-                      <span class="mono qr-importance" v-if="it.importance !== null">важность {{ fmtNum(it.importance) }}</span>
-                      <span class="mono muted" v-if="it.site">{{ it.site }}</span>
+                      <span class="mono">{{ it.line }}</span>
                     </div>
                     <div class="qr-summary">{{ it.summary }}</div>
                     <div v-if="it.reason" class="muted qr-reason">причина: {{ it.reason }}</div>

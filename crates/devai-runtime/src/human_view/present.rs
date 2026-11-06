@@ -9,7 +9,7 @@
 
 use devai_core::types::{
     Artifact, ArtifactKind, ArtifactStatus, ExecutionStatus, RoleExecution, Task, TaskState,
-    short_id,
+    Timestamp, short_id,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -157,6 +157,12 @@ impl PresentedReport {
     }
 }
 
+/// The timestamp a freshness marker prints: UTC, second precision, no
+/// timezone math — the stored fact, formatted once.
+fn fmt_ts(t: &Timestamp) -> String {
+    t.format("%Y-%m-%d %H:%M:%SZ").to_string()
+}
+
 /// REQ-QH-05: freshness as a FACT of the store — task phase, stored artifact
 /// status, role executions. Nothing is inferred from the report body, and the
 /// report content is not touched.
@@ -184,9 +190,19 @@ pub fn freshness(task: &Task, a: &Artifact, execs: &[RoleExecution]) -> ReportFr
         };
     }
     let tail = if let Some(e) = running {
+        // «в работе» is claimed ONLY when a live RUNNING execution exists.
         format!(
             "готовится ре-аудит (execution {}, в работе)",
             short_id(&e.id)
+        )
+    } else if let Some(e) = last.filter(|e| e.status == ExecutionStatus::Completed) {
+        // The newest auditor run is the COMPLETED one that produced the very
+        // report on screen: there is no re-audit in flight, and calling that
+        // run «не завершён» would invent one (rework R1).
+        format!(
+            "возврат без ре-аудита; последний прогон {} COMPLETED {}",
+            short_id(&e.id),
+            fmt_ts(e.finished_at.as_ref().unwrap_or(&e.started_at))
         )
     } else if let Some(e) = last {
         format!(

@@ -622,6 +622,7 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
             "score": { "type": "number" },
             "theta": { "type": "number" },
             "basis": { "type": "string" },
+            "numbers": { "type": "string", "description": "S and threshold already formatted by the one formatter at assembly; readers print it verbatim (rework R3)" },
             "counts": {
               "type": "object",
               "required": ["blocks", "nuances", "anchors", "unchecked"],
@@ -655,6 +656,7 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
                     "id": { "type": "string" },
                     "kind": { "type": "string", "description": "@ITEM_KIND_LIST@" },
                     "summary": { "type": "string", "description": "ONE short visible line — no code, no paragraphs (REQ-QH-04)" },
+                    "line": { "type": "string", "description": "the COMPLETE visible row (id, score, weight, importance, site — or the anchor sentence), formatted once at assembly; every channel prints it verbatim (rework R3)" },
                     "site": { "type": "string", "description": "file:line of the finding, empty when there is none" },
                     "score": { "type": ["number", "null"] },
                     "weight": { "type": ["number", "null"] },

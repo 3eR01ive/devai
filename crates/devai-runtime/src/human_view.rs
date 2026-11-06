@@ -31,6 +31,12 @@ pub mod present;
 
 use std::collections::BTreeMap;
 
+/// The quality-report contract THIS platform assembles and publishes.
+/// Spelled once: assembly, publication and the messages that name a version
+/// read it from here (rework R2), so a contract bump cannot leave a stale
+/// «@4» in a doc comment or an assertion.
+pub const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 5);
+
 use devai_core::vocab::{CheckState, ItemKind};
 use devai_store::config::Profile;
 use serde::{Deserialize, Serialize};
@@ -80,6 +86,10 @@ pub struct HumanHeadline {
     pub score: f64,
     pub theta: f64,
     pub basis: String,
+    /// The «S / threshold» figures ALREADY formatted by the one formatter
+    /// (`fmt_num`) — every reader prints this string, none re-formats the
+    /// numbers (rework R3: one precision, one place).
+    pub numbers: String,
     /// Counts per group — the «what hits the verdict, what is noise» line.
     pub counts: HumanCounts,
 }
@@ -136,6 +146,11 @@ pub struct HumanItem {
     pub kind: String,
     /// ONE short visible line: what happened, no code, no paragraphs.
     pub summary: String,
+    /// The COMPLETE visible row (id, score, weight, importance, site — or the
+    /// anchor sentence), formatted by the only formatter at assembly. Every
+    /// channel prints this string verbatim, so the CLI and the panel cannot
+    /// drift into two wordings (rework R3).
+    pub line: String,
     /// file:line of the finding, empty when the item has no site.
     pub site: String,
     pub score: Option<f64>,
@@ -233,6 +248,7 @@ fn headline_of(
         score,
         theta,
         basis: basis.into(),
+        numbers: format!("S={}/1.00, порог {}", fmt_num(score), fmt_num(theta)),
         counts: HumanCounts::of(groups),
     }
 }
@@ -330,6 +346,7 @@ impl Buckets {
                 summary: format!(
                     "невыполненных проверок на вес {blocked_weight:.2} > {max_blocked_weight:.2} — вердикт не может быть готовым"
                 ),
+                line: String::new(),
                 site: String::new(),
                 score: None,
                 weight: Some(blocked_weight),
@@ -358,6 +375,7 @@ impl Buckets {
                         ProbeState::Fail => "шлюз не пройден — вердикт возвращается".to_string(),
                         _ => "шлюз не выполнен — вердикт не может быть окончательным".to_string(),
                     },
+                    line: String::new(),
                     site: first_site(&g.detail).unwrap_or_default(),
                     score: None,
                     weight: None,
@@ -397,6 +415,7 @@ impl Buckets {
                 id: c.id.clone(),
                 kind: ItemKind::Pending.as_str().into(),
                 summary: one_line(t, "нужна твоя подпись — вердикт не готов"),
+                line: String::new(),
                 site: String::new(),
                 score: None,
                 weight: Some(c.weight),
@@ -419,6 +438,7 @@ impl Buckets {
                 id: c.id.clone(),
                 kind: ItemKind::Blocked.as_str().into(),
                 summary: one_line(t, "проверка не выполнена — балла нет"),
+                line: String::new(),
                 site: String::new(),
                 score: None,
                 weight: Some(c.weight),
@@ -489,6 +509,7 @@ impl Buckets {
                 id: c.id.clone(),
                 kind: ItemKind::Unknown.as_str().into(),
                 summary: one_line(t, "состояние проверки не распознано"),
+                line: String::new(),
                 site: String::new(),
                 score: c.score,
                 weight: Some(c.weight),
@@ -521,28 +542,48 @@ impl Buckets {
                 key: GROUP_BLOCKS.into(),
                 title: TITLE_BLOCKS.into(),
                 lead: "их единицы: нарушенные пороги, проваленные шлюзы, блокирующее и места под подпись".into(),
-                items: self.blocks.into_iter().map(|(_, _, i)| i).collect(),
+                items: self
+                    .blocks
+                    .into_iter()
+                    .map(|(_, _, i)| finish_line(i))
+                    .collect(),
             },
             HumanGroup {
                 key: GROUP_NUANCES.into(),
                 title: TITLE_NUANCES.into(),
                 lead: "построчно: проверка, балл, вес, важность, сайт, суть; полностью пройденное — в конце (важность 0)".into(),
-                items: self.nuances.into_iter().map(|(_, i)| i).collect(),
+                items: self
+                    .nuances
+                    .into_iter()
+                    .map(|(_, i)| finish_line(i))
+                    .collect(),
             },
             HumanGroup {
                 key: GROUP_ANCHORS.into(),
                 title: TITLE_ANCHORS.into(),
                 lead: "«закреплено» — чьим решением держится; без отсылки на решение пункт сюда не попадает".into(),
-                items: self.anchors,
+                items: self.anchors.into_iter().map(finish_line).collect(),
             },
             HumanGroup {
                 key: GROUP_UNCHECKED.into(),
                 title: TITLE_UNCHECKED.into(),
                 lead: String::new(),
-                items: self.unchecked.into_iter().map(|(_, i)| i).collect(),
+                items: self
+                    .unchecked
+                    .into_iter()
+                    .map(|(_, i)| finish_line(i))
+                    .collect(),
             },
         ]
     }
+}
+
+/// Freeze an item's COMPLETE visible row at assembly (rework R3): the string
+/// every channel prints. Decided here, once, so the CLI and the panel cannot
+/// print the same point with two wordings or two precisions.
+fn finish_line(mut it: HumanItem) -> HumanItem {
+    it.line = visible_line(&it);
+    it
 }
 
 /// A name-only row of the anchors group: kept in force by a NAMED ratified
@@ -552,6 +593,7 @@ fn ratified_item(c: &CheckOutcome, statement: &str, ratified_by: String) -> Huma
         id: c.id.clone(),
         kind: ItemKind::Anchor.as_str().into(),
         summary: one_line(statement, "закреплено решением"),
+        line: String::new(),
         site: String::new(),
         score: c.score,
         weight: Some(c.weight),
@@ -590,6 +632,7 @@ fn scored_item(
             visible_summary(c, statement)
         },
         site: visible_site(c),
+        line: String::new(),
         score: c.score,
         weight: Some(c.weight),
         importance: importance_of(c),
@@ -606,6 +649,7 @@ fn no_score_item(c: &CheckOutcome, statement: &str) -> HumanItem {
         id: c.id.clone(),
         kind: ItemKind::NoScore.as_str().into(),
         summary: one_line(statement, "проверка завершена без балла"),
+        line: String::new(),
         site: String::new(),
         score: None,
         weight: Some(c.weight),
@@ -819,8 +863,8 @@ fn render_headline(h: &HumanHeadline) -> Vec<String> {
         "ОТЧЁТ КАЧЕСТВА · человеческая форма".to_string(),
         String::new(),
         format!(
-            "ВЕРДИКТ: {} ({}) — S={:.3}/1.00, порог {:.2}: {}",
-            h.verdict, h.machine_verdict, h.score, h.theta, h.basis
+            "ВЕРДИКТ: {} ({}) — {}: {}",
+            h.verdict, h.machine_verdict, h.numbers, h.basis
         ),
         format!(
             "бьёт по вердикту: {} · нюансы: {} · якоря: {} · не проверено: {}",
@@ -842,7 +886,7 @@ fn render_group(out: &mut Vec<String>, gi: usize, g: &HumanGroup) {
     }
     for (ii, it) in g.items.iter().enumerate() {
         if g.key == GROUP_ANCHORS {
-            out.push(anchor_line(it));
+            out.push(it.line.clone());
             continue;
         }
         render_item(out, ii, it);
@@ -853,7 +897,7 @@ fn render_group(out: &mut Vec<String>, gi: usize, g: &HumanGroup) {
 /// the short visible row, the essence, the reason, then the collapsed proof
 /// layer indented UNDER it — never code inside the sentence.
 fn render_item(out: &mut Vec<String>, ii: usize, it: &HumanItem) {
-    out.push(format!("  {}. {}", ii + 1, item_headline(it)));
+    out.push(format!("  {}. {}", ii + 1, it.line));
     if !it.summary.is_empty() {
         out.push(format!("     суть: {}", it.summary));
     }
@@ -871,6 +915,17 @@ fn render_item(out: &mut Vec<String>, ii: usize, it: &HumanItem) {
         for line in e.lines() {
             out.push(format!("       │ {}", line.trim_end()));
         }
+    }
+}
+
+/// The COMPLETE visible row of one item — the single formatter of what a
+/// human sees (REQ-QH-02, rework R3): an anchor keeps its name-and-ratifier
+/// sentence, every other point carries id · score · weight · importance · site.
+fn visible_line(it: &HumanItem) -> String {
+    if it.kind == ItemKind::Anchor.as_str() {
+        anchor_line(it)
+    } else {
+        item_headline(it)
     }
 }
 
@@ -1311,6 +1366,16 @@ scoring:
         empty.groups[3].items.clear();
         let text = render_text(&empty);
         assert!(!text.contains(TITLE_UNCHECKED), "{text}");
+    }
+
+    /// R6: the rendered human text of ONE fixture, byte for byte (the fixture
+    /// lives in `tests/fixtures/human_view_cli_text.txt`). Every wording and
+    /// precision change of the CLI form shows up in the test diff instead of
+    /// shipping silently.
+    #[test]
+    fn rendered_cli_text_is_pinned_byte_for_byte() {
+        const PINNED: &str = include_str!("../tests/fixtures/human_view_cli_text.txt");
+        assert_eq!(render_text(&fixture()), PINNED.trim_end_matches('\n'));
     }
 
     /// REQ-QH-01 AC3 (rework R5): the same assembly inputs yield a BIT-EQUAL

@@ -10,7 +10,7 @@
 // `report_text`. This module never trusts `report.report.human_view` just
 // because it is present: it re-checks the SHAPE, because a broken form made
 // the panel throw (headline.score.toFixed on a number that is not one).
-import type { HumanForm, HumanFormItem, QualityReportView } from "./types";
+import type { HumanForm, HumanFormItem, QualityReportView, ReportFreshness } from "./types";
 
 /** What the panel renders — exactly one branch, decided from stored facts. */
 export type ReportBody =
@@ -19,17 +19,10 @@ export type ReportBody =
   | { kind: "flat"; text: string }
   | { kind: "absent"; text: string };
 
-/** The number format of a point (score, weight, importance) — one precision,
- * the same one the CLI render uses, so two surfaces never disagree. */
-export function fmtNum(v: number): string {
-  return v.toFixed(3);
-}
-
-/** The anchor row: the check NAME plus whom the ratified decision belongs to
- * (ratified OQ-QH-2: names only, the decision is named, never invented). */
-export function anchorLine(item: HumanFormItem): string {
-  return `${item.id} — закреплено: ${item.ratified_by ?? "отсылка на решение не указана"}`;
-}
+/** The number format of a point lives ONCE, in Rust (`fmt_num`): the panel
+ * prints the stored `headline.numbers` and `item.line` verbatim, so two
+ * surfaces can never disagree on a precision (rework R3). Nothing here
+ * re-formats a score, a weight or an importance. */
 
 const GROUP_KEYS = ["blocks", "nuances", "anchors", "unchecked"];
 
@@ -49,6 +42,7 @@ function isItem(v: unknown): v is HumanFormItem {
   if (!v || typeof v !== "object") return false;
   const it = v as Record<string, unknown>;
   if (!isStr(it.id) || !isStr(it.kind) || !isStr(it.summary) || !isStr(it.site)) return false;
+  if (!isStr(it.line)) return false;
   if (!isNumOrNull(it.score) || !isNumOrNull(it.weight) || !isNumOrNull(it.importance)) {
     return false;
   }
@@ -75,6 +69,7 @@ export function validateHumanForm(v: unknown): { form: HumanForm } | { error: st
   if (!h || typeof h !== "object") return { error: "нет вердикт-строки (headline)" };
   if (!isStr(h.verdict) || !isStr(h.machine_verdict)) return { error: "в headline нет вердикта" };
   if (!isNum(h.score) || !isNum(h.theta)) return { error: "в headline нет чисел S/порога" };
+  if (!isStr(h.numbers)) return { error: "в headline нет готовой строки чисел" };
   if (!isStr(h.basis)) return { error: "в headline нет basis" };
   const c = h.counts as Record<string, unknown> | undefined;
   if (!c || typeof c !== "object") return { error: "в headline нет счётчиков групп" };
@@ -128,4 +123,24 @@ export function presentReport(report: QualityReportView): ReportBody {
 /** The short artifact label used in the damaged-form marker. */
 export function shortArtifact(id: string): string {
   return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+/** The freshness banner of the panel, as one decision: «no banner» or the
+ * ready head (the platform's marker, quoted verbatim) plus its fact line.
+ * The panel template lays out exactly this — no branch of its own (rework R5:
+ * the stale-banner branch is covered by `tests/report_view.test.ts`). */
+export type FreshnessBanner =
+  | { stale: false }
+  | { stale: true; head: string; detail: string };
+
+export function freshnessBanner(
+  freshness: ReportFreshness | null | undefined,
+  reportStatus: string,
+): FreshnessBanner {
+  if (!freshness || !freshness.stale) return { stale: false };
+  const parts = [`статус отчёта ${reportStatus}`, `фаза ${freshness.task_state}`];
+  if (freshness.execution) {
+    parts.push(`execution ${shortArtifact(freshness.execution)} (${freshness.execution_status})`);
+  }
+  return { stale: true, head: freshness.marker, detail: parts.join(" · ") };
 }

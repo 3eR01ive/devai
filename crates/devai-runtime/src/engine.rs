@@ -25,17 +25,13 @@ use crate::prompt::build_user_prompt;
 use crate::worktree;
 
 /// Stage the auditor answers in: the agent emits an
-/// evaluation-assessment; the PLATFORM assembles the quality-report@4.
+/// evaluation-assessment; the PLATFORM assembles the quality report.
 const ASSESSMENT_CONTRACT: (&str, u32) = ("evaluation-assessment", 1);
-/// @4 extends @3 (QA rule "every criteria entry cites concrete evidence":
-/// `evaluation.checks[].evidence` required, `minItems: 1`) with the required
-/// embedded `workspace_revision` the platform captured at execution start —
-/// a report is now traceable to the exact HEAD + dirty-tree digest + profile
-/// name@version + roles slug@version it was written against. The version is
-/// pinned HERE (code), so the mechanical gate cannot be bypassed by an old
-/// schema text lingering in a home's contract table (seeding is insert-only;
-/// @1..@3 stay in the store untouched as history).
-const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 5);
+/// The quality-report contract version is pinned in CODE (`human_view`), so
+/// the mechanical gate cannot be bypassed by an old schema text lingering in
+/// a home's contract table (seeding is insert-only; older versions stay in
+/// the store untouched as history). Nothing else spells the version.
+use crate::human_view::QUALITY_REPORT_CONTRACT;
 
 /// Run-artifact root under the data directory (REQ-WT-05): evidence is
 /// platform-declared — `<home>/evidence/<task>/<execution>` — and agents
@@ -957,7 +953,7 @@ impl<'a> Engine<'a> {
             None
         };
 
-        // In QA the AGENT answers in assessment shape; the quality-report@4
+        // In QA the AGENT answers in assessment shape; the quality report
         // artifact is assembled by the platform afterwards.
         let contract_schema: Option<String> = if is_qa {
             Some(
@@ -1132,7 +1128,7 @@ impl<'a> Engine<'a> {
             ));
         }
 
-        // The auditor ANSWERS in assessment shape; quality-report@4 describes
+        // The auditor ANSWERS in assessment shape; the quality report describes
         // the artifact the platform assembles afterwards. The prompt must not
         // ask for a shape the agent cannot honestly produce.
         let mut exec_role = role.clone();
@@ -1309,7 +1305,7 @@ impl<'a> Engine<'a> {
         };
 
         // QA: merge the platform's probe results with the auditor's
-        // assessment into the machine quality-report@4 and run the
+        // assessment into the machine quality report and run the
         // deterministic verdict function. Assembly happens BEFORE the
         // execution is closed, so a broken assembly is honestly FAILED.
         // The SAME revision recorded on the execution row is embedded in the
