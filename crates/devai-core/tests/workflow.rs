@@ -1362,9 +1362,14 @@ fn signboard_rule_name_then_draft_sentence_then_title() {
     // Whitespace inside the first line collapses — the signboard is ONE line.
     let w = Task::new("t", "много    пробелов   тут", None, now());
     assert_eq!(w.display_sign(), "много пробелов тут");
-    // A newline terminates the showcase even without punctuation.
-    let n = Task::new("t", "до перевода строки\nпосле", None, now());
-    assert_eq!(n.display_sign(), "до перевода строки");
+    // A newline is NOT a terminator (ratified OQ-TN-3 = first SENTENCE):
+    // the line break inside the sentence collapses into a space.
+    let n = Task::new("t", "А\nБ.", None, now());
+    assert_eq!(n.display_sign(), "А Б.");
+    // ...and the sentence really ends at its punctuation, not at the newline:
+    // "Первое предложение.\nВторое." → "Первое предложение."
+    let two = Task::new("t", "Первое предложение.\nВторое.", None, now());
+    assert_eq!(two.display_sign(), "Первое предложение.");
 
     // 3) A DRAFT with no statement at all keeps the title — вывеска не пуста.
     let empty = Task::new("just the title", "   ", None, now());
@@ -1409,15 +1414,16 @@ fn serialized_task_carries_the_finished_signboard() {
     assert_eq!(v["title"], "formal title", "заголовок создавшего не тронут");
     assert_eq!(v["human_name"], "Имя по смыслу спека");
 
-    // DRAFT: first sentence, ellipsis counts as a sentence end, and a
-    // newline terminates the showcase without punctuation.
+    // DRAFT: first sentence, ellipsis counts as a sentence end; a newline
+    // does NOT terminate — it folds into a space inside the sentence.
     for (statement, expected) in [
         (
             "Первое предложение. Второе — детали.",
             "Первое предложение.",
         ),
         ("Готово… остальное потом", "Готово…"),
-        ("до перевода строки\nпосле", "до перевода строки"),
+        ("до перевода строки\nпосле", "до перевода строки после"),
+        ("А\nБ.", "А Б."),
         ("версия v1.2 готова", "версия v1.2 готова"),
     ] {
         let d = Task::new("formal title", statement, None, now());

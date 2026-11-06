@@ -285,34 +285,36 @@ pub fn task_display_sign(
 
 /// The first sentence of a human statement: up to the first sentence-ending
 /// punctuation (`.`, `!`, `?`, `…`) followed by whitespace or the end of the
-/// text, with any newline runs inside the sentence collapsed into single
-/// spaces so the signboard stays a list line. Whitespace-only input reads as
+/// text. Newlines are NOT terminators — they are ordinary whitespace that
+/// gets collapsed into single spaces together with the other whitespace runs,
+/// so a line break inside the first sentence never cuts it short and the
+/// signboard still stays a single list line. Whitespace-only input reads as
 /// an empty sentence (the caller falls through to the next rule limb).
 /// Deterministic and mechanical — no model, no truncation mid-word.
 pub fn first_sentence(text: &str) -> String {
-    let mut chars: Vec<char> = text.chars().collect();
-    // collapse newlines for the scan AND the render: the sentence is what
-    // comes first, shown on one line.
+    let chars: Vec<char> = text.chars().collect();
     let ends: &[char] = &['.', '!', '?', '…'];
-    let mut i = 0usize;
-    let cut = loop {
-        if i >= chars.len() {
-            break chars.len();
+    let mut cut = chars.len();
+    for (i, c) in chars.iter().enumerate() {
+        if !ends.contains(c) {
+            continue;
         }
-        if chars[i] == '\n' || chars[i] == '\r' {
-            break i;
-        }
-        if ends.contains(&chars[i]) {
-            let next = chars.get(i + 1).copied().unwrap_or(' ');
-            if next.is_whitespace() || i + 1 == chars.len() {
-                break i + 1;
+        // a terminator ends the sentence only when followed by whitespace
+        // (newlines included) or by nothing at all
+        match chars.get(i + 1) {
+            Some(next) if !next.is_whitespace() => continue,
+            _ => {
+                cut = i + 1;
+                break;
             }
         }
-        i += 1;
-    };
-    let raw: String = chars[..cut].iter().collect();
-    chars.clear();
-    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    chars[..cut]
+        .iter()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ---------------------------------------------------------------------------
