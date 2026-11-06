@@ -10,7 +10,13 @@
 // `report_text`. This module never trusts `report.report.human_view` just
 // because it is present: it re-checks the SHAPE, because a broken form made
 // the panel throw (headline.score.toFixed on a number that is not one).
-import type { HumanForm, HumanFormItem, QualityReportView, ReportFreshness } from "./types";
+import type {
+  HumanForm,
+  HumanFormGroup,
+  HumanFormItem,
+  QualityReportView,
+  ReportFreshness,
+} from "./types";
 
 /** What the panel renders — exactly one branch, decided from stored facts. */
 export type ReportBody =
@@ -143,4 +149,35 @@ export function freshnessBanner(
     parts.push(`execution ${shortArtifact(freshness.execution)} (${freshness.execution_status})`);
   }
   return { stale: true, head: freshness.marker, detail: parts.join(" · ") };
+}
+
+// ---------------------------------------------------------------------------
+// The panel's remaining render decisions (rework R4): which groups print, the
+// «пройдено без замечаний» note, the name-only anchor rows and the collapsed
+// evidence layer. They live here — not in the template — so `node --test` can
+// cover every branch without a browser. No wording and no number is produced
+// here: the strings are the stored Rust ones, printed verbatim.
+// ---------------------------------------------------------------------------
+
+/** The groups the panel prints: an empty group is omitted, exactly like the
+ * CLI renderer's conditional sections. */
+export function visibleGroups(form: HumanForm): HumanFormGroup[] {
+  return form.groups.filter((g) => g.items.length > 0);
+}
+
+/** «пройдено без замечаний: N» prints only when the form counted such points
+ * (a v1 form has no `passed` field at all). */
+export function showsPassedNote(form: HumanForm): boolean {
+  return (form.headline.counts.passed ?? 0) > 0;
+}
+
+/** Anchors are name-only rows: the stored line and nothing else; every other
+ * group also prints summary, reason and the evidence layer. */
+export function isNameOnlyGroup(group: HumanFormGroup): boolean {
+  return group.key === "anchors";
+}
+
+/** The collapsed proof layer exists exactly when evidence was stored. */
+export function hasEvidence(it: HumanFormItem): boolean {
+  return (it.evidence?.length ?? 0) > 0;
 }

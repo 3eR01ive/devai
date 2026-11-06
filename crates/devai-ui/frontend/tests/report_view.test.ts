@@ -6,7 +6,7 @@
 // Run: `npm test` (node --test on the TS sources; Node strips the types).
 import assert from "node:assert/strict";
 import test from "node:test";
-import { freshnessBanner, presentReport, validateHumanForm } from "../src/report_view.ts";
+import { freshnessBanner, hasEvidence, isNameOnlyGroup, presentReport, showsPassedNote, validateHumanForm, visibleGroups } from "../src/report_view.ts";
 import type { QualityReportView, ReportFreshness } from "../src/types.ts";
 
 function view(over: Partial<QualityReportView>): QualityReportView {
@@ -197,4 +197,50 @@ test("the panel prints the stored item rows verbatim", () => {
     "brk/x · балл — · вес 0.100",
   ]);
   assert.equal(body.form.headline.numbers, "S=0.820/1.00, порог 0.900");
+});
+
+// R4 (rework): the panel's own render branches — which groups print, the
+// «пройдено» note, name-only anchor rows and the collapsed evidence layer —
+// are decisions of this module, so `node --test` covers them.
+test("empty groups are not printed while their stored form stays intact", () => {
+  const f = form() as any;
+  const full = presentReport(view({ report: { human_view: f } }));
+  assert.equal(full.kind, "form");
+  if (full.kind !== "form") return;
+  assert.equal(visibleGroups(full.form).length, 4);
+
+  const stripped = {
+    ...full.form,
+    groups: full.form.groups.map((g, i) => (i === 3 ? { ...g, items: [] } : g)),
+  };
+  assert.deepEqual(
+    visibleGroups(stripped).map((g) => g.key),
+    ["blocks", "nuances", "anchors"],
+    "a group with no items prints no heading — but the stored form is unchanged",
+  );
+  assert.equal(full.form.groups[3].items.length, 1, "no read-time re-derivation happened");
+});
+
+test("the «пройдено без замечаний» note appears only when points were counted", () => {
+  const f = form() as any;
+  assert.equal(showsPassedNote(f), false, "no passed field: nothing to print");
+  f.headline.counts.passed = 0;
+  assert.equal(showsPassedNote(f), false);
+  f.headline.counts.passed = 3;
+  assert.equal(showsPassedNote(f), true);
+});
+
+test("only the anchors group is a name-only row", () => {
+  const f = form() as any;
+  assert.deepEqual(
+    f.groups.map((g: any) => isNameOnlyGroup(g)),
+    [false, false, true, false],
+  );
+  assert.equal(isNameOnlyGroup({ key: "blocks", title: "t", lead: "", items: [] }), false);
+});
+
+test("the collapsed evidence layer exists exactly when evidence was stored", () => {
+  assert.equal(hasEvidence({ id: "a", kind: "scored", summary: "s", line: "l", site: "", score: 1, weight: 0, importance: 0 }), false);
+  assert.equal(hasEvidence({ id: "a", kind: "scored", summary: "s", line: "l", site: "", score: 1, weight: 0, importance: 0, evidence: [] }), false);
+  assert.equal(hasEvidence({ id: "a", kind: "scored", summary: "s", line: "l", site: "", score: 1, weight: 0, importance: 0, evidence: ["probe output"] }), true);
 });

@@ -1960,6 +1960,14 @@ fn craft_report(store: &Store, task_id: Id, content: serde_json::Value, version:
         .unwrap();
 }
 
+/// A failing report whose single finding carries `marker` — two of these make
+/// the selection rule's choice observable in the quoted text.
+fn report_marked(marker: &str) -> serde_json::Value {
+    let mut doc = failing_doc();
+    doc.evaluation.checks[0].violations = vec![format!("{marker}: finding")];
+    serde_json::to_value(&doc).unwrap()
+}
+
 fn mk_check(
     id: &str,
     verify: &str,
@@ -2626,6 +2634,60 @@ fn a_returned_reports_findings_are_delivered_labelled_stale_never_dropped() {
             && refresh.contains("FINDING-MARKER-4e7b")
             && !refresh.contains("отчёт STALE"),
         "a newer CURRENT report is quoted as CURRENT: {refresh}"
+    );
+}
+
+#[test]
+fn the_findings_reader_and_the_panel_share_one_selection_rule() {
+    // R3 (rework): «which report do we show» is ONE rule (`present::select_report`)
+    // for the panel and for the findings quoted into the implementer prompt —
+    // including the SUPERSEDED case, where the two readers used to diverge.
+    let (_d, store) = store();
+    let t = Task::new(
+        "OneRule",
+        "panel and prompt must quote the same report row",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    returned(&store, t.id, "вернись к находкам");
+    craft_report(&store, t.id, report_marked("MARKER-OLD-A"), 4);
+    craft_report(&store, t.id, report_marked("MARKER-NEW-B"), 4);
+
+    // Drop the CURRENT row: both publications are history now, and only the
+    // selection rule decides which one a reader quotes.
+    let task = store.get_task(&t.id.to_string()).unwrap();
+    let supersede: Vec<(Id, ArtifactStatus)> = store
+        .artifacts(t.id)
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
+        .map(|a| (a.id, ArtifactStatus::Superseded))
+        .collect();
+    let m = workflow::Mutation {
+        task: task.clone(),
+        events: vec![],
+        artifact_status: supersede,
+        questions: vec![],
+    };
+    store.commit(task.lock_version, &m).unwrap();
+
+    let arts = store.artifacts(t.id).unwrap();
+    let picked =
+        devai_runtime::human_view::present::select_report(&arts).expect("a report row is selected");
+    assert_eq!(picked.seq, 2, "no CURRENT: the newest row is the one shown");
+    assert_eq!(picked.status, ArtifactStatus::Superseded);
+
+    let section = rework_context(&store, &t, "implementation-agent", &policy())
+        .unwrap()
+        .expect("findings of the selected report are delivered");
+    assert!(
+        section.contains("MARKER-NEW-B") && !section.contains("MARKER-OLD-A"),
+        "the prompt quotes the same row the panel selects: {section}"
+    );
+    assert!(
+        section.contains("это findings не-текущего отчёта, не решение по текущей ревизии"),
+        "a non-CURRENT row is labelled as such, never as the decision: {section}"
     );
 }
 

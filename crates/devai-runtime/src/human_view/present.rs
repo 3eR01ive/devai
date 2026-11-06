@@ -21,12 +21,13 @@ use super::{HumanReportView, render_text};
 pub const AUDITOR_ROLE: &str = "quality-auditor";
 
 /// REQ-005 / REQ-QH-06: status-only selection. CURRENT wins; when there is
-/// none, the newest row (by seq) is still selected whatever its status — it
-/// is then shown under an explicit «устарел» marker, never as the current
-/// decision and never hidden as «QA has not run».
+/// none, the newest row (by seq) is still selected whatever its status — for
+/// a task that is not terminal it is then shown under an explicit «устарел»
+/// marker (see [`freshness`]), never as the current decision and never hidden
+/// as «QA has not run».
 ///
 /// rework R2: this is the ONE selection rule. Both readers — the presented
-/// report (`tasks::presented_quality`) and the findings quoted into the
+/// report (`mutations::presented_quality`) and the findings quoted into the
 /// implementer prompt (`context::quality_findings`) — call it, so they can
 /// never disagree on which report is «the» report (STALE + SUPERSEDED used
 /// to diverge: the panel showed one row, the prompt quoted another).
@@ -228,7 +229,7 @@ fn stale_tail(running: Option<&RoleExecution>, last: Option<&RoleExecution>) -> 
         // The newest auditor run is the COMPLETED one that produced the very
         // report on screen: there is no re-audit in flight, and calling that
         // run «не завершён» would invent one (rework R1).
-        Some(e) if e.status == ExecutionStatus::Completed => reaudit_absent(e),
+        Some(e) if e.status == ExecutionStatus::Completed => reaudit_not_launched(e),
         Some(e) => reaudit_unfinished(e),
         None => "ре-аудит ещё не запущен".to_string(),
     }
@@ -241,7 +242,7 @@ fn reaudit_running(e: &RoleExecution) -> String {
     )
 }
 
-fn reaudit_absent(e: &RoleExecution) -> String {
+fn reaudit_not_launched(e: &RoleExecution) -> String {
     format!(
         "возврат без ре-аудита; последний прогон {} COMPLETED {}",
         short_id(&e.id),
@@ -322,5 +323,91 @@ mod tests {
         // No quality report at all: honest «none», never another kind's row.
         let arts = vec![art(ArtifactKind::Patch, 1, ArtifactStatus::Current)];
         assert!(select_report(&arts).is_none());
+    }
+
+    /// The store row shape the freshness fact reads (role, status, times).
+    fn exec(status: ExecutionStatus, started: chrono::DateTime<Utc>) -> RoleExecution {
+        RoleExecution {
+            id: new_id(),
+            task_id: new_id(),
+            role_slug: AUDITOR_ROLE.into(),
+            role_version: 1,
+            agent_name: None,
+            status,
+            inputs: vec![],
+            summary: None,
+            error: None,
+            started_at: started,
+            finished_at: None,
+            workspace_revision: None,
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
+            owner_pid: None,
+            owner_host: None,
+            owner_process_start: None,
+        }
+    }
+
+    fn task_in(state: TaskState) -> Task {
+        let mut t = Task::new("freshness", "unit", None, Utc::now());
+        t.state = state;
+        t
+    }
+
+    /// REQ-QH-05: the marker names a STORE fact, never a guess. This unit
+    /// pins the three non-live branches — nothing launched, a last run that
+    /// is neither RUNNING nor COMPLETED («не завершён», never «в работе»),
+    /// and a COMPLETED last run (a return without a re-audit). The live
+    /// RUNNING branch is covered end-to-end through the API.
+    #[test]
+    fn the_freshness_marker_names_only_store_facts() {
+        let now = Utc::now();
+        let a = art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale);
+
+        let none = freshness(&task_in(TaskState::Rework), &a, &[]);
+        assert!(none.stale && none.marker.contains("ре-аудит ещё не запущен"));
+        assert_eq!(none.execution, None);
+
+        let failed = exec(ExecutionStatus::Failed, now - chrono::Duration::seconds(5));
+        let unfinished = freshness(&task_in(TaskState::Rework), &a, &[failed]);
+        assert!(
+            unfinished.marker.contains("ре-аудит не завершён")
+                && unfinished.marker.contains("FAILED"),
+            "{}",
+            unfinished.marker
+        );
+        assert_eq!(unfinished.execution_status.as_deref(), Some("FAILED"));
+
+        let done = exec(ExecutionStatus::Completed, now);
+        let no_reaudit = freshness(&task_in(TaskState::Rework), &a, &[done]);
+        assert!(
+            no_reaudit.marker.contains("возврат без ре-аудита"),
+            "a COMPLETED last run is not an unfinished re-audit: {}",
+            no_reaudit.marker
+        );
+    }
+
+    /// The two ways a report IS the last word: CURRENT on a non-terminal
+    /// task, or any status once the task is terminal — no marker is invented
+    /// in either case (the same raw facts are still carried).
+    #[test]
+    fn a_current_report_on_a_live_task_carries_no_marker() {
+        let a = art(ArtifactKind::QualityReport, 1, ArtifactStatus::Current);
+        let fresh = freshness(&task_in(TaskState::Qa), &a, &[]);
+        assert!(!fresh.stale);
+        assert!(fresh.marker.is_empty());
+        assert_eq!(fresh.report_seq, 1);
+        assert_eq!(fresh.task_state, "QA");
+
+        // A settled task does not present a «stale» warning: nothing is
+        // being re-decided any more (same status, no marker).
+        let settled = freshness(
+            &task_in(TaskState::Accepted),
+            &art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale),
+            &[],
+        );
+        assert!(!settled.stale);
+        assert!(settled.marker.is_empty());
     }
 }

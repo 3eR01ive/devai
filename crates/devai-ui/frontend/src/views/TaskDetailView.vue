@@ -8,7 +8,15 @@ import { computed, onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
-import { freshnessBanner, presentReport, type ReportBody } from "../report_view";
+import {
+  freshnessBanner,
+  hasEvidence,
+  isNameOnlyGroup,
+  presentReport,
+  showsPassedNote,
+  visibleGroups,
+  type ReportBody,
+} from "../report_view";
 import type {
   ActiveRow,
   Artifact,
@@ -392,15 +400,15 @@ onMounted(loadAll);
               нюансы: {{ reportBody.form.headline.counts.nuances }} ·
               якоря: {{ reportBody.form.headline.counts.anchors }} ·
               не проверено: {{ reportBody.form.headline.counts.unchecked }}<template
-                v-if="reportBody.form.headline.counts.passed"
+                v-if="showsPassedNote(reportBody.form)"
               > · пройдено без замечаний: {{ reportBody.form.headline.counts.passed }}</template>
             </p>
-            <div v-for="g in reportBody.form.groups.filter(x => x.items.length)" :key="g.key" class="qr-group">
+            <div v-for="g in visibleGroups(reportBody.form)" :key="g.key" class="qr-group">
               <h4 class="qr-group-title">{{ g.title }} ({{ g.items.length }})</h4>
               <p v-if="g.lead" class="muted" style="margin: 0 0 4px">{{ g.lead }}</p>
               <ul class="qr-items">
                 <li v-for="it in g.items" :key="it.id">
-                  <template v-if="g.key === 'anchors'">
+                  <template v-if="isNameOnlyGroup(g)">
                     <span class="mono">{{ it.line }}</span>
                   </template>
                   <template v-else>
@@ -409,9 +417,9 @@ onMounted(loadAll);
                     </div>
                     <div class="qr-summary">{{ it.summary }}</div>
                     <div v-if="it.reason" class="muted qr-reason">причина: {{ it.reason }}</div>
-                    <details v-if="it.evidence && it.evidence.length" class="qr-evidence">
-                      <summary class="muted">доказательства ({{ it.evidence.length }})</summary>
-                      <pre class="content">{{ it.evidence.join("\n\n") }}</pre>
+                    <details v-if="hasEvidence(it)" class="qr-evidence">
+                      <summary class="muted">доказательства ({{ (it.evidence ?? []).length }})</summary>
+                      <pre class="content">{{ (it.evidence ?? []).join("\n\n") }}</pre>
                     </details>
                   </template>
                 </li>

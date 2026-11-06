@@ -2345,8 +2345,23 @@ scoring:
     /// a passed MECHANICAL check, a breached floor and a nuance, each with a
     /// stored one-line summary and a collapsed evidence layer.
     fn assembled_report_doc() -> serde_json::Value {
-        let profile: devai_store::config::Profile =
-            serde_yaml::from_str(FORM_PROFILE_YAML).expect("form fixture profile parses");
+        devai_runtime::evaluation::assemble(
+            &form_profile(),
+            &form_eval_run(),
+            &form_assessment(),
+            "ex-form",
+            &unbound_revision(),
+            &std::collections::BTreeMap::new(),
+        )
+        .json
+    }
+
+    fn form_profile() -> devai_store::config::Profile {
+        serde_yaml::from_str(FORM_PROFILE_YAML).expect("form fixture profile parses")
+    }
+
+    /// The mechanical probe results the assembler consumes: one passed check.
+    fn form_eval_run() -> devai_runtime::evaluation::EvalRun {
         let mut mech = std::collections::HashMap::new();
         mech.insert(
             "mech/pass".to_string(),
@@ -2356,103 +2371,136 @@ scoring:
                 output: "12 passed".into(),
             },
         );
-        let run = devai_runtime::evaluation::EvalRun {
+        devai_runtime::evaluation::EvalRun {
             gates: vec![],
             mech,
             hybrid: std::collections::HashMap::new(),
             evidence_text: String::new(),
-        };
-        let assessment = serde_json::json!({
+        }
+    }
+
+    /// The auditor's assessment answer: one breached floor and one nuance.
+    fn form_assessment() -> serde_json::Value {
+        serde_json::json!({
             "scores": { "corr/floor": 0.4, "cl/y": 0.9 },
             "findings": [{
                 "check": "corr/floor",
                 "text": "the guard is missing at src/a.rs:7",
                 "evidence": ["fn step() { unchecked() }"]
             }]
-        });
-        let revision = WorkspaceRevision {
+        })
+    }
+
+    fn unbound_revision() -> WorkspaceRevision {
+        WorkspaceRevision {
             git_head: None,
             dirty_digest: None,
             profile: None,
             roles: vec![],
-        };
-        devai_runtime::evaluation::assemble(
-            &profile,
-            &run,
-            &assessment,
-            "ex-form",
-            &revision,
-            &std::collections::BTreeMap::new(),
-        )
-        .json
+        }
     }
 
-    /// REQ-QH-01/05/06: the presentation channel quotes the STORED human form
-    /// (never re-assembles one), and a report that is no longer the last word
-    /// is announced as stale — with the task phase — instead of being passed
-    /// off as the current decision. Old bodies keep their stored flat text.
+    /// Publish the assembler-produced @5 document and return its artifact row.
+    fn publish_form_report(api: &Api, t: Id) -> Artifact {
+        api.artifact_publish_row(PublishReq {
+            id: t.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: serde_json::to_vec(&assembled_report_doc()).unwrap(),
+            depends: vec![],
+            contract: Some("quality-report@5".into()),
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap()
+        .artifact
+    }
+
+    /// The ratified return as the store records it: task → REWORK and the
+    /// rejected report CURRENT → STALE (OQ-QH-3, a data change).
+    fn return_to_rework_state(api: &Api, t: Id, artifact: Id) {
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let mut m = Mutation {
+            task: task.clone(),
+            events: vec![],
+            artifact_status: vec![(artifact, ArtifactStatus::Stale)],
+            questions: vec![],
+        };
+        m.task.state = TaskState::Rework;
+        api.store.commit(task.lock_version, &m).unwrap();
+    }
+
+    /// One auditor execution row in the shape the freshness fact reads. The
+    /// row is left RUNNING; a caller that needs a finished run closes it with
+    /// `finish_execution`.
+    fn auditor_exec(task_id: Id, started: Timestamp) -> RoleExecution {
+        RoleExecution {
+            id: new_id(),
+            task_id,
+            role_slug: present::AUDITOR_ROLE.into(),
+            role_version: 1,
+            agent_name: None,
+            status: ExecutionStatus::Running,
+            inputs: vec![],
+            summary: None,
+            error: None,
+            started_at: started,
+            finished_at: None,
+            workspace_revision: None,
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
+            owner_pid: None,
+            owner_host: None,
+            owner_process_start: None,
+        }
+    }
+
+    /// REQ-QH-01/06: the panel quotes the STORED human form (it never
+    /// re-assembles one), and the UI view is the same read — same text,
+    /// same source token.
     #[test]
-    fn the_stored_human_form_is_presented_and_rework_is_announced_as_stale() {
+    fn the_stored_human_form_is_what_both_channels_present() {
         let dir = tempfile::tempdir().unwrap();
         let api = seeded_api(dir.path());
         let t = fresh_task(&api, "form-presentation");
-
-        let body = assembled_report_doc();
-        let row = api
-            .artifact_publish_row(PublishReq {
-                id: t.to_string(),
-                kind: ArtifactKind::QualityReport,
-                name: "qr".into(),
-                content: serde_json::to_vec(&body).unwrap(),
-                depends: vec![],
-                contract: Some("quality-report@5".into()),
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
+        publish_form_report(&api, t);
 
         let p = api.presented_quality_report(t).unwrap().unwrap();
         assert_eq!(p.source, present::RenderSource::HumanForm);
         assert!(
-            p.text.contains("БЬЁТ ПО ВЕРДИКТУ"),
-            "the stored form is what gets rendered, grouped by decision weight: {}",
+            p.text.contains("БЬЁТ ПО ВЕРДИКТУ") && p.text.contains("важность 0.120"),
+            "the stored form is rendered, grouped by decision weight: {}",
             p.text
         );
-        assert!(p.text.contains("важность 0.120"));
         // R7/R5 + R4 (decision of 07.11): the passed mechanical check comes
         // through the real producer and is NOT an «unknown state» hole; a 1.0
         // with no decision link is the norm, so it is counted, not listed.
-        assert!(
-            !p.text.contains("mech/pass"),
-            "a fully passed point is not a finding: {}",
-            p.text
-        );
-        assert!(
-            p.text.contains("пройдено без замечаний: 1"),
-            "the norm point is still accounted for: {}",
-            p.text
-        );
-        assert!(
-            !p.text.contains("не распознано"),
-            "no producer state may fall through as unknown: {}",
-            p.text
-        );
+        assert!(!p.text.contains("mech/pass"), "{}", p.text);
+        assert!(p.text.contains("пройдено без замечаний: 1"), "{}", p.text);
+        assert!(!p.text.contains("не распознано"), "{}", p.text);
         assert!(
             !p.text.contains("RAW-FLAT-TEXT-MARKER"),
             "the flat text is the fallback, not the channel, for @5 bodies"
         );
         assert!(!p.freshness.stale);
         assert_eq!(p.freshness.report_status, "CURRENT");
-        // The UI view is the SAME read: same text, same source, same verdict.
+
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.report_text.as_deref(), Some(p.text.as_str()));
         assert_eq!(view.source, "human_form");
+    }
 
-        // A pre-@5 body still renders its own stored text, byte for byte.
-        let t2 = fresh_task(&api, "legacy");
+    /// REQ-QH-06 fallback: a pre-@5 body still renders its own stored text,
+    /// byte for byte — no form is invented for it.
+    #[test]
+    fn a_legacy_body_still_renders_its_own_flat_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "legacy");
         api.artifact_publish_row(PublishReq {
-            id: t2.to_string(),
+            id: t.to_string(),
             kind: ArtifactKind::QualityReport,
             name: "qr".into(),
             content: br#"{"report_text":"LEGACY-FLAT-TEXT"}"#.to_vec(),
@@ -2464,26 +2512,30 @@ scoring:
         })
         .unwrap();
         assert_eq!(
-            api.quality_report_text(t2).unwrap().as_deref(),
+            api.quality_report_text(t).unwrap().as_deref(),
             Some("LEGACY-FLAT-TEXT")
         );
+        assert_eq!(
+            api.presented_quality_report(t).unwrap().unwrap().source,
+            present::RenderSource::FlatText
+        );
+    }
 
-        // Rework (ratified OQ-QH-3) flips the row CURRENT -> STALE; the
-        // presentation must say so instead of showing it as the decision.
-        let task = api.store.get_task(&t.to_string()).unwrap();
-        let mut m = Mutation {
-            task: task.clone(),
-            events: vec![],
-            artifact_status: vec![(row.artifact.id, ArtifactStatus::Stale)],
-            questions: vec![],
-        };
-        m.task.state = TaskState::Rework;
-        api.store.commit(task.lock_version, &m).unwrap();
+    /// REQ-QH-05: after a return the stored report is announced as stale —
+    /// with the task phase and the stored status — instead of being shown as
+    /// the decision; both channels carry the same fact.
+    #[test]
+    fn rework_announces_the_stored_report_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "rework-stale");
+        let artifact = publish_form_report(&api, t);
+        return_to_rework_state(&api, t, artifact.id);
 
-        let p2 = api.presented_quality_report(t).unwrap().unwrap();
-        assert!(p2.freshness.stale);
-        assert_eq!(p2.freshness.report_status, "STALE");
-        assert_eq!(p2.freshness.task_state, "REWORK");
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert!(p.freshness.stale);
+        assert_eq!(p.freshness.report_status, "STALE");
+        assert_eq!(p.freshness.task_state, "REWORK");
         let text = api.quality_report_text(t).unwrap().unwrap();
         assert_eq!(
             text.lines().next().unwrap_or(""),
@@ -2495,7 +2547,7 @@ scoring:
             text.contains("БЬЁТ ПО ВЕРДИКТУ"),
             "the stored form is still readable: {text}"
         );
-        // The UI view carries the same fact, not a second derivation.
+
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.status, "STALE");
         assert!(view.freshness.expect("freshness is part of the view").stale);
@@ -2503,52 +2555,14 @@ scoring:
 
     /// R1/R5: the freshness marker names the STORE fact. A return whose last
     /// auditor run is the COMPLETED one that produced the report is NOT an
-    /// unfinished re-audit (the old code invented one), «в работе» appears
-    /// only with a live RUNNING row, and both formulations are pinned in full.
+    /// unfinished re-audit (the old code invented one).
     #[test]
-    fn freshness_marker_names_the_store_fact_not_an_invented_reaudit() {
-        fn auditor_exec(task_id: Id, started: Timestamp) -> RoleExecution {
-            RoleExecution {
-                id: new_id(),
-                task_id,
-                role_slug: present::AUDITOR_ROLE.into(),
-                role_version: 1,
-                agent_name: None,
-                status: ExecutionStatus::Running,
-                inputs: vec![],
-                summary: None,
-                error: None,
-                started_at: started,
-                finished_at: None,
-                workspace_revision: None,
-                attempt: 1,
-                parent_execution: None,
-                failure_class: None,
-                owner_pid: None,
-                owner_host: None,
-                owner_process_start: None,
-            }
-        }
-
+    fn a_completed_auditor_run_is_not_an_unfinished_reaudit() {
         let dir = tempfile::tempdir().unwrap();
         let api = seeded_api(dir.path());
-        let t = fresh_task(&api, "freshness-facts");
-        let body = assembled_report_doc();
-        let row = api
-            .artifact_publish_row(PublishReq {
-                id: t.to_string(),
-                kind: ArtifactKind::QualityReport,
-                name: "qr".into(),
-                content: serde_json::to_vec(&body).unwrap(),
-                depends: vec![],
-                contract: Some("quality-report@5".into()),
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
+        let t = fresh_task(&api, "freshness-completed");
+        let artifact = publish_form_report(&api, t);
 
-        // The COMPLETED auditor run that produced the report on screen.
         let started = chrono::DateTime::parse_from_rfc3339("2026-11-06T10:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -2563,17 +2577,7 @@ scoring:
                 started + chrono::Duration::minutes(5),
             )
             .unwrap();
-
-        // Return to rework: the rejected report stops being CURRENT (OQ-QH-3).
-        let task = api.store.get_task(&t.to_string()).unwrap();
-        let mut m = Mutation {
-            task: task.clone(),
-            events: vec![],
-            artifact_status: vec![(row.artifact.id, ArtifactStatus::Stale)],
-            questions: vec![],
-        };
-        m.task.state = TaskState::Rework;
-        api.store.commit(task.lock_version, &m).unwrap();
+        return_to_rework_state(&api, t, artifact.id);
 
         let p = api.presented_quality_report(t).unwrap().unwrap();
         assert_eq!(
@@ -2596,20 +2600,30 @@ scoring:
                 .unwrap_or(""),
             p.freshness.marker
         );
+    }
 
-        // A live re-audit: only NOW is «в работе» a fact of the store.
+    /// …and only a live RUNNING row earns «в работе»: the marker then names
+    /// that execution and its own stored status.
+    #[test]
+    fn in_work_is_claimed_only_with_a_live_audit_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "freshness-running");
+        let artifact = publish_form_report(&api, t);
+        return_to_rework_state(&api, t, artifact.id);
+
         let running = auditor_exec(t, Utc::now());
         api.store.start_execution(&running).unwrap();
-        let p2 = api.presented_quality_report(t).unwrap().unwrap();
+        let p = api.presented_quality_report(t).unwrap().unwrap();
         assert_eq!(
-            p2.freshness.marker,
+            p.freshness.marker,
             format!(
                 "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: готовится ре-аудит (execution {}, в работе)",
                 short_id(&running.id)
             )
         );
         assert_eq!(
-            p2.freshness.execution_status.as_deref(),
+            p.freshness.execution_status.as_deref(),
             Some("RUNNING"),
             "the view names the live execution, not a finished one"
         );

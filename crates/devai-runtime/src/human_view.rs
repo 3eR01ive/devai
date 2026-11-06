@@ -9,21 +9,19 @@
 //! computes no importance, no group membership and no ordering.
 //!
 //! Grouping is by DECISION WEIGHT, not by check id:
-//!   1. blocks    — «бьёт по вердикту / требует твоего решения» (the S<theta
-//!                  breach itself, gates, floor breaches, cap, mechanical
-//!                  fails, pending human signature);
-//!   2. nuances   — ONLY the points still below 1.0 (ratified OQ-QH-1: no
-//!                  0.8–0.9 band filter; 0.4 without a breach is still the
-//!                  human's business), ordered by lost-points×weight. A fully
-//!                  passed point (1.0) WITHOUT a ratified_by link is the NORM
-//!                  (decision of 07.11, R4): it is not a finding, so it is
-//!                  counted in the headline and appears in no group;
-//!   3. anchors   — ONLY positions with an EXPLICIT ratified_by link to a
-//!                  stored decision; names only, junk-drawer forbidden
-//!                  (ratified OQ-QH-2);
-//!   4. unchecked — BLOCKED checks with their reason and weight, and any
-//!                  check state this build does not know (named, never
-//!                  silently folded into a known branch).
+//! 1. blocks — «бьёт по вердикту / требует твоего решения» (the S<theta
+//!    breach itself, gates, floor breaches, cap, mechanical fails, pending
+//!    human signature);
+//! 2. nuances — ONLY the points still below 1.0 (ratified OQ-QH-1: no
+//!    0.8–0.9 band filter; 0.4 without a breach is still the human's
+//!    business), ordered by lost-points×weight. A fully passed point (1.0)
+//!    WITHOUT a ratified_by link is the NORM (decision of 07.11, R4): it is
+//!    not a finding, so it is counted in the headline and appears in no group;
+//! 3. anchors — ONLY positions with an EXPLICIT ratified_by link to a stored
+//!    decision; names only, junk-drawer forbidden (ratified OQ-QH-2);
+//! 4. unchecked — BLOCKED checks with their reason and weight, and any check
+//!    state this build does not know (named, never silently folded into a
+//!    known branch).
 //!
 //! Code and probe output live in the per-item `evidence` layer (REQ-QH-04),
 //! never inside the visible one-line summary.
@@ -81,8 +79,9 @@ pub struct HumanReportView {
     /// still present here as data — the RENDERER omits its heading (the
     /// conditional-section precedent of §2.6 `render`).
     pub groups: Vec<HumanGroup>,
-    /// Blocked weight as decided at assembly, so the «не проверено» heading
-    /// needs no recomputation by any reader.
+    /// Blocked weight as decided at assembly, carried in the form as a fact
+    /// (the cap row states its own comparison, so no reader derives it, and
+    /// the renderer prints no total — it is here for consumers of the shape).
     pub blocked_weight: f64,
     pub max_blocked_weight: f64,
 }
@@ -326,7 +325,7 @@ impl<'a> Assembly<'a> {
     }
 
     fn is_breached(&self, id: &str) -> bool {
-        self.breached.iter().any(|b| *b == id)
+        self.breached.contains(&id)
     }
 
     fn ratified_by(&self, id: &str) -> Option<&'a Ratified> {
@@ -402,7 +401,9 @@ impl Buckets {
                 id: "blocked-weight".into(),
                 kind: ItemKind::Cap.as_str().into(),
                 summary: format!(
-                    "невыполненных проверок на вес {blocked_weight:.2} > {max_blocked_weight:.2} — вердикт не может быть готовым"
+                    "невыполненных проверок на вес {} > {} — вердикт не может быть готовым",
+                    fmt_num(blocked_weight),
+                    fmt_num(max_blocked_weight)
                 ),
                 line: String::new(),
                 site: String::new(),
@@ -416,7 +417,8 @@ impl Buckets {
         ));
     }
 
-    /// Gates first: a failed gate is the decision, not a nuance.
+    /// Gates first: a gate that is not PASS (failed OR unperformed) is the
+    /// decision, not a nuance.
     fn push_gates(&mut self, gates: &[GateOutcome]) {
         for g in gates.iter().filter(|g| g.state != ProbeState::Pass) {
             self.blocks.push((
@@ -988,17 +990,16 @@ fn visible_line(it: &HumanItem) -> String {
     }
 }
 
-/// One name-only row of the anchors group — the SAME line in every channel:
-/// a ratified link is printed with who ratified it, a fully passed point says
-/// so in plain words instead of showing an empty «закреплено:».
+/// One name-only row of the anchors group — the SAME line in every channel.
+/// An anchor is only created WITH a ratified link (`ratified_item`, ratified
+/// OQ-QH-2), so «закреплено: <decision>» is the row. The `None` arm is a
+/// defensive fallback for an item built outside `build` (nothing in the
+/// assembly produces an unlinked anchor after the 07.11 decision): it prints
+/// the ordinary scored row rather than an empty «закреплено:».
 fn anchor_line(it: &HumanItem) -> String {
     match &it.ratified_by {
         Some(by) => format!("  · {} — закреплено: {}", it.id, by),
-        None => format!(
-            "  · {} — полностью пройдено, замечаний нет (балл {})",
-            it.id,
-            it.score.map(fmt_num).unwrap_or_else(|| "—".into())
-        ),
+        None => item_headline(it),
     }
 }
 
@@ -1469,10 +1470,122 @@ scoring:
             "cap breach sits in the decision block"
         );
         assert_eq!(v.groups[0].items[1].kind, "cap");
-        assert!(v.groups[0].items[1].summary.contains("0.25 > 0.20"));
+        // One precision for every figure of the form (`fmt_num`), the same
+        // formatter the row's own weight/summary uses (rework R3/mt-dry).
+        assert!(
+            v.groups[0].items[1].summary.contains("0.250 > 0.200"),
+            "{}",
+            v.groups[0].items[1].summary
+        );
         // The blocked check itself is «не проверено», never duplicated here.
         assert_eq!(v.groups[3].items.len(), 1);
         assert_eq!(v.groups[3].items[0].id, "brk/x");
+    }
+
+    #[test]
+    fn an_unperformed_gate_is_a_decision_row() {
+        let p = profile();
+        let gate = GateOutcome {
+            id: "ci-green".into(),
+            state: ProbeState::Blocked,
+            detail: "no toolchain in the sandbox".into(),
+        };
+        let v = build(
+            &p,
+            "INCONCLUSIVE",
+            0.9,
+            0.8,
+            "b",
+            &[],
+            &[gate],
+            &[],
+            &[],
+            0.0,
+            0.2,
+            &BTreeMap::new(),
+        );
+        assert_eq!(v.groups[0].items[0].id, "ci-green");
+        assert_eq!(v.groups[0].items[0].kind, "gate-unperformed");
+        assert_eq!(
+            v.groups[0].items[0].reason.as_deref(),
+            Some("no toolchain in the sandbox"),
+            "the gate detail is carried as the stated reason"
+        );
+    }
+
+    #[test]
+    fn a_breached_anchored_point_stays_a_decision_row() {
+        let p = profile();
+        let mut anchored = check("anch/a", "SCORED", Some(0.4), 0.20);
+        anchored.floor = Some(0.7);
+        let v = build(
+            &p,
+            "FAIL",
+            0.5,
+            0.8,
+            "b",
+            &[anchored],
+            &[],
+            &["anch/a=0.40<floor 0.70".to_string()],
+            &[],
+            0.0,
+            0.2,
+            &ratified_map(),
+        );
+        let blocks: Vec<&str> = v.groups[0].items.iter().map(|i| i.id.as_str()).collect();
+        assert!(
+            blocks.contains(&"anch/a"),
+            "a breached point is a decision row, never filed away as a name: {blocks:?}"
+        );
+        assert!(v.groups[2].items.is_empty(), "the anchor list stays clean");
+        assert_eq!(
+            v.groups[0]
+                .items
+                .iter()
+                .find(|i| i.id == "anch/a")
+                .and_then(|i| i.ratified_by.as_deref()),
+            Some("решение 01a1b1b8-dec (guerrero)"),
+            "the link is still shown on the decision row"
+        );
+    }
+
+    #[test]
+    fn a_scored_point_without_a_score_is_named_unchecked() {
+        let p = profile();
+        let v = build(
+            &p,
+            "INCONCLUSIVE",
+            0.5,
+            0.8,
+            "b",
+            &[check("n/z", "SCORED", None, 0.10)],
+            &[],
+            &[],
+            &[],
+            0.0,
+            0.2,
+            &BTreeMap::new(),
+        );
+        assert_eq!(v.groups[3].items[0].kind, "no-score");
+        assert_eq!(v.groups[3].items[0].weight, Some(0.10));
+        assert_eq!(
+            v.groups[3].items[0].reason.as_deref(),
+            Some("состояние SCORED без балла — предъявить нечего")
+        );
+    }
+
+    #[test]
+    fn a_ratified_link_without_an_actor_names_only_the_decision() {
+        let link = Ratified {
+            decision_id: "01a1b1b8-dec".into(),
+            actor: "  ".into(),
+        };
+        assert_eq!(link.display(), "решение 01a1b1b8-dec");
+        let named = Ratified {
+            decision_id: "01a1b1b8-dec".into(),
+            actor: "guerrero".into(),
+        };
+        assert_eq!(named.display(), "решение 01a1b1b8-dec (guerrero)");
     }
 
     #[test]
