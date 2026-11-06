@@ -133,8 +133,9 @@ pub enum ParagraphSource {
 /// One informational row of the reference group (ratified OQ-GATE-1):
 /// an unanswered NON-BLOCKING question — a note on an active task
 /// (workflow.rs:747-748), where the platform does NOT stand. Shown as a
-/// separate reference group below the waiting list, never as a wait row,
-/// never counted into the wait badge (REQ-GATE-10).
+/// separate reference group below the waiting list, never as a wait row —
+/// but it IS a row of the section, so the badge counts it
+/// (badge == waiting + human_stopped + notes, REQ-GATE-08 AC3).
 #[derive(Serialize, Clone, Debug)]
 pub struct WaitNote {
     pub task: Task,
@@ -682,8 +683,21 @@ pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
             None => notes.extend(reference_notes(&api, &task)?),
         }
     }
-    // REQ-GATE-08: the longest-waiting first — task.updated_at ascending,
-    // re-ordered here from stored data (task.list itself serves descending).
+    // REQ-GATE-08 ordering (longest-waiting first) and the badge are applied
+    // by the composer below, on stored data only.
+    Ok(build_wait_snapshot(waiting, human_stopped, notes))
+}
+
+/// Assemble the section from already-grouped rows: ordering by wait age
+/// (REQ-GATE-08) and the badge live in this ONE place, so the AC3 invariant
+/// `badge == waiting.len() + human_stopped.len() + notes.len()` (the
+/// ratified OQ-GATE-1 shows the notes as rows, so they are counted) is
+/// exercised by `badge_counts_every_section_row` rather than restated.
+fn build_wait_snapshot(
+    mut waiting: Vec<WaitRow>,
+    mut human_stopped: Vec<WaitRow>,
+    mut notes: Vec<WaitNote>,
+) -> WaitSnapshot {
     sort_by_wait_age(&mut waiting);
     sort_by_wait_age(&mut human_stopped);
     notes.sort_by(|a, b| {
@@ -693,12 +707,12 @@ pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
             .then(a.question.created_at.cmp(&b.question.created_at))
     });
     let badge = waiting.len() + human_stopped.len() + notes.len();
-    Ok(WaitSnapshot {
+    WaitSnapshot {
         waiting,
         human_stopped,
         notes,
         badge,
-    })
+    }
 }
 
 /// One wait row, composed from published reads only: the demand copy
@@ -1135,16 +1149,14 @@ mod tests {
     /// Badge discipline (REQ-GATE-08 AC3): the badge is the number of rows
     /// of the section on the same snapshot — waiting + human-stopped + the
     /// ratified OQ-GATE-1 reference notes (they are shown rows, not a
-    /// hidden bucket).
+    /// hidden bucket). Asserted through `build_wait_snapshot` itself, the
+    /// same function `inbox_view` ends with, so a badge formula that
+    /// dropped the notes would fail here.
     #[test]
     fn badge_counts_every_section_row() {
-        // The snapshot is composed by inbox_view from live reads; the
-        // invariant itself is `badge == waiting + human_stopped + notes`
-        // and is asserted on the live fixture run's JSON (see the
-        // implementation report's evidence pointer).
         let now = now_fixture();
-        let snapshot = WaitSnapshot {
-            waiting: vec![WaitRow {
+        let snapshot = build_wait_snapshot(
+            vec![WaitRow {
                 task: task_fixture("a", "", now),
                 demand: "w".into(),
                 cli_hint: "h".into(),
@@ -1153,7 +1165,7 @@ mod tests {
                 report: None,
                 report_note: None,
             }],
-            human_stopped: vec![WaitRow {
+            vec![WaitRow {
                 task: task_fixture("b", "", now),
                 demand: "w".into(),
                 cli_hint: "h".into(),
@@ -1162,7 +1174,7 @@ mod tests {
                 report: None,
                 report_note: None,
             }],
-            notes: vec![WaitNote {
+            vec![WaitNote {
                 task: task_fixture("c", "", now),
                 question: Question {
                     id: devai_core::types::new_id(),
@@ -1179,8 +1191,9 @@ mod tests {
                     created_at: now,
                 },
             }],
-            badge: 3,
-        };
+        );
+        // 1 waiting + 1 human-stopped + 1 note.
+        assert_eq!(snapshot.badge, 3);
         assert_eq!(
             snapshot.badge,
             snapshot.waiting.len() + snapshot.human_stopped.len() + snapshot.notes.len()
