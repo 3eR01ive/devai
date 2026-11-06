@@ -30,14 +30,15 @@
   "item_kinds": [
     { "variant": "Gate", "token": "gate", "doc": "A gate probe failed — the verdict goes back." },
     { "variant": "GateUnperformed", "token": "gate-unperformed", "doc": "A gate probe could not be performed." },
+    { "variant": "Threshold", "token": "threshold", "doc": "The verdict's own threshold (S below theta) was not met." },
     { "variant": "Cap", "token": "cap", "doc": "Unperformed weight above the cap: the verdict cannot be complete." },
     { "variant": "Pending", "token": "pending", "doc": "Waiting for the human's signature." },
     { "variant": "Floor", "token": "floor", "doc": "A floor was breached." },
     { "variant": "Mechanical", "token": "mechanical", "doc": "A mechanical check failed." },
-    { "variant": "Scored", "token": "scored", "doc": "A scored point in the nuances band (ratified OQ-QH-1/2)." },
+    { "variant": "Scored", "token": "scored", "doc": "A scored point below 1.0 — a nuance, ordered by lost points x weight." },
     { "variant": "Blocked", "token": "blocked", "doc": "Not performed — no score." },
     { "variant": "Anchor", "token": "anchor", "doc": "Kept in force by a named ratified decision (names only)." },
-    { "variant": "Passed", "token": "passed", "doc": "Scored 1.0 without a decision link (presented, importance 0)." },
+    { "variant": "Passed", "token": "passed", "doc": "Scored 1.0 without a decision link: the norm, not a finding (v1 forms listed it at importance 0; v2 counts it in the headline)." },
     { "variant": "NoScore", "token": "no-score", "doc": "Scored state without a score — nothing to present but the fact." },
     { "variant": "Unknown", "token": "unknown", "doc": "A state this build does not recognise, shown with its raw token." }
   ]

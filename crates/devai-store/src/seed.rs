@@ -599,7 +599,7 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
             r#"{
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Quality Report v5 — machine-assembled; the human form is stored with the report",
-  "description": "v4 plus `human_view`: the human PRESENTATION of the same report, assembled ONCE by the platform at publication from already-decided values (scores, weights, floors, pending, gates, ratified anchors) and quoted verbatim by every reader — never regrouped, re-scored or re-sorted at read time. Four groups in a fixed order: blocks (gates, floor breaches, blocking, pending signature), nuances (every remaining scored point, each with score, weight and importance = (1-score)*weight, most important first; a fully passed point without a decision link is here too, at importance 0), anchors (ONLY positions with an explicit ratified_by decision link, names only), unchecked (BLOCKED checks and unknown states, with reason and weight). Code and probe output live in the per-item evidence layer, never in the visible one-line summary. report_text keeps its v3/v4 §2.6 form: it is the fallback for bodies published before this version, not a second source of truth.",
+  "description": "v4 plus `human_view`: the human PRESENTATION of the same report, assembled ONCE by the platform at publication from already-decided values (scores, weights, floors, pending, gates, ratified anchors) and quoted verbatim by every reader — never regrouped, re-scored or re-sorted at read time. Four groups in a fixed order: blocks (the S<theta threshold breach, gates, floor breaches, blocking, pending signature), nuances (every point still below 1.0, each with score, weight and importance = (1-score)*weight, most important first; a fully passed point with no decision link is the norm and is counted in headline.counts.passed instead of being listed), anchors (ONLY positions with an explicit ratified_by decision link, names only), unchecked (BLOCKED checks and unknown states, with reason and weight). Code and probe output live in the per-item evidence layer, never in the visible one-line summary. report_text keeps its v3/v4 §2.6 form: it is the fallback for bodies published before this version, not a second source of truth.",
   "type": "object",
   "required": ["verdict", "recommendation_basis", "report_text", "profile", "workspace_revision", "human_view", "evaluation"],
   "properties": {
@@ -630,7 +630,8 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
                 "blocks": { "type": "integer" },
                 "nuances": { "type": "integer" },
                 "anchors": { "type": "integer" },
-                "unchecked": { "type": "integer" }
+                "unchecked": { "type": "integer" },
+                "passed": { "type": "integer", "description": "fully passed points (1.0, no decision link): the norm, counted not listed (optional in v1 forms)" }
               }
             }
           }

@@ -391,7 +391,9 @@ onMounted(loadAll);
               бьёт по вердикту: {{ reportBody.form.headline.counts.blocks }} ·
               нюансы: {{ reportBody.form.headline.counts.nuances }} ·
               якоря: {{ reportBody.form.headline.counts.anchors }} ·
-              не проверено: {{ reportBody.form.headline.counts.unchecked }}
+              не проверено: {{ reportBody.form.headline.counts.unchecked }}<template
+                v-if="reportBody.form.headline.counts.passed"
+              > · пройдено без замечаний: {{ reportBody.form.headline.counts.passed }}</template>
             </p>
             <div v-for="g in reportBody.form.groups.filter(x => x.items.length)" :key="g.key" class="qr-group">
               <h4 class="qr-group-title">{{ g.title }} ({{ g.items.length }})</h4>

@@ -179,7 +179,15 @@ export interface HumanForm {
     // «S=…/1.00, порог …» — already formatted by the one Rust formatter.
     numbers: string;
     basis: string;
-    counts: { blocks: number; nuances: number; anchors: number; unchecked: number };
+    counts: {
+      blocks: number;
+      nuances: number;
+      anchors: number;
+      unchecked: number;
+      // fully passed points (1.0, no decision link): the norm, counted not
+      // listed — absent in v1 forms, so optional.
+      passed?: number;
+    };
   };
   groups: HumanFormGroup[];
   blocked_weight: number;

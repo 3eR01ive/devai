@@ -21,9 +21,15 @@ use super::{HumanReportView, render_text};
 pub const AUDITOR_ROLE: &str = "quality-auditor";
 
 /// REQ-005 / REQ-QH-06: status-only selection. CURRENT wins; when there is
-/// none, the newest STALE/SUPERSEDED row is still selected — it is then shown
-/// under an explicit «устарел» marker, never as the current decision and
-/// never hidden as «QA has not run».
+/// none, the newest row (by seq) is still selected whatever its status — it
+/// is then shown under an explicit «устарел» marker, never as the current
+/// decision and never hidden as «QA has not run».
+///
+/// rework R2: this is the ONE selection rule. Both readers — the presented
+/// report (`tasks::presented_quality`) and the findings quoted into the
+/// implementer prompt (`context::quality_findings`) — call it, so they can
+/// never disagree on which report is «the» report (STALE + SUPERSEDED used
+/// to diverge: the panel showed one row, the prompt quoted another).
 pub fn select_report(arts: &[Artifact]) -> Option<&Artifact> {
     arts.iter()
         .filter(|a| a.kind == ArtifactKind::QualityReport)
@@ -249,4 +255,72 @@ fn reaudit_unfinished(e: &RoleExecution) -> String {
         short_id(&e.id),
         e.status.as_str()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use devai_core::types::{ContractRef, DataCategory, new_id};
+
+    /// One artifact row of the shape the store hands in — the fields the
+    /// selection rule reads are the ones set here.
+    fn art(kind: ArtifactKind, seq: u32, status: ArtifactStatus) -> Artifact {
+        Artifact {
+            id: new_id(),
+            task_id: new_id(),
+            kind,
+            name: format!("{}-v{seq}", kind.as_str().to_lowercase()),
+            seq,
+            category: DataCategory::Artifact,
+            status,
+            sha256: format!("sha-{seq}"),
+            size: 1,
+            media_type: "application/json".into(),
+            contract: Some(ContractRef {
+                name: "quality-report".into(),
+                version: 5,
+            }),
+            created_by: "user".into(),
+            execution_id: None,
+            depends_on: vec![],
+            created_at: Utc::now(),
+        }
+    }
+
+    /// R2 (rework): the ONE selection rule answers for SUPERSEDED too — a
+    /// CURRENT row always wins, and without one the newest row is selected
+    /// whatever its status, so both readers quote the same report.
+    #[test]
+    fn a_superseded_report_is_selected_by_the_same_rule() {
+        let arts = vec![
+            art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale),
+            art(ArtifactKind::QualityReport, 2, ArtifactStatus::Superseded),
+        ];
+        let picked = select_report(&arts).expect("a report is selected");
+        assert_eq!(
+            (picked.seq, picked.status),
+            (2, ArtifactStatus::Superseded),
+            "no CURRENT: the newest row is shown (it is marked stale on screen)"
+        );
+
+        // A CURRENT row wins even when an older SUPERSEDED one still exists.
+        let arts = vec![
+            art(ArtifactKind::QualityReport, 1, ArtifactStatus::Superseded),
+            art(ArtifactKind::QualityReport, 2, ArtifactStatus::Current),
+        ];
+        let picked = select_report(&arts).expect("a report is selected");
+        assert_eq!(picked.status, ArtifactStatus::Current);
+
+        // Only current: highest seq.
+        let arts = vec![
+            art(ArtifactKind::QualityReport, 1, ArtifactStatus::Current),
+            art(ArtifactKind::QualityReport, 2, ArtifactStatus::Current),
+        ];
+        assert_eq!(select_report(&arts).unwrap().seq, 2);
+
+        // No quality report at all: honest «none», never another kind's row.
+        let arts = vec![art(ArtifactKind::Patch, 1, ArtifactStatus::Current)];
+        assert!(select_report(&arts).is_none());
+    }
 }

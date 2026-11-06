@@ -11,6 +11,7 @@ export type CheckStateToken =
 export type HumanItemKind =
   | "gate"
   | "gate-unperformed"
+  | "threshold"
   | "cap"
   | "pending"
   | "floor"

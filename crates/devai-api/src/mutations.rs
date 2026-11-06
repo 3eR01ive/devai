@@ -2415,14 +2415,24 @@ scoring:
         let p = api.presented_quality_report(t).unwrap().unwrap();
         assert_eq!(p.source, present::RenderSource::HumanForm);
         assert!(
-            p.text.contains("БЬЁТ ПО ВЕРДИКТУ") && p.text.contains("НЮАНСЫ"),
+            p.text.contains("БЬЁТ ПО ВЕРДИКТУ"),
             "the stored form is what gets rendered, grouped by decision weight: {}",
             p.text
         );
         assert!(p.text.contains("важность 0.120"));
-        // R7/R5: the passed mechanical check came through the real producer
-        // and is PRESENTED — not an «unknown state» hole.
-        assert!(p.text.contains("mech/pass"), "{}", p.text);
+        // R7/R5 + R4 (decision of 07.11): the passed mechanical check comes
+        // through the real producer and is NOT an «unknown state» hole; a 1.0
+        // with no decision link is the norm, so it is counted, not listed.
+        assert!(
+            !p.text.contains("mech/pass"),
+            "a fully passed point is not a finding: {}",
+            p.text
+        );
+        assert!(
+            p.text.contains("пройдено без замечаний: 1"),
+            "the norm point is still accounted for: {}",
+            p.text
+        );
         assert!(
             !p.text.contains("не распознано"),
             "no producer state may fall through as unknown: {}",
@@ -2481,7 +2491,10 @@ scoring:
             "the full formulation is pinned: no execution exists, so none is named"
         );
         assert!(text.contains("НЕ текущее решение"), "{text}");
-        assert!(text.contains("НЮАНСЫ"), "the stored form is still readable");
+        assert!(
+            text.contains("БЬЁТ ПО ВЕРДИКТУ"),
+            "the stored form is still readable: {text}"
+        );
         // The UI view carries the same fact, not a second derivation.
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.status, "STALE");
