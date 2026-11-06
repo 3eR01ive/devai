@@ -29,7 +29,7 @@ pub use mutations::{
     MergeResult, MutationResult, OverrideResult, ProjectAddReq, PublishOutcome, PublishReq,
     PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome, ReviseReq, RunOutcome, RunReq,
     TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome, TaskProjectSetOutcome,
-    TaskProjectSetReq, UnlinkResult, WorkflowOp,
+    TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult, WorkflowOp,
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 

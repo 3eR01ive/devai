@@ -1,0 +1,16 @@
+-- v8 -> v9: the human task name (task 01a1ad1d, REQ-TN-01, ratified OQ-TN-2).
+--
+-- `human_name` is the short human signboard of a task: the analyst produces
+-- it as a required field of the requirements-specification contract (@4),
+-- the platform stamps it on the task when a CURRENT spec publishes, and the
+-- human `task.rename` operation may set or replace it directly (OQ-TN-1).
+-- Exactly ONE current name lives on a task — a value replacement, not a
+-- history table (REQ-TN-01 AC3; the append-only trail stays in
+-- `workflow_events`).
+--
+-- ADDITIVE ONLY: one nullable column, no row is rewritten. Legacy tasks —
+-- those that passed analysis before names existed — keep NULL and continue
+-- to show their formal title (ratified OQ-TN-2: NO forced one-time rename;
+-- they catch up at the next revise). `title` keeps its meaning: the verbatim
+-- text of the creator, never overwritten by a rename (REQ-TN-01 AC2).
+ALTER TABLE tasks ADD COLUMN human_name TEXT NULL;

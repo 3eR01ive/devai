@@ -91,6 +91,9 @@ pub fn task_from_row(r: &Row) -> StoreResult<Task> {
         lock_version: get::<i64>(r, 7)? as u64,
         created_at: parse_ts(get(r, 8)?)?,
         updated_at: parse_ts(get(r, 9)?)?,
+        // v9 (REQ-TN-01): the optional human signboard, last column of every
+        // explicit task projection.
+        human_name: get(r, 10)?,
     })
 }
 
@@ -105,47 +108,86 @@ pub fn project_from_row(r: &Row) -> StoreResult<Project> {
     })
 }
 
-/// A dependency edge row from the shared 10-column projection
+/// A dependency edge row from the shared 14-column projection
 /// (`DEPENDENCY_EDGE_SELECT` in lib.rs): edge columns interleaved with the
-/// JOINed states/titles of BOTH endpoint tasks. An unknown `kind` literal is
-/// a loud read error, never a silently dropped edge.
+/// JOINed states/titles of BOTH endpoint tasks plus the v9 fields the
+/// signboard rule needs (human name + business description of each end).
+/// The `task_display` / `depends_on_display` halves are the ONE REQ-TN-03
+/// rule computed on the read plane — consumers render finished signboards
+/// (ratified OQ-TN-5: both edge ends carry human names, `id` + title stay
+/// the machine-readable traceability). An unknown `kind` literal is a loud
+/// read error, never a silently dropped edge.
 pub fn dependency_from_row(r: &Row) -> StoreResult<TaskDependency> {
+    let task_state: TaskState = enum_col("TaskState", get(r, 2)?, TaskState::parse)?;
+    let task_title: String = get(r, 3)?;
+    let task_human: Option<String> = get(r, 10)?;
+    let task_business: String = get(r, 11)?;
+    let depends_on_state: TaskState = enum_col("TaskState", get(r, 5)?, TaskState::parse)?;
+    let depends_on_title: String = get(r, 6)?;
+    let depends_on_human: Option<String> = get(r, 12)?;
+    let depends_on_business: String = get(r, 13)?;
     Ok(TaskDependency {
         id: parse_id(get(r, 0)?)?,
         task_id: parse_id(get(r, 1)?)?,
-        task_state: enum_col("TaskState", get(r, 2)?, TaskState::parse)?,
-        task_title: get(r, 3)?,
+        task_state,
+        task_display: task_display_sign(
+            task_state,
+            task_human.as_deref(),
+            &task_business,
+            &task_title,
+        ),
+        task_title,
         depends_on_id: parse_id(get(r, 4)?)?,
-        depends_on_state: enum_col("TaskState", get(r, 5)?, TaskState::parse)?,
-        depends_on_title: get(r, 6)?,
+        depends_on_state,
+        depends_on_display: task_display_sign(
+            depends_on_state,
+            depends_on_human.as_deref(),
+            &depends_on_business,
+            &depends_on_title,
+        ),
+        depends_on_title,
         kind: enum_col("DependencyKind", get(r, 7)?, DependencyKind::parse)?,
         actor: get(r, 8)?,
         created_at: parse_ts(get(r, 9)?)?,
     })
 }
 
-/// The edge tail of the dependency-graph node projection (columns 10..16 —
-/// `d.id, d.kind, d.depends_on_id, d.actor, d.created_at, p.state, p.title`).
-/// `None` is the LEFT JOIN's honest answer for a task with no stored edges:
-/// rows written before v4 read as an EMPTY dependency set, never as corrupt
-/// (REQ-08 AC2). The endpoint task fields come from the node itself.
+/// The edge tail of the dependency-graph node projection (columns 11..19 —
+/// `d.id, d.kind, d.depends_on_id, d.actor, d.created_at, p.state, p.title,
+/// p.human_name, p.business_description`; column 10 is the node task's own
+/// `human_name`, read by `task_from_row`). `None` is the LEFT JOIN's honest
+/// answer for a task with no stored edges: rows written before v4 read as
+/// an EMPTY dependency set, never as corrupt (REQ-08 AC2). The endpoint
+/// task fields come from the node itself; the signboards are the ONE
+/// REQ-TN-03 rule applied on the read plane (see `dependency_from_row`).
 pub fn dependency_tail_from_row(r: &Row, task: &Task) -> StoreResult<Option<TaskDependency>> {
-    let edge_id: Option<String> = get(r, 10)?;
+    let edge_id: Option<String> = get(r, 11)?;
     let Some(edge_id) = edge_id else {
         return Ok(None);
     };
-    let depends_on_state: String = get(r, 15)?;
+    let depends_on_state: String = get(r, 16)?;
+    let depends_on_state = enum_col("TaskState", depends_on_state, TaskState::parse)?;
+    let depends_on_title: String = get(r, 17)?;
+    let depends_on_human: Option<String> = get(r, 18)?;
+    let depends_on_business: String = get(r, 19)?;
     Ok(Some(TaskDependency {
         id: parse_id(edge_id)?,
         task_id: task.id,
         task_state: task.state,
+        task_display: task.display_sign(),
         task_title: task.title.clone(),
-        depends_on_id: parse_id(get(r, 12)?)?,
-        depends_on_state: enum_col("TaskState", depends_on_state, TaskState::parse)?,
-        depends_on_title: get(r, 16)?,
-        kind: enum_col("DependencyKind", get(r, 11)?, DependencyKind::parse)?,
-        actor: get(r, 13)?,
-        created_at: parse_ts(get(r, 14)?)?,
+        depends_on_id: parse_id(get(r, 13)?)?,
+        depends_on_state,
+        depends_on_display: task_display_sign(
+            depends_on_state,
+            depends_on_human.as_deref(),
+            &depends_on_business,
+            &depends_on_title,
+        ),
+        depends_on_title,
+        kind: enum_col("DependencyKind", get(r, 12)?, DependencyKind::parse)?,
+        actor: get(r, 14)?,
+        created_at: parse_ts(get(r, 15)?)?,
     }))
 }
 

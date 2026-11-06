@@ -1,0 +1,32 @@
+# Human task name template (task 01a1ad1d, REQ-TN-05) — platform protocol
+# data. The same idiom as `humanize:` above: a merge-scan of `workflow/*.yaml`
+# for the `task_name:` section (`devai_store::config::load_task_name_policy`).
+# A home without this file behaves exactly like these factory bytes
+# (`TaskNamePolicy::default()`); editing a value needs no rebuild. A typo'd
+# key or an inverted window is a LOUD config error at `devai init` and at
+# every engine run / manual publish / `task rename` — never a silently
+# ignored default.
+#
+# The name is the human signboard of the task (REQ-TN-01/02): produced by
+# the requirements analyst as the required `task_name` field of the
+# requirements-specification@4 contract, stamped on the task at publication,
+# replaced whole by every new CURRENT version (REQ-TN-04). Its discipline
+# here is MECHANICAL — a deterministic detector, never a model judgment
+# (REQ-TN-05 AC3). The list/graph signboard RULE (name / draft showcase /
+# title) lives in devai-core (`task_display_sign`), this file owns only the
+# SHAPE of a legal name.
+task_name:
+  # The field name is fixed by the contract schema, not by the
+  # implementation — the ratified OQ-HP-6 habit applied to the new field
+  # (REQ-TN-02 constraint). The gate detector fires only on contracts whose
+  # stored schema REQUIRES this field as a top-level string.
+  field: task_name
+  # Volume discipline: short enough to sign a list row and a graph edge,
+  # long enough to say what the task is about. The factory max keeps the
+  # whole role reply inside the physical response limit together with the
+  # schema skeleton (humanize.yaml idiom).
+  min_chars: 3
+  max_chars: 60
+  # One-line signboard: a name containing a newline never fits a list row
+  # or a graph label (REQ-TN-05: "умещается в строку списка/графа").
+  single_line: true

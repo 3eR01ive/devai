@@ -6,7 +6,7 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import { fmtTime, pollMs, setPollMs, POLL_CHOICES, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
-import type { InboxEntry, UiError } from "../types";
+import { type InboxEntry, type UiError } from "../types";
 
 const entries = ref<InboxEntry[]>([]);
 const error = ref<UiError | null>(null);
@@ -55,7 +55,7 @@ onUnmounted(() => {
     <div v-if="!entries.length" class="empty">Линия нигде не ждёт оператора — открытых вопросов нет</div>
     <div v-for="en in entries" :key="en.task.id" class="panel">
       <h3>
-        <RouterLink class="title-link" :to="`/task/${en.task.id}`">{{ en.task.title }}</RouterLink>
+        <RouterLink class="title-link" :to="`/task/${en.task.id}`">{{ en.task.display }}</RouterLink>
         · {{ shortId(en.task.id) }}
       </h3>
       <div class="body">

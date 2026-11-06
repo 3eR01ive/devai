@@ -31,6 +31,16 @@ export interface Task {
   project_id: string | null;
   title: string;
   business_description: string;
+  // REQ-TN-01: human signboard of the task (analyst's name, stamped at
+  // spec publication; editable by the human `task rename`). null = имени
+  // ещё нет. Формальный title остаётся текстом создавшего всегда.
+  human_name: string | null;
+  // REQ-TN-03: the FINISHED signboard, computed ONCE by the producer
+  // (`devai_core::types::Task::display_sign`, serialized as `display`):
+  // human name → first sentence of the DRAFT statement → formal title.
+  // The frontend renders this string verbatim and NEVER re-derives it
+  // (no-read-time-rederivation): there is no client-side copy of the rule.
+  display: string;
   state: string;
   return_state: string | null;
   requirements_seq: number;
@@ -38,6 +48,12 @@ export interface Task {
   created_at: string;
   updated_at: string;
 }
+
+// REQ-TN-03 / R1: the signboard comes from the API as finished data
+// (`Task.display`) — the ONE rule lives in devai-core and is computed on
+// the producer side. This file holds NO client-side copy of the rule:
+// no `firstSentence`, no re-derivation per renderer (no-read-time-
+// rederivation). Views print `task.display` / `edge.task_display`.
 
 export interface ContractRef {
   name: string;
@@ -152,9 +168,13 @@ export interface TaskDependency {
   task_id: string;
   task_state: string;
   task_title: string;
+  // Ratified OQ-TN-5: готовые вывески обоих концов ребра (правило REQ-TN-03
+  // посчитано read-плоскостью); title остаётся машиночитаемым следом.
+  task_display: string;
   depends_on_id: string;
   depends_on_state: string;
   depends_on_title: string;
+  depends_on_display: string;
   kind: string; // parent | blocks
   actor: string;
   created_at: string;

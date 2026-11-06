@@ -106,7 +106,9 @@ fn seeded(home: &Path) -> String {
     );
     let id = devai(home, &["task", "list"])
         .lines()
-        .find(|l| l.contains("Pipe smoke"))
+        // REQ-TN-03: `task list` signs DRAFT with the first sentence of the
+        // statement (the description), not the creator's raw title.
+        .find(|l| l.contains("closed reader"))
         .unwrap()
         .split_whitespace()
         .next()

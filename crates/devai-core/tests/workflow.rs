@@ -57,7 +57,7 @@ fn in_state(task: &Task, target: TaskState, artifacts: &mut Vec<Artifact>) -> Ta
         vec![],
     );
     artifacts.push(spec.clone());
-    t = workflow::requirements_published(&t, artifacts, None, actor, now())
+    t = workflow::requirements_published(&t, artifacts, None, None, actor, now())
         .unwrap()
         .task;
     if target == TaskState::Review {
@@ -107,7 +107,7 @@ fn full_happy_lifecycle() {
         vec![],
     );
     artifacts.push(spec.clone());
-    t = workflow::requirements_published(&t, &artifacts, None, "analyst", now())
+    t = workflow::requirements_published(&t, &artifacts, None, None, "analyst", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Review);
@@ -496,7 +496,7 @@ fn cannot_publish_spec_from_draft() {
         vec![],
     );
     artifacts.push(spec);
-    let err = workflow::requirements_published(&t, &artifacts, None, "u", now()).unwrap_err();
+    let err = workflow::requirements_published(&t, &artifacts, None, None, "u", now()).unwrap_err();
     assert!(
         err.to_string().contains("not allowed in state DRAFT"),
         "{err}"
@@ -663,7 +663,8 @@ fn revise_supersedes_old_spec_and_stales_dependents() {
     );
     artifacts.push(spec2.clone());
     let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), "u", now()).unwrap();
+        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now())
+            .unwrap();
     t = m.task;
     assert_eq!(t.state, TaskState::Review);
     assert_eq!(t.requirements_seq, 2);
@@ -766,7 +767,8 @@ fn revise_from_v3_shaped_snapshot_stales_dependents_without_double_flip() {
         .collect();
 
     let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), "u", now()).unwrap();
+        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now())
+            .unwrap();
     assert_eq!(m.task.state, TaskState::Review);
     assert_eq!(m.task.requirements_seq, 2);
 
@@ -823,10 +825,13 @@ fn dep(task: &Task, on_id: Id, on_state: TaskState, kind: DependencyKind) -> Tas
         id: new_id(),
         task_id: task.id,
         task_state: task.state,
+        // read-плоскость hands finished signboards alongside the titles
+        task_display: task.display_sign(),
         task_title: task.title.clone(),
         depends_on_id: on_id,
         depends_on_state: on_state,
         depends_on_title: "depended-on".into(),
+        depends_on_display: "depended-on".into(),
         kind,
         actor: "tester".into(),
         created_at: now(),
@@ -1249,5 +1254,190 @@ fn form_escalation_retells_an_unreadable_paragraph_in_plain_words() {
         m.questions[0]
             .text
             .contains("человеческий абзац не прошёл проверку читаемости")
+    );
+}
+
+// --- task 01a1ad1d: the human name on publication and the signboard rule
+// (REQ-TN-01/02/03/04, ratified OQ-TN-2/3) ------------------------------------
+
+#[test]
+fn publication_stamps_and_replaces_the_human_name() {
+    let base = draft_task();
+    let mut artifacts = vec![];
+    let mut t = workflow::start(&base, "u", now()).unwrap().task;
+
+    // REQ-TN-01/02: publishing a CURRENT spec with a name stamps it on the
+    // task in the SAME mutation; the formal title stays byte-for-byte the
+    // creator's text (AC2); the event payload carries the value.
+    let spec1 = artifact(
+        &t,
+        ArtifactKind::RequirementsSpec,
+        1,
+        ArtifactStatus::Current,
+        vec![],
+    );
+    artifacts.push(spec1);
+    let m = workflow::requirements_published(
+        &t,
+        &artifacts,
+        None,
+        Some("Понятные имена задач"),
+        "analyst",
+        now(),
+    )
+    .unwrap();
+    assert_eq!(m.task.human_name.as_deref(), Some("Понятные имена задач"));
+    assert_eq!(m.task.title, "t", "AC2: the title is never rewritten");
+    let ev = m
+        .events
+        .iter()
+        .find(|e| e.kind == event_kind::REQUIREMENTS_PUBLISHED)
+        .expect("the publication event");
+    assert_eq!(ev.payload[json_field::HUMAN_NAME], "Понятные имена задач");
+    t = m.task;
+
+    // REQ-TN-04: a rework spec re-signs the task WHOLE from its own body —
+    // replacement, not accumulation (REQ-TN-01 AC3).
+    let spec2 = artifact(
+        &t,
+        ArtifactKind::RequirementsSpec,
+        2,
+        ArtifactStatus::Current,
+        vec![],
+    );
+    artifacts.push(spec2);
+    let m = workflow::requirements_published(
+        &t,
+        &artifacts,
+        Some("scope change"),
+        Some("Новая вывеска"),
+        "u",
+        now(),
+    )
+    .unwrap();
+    assert_eq!(m.task.human_name.as_deref(), Some("Новая вывеска"));
+    t = m.task;
+
+    // REQ-TN-02 AC3 (non-retroactivity): a publication whose body predates
+    // the name obligation (None — @1..@3 shape) says NOTHING about the
+    // signboard: it neither clears nor changes the current value.
+    let spec3 = artifact(
+        &t,
+        ArtifactKind::RequirementsSpec,
+        3,
+        ArtifactStatus::Current,
+        vec![],
+    );
+    artifacts.push(spec3);
+    let m = workflow::requirements_published(&t, &artifacts, Some("legacy body"), None, "u", now())
+        .unwrap();
+    assert_eq!(m.task.human_name.as_deref(), Some("Новая вывеска"));
+    assert_eq!(m.task.requirements_seq, 3);
+}
+
+#[test]
+fn signboard_rule_name_then_draft_sentence_then_title() {
+    // 1) A human name wins in ANY state.
+    let mut named = draft_task();
+    named.human_name = Some("Имя по смыслу спека".into());
+    assert_eq!(named.display_sign(), "Имя по смыслу спека");
+
+    // 2) DRAFT without a name shows the FIRST SENTENCE of the statement
+    //    (ratified OQ-TN-3), not the whole text and not a mid-word cut.
+    let d = Task::new(
+        "formal title",
+        "Первое предложение. Второе — детали.\nТретья строка.",
+        None,
+        now(),
+    );
+    assert_eq!(d.display_sign(), "Первое предложение.");
+    // A period NOT followed by whitespace stays inside the sentence; a
+    // decimal point inside a token never cuts.
+    let p = Task::new("t", "версия v1.2 готова", None, now());
+    assert_eq!(
+        p.display_sign(),
+        "версия v1.2 готова",
+        "no cut inside a token"
+    );
+    // Whitespace inside the first line collapses — the signboard is ONE line.
+    let w = Task::new("t", "много    пробелов   тут", None, now());
+    assert_eq!(w.display_sign(), "много пробелов тут");
+    // A newline is NOT a terminator (ratified OQ-TN-3 = first SENTENCE):
+    // the line break inside the sentence collapses into a space.
+    let n = Task::new("t", "А\nБ.", None, now());
+    assert_eq!(n.display_sign(), "А Б.");
+    // ...and the sentence really ends at its punctuation, not at the newline:
+    // "Первое предложение.\nВторое." → "Первое предложение."
+    let two = Task::new("t", "Первое предложение.\nВторое.", None, now());
+    assert_eq!(two.display_sign(), "Первое предложение.");
+
+    // 3) A DRAFT with no statement at all keeps the title — вывеска не пуста.
+    let empty = Task::new("just the title", "   ", None, now());
+    assert_eq!(empty.display_sign(), "just the title");
+
+    // 4) Past DRAFT with no name (legacy, ratified OQ-TN-2): the title —
+    //    the statement showcase belongs to DRAFT only.
+    let mut artifacts = vec![];
+    let reviewed = in_state(
+        &Task::new("ttl", "не показывать это.", None, now()),
+        TaskState::Review,
+        &mut artifacts,
+    );
+    assert_eq!(reviewed.human_name, None);
+    assert_eq!(reviewed.display_sign(), "ttl");
+
+    // The bare-fields twin serves edge ends identically.
+    assert_eq!(
+        task_display_sign(TaskState::Draft, None, "болью словами. детали", "title"),
+        "болью словами."
+    );
+    // A whitespace-only stored name is NOT a signboard: the rule falls
+    // through to the state limb (QA → title), never renders blank.
+    assert_eq!(
+        task_display_sign(TaskState::Qa, Some("   "), "x. y", "title"),
+        "title"
+    );
+}
+
+/// R1 (mt/dry): the signboard crosses the Rust↔TS boundary as FINISHED
+/// data — `Task` serializes a `display` field computed by the ONE rule.
+/// There is no client-side copy of the rule any more (types.ts renders
+/// `task.display` verbatim), so this test pins the producer's field for
+/// the edge cases the deleted TS mirror used to cover: empty statement,
+/// ellipsis, newline, and the untouched formal title alongside the name.
+#[test]
+fn serialized_task_carries_the_finished_signboard() {
+    let mut named = Task::new("formal title", "другая постановка. детали", None, now());
+    named.human_name = Some("Имя по смыслу спека".into());
+    let v = serde_json::to_value(&named).unwrap();
+    assert_eq!(v["display"], "Имя по смыслу спека");
+    assert_eq!(v["title"], "formal title", "заголовок создавшего не тронут");
+    assert_eq!(v["human_name"], "Имя по смыслу спека");
+
+    // DRAFT: first sentence, ellipsis counts as a sentence end; a newline
+    // does NOT terminate — it folds into a space inside the sentence.
+    for (statement, expected) in [
+        (
+            "Первое предложение. Второе — детали.",
+            "Первое предложение.",
+        ),
+        ("Готово… остальное потом", "Готово…"),
+        ("до перевода строки\nпосле", "до перевода строки после"),
+        ("А\nБ.", "А Б."),
+        ("версия v1.2 готова", "версия v1.2 готова"),
+    ] {
+        let d = Task::new("formal title", statement, None, now());
+        assert_eq!(
+            serde_json::to_value(&d).unwrap()["display"],
+            expected,
+            "statement {statement:?}"
+        );
+    }
+
+    // Empty / whitespace-only statement: the signboard is never blank.
+    let bare = Task::new("just the title", "   ", None, now());
+    assert_eq!(
+        serde_json::to_value(&bare).unwrap()["display"],
+        "just the title"
     );
 }

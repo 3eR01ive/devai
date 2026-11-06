@@ -156,13 +156,18 @@ onMounted(loadAll);
 
   <section v-if="status">
     <div class="rowflex" style="margin-bottom: 12px">
-      <h2 style="margin: 0">{{ status.task.title }}</h2>
+      <h2 style="margin: 0">{{ status.task.display }}</h2>
       <StateChip :token="status.task.state" />
       <StateChip v-if="status.task.return_state" :token="status.task.return_state" />
       <div class="spacer" />
       <span class="mono muted">{{ status.task.id }}</span>
       <button @click="loadAll">Обновить</button>
     </div>
+    <p
+      v-if="status.task.display !== status.task.title"
+      class="muted mono"
+      style="margin: 0 0 10px"
+    >заголовок создавшего: {{ status.task.title }}</p>
     <p class="muted" style="white-space: pre-wrap">{{ status.task.business_description }}</p>
 
     <!-- Пайплайн: порядок отдаёт платформа (PipelineView), UI не хранит свой -->
@@ -301,12 +306,12 @@ onMounted(loadAll);
       <div class="body">
         <div v-for="d in deps.outgoing" :key="d.id" class="rowflex" style="margin-bottom: 4px">
           <span class="mono muted">→ {{ d.kind }}</span>
-          <RouterLink class="title-link" :to="`/task/${d.depends_on_id}`">{{ d.depends_on_title }}</RouterLink>
+          <RouterLink class="title-link" :to="`/task/${d.depends_on_id}`">{{ d.depends_on_display }}</RouterLink>
           <StateChip :token="d.depends_on_state" />
         </div>
         <div v-for="d in deps.incoming" :key="d.id" class="rowflex" style="margin-bottom: 4px">
           <span class="mono muted">← {{ d.kind }}</span>
-          <RouterLink class="title-link" :to="`/task/${d.task_id}`">{{ d.task_title }}</RouterLink>
+          <RouterLink class="title-link" :to="`/task/${d.task_id}`">{{ d.task_display }}</RouterLink>
           <StateChip :token="d.task_state" />
         </div>
       </div>

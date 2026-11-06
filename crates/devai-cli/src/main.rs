@@ -295,6 +295,24 @@ enum TaskCmd {
         /// The project (id or name)
         project: String,
     },
+    /// Set or REPLACE the human name (signboard) of a task directly
+    /// (task 01a1ad1d, ratified OQ-TN-1): the human door to the name —
+    /// no rework cycle, the workflow state is not touched. The name is
+    /// validated against the same declarative window as spec publication
+    /// (`config/workflow/task-name.yaml`: non-blank, min..max chars, one
+    /// line); the formal title of the creator is never rewritten — it
+    /// stays in the task data. One append-only `task.human_name.set`
+    /// event per effective change; re-applying the current name is a
+    /// side-effect-free no-op.
+    Rename {
+        /// The task (id or unique prefix)
+        id: String,
+        /// The new human name (short, one line)
+        name: String,
+        /// Reject if the task's lock version moved (optimistic concurrency)
+        #[arg(long)]
+        expected_lock: Option<u64>,
+    },
     /// Show immutable event history
     Events {
         id: String,

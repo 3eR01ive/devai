@@ -59,6 +59,11 @@ CREATE TABLE tasks(
   project_id           TEXT NULL REFERENCES projects(id),
   title                TEXT NOT NULL,
   business_description TEXT NOT NULL DEFAULT '',
+  -- v9 (task 01a1ad1d, REQ-TN-01): the human signboard produced by the
+  -- analyst and stamped at spec publication; NULL until a name exists
+  -- (legacy tasks keep NULL and read their title — ratified OQ-TN-2).
+  -- The title above stays the verbatim creator text, never rewritten.
+  human_name           TEXT NULL,
   state                TEXT NOT NULL,
   return_state         TEXT NULL,
   requirements_seq     INTEGER NOT NULL DEFAULT 0,

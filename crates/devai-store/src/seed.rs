@@ -63,6 +63,10 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
     // loudness — a typo'd key or an inverted volume window fails `devai
     // init`, it is never a silent default.
     config::load_humanize_policy(&dir.join("workflow"))?;
+    // REQ-TN-05 AC2: the task-name template is validated the same way —
+    // the volume window of the human signboard is config, a broken or
+    // inverted declaration fails the seed loudly.
+    config::load_task_name_policy(&dir.join("workflow"))?;
     let inserted = config::seed_roles(store, &cfg, now)?;
 
     for (name, version, schema) in contracts() {
@@ -216,6 +220,60 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
     "source": { "type": ["string", "null"], "description": "initial description or reference" },
     "business_description": { "type": ["string", "null"], "description": "optional in the reply — the platform completes it from the stored task description when absent" },
     "human_paragraph": { "type": "string", "description": "the human explanation of the artifact, in plain words: what happens now and what will change (required slots, volume window and overlap limits come from config/workflow/humanize.yaml — never restated here)" },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "statement"],
+        "properties": {
+          "id": { "type": "string" },
+          "statement": { "type": "string" },
+          "acceptance_criteria": { "type": ["array", "null"], "items": { "type": "string" } },
+          "constraints": { "type": ["array", "null"], "items": { "type": "string" } },
+          "depends_on": { "type": ["array", "null"], "items": { "type": "string" } },
+          "source": { "type": ["object", "null"], "properties": { "file": { "type": "string" }, "commit_sha": { "type": "string" }, "checked_at": { "type": "string" } } },
+          "unverified": { "type": ["boolean", "null"] }
+        }
+      }
+    },
+    "open_questions": { "type": ["array", "null"], "items": { "type": "string" } },
+    "unknowns": { "type": "array", "items": { "type": "string" } },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "change_history": { "type": ["array", "null"], "items": { "type": "object" } }
+  }
+}"#,
+        ),
+        (
+            // @4 — the human task name becomes protocol (task 01a1ad1d,
+            // REQ-TN-02). @1..@3 stay seeded as history, insert-only, and
+            // stay enforced for artifacts published under them (the same
+            // non-retroactivity precedent as @3's paragraph, REQ-TN-02 AC3).
+            // `task_name` is the REQUIRED short human signboard the analyst
+            // produces from the meaning of THIS spec: the platform stamps it
+            // on the task at publication (echo fields `task_id` /
+            // `business_description` already travel that path — engine.rs
+            // stamp_spec_echo; the name rides the requirements_published
+            // command in the SAME commit). Every new CURRENT version brings
+            // a new name WHOLE (REQ-TN-04). The volume window and the
+            // one-line rule deliberately have NO literals in this schema —
+            // they live in `config/workflow/task-name.yaml` and are enforced
+            // by the deterministic detector (REQ-TN-05), the ratified
+            // humanize idiom.
+            "requirements-specification",
+            4,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Requirements Specification v4 — the human task name is protocol",
+  "description": "Same shape as @3 (every required key declared in properties; WRITE: omit optional fields you cannot fill, never null; READ: an explicit null on an optional field reads as absence) plus the REQ-TN-02 obligation: `task_name` is a REQUIRED top-level string — the short human signboard of the TASK ITSELF, worded from the meaning of this specification (one current name on the task, replaced whole by every new CURRENT version; the formal title of the creator is never rewritten). The volume window, the single-line rule and the field-name discipline live in config/workflow/task-name.yaml and are enforced by the deterministic mechanical detector (REQ-TN-05), never restated as literals in this schema. `human_paragraph` keeps its @3 obligation. `task_id` is stamped by the platform from stored data; `business_description` is completed from the stored task description when skipped; `version` is role-owned (rework bumps it).",
+  "type": "object",
+  "required": ["version", "requirements", "unknowns", "assumptions", "human_paragraph", "task_name"],
+  "properties": {
+    "task_id": { "type": ["string", "null"], "description": "optional in the reply — the platform stamps the stored task id before publishing" },
+    "version": { "type": "integer", "minimum": 1 },
+    "source": { "type": ["string", "null"], "description": "initial description or reference" },
+    "business_description": { "type": ["string", "null"], "description": "optional in the reply — the platform completes it from the stored task description when absent" },
+    "human_paragraph": { "type": "string", "description": "the human explanation of the artifact, in plain words: what happens now and what will change (required slots, volume window and overlap limits come from config/workflow/humanize.yaml — never restated here)" },
+    "task_name": { "type": "string", "description": "the short human signboard of the task, in the language of the business description; the name the queues, the graph and the UI sign the task with (volume window and the single-line rule come from config/workflow/task-name.yaml — never restated here)" },
     "requirements": {
       "type": "array",
       "items": {

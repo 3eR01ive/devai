@@ -61,6 +61,11 @@ pub struct ExecRequest {
     /// section that tells the role what a readable paragraph is. A home
     /// without the file behaves like the factory defaults (`Default`).
     pub humanize: HumanizePolicy,
+    /// Human task name template (task 01a1ad1d, REQ-TN-05): the same idiom
+    /// for the spec's `task_name` field — the mechanical name detector and
+    /// the analyst prompt section read THIS, a home without the file
+    /// behaves like the factory defaults (`TaskNamePolicy::default()`).
+    pub task_name: devai_store::config::TaskNamePolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +264,16 @@ impl AgentRuntime {
         ) {
             user.push_str(&section);
         }
+        // REQ-TN-05 (task 01a1ad1d): the task-name template is config too —
+        // delivered to the role exactly where the gate enforces the field
+        // (the humanize discipline: one prompt half, one gate half, one file).
+        if let Some(section) = crate::taskname::template_section(
+            &req.task_name,
+            req.contract_schema.as_deref(),
+            &crate::humanize::paragraph_language(&req.humanize, &req.business),
+        ) {
+            user.push_str(&section);
+        }
 
         // The role's declarative `tools` (config/roles/*.yaml) decide what the
         // provider process may touch. No tools declared == pure text answer.
@@ -327,7 +342,12 @@ impl AgentRuntime {
         let parsed: Value = serde_json::from_str(&json).map_err(|e| AdapterError::BadOutput {
             violations: vec![format!("extracted object is not valid JSON: {e}")],
         })?;
-        validate_reply(&json, req.contract_schema.as_deref(), &req.humanize)?;
+        validate_reply(
+            &json,
+            req.contract_schema.as_deref(),
+            &req.humanize,
+            &req.task_name,
+        )?;
         Ok(ExecOutput {
             content: json.into_bytes(),
             summary: summarize(contract.map(|c| c.0), &parsed),
@@ -397,7 +417,12 @@ impl AgentRuntime {
         let parsed: Value = serde_json::from_str(&json).map_err(|e| AdapterError::BadOutput {
             violations: vec![format!("extracted object is not valid JSON: {e}")],
         })?;
-        validate_reply(&json, req.contract_schema.as_deref(), &req.humanize)?;
+        validate_reply(
+            &json,
+            req.contract_schema.as_deref(),
+            &req.humanize,
+            &req.task_name,
+        )?;
         let contract = req.role.output_contract.as_ref().map(|c| c.name.as_str());
         Ok(ExecOutput {
             content: json.into_bytes(),
@@ -438,6 +463,16 @@ impl AgentRuntime {
             &req.humanize,
             req.contract_schema.as_deref(),
             &req.business,
+        ) {
+            user.push_str(&section);
+        }
+        // REQ-TN-05 (task 01a1ad1d): the task-name template is config too —
+        // delivered to the role exactly where the gate enforces the field
+        // (the humanize discipline: one prompt half, one gate half, one file).
+        if let Some(section) = crate::taskname::template_section(
+            &req.task_name,
+            req.contract_schema.as_deref(),
+            &crate::humanize::paragraph_language(&req.humanize, &req.business),
         ) {
             user.push_str(&section);
         }
@@ -596,6 +631,10 @@ impl AgentRuntime {
                 "version": 1,
                 "source": "mock runtime",
                 "human_paragraph": mock_human_paragraph(),
+                // REQ-TN-02: the human signboard is part of the mock's
+                // contract-shaped reply — deterministic from the task's
+                // formal title, inside the factory window.
+                "task_name": mock_task_name(&req.title, req.task_name.max_chars),
                 "business_description": req.business,
                 "requirements": [{
                     "id": "R1",
@@ -649,6 +688,7 @@ impl AgentRuntime {
             &String::from_utf8_lossy(&text),
             req.contract_schema.as_deref(),
             &req.humanize,
+            &req.task_name,
         )
         // Seed/schema drift is a PLATFORM bug, not the fixture role's
         // form error — it must not burn loop re-prompts (REQ-FG-03).
@@ -698,6 +738,7 @@ impl AgentRuntime {
             &String::from_utf8_lossy(&text),
             req.contract_schema.as_deref(),
             &req.humanize,
+            &req.task_name,
         )
         .map_err(|e| {
             AdapterError::Platform(format!(
@@ -724,6 +765,7 @@ impl AgentRuntime {
             &String::from_utf8_lossy(&text),
             req.contract_schema.as_deref(),
             &req.humanize,
+            &req.task_name,
         )?;
         // Valid under no stored reply contract (no required keys satisfied);
         // if a test passes no schema at all, manufacture the form failure.
@@ -810,18 +852,26 @@ fn claude_tools_for(role: &RoleDefinition) -> Vec<String> {
 /// source of truth — the fallback here is the same policy the embedded
 /// `config/workflow/humanize.yaml` declares, never an off-switch).
 pub fn validate_against_contract(content: &str, schema: Option<&str>) -> Result<(), AdapterError> {
-    validate_reply(content, schema, &HumanizePolicy::default())
+    validate_reply(
+        content,
+        schema,
+        &HumanizePolicy::default(),
+        &devai_store::config::TaskNamePolicy::default(),
+    )
 }
 
 /// The full reply gate with the project's humanization policy (REQ-HP-02/03:
 /// one gate, every publication path; the engine loop and the manual
-/// `artifact publish` reach the SAME violations through this half).
+/// `artifact publish` reach the SAME violations through this half) and the
+/// project's task-name template (REQ-TN-05 AC1: the manual door runs the
+/// SAME name detector as the engine loop).
 pub fn validate_reply(
     content: &str,
     schema: Option<&str>,
     humanize: &HumanizePolicy,
+    task_name: &devai_store::config::TaskNamePolicy,
 ) -> Result<(), AdapterError> {
-    let violations = artifact_violations(content, schema, humanize)?;
+    let violations = artifact_violations(content, schema, humanize, task_name)?;
     if !violations.is_empty() {
         return Err(AdapterError::BadOutput { violations });
     }
@@ -832,7 +882,12 @@ pub fn contract_violations(
     content: &str,
     schema: Option<&str>,
 ) -> Result<Vec<String>, AdapterError> {
-    artifact_violations(content, schema, &HumanizePolicy::default())
+    artifact_violations(
+        content,
+        schema,
+        &HumanizePolicy::default(),
+        &devai_store::config::TaskNamePolicy::default(),
+    )
 }
 
 /// The form gate as DATA: every violation with its json path, whole.
@@ -854,6 +909,7 @@ pub fn artifact_violations(
     content: &str,
     schema: Option<&str>,
     humanize: &HumanizePolicy,
+    task_name: &devai_store::config::TaskNamePolicy,
 ) -> Result<Vec<String>, AdapterError> {
     let Some(schema) = schema else {
         return Ok(Vec::new());
@@ -876,6 +932,15 @@ pub fn artifact_violations(
         // list, never two views of the same defect.
         errs.extend(crate::humanize::paragraph_violations(
             &value, &schema_v, humanize,
+        ));
+    }
+    if errs.is_empty() {
+        // The task-name detector (REQ-TN-05) is the same protocol half as
+        // the paragraph's: it fires only when the stored schema REQUIRES
+        // the configured name field, so @1..@3 and every non-bearing
+        // contract are exempt by construction, never by a kind branch.
+        errs.extend(crate::taskname::name_violations(
+            &value, &schema_v, task_name,
         ));
     }
     Ok(errs)
@@ -1078,6 +1143,32 @@ fn mock_human_paragraph() -> String {
     "Простыми словами: сейчас результат роли выглядит как формальный протокол, и человеку приходится переводить его на обычный язык самостоятельно, по контексту запуска. Этот артефакт объясняет суть по-человечески: что происходит сегодня и что изменится, если решение принять. Платформа начнёт показывать такой абзац оператору первым, до формальной структуры, а гейт будет механически проверять, что он действительно написан для человека.".to_string()
 }
 
+/// REQ-TN-02: the mock analyst's `task_name` — deterministic, derived from
+/// the task's formal title by taking WHOLE leading words up to the
+/// configured window (never a mid-word cut, never blank: a title that is
+/// itself blank falls back to a fixed legal name). The window is the
+/// policy's, not a code literal.
+fn mock_task_name(title: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for w in title.split_whitespace() {
+        let add = if out.is_empty() { w } else { " " };
+        let projected = count + add.chars().count() + w.chars().count();
+        if projected > max_chars {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+        count = projected;
+    }
+    if out.trim().is_empty() {
+        out = "mock спецификация задачи".to_string();
+    }
+    out
+}
+
 fn one_line(s: &str) -> String {
     let t = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if t.chars().count() > 80 {
@@ -1126,6 +1217,7 @@ mod tests {
             evidence: None,
             repair: None,
             humanize: HumanizePolicy::default(),
+            task_name: devai_store::config::TaskNamePolicy::default(),
         }
     }
 

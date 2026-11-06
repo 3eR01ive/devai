@@ -60,6 +60,13 @@
       "to": 8,
       "script": "migrations/008_task_creation_keys.sql",
       "apply": "script"
+    },
+    {
+      "id": "009_task_human_name",
+      "from": 8,
+      "to": 9,
+      "script": "migrations/009_task_human_name.sql",
+      "apply": "additive_human_name_column"
     }
   ]
 }

@@ -7,7 +7,7 @@ import { useRoute } from "vue-router";
 import { api, toUiError } from "../api";
 import { fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
-import type { Task, UiError } from "../types";
+import { type Task, type UiError } from "../types";
 
 const route = useRoute();
 const tasks = ref<Task[]>([]);
@@ -65,7 +65,7 @@ onMounted(load);
       <tbody>
         <tr v-for="t in visible" :key="t.id">
           <td>
-            <RouterLink class="title-link" :to="`/task/${t.id}`">{{ t.title }}</RouterLink>
+            <RouterLink class="title-link" :to="`/task/${t.id}`">{{ t.display }}</RouterLink>
           </td>
           <td class="mono muted">{{ shortId(t.id) }}</td>
           <td>

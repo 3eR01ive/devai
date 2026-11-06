@@ -130,6 +130,62 @@ fn current_spec(artifacts: &[Artifact]) -> Option<&Artifact> {
         .max_by_key(|a| a.seq)
 }
 
+/// Typed outcome of reading the signboard field out of a stored CURRENT
+/// spec body (QA R1, rel/error-context): «does not read as JSON» and «no
+/// name in the body» are DIFFERENT facts. The second is the legal absence
+/// a @1..@3 legacy body means; the first is a store-integrity failure that
+/// no door may fold into the absence branch — collapsing them is what
+/// let a swallowed read error keep the previous signboard silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecNameRead {
+    /// The field is present and non-blank — the name this publication
+    /// stamps.
+    Named(String),
+    /// The body parses as JSON but names no usable signboard (missing
+    /// field, non-string, blank): the publication says NOTHING about the
+    /// signboard, the stored one is kept (REQ-TN-02 AC3).
+    Absent,
+    /// The bytes are not parseable JSON — corruption, not absence.
+    Corrupt,
+}
+
+/// The typed half: a door that RE-READS a stored body uses this so an
+/// integrity failure stays distinguishable from the legal absence
+/// (QA R1); doors handed bytes that already passed the contract gate use
+/// the [`human_name_from_spec`] wrapper below.
+pub fn read_human_name_from_spec(content: &[u8], field: &str) -> SpecNameRead {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(content) else {
+        return SpecNameRead::Corrupt;
+    };
+    let Some(raw) = value.get(field).and_then(|v| v.as_str()) else {
+        return SpecNameRead::Absent;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return SpecNameRead::Absent;
+    }
+    SpecNameRead::Named(trimmed.to_string())
+}
+
+/// REQ-TN-02: read the human name out of a published CURRENT spec BODY.
+/// The body arrives already contract-gated (`task_name` is REQUIRED by the
+/// @4 schema, the mechanical window detector already rejected anything the
+/// project template disallows), so this half is a pure read: the field
+/// named by the loaded `config/workflow/task-name.yaml` policy, trimmed,
+/// returned when non-blank. A body with no such field returns `None` — the
+/// obligation is NOT retroactive (REQ-TN-02 AC3), absence means "this
+/// publication says nothing about the signboard", never "clear it". The
+/// `Corrupt` outcome maps to `None` HERE because every caller of this
+/// wrapper holds bytes that just passed the JSON-Schema gate; a door that
+/// reads the body back from the store uses [`read_human_name_from_spec`]
+/// instead and refuses on `Corrupt` (QA R1).
+pub fn human_name_from_spec(content: &[u8], field: &str) -> Option<String> {
+    match read_human_name_from_spec(content, field) {
+        SpecNameRead::Named(v) => Some(v),
+        SpecNameRead::Absent | SpecNameRead::Corrupt => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // dependency gate (REQ-03/04)
 // ---------------------------------------------------------------------------
@@ -222,10 +278,23 @@ pub fn start(task: &Task, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
 /// role or by the user via `revise`). The spec artifact must already exist in
 /// `artifacts` with `status = CURRENT`. Supersedes previous versions, marks
 /// dependent results stale and returns the task to REVIEW.
+///
+/// `human_name` is the signboard read out of the published CURRENT spec BODY
+/// (REQ-TN-02: the analyst produces it as a required contract field, every
+/// publication path — engine run, manual `task revise`, `artifact advance` —
+/// extracts it with the ONE helper `human_name_from_spec` and hands it HERE;
+/// this command is the single writer of the field on publication). `Some(v)`
+/// REPLACES the stored name wholesale — a rework spec re-signs the task from
+/// its own body, never a delta (REQ-TN-04, ratified OQ-HP-4 idiom); `None`
+/// (a spec published under @1..@3, no name in the body) keeps the previous
+/// name untouched — the obligation is not retroactive (REQ-TN-02 AC3). The
+/// title is never touched (REQ-TN-01 AC2). The name lands on the task row
+/// inside the SAME commit as the transition and its event.
 pub fn requirements_published(
     task: &Task,
     artifacts: &[Artifact],
     reason: Option<&str>,
+    human_name: Option<&str>,
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
@@ -255,6 +324,10 @@ pub fn requirements_published(
     };
 
     let is_revise = task.requirements_seq > 0;
+    // REQ-TN-02/04: the name this publication writes. Absence keeps the
+    // previous stored value (a legacy-body publication does not clear a
+    // signboard); presence replaces it whole.
+    let name_now: Option<&str> = human_name.or(task.human_name.as_deref());
     let mut m = transition(
         task,
         TaskState::Review,
@@ -269,9 +342,11 @@ pub fn requirements_published(
             (json_field::REQUIREMENTS_SEQ): spec.seq,
             (json_field::SPEC_ID): spec.id.to_string(),
             (json_field::REASON): reason,
+            (json_field::HUMAN_NAME): name_now,
         }),
     );
     m.task.requirements_seq = spec.seq;
+    m.task.human_name = name_now.map(|s| s.to_string());
 
     // The predecessor specs this publication replaces. The set is keyed on
     // (kind, older seq), NOT on CURRENT: since the store-level generic

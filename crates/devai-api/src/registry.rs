@@ -39,11 +39,22 @@ pub struct OpDescriptor {
 
 /// R3 QA (da/api-contract): THE version of the published API surface —
 /// the single source every machine-readable registry publication stamps.
-/// `@2` names the cycle that moved the mutation plane onto the surface
-/// (REQ-MUT-*); a future breaking change to operation names, classes or
-/// shape contracts bumps this constant and nothing else (grep finds one
-/// declaration — there is no second copy to drift).
-pub const SURFACE_VERSION: &str = "api-surface@2";
+/// Bump MECHANICS (QA R5, da/api-contract): the surface is a contract for
+/// second consumers (devai-ui dogfoods it), so the constant moves when
+/// the published contract changes shape for them — a new operation joins
+/// or leaves the table, or a request/response shape gains/loses a field a
+/// consumer reads. It is bumped AT the publication of that increment (in
+/// the same change as the operations/shape entries it versions), never
+/// lazily later and never for a prose-only edit; grep finds ONE
+/// declaration — there is no second copy to drift.
+/// `@2` named the cycle that moved the mutation plane onto the surface
+/// (REQ-MUT-*). `@3` names the human-signboard increment shipped with it:
+/// the surface gained the rename/advance name doors (`task.rename`, the
+/// spec-advance signboard stamp) and the read shapes now carry the name
+/// plane (`Task.human_name`, `TaskDependency.task_display`/
+/// `depends_on_display`) — a consumer typed against `@2` reads those
+/// fields as unknown-absent, so the stamp must move with them.
+pub const SURFACE_VERSION: &str = "api-surface@3";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -302,6 +313,14 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "id_or_name",
             output: "TaskProjectBackfillOutcome{bound, already_bound, skipped_terminal, skipped_other_project}",
             description: "REQ-BIND-03 under the ratified OQ-BIND-2 rule: bind the given project to every task that lives UNBOUND and NON-TERMINAL, each through `task.project.set` (one event, one lock bump per task). Terminal history keeps the address it lived and judged at; tasks owned by another project are never re-bound. Re-application finds no candidates and changes nothing (idempotent). Mirrors `task backfill-project`.",
+        },
+        // ---- task: human signboard (task 01a1ad1d, REQ-TN, OQ-TN-1) ----
+        OpDescriptor {
+            name: "task.rename",
+            class: OpClass::Mutation,
+            input: "TaskRenameReq{id, name, expected_lock}",
+            output: "TaskRenameOutcome{task, human_name, changed}",
+            description: "HUMAN door to the signboard (ratified OQ-TN-1): set or replace the task's human name directly — no rework cycle, the workflow state is never touched. The name is validated against the SAME declarative window as spec publication (config/workflow/task-name.yaml: blank / too-short / too-long / multi-line values refuse typed `contract_violation`); refs resolve first, a stale `expected_lock` refuses typed `conflict`, re-applying the name the task already carries is a side-effect-free NO-OP (`changed=false`), an effective change bumps lock_version and appends one `task.human_name.set` event in the SAME transaction. The formal title is never rewritten (REQ-TN-01). Mirrors `task rename`.",
         },
         OpDescriptor {
             name: "task.depend",
@@ -622,6 +641,30 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(doc["surface_version"].as_str().unwrap(), SURFACE_VERSION);
         assert!(doc["operations"].is_array());
+    }
+
+    #[test]
+    fn surface_version_v3_ships_the_name_plane() {
+        // QA R5 (da/api-contract): the stamp and its increment are
+        // pinned TOGETHER — @3 is by this test defined as "the
+        // human-signboard surface": if the constant moves without the
+        // rename door/shape moving with it, or the name plane leaves the
+        // table while the stamp claims it, this fails. The literal is
+        // the deliberate second writing of the version: bumping the
+        // constant is an author's decision documented at the declaration
+        // (see the bump mechanics comment there), and this test forces
+        // that decision to be taken consciously, twice, in one change.
+        assert_eq!(SURFACE_VERSION, "api-surface@3");
+        let rename = operations()
+            .into_iter()
+            .find(|o| o.name == "task.rename")
+            .expect("@3 surface must publish task.rename (ratified OQ-TN-1)");
+        assert_eq!(rename.class, OpClass::Mutation);
+        assert!(
+            rename.output.contains("human_name"),
+            "the rename outcome shape must carry the signboard: {}",
+            rename.output
+        );
     }
 
     #[test]

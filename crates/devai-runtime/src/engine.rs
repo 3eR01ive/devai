@@ -13,7 +13,9 @@ use chrono::Utc;
 use devai_core::error::CoreError;
 use devai_core::types::*;
 use devai_core::workflow;
-use devai_store::config::{HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy};
+use devai_store::config::{
+    HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
+};
 use devai_store::{ArtifactDraft, Store, StoreError};
 
 use crate::adapters::{
@@ -319,6 +321,16 @@ pub struct Engine<'a> {
     /// operator can still fix — the factory default never masquerades as
     /// the project's declared template (REQ-HP-04 AC2).
     humanize_config_error: Option<String>,
+    /// Declarative task-name template (task 01a1ad1d, REQ-TN-05): the
+    /// field name, volume window and one-line rule of the human signboard —
+    /// `config/workflow/task-name.yaml`, loaded once per run, handed to the
+    /// gate and to the analyst prompt as data.
+    task_name: TaskNamePolicy,
+    /// A present-but-broken name template is LOUD at the next stage — the
+    /// same held-error discipline as the humanization template (a typo'd
+    /// key must never degrade into the factory policy while the YAML on
+    /// disk claims otherwise).
+    task_name_config_error: Option<String>,
     /// REWORK-context delivery table (R-001): which recorded decision events
     /// feed which role. Platform workflow data, loaded from
     /// `config/workflow/rework-context.yaml`; a home without it falls back
@@ -366,6 +378,18 @@ impl<'a> Engine<'a> {
                 devai_store::config::HumanizePolicy::default()
             }
         };
+        // Task-name template (REQ-TN-05). The same loud-degrade discipline:
+        // absent file => the embedded factory bytes; present-but-broken =>
+        // the error is HELD and raised loudly at the next stage.
+        let mut task_name_config_error = None;
+        let task_name = match devai_store::config::load_task_name_policy(&cfg_dir.join("workflow"))
+        {
+            Ok(policy) => policy,
+            Err(e) => {
+                task_name_config_error = Some(e.to_string());
+                TaskNamePolicy::default()
+            }
+        };
         // REWORK delivery table. Unlike the form budget, the table cannot
         // degrade quietly — a silently empty table would disable delivery
         // while the YAML on disk claims otherwise. Absent file/dir =>
@@ -392,6 +416,8 @@ impl<'a> Engine<'a> {
             response_form,
             humanize,
             humanize_config_error,
+            task_name,
+            task_name_config_error,
             rework,
             rework_config_error,
         }
@@ -890,6 +916,12 @@ impl<'a> Engine<'a> {
         if let Some(err) = &self.humanize_config_error {
             return Err(RuntimeError::Store(StoreError::Config(err.clone())));
         }
+        // REQ-TN-05 AC2: a broken task-name template stops the stage
+        // LOUDLY — the factory window never silently replaces what the
+        // project's `task-name.yaml` declares.
+        if let Some(err) = &self.task_name_config_error {
+            return Err(RuntimeError::Store(StoreError::Config(err.clone())));
+        }
         if let Some(section) =
             crate::context::rework_context(self.store, task, role_slug, &self.rework)?
         {
@@ -1178,6 +1210,9 @@ impl<'a> Engine<'a> {
             // REQ-HP-04: the loaded template rides with the request — the
             // gate and the prompt read the same values, one per run.
             humanize: self.humanize.clone(),
+            // REQ-TN-05: the name template rides the same way (gate half
+            // and prompt half read one loaded policy).
+            task_name: self.task_name.clone(),
         };
 
         // THE response-form correction loop (REQ-FG-02..04, OQ-FG-06/08/09):
@@ -1349,7 +1384,12 @@ impl<'a> Engine<'a> {
                                 QUALITY_REPORT_CONTRACT.1,
                             )
                         })?;
-                    if let Err(e) = adapters::validate_reply(&text, Some(&schema), &self.humanize) {
+                    if let Err(e) = adapters::validate_reply(
+                        &text,
+                        Some(&schema),
+                        &self.humanize,
+                        &self.task_name,
+                    ) {
                         let _ = self.store.finish_execution_classified(
                             &execution,
                             ExecutionStatus::Failed,
@@ -1421,6 +1461,11 @@ impl<'a> Engine<'a> {
                 task,
                 &fresh,
                 Some(&format!("{role_slug} execution {}", execution.id)),
+                // REQ-TN-02: the signboard is stamped from the body of THIS
+                // publication — the same publication path that stamps the
+                // echo fields; the field name comes from the loaded
+                // task-name template, never a code guess.
+                workflow::human_name_from_spec(&content, &self.task_name.field).as_deref(),
                 actor,
                 Utc::now(),
             )?,
@@ -1527,9 +1572,9 @@ impl<'a> Engine<'a> {
         // gate after touching the reply — the FULL gate, human paragraph
         // included (REQ-HP-02: no bypass door; the echo stamping must not
         // break what the role wrote).
-        adapters::validate_reply(&text, contract_schema, &self.humanize).map_err(|e| {
-            AdapterError::Platform(format!("platform stamping broke the spec contract: {e}"))
-        })?;
+        adapters::validate_reply(&text, contract_schema, &self.humanize, &self.task_name).map_err(
+            |e| AdapterError::Platform(format!("platform stamping broke the spec contract: {e}")),
+        )?;
         Ok(ExecOutput {
             content: text.into_bytes(),
             summary: out.summary,
@@ -1587,7 +1632,7 @@ impl<'a> Engine<'a> {
         // mechanical half of implementation-report@3: the guarantee is
         // engine-side, not a promise to the model) — the FULL gate, so the
         // human paragraph survives platform stamping unchanged (REQ-HP-07).
-        adapters::validate_reply(&text, contract_schema, &self.humanize)?;
+        adapters::validate_reply(&text, contract_schema, &self.humanize, &self.task_name)?;
         self.store.insert_event(
             Some(task.id),
             event_kind::WORKTREE_COMMITTED,
