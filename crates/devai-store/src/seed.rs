@@ -615,14 +615,14 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
         "lang": { "type": "string", "description": "language of every human string in this shape (task language, ru)" },
         "headline": {
           "type": "object",
-          "required": ["verdict", "machine_verdict", "score", "theta", "basis", "counts"],
+          "required": ["verdict", "machine_verdict", "score", "theta", "basis", "numbers", "counts"],
           "properties": {
-            "verdict": { "type": "string" },
+            "verdict": { "type": "string", "description": "human verdict word (ПРОШЁЛ / НЕ ПРОШЁЛ / ВЕРДИКТ НЕ ГОТОВ)" },
             "machine_verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
-            "score": { "type": "number" },
-            "theta": { "type": "number" },
-            "basis": { "type": "string" },
-            "numbers": { "type": "string", "description": "S and threshold already formatted by the one formatter at assembly; readers print it verbatim (rework R3)" },
+            "score": { "type": "number", "description": "S as decided by the deterministic verdict function at assembly" },
+            "theta": { "type": "number", "description": "the verdict threshold the profile scored against" },
+            "basis": { "type": "string", "description": "the recommendation basis, quoted from the decided values" },
+            "numbers": { "type": "string", "description": "REQUIRED: S and threshold already formatted by the one formatter at assembly; every reader (CLI and panel) prints it verbatim and cannot load the form without it (rework R3/R1)" },
             "counts": {
               "type": "object",
               "required": ["blocks", "nuances", "anchors", "unchecked"],
@@ -652,19 +652,19 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
                 "type": "array",
                 "items": {
                   "type": "object",
-                  "required": ["id", "kind", "summary", "site"],
+                  "required": ["id", "kind", "summary", "line", "site"],
                   "properties": {
-                    "id": { "type": "string" },
+                    "id": { "type": "string", "description": "check id or gate id — the identity the operator cites back" },
                     "kind": { "type": "string", "description": "@ITEM_KIND_LIST@" },
                     "summary": { "type": "string", "description": "ONE short visible line — no code, no paragraphs (REQ-QH-04)" },
-                    "line": { "type": "string", "description": "the COMPLETE visible row (id, score, weight, importance, site — or the anchor sentence), formatted once at assembly; every channel prints it verbatim (rework R3)" },
+                    "line": { "type": "string", "description": "REQUIRED: the COMPLETE visible row (id, score, weight, importance, site — or the anchor sentence), formatted once at assembly; every channel prints it verbatim and neither the CLI nor the panel can load the form without it (rework R3/R1)" },
                     "site": { "type": "string", "description": "file:line of the finding, empty when there is none" },
-                    "score": { "type": ["number", "null"] },
-                    "weight": { "type": ["number", "null"] },
-                    "importance": { "type": ["number", "null"], "description": "(1-score)*weight as decided at assembly; null when the item has no score" },
-                    "ratified_by": { "type": "string", "description": "the stored decision that keeps this anchor in force" },
-                    "reason": { "type": "string" },
-                    "evidence": { "type": "array", "items": { "type": "string" }, "description": "the collapsed proof layer: citation bodies and probe output, verbatim" }
+                    "score": { "type": ["number", "null"], "description": "optional: the decided score; always emitted by the v5 writer, null for items without a score (gates, pending, blocked)" },
+                    "weight": { "type": ["number", "null"], "description": "optional: the profile weight; always emitted by the v5 writer, null when the item carries no weight" },
+                    "importance": { "type": ["number", "null"], "description": "optional: (1-score)*weight as decided at assembly; always emitted by the v5 writer, null when the item has no score" },
+                    "ratified_by": { "type": "string", "description": "optional, OMITTED when absent: the stored decision that keeps this anchor in force" },
+                    "reason": { "type": "string", "description": "optional, OMITTED when absent: the BLOCKED reason / gate detail — a fact, not a judgement" },
+                    "evidence": { "type": "array", "items": { "type": "string" }, "description": "optional, OMITTED when empty: the collapsed proof layer — citation bodies and probe output, verbatim" }
                   }
                 }
               }
@@ -673,6 +673,20 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
         },
         "blocked_weight": { "type": "number" },
         "max_blocked_weight": { "type": "number" }
+      }
+    },
+    "freshness": {
+      "type": "object",
+      "description": "NOT stored in the body: the export of a reader (REQ-QH-05) beside the shown report — which row is shown, and whether it is still the last word. Assembled at READ time from raw store facts (task phase, stored artifact status, auditor executions); it re-derives no report content. Declared in this contract so the freshness marker has ONE shape owner and the API/panel cannot drift from its required fields (rework R1).",
+      "required": ["stale", "marker", "report_seq", "report_status", "task_state"],
+      "properties": {
+        "stale": { "type": "boolean", "description": "true when the shown row is not the last word and the task is not terminal" },
+        "marker": { "type": "string", "description": "ready-to-show marker naming the stored facts; empty when the report is current" },
+        "report_seq": { "type": "integer", "description": "seq of the shown artifact row" },
+        "report_status": { "type": "string", "description": "stored status of the shown row: CURRENT / STALE / SUPERSEDED" },
+        "task_state": { "type": "string", "description": "the task phase the marker names" },
+        "execution": { "type": ["string", "null"], "description": "optional: id of the newest auditor execution, null when none ran" },
+        "execution_status": { "type": ["string", "null"], "description": "optional: status of that execution (RUNNING is named «в работе» only from this fact)" }
       }
     },
     "profile": {

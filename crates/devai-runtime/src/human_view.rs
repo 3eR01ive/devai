@@ -1666,4 +1666,143 @@ scoring:
         let blocks: Vec<&str> = v.groups[0].items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(blocks, vec!["score-threshold", "pend/p", "blk/floor"]);
     }
+
+    /// The CURRENT quality-report contract, as seeded (highest version).
+    fn quality_report_schema() -> serde_json::Value {
+        let (_, _, raw) = devai_store::seed::contracts()
+            .into_iter()
+            .filter(|(name, _, _)| *name == "quality-report")
+            .max_by_key(|(_, version, _)| *version)
+            .expect("the quality-report contract is seeded");
+        serde_json::from_str(&raw).expect("the seeded schema is valid JSON")
+    }
+
+    /// R1 (da/api-contract 0.7): the seeded document schema and the reader are
+    /// ONE shape, checked over the form THIS writer emits:
+    /// every key the schema marks `required` is emitted; every emitted key is
+    /// declared; and `required` is exactly the set the reader cannot load
+    /// without — a declared-only key removed still loads, a required one does
+    /// not. A field the reader needs but the schema leaves optional (the bug
+    /// this test exists for: `line`, `headline.numbers`) fails here instead of
+    /// surfacing as a «повреждённая форма» in production.
+    #[test]
+    fn the_seeded_schema_and_the_reader_are_the_same_shape() {
+        let schema = quality_report_schema();
+        let value = serde_json::to_value(fixture()).expect("the form serialises");
+        let mut steps = Vec::new();
+        let mut checks = Vec::new();
+        assert_shape(
+            &schema["properties"]["human_view"],
+            &value,
+            "human_view",
+            &mut steps,
+            &mut checks,
+        );
+        for (steps, required) in checks {
+            let path = steps_path(&steps);
+            let mut missing = value.clone();
+            remove_at(&mut missing, &steps);
+            let loads = serde_json::from_value::<HumanReportView>(missing);
+            if required {
+                assert!(
+                    loads.is_err(),
+                    "{path} is required by the schema, yet the reader loads a form without it"
+                );
+            } else {
+                assert!(
+                    loads.is_ok(),
+                    "{path} is optional in the schema, yet the reader cannot load without it: {:?}",
+                    loads.err()
+                );
+            }
+        }
+    }
+
+    /// One step of a walk over the emitted JSON: an object key or an array
+    /// element, so a failed check can name (and remove) the exact field.
+    #[derive(Clone, Debug)]
+    enum Step {
+        Key(String),
+        Index(usize),
+    }
+
+    fn steps_path(steps: &[Step]) -> String {
+        let mut out = String::from("human_view");
+        for s in steps {
+            match s {
+                Step::Key(k) => out.push_str(&format!(".{k}")),
+                Step::Index(i) => out.push_str(&format!("[{i}]")),
+            }
+        }
+        out
+    }
+
+    fn remove_at(root: &mut serde_json::Value, steps: &[Step]) {
+        let (last, path) = steps.split_last().expect("a check always has a step");
+        let mut cur = root;
+        for s in path {
+            cur = match s {
+                Step::Key(k) => &mut cur[k],
+                Step::Index(i) => &mut cur[*i],
+            };
+        }
+        match last {
+            Step::Key(k) => {
+                cur.as_object_mut().expect("keyed step").remove(k);
+            }
+            Step::Index(i) => {
+                cur.as_array_mut().expect("indexed step").remove(*i);
+            }
+        }
+    }
+
+    /// Walk the writer's own output against the schema. Collects (for every
+    /// emitted key) its path and whether the schema marks it required, so the
+    /// caller can prove the split both ways on the whole document.
+    fn assert_shape(
+        schema: &serde_json::Value,
+        value: &serde_json::Value,
+        path: &str,
+        steps: &mut Vec<Step>,
+        checks: &mut Vec<(Vec<Step>, bool)>,
+    ) {
+        if let Some(arr) = value.as_array() {
+            let items = schema
+                .get("items")
+                .unwrap_or_else(|| panic!("{path}: the schema declares no array items"));
+            for (i, v) in arr.iter().enumerate() {
+                steps.push(Step::Index(i));
+                assert_shape(items, v, &format!("{path}[{i}]"), steps, checks);
+                steps.pop();
+            }
+            return;
+        }
+        let Some(obj) = value.as_object() else {
+            return;
+        };
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap_or_else(|| panic!("{path}: the schema declares no properties"));
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for name in &required {
+            assert!(
+                obj.contains_key(*name),
+                "schema requires {path}.{name}, the writer does not emit it"
+            );
+        }
+        for (key, child) in obj {
+            let child_schema = props.get(key).unwrap_or_else(|| {
+                panic!("the writer emits {path}.{key}, the schema does not declare it")
+            });
+            steps.push(Step::Key(key.clone()));
+            assert_shape(child_schema, child, &format!("{path}.{key}"), steps, checks);
+            checks.push((steps.clone(), required.contains(&key.as_str())));
+            steps.pop();
+        }
+    }
 }

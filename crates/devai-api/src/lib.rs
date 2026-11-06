@@ -959,3 +959,82 @@ fn workspace_event_facts(t: &Task, events: &[WorkflowEvent]) -> WorkspaceFacts {
     }
     f
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ReportFreshness;
+
+    /// The CURRENT quality-report contract, as seeded (highest version).
+    fn quality_report_schema() -> serde_json::Value {
+        let (_, _, raw) = devai_store::seed::contracts()
+            .into_iter()
+            .filter(|(name, _, _)| *name == "quality-report")
+            .max_by_key(|(_, version, _)| *version)
+            .expect("the quality-report contract is seeded");
+        serde_json::from_str(&raw).expect("the seeded schema is valid JSON")
+    }
+
+    /// R1 (da/api-contract 0.7): the freshness marker this view publishes is
+    /// declared by the quality-report contract — every field the view
+    /// serialises is declared, and `required` is exactly the set a reader
+    /// cannot do without (the two execution facts are nullable, so they stay
+    /// optional). A panel reading `freshness.task_state` must never face an
+    /// undeclared field.
+    #[test]
+    fn the_freshness_marker_matches_the_declared_shape() {
+        let schema = quality_report_schema();
+        let declared = &schema["properties"]["freshness"];
+        let marker = ReportFreshness {
+            stale: true,
+            marker: "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK".into(),
+            report_seq: 1,
+            report_status: "STALE".into(),
+            task_state: "REWORK".into(),
+            execution: Some("01a1b1b8-exec".into()),
+            execution_status: Some("RUNNING".into()),
+        };
+        let value = serde_json::to_value(&marker).expect("the freshness fact serialises");
+        let props = declared["properties"]
+            .as_object()
+            .expect("the contract declares freshness properties");
+        for key in value.as_object().expect("serialises to an object").keys() {
+            assert!(
+                props.contains_key(key),
+                "the API publishes freshness.{key}, the contract does not declare it"
+            );
+        }
+        let required: Vec<&str> = declared["required"]
+            .as_array()
+            .expect("the contract declares freshness.required")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            required,
+            vec![
+                "stale",
+                "marker",
+                "report_seq",
+                "report_status",
+                "task_state"
+            ],
+            "required = the facts a reader cannot do without"
+        );
+        for key in &required {
+            assert!(
+                value.get(key).is_some(),
+                "freshness.{key} is required, the writer does not emit it"
+            );
+        }
+        // The nullable execution facts are honestly OPTIONAL: a marker with
+        // only the required facts still loads as the reader's own type.
+        let mut minimal = value.clone();
+        let obj = minimal.as_object_mut().expect("object");
+        obj.remove("execution");
+        obj.remove("execution_status");
+        let loaded: ReportFreshness =
+            serde_json::from_value(minimal).expect("required-only freshness loads");
+        assert_eq!(loaded.execution, None);
+        assert_eq!(loaded.execution_status, None);
+    }
+}

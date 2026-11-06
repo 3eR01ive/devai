@@ -11,7 +11,7 @@ use devai_core::types::{
     Artifact, ArtifactKind, ArtifactStatus, ExecutionStatus, Id, RoleExecution, Task, TaskState,
     Timestamp, WorkflowEvent, event_kind, json_field, short_id,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{HumanReportView, render_text};
@@ -123,7 +123,7 @@ pub fn render_stored_report(v: &Value) -> RenderedReport {
 
 /// Why the report on screen is (or is not) the last word — raw store facts:
 /// the task phase, the stored artifact status, and the auditor execution.
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ReportFreshness {
     pub stale: bool,
     /// Ready-to-show marker line; empty when the report is current.
