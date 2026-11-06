@@ -28,11 +28,12 @@ use std::path::{Path, PathBuf};
 
 use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
+use devai_runtime::human_view::present::{self, PresentedReport, ReportFreshness};
 use devai_runtime::{Engine, Gate, RunReport, liveness};
 use devai_store::{ArtifactDraft, StoreError, bundle, guess_media_type, seed};
 use uuid::Uuid;
 
-use crate::{Api, ApiError, ApiResult, ReportFreshness};
+use crate::{Api, ApiError, ApiResult};
 
 // ---------------------------------------------------------------------------
 // Typed requests and results (REQ-MUT-01 AC1)
@@ -189,7 +190,10 @@ pub struct RunOutcome {
     pub report: RunReport,
     /// The CURRENT quality report row (the `ReportFresh` gate names it).
     pub current_quality_report: Option<Artifact>,
-    /// The stored §2.6 rendering shown at the human gates, when present.
+    /// The rendered quality report shown at the human gates, when present:
+    /// the stored human form for quality-report@5 bodies, the legacy flat
+    /// `report_text` for pre-@5 bodies (a damaged form renders an explicit
+    /// marker, never silence).
     pub gate_report_text: Option<String>,
     /// REQ-QH-05: whether the report shown at the gate is still the last
     /// word — the marker names the task phase and the re-audit execution.
@@ -1743,21 +1747,17 @@ impl Api {
         Ok(Some((format!("{label} v{}", a.seq), paragraph.to_string())))
     }
 
-    /// The §2.6 rendering of the CURRENT quality report, when one is
-    /// present (the human gate's viewing channel; reports assembled before
-    /// @2 render the placeholder the old CLI printed). `Ok(None)` is the
-    /// honest «no CURRENT quality report»; a store failure or an unreadable
-    /// (non-JSON) blob propagates as `Err` with its machine code — never a
-    /// silent «absence» (QA R2: `.ok()?` swallowed corrupt data into None,
-    /// indistinguishable from «no report»).
+    /// The rendered quality report shown at the human gates, when one is
+    /// present (the gate's viewing channel). `Ok(None)` is the honest «no
+    /// quality report»; a store failure or a body that is not JSON at all
+    /// propagates as `Err` with its machine code — never a silent «absence».
     ///
-    /// REQ-QH-05/06: the text is the STORED human form when the report
-    /// carries one (`human_view`, quality-report@5) and the stored
-    /// `report_text` otherwise — nothing is regrouped or recomputed here.
-    /// When the shown report is no longer the last word (rework in flight,
-    /// or the selected row is not CURRENT), a freshness marker computed from
-    /// raw store facts is prepended so an outdated report never reads as the
-    /// decision.
+    /// REQ-QH-05/06: the rendering (stored human form, legacy flat text, or
+    /// the damaged-form marker) and the freshness fact both come from
+    /// `human_view::present` — raw rows in, stored fields out. When the shown
+    /// report is no longer the last word (rework in flight, or the selected
+    /// row is not CURRENT), the freshness marker is prepended so an outdated
+    /// report never reads as the decision.
     pub fn quality_report_text(&self, task_id: Id) -> ApiResult<Option<String>> {
         Ok(self
             .presented_quality_report(task_id)?
@@ -1765,19 +1765,13 @@ impl Api {
     }
 
     /// The presented report plus its freshness verdict — the same single
-    /// read the CLI gates and the UI panel consume.
+    /// read the CLI gates and the UI panel consume. Thin on purpose: the
+    /// row selection, the rendering and the freshness marker live in
+    /// `devai_runtime::human_view::present`.
     pub fn presented_quality_report(&self, task_id: Id) -> ApiResult<Option<PresentedReport>> {
         let task = self.store.get_task(&task_id.to_string())?;
         let arts = self.store.artifacts(task_id)?;
-        // REQ-005: status-only selection. CURRENT wins; when there is none,
-        // a STALE/SUPERSEDED quality report is shown ONLY under an explicit
-        // «устарел» marker — never as the current decision, never hidden as
-        // «QA has not run» either.
-        let picked = arts
-            .iter()
-            .filter(|a| a.kind == ArtifactKind::QualityReport)
-            .max_by_key(|a| (a.status == ArtifactStatus::Current, a.seq));
-        let Some(a) = picked else {
+        let Some(a) = present::select_report(&arts) else {
             return Ok(None);
         };
         let blob = self.store.read_blob(&a.sha256)?;
@@ -1785,115 +1779,11 @@ impl Api {
             "the quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
             short_id(&a.id)
         )))?;
-        let body = render_stored_report(&v);
-        let freshness = self.report_freshness(&task, a)?;
-        Ok(Some(PresentedReport { text: body, freshness }))
-    }
-
-    /// REQ-QH-05: freshness as a FACT of the store — task phase, stored
-    /// artifact status, role executions. Nothing is inferred from the report
-    /// body, and the report content is not touched.
-    fn report_freshness(&self, task: &Task, a: &Artifact) -> ApiResult<ReportFreshness> {
-        let reworking = task.state == TaskState::Rework
-            || task.return_state == Some(TaskState::Rework);
-        let stale = (reworking || a.status != ArtifactStatus::Current)
-            && !task.state.is_terminal();
-        let execs: Vec<RoleExecution> = self
-            .store
-            .list_executions(Some(task.id))?
-            .into_iter()
-            .filter(|e| e.role_slug == "quality-auditor")
-            .collect();
-        let running = execs
-            .iter()
-            .filter(|e| e.status == ExecutionStatus::Running)
-            .max_by_key(|e| e.started_at);
-        let last = execs.iter().max_by_key(|e| e.started_at);
-        if !stale {
-            return Ok(ReportFreshness {
-                stale: false,
-                marker: String::new(),
-                report_seq: a.seq,
-                report_status: a.status.as_str().to_string(),
-                task_state: task.state.as_str().to_string(),
-                execution: last.map(|e| e.id.to_string()),
-                execution_status: last.map(|e| e.status.as_str().to_string()),
-            });
-        }
-        let tail = if let Some(e) = running {
-            format!(
-                "готовится ре-аудит (execution {}, в работе)",
-                short_id(&e.id)
-            )
-        } else if let Some(e) = last {
-            format!(
-                "ре-аудит не завершён (execution {}, {})",
-                short_id(&e.id),
-                e.status.as_str()
-            )
-        } else {
-            "ре-аудит ещё не запущен".to_string()
-        };
-        Ok(ReportFreshness {
-            stale: true,
-            marker: format!(
-                "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {}",
-                a.seq,
-                task.state.as_str(),
-                tail
-            ),
-            report_seq: a.seq,
-            report_status: a.status.as_str().to_string(),
-            task_state: task.state.as_str().to_string(),
-            execution: last.map(|e| e.id.to_string()),
-            execution_status: last.map(|e| e.status.as_str().to_string()),
-        })
-    }
-}
-
-/// The text of ONE stored report body: the human form when the body carries
-/// one (quality-report@5), the stored §2.6 text otherwise (@1..@4 bodies),
-/// and the honest legacy placeholder when neither exists. Pure layout — the
-/// form's grouping, order and numbers are read, never recomputed.
-pub fn render_stored_report(v: &serde_json::Value) -> String {
-    if let Some(form) = v.get("human_view") {
-        if let Ok(form) = serde_json::from_value::<devai_runtime::human_view::HumanReportView>(
-            form.clone(),
-        ) {
-            return devai_runtime::human_view::render_text(&form);
-        }
-    }
-    v.get("report_text")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "(report assembled before @2 — no rendering)".into())
-}
-
-/// One presented report: the text a human signs plus why it is (or is not)
-/// the last word.
-#[derive(Debug, Clone)]
-pub struct PresentedReport {
-    pub text: String,
-    pub freshness: ReportFreshness,
-}
-
-impl PresentedReport {
-    /// The text-only view of the same presentation: the freshness marker and
-    /// the «это НЕ текущее решение» label are PREPENDED when the report is
-    /// outdated, so a consumer that only takes a string cannot silently show
-    /// a stale report as the decision (REQ-QH-05). Channels that render the
-    /// marker themselves use `text` + `freshness` instead.
-    pub fn text_with_freshness(&self) -> String {
-        if !self.freshness.stale {
-            return self.text.clone();
-        }
-        format!(
-            "{}\n(показан отчёт v{} в статусе {} — это НЕ текущее решение)\n\n{}",
-            self.freshness.marker,
-            self.freshness.report_seq,
-            self.freshness.report_status,
-            self.text
-        )
+        let execs = self.store.list_executions(Some(task.id))?;
+        Ok(Some(PresentedReport {
+            text: present::render_stored_report(&v).text,
+            freshness: present::freshness(&task, a, &execs),
+        }))
     }
 }
 
@@ -2493,7 +2383,6 @@ mod tests {
         assert!(view.freshness.expect("freshness is part of the view").stale);
     }
 
-
     /// QA R2: `quality_report_text` distinguishes «no report» (Ok(None))
     /// from «report unreadable» (Err with a machine code). A corrupt CURRENT
     /// blob must never be silently rendered as absence of a report.
@@ -2536,6 +2425,43 @@ mod tests {
         let e = api.quality_report_text(t).unwrap_err();
         assert_eq!(e.code(), ErrorCode("corrupt"));
         assert!(format!("{e}").contains("does not parse as JSON"), "{e}");
+    }
+
+    /// R3: a structurally damaged `human_view` (a valid JSON body whose form
+    /// does not deserialize) is ANNOUNCED. The flat text may still be shown,
+    /// but never silently as if it were the stored form.
+    #[test]
+    fn a_damaged_human_view_is_announced_not_silently_flattened() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let t = fresh_task(&api, "damaged-form");
+        let body = serde_json::json!({
+            "verdict": "RETURN",
+            "recommendation_basis": "красные линии: x",
+            "report_text": "FLAT-BODY-STILL-HERE",
+            "human_view": { "version": "not-a-number", "headline": 42 },
+            "profile": { "project": "p", "version": 1 },
+            "evaluation": { "verdict": "FAIL", "score": 0.5, "theta": 0.8, "gates": [], "checks": [] },
+        });
+        api.artifact_publish_row(PublishReq {
+            id: t.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: serde_json::to_vec(&body).unwrap(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap();
+
+        let text = api.quality_report_text(t).unwrap().unwrap();
+        assert!(
+            text.contains("форма отчёта повреждена"),
+            "the damaged form must be announced: {text}"
+        );
+        assert!(text.contains("FLAT-BODY-STILL-HERE"), "{text}");
     }
 
     /// REQ-MUT-03/04 + human Q2: `Api::open` is the only bootstrap entry —

@@ -208,7 +208,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.run",
             class: OpClass::Mutation,
             input: "RunReq{id, agent, workspace, force_reaudit}",
-            output: "RunOutcome{report, current_quality_report, gate_report_text, allowed_operations}",
+            output: "RunOutcome{report, current_quality_report, gate_report_text, gate_report_freshness, gate_human_paragraphs, allowed_operations}",
             description: "Drive assigned roles through all autonomous stages to the next human gate; refuses while a RUNNING execution exists (single writer). force_reaudit carries the --force-reaudit gate semantics. Mirrors `task run`.",
         },
         OpDescriptor {

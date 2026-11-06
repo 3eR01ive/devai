@@ -742,9 +742,7 @@ pub fn return_to_rework(
     // a new audit publishes its successor.
     let rejected: Vec<Id> = artifacts
         .iter()
-        .filter(|a| {
-            a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current
-        })
+        .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
         .map(|a| a.id)
         .collect();
     if !rejected.is_empty() {

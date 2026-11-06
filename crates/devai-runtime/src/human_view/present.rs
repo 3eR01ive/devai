@@ -1,0 +1,183 @@
+//! Presentation of a STORED quality report: which artifact row is shown, how
+//! its body is rendered, and whether it is still the last word (REQ-QH-05/06).
+//!
+//! Everything here is a pure function over rows the caller has already read
+//! from the store — no store handle, no read-time re-derivation of the report
+//! content. The API layer (`devai-api`) only fetches rows and blobs and hands
+//! them in; the decisions «what is shown», «what is the freshness marker» and
+//! «how is the body laid out» live with the human form itself.
+
+use devai_core::types::{
+    Artifact, ArtifactKind, ArtifactStatus, ExecutionStatus, RoleExecution, Task, TaskState,
+    short_id,
+};
+use serde::Serialize;
+use serde_json::Value;
+
+use super::{HumanReportView, render_text};
+
+/// REQ-005 / REQ-QH-06: status-only selection. CURRENT wins; when there is
+/// none, the newest STALE/SUPERSEDED row is still selected — it is then shown
+/// under an explicit «устарел» marker, never as the current decision and
+/// never hidden as «QA has not run».
+pub fn select_report(arts: &[Artifact]) -> Option<&Artifact> {
+    arts.iter()
+        .filter(|a| a.kind == ArtifactKind::QualityReport)
+        .max_by_key(|a| (a.status == ArtifactStatus::Current, a.seq))
+}
+
+/// What the presented text was rendered FROM — the honest outcome of the
+/// read (REQ-QH-06): the report's own stored form, its legacy flat text, a
+/// damaged form (announced in the text, flat text kept if there is one), or
+/// nothing at all. A structurally broken form is never silently swapped for
+/// the flat text: the reader must be able to tell the two apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderSource {
+    /// quality-report@5+: the stored human form.
+    HumanForm,
+    /// A pre-@5 body: its own stored `report_text`, byte for byte.
+    FlatText,
+    /// A `human_view` that does not parse: marker + flat text (if any).
+    CorruptForm,
+    /// Neither a form nor a flat text (pre-@2 body).
+    Absent,
+}
+
+/// One rendered report body plus the distinguishable source it came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderedReport {
+    pub text: String,
+    pub source: RenderSource,
+}
+
+/// The text of ONE stored report body. Pure layout: a stored form is laid out
+/// by `render_text` (grouping, order and numbers are read, never recomputed);
+/// a legacy body is quoted byte for byte; a damaged form is announced.
+pub fn render_stored_report(v: &Value) -> RenderedReport {
+    let flat = v.get("report_text").and_then(|t| t.as_str());
+    if let Some(form) = v.get("human_view") {
+        return match serde_json::from_value::<HumanReportView>(form.clone()) {
+            Ok(form) => RenderedReport {
+                text: render_text(&form),
+                source: RenderSource::HumanForm,
+            },
+            Err(_) => RenderedReport {
+                text: match flat {
+                    Some(flat) => {
+                        format!("⚠ форма отчёта повреждена, показан плоский текст\n\n{flat}")
+                    }
+                    None => "⚠ форма отчёта повреждена — рендеринга нет".to_string(),
+                },
+                source: RenderSource::CorruptForm,
+            },
+        };
+    }
+    match flat {
+        Some(flat) => RenderedReport {
+            text: flat.to_string(),
+            source: RenderSource::FlatText,
+        },
+        None => RenderedReport {
+            text: "(report assembled before @2 — no rendering)".to_string(),
+            source: RenderSource::Absent,
+        },
+    }
+}
+
+/// Why the report on screen is (or is not) the last word — raw store facts:
+/// the task phase, the stored artifact status, and the auditor execution.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ReportFreshness {
+    pub stale: bool,
+    /// Ready-to-show marker line; empty when the report is current.
+    pub marker: String,
+    pub report_seq: u32,
+    pub report_status: String,
+    pub task_state: String,
+    pub execution: Option<String>,
+    pub execution_status: Option<String>,
+}
+
+/// One presented report: the text a human signs plus why it is (or is not)
+/// the last word.
+#[derive(Debug, Clone)]
+pub struct PresentedReport {
+    pub text: String,
+    pub freshness: ReportFreshness,
+}
+
+impl PresentedReport {
+    /// The text-only view of the same presentation: the freshness marker and
+    /// the «это НЕ текущее решение» label are PREPENDED when the report is
+    /// outdated, so a consumer that only takes a string cannot silently show
+    /// a stale report as the decision (REQ-QH-05). Channels that render the
+    /// marker themselves use `text` + `freshness` instead.
+    pub fn text_with_freshness(&self) -> String {
+        if !self.freshness.stale {
+            return self.text.clone();
+        }
+        format!(
+            "{}\n(показан отчёт v{} в статусе {} — это НЕ текущее решение)\n\n{}",
+            self.freshness.marker,
+            self.freshness.report_seq,
+            self.freshness.report_status,
+            self.text
+        )
+    }
+}
+
+/// REQ-QH-05: freshness as a FACT of the store — task phase, stored artifact
+/// status, role executions. Nothing is inferred from the report body, and the
+/// report content is not touched.
+pub fn freshness(task: &Task, a: &Artifact, execs: &[RoleExecution]) -> ReportFreshness {
+    let reworking = task.state == TaskState::Rework || task.return_state == Some(TaskState::Rework);
+    let stale = (reworking || a.status != ArtifactStatus::Current) && !task.state.is_terminal();
+    let execs: Vec<&RoleExecution> = execs
+        .iter()
+        .filter(|e| e.role_slug == "quality-auditor")
+        .collect();
+    let running = execs
+        .iter()
+        .filter(|e| e.status == ExecutionStatus::Running)
+        .max_by_key(|e| e.started_at);
+    let last = execs.iter().max_by_key(|e| e.started_at);
+    if !stale {
+        return ReportFreshness {
+            stale: false,
+            marker: String::new(),
+            report_seq: a.seq,
+            report_status: a.status.as_str().to_string(),
+            task_state: task.state.as_str().to_string(),
+            execution: last.map(|e| e.id.to_string()),
+            execution_status: last.map(|e| e.status.as_str().to_string()),
+        };
+    }
+    let tail = if let Some(e) = running {
+        format!(
+            "готовится ре-аудит (execution {}, в работе)",
+            short_id(&e.id)
+        )
+    } else if let Some(e) = last {
+        format!(
+            "ре-аудит не завершён (execution {}, {})",
+            short_id(&e.id),
+            e.status.as_str()
+        )
+    } else {
+        "ре-аудит ещё не запущен".to_string()
+    };
+    ReportFreshness {
+        stale: true,
+        marker: format!(
+            "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {}",
+            a.seq,
+            task.state.as_str(),
+            tail
+        ),
+        report_seq: a.seq,
+        report_status: a.status.as_str().to_string(),
+        task_state: task.state.as_str().to_string(),
+        execution: last.map(|e| e.id.to_string()),
+        execution_status: last.map(|e| e.status.as_str().to_string()),
+    }
+}

@@ -946,7 +946,14 @@ scoring:
         let p = tiny_profile("true", "true");
         let run = run_ok(&p);
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         assert_eq!(out.recommendation, "ESCALATE");
         assert!(
@@ -962,12 +969,26 @@ scoring:
         let p = tiny_profile("true", "false");
         let run = run_ok(&p);
         let a = assessment(&[], &[("rub/b", "no access")], &[]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         // gate ok, but mech FAIL -> S drops; pending human -> inconclusive first.
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         let p2 = tiny_profile("false", "true");
         let run2 = execute(&p2, Path::new(env!("CARGO_MANIFEST_DIR")));
-        let out2 = assemble(&p2, &run2, &a, "exec-2", &fixture_revision(), &Default::default());
+        let out2 = assemble(
+            &p2,
+            &run2,
+            &a,
+            "exec-2",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out2.evaluation_verdict, "FAIL");
         assert_eq!(out2.recommendation, "RETURN");
         assert!(out2.report_text.contains("ШЛЮЗ: gate-1 — FAIL"));
@@ -979,7 +1000,14 @@ scoring:
         let run = run_ok(&p);
         // No assessment at all: mech blocked (127) weight .5 > cap .2.
         let a = assessment(&[], &[], &[]);
-        let _out = assemble(&p, &run, &a, "exec-0", &fixture_revision(), &Default::default());
+        let _out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-0",
+            &fixture_revision(),
+            &Default::default(),
+        );
         // pending human fires first here; drop hum/c to test the cap path:
         let mut p2 = p.clone();
         p2.evaluations[0].checks.retain(|c| c.id != "hum/c");
@@ -988,7 +1016,14 @@ scoring:
             .collect();
         // V7 sum != 1 by design for this check path — validate isn't called here.
         let run2 = execute(&p2, Path::new(env!("CARGO_MANIFEST_DIR")));
-        let out2 = assemble(&p2, &run2, &a, "exec-1", &fixture_revision(), &Default::default());
+        let out2 = assemble(
+            &p2,
+            &run2,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out2.evaluation_verdict, "INCONCLUSIVE");
         assert!(
             out2.report_text.contains("НЕ ПРОВЕРЕНО"),
@@ -1004,7 +1039,14 @@ scoring:
         p.evaluations[0].checks.retain(|c| c.id != "hum/c");
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let a = assessment(&[("rub/b", 0.4)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         let j = &out.json["evaluation"]["checks"];
         let b = j
             .as_array()
@@ -1027,7 +1069,14 @@ scoring:
             &[],
             &[("rub/b", "single style drift", &["x.rs:1"])],
         );
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "PASS");
         assert_eq!(out.recommendation, "ACCEPT");
         assert!(
@@ -1046,7 +1095,14 @@ scoring:
         p.evaluations[0].checks[1].detects = vec!["correctness/state-transition".into()];
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let a = assessment(&[("rub/b", 0.4)], &[], &[("rub/b", "leak", &["x.rs:1"])]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "FAIL");
         assert!(
             out.report_text.contains("красные линии"),
@@ -1115,7 +1171,14 @@ scoring:
         p.gates[0].probes[0].cmd = "{{build_cmd}}".into();
         let run = execute(&p, ws.path());
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-slot", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-slot",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         assert_eq!(out.recommendation, "ESCALATE");
         // The gate outcome is BLOCKED — not FAIL/gate=0, not PASS/gate=1.
@@ -1150,7 +1213,14 @@ scoring:
         p.evaluations[0].checks[0].probes[0].cmd = "{{unbound}}".into();
         let run = execute(&p, ws.path());
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-w", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-w",
+            &fixture_revision(),
+            &Default::default(),
+        );
         let bw = out.json["evaluation"]["blocked_weight"].as_f64().unwrap();
         assert!((bw - 0.5).abs() < 1e-9, "blocked weight carried: {bw}");
         // 0.5 > cap 0.2 → INCONCLUSIVE per the existing blocked policy.
@@ -1174,7 +1244,14 @@ scoring:
 
         // Rubric 1.0 with no findings: previously an evidence-less entry.
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-42", &fixture_revision(), &Default::default());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-42",
+            &fixture_revision(),
+            &Default::default(),
+        );
         let checks = out.json["evaluation"]["checks"].as_array().unwrap();
         assert!(!checks.is_empty());
         for c in checks {
@@ -1209,7 +1286,14 @@ scoring:
         // Gap-only assessment (mock-cycle shape): BLOCKED entries cite their
         // gap record, the report still satisfies the contract.
         let a2 = assessment(&[], &[("rub/b", "offline: no access to the diff")], &[]);
-        let out2 = assemble(&p, &run, &a2, "exec-43", &fixture_revision(), &Default::default());
+        let out2 = assemble(
+            &p,
+            &run,
+            &a2,
+            "exec-43",
+            &fixture_revision(),
+            &Default::default(),
+        );
         for c in out2.json["evaluation"]["checks"].as_array().unwrap() {
             let ev = c["evidence"].as_array().unwrap();
             assert!(

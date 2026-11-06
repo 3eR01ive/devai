@@ -246,8 +246,7 @@ fn qa_return_stales_the_rejected_quality_report() {
     let m = workflow::return_to_rework(&t, &artifacts, Some("п1"), "auditor", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Rework);
     assert!(
-        m.artifact_status
-            .contains(&(qr.id, ArtifactStatus::Stale)),
+        m.artifact_status.contains(&(qr.id, ArtifactStatus::Stale)),
         "the returned report must move CURRENT -> STALE: {:?}",
         m.artifact_status
     );
@@ -256,20 +255,26 @@ fn qa_return_stales_the_rejected_quality_report() {
         .iter()
         .find(|e| e.kind == event_kind::ARTIFACTS_STALED)
         .expect("the status flip is announced, never silent");
-    assert_eq!(ev.payload[json_field::STALED], serde_json::json!([qr.id.to_string()]));
-    assert!(ev.payload[json_field::CAUSE]
-        .as_str()
-        .unwrap()
-        .contains("rework"));
+    assert_eq!(
+        ev.payload[json_field::STALED],
+        serde_json::json!([qr.id.to_string()])
+    );
+    assert!(
+        ev.payload[json_field::CAUSE]
+            .as_str()
+            .unwrap()
+            .contains("rework")
+    );
 
     // Nothing to stale: no event is invented (an empty return stays quiet).
     let bare = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
     let m2 = workflow::return_to_rework(&bare, &[], Some("п1"), "auditor", now()).unwrap();
     assert!(m2.artifact_status.is_empty());
-    assert!(m2
-        .events
-        .iter()
-        .all(|e| e.kind != event_kind::ARTIFACTS_STALED));
+    assert!(
+        m2.events
+            .iter()
+            .all(|e| e.kind != event_kind::ARTIFACTS_STALED)
+    );
 }
 
 #[test]

@@ -264,20 +264,19 @@ impl Api {
     /// a «QA has not run» lie or a stale text posing as the decision.
     pub fn task_report(&self, id_prefix: &str) -> ApiResult<QualityReportView> {
         let t = self.store.resolve_task(id_prefix)?;
+        // ONE artifacts snapshot per call: the selected row is picked from it
+        // and the freshness verdict is computed from the same list, so the
+        // view can never describe two different store states.
         let arts = self.store.artifacts(t.id)?;
-        let a = arts
-            .iter()
-            .filter(|x| x.kind == ArtifactKind::QualityReport)
-            .max_by_key(|x| (x.status == ArtifactStatus::Current, x.seq))
-            .ok_or_else(|| {
-                ApiError::Store(devai_store::StoreError::NotFound(
-                    "quality report".into(),
-                    format!(
-                        "task {} has no quality report yet — QA has not run",
-                        short_hint(&t.id)
-                    ),
-                ))
-            })?;
+        let a = devai_runtime::human_view::present::select_report(&arts).ok_or_else(|| {
+            ApiError::Store(devai_store::StoreError::NotFound(
+                "quality report".into(),
+                format!(
+                    "task {} has no quality report yet — QA has not run",
+                    short_hint(&t.id)
+                ),
+            ))
+        })?;
         let blob = self.store.read_blob(&a.sha256)?;
         let value: serde_json::Value =
             serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
@@ -287,9 +286,11 @@ impl Api {
             .map(|c| format!("{}@{}", c.name, c.version))
             .unwrap_or_else(|| "—".into());
         // ONE rendering path shared with the CLI gate: the stored human form
-        // when present, the stored §2.6 text for pre-@5 bodies.
-        let report_text = Some(crate::mutations::render_stored_report(&value));
-        let presented = self.presented_quality_report(t.id)?;
+        // when present, the stored legacy text for pre-@5 bodies, and an
+        // explicit marker for a damaged form.
+        let rendered = devai_runtime::human_view::present::render_stored_report(&value);
+        let execs = self.store.list_executions(Some(t.id))?;
+        let freshness = devai_runtime::human_view::present::freshness(&t, a, &execs);
         Ok(QualityReportView {
             task: t.id.to_string(),
             artifact: a.id.to_string(),
@@ -299,8 +300,8 @@ impl Api {
             execution: a.execution_id.map(|e| e.to_string()),
             status: a.status.as_str().to_string(),
             report: value,
-            report_text,
-            freshness: presented.map(|p| p.freshness),
+            report_text: Some(rendered.text),
+            freshness: Some(freshness),
         })
     }
 
@@ -752,7 +753,8 @@ pub struct QualityReportView {
     /// The machine body of the report (the stored artifact content).
     pub report: serde_json::Value,
     /// The human rendering the operator signs: the STORED human form when
-    /// the report carries one, the stored §2.6 text for pre-@5 bodies.
+    /// the report carries one, the legacy flat `report_text` for pre-@5
+    /// bodies.
     pub report_text: Option<String>,
     /// REQ-QH-05: freshness as store fact — `stale` plus the marker and the
     /// re-audit execution it names. Never inferred from the report body.
@@ -761,17 +763,10 @@ pub struct QualityReportView {
 
 /// Why the report on screen is (or is not) the last word — raw store facts:
 /// the task phase, the stored artifact status, and the auditor execution.
-#[derive(Serialize, Clone, Debug, PartialEq)]
-pub struct ReportFreshness {
-    pub stale: bool,
-    /// Ready-to-show marker line; empty when the report is current.
-    pub marker: String,
-    pub report_seq: u32,
-    pub report_status: String,
-    pub task_state: String,
-    pub execution: Option<String>,
-    pub execution_status: Option<String>,
-}
+/// The shape lives with the human form's presentation module (one owner for
+/// writers and readers) and is re-exported here because the API views publish
+/// it.
+pub use devai_runtime::human_view::present::ReportFreshness;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct DependenciesView {

@@ -1304,10 +1304,7 @@ pub fn resolve_effective_profile(
             .filter_map(|target| {
                 let item = overlay.items.iter().find(|i| &i.target_id == target)?;
                 let (_, actor) = decisions.get(&item.ratified_by)?;
-                Some((
-                    target.clone(),
-                    (item.ratified_by.clone(), actor.clone()),
-                ))
+                Some((target.clone(), (item.ratified_by.clone(), actor.clone())))
             })
             .collect();
         Ok(Resolution {

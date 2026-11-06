@@ -1100,12 +1100,13 @@ fn task_run(
         Gate::WaitingAccept => {
             // The paragraph of the code the operator is accepting comes
             // first (ratified OQ-HP-1: implementation-report is read at
-            // this gate); the §2.6 rendering follows as the machine half.
+            // this gate); the assembled report follows as the machine half.
             for (label, text) in &o.gate_human_paragraphs {
                 outln!("── {label}: человеческий абзац ──");
                 outln!("{text}");
             }
-            // The §2.6 rendering is for the human at the gate.
+            // The assembled report (the stored human form) is for the human
+            // at the gate.
             if let Some(f) = o.gate_report_freshness.as_ref().filter(|f| f.stale) {
                 outln!("{}", f.marker);
             }

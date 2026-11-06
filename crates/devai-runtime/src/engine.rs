@@ -557,13 +557,7 @@ impl<'a> Engine<'a> {
             .ratified
             .into_iter()
             .map(|(target, (decision_id, actor))| {
-                (
-                    target,
-                    crate::human_view::Ratified {
-                        decision_id,
-                        actor,
-                    },
-                )
+                (target, crate::human_view::Ratified { decision_id, actor })
             })
             .collect();
         Ok((r.profile, r.warnings, ratified))

@@ -145,6 +145,13 @@ const humanForm = computed<HumanForm | null>(() => {
   return body?.human_view ?? null;
 });
 
+// Единый форматтер чисел пункта (R9): балл, вес и важность печатаются одной
+// точностью — той же, что в CLI-рендере сохранённой формы. Второй форматер
+// с собственной точностью человеку пришлось бы сверять глазами.
+function fmtNum(v: number): string {
+  return v.toFixed(3);
+}
+
 async function openContent(a: Artifact) {
   contentFor.value = a.id;
   content.value = null;
@@ -388,14 +395,15 @@ onMounted(loadAll);
                 <li v-for="it in g.items" :key="it.id">
                   <template v-if="g.key === 'anchors'">
                     <span class="mono">{{ it.id }}</span>
-                    <span class="muted"> — закреплено: {{ it.ratified_by }}</span>
+                    <span class="muted" v-if="it.ratified_by"> — закреплено: {{ it.ratified_by }}</span>
+                    <span class="muted" v-else> — полностью пройдено, замечаний нет</span>
                   </template>
                   <template v-else>
                     <div class="qr-item-line">
                       <span class="mono qr-id">{{ it.id }}</span>
-                      <span class="mono">балл {{ it.score === null ? "—" : it.score.toFixed(2) }}</span>
-                      <span class="mono" v-if="it.weight !== null">вес {{ it.weight.toFixed(2) }}</span>
-                      <span class="mono qr-importance" v-if="it.importance !== null">важность {{ it.importance.toFixed(3) }}</span>
+                      <span class="mono">балл {{ it.score === null ? "—" : fmtNum(it.score) }}</span>
+                      <span class="mono" v-if="it.weight !== null">вес {{ fmtNum(it.weight) }}</span>
+                      <span class="mono qr-importance" v-if="it.importance !== null">важность {{ fmtNum(it.importance) }}</span>
                       <span class="mono muted" v-if="it.site">{{ it.site }}</span>
                     </div>
                     <div class="qr-summary">{{ it.summary }}</div>
