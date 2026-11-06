@@ -897,24 +897,9 @@ impl Api {
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
         let task = self.store.resolve_task(&req.id)?;
         // REQ-TN-05 AC1 («и на ручном revise-публикации»): this is the
-        // MANUAL door a human actually uses, and the registry has always
-        // advertised it «through the contract gate». The gate is the
-        // analyst's ACTIVE output contract — resolved from the seeded role
-        // definition (config/roles data, the same source the engine loop
-        // reads at run time), never a code-pinned version: bumping the
-        // role moves both doors at once (REQ-TN-02 AC4). A home whose role
-        // data carries no output contract refuses LOUD — an unresolvable
-        // gate never degrades into an ungated publication.
-        let contract = self
-            .store
-            .get_role("requirements-analyst")?
-            .and_then(|r| r.output_contract)
-            .ok_or_else(|| {
-                ApiError::refused(
-                    "analyst_contract_unresolved",
-                    "the requirements-analyst role defines no output contract — manual revise cannot resolve which stored schema gates this publication; repair the role data (config/roles/requirements-analyst.yaml), publication stays refused",
-                )
-            })?;
+        // MANUAL door a human actually uses, gated through the analyst's
+        // active output contract — resolved by `analyst_output_contract`.
+        let contract = self.analyst_output_contract()?;
         // The name is read BEFORE the body moves into publication — the
         // bytes that pass the gate are the bytes the signboard is stamped
         // from, one source, no second parse of stored content.
@@ -954,6 +939,25 @@ impl Api {
                 .map(|s| s.to_string())
                 .collect(),
         })
+    }
+
+    /// The requirements-analyst's ACTIVE output contract — the gate of
+    /// the manual revise door. Resolved from the seeded role definition
+    /// (config/roles data, the same source the engine loop reads at run
+    /// time), never a code-pinned version: bumping the role moves both
+    /// doors at once (REQ-TN-02 AC4). A home whose role data carries no
+    /// output contract refuses LOUD — an unresolvable gate never degrades
+    /// into an ungated publication.
+    fn analyst_output_contract(&self) -> ApiResult<ContractRef> {
+        self.store
+            .get_role("requirements-analyst")?
+            .and_then(|r| r.output_contract)
+            .ok_or_else(|| {
+                ApiError::refused(
+                    "analyst_contract_unresolved",
+                    "the requirements-analyst role defines no output contract — manual revise cannot resolve which stored schema gates this publication; repair the role data (config/roles/requirements-analyst.yaml), publication stays refused",
+                )
+            })
     }
 
     // ---- artifacts ---------------------------------------------------------
@@ -1035,110 +1039,17 @@ impl Api {
     pub fn artifact_advance(&self, req: AdvanceReq) -> ApiResult<AdvanceOutcome> {
         let task = self.store.resolve_task(&req.id)?;
         let a = self.store.get_artifact(&req.artifact_id)?;
+        // QA R2 (cl/short-units): the facade is pure DISPATCH — one arm
+        // per advancing kind, the kind's mechanics living in a private
+        // unit beside it. Membership of the advancing set is still owned
+        // by the core predicate; a kind outside it can only be refused
+        // loudly here, never quietly skipped.
         match req.kind {
-            ArtifactKind::RequirementsSpec => {
-                let arts = self.store.artifacts(task.id)?;
-                // REQ-TN-02: the phased manual door stamps the name from
-                // the CURRENT spec body too — the content-addressed blob
-                // of the row just published, read with the template's field.
-                let field = self.task_name_policy()?.field;
-                // QA R1 (rel/error-context): the re-read is TYPED. A
-                // CURRENT spec blob that does not read back, or reads back
-                // as non-JSON, is a store-integrity failure — the advance
-                // refuses LOUD (`spec_body_unreadable`) instead of folding
-                // the failure into «body without a name» and silently
-                // keeping the previous signboard. «Readable but
-                // name-less» (the @1..@3 legacy shape) stays the ONE
-                // legal absence branch: such a publication says nothing
-                // about the signboard (REQ-TN-02 AC3).
-                let name = match arts
-                    .iter()
-                    .filter(|x| {
-                        x.kind == ArtifactKind::RequirementsSpec
-                            && x.status == ArtifactStatus::Current
-                    })
-                    .max_by_key(|x| x.seq)
-                {
-                    Some(x) => {
-                        let body = self.store.read_blob(&x.sha256).map_err(|e| {
-                            ApiError::refused(
-                                "spec_body_unreadable",
-                                format!(
-                                    "CURRENT spec {} blob {} does not read back: {e} — the advance refuses instead of silently keeping the stored signboard; repair the store or republish the specification",
-                                    x.id, x.sha256
-                                ),
-                            )
-                        })?;
-                        match workflow::read_human_name_from_spec(&body, &field) {
-                            workflow::SpecNameRead::Named(v) => Some(v),
-                            workflow::SpecNameRead::Absent => None,
-                            workflow::SpecNameRead::Corrupt => {
-                                return Err(ApiError::refused(
-                                    "spec_body_unreadable",
-                                    format!(
-                                        "CURRENT spec {} blob {} reads back as bytes that are not parseable JSON — the advance refuses instead of silently keeping the stored signboard; the row and its blob are inconsistent, republish the specification",
-                                        x.id, x.sha256
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    // No CURRENT spec at all: `requirements_published`
-                    // keeps its own guard and refuses loudly below.
-                    None => None,
-                };
-                let m = workflow::requirements_published(
-                    &task,
-                    &arts,
-                    None,
-                    name.as_deref(),
-                    &self.actor,
-                    Utc::now(),
-                )?;
-                self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome {
-                    from: task.state,
-                    to: m.task.state,
-                    rework_gate: false,
-                })
-            }
+            ArtifactKind::RequirementsSpec => self.advance_spec_published(&task),
             ArtifactKind::ReviewReport => {
-                let v = match req.verdict.as_deref() {
-                    Some(s) => Self::parse_verdict(s)?,
-                    None => {
-                        return Err(ApiError::refused(
-                            "bad_request",
-                            "publishing REVIEW_REPORT requires --verdict approved|needs_revision",
-                        ));
-                    }
-                };
-                let m = workflow::review_recorded(&task, v, None, &self.actor, Utc::now())?;
-                self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome {
-                    from: task.state,
-                    to: m.task.state,
-                    rework_gate: false,
-                })
+                self.advance_review_recorded(&task, req.verdict.as_deref())
             }
-            ArtifactKind::ImplementationReport => {
-                // The manual publication crosses the SAME core command as
-                // the engine — including the empty-rework gate.
-                let arts = self.store.artifacts(task.id)?;
-                let facts = devai_runtime::gate::collect_implementation_report_facts(
-                    &self.store,
-                    task.id,
-                    &a,
-                    &arts,
-                    None,
-                )?;
-                let m = workflow::implementation_reported(&task, &facts, &self.actor, Utc::now())?;
-                self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome {
-                    from: task.state,
-                    to: m.task.state,
-                    rework_gate: m.task.state == TaskState::WaitingForInput,
-                })
-            }
+            ArtifactKind::ImplementationReport => self.advance_implementation_reported(&task, &a),
             // Fail-closed (QA R5): the kind carries no advance. The refusal
             // lists the advancing kinds DERIVED from the core predicate —
             // never a hand-copied set that could drift (QA R4).
@@ -1156,6 +1067,123 @@ impl Api {
                 ),
             )),
         }
+    }
+
+    /// The RequirementsSpec arm: the SAME core command as the engine, plus
+    /// the signboard stamp — the phased manual door reads the name from
+    /// the CURRENT spec body (REQ-TN-02) and hands it to the transition.
+    fn advance_spec_published(&self, task: &Task) -> ApiResult<AdvanceOutcome> {
+        let arts = self.store.artifacts(task.id)?;
+        let name = self.current_spec_human_name(&arts)?;
+        let m = workflow::requirements_published(
+            task,
+            &arts,
+            None,
+            name.as_deref(),
+            &self.actor,
+            Utc::now(),
+        )?;
+        self.store.commit(task.lock_version, &m)?;
+        Ok(AdvanceOutcome {
+            from: task.state,
+            to: m.task.state,
+            rework_gate: false,
+        })
+    }
+
+    /// The typed name read of the CURRENT spec (QA R1, rel/error-context;
+    /// body read, QA R2: this is the private unit the advance dispatches
+    /// to, not inline facade machinery). The blob is the content-addressed
+    /// body of the row just published, read with the template's field. A
+    /// CURRENT spec blob that does not read back, or reads back as
+    /// non-JSON, is a store-integrity failure — the advance refuses LOUD
+    /// (`spec_body_unreadable`) instead of folding the failure into «body
+    /// without a name» and silently keeping the previous signboard.
+    /// «Readable but name-less» (the @1..@3 legacy shape) stays the ONE
+    /// legal absence branch: such a publication says nothing about the
+    /// signboard (REQ-TN-02 AC3).
+    fn current_spec_human_name(&self, arts: &[Artifact]) -> ApiResult<Option<String>> {
+        let field = self.task_name_policy()?.field;
+        let Some(x) = arts
+            .iter()
+            .filter(|x| {
+                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
+            })
+            .max_by_key(|x| x.seq)
+        else {
+            // No CURRENT spec at all: `requirements_published` keeps its
+            // own guard and refuses loudly at the transition below.
+            return Ok(None);
+        };
+        let body = self.store.read_blob(&x.sha256).map_err(|e| {
+            ApiError::refused(
+                "spec_body_unreadable",
+                format!(
+                    "CURRENT spec {} blob {} does not read back: {e} — the advance refuses instead of silently keeping the stored signboard; repair the store or republish the specification",
+                    x.id, x.sha256
+                ),
+            )
+        })?;
+        match workflow::read_human_name_from_spec(&body, &field) {
+            workflow::SpecNameRead::Named(v) => Ok(Some(v)),
+            workflow::SpecNameRead::Absent => Ok(None),
+            workflow::SpecNameRead::Corrupt => Err(ApiError::refused(
+                "spec_body_unreadable",
+                format!(
+                    "CURRENT spec {} blob {} reads back as bytes that are not parseable JSON — the advance refuses instead of silently keeping the stored signboard; the row and its blob are inconsistent, republish the specification",
+                    x.id, x.sha256
+                ),
+            )),
+        }
+    }
+
+    /// The ReviewReport arm: verdict token through the core synonym
+    /// dictionary, then the transition (no signboard involved).
+    fn advance_review_recorded(
+        &self,
+        task: &Task,
+        verdict: Option<&str>,
+    ) -> ApiResult<AdvanceOutcome> {
+        let v = match verdict {
+            Some(s) => Self::parse_verdict(s)?,
+            None => {
+                return Err(ApiError::refused(
+                    "bad_request",
+                    "publishing REVIEW_REPORT requires --verdict approved|needs_revision",
+                ));
+            }
+        };
+        let m = workflow::review_recorded(task, v, None, &self.actor, Utc::now())?;
+        self.store.commit(task.lock_version, &m)?;
+        Ok(AdvanceOutcome {
+            from: task.state,
+            to: m.task.state,
+            rework_gate: false,
+        })
+    }
+
+    /// The ImplementationReport arm: the manual publication crosses the
+    /// SAME core command as the engine — including the empty-rework gate.
+    fn advance_implementation_reported(
+        &self,
+        task: &Task,
+        a: &Artifact,
+    ) -> ApiResult<AdvanceOutcome> {
+        let arts = self.store.artifacts(task.id)?;
+        let facts = devai_runtime::gate::collect_implementation_report_facts(
+            &self.store,
+            task.id,
+            a,
+            &arts,
+            None,
+        )?;
+        let m = workflow::implementation_reported(task, &facts, &self.actor, Utc::now())?;
+        self.store.commit(task.lock_version, &m)?;
+        Ok(AdvanceOutcome {
+            from: task.state,
+            to: m.task.state,
+            rework_gate: m.task.state == TaskState::WaitingForInput,
+        })
     }
 
     /// `artifact.publish` — the compound operation: the row through the

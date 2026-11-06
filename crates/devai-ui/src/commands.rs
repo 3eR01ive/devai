@@ -436,6 +436,127 @@ mod tests {
         );
     }
 
+    /// QA R4 (mt/change-isolation + ux/contract-stability): the
+    /// name/signboard plane crosses the Rust↔TS boundary in exactly THREE
+    /// serde shapes — the task row (the signage field `human_name`), the
+    /// `task.rename` outcome (`TaskRenameOutcome`), and the dependency
+    /// edge (both-end signage `task_display`/`depends_on_display`). The
+    /// fixture pins their exact JSON form (the `ui_error`/artifact idiom
+    /// above); the second half compares the pinned KEY SETS against the
+    /// `Task`/`TaskDependency` interfaces declared in `types.ts` — drift
+    /// on either side (a Rust rename, an unmoved TS field) fails the
+    /// build now, not as a silent `undefined` in a rendered list.
+    #[test]
+    fn name_plane_serde_shapes_are_pinned_by_fixtures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ipc_shapes.json"))
+                .expect("ipc fixtures must be valid JSON");
+
+        let task = pinned_task();
+        assert_eq!(serde_json::to_value(&task).unwrap(), fixture["task_row"]);
+
+        let outcome = devai_api::TaskRenameOutcome {
+            task: task.clone(),
+            human_name: "Понятные имена задач".to_string(),
+            changed: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&outcome).unwrap(),
+            fixture["task_rename_outcome"]
+        );
+
+        let id = |s: &str| devai_core::types::Id::parse_str(s).unwrap();
+        let edge = devai_core::types::TaskDependency {
+            id: id("01a1bbbb-0000-0000-0000-000000000001"),
+            task_id: id("01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            task_state: TaskState::Review,
+            task_title: task.title.clone(),
+            depends_on_id: id("01a1cccc-1111-1111-1111-111111111111"),
+            depends_on_state: TaskState::Draft,
+            depends_on_title: "заголовок блока, написанный создавшим".to_string(),
+            task_display: "Понятные имена задач".to_string(),
+            depends_on_display: "Названия задач неразборчивы в списках.".to_string(),
+            kind: devai_core::types::DependencyKind::Blocks,
+            actor: "operator".to_string(),
+            created_at: pinned_now(),
+        };
+        assert_eq!(
+            serde_json::to_value(&edge).unwrap(),
+            fixture["task_dependency_edge"]
+        );
+
+        // The TS mirror half (drift the other direction): field NAME SETS
+        // of the frontend interfaces must equal the pinned serde keys —
+        // prose-parsed here exactly like api.ts above.
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let types_ts =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/types.ts")).unwrap();
+        for (iface, shape) in [
+            ("Task", "task_row"),
+            ("TaskDependency", "task_dependency_edge"),
+        ] {
+            let mut ts_fields = ts_interface_fields(&types_ts, iface);
+            ts_fields.sort();
+            let mut pinned: Vec<String> = fixture[shape]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            pinned.sort();
+            assert_eq!(
+                ts_fields, pinned,
+                "`types.ts` interface `{iface}` drifted from the pinned serde shape"
+            );
+        }
+    }
+
+    /// The fixed instant behind every pinned name-plane shape — the
+    /// fixture is deterministic, never `Utc::now()`.
+    fn pinned_now() -> devai_core::types::Timestamp {
+        chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// The pinned task row: a task whose analyst already stamped a human
+    /// name — the exact shape `tasks_list`/`task_get` hand to `types.ts`.
+    fn pinned_task() -> Task {
+        Task {
+            id: devai_core::types::Id::parse_str("01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap(),
+            project_id: None,
+            title: "task names: mechanical name plane and list signage".to_string(),
+            business_description:
+                "Названия задач неразборчивы в списках. Хочу человеческое имя после аналитика."
+                    .to_string(),
+            human_name: Some("Понятные имена задач".to_string()),
+            state: TaskState::Review,
+            return_state: None,
+            requirements_seq: 2,
+            lock_version: 7,
+            created_at: pinned_now(),
+            updated_at: pinned_now(),
+        }
+    }
+
+    /// Field names declared by `export interface NAME { … }` in a TS
+    /// source: comment-only lines skipped, every field is the token
+    /// before its first colon.
+    fn ts_interface_fields(ts: &str, iface: &str) -> Vec<String> {
+        let open = format!("export interface {iface} {{");
+        let start = ts
+            .find(&open)
+            .unwrap_or_else(|| panic!("types.ts must declare `{iface}`"));
+        let body = &ts[start + open.len()..];
+        let close = body.find('}').expect("interface closing brace");
+        body[..close]
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .map(|l| l.split(':').next().unwrap_or(l).trim().to_string())
+            .collect()
+    }
+
     /// REQ-WV-04 AC1 + AC4 (mechanical half, the window-content criterion
     /// itself is T7's harness): the frontend's data door is closed over
     /// this table — EVERY `invoke("<name>")` in api.ts must

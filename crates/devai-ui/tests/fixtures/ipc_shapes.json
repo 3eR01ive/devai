@@ -12,5 +12,49 @@
     "shape": "binary",
     "artifact_id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     "size": 42
+  },
+  "task_row": {
+    "id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "project_id": null,
+    "title": "task names: mechanical name plane and list signage",
+    "business_description": "Названия задач неразборчивы в списках. Хочу человеческое имя после аналитика.",
+    "human_name": "Понятные имена задач",
+    "state": "REVIEW",
+    "return_state": null,
+    "requirements_seq": 2,
+    "lock_version": 7,
+    "created_at": "2026-11-06T12:00:00Z",
+    "updated_at": "2026-11-06T12:00:00Z"
+  },
+  "task_rename_outcome": {
+    "task": {
+      "id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "project_id": null,
+      "title": "task names: mechanical name plane and list signage",
+      "business_description": "Названия задач неразборчивы в списках. Хочу человеческое имя после аналитика.",
+      "human_name": "Понятные имена задач",
+      "state": "REVIEW",
+      "return_state": null,
+      "requirements_seq": 2,
+      "lock_version": 7,
+      "created_at": "2026-11-06T12:00:00Z",
+      "updated_at": "2026-11-06T12:00:00Z"
+    },
+    "human_name": "Понятные имена задач",
+    "changed": true
+  },
+  "task_dependency_edge": {
+    "id": "01a1bbbb-0000-0000-0000-000000000001",
+    "task_id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "task_state": "REVIEW",
+    "task_title": "task names: mechanical name plane and list signage",
+    "depends_on_id": "01a1cccc-1111-1111-1111-111111111111",
+    "depends_on_state": "DRAFT",
+    "depends_on_title": "заголовок блока, написанный создавшим",
+    "task_display": "Понятные имена задач",
+    "depends_on_display": "Названия задач неразборчивы в списках.",
+    "kind": "BLOCKS",
+    "actor": "operator",
+    "created_at": "2026-11-06T12:00:00Z"
   }
 }
