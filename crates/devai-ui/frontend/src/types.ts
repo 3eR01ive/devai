@@ -136,6 +136,52 @@ export interface ActiveSnapshot {
   rows: ActiveRow[];
 }
 
+export interface HumanFormItem {
+  id: string;
+  kind: string;
+  summary: string;
+  site: string;
+  score: number | null;
+  weight: number | null;
+  importance: number | null;
+  ratified_by?: string;
+  reason?: string;
+  evidence?: string[];
+}
+
+export interface HumanFormGroup {
+  key: "blocks" | "nuances" | "anchors" | "unchecked";
+  title: string;
+  lead: string;
+  items: HumanFormItem[];
+}
+
+export interface HumanForm {
+  version: number;
+  lang: string;
+  headline: {
+    verdict: string;
+    machine_verdict: string;
+    score: number;
+    theta: number;
+    basis: string;
+    counts: { blocks: number; nuances: number; anchors: number; unchecked: number };
+  };
+  groups: HumanFormGroup[];
+  blocked_weight: number;
+  max_blocked_weight: number;
+}
+
+export interface ReportFreshness {
+  stale: boolean;
+  marker: string;
+  report_seq: number;
+  report_status: string;
+  task_state: string;
+  execution: string | null;
+  execution_status: string | null;
+}
+
 export interface QualityReportView {
   task: string;
   artifact: string;
@@ -143,8 +189,10 @@ export interface QualityReportView {
   contract: string;
   created_at: string;
   execution: string | null;
+  status: string;
   report: unknown;
   report_text: string | null;
+  freshness: ReportFreshness | null;
 }
 
 export interface TaskDependency {

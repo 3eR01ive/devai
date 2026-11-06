@@ -714,6 +714,7 @@ pub fn accept(
 
 pub fn return_to_rework(
     task: &Task,
+    artifacts: &[Artifact],
     rationale: Option<&str>,
     actor: &str,
     now: Timestamp,
@@ -724,14 +725,41 @@ pub fn return_to_rework(
         "return",
         CoreError::hint("QA results can be returned only in QA"),
     )?;
-    Ok(transition(
+    let mut m = transition(
         task,
         TaskState::Rework,
         event_kind::QUALITY_RETURNED,
         actor,
         now,
         json!({ (json_field::RATIONALE): rationale }),
-    ))
+    );
+
+    // Ratified OQ-QH-3: rework is a DATA change, not only a presentation one.
+    // The quality report the return just rejected stops being CURRENT — a
+    // stale report that still reads as CURRENT is «старьё выглядит решением»
+    // at the store level, which no presentation layer could honestly fix.
+    // Nothing is deleted: the row keeps its content and moves to STALE until
+    // a new audit publishes its successor.
+    let rejected: Vec<Id> = artifacts
+        .iter()
+        .filter(|a| {
+            a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current
+        })
+        .map(|a| a.id)
+        .collect();
+    if !rejected.is_empty() {
+        m.artifact_status
+            .extend(rejected.iter().map(|id| (*id, ArtifactStatus::Stale)));
+        m.events.push(EventDraft {
+            kind: event_kind::ARTIFACTS_STALED,
+            actor: actor.to_string(),
+            payload: json!({
+                (json_field::STALED): rejected.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                (json_field::CAUSE): "rework: quality report returned by the human",
+            }),
+        });
+    }
+    Ok(m)
 }
 
 /// A role raises a question. Blocking questions move the task to

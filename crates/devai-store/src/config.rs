@@ -1202,6 +1202,11 @@ pub fn compose_profile(
 pub struct Resolution {
     pub profile: Option<Profile>,
     pub warnings: Vec<String>,
+    /// target_id -> (decision id, actor) for the RATIFIED overlay items that
+    /// actually entered force in this composition. The human form of a
+    /// quality report names the anchoring decision from here (OQ-QH-2);
+    /// resolving that at read time instead would be a second derivation.
+    pub ratified: BTreeMap<String, (String, String)>,
 }
 
 /// Deterministic per-project resolution (REQ-SP-103, replaces the old
@@ -1237,6 +1242,7 @@ pub fn resolve_effective_profile(
         return Ok(Resolution {
             profile: fallback.cloned(),
             warnings: Vec::new(),
+            ratified: BTreeMap::new(),
         });
     };
     let path = overlay_path(cfg_dir, pid);
@@ -1272,7 +1278,11 @@ pub fn resolve_effective_profile(
                     cfg_dir.join("evaluation").display()
                 ))
             })?;
-        let ratified = store.ratified_profile_refs()?;
+        let decisions = store.ratified_profile_decisions()?;
+        let ratified: BTreeMap<String, Vec<String>> = decisions
+            .iter()
+            .map(|(id, (refs, _actor))| (id.clone(), refs.clone()))
+            .collect();
         let comp = compose_profile(base, &overlay, &ratified)
             .map_err(|e| cfg_err(format!("{}: {e}", path.display())))?;
         let mut warnings: Vec<String> = comp
@@ -1286,9 +1296,24 @@ pub fn resolve_effective_profile(
             .chain(comp.warnings)
             .collect();
         warnings.sort();
+        // The anchor map of the human form (OQ-QH-2): only items that ACTUALLY
+        // entered force, each with the decision that gave it force.
+        let ratified_in_force: BTreeMap<String, (String, String)> = comp
+            .applied
+            .iter()
+            .filter_map(|target| {
+                let item = overlay.items.iter().find(|i| &i.target_id == target)?;
+                let (_, actor) = decisions.get(&item.ratified_by)?;
+                Some((
+                    target.clone(),
+                    (item.ratified_by.clone(), actor.clone()),
+                ))
+            })
+            .collect();
         Ok(Resolution {
             profile: Some(comp.effective),
             warnings,
+            ratified: ratified_in_force,
         })
     } else {
         // No overlay for this project (REQ-SP-103).
@@ -1318,6 +1343,7 @@ pub fn resolve_effective_profile(
         Ok(Resolution {
             profile: chosen,
             warnings: Vec::new(),
+            ratified: BTreeMap::new(),
         })
     }
 }

@@ -3,7 +3,7 @@
 //!
 //!   1. a fresh task runs analyst → reviewer → (human approve) →
 //!      implementation → QA: every role execution is bound platform-side
-//!      to the workspace revision, and the quality-report@4 embeds it;
+//!      to the workspace revision, and the quality-report@5 embeds it;
 //!   2. re-running on the UNCHANGED workspace must NOT silently re-run the
 //!      auditor: the run stops at the freshness gate and asks for an
 //!      explicit decision (zero new executions, one `qa.fresh_awaiting_decision`
@@ -147,7 +147,7 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
         &["task", "approve", &id, "--rationale", "dogfood approval"],
     );
 
-    // -- full cycle into QA: platform-assembled quality-report@4 is published
+    // -- full cycle into QA: platform-assembled quality-report@5 is published
     let r2 = devai_json(
         home.path(),
         &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
@@ -282,7 +282,7 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
     // REQ-004 + no-drift: the @4 report embeds the exact revision of its execution row.
     let rep = devai_json(home.path(), &["task", "report", &id]);
     assert_eq!(rep["seq"], 1);
-    assert_eq!(rep["contract"], "quality-report@4");
+    assert_eq!(rep["contract"], "quality-report@5");
     let rep_exec_id = rep["execution"].as_str().unwrap().to_string();
     let rep_exec = execs
         .iter()
@@ -293,7 +293,7 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
         "report and execution row never drift"
     );
     println!(
-        "──── dogfood evidence: quality-report@4 embedded workspace_revision ────\n{}",
+        "──── dogfood evidence: quality-report@5 embedded workspace_revision ────\n{}",
         serde_json::to_string_pretty(&rep["report"]["workspace_revision"]).unwrap()
     );
 

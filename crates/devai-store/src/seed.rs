@@ -575,6 +575,149 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
         (
+            "quality-report",
+            5,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Quality Report v5 — machine-assembled; the human form is stored with the report",
+  "description": "v4 plus `human_view`: the human PRESENTATION of the same report, assembled ONCE by the platform at publication from already-decided values (scores, weights, floors, pending, gates, ratified anchors) and quoted verbatim by every reader — never regrouped, re-scored or re-sorted at read time. Four groups in a fixed order: blocks (gates, floor breaches, blocking, pending signature), nuances (every remaining scored point below 1.0, each with score, weight and importance = (1-score)*weight, most important first), anchors (only positions with an explicit ratified_by decision link, names only), unchecked (BLOCKED checks with reason and weight). Code and probe output live in the per-item evidence layer, never in the visible one-line summary. report_text keeps its v3/v4 §2.6 form: it is the fallback for bodies published before this version, not a second source of truth.",
+  "type": "object",
+  "required": ["verdict", "recommendation_basis", "report_text", "profile", "workspace_revision", "human_view", "evaluation"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["ACCEPT", "RETURN", "ESCALATE"] },
+    "recommendation_basis": { "type": "string" },
+    "report_text": { "type": "string" },
+    "human_view": {
+      "type": "object",
+      "description": "The stored human form (REQ-QH-01..04). Readers quote it; nothing here is recomputed on read.",
+      "required": ["version", "lang", "headline", "groups", "blocked_weight", "max_blocked_weight"],
+      "properties": {
+        "version": { "type": "integer" },
+        "lang": { "type": "string", "description": "language of every human string in this shape (task language, ru)" },
+        "headline": {
+          "type": "object",
+          "required": ["verdict", "machine_verdict", "score", "theta", "basis", "counts"],
+          "properties": {
+            "verdict": { "type": "string" },
+            "machine_verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+            "score": { "type": "number" },
+            "theta": { "type": "number" },
+            "basis": { "type": "string" },
+            "counts": {
+              "type": "object",
+              "required": ["blocks", "nuances", "anchors", "unchecked"],
+              "properties": {
+                "blocks": { "type": "integer" },
+                "nuances": { "type": "integer" },
+                "anchors": { "type": "integer" },
+                "unchecked": { "type": "integer" }
+              }
+            }
+          }
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "description": "always four, in the fixed order blocks, nuances, anchors, unchecked; an empty group prints no heading",
+          "items": {
+            "type": "object",
+            "required": ["key", "title", "lead", "items"],
+            "properties": {
+              "key": { "type": "string", "enum": ["blocks", "nuances", "anchors", "unchecked"] },
+              "title": { "type": "string" },
+              "lead": { "type": "string" },
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id", "kind", "summary", "site"],
+                  "properties": {
+                    "id": { "type": "string" },
+                    "kind": { "type": "string", "description": "gate | gate-unperformed | pending | floor | mechanical | scored | blocked | anchor" },
+                    "summary": { "type": "string", "description": "ONE short visible line — no code, no paragraphs (REQ-QH-04)" },
+                    "site": { "type": "string", "description": "file:line of the finding, empty when there is none" },
+                    "score": { "type": ["number", "null"] },
+                    "weight": { "type": ["number", "null"] },
+                    "importance": { "type": ["number", "null"], "description": "(1-score)*weight as decided at assembly; null when the item has no score" },
+                    "ratified_by": { "type": "string", "description": "the stored decision that keeps this anchor in force" },
+                    "reason": { "type": "string" },
+                    "evidence": { "type": "array", "items": { "type": "string" }, "description": "the collapsed proof layer: citation bodies and probe output, verbatim" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "blocked_weight": { "type": "number" },
+        "max_blocked_weight": { "type": "number" }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "required": ["project", "version"],
+      "properties": { "project": { "type": "string" }, "version": { "type": "integer" } }
+    },
+    "workspace_revision": {
+      "type": "object",
+      "description": "Workspace provenance captured platform-side (never by a model) at execution start. All four components are required; git_head/dirty_digest are null outside a git repo, profile is null when no evaluation profile is loaded — such a revision is not comparable and freshness is never claimed from it.",
+      "required": ["git_head", "dirty_digest", "profile", "roles"],
+      "properties": {
+        "git_head": { "type": ["string", "null"] },
+        "dirty_digest": { "type": ["string", "null"] },
+        "profile": { "type": ["string", "null"] },
+        "roles": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "assessment_execution": { "type": "string", "description": "role execution id of the auditor run" },
+    "evaluation": {
+      "type": "object",
+      "required": ["verdict", "score", "theta", "gates", "checks"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "score": { "type": "number" },
+        "theta": { "type": "number" },
+        "blocked_weight": { "type": "number" },
+        "max_blocked_weight": { "type": "number" },
+        "floors_breached": { "type": "array", "items": { "type": "string" } },
+        "pending_human": { "type": "array", "items": { "type": "string" } },
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "state"],
+            "properties": {
+              "id": { "type": "string" },
+              "state": { "type": "string", "enum": ["PASS", "FAIL", "BLOCKED"] },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "verify", "state", "weight", "detects", "evidence"],
+            "properties": {
+              "id": { "type": "string" },
+              "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
+              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "score": { "type": "number" },
+              "floor": { "type": "number" },
+              "weight": { "type": "number" },
+              "detects": { "type": "array", "items": { "type": "string" } },
+              "violations": { "type": "array", "items": { "type": "string" } },
+              "evidence": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "concrete citations: test output excerpt, artifact id, build log reference — at least one per check entry" },
+              "reason": { "type": "string", "description": "why BLOCKED / unscored" }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#,
+        ),
+        (
             "evaluation-assessment",
             1,
             r#"{

@@ -190,8 +190,8 @@ fn full_cycle_through_both_human_gates() {
             .contract
             .as_ref()
             .map(|c| (c.name.as_str(), c.version)),
-        Some(("quality-report", 4)),
-        "QA artifact must be published under quality-report@4"
+        Some(("quality-report", 5)),
+        "QA artifact must be published under quality-report@5"
     );
     let rep: serde_json::Value = serde_json::from_slice(&qa).unwrap();
     assert_eq!(rep["verdict"], "ESCALATE");
@@ -1693,7 +1693,14 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
 
     // QA returns with three concrete points — the precedent's shape.
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::return_to_rework(&cur, Some("п1; п2; п3"), "tester", Utc::now()).unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("п1; п2; п3"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     // The rework execution does nothing either: R2 is stamped with the SAME
@@ -1837,7 +1844,14 @@ fn rework_with_new_commit_still_reaches_qa() {
     store.create_task(&t).unwrap();
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::return_to_rework(&cur, Some("fix the points"), "tester", Utc::now()).unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("fix the points"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     // Real work lands in the task's worktree; the platform commit captures it
@@ -1977,6 +1991,7 @@ fn failing_doc() -> QualityReportDoc {
         verdict: "RETURN".into(),
         recommendation_basis: "красные линии: spec-coverage=0.40<floor 0.70".into(),
         report_text: "crafted for delivery tests".into(),
+        human_view: None,
         assessment_execution: "exec-crafted".into(),
         profile: ProfileIdentity {
             project: "devai".into(),
@@ -2481,6 +2496,7 @@ fn the_rework_execution_actually_receives_the_assembled_section() {
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
         &cur,
+        &store.artifacts(t.id).unwrap(),
         Some("THE-WIRING-MARKER — return text as the human wrote it"),
         "tester",
         Utc::now(),
@@ -2557,8 +2573,14 @@ fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
     store.create_task(&t).unwrap();
     drive_to_report(&store, &t, &ws); // the whole cycle runs on a home WITHOUT the workflow dir
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::return_to_rework(&cur, Some("FACTORY-FALLBACK-MARKER"), "tester", Utc::now())
-        .unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("FACTORY-FALLBACK-MARKER"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
     let engine = engine_in(&store, &ws, false);
     engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -2731,6 +2753,7 @@ fn the_empty_rework_gate_trips_the_return_text_into_the_next_window() {
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
         &cur,
+        &store.artifacts(t.id).unwrap(),
         Some("GATE-CYCLE-RATIONALE — п1; п2"),
         "tester",
         Utc::now(),

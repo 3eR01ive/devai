@@ -1106,6 +1106,9 @@ fn task_run(
                 outln!("{text}");
             }
             // The §2.6 rendering is for the human at the gate.
+            if let Some(f) = o.gate_report_freshness.as_ref().filter(|f| f.stale) {
+                outln!("{}", f.marker);
+            }
             if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
                 outln!("{text}");
@@ -1132,6 +1135,9 @@ fn task_run(
                 outln!(
                     "⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run"
                 );
+            }
+            if let Some(f) = o.gate_report_freshness.as_ref().filter(|f| f.stale) {
+                outln!("{}", f.marker);
             }
             if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
@@ -1370,6 +1376,12 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
             .unwrap_or_else(|| "-".to_string())
     );
     outln!("---");
+    // REQ-QH-05: the on-demand report channel takes the freshness fact from
+    // the API view — a report the line has already left behind is announced
+    // here too, never passed off as the current decision.
+    if let Some(f) = v.freshness.as_ref().filter(|f| f.stale) {
+        outln!("{}", f.marker);
+    }
     match v.report_text {
         Some(text) => outln!("{text}"),
         // Reports assembled before @2 carry no rendering: show the machine

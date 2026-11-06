@@ -254,20 +254,26 @@ impl Api {
         })
     }
 
-    /// The CURRENT quality report the human signs at the QA gate — full
-    /// machine body plus the stored rendering (REQ-API-07: observable
-    /// outside the session that produced it).
+    /// The quality report the human signs at the QA gate — full machine body
+    /// plus the stored human rendering (REQ-API-07: observable outside the
+    /// session that produced it).
+    ///
+    /// REQ-QH-05/06: CURRENT is preferred, but when the task has been
+    /// returned to rework the rejected report is still SHOWN — with its
+    /// STALE status and a freshness marker naming the re-audit — instead of
+    /// a «QA has not run» lie or a stale text posing as the decision.
     pub fn task_report(&self, id_prefix: &str) -> ApiResult<QualityReportView> {
         let t = self.store.resolve_task(id_prefix)?;
         let arts = self.store.artifacts(t.id)?;
         let a = arts
             .iter()
-            .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
+            .filter(|x| x.kind == ArtifactKind::QualityReport)
+            .max_by_key(|x| (x.status == ArtifactStatus::Current, x.seq))
             .ok_or_else(|| {
                 ApiError::Store(devai_store::StoreError::NotFound(
                     "quality report".into(),
                     format!(
-                        "task {} has no CURRENT quality report — QA has not run",
+                        "task {} has no quality report yet — QA has not run",
                         short_hint(&t.id)
                     ),
                 ))
@@ -280,10 +286,10 @@ impl Api {
             .as_ref()
             .map(|c| format!("{}@{}", c.name, c.version))
             .unwrap_or_else(|| "—".into());
-        let report_text = value
-            .get("report_text")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
+        // ONE rendering path shared with the CLI gate: the stored human form
+        // when present, the stored §2.6 text for pre-@5 bodies.
+        let report_text = Some(crate::mutations::render_stored_report(&value));
+        let presented = self.presented_quality_report(t.id)?;
         Ok(QualityReportView {
             task: t.id.to_string(),
             artifact: a.id.to_string(),
@@ -291,8 +297,10 @@ impl Api {
             contract,
             created_at: a.created_at,
             execution: a.execution_id.map(|e| e.to_string()),
+            status: a.status.as_str().to_string(),
             report: value,
             report_text,
+            freshness: presented.map(|p| p.freshness),
         })
     }
 
@@ -738,10 +746,31 @@ pub struct QualityReportView {
     pub contract: String,
     pub created_at: Timestamp,
     pub execution: Option<String>,
+    /// The stored artifact status of the row being shown: CURRENT, or the
+    /// STALE/SUPERSEDED predecessor shown under a «устарел» marker.
+    pub status: String,
     /// The machine body of the report (the stored artifact content).
     pub report: serde_json::Value,
-    /// The §2.6 rendering the human signs, when the report carries one.
+    /// The human rendering the operator signs: the STORED human form when
+    /// the report carries one, the stored §2.6 text for pre-@5 bodies.
     pub report_text: Option<String>,
+    /// REQ-QH-05: freshness as store fact — `stale` plus the marker and the
+    /// re-audit execution it names. Never inferred from the report body.
+    pub freshness: Option<ReportFreshness>,
+}
+
+/// Why the report on screen is (or is not) the last word — raw store facts:
+/// the task phase, the stored artifact status, and the auditor execution.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ReportFreshness {
+    pub stale: bool,
+    /// Ready-to-show marker line; empty when the report is current.
+    pub marker: String,
+    pub report_seq: u32,
+    pub report_status: String,
+    pub task_state: String,
+    pub execution: Option<String>,
+    pub execution_status: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]

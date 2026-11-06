@@ -4,7 +4,7 @@
 // исполнения и воркспейс — каждое поле из готовой typed-view платформы.
 // UI не хранит свою очерёдность стадий, не переприсваивает статусы
 // артефактов и не выдумывает строки воркспейсов.
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
@@ -14,6 +14,7 @@ import type {
   ArtifactContent,
   Decision,
   DependenciesView,
+  HumanForm,
   LivenessView,
   ProgressView,
   QualityReportView,
@@ -135,6 +136,14 @@ async function loadReport() {
     reportError.value = toUiError(e); // NotFound «QA has not run» — platform text as-is (REQ-UI-07 AC2)
   }
 }
+
+// Человеческая форма отчёта — сохранённый при публикации `human_view`
+// (REQ-QH-01): рендерим его поля как есть, порядок групп, баллы и важность
+// не пересчитываются в UI. Старый отчёт без формы идёт плоским report_text.
+const humanForm = computed<HumanForm | null>(() => {
+  const body = report.value?.report as { human_view?: HumanForm } | null | undefined;
+  return body?.human_view ?? null;
+});
 
 async function openContent(a: Artifact) {
   contentFor.value = a.id;
@@ -340,17 +349,67 @@ onMounted(loadAll);
     </div>
 
     <div class="panel">
-      <h3>Отчёт качества (task.report · CURRENT)</h3>
+      <h3>Отчёт качества (task.report)</h3>
       <div class="body">
         <div v-if="reportError" class="errorbox" style="margin-bottom: 0">
           <span class="code">{{ reportError.code }}</span>{{ reportError.message }}
         </div>
         <template v-else-if="report">
+          <div v-if="report.freshness && report.freshness.stale" class="stale-banner">
+            <strong>{{ report.freshness.marker }}</strong>
+            <span class="mono muted">статус отчёта {{ report.status }} · фаза {{ report.freshness.task_state }}
+              <template v-if="report.freshness.execution"> · execution {{ shortId(report.freshness.execution) }} ({{ report.freshness.execution_status }})</template>
+            </span>
+          </div>
           <div class="rowflex" style="margin-bottom: 6px">
             <span class="mono muted">artifact {{ shortId(report.artifact) }} · seq {{ report.seq }} · {{ report.contract }}</span>
             <span class="mono muted">создан {{ fmtTime(report.created_at) }}</span>
+            <StateChip :token="report.status" />
           </div>
-          <pre v-if="report.report_text" class="content">{{ report.report_text }}</pre>
+          <!-- Человеческая форма (REQ-QH-03/04): группы читаются из
+               сохранённого human_view как есть — UI ничего не группирует и не
+               пересчитывает; код и доказательства живут в свёртке пункта. -->
+          <template v-if="humanForm">
+            <div class="qr-headline">
+              <span class="mono">ВЕРДИКТ: {{ humanForm.headline.verdict }} ({{ humanForm.headline.machine_verdict }})</span>
+              <span class="muted mono">S={{ humanForm.headline.score.toFixed(3) }}/1.00 · порог {{ humanForm.headline.theta.toFixed(2) }}</span>
+            </div>
+            <p class="muted" style="margin: 2px 0 8px">{{ humanForm.headline.basis }}</p>
+            <p class="mono muted" style="margin: 0 0 10px">
+              бьёт по вердикту: {{ humanForm.headline.counts.blocks }} ·
+              нюансы: {{ humanForm.headline.counts.nuances }} ·
+              якоря: {{ humanForm.headline.counts.anchors }} ·
+              не проверено: {{ humanForm.headline.counts.unchecked }}
+            </p>
+            <div v-for="g in humanForm.groups.filter(x => x.items.length)" :key="g.key" class="qr-group">
+              <h4 class="qr-group-title">{{ g.title }} ({{ g.items.length }})</h4>
+              <p v-if="g.lead" class="muted" style="margin: 0 0 4px">{{ g.lead }}</p>
+              <ul class="qr-items">
+                <li v-for="it in g.items" :key="it.id">
+                  <template v-if="g.key === 'anchors'">
+                    <span class="mono">{{ it.id }}</span>
+                    <span class="muted"> — закреплено: {{ it.ratified_by }}</span>
+                  </template>
+                  <template v-else>
+                    <div class="qr-item-line">
+                      <span class="mono qr-id">{{ it.id }}</span>
+                      <span class="mono">балл {{ it.score === null ? "—" : it.score.toFixed(2) }}</span>
+                      <span class="mono" v-if="it.weight !== null">вес {{ it.weight.toFixed(2) }}</span>
+                      <span class="mono qr-importance" v-if="it.importance !== null">важность {{ it.importance.toFixed(3) }}</span>
+                      <span class="mono muted" v-if="it.site">{{ it.site }}</span>
+                    </div>
+                    <div class="qr-summary">{{ it.summary }}</div>
+                    <div v-if="it.reason" class="muted qr-reason">причина: {{ it.reason }}</div>
+                    <details v-if="it.evidence && it.evidence.length" class="qr-evidence">
+                      <summary class="muted">доказательства ({{ it.evidence.length }})</summary>
+                      <pre class="content">{{ it.evidence.join("\n\n") }}</pre>
+                    </details>
+                  </template>
+                </li>
+              </ul>
+            </div>
+          </template>
+          <pre v-else-if="report.report_text" class="content">{{ report.report_text }}</pre>
           <details>
             <summary class="muted">machine-тело отчёта</summary>
             <pre class="content">{{ JSON.stringify(report.report, null, 2) }}</pre>

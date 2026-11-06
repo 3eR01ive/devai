@@ -35,7 +35,7 @@ const ASSESSMENT_CONTRACT: (&str, u32) = ("evaluation-assessment", 1);
 /// pinned HERE (code), so the mechanical gate cannot be bypassed by an old
 /// schema text lingering in a home's contract table (seeding is insert-only;
 /// @1..@3 stay in the store untouched as history).
-const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 4);
+const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 5);
 
 /// Run-artifact root under the data directory (REQ-WT-05): evidence is
 /// platform-declared — `<home>/evidence/<task>/<execution>` — and agents
@@ -527,8 +527,25 @@ impl<'a> Engine<'a> {
     /// verification both read the SAME resolution the stages bind to — one
     /// source of truth, never a second derivation.
     pub fn effective_profile(&self, task: &Task) -> RuntimeResult<(Option<Profile>, Vec<String>)> {
+        let (p, w, _ratified) = self.effective_profile_anchors(task)?;
+        Ok((p, w))
+    }
+
+    /// `effective_profile` PLUS the ratified-anchor map of this resolution
+    /// (target_id -> decision that keeps it in force). The QA assembly stores
+    /// that map into the human form (OQ-QH-2 «якоря/ратифицированное»), so
+    /// the anchor list is a fact decided with the profile — never guessed by
+    /// a reader from the plain profile text.
+    pub fn effective_profile_anchors(
+        &self,
+        task: &Task,
+    ) -> RuntimeResult<(
+        Option<Profile>,
+        Vec<String>,
+        std::collections::BTreeMap<String, crate::human_view::Ratified>,
+    )> {
         if self.profile_explicit {
-            return Ok((self.profile.clone(), Vec::new()));
+            return Ok((self.profile.clone(), Vec::new(), Default::default()));
         }
         let pid = task.project_id.map(|i| i.to_string());
         let r = devai_store::config::resolve_effective_profile(
@@ -536,7 +553,20 @@ impl<'a> Engine<'a> {
             &self.cfg_dir,
             pid.as_deref(),
         )?;
-        Ok((r.profile, r.warnings))
+        let ratified = r
+            .ratified
+            .into_iter()
+            .map(|(target, (decision_id, actor))| {
+                (
+                    target,
+                    crate::human_view::Ratified {
+                        decision_id,
+                        actor,
+                    },
+                )
+            })
+            .collect();
+        Ok((r.profile, r.warnings, ratified))
     }
 
     /// The workspace a stage of THIS task evaluates against: the task's
@@ -625,7 +655,8 @@ impl<'a> Engine<'a> {
             // two full reads+parses of the config tree for one stage; both
             // now consume this single resolution — one source of truth for
             // freshness AND for judgement.
-            let (profile, binding_warnings) = self.effective_profile(&task)?;
+            let (profile, binding_warnings, ratified_anchors) =
+                self.effective_profile_anchors(&task)?;
 
             // QA freshness gate (REQ-005): BEFORE launching any auditor run,
             // compare the freshly computed workspace revision with the one
@@ -687,6 +718,7 @@ impl<'a> Engine<'a> {
                 actor,
                 profile,
                 binding_warnings,
+                ratified_anchors,
             )? {
                 StageResult::Stepped(step) => step,
                 StageResult::Escalated => {
@@ -792,6 +824,7 @@ impl<'a> Engine<'a> {
         actor: &str,
         profile: Option<Profile>,
         binding_warnings: Vec<String>,
+        ratified_anchors: std::collections::BTreeMap<String, crate::human_view::Ratified>,
     ) -> RuntimeResult<StageResult> {
         // Sovereignty check first: the role may only run in this stage.
         workflow::check_execution_allowed(role_slug, task)?;
@@ -1336,6 +1369,7 @@ impl<'a> Engine<'a> {
                         &assessment,
                         &execution.id.to_string(),
                         &revision,
+                        &ratified_anchors,
                     );
                     let text = serde_json::to_string_pretty(&assembled.json).map_err(|e| {
                         AdapterError::Platform(format!("cannot serialize assembled report: {e}"))

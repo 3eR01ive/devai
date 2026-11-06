@@ -32,7 +32,7 @@ use devai_runtime::{Engine, Gate, RunReport, liveness};
 use devai_store::{ArtifactDraft, StoreError, bundle, guess_media_type, seed};
 use uuid::Uuid;
 
-use crate::{Api, ApiError, ApiResult};
+use crate::{Api, ApiError, ApiResult, ReportFreshness};
 
 // ---------------------------------------------------------------------------
 // Typed requests and results (REQ-MUT-01 AC1)
@@ -191,6 +191,9 @@ pub struct RunOutcome {
     pub current_quality_report: Option<Artifact>,
     /// The stored §2.6 rendering shown at the human gates, when present.
     pub gate_report_text: Option<String>,
+    /// REQ-QH-05: whether the report shown at the gate is still the last
+    /// word — the marker names the task phase and the re-audit execution.
+    pub gate_report_freshness: Option<ReportFreshness>,
     /// REQ-HP-05: the human paragraphs the gate presents FIRST, before any
     /// formal structure — `(artifact label, stored paragraph)` pairs read
     /// verbatim from the CURRENT artifacts' bodies (REQ-HP-07: the gate
@@ -621,8 +624,8 @@ impl Api {
                     )
                 })
             }
-            WorkflowOp::Return { rationale } => self.run_op(id, move |t, _a| {
-                workflow::return_to_rework(t, rationale.as_deref(), &self.actor, Utc::now())
+            WorkflowOp::Return { rationale } => self.run_op(id, move |t, a| {
+                workflow::return_to_rework(t, a, rationale.as_deref(), &self.actor, Utc::now())
             }),
             WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| {
                 workflow::pause(t, reason.as_deref(), &self.actor, Utc::now())
@@ -766,17 +769,23 @@ impl Api {
             engine = engine.with_workspace(w);
         }
         let report = engine.advance(&req.id, &req.agent, &self.actor)?;
-        // The gate renderings read the CURRENT quality report — the same
-        // status-only selection (REQ-005) the old handler performed.
-        let (current_quality_report, gate_report_text) = match report.gate {
-            Gate::WaitingAccept => (None, self.quality_report_text(report.task_id)?),
-            Gate::ReportFresh => (
-                self.store.artifacts(report.task_id)?.into_iter().find(|x| {
-                    x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
-                }),
-                self.quality_report_text(report.task_id)?,
-            ),
-            _ => (None, None),
+        // The gate renderings read the presented quality report — the same
+        // status-aware selection (REQ-005, REQ-QH-05/06) the UI panel uses:
+        // the stored human form when present, the §2.6 text otherwise, plus
+        // the freshness marker when the report is no longer the last word.
+        let presented = match report.gate {
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                self.presented_quality_report(report.task_id)?
+            }
+            _ => None,
+        };
+        let gate_report_text = presented.as_ref().map(|p| p.text.clone());
+        let gate_report_freshness = presented.map(|p| p.freshness);
+        let current_quality_report = match report.gate {
+            Gate::ReportFresh => self.store.artifacts(report.task_id)?.into_iter().find(|x| {
+                x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
+            }),
+            _ => None,
         };
         // REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
         // presentation — approval/review reads spec + review, acceptance
@@ -812,6 +821,7 @@ impl Api {
             report,
             current_quality_report,
             gate_report_text,
+            gate_report_freshness,
             gate_human_paragraphs,
             allowed_operations: workflow::allowed_ops(&t)
                 .into_iter()
@@ -1740,24 +1750,150 @@ impl Api {
     /// (non-JSON) blob propagates as `Err` with its machine code — never a
     /// silent «absence» (QA R2: `.ok()?` swallowed corrupt data into None,
     /// indistinguishable from «no report»).
+    ///
+    /// REQ-QH-05/06: the text is the STORED human form when the report
+    /// carries one (`human_view`, quality-report@5) and the stored
+    /// `report_text` otherwise — nothing is regrouped or recomputed here.
+    /// When the shown report is no longer the last word (rework in flight,
+    /// or the selected row is not CURRENT), a freshness marker computed from
+    /// raw store facts is prepended so an outdated report never reads as the
+    /// decision.
     pub fn quality_report_text(&self, task_id: Id) -> ApiResult<Option<String>> {
+        Ok(self
+            .presented_quality_report(task_id)?
+            .map(|p| p.text_with_freshness()))
+    }
+
+    /// The presented report plus its freshness verdict — the same single
+    /// read the CLI gates and the UI panel consume.
+    pub fn presented_quality_report(&self, task_id: Id) -> ApiResult<Option<PresentedReport>> {
+        let task = self.store.get_task(&task_id.to_string())?;
         let arts = self.store.artifacts(task_id)?;
-        // REQ-005: status-only selection (single CURRENT pinned at v3).
-        let Some(a) = arts
+        // REQ-005: status-only selection. CURRENT wins; when there is none,
+        // a STALE/SUPERSEDED quality report is shown ONLY under an explicit
+        // «устарел» marker — never as the current decision, never hidden as
+        // «QA has not run» either.
+        let picked = arts
             .iter()
-            .find(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
-        else {
+            .filter(|a| a.kind == ArtifactKind::QualityReport)
+            .max_by_key(|a| (a.status == ArtifactStatus::Current, a.seq));
+        let Some(a) = picked else {
             return Ok(None);
         };
         let blob = self.store.read_blob(&a.sha256)?;
         let v: serde_json::Value = serde_json::from_slice(&blob).map_err(|e| ApiError::refused("corrupt", format!(
-            "the CURRENT quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
+            "the quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
             short_id(&a.id)
         )))?;
-        Ok(v.get("report_text")
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| Some("(report assembled before @2 — no rendering)".into())))
+        let body = render_stored_report(&v);
+        let freshness = self.report_freshness(&task, a)?;
+        Ok(Some(PresentedReport { text: body, freshness }))
+    }
+
+    /// REQ-QH-05: freshness as a FACT of the store — task phase, stored
+    /// artifact status, role executions. Nothing is inferred from the report
+    /// body, and the report content is not touched.
+    fn report_freshness(&self, task: &Task, a: &Artifact) -> ApiResult<ReportFreshness> {
+        let reworking = task.state == TaskState::Rework
+            || task.return_state == Some(TaskState::Rework);
+        let stale = (reworking || a.status != ArtifactStatus::Current)
+            && !task.state.is_terminal();
+        let execs: Vec<RoleExecution> = self
+            .store
+            .list_executions(Some(task.id))?
+            .into_iter()
+            .filter(|e| e.role_slug == "quality-auditor")
+            .collect();
+        let running = execs
+            .iter()
+            .filter(|e| e.status == ExecutionStatus::Running)
+            .max_by_key(|e| e.started_at);
+        let last = execs.iter().max_by_key(|e| e.started_at);
+        if !stale {
+            return Ok(ReportFreshness {
+                stale: false,
+                marker: String::new(),
+                report_seq: a.seq,
+                report_status: a.status.as_str().to_string(),
+                task_state: task.state.as_str().to_string(),
+                execution: last.map(|e| e.id.to_string()),
+                execution_status: last.map(|e| e.status.as_str().to_string()),
+            });
+        }
+        let tail = if let Some(e) = running {
+            format!(
+                "готовится ре-аудит (execution {}, в работе)",
+                short_id(&e.id)
+            )
+        } else if let Some(e) = last {
+            format!(
+                "ре-аудит не завершён (execution {}, {})",
+                short_id(&e.id),
+                e.status.as_str()
+            )
+        } else {
+            "ре-аудит ещё не запущен".to_string()
+        };
+        Ok(ReportFreshness {
+            stale: true,
+            marker: format!(
+                "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {}",
+                a.seq,
+                task.state.as_str(),
+                tail
+            ),
+            report_seq: a.seq,
+            report_status: a.status.as_str().to_string(),
+            task_state: task.state.as_str().to_string(),
+            execution: last.map(|e| e.id.to_string()),
+            execution_status: last.map(|e| e.status.as_str().to_string()),
+        })
+    }
+}
+
+/// The text of ONE stored report body: the human form when the body carries
+/// one (quality-report@5), the stored §2.6 text otherwise (@1..@4 bodies),
+/// and the honest legacy placeholder when neither exists. Pure layout — the
+/// form's grouping, order and numbers are read, never recomputed.
+pub fn render_stored_report(v: &serde_json::Value) -> String {
+    if let Some(form) = v.get("human_view") {
+        if let Ok(form) = serde_json::from_value::<devai_runtime::human_view::HumanReportView>(
+            form.clone(),
+        ) {
+            return devai_runtime::human_view::render_text(&form);
+        }
+    }
+    v.get("report_text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "(report assembled before @2 — no rendering)".into())
+}
+
+/// One presented report: the text a human signs plus why it is (or is not)
+/// the last word.
+#[derive(Debug, Clone)]
+pub struct PresentedReport {
+    pub text: String,
+    pub freshness: ReportFreshness,
+}
+
+impl PresentedReport {
+    /// The text-only view of the same presentation: the freshness marker and
+    /// the «это НЕ текущее решение» label are PREPENDED when the report is
+    /// outdated, so a consumer that only takes a string cannot silently show
+    /// a stale report as the decision (REQ-QH-05). Channels that render the
+    /// marker themselves use `text` + `freshness` instead.
+    pub fn text_with_freshness(&self) -> String {
+        if !self.freshness.stale {
+            return self.text.clone();
+        }
+        format!(
+            "{}\n(показан отчёт v{} в статусе {} — это НЕ текущее решение)\n\n{}",
+            self.freshness.marker,
+            self.freshness.report_seq,
+            self.freshness.report_status,
+            self.text
+        )
     }
 }
 
@@ -2232,6 +2368,131 @@ mod tests {
             TaskState::Analysis
         );
     }
+
+    /// REQ-QH-01/05/06: the presentation channel quotes the STORED human form
+    /// (never re-assembles one), and a report that is no longer the last word
+    /// is announced as stale — with the task phase — instead of being passed
+    /// off as the current decision. Old bodies keep their stored flat text.
+    #[test]
+    fn the_stored_human_form_is_presented_and_rework_is_announced_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "form-presentation");
+
+        let form = serde_json::json!({
+            "version": 1,
+            "lang": "ru",
+            "headline": {
+                "verdict": "НЕ ПРОШЁЛ",
+                "machine_verdict": "FAIL",
+                "score": 0.5,
+                "theta": 0.8,
+                "basis": "красные линии: x",
+                "counts": {"blocks": 1, "nuances": 1, "anchors": 0, "unchecked": 0}
+            },
+            "groups": [
+                {"key": "blocks", "title": "БЬЁТ ПО ВЕРДИКТУ / ТРЕБУЕТ ТВОЕГО РЕШЕНИЯ", "lead": "",
+                 "items": [{"id": "corr/x", "kind": "floor", "summary": "guard missing", "site": "src/a.rs:7",
+                            "score": 0.4, "weight": 0.2, "importance": 0.12, "evidence": ["body of the finding"]}]},
+                {"key": "nuances", "title": "НЮАНСЫ", "lead": "",
+                 "items": [{"id": "cl/y", "kind": "scored", "summary": "style drift", "site": "",
+                            "score": 0.9, "weight": 0.1, "importance": 0.01}]},
+                {"key": "anchors", "title": "ЯКОРЯ / РАТИФИЦИРОВАНО", "lead": "", "items": []},
+                {"key": "unchecked", "title": "НЕ ПРОВЕРЕНО / ЖДЁТ", "lead": "", "items": []}
+            ],
+            "blocked_weight": 0.0,
+            "max_blocked_weight": 0.2
+        });
+        let body = serde_json::json!({
+            "verdict": "RETURN",
+            "recommendation_basis": "красные линии: x",
+            "report_text": "RAW-FLAT-TEXT-MARKER",
+            "human_view": form,
+            "profile": { "project": "p", "version": 1 },
+            "workspace_revision": {
+                "git_head": null, "dirty_digest": null, "profile": null, "roles": []
+            },
+            "evaluation": {
+                "verdict": "FAIL", "score": 0.5, "theta": 0.8,
+                "gates": [], "checks": []
+            },
+        });
+        let row = api
+            .artifact_publish_row(PublishReq {
+                id: t.to_string(),
+                kind: ArtifactKind::QualityReport,
+                name: "qr".into(),
+                content: serde_json::to_vec(&body).unwrap(),
+                depends: vec![],
+                contract: Some("quality-report@5".into()),
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
+            .unwrap();
+
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert!(
+            p.text.contains("НЮАНСЫ"),
+            "the stored form is what gets rendered: {}",
+            p.text
+        );
+        assert!(p.text.contains("важность 0.120"));
+        assert!(
+            !p.text.contains("RAW-FLAT-TEXT-MARKER"),
+            "the flat text is the fallback, not the channel, for @5 bodies"
+        );
+        assert!(!p.freshness.stale);
+        assert_eq!(p.freshness.report_status, "CURRENT");
+
+        // A pre-@5 body still renders its own stored text, byte for byte.
+        let t2 = fresh_task(&api, "legacy");
+        api.artifact_publish_row(PublishReq {
+            id: t2.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: br#"{"report_text":"LEGACY-FLAT-TEXT"}"#.to_vec(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap();
+        assert_eq!(
+            api.quality_report_text(t2).unwrap().as_deref(),
+            Some("LEGACY-FLAT-TEXT")
+        );
+
+        // Rework (ratified OQ-QH-3) flips the row CURRENT -> STALE; the
+        // presentation must say so instead of showing it as the decision.
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let mut m = Mutation {
+            task: task.clone(),
+            events: vec![],
+            artifact_status: vec![(row.artifact.id, ArtifactStatus::Stale)],
+            questions: vec![],
+        };
+        m.task.state = TaskState::Rework;
+        api.store.commit(task.lock_version, &m).unwrap();
+
+        let p2 = api.presented_quality_report(t).unwrap().unwrap();
+        assert!(p2.freshness.stale);
+        assert_eq!(p2.freshness.report_status, "STALE");
+        assert_eq!(p2.freshness.task_state, "REWORK");
+        let text = api.quality_report_text(t).unwrap().unwrap();
+        assert!(
+            text.starts_with("⚠ отчёт v1 УСТАРЕЛ — задача в REWORK"),
+            "{text}"
+        );
+        assert!(text.contains("НЕ текущее решение"), "{text}");
+        assert!(text.contains("НЮАНСЫ"), "the stored form is still readable");
+        // The UI view carries the same fact, not a second derivation.
+        let view = api.task_report(&t.to_string()).unwrap();
+        assert_eq!(view.status, "STALE");
+        assert!(view.freshness.expect("freshness is part of the view").stale);
+    }
+
 
     /// QA R2: `quality_report_text` distinguishes «no report» (Ok(None))
     /// from «report unreadable» (Err with a machine code). A corrupt CURRENT
