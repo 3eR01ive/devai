@@ -136,6 +136,7 @@ const RUNG_APPLIERS: &[(&str, RungApply)] = &[
     ("decisions_backfill", decisions_backfill),
     ("execution_form_columns", execution_form_columns),
     ("single_writer_repair", single_writer_repair),
+    ("additive_human_name_column", additive_human_name_column),
 ];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
@@ -260,13 +261,14 @@ impl Store {
     /// and the atomic compound below — the insert SQL stays in one place).
     fn insert_task_row(tx: &Transaction<'_>, t: &Task) -> StoreResult<()> {
         tx.execute(
-            "INSERT INTO tasks(id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO tasks(id,project_id,title,business_description,human_name,state,return_state,requirements_seq,lock_version,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 t.id.to_string(),
                 t.project_id.map(|i| i.to_string()),
                 t.title,
                 t.business_description,
+                t.human_name,
                 t.state.as_str(),
                 t.return_state.map(|s| s.as_str()),
                 t.requirements_seq,
@@ -365,9 +367,11 @@ impl Store {
                 id: new_id(),
                 task_id: t.id,
                 task_state: t.state,
+                task_display: t.display_sign(),
                 task_title: t.title.clone(),
                 depends_on_id: dep.id,
                 depends_on_state: dep.state,
+                depends_on_display: dep.display_sign(),
                 depends_on_title: dep.title.clone(),
                 kind: *kind,
                 actor: actor.to_string(),
@@ -411,7 +415,7 @@ impl Store {
         rows::unwrap_row(
             self.conn
                 .query_row(
-                    "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at FROM tasks WHERE id = ?1",
+                    "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name FROM tasks WHERE id = ?1",
                     params![id],
                     |r| rows::r2sql(rows::task_from_row(r)),
                 )
@@ -423,7 +427,7 @@ impl Store {
     /// Resolves a task by a unique id prefix (human-friendly CLI usage).
     pub fn resolve_task(&self, prefix: &str) -> StoreResult<Task> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at
+            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name
              FROM tasks WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 2",
         )?;
         let mut rows = stmt.query(params![prefix.to_lowercase()])?;
@@ -444,7 +448,7 @@ impl Store {
 
     pub fn list_tasks(&self) -> StoreResult<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at
+            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name
              FROM tasks ORDER BY updated_at DESC",
         )?;
         let mut rows = stmt.query([])?;
@@ -460,14 +464,20 @@ impl Store {
     pub fn commit(&self, base_lock: u64, m: &Mutation) -> StoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         let affected = tx.execute(
-            "UPDATE tasks SET state=?1, return_state=?2, requirements_seq=?3, lock_version=?4, updated_at=?5
-             WHERE id=?6 AND lock_version=?7",
+            "UPDATE tasks SET state=?1, return_state=?2, requirements_seq=?3, lock_version=?4, updated_at=?5, human_name=?6
+             WHERE id=?7 AND lock_version=?8",
             params![
                 m.task.state.as_str(),
                 m.task.return_state.map(|s| s.as_str()),
                 m.task.requirements_seq,
                 m.task.lock_version as i64,
                 rows::ts(&m.task.updated_at),
+                // REQ-TN-01: the human signboard travels WITH the mutation it
+                // belongs to — a requirements publication stamps the name and
+                // advances the state in ONE transaction; every other
+                // transition carries the stored value back unchanged (the
+                // task it clones came out of this same read plane).
+                m.task.human_name,
                 m.task.id.to_string(),
                 base_lock as i64,
             ],
@@ -583,6 +593,66 @@ impl Store {
         })
     }
 
+    /// REQ-TN (ratified OQ-TN-1): the HUMAN write path of the signboard —
+    /// `task.rename` sets or replaces the human name directly, no rework
+    /// cycle, no third role. Mirrors `set_task_project` exactly: optimistic
+    /// lock, one `task.human_name.set` event in the SAME transaction as the
+    /// UPDATE, one effective change per call (a NO-OP re-apply is the API's
+    /// concern and writes nothing). Window validation belongs to the API
+    /// gate (the config-driven policy), not to this half; the store keeps
+    /// the string it was given verbatim. A publication-side stamp never
+    /// travels here: it rides the workflow mutation through `commit`
+    /// (REQ-TN-02), so the two writers share no code path by design.
+    pub fn set_task_human_name(
+        &self,
+        t: &Task,
+        human_name: Option<&str>,
+        actor: &str,
+        now: Timestamp,
+    ) -> StoreResult<Task> {
+        let next_lock = t.lock_version + 1;
+        let tx = self.conn.unchecked_transaction()?;
+        let affected = tx.execute(
+            "UPDATE tasks SET human_name=?1, lock_version=?2, updated_at=?3
+             WHERE id=?4 AND lock_version=?5",
+            params![
+                human_name,
+                next_lock as i64,
+                rows::ts(&now),
+                t.id.to_string(),
+                t.lock_version as i64,
+            ],
+        )?;
+        if affected == 0 {
+            drop(tx);
+            return Err(StoreError::Conflict {
+                what: format!("task {}", t.id),
+                expected: t.lock_version,
+                found: self.get_task(&t.id.to_string())?.lock_version,
+            });
+        }
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                t.id.to_string(),
+                event_kind::TASK_HUMAN_NAME_SET,
+                actor,
+                json_string(&serde_json::json!({
+                    (json_field::HUMAN_NAME): human_name,
+                })),
+                rows::ts(&now),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Task {
+            human_name: human_name.map(|s| s.to_string()),
+            lock_version: next_lock,
+            updated_at: now,
+            ..t.clone()
+        })
+    }
+
     // ------------------------------------------------------------------
     // task dependency graph (REQ-01/02/07)
     // ------------------------------------------------------------------
@@ -593,7 +663,7 @@ impl Store {
     /// dependencies AND task states (REQ-04 AC1). Callers add their own
     /// `WHERE d.status='ACTIVE' AND ...`: SUPERSEDED rows are history, they
     /// leave every live read (ratified OQ7) but stay in the table forever.
-    const DEPENDENCY_EDGE_SELECT: &'static str = "SELECT d.id, d.task_id, t.state, t.title, d.depends_on_id, p.state, p.title, d.kind, d.actor, d.created_at \
+    const DEPENDENCY_EDGE_SELECT: &'static str = "SELECT d.id, d.task_id, t.state, t.title, d.depends_on_id, p.state, p.title, d.kind, d.actor, d.created_at, t.human_name, t.business_description, p.human_name, p.business_description \
         FROM task_dependencies d JOIN tasks t ON t.id = d.task_id JOIN tasks p ON p.id = d.depends_on_id";
 
     /// Is there already an ACTIVE path `from →*→ to` over edges of `kind`?
@@ -680,9 +750,11 @@ impl Store {
             id: new_id(),
             task_id,
             task_state: dependent.state,
+            task_display: dependent.display_sign(),
             task_title: dependent.title,
             depends_on_id,
             depends_on_state: depends_on.state,
+            depends_on_display: depends_on.display_sign(),
             depends_on_title: depends_on.title,
             kind,
             actor: actor.to_string(),
@@ -829,8 +901,9 @@ impl Store {
     pub fn dependency_graph(&self) -> StoreResult<Vec<DependencyNode>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.business_description, t.state, t.return_state,
-                    t.requirements_seq, t.lock_version, t.created_at, t.updated_at,
-                    d.id, d.kind, d.depends_on_id, d.actor, d.created_at, p.state, p.title
+                    t.requirements_seq, t.lock_version, t.created_at, t.updated_at, t.human_name,
+                    d.id, d.kind, d.depends_on_id, d.actor, d.created_at, p.state, p.title,
+                    p.human_name, p.business_description
              FROM tasks t
              LEFT JOIN task_dependencies d ON d.task_id = t.id AND d.status = 'ACTIVE'
              LEFT JOIN tasks p ON p.id = d.depends_on_id
@@ -1640,14 +1713,13 @@ fn execution_form_columns(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResul
 
 /// Statement-by-statement script application with `ADD COLUMN` presence
 /// checks (SQLite has no `ADD COLUMN IF NOT EXISTS`) — the idempotence pure
-/// SQL cannot express, shared by rung 006 and rung 007. Everything else
-/// (index DDL written `IF NOT EXISTS`) runs verbatim.
+/// SQL cannot express, shared by rung 006, rung 007 and rung 009. Everything
+/// else (index DDL written `IF NOT EXISTS`) runs verbatim.
+///
+/// The presence check reads the table NAMED BY THE STATEMENT (rung 006/007
+/// touched `role_executions`, rung 009 touches `tasks`): one generic scan,
+/// never a per-rung table literal.
 fn apply_script_with_column_skip(tx: &Transaction<'_>, script: &'static str) -> StoreResult<()> {
-    let existing: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT name FROM pragma_table_info('role_executions')")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
     // `--` commentary (Russian included, and its punctuation may contain
     // `;`) is cut from EVERY line BEFORE splitting on statements — comment
     // text must never reach the executor or the token parser.
@@ -1664,8 +1736,16 @@ fn apply_script_with_column_skip(tx: &Transaction<'_>, script: &'static str) -> 
         if stmt.is_empty() {
             continue;
         }
-        if let Some(col) = added_column_name(stmt) {
-            if existing.iter().any(|c| c == col) {
+        if let Some((table, col)) = added_column_of(stmt) {
+            let existing: Vec<String> = {
+                let mut s = tx.prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{}')",
+                    table.replace('\'', "''")
+                ))?;
+                let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if existing.iter().any(|c| c == &col) {
                 continue;
             }
         }
@@ -1674,20 +1754,42 @@ fn apply_script_with_column_skip(tx: &Transaction<'_>, script: &'static str) -> 
     Ok(())
 }
 
-/// The column name an `ALTER TABLE … ADD COLUMN <name> …` statement adds,
-/// by token scan; `None` for any other statement (those run verbatim —
-/// only column-adding statements get the presence check).
-fn added_column_name(code: &str) -> Option<&str> {
+/// The `(table, column)` pair an `ALTER TABLE <table> ADD [COLUMN] <name> …`
+/// statement targets, by token scan; `None` for any other statement (those
+/// run verbatim — only column-adding statements get the presence check).
+fn added_column_of(code: &str) -> Option<(String, String)> {
+    fn ident(tok: &str) -> String {
+        tok.trim_matches(|c: char| c == '`' || c == '"' || c == '[')
+            .trim_end_matches(']')
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
     let toks: Vec<&str> = code.split_whitespace().collect();
-    for w in toks.windows(3) {
-        if w[0].eq_ignore_ascii_case("ADD") && w[1].eq_ignore_ascii_case("COLUMN") {
-            let name = w[2].trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
-            if !name.is_empty() {
-                return Some(name);
-            }
+    let alter = |w: &&str| w.eq_ignore_ascii_case("ALTER");
+    let table_kw = |w: &&str| w.eq_ignore_ascii_case("TABLE");
+    let add = |w: &&str| w.eq_ignore_ascii_case("ADD");
+    let column_kw = |w: &&str| w.eq_ignore_ascii_case("COLUMN");
+    // `ALTER TABLE <table> ADD COLUMN <name> …` or the bare `ADD <name>`
+    // SQLite form — token positions: [0]=ALTER [1]=TABLE [2]=<table>
+    // [3]=ADD [4]=(COLUMN|[<name>]) [5]=(<name> after COLUMN).
+    if toks.len() >= 5 && alter(&toks[0]) && table_kw(&toks[1]) && add(&toks[3]) {
+        let name_tok = if column_kw(&toks[4]) {
+            toks.get(5).copied().unwrap_or("")
+        } else {
+            toks[4]
+        };
+        if !name_tok.is_empty() {
+            return Some((ident(toks[2]), ident(name_tok)));
         }
     }
     None
+}
+
+/// Rung v8→v9 (task 01a1ad1d, REQ-TN-01): one additive nullable column on
+/// `tasks`; pure SQL plus the shared presence check for idempotence.
+fn additive_human_name_column(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    apply_script_with_column_skip(tx, step.script)
 }
 
 /// Rung v2→v3 (REQ-003): the one-time repair of pre-existing multi-CURRENT

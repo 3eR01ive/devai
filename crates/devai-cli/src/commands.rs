@@ -23,6 +23,7 @@ use crate::{
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
     MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq,
+    TaskRenameReq,
     TaskProjectSetReq,
 };
 
@@ -306,6 +307,8 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         cmd @ (TaskCmd::SetProject { .. } | TaskCmd::BackfillProject { .. }) => {
             task_binding_plane(ctx, cmd, json)?
         }
+        // — the human signboard write (task 01a1ad1d, ratified OQ-TN-1) —
+        cmd @ TaskCmd::Rename { .. } => task_rename_arm(ctx, cmd, json)?,
         // — the dependency plane (one group handler) —
         cmd @ (TaskCmd::Depend { .. }
         | TaskCmd::Dependencies { .. }
@@ -432,7 +435,7 @@ fn render_task_created(t: &Task, linked: &[TaskDependency], json: bool) -> Resul
                 d.kind.as_str(),
                 short(&d.depends_on_id),
                 d.depends_on_state.as_str(),
-                d.depends_on_title
+                d.depends_on_display
             );
         }
         outln!("start it with: devai task start {}", short(&t.id));
@@ -448,12 +451,15 @@ fn task_list(ctx: &Ctx, json: bool) -> Result<()> {
         outln!("(no tasks)");
     } else {
         for t in ts {
+            // REQ-TN-03: the list SIGNS tasks with the human name — the ONE
+            // rule from core over stored task fields (name / draft showcase
+            // / title), never a per-renderer copy.
             outln!(
                 "{}  {:<17}  v{:>2}  {}",
                 short(&t.id),
                 t.state.as_str(),
                 t.requirements_seq,
-                t.title
+                t.display_sign()
             );
         }
     }
@@ -656,6 +662,48 @@ fn task_binding_plane(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     }
 }
 
+/// The `task rename` arm (REQ-TN, ratified OQ-TN-1): the human door to the
+/// signboard, delegating to the registered `task.rename` operation. This
+/// layer owns presentation only — the name window is the API's contract-
+/// gated refusal (`contract_rejected` renders the violation list), never a
+/// CLI-side copy.
+fn task_rename_arm(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
+    let TaskCmd::Rename {
+        id,
+        name,
+        expected_lock,
+    } = cmd
+    else {
+        unreachable!("the dispatcher routes only the Rename arm here");
+    };
+    let o = ctx
+        .api()
+        .task_rename(TaskRenameReq {
+            id,
+            name,
+            expected_lock,
+        })
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&o)?);
+    } else if o.changed {
+        outln!(
+            "task {} renamed → `{}` (title keeps the creator's words, lock {})",
+            short(&o.task.id),
+            o.human_name,
+            o.task.lock_version
+        );
+    } else {
+        outln!(
+            "task {} already carries the name `{}` — nothing changed (lock {})",
+            short(&o.task.id),
+            o.human_name,
+            o.task.lock_version
+        );
+    }
+    Ok(())
+}
+
 fn task_set_project(ctx: &Ctx, id: &str, project: &str, json: bool) -> Result<()> {
     let o = ctx
         .api()
@@ -760,7 +808,7 @@ fn task_depend(ctx: &Ctx, id: String, on: String, kind: String, json: bool) -> R
             d.kind.as_str(),
             short(&d.depends_on_id),
             d.depends_on_state.as_str(),
-            d.depends_on_title,
+            d.depends_on_display,
             d.actor,
             d.created_at.format("%Y-%m-%d %H:%M:%S")
         );
@@ -795,7 +843,7 @@ fn print_dependency_edges(outgoing: &[TaskDependency], incoming: &[TaskDependenc
             d.kind.as_str(),
             short(&d.depends_on_id),
             d.depends_on_state.as_str(),
-            d.depends_on_title,
+            d.depends_on_display,
             d.actor
         );
     }
@@ -806,7 +854,7 @@ fn print_dependency_edges(outgoing: &[TaskDependency], incoming: &[TaskDependenc
             d.kind.as_str(),
             short(&d.task_id),
             d.task_state.as_str(),
-            d.task_title,
+            d.task_display,
             d.actor
         );
     }
@@ -913,7 +961,7 @@ fn task_epics(ctx: &Ctx, json: bool) -> Result<()> {
                 "{}  {:<13} {}  ({} derived child/ren via 'parent')",
                 short(&e.task.id),
                 e.task.state.as_str(),
-                e.task.title,
+                e.task.display_sign(),
                 e.derived_children
             );
         }
@@ -957,15 +1005,16 @@ fn print_graph_human(nodes: &[DependencyNode]) -> Result<()> {
             "{}  {:<13} {}  [{mark}]",
             short(&n.task.id),
             n.task.state.as_str(),
-            n.task.title
+            n.task.display_sign()
         );
         for d in &n.dependencies {
+            // Ratified OQ-TN-5: BOTH ends of an edge carry the signboard.
             outln!(
                 "    —{:<7}→ {}  {:<13} {}",
                 d.kind.as_str(),
                 short(&d.depends_on_id),
                 d.depends_on_state.as_str(),
-                d.depends_on_title
+                d.depends_on_display
             );
         }
     }
@@ -2028,6 +2077,10 @@ fn import(ctx: &Ctx, dir: &Path, json: bool) -> Result<()> {
 
 fn print_task(t: &Task) {
     outln!("id:        {}", t.id);
+    // Ratified OQ-TN-4: the DETAIL view shows the human signboard AND the
+    // formal title side by side — the operator can always compare the
+    // signboard with the creator's verbatim words.
+    outln!("name:      {}", t.display_sign());
     outln!("title:     {}", t.title);
     outln!(
         "state:     {}{}",
@@ -2075,6 +2128,7 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     let running: Vec<_> = v.running_executions.iter().collect();
 
     outln!("id:    {}", t.id);
+    outln!("name:  {}", t.display_sign());
     outln!("title: {}", t.title);
     outln!(
         "state: {}{}",

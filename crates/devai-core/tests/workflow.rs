@@ -57,7 +57,7 @@ fn in_state(task: &Task, target: TaskState, artifacts: &mut Vec<Artifact>) -> Ta
         vec![],
     );
     artifacts.push(spec.clone());
-    t = workflow::requirements_published(&t, artifacts, None, actor, now())
+    t = workflow::requirements_published(&t, artifacts, None, None, actor, now())
         .unwrap()
         .task;
     if target == TaskState::Review {
@@ -107,7 +107,7 @@ fn full_happy_lifecycle() {
         vec![],
     );
     artifacts.push(spec.clone());
-    t = workflow::requirements_published(&t, &artifacts, None, "analyst", now())
+    t = workflow::requirements_published(&t, &artifacts, None, None, "analyst", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Review);
@@ -496,7 +496,7 @@ fn cannot_publish_spec_from_draft() {
         vec![],
     );
     artifacts.push(spec);
-    let err = workflow::requirements_published(&t, &artifacts, None, "u", now()).unwrap_err();
+    let err = workflow::requirements_published(&t, &artifacts, None, None, "u", now()).unwrap_err();
     assert!(
         err.to_string().contains("not allowed in state DRAFT"),
         "{err}"
@@ -663,7 +663,7 @@ fn revise_supersedes_old_spec_and_stales_dependents() {
     );
     artifacts.push(spec2.clone());
     let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), "u", now()).unwrap();
+        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now()).unwrap();
     t = m.task;
     assert_eq!(t.state, TaskState::Review);
     assert_eq!(t.requirements_seq, 2);
@@ -766,7 +766,7 @@ fn revise_from_v3_shaped_snapshot_stales_dependents_without_double_flip() {
         .collect();
 
     let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), "u", now()).unwrap();
+        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Review);
     assert_eq!(m.task.requirements_seq, 2);
 
@@ -823,10 +823,13 @@ fn dep(task: &Task, on_id: Id, on_state: TaskState, kind: DependencyKind) -> Tas
         id: new_id(),
         task_id: task.id,
         task_state: task.state,
+        // read-плоскость hands finished signboards alongside the titles
+        task_display: task.display_sign(),
         task_title: task.title.clone(),
         depends_on_id: on_id,
         depends_on_state: on_state,
         depends_on_title: "depended-on".into(),
+        depends_on_display: "depended-on".into(),
         kind,
         actor: "tester".into(),
         created_at: now(),

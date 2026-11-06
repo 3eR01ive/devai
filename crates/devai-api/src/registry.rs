@@ -303,6 +303,14 @@ pub fn operations() -> Vec<OpDescriptor> {
             output: "TaskProjectBackfillOutcome{bound, already_bound, skipped_terminal, skipped_other_project}",
             description: "REQ-BIND-03 under the ratified OQ-BIND-2 rule: bind the given project to every task that lives UNBOUND and NON-TERMINAL, each through `task.project.set` (one event, one lock bump per task). Terminal history keeps the address it lived and judged at; tasks owned by another project are never re-bound. Re-application finds no candidates and changes nothing (idempotent). Mirrors `task backfill-project`.",
         },
+        // ---- task: human signboard (task 01a1ad1d, REQ-TN, OQ-TN-1) ----
+        OpDescriptor {
+            name: "task.rename",
+            class: OpClass::Mutation,
+            input: "TaskRenameReq{id, name, expected_lock}",
+            output: "TaskRenameOutcome{task, human_name, changed}",
+            description: "HUMAN door to the signboard (ratified OQ-TN-1): set or replace the task's human name directly — no rework cycle, the workflow state is never touched. The name is validated against the SAME declarative window as spec publication (config/workflow/task-name.yaml: blank / too-short / too-long / multi-line values refuse typed `contract_rejected`); refs resolve first, a stale `expected_lock` refuses typed `conflict`, re-applying the name the task already carries is a side-effect-free NO-OP (`changed=false`), an effective change bumps lock_version and appends one `task.human_name.set` event in the SAME transaction. The formal title is never rewritten (REQ-TN-01). Mirrors `task rename`.",
+        },
         OpDescriptor {
             name: "task.depend",
             class: OpClass::Mutation,

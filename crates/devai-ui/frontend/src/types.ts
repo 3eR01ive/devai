@@ -31,12 +31,60 @@ export interface Task {
   project_id: string | null;
   title: string;
   business_description: string;
+  // REQ-TN-01: human signboard of the task (analyst's name, stamped at
+  // spec publication; editable by the human `task rename`). null = имени
+  // ещё нет. Формальный title остаётся текстом создавшего всегда.
+  human_name: string | null;
   state: string;
   return_state: string | null;
   requirements_seq: number;
   lock_version: number;
   created_at: string;
   updated_at: string;
+}
+
+// REQ-TN-03: ЕДИНОЕ правило вывески для фронта — одна функция, все вьюхи и
+// списки берут вывеску из неё (не копия правила в каждом рендерере).
+// Зеркало Rust-правила `devai_core::types::Task::display_sign`:
+//  * есть человеческое имя → оно;
+//  * нет имени и задача в DRAFT (анализа ещё не было) → ПЕРВОЕ ПРЕДЛОЖЕНИЕ
+//    исходной постановки (ратифицировано OQ-TN-3: не целиком, не обрезком);
+//  * иначе — формальный заголовок.
+export function taskSignboard(t: Task): string {
+  if (t.human_name && t.human_name.trim().length > 0) return t.human_name;
+  if (t.state === "DRAFT") {
+    const first = firstSentence(t.business_description);
+    if (first.length > 0) return first;
+  }
+  return t.title;
+}
+
+// Первое предложение: до первой концевой пунктуации (. ! ? …), за которой
+// пробел или конец, либо до перевода строки; внутренние пробелы схлопнуты.
+// Детерминированно, то же поведение, что `first_sentence` в devai-core.
+export function firstSentence(text: string): string {
+  const chars = Array.from(text);
+  let cut = chars.length;
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i];
+    if (c === "\n" || c === "\r") {
+      cut = i;
+      break;
+    }
+    if (c === "." || c === "!" || c === "?" || c === "…") {
+      const next = i + 1 < chars.length ? chars[i + 1] : " ";
+      if (next.trim() === "") {
+        cut = i + 1;
+        break;
+      }
+    }
+  }
+  return chars
+    .slice(0, cut)
+    .join("")
+    .split(/\s+/)
+    .filter((w) => w.length > 0)
+    .join(" ");
 }
 
 export interface ContractRef {
@@ -152,9 +200,13 @@ export interface TaskDependency {
   task_id: string;
   task_state: string;
   task_title: string;
+  // Ratified OQ-TN-5: готовые вывески обоих концов ребра (правило REQ-TN-03
+  // посчитано read-плоскостью); title остаётся машиночитаемым следом.
+  task_display: string;
   depends_on_id: string;
   depends_on_state: string;
   depends_on_title: string;
+  depends_on_display: string;
   kind: string; // parent | blocks
   actor: string;
   created_at: string;

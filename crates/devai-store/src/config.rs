@@ -87,6 +87,10 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         "workflow/humanize.yaml",
         include_str!("../../../config/workflow/humanize.yaml"),
     ),
+    (
+        "workflow/task-name.yaml",
+        include_str!("../../../config/workflow/task-name.yaml"),
+    ),
 ];
 
 fn cfg_err(msg: impl Into<String>) -> StoreError {
@@ -1595,6 +1599,119 @@ pub fn load_humanize_policy(dir: &Path) -> StoreResult<HumanizePolicy> {
             policy = serde_yaml::from_value::<HumanizePolicy>(section.clone()).map_err(|e| {
                 cfg_err(format!(
                     "{}: humanize section is invalid (keys: field, language, min_chars, max_chars, overlap_max_ratio, ngram, overlap_ignore, forbidden_markers, slots): {e}",
+                    p.display()
+                ))
+            })?;
+            policy.validate(&p.display().to_string())?;
+        }
+    }
+    Ok(policy)
+}
+
+// ---------------------------------------------------------------------------
+// Human task name template (task 01a1ad1d, REQ-TN-05) — platform protocol
+// data.
+// ---------------------------------------------------------------------------
+
+/// Declarative discipline of the human task name (REQ-TN-05): the field
+/// name, the volume window and the one-line rule live in
+/// `config/workflow/task-name.yaml` (the `task_name:` section) —
+/// project-tunable data, never code literals ("Запечённые в код числа
+/// запрещены"). The mechanical detector (`devai_runtime::taskname`) reads
+/// this policy on every publication path AND the manual `task.rename` gate
+/// applies the SAME window; the factory `Default` is the embedded file's
+/// meaning verbatim, so a home without the file behaves exactly like one
+/// that has it at defaults (the `HumanizePolicy` idiom).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct TaskNamePolicy {
+    /// The field of the spec artifact that carries the name — fixed by the
+    /// contract schema, declared here so producer, gate and reader speak
+    /// one literal (the ratified OQ-HP-6 habit, REQ-TN-02 constraint).
+    pub field: String,
+    pub min_chars: usize,
+    pub max_chars: usize,
+    /// A legal name fits ONE list/graph line: no embedded newlines.
+    pub single_line: bool,
+}
+
+impl Default for TaskNamePolicy {
+    /// The factory bytes (`config/workflow/task-name.yaml`) — a name long
+    /// enough to say what the task is, short enough to sign a row, and
+    /// always a single line.
+    fn default() -> Self {
+        TaskNamePolicy {
+            field: default_task_name_field(),
+            min_chars: default_task_name_min(),
+            max_chars: default_task_name_max(),
+            single_line: true,
+        }
+    }
+}
+
+fn default_task_name_field() -> String {
+    "task_name".into()
+}
+fn default_task_name_min() -> usize {
+    3
+}
+fn default_task_name_max() -> usize {
+    60
+}
+
+impl TaskNamePolicy {
+    /// Bounds checked LOUD at load: a blank field name or an inverted
+    /// window would silently reject (or never reject) every name — the
+    /// operator gets the file, the key and the meaning (REQ-TN-05: an
+    /// out-of-range value is a loud config error, never a swallowed
+    /// default).
+    fn validate(&self, where_: &str) -> StoreResult<()> {
+        if self.field.trim().is_empty() {
+            return Err(cfg_err(format!(
+                "{where_}: task_name.field must name the spec field carrying the human name (factory value: `task_name`)"
+            )));
+        }
+        if self.min_chars > self.max_chars {
+            return Err(cfg_err(format!(
+                "{}: task_name.min_chars ({}) must not exceed task_name.max_chars ({}) — the volume window is empty",
+                where_, self.min_chars, self.max_chars
+            )));
+        }
+        if self.min_chars == 0 {
+            return Err(cfg_err(format!(
+                "{where_}: task_name.min_chars must be >= 1 — a zero floor admits the empty name (the window rejects blank by construction, so a 0 here is a typo)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Merge-scan `workflow/*.yaml` for the `task_name:` key, exactly the
+/// `load_humanize_policy` idiom: files without the section are inert, the
+/// LAST declared section wins, a malformed declaration or a typo'd key is a
+/// LOUD config error naming the file — never a default-silence. An absent
+/// directory/file returns the factory defaults.
+pub fn load_task_name_policy(dir: &Path) -> StoreResult<TaskNamePolicy> {
+    let mut policy = TaskNamePolicy::default();
+    if !dir.is_dir() {
+        return Ok(policy);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    for p in &paths {
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if let Some(section) = doc.get("task_name") {
+            // deny_unknown_fields: a typo'd key names itself here.
+            policy = serde_yaml::from_value::<TaskNamePolicy>(section.clone()).map_err(|e| {
+                cfg_err(format!(
+                    "{}: task_name section is invalid (keys: field, min_chars, max_chars, single_line): {e}",
                     p.display()
                 ))
             })?;

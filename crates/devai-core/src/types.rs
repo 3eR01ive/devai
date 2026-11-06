@@ -169,6 +169,17 @@ pub struct Task {
     pub project_id: Option<Id>,
     pub title: String,
     pub business_description: String,
+    /// The human name of the task (REQ-TN-01): produced by the analyst as a
+    /// required field of the CURRENT specification, stamped onto the task at
+    /// publication, overridable by the human `task.rename` operation
+    /// (ratified OQ-TN-1). NEVER overwrites `title`: the formal title stays
+    /// the verbatim text its creator typed (REQ-TN-01 AC2). Exactly ONE
+    /// current name lives on the task — a new spec version replaces the
+    /// value, it does not accumulate a list (REQ-TN-01 AC3). Legacy tasks
+    /// that passed analysis before names existed keep `None` and show their
+    /// title (ratified OQ-TN-2: no forced one-time rename).
+    #[serde(default)]
+    pub human_name: Option<String>,
     pub state: TaskState,
     /// Stage currently remembered while the task is in a hold state.
     pub return_state: Option<TaskState>,
@@ -193,6 +204,7 @@ impl Task {
             project_id,
             title: title.into(),
             business_description: business_description.into(),
+            human_name: None,
             state: TaskState::Draft,
             return_state: None,
             requirements_seq: 0,
@@ -201,6 +213,80 @@ impl Task {
             updated_at: now,
         }
     }
+
+    /// THE signboard rule (REQ-TN-03, ONE implementation for every list and
+    /// view — consumers render this value, they never re-derive it from
+    /// artifact bodies or duplicate the rule per renderer):
+    ///  * a human name exists → the name;
+    ///  * no name and the analysis never happened (DRAFT) → the FIRST
+    ///    SENTENCE of the stored business description (ratified OQ-TN-3:
+    ///    neither the whole statement nor a mid-word cut);
+    ///  * neither yields a non-blank value → the formal title.
+    /// Reads only stored task fields — never an artifact body.
+    pub fn display_sign(&self) -> String {
+        task_display_sign(
+            self.state,
+            self.human_name.as_deref(),
+            &self.business_description,
+            &self.title,
+        )
+    }
+}
+
+/// The signboard rule spelled over bare fields — the same ONE rule serving
+/// endpoint projections of dependency edges, where the whole `Task` row of
+/// the far endpoint is not carried (REQ-TN-03: the read plane hands the
+/// finished signboard to its consumers).
+pub fn task_display_sign(
+    state: TaskState,
+    human_name: Option<&str>,
+    business_description: &str,
+    title: &str,
+) -> String {
+    if let Some(n) = human_name {
+        if !n.trim().is_empty() {
+            return n.to_string();
+        }
+    }
+    if state == TaskState::Draft {
+        let first = first_sentence(business_description);
+        if !first.is_empty() {
+            return first;
+        }
+    }
+    title.to_string()
+}
+
+/// The first sentence of a human statement: up to the first sentence-ending
+/// punctuation (`.`, `!`, `?`, `…`) followed by whitespace or the end of the
+/// text, with any newline runs inside the sentence collapsed into single
+/// spaces so the signboard stays a list line. Whitespace-only input reads as
+/// an empty sentence (the caller falls through to the next rule limb).
+/// Deterministic and mechanical — no model, no truncation mid-word.
+pub fn first_sentence(text: &str) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    // collapse newlines for the scan AND the render: the sentence is what
+    // comes first, shown on one line.
+    let ends: &[char] = &['.', '!', '?', '…'];
+    let mut i = 0usize;
+    let cut = loop {
+        if i >= chars.len() {
+            break chars.len();
+        }
+        if chars[i] == '\n' || chars[i] == '\r' {
+            break i;
+        }
+        if ends.contains(&chars[i]) {
+            let next = chars.get(i + 1).copied().unwrap_or(' ');
+            if next.is_whitespace() || i + 1 == chars.len() {
+                break i + 1;
+            }
+        }
+        i += 1;
+    };
+    let raw: String = chars[..cut].iter().collect();
+    chars.clear();
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +341,16 @@ pub struct TaskDependency {
     pub depends_on_id: Id,
     pub depends_on_state: TaskState,
     pub depends_on_title: String,
+    /// Ratified OQ-TN-5: BOTH ends of a graph edge are signed with the
+    /// human signboard (the REQ-TN-03 rule, computed once on the READ plane
+    /// from stored task fields); `id` + the formal title above stay the
+    /// machine-readable traceability half. Consumers render these values and
+    /// never re-derive a signboard (REQ-TN-03: no read-time re-derivation
+    /// per renderer, no artifact parsing for a label).
+    #[serde(default)]
+    pub task_display: String,
+    #[serde(default)]
+    pub depends_on_display: String,
     pub kind: DependencyKind,
     /// Author of the edge — attributed like `decisions.actor` (REQ-07 AC3).
     pub actor: String,
@@ -808,6 +904,13 @@ pub mod event_kind {
     /// project writes nothing. Payload: the new `project_id` and the
     /// `previous_project_id` (null when the task was projectless).
     pub const TASK_PROJECT_SET: &str = "task.project.set";
+    /// REQ-TN (ratified OQ-TN-1): the human signboard of a task was set or
+    /// replaced by the HUMAN `task.rename` operation. Publication of a
+    /// CURRENT spec writes the name through `requirements.published` /
+    /// `requirements.revised` (the payload carries `human_name` there); this
+    /// event is the manual half — one append-only event per EFFECTIVE
+    /// change. Payload: the new `human_name`.
+    pub const TASK_HUMAN_NAME_SET: &str = "task.human_name.set";
     pub const WORKFLOW_STARTED: &str = "workflow.started";
     pub const STATE_CHANGED: &str = "workflow.state_changed";
     pub const REQUIREMENTS_PUBLISHED: &str = "requirements.published";
@@ -912,6 +1015,7 @@ pub mod event_kind {
         TASK_DEPENDENCY_UNLINKED,
         TASK_DEPENDENCY_OVERRIDDEN,
         TASK_PROJECT_SET,
+        TASK_HUMAN_NAME_SET,
         WORKFLOW_STARTED,
         STATE_CHANGED,
         REQUIREMENTS_PUBLISHED,
@@ -1007,6 +1111,10 @@ pub mod json_field {
     /// task). Producer and reader speak one vocabulary.
     pub const PROJECT_ID: &str = "project_id";
     pub const PREVIOUS_PROJECT_ID: &str = "previous_project_id";
+    /// Human task name (REQ-TN, task 01a1ad1d): the signboard written by the
+    /// `task.human_name.set` event and by the requirements publication
+    /// payloads. Producer and reader speak this one literal.
+    pub const HUMAN_NAME: &str = "human_name";
     /// Source workflow events a backfill extracted from, and the decision
     /// rows it created (rung 005 fact-event payload; the ids are also cited
     /// row-to-event via `decisions.refs`).
@@ -1070,6 +1178,7 @@ pub mod json_field {
         DEPENDENCY_KIND,
         PROJECT_ID,
         PREVIOUS_PROJECT_ID,
+        HUMAN_NAME,
         SOURCE_EVENTS,
         DECISION_IDS,
         RATIONALE,

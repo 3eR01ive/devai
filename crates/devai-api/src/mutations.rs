@@ -88,6 +88,29 @@ pub struct TaskProjectSetReq {
     pub expected_lock: Option<u64>,
 }
 
+/// `task.rename` (ratified OQ-TN-1) — set/replace the human signboard of
+/// an existing task directly. `id` is a full id or a unique prefix, resolved
+/// through `task.get` semantics first; `name` is the new signboard (window-
+/// checked against the declarative task-name template before any write);
+/// `expected_lock` is the OPTIONAL optimistic lock the writer added last —
+/// a stale value refuses typed `conflict` before any write.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRenameReq {
+    pub id: String,
+    pub name: String,
+    pub expected_lock: Option<u64>,
+}
+
+/// The outcome of `task.rename`: the task row AS STORED after the call plus
+/// the accepted (trimmed) name; `changed=false` exactly when the task
+/// already carried it and nothing was written.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRenameOutcome {
+    pub task: Task,
+    pub human_name: String,
+    pub changed: bool,
+}
+
 /// The outcome of `task.project.set`: the task AS STORED after the call
 /// (lock bumped only when the binding actually changed) and `changed` —
 /// false for an idempotent re-apply of the project already bound, which
@@ -535,6 +558,56 @@ impl Api {
         })
     }
 
+    /// REQ-TN (ratified OQ-TN-1): set or replace the human signboard of a
+    /// task DIRECTLY — the human door to the name, without a rework cycle
+    /// (the morning the operator renamed eleven active tasks by hand proved
+    /// the need). Mirrors `task.project_set`: refs resolve first, the name
+    /// is validated against the SAME declarative window the publication
+    /// gate uses (REQ-TN-05 AC1 «и на ручном публикации» — one rule, two
+    /// doors), a stale `expected_lock` refuses typed `conflict`, an
+    /// effective change writes row + `task.human_name.set` event in one
+    /// transaction. Re-applying the name the task already carries is a
+    /// side-effect-free NO-OP (`changed=false`), like the project binding.
+    /// The workflow state is never touched — a rename signs, it does not
+    /// re-open.
+    pub fn task_rename(&self, req: TaskRenameReq) -> ApiResult<TaskRenameOutcome> {
+        let task = self.store.resolve_task(&req.id)?;
+        if req.expected_lock.is_some_and(|l| l != task.lock_version) {
+            return Err(StoreError::Conflict {
+                what: format!("task {}", task.id),
+                expected: req.expected_lock.unwrap(),
+                found: task.lock_version,
+            }
+            .into());
+        }
+        let policy = self.task_name_policy()?;
+        let name = devai_runtime::taskname::validate_human_name(&req.name, &policy)
+            .map_err(|violations| {
+                ApiError::refused(
+                    "contract_rejected",
+                    format!(
+                        "the human task name violates config/workflow/task-name.yaml: {}",
+                        violations.join("; ")
+                    ),
+                )
+            })?;
+        if task.human_name.as_deref() == Some(name.as_str()) {
+            return Ok(TaskRenameOutcome {
+                task,
+                human_name: name,
+                changed: false,
+            });
+        }
+        let updated = self
+            .store
+            .set_task_human_name(&task, Some(name.as_str()), &self.actor, Utc::now())?;
+        Ok(TaskRenameOutcome {
+            human_name: name,
+            task: updated,
+            changed: true,
+        })
+    }
+
     /// REQ-BIND-03 (C5 D1, backfill under the ratified OQ-BIND-2 rule):
     /// bind `project` to EVERY task that lives unbound and non-terminal —
     /// terminal (ACCEPTED/CANCELLED) history stays where it lived and
@@ -822,6 +895,11 @@ impl Api {
 
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
         let task = self.store.resolve_task(&req.id)?;
+        // The name is read BEFORE the body moves into publication — the
+        // bytes that pass the gate are the bytes the signboard is stamped
+        // from, one source, no second parse of stored content.
+        let field = self.task_name_policy()?.field;
+        let name = workflow::human_name_from_spec(&req.content, &field);
         let _a = self.publish_row_internal(
             task.id,
             ArtifactKind::RequirementsSpec,
@@ -838,6 +916,7 @@ impl Api {
             &task,
             &after,
             req.reason.as_deref(),
+            name.as_deref(),
             &self.actor,
             Utc::now(),
         )?;
@@ -939,8 +1018,27 @@ impl Api {
         match req.kind {
             ArtifactKind::RequirementsSpec => {
                 let arts = self.store.artifacts(task.id)?;
-                let m =
-                    workflow::requirements_published(&task, &arts, None, &self.actor, Utc::now())?;
+                // REQ-TN-02: the phased manual door stamps the name from
+                // the CURRENT spec body too — the content-addressed blob
+                // of the row just published, read with the template's field.
+                let field = self.task_name_policy()?.field;
+                let name = arts
+                    .iter()
+                    .filter(|x| {
+                        x.kind == ArtifactKind::RequirementsSpec
+                            && x.status == ArtifactStatus::Current
+                    })
+                    .max_by_key(|x| x.seq)
+                    .and_then(|x| self.store.read_blob(&x.sha256).ok())
+                    .and_then(|b| workflow::human_name_from_spec(&b, &field));
+                let m = workflow::requirements_published(
+                    &task,
+                    &arts,
+                    None,
+                    name.as_deref(),
+                    &self.actor,
+                    Utc::now(),
+                )?;
                 self.store.commit(task.lock_version, &m)?;
                 Ok(AdvanceOutcome {
                     from: task.state,
@@ -1078,10 +1176,12 @@ impl Api {
             // the source of truth, a broken template is a LOUD refusal,
             // never a silent factory fallback on the manual path.
             let humanize = self.humanize_policy()?;
+            let task_name = self.task_name_policy()?;
             let violations = devai_runtime::artifact_violations(
                 String::from_utf8_lossy(&content).as_ref(),
                 Some(schema.as_str()),
                 &humanize,
+                &task_name,
             )?;
             if !violations.is_empty() {
                 return Err(ApiError::ContractRejected {
@@ -1699,6 +1799,20 @@ impl Api {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.store.root().join("config"));
         Ok(devai_store::config::load_humanize_policy(
+            &cfg_dir.join("workflow"),
+        )?)
+    }
+
+    /// The project's task-name template, resolved exactly the way the
+    /// humanization one is (REQ-TN-05 AC2): loaded per call, so a window
+    /// edit lands on the very next gate without a rebuild, and a broken
+    /// file refuses LOUD — the manual paths never silently fall back to
+    /// the factory while the YAML claims otherwise.
+    fn task_name_policy(&self) -> ApiResult<devai_store::config::TaskNamePolicy> {
+        let cfg_dir = std::env::var_os("DEVAI_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.store.root().join("config"));
+        Ok(devai_store::config::load_task_name_policy(
             &cfg_dir.join("workflow"),
         )?)
     }

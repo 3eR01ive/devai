@@ -15,6 +15,7 @@ pub mod humanize;
 pub mod liveness;
 mod prompt;
 pub mod revision;
+pub mod taskname;
 pub mod worktree;
 
 pub use adapters::{

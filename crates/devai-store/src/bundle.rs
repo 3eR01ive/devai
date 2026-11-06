@@ -390,13 +390,16 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
     let tx = store.conn.unchecked_transaction()?;
 
     tx.execute(
-        "INSERT INTO tasks(id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO tasks(id,project_id,title,business_description,human_name,state,return_state,requirements_seq,lock_version,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         rusqlite::params![
             task.id.to_string(),
             task.project_id.map(|i| i.to_string()),
             task.title,
             task.business_description,
+            // REQ-TN-01: the exported signboard rides the bundle verbatim —
+            // an export/import roundtrip moves the human name with the task.
+            task.human_name,
             task.state.as_str(),
             task.return_state.map(|s| s.as_str()),
             task.requirements_seq,

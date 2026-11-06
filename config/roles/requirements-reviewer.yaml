@@ -14,5 +14,5 @@ instructions: >-
   На rework абзац пишется заново целиком, текущее состояние, не дельта.
 done_criteria: Review Report опубликован с вердиктом APPROVED или NEEDS_REVISION
 tools: ["filesystem:read", "api:project-knowledge"]
-input_contract: requirements-specification@3
+input_contract: requirements-specification@4
 output_contract: review-report@2

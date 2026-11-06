@@ -66,7 +66,7 @@ fn to_implementation(store: &Store) -> (Task, Artifact, Artifact) {
     commit(
         store,
         &t,
-        workflow::requirements_published(&t, &arts, None, "analyst", now()).unwrap(),
+        workflow::requirements_published(&t, &arts, None, None, "analyst", now()).unwrap(),
     );
     t = store.get_task(&t.id.to_string()).unwrap();
 
@@ -155,7 +155,7 @@ fn revision_marks_dependents_stale_persistently() {
         vec![],
     );
     let arts = store.artifacts(t.id).unwrap();
-    let m = workflow::requirements_published(&t, &arts, Some("scope change"), "u", now()).unwrap();
+    let m = workflow::requirements_published(&t, &arts, Some("scope change"), None, "u", now()).unwrap();
     commit(&store, &t, m);
 
     let arts = store.artifacts(t.id).unwrap();
