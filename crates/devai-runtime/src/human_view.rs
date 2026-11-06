@@ -442,7 +442,8 @@ impl Buckets {
         // decision item, never filed away as a name.
         if let Some(link) = ctx.ratified_by(&c.id) {
             if is_perfect(c) && !is_breach && !is_mech_fail {
-                self.anchors.push(ratified_item(c, statement, link.display()));
+                self.anchors
+                    .push(ratified_item(c, statement, link.display()));
                 return;
             }
         }
@@ -619,9 +620,13 @@ fn no_score_item(c: &CheckOutcome, statement: &str) -> HumanItem {
 /// there is no score; a 1.0 point yields `Some(0.0)` — a real number, printed
 /// as 0.000, so «nothing lost» is visible instead of absent.
 fn importance_of(c: &CheckOutcome) -> Option<f64> {
-    c.score
-        .map(|s| (1.0 - s).max(0.0) * c.weight)
-        .map(|lost| if lost <= LOST_SCORE_EPSILON { 0.0 } else { lost })
+    c.score.map(|s| (1.0 - s).max(0.0) * c.weight).map(|lost| {
+        if lost <= LOST_SCORE_EPSILON {
+            0.0
+        } else {
+            lost
+        }
+    })
 }
 
 /// Exactly 1.0 (within f64 noise) — the only score an anchor may carry.
@@ -1213,7 +1218,8 @@ scoring:
                 .collect();
             assert_eq!(hits.len(), 1, "{} must be in exactly one group", s.as_str());
             assert_ne!(
-                hits[0].kind, "unknown",
+                hits[0].kind,
+                "unknown",
                 "{} is a state the producer emits — never an unknown token",
                 s.as_str()
             );
@@ -1305,5 +1311,21 @@ scoring:
         empty.groups[3].items.clear();
         let text = render_text(&empty);
         assert!(!text.contains(TITLE_UNCHECKED), "{text}");
+    }
+
+    /// REQ-QH-01 AC3 (rework R5): the same assembly inputs yield a BIT-EQUAL
+    /// form on every build. Group membership, ordering and importance come
+    /// from `BTreeMap`s and explicit sorts, so this must hold without a
+    /// dedupe pass at read time — the test pins it, so a future `HashMap` or
+    /// an unstable sort fails here instead of drifting the stored document.
+    #[test]
+    fn two_builds_of_the_same_inputs_are_bit_equal() {
+        let a = serde_json::to_vec(&fixture()).expect("the form serialises");
+        let b = serde_json::to_vec(&fixture()).expect("the form serialises");
+        assert_eq!(a, b, "assembly must be deterministic for the same inputs");
+        // And the deterministic order is the DECISION order, not id order.
+        let v: HumanReportView = serde_json::from_slice(&a).expect("round-trips");
+        let blocks: Vec<&str> = v.groups[0].items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(blocks, vec!["pend/p", "blk/floor"]);
     }
 }

@@ -67,7 +67,7 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
 
     for (name, version, schema) in contracts() {
         if store.get_contract(name, version)?.is_none() {
-            store.put_contract(name, version, schema)?;
+            store.put_contract(name, version, &schema)?;
         }
     }
 
@@ -98,7 +98,26 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
 /// Output-contract schemas (JSON Schema draft-07). These define the SHAPE
 /// of role results; the per-check acceptance rules live in
 /// `config/criteria/*.yaml`.
-pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
+pub fn contracts() -> Vec<(&'static str, u32, String)> {
+    contracts_raw()
+        .into_iter()
+        .map(|(name, version, raw)| (name, version, fill_vocabulary(raw)))
+        .collect()
+}
+
+/// Rework R4: fill the vocabulary placeholders of a schema with the ONE
+/// generated vocabulary ([`devai_core::vocab`]). The seeded contract can then
+/// never list a check state or item kind the code does not emit, and adding a
+/// token is a `vocab.json` edit — not a hunt through hand-copied JSON.
+fn fill_vocabulary(raw: &str) -> String {
+    raw.replace(
+        "@CHECK_STATE_ENUM@",
+        devai_core::vocab::CheckState::JSON_ENUM,
+    )
+    .replace("@ITEM_KIND_LIST@", devai_core::vocab::ItemKind::LIST)
+}
+
+fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
     vec![
         (
             "requirements-specification",
@@ -415,7 +434,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             "properties": {
               "id": { "type": "string" },
               "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
-              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
               "score": { "type": "number" },
               "floor": { "type": "number" },
               "weight": { "type": "number" },
@@ -481,7 +500,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             "properties": {
               "id": { "type": "string" },
               "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
-              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
               "score": { "type": "number" },
               "floor": { "type": "number" },
               "weight": { "type": "number" },
@@ -558,7 +577,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             "properties": {
               "id": { "type": "string" },
               "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
-              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
               "score": { "type": "number" },
               "floor": { "type": "number" },
               "weight": { "type": "number" },
@@ -634,7 +653,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
                   "required": ["id", "kind", "summary", "site"],
                   "properties": {
                     "id": { "type": "string" },
-                    "kind": { "type": "string", "description": "gate | gate-unperformed | cap | pending | floor | mechanical | scored | blocked | anchor | passed | no-score | unknown" },
+                    "kind": { "type": "string", "description": "@ITEM_KIND_LIST@" },
                     "summary": { "type": "string", "description": "ONE short visible line — no code, no paragraphs (REQ-QH-04)" },
                     "site": { "type": "string", "description": "file:line of the finding, empty when there is none" },
                     "score": { "type": ["number", "null"] },
@@ -701,7 +720,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             "properties": {
               "id": { "type": "string" },
               "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
-              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
               "score": { "type": "number" },
               "floor": { "type": "number" },
               "weight": { "type": "number" },
@@ -807,7 +826,7 @@ mod tests {
             .filter(|(name, _, _)| *name == "quality-report")
             .max_by_key(|(_, version, _)| *version)
             .expect("quality-report contract is seeded");
-        serde_json::from_str(raw).expect("the seeded schema is valid JSON")
+        serde_json::from_str(&raw).expect("the seeded schema is valid JSON")
     }
 
     #[test]

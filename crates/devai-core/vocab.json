@@ -1,0 +1,44 @@
+{
+  "_comment": "SINGLE SOURCE of the quality-evaluation vocabulary (rework R4). devai-core/build.rs turns this file into Rust code (crates/devai-core/src/vocab.rs includes it), and devai-ui/build.rs turns it into the frontend TS unions (crates/devai-ui/frontend/src/vocab.generated.ts). The seeded JSON schema (quality-report) takes its check-state enum and item-kind list from the generated Rust constants. Never hand-edit a generated surface; add the token HERE and rebuild.",
+  "check_states": [
+    {
+      "variant": "MechanicalPass",
+      "token": "MECHANICAL_PASS",
+      "doc": "Mechanical probes all passed — the platform's own 1.0."
+    },
+    {
+      "variant": "MechanicalFail",
+      "token": "MECHANICAL_FAIL",
+      "doc": "A mechanical probe failed: blocking, never a footnote."
+    },
+    {
+      "variant": "Scored",
+      "token": "SCORED",
+      "doc": "Rubric-reviewed and scored by the auditor."
+    },
+    {
+      "variant": "Blocked",
+      "token": "BLOCKED",
+      "doc": "No score: probe did not run, evidence missing, or no auditor rating."
+    },
+    {
+      "variant": "PendingHuman",
+      "token": "PENDING_HUMAN",
+      "doc": "Left unsigned on purpose — the human's signature is the verdict."
+    }
+  ],
+  "item_kinds": [
+    { "variant": "Gate", "token": "gate", "doc": "A gate probe failed — the verdict goes back." },
+    { "variant": "GateUnperformed", "token": "gate-unperformed", "doc": "A gate probe could not be performed." },
+    { "variant": "Cap", "token": "cap", "doc": "Unperformed weight above the cap: the verdict cannot be complete." },
+    { "variant": "Pending", "token": "pending", "doc": "Waiting for the human's signature." },
+    { "variant": "Floor", "token": "floor", "doc": "A floor was breached." },
+    { "variant": "Mechanical", "token": "mechanical", "doc": "A mechanical check failed." },
+    { "variant": "Scored", "token": "scored", "doc": "A scored point in the nuances band (ratified OQ-QH-1/2)." },
+    { "variant": "Blocked", "token": "blocked", "doc": "Not performed — no score." },
+    { "variant": "Anchor", "token": "anchor", "doc": "Kept in force by a named ratified decision (names only)." },
+    { "variant": "Passed", "token": "passed", "doc": "Scored 1.0 without a decision link (presented, importance 0)." },
+    { "variant": "NoScore", "token": "no-score", "doc": "Scored state without a score — nothing to present but the fact." },
+    { "variant": "Unknown", "token": "unknown", "doc": "A state this build does not recognise, shown with its raw token." }
+  ]
+}

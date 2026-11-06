@@ -136,30 +136,14 @@ export interface ActiveSnapshot {
   rows: ActiveRow[];
 }
 
-// Contract lexicon (rework R3): these tokens are declared ONCE in
-// `devai_core::vocab` and pinned here by a parity test in `src/commands.rs`
-// (`ts_types_match_the_rust_vocabulary`). A state or kind added on the Rust
-// side without this file fails `cargo test`, before the window ever opens.
-export type CheckStateToken =
-  | "MECHANICAL_PASS"
-  | "MECHANICAL_FAIL"
-  | "SCORED"
-  | "BLOCKED"
-  | "PENDING_HUMAN";
-
-export type HumanItemKind =
-  | "gate"
-  | "gate-unperformed"
-  | "cap"
-  | "pending"
-  | "floor"
-  | "mechanical"
-  | "scored"
-  | "blocked"
-  | "anchor"
-  | "passed"
-  | "no-score"
-  | "unknown";
+// Contract lexicon (rework R3/R4): these tokens are declared ONCE in
+// `crates/devai-core/vocab.json`; the unions below are GENERATED from that
+// data by `crates/devai-ui/build.rs` into `./vocab.generated.ts` and only
+// re-exported here. Do not hand-write a token here — edit vocab.json and
+// rebuild; `ts_types_match_the_rust_vocabulary` in `src/commands.rs` fails if
+// the generated file stops matching the Rust enums.
+import type { CheckStateToken, HumanItemKind } from "./vocab.generated";
+export type { CheckStateToken, HumanItemKind } from "./vocab.generated";
 
 export interface HumanFormItem {
   id: string;

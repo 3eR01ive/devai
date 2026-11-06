@@ -8,13 +8,13 @@ import { computed, onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
+import { anchorLine, fmtNum, presentReport, type ReportBody } from "../report_view";
 import type {
   ActiveRow,
   Artifact,
   ArtifactContent,
   Decision,
   DependenciesView,
-  HumanForm,
   LivenessView,
   ProgressView,
   QualityReportView,
@@ -139,18 +139,13 @@ async function loadReport() {
 
 // Человеческая форма отчёта — сохранённый при публикации `human_view`
 // (REQ-QH-01): рендерим его поля как есть, порядок групп, баллы и важность
-// не пересчитываются в UI. Старый отчёт без формы идёт плоским report_text.
-const humanForm = computed<HumanForm | null>(() => {
-  const body = report.value?.report as { human_view?: HumanForm } | null | undefined;
-  return body?.human_view ?? null;
-});
-
-// Единый форматтер чисел пункта (R9): балл, вес и важность печатаются одной
-// точностью — той же, что в CLI-рендере сохранённой формы. Второй форматер
-// с собственной точностью человеку пришлось бы сверять глазами.
-function fmtNum(v: number): string {
-  return v.toFixed(3);
-}
+// не пересчитываются в UI. Какую ветку показать (форма / повреждённая форма /
+// плоский текст / пусто) решает `report_view.ts` — по source API и с
+// проверкой формы, чтобы структурно битый blob не ронял панель (rework R2;
+// ветки покрыты tests/report_view.test.ts, R3).
+const reportBody = computed<ReportBody | null>(() =>
+  report.value ? presentReport(report.value) : null,
+);
 
 async function openContent(a: Artifact) {
   contentFor.value = a.id;
@@ -378,27 +373,28 @@ onMounted(loadAll);
           </div>
           <!-- Человеческая форма (REQ-QH-03/04): группы читаются из
                сохранённого human_view как есть — UI ничего не группирует и не
-               пересчитывает; код и доказательства живут в свёртке пункта. -->
-          <template v-if="humanForm">
+               пересчитывает; код и доказательства живут в свёртке пункта.
+               Ветку выбирает report_view.ts (rework R2/R3): битая форма даёт
+               честный маркер, а не падение панели. -->
+          <template v-if="reportBody && reportBody.kind === 'form'">
             <div class="qr-headline">
-              <span class="mono">ВЕРДИКТ: {{ humanForm.headline.verdict }} ({{ humanForm.headline.machine_verdict }})</span>
-              <span class="muted mono">S={{ humanForm.headline.score.toFixed(3) }}/1.00 · порог {{ humanForm.headline.theta.toFixed(2) }}</span>
+              <span class="mono">ВЕРДИКТ: {{ reportBody.form.headline.verdict }} ({{ reportBody.form.headline.machine_verdict }})</span>
+              <span class="muted mono">S={{ fmtNum(reportBody.form.headline.score) }}/1.00 · порог {{ fmtNum(reportBody.form.headline.theta) }}</span>
             </div>
-            <p class="muted" style="margin: 2px 0 8px">{{ humanForm.headline.basis }}</p>
+            <p class="muted" style="margin: 2px 0 8px">{{ reportBody.form.headline.basis }}</p>
             <p class="mono muted" style="margin: 0 0 10px">
-              бьёт по вердикту: {{ humanForm.headline.counts.blocks }} ·
-              нюансы: {{ humanForm.headline.counts.nuances }} ·
-              якоря: {{ humanForm.headline.counts.anchors }} ·
-              не проверено: {{ humanForm.headline.counts.unchecked }}
+              бьёт по вердикту: {{ reportBody.form.headline.counts.blocks }} ·
+              нюансы: {{ reportBody.form.headline.counts.nuances }} ·
+              якоря: {{ reportBody.form.headline.counts.anchors }} ·
+              не проверено: {{ reportBody.form.headline.counts.unchecked }}
             </p>
-            <div v-for="g in humanForm.groups.filter(x => x.items.length)" :key="g.key" class="qr-group">
+            <div v-for="g in reportBody.form.groups.filter(x => x.items.length)" :key="g.key" class="qr-group">
               <h4 class="qr-group-title">{{ g.title }} ({{ g.items.length }})</h4>
               <p v-if="g.lead" class="muted" style="margin: 0 0 4px">{{ g.lead }}</p>
               <ul class="qr-items">
                 <li v-for="it in g.items" :key="it.id">
                   <template v-if="g.key === 'anchors'">
-                    <span class="mono">{{ it.id }}</span>
-                    <span class="muted"> — закреплено: {{ it.ratified_by ?? "отсылка на решение не указана" }}</span>
+                    <span class="mono">{{ anchorLine(it) }}</span>
                   </template>
                   <template v-else>
                     <div class="qr-item-line">
@@ -419,7 +415,14 @@ onMounted(loadAll);
               </ul>
             </div>
           </template>
-          <pre v-else-if="report.report_text" class="content">{{ report.report_text }}</pre>
+          <template v-else-if="reportBody && reportBody.kind === 'damaged'">
+            <div class="errorbox" style="margin-bottom: 8px">{{ reportBody.marker }}</div>
+            <pre v-if="reportBody.text" class="content">{{ reportBody.text }}</pre>
+          </template>
+          <pre
+            v-else-if="reportBody && (reportBody.kind === 'flat' || reportBody.kind === 'absent')"
+            class="content"
+          >{{ reportBody.text }}</pre>
           <details>
             <summary class="muted">machine-тело отчёта</summary>
             <pre class="content">{{ JSON.stringify(report.report, null, 2) }}</pre>

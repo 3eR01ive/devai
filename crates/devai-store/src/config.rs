@@ -2184,9 +2184,9 @@ scoring:
     #[test]
     fn current_contracts_declare_every_required_key() {
         // Keep only the latest version per name — @1 stays seeded untouched.
-        let mut latest: BTreeMap<&str, (u32, &str)> = BTreeMap::new();
+        let mut latest: BTreeMap<&str, (u32, String)> = BTreeMap::new();
         for (name, version, schema) in crate::seed::contracts() {
-            let e = latest.entry(name).or_insert((0, ""));
+            let e = latest.entry(name).or_insert((0, String::new()));
             if version > e.0 {
                 *e = (version, schema);
             }
@@ -2230,7 +2230,7 @@ scoring:
     /// the historical incident key is declared in properties now.
     #[test]
     fn requirements_specification_v2_makes_echo_fields_optional_and_declared() {
-        let (_, v2, schema) = crate::seed::contracts()
+        let (_, _v2, schema) = crate::seed::contracts()
             .into_iter()
             .find(|(name, ver, _)| *name == "requirements-specification" && *ver == 2)
             .expect("requirements-specification@2 is seeded");

@@ -1281,7 +1281,7 @@ scoring:
             serde_json::json!(fixture_revision()),
             "assemble must embed the platform revision verbatim"
         );
-        crate::adapters::validate_against_contract(&out.json.to_string(), Some(schema))
+        crate::adapters::validate_against_contract(&out.json.to_string(), Some(&schema))
             .expect("assembled report must satisfy quality-report@4");
 
         // Gap-only assessment (mock-cycle shape): BLOCKED entries cite their
@@ -1304,7 +1304,7 @@ scoring:
                 c["id"]
             );
         }
-        crate::adapters::validate_against_contract(&out2.json.to_string(), Some(schema))
+        crate::adapters::validate_against_contract(&out2.json.to_string(), Some(&schema))
             .expect("blocked-mix report must satisfy quality-report@4");
     }
 }
