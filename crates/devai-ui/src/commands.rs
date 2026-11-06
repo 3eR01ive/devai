@@ -397,6 +397,45 @@ mod tests {
         }
     }
 
+    /// R4 (ts/coverage-static): the serde output of the ipc command core is
+    /// the frontend's contract — `types.ts` is written against it. This
+    /// fixture pins the exact JSON shape: field names of `UiError`, the
+    /// `shape` tag token and the variant field names of `ArtifactContent`.
+    /// A rename or a tag move fails HERE (cargo test, before the window
+    /// ever opens), not as a runtime symptom of a silent `undefined`
+    /// through types.ts.
+    #[test]
+    fn ipc_serde_output_is_pinned_by_fixtures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ipc_shapes.json"))
+                .expect("ipc fixtures must be valid JSON");
+        let id = "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
+
+        let err = UiError {
+            code: "not_found".to_string(),
+            message: "task `x1` was not found".to_string(),
+        };
+        assert_eq!(serde_json::to_value(&err).unwrap(), fixture["ui_error"]);
+
+        let text = ArtifactContent::Text {
+            artifact_id: id.clone(),
+            text: "hello ipc".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&text).unwrap(),
+            fixture["artifact_text"]
+        );
+
+        let bin = ArtifactContent::Binary {
+            artifact_id: id,
+            size: 42,
+        };
+        assert_eq!(
+            serde_json::to_value(&bin).unwrap(),
+            fixture["artifact_binary"]
+        );
+    }
+
     /// REQ-WV-04 AC1 + AC4 (mechanical half, the window-content criterion
     /// itself is T7's harness): the frontend's data door is closed over
     /// this table — EVERY `invoke("<name>")` in api.ts must

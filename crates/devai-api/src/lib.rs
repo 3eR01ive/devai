@@ -430,86 +430,44 @@ impl Api {
         Ok(view)
     }
 
-    /// The one resolution both workspace operations share: stored facts
-    /// first (events + project rows), then — and only as a reachability
-    /// question — which recorded repository directory can answer git.
+    /// The one resolution both workspace operations share, split into two
+    /// private units (R2): `workspace_event_facts` — a pure fold over the
+    /// task's stored workflow events — and `resolve_workspace_repo` — the
+    /// reachability question of which recorded directory can answer git.
+    /// Both operations go through this ONE path, which is why list and diff
+    /// cannot disagree; the split changes the shape, not the resolution.
     /// No re-derivation: baseline = stored `bound_head`, tip = live branch
     /// or the last stored `worktree.committed` stamp.
     fn workspace_facts(&self, id_prefix: &str) -> ApiResult<WorkspaceFacts> {
         let t = self.store.resolve_task(id_prefix)?;
         let events = self.store.all_events_for_task(t.id)?;
-
-        let mut bound_head: Option<String> = None;
-        let mut worktree_dir: Option<String> = None;
-        let mut merged: Option<(Option<String>, Option<String>)> = None;
-        let mut commits: Vec<WorkspaceCommitStamp> = Vec::new();
-        let mut isolated = false;
-        for ev in &events {
-            match ev.kind.as_str() {
-                event_kind::WORKTREE_PREPARED => {
-                    isolated = true;
-                    // The FIRST prepared stamp owns the baseline: isolation
-                    // branched from the bound head of its first composition
-                    // (REQ-WV-03); a later rework reuses the branch.
-                    if bound_head.is_none() {
-                        bound_head = string_field(&ev.payload, "bound_head");
-                    }
-                    worktree_dir = string_field(&ev.payload, "worktree");
-                }
-                event_kind::WORKTREE_COMMITTED => {
-                    if let Some(commit) = string_field(&ev.payload, "commit") {
-                        commits.push(WorkspaceCommitStamp {
-                            execution: string_field(&ev.payload, "execution").unwrap_or_default(),
-                            commit,
-                            at: ev.created_at,
-                        });
-                    }
-                }
-                event_kind::REWORK_MERGED => {
-                    merged = Some((
-                        string_field(&ev.payload, "head_before"),
-                        string_field(&ev.payload, "head_after"),
-                    ));
-                }
-                _ => {}
-            }
+        let mut f = workspace_event_facts(&t, &events);
+        if f.isolated {
+            self.resolve_workspace_repo(&mut f, &t, &events)?;
         }
-        let (head_before, head_after) = merged.unwrap_or((None, None));
+        Ok(f)
+    }
 
-        let mut f = WorkspaceFacts {
-            task: t.id.to_string(),
-            isolated,
-            // The branch name is deterministic from the task id — the same
-            // spelling task.active publishes for a prepared worktree
-            // (worktree::branch_name is the only place the shape exists).
-            branch: isolated.then(|| worktree::branch_name(t.id)),
-            worktree: worktree_dir.clone(),
-            bound_head: bound_head.clone(),
-            commits: commits.clone(),
-            head_before,
-            head_after,
-            state: workspace_state::NO_ISOLATION,
-            repo: None,
-            tip: None,
-            partial: false,
-            note: None,
-        };
-        if !isolated {
-            f.note = Some(
-                "the task has no worktree.prepared event — its work was never isolated; there is no changeset to show"
-                    .into(),
-            );
-            return Ok(f);
-        }
+    /// Repo-resolution unit: candidates strictly from stored paths (the
+    /// recorded worktree directory, the workspace recorded at
+    /// `rework.merged`, then the task's project repositories). The owner of
+    /// the facts is the one that resolves them — REQ-WV-07 AC3 makes this a
+    /// rev-resolvability question. The branch probe is typed
+    /// (`worktree::branch_tip`): "git itself failed" propagates as a
+    /// distinguishable failure (R3) and never degrades into a
+    /// `historical`/`unavailable` verdict masquerading as an honest answer.
+    fn resolve_workspace_repo(
+        &self,
+        f: &mut WorkspaceFacts,
+        t: &Task,
+        events: &[WorkflowEvent],
+    ) -> ApiResult<()> {
+        let git_err = |e| ApiError::Runtime(RuntimeError::Worktree(e));
+        let bound = f.bound_head.clone();
+        let last_commit = f.commits.last().map(|c| c.commit.clone());
 
-        // Candidate repositories, strictly from stored paths: the recorded
-        // worktree directory, the workspace recorded at `rework.merged`,
-        // then the task's project repositories. The owner of the facts is
-        // the one that resolves them (branch ref or commit objects) —
-        // REQ-WV-07 AC3 makes this a rev resolvability question.
-        let last_commit = commits.last().map(|c| c.commit.clone());
         let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Some(dir) = &worktree_dir {
+        if let Some(dir) = &f.worktree {
             candidates.push(PathBuf::from(dir));
         }
         if let Some(ev) = events
@@ -528,37 +486,47 @@ impl Api {
                 }
             }
         }
-        let owns_facts = |dir: &Path| -> bool {
-            worktree::branch_tip(dir, t.id).is_some()
-                || bound_head
+        // This repository holds the task's branch, or resolves the stored
+        // commits; a git failure in the probe is an Err, not a verdict.
+        let owns_facts = |dir: &Path| -> ApiResult<bool> {
+            match worktree::branch_tip(dir, t.id).map_err(git_err)? {
+                Some(_) => Ok(true),
+                None => Ok(bound
                     .as_deref()
                     .is_some_and(|h| worktree::commit_resolvable(dir, h))
-                || last_commit
-                    .as_deref()
-                    .is_some_and(|c| worktree::commit_resolvable(dir, c))
+                    || last_commit
+                        .as_deref()
+                        .is_some_and(|c| worktree::commit_resolvable(dir, c))),
+            }
         };
-        let repo = candidates
-            .iter()
-            .find(|c| worktree::is_git_repo(c) && owns_facts(c))
-            .cloned();
+        let mut repo: Option<PathBuf> = None;
+        for c in &candidates {
+            if !worktree::is_git_repo(c) {
+                continue;
+            }
+            if owns_facts(c)? {
+                repo = Some(c.clone());
+                break;
+            }
+        }
         let Some(repo) = repo else {
             f.state = workspace_state::UNAVAILABLE;
             f.note = Some(
                 "no recorded repository path is reachable and owns the stored commits — only the stored facts can be shown"
                     .into(),
             );
-            return Ok(f);
+            return Ok(());
         };
         f.repo = Some(repo.clone());
 
-        if let Some(tip) = worktree::branch_tip(&repo, t.id) {
+        if let Some(tip) = worktree::branch_tip(&repo, t.id).map_err(git_err)? {
             f.state = workspace_state::LIVE;
             f.tip = Some(tip);
-            return Ok(f);
+            return Ok(());
         }
         // Branch gone: (b) is the stored shas still resolvable in the
         // object store, (c) is everything else.
-        let both_resolvable = bound_head
+        let both_resolvable = bound
             .as_deref()
             .is_some_and(|h| worktree::commit_resolvable(&repo, h))
             && last_commit
@@ -578,7 +546,7 @@ impl Api {
                     .into(),
             );
         }
-        Ok(f)
+        Ok(())
     }
     // ------------------------------------------------------------------
     // artifacts
@@ -888,4 +856,76 @@ fn string_field(payload: &serde_json::Value, key: &str) -> Option<String> {
         .get(key)
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+/// Events-scan unit (the R2 split): a pure fold over the task's stored
+/// workflow events — which composition facts the workspace has (baseline =
+/// the `bound_head` of the FIRST `worktree.prepared`, per-run commit
+/// stamps, merge heads) and whether isolation happened at all. No git, no
+/// filesystem: data only. The repository question is a separate unit
+/// (`Api::resolve_workspace_repo`), so both workspace operations keep one
+/// shared resolution and the list/diff stay consistent by construction.
+fn workspace_event_facts(t: &Task, events: &[WorkflowEvent]) -> WorkspaceFacts {
+    let mut bound_head: Option<String> = None;
+    let mut worktree_dir: Option<String> = None;
+    let mut merged: Option<(Option<String>, Option<String>)> = None;
+    let mut commits: Vec<WorkspaceCommitStamp> = Vec::new();
+    let mut isolated = false;
+    for ev in events {
+        match ev.kind.as_str() {
+            event_kind::WORKTREE_PREPARED => {
+                isolated = true;
+                // The FIRST prepared stamp owns the baseline: isolation
+                // branched from the bound head of its first composition
+                // (REQ-WV-03); a later rework reuses the branch.
+                if bound_head.is_none() {
+                    bound_head = string_field(&ev.payload, "bound_head");
+                }
+                worktree_dir = string_field(&ev.payload, "worktree");
+            }
+            event_kind::WORKTREE_COMMITTED => {
+                if let Some(commit) = string_field(&ev.payload, "commit") {
+                    commits.push(WorkspaceCommitStamp {
+                        execution: string_field(&ev.payload, "execution").unwrap_or_default(),
+                        commit,
+                        at: ev.created_at,
+                    });
+                }
+            }
+            event_kind::REWORK_MERGED => {
+                merged = Some((
+                    string_field(&ev.payload, "head_before"),
+                    string_field(&ev.payload, "head_after"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let (head_before, head_after) = merged.unwrap_or((None, None));
+
+    let mut f = WorkspaceFacts {
+        task: t.id.to_string(),
+        isolated,
+        // The branch name is deterministic from the task id — the same
+        // spelling task.active publishes for a prepared worktree
+        // (worktree::branch_name is the only place the shape exists).
+        branch: isolated.then(|| worktree::branch_name(t.id)),
+        worktree: worktree_dir,
+        bound_head,
+        commits,
+        head_before,
+        head_after,
+        state: workspace_state::NO_ISOLATION,
+        repo: None,
+        tip: None,
+        partial: false,
+        note: None,
+    };
+    if !isolated {
+        f.note = Some(
+            "the task has no worktree.prepared event — its work was never isolated; there is no changeset to show"
+                .into(),
+        );
+    }
+    f
 }

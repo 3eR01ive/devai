@@ -334,6 +334,71 @@ fn diff_answers_per_file_with_typed_verdicts() {
     assert!(err.to_string().contains("not in the changeset"));
 }
 
+/// R1 (operator directive): the registry-completeness pin lives on the
+/// LIVE code registry (`devai_api::operations()`), served to consumers by
+/// the published `devai api registry` command. Both view operations must be
+/// registered Read entries with full descriptions and a CLI mirror clause
+/// (Q3 ratified: the console surface exists), which is exactly what
+/// `devai api registry` serves.
+#[test]
+fn both_view_operations_are_published_on_the_live_registry() {
+    let ops = devai_api::operations();
+    for (name, mirror) in [
+        ("task.workspace_changes", "task workspace"),
+        ("task.workspace_diff", "task workspace-diff"),
+    ] {
+        let d = ops
+            .iter()
+            .find(|o| o.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is not published on the live registry"));
+        assert_eq!(
+            d.class,
+            devai_api::OpClass::Read,
+            "`{name}` must stay class=read — the view adds no mutation (REQ-WV-08 AC2)"
+        );
+        assert!(
+            d.description.trim().len() >= 20 && !d.input.is_empty() && !d.output.is_empty(),
+            "`{name}`: description and shapes must be complete registry data"
+        );
+        assert!(
+            d.description.contains(mirror),
+            "`{name}`: description must name its CLI mirror `{mirror}`"
+        );
+    }
+}
+
+/// R5 (data half of the merged render branch): `rework.merged` facts
+/// (head_before/head_after) arrive in the view verbatim — the UI renders
+/// the merge line from stored data and invents nothing (window pairs in
+/// the harness cover the render side).
+#[test]
+fn merge_facts_arrive_in_the_view_verbatim() {
+    let f = Fixture::new(false);
+    let store = Store::open(f.home.path()).unwrap();
+    let head_before = "a".repeat(40);
+    let head_after = "b".repeat(40);
+    store
+        .insert_event(
+            Some(f.task_id),
+            event_kind::REWORK_MERGED,
+            "guerrero",
+            serde_json::json!({
+                "branch": worktree::branch_name(f.task_id),
+                "workspace": f.repo.path().display().to_string(),
+                "head_before": head_before,
+                "head_after": head_after,
+            }),
+        )
+        .unwrap();
+    drop(store);
+
+    let v = f.api().task_workspace_changes(&f.id()).unwrap();
+    // The branch survives the merge (REQ-WV-07a): live view, merge facts shown.
+    assert_eq!(v.state, workspace_state::LIVE);
+    assert_eq!(v.head_before.as_deref(), Some(head_before.as_str()));
+    assert_eq!(v.head_after.as_deref(), Some(head_after.as_str()));
+}
+
 /// REQ-WV-01 AC2: a task without worktree.prepared gets the explicit typed
 /// verdict "no isolation" — not an error, not an invented list. Same for
 /// the companion diff operation.
