@@ -1,0 +1,34 @@
+{
+  "id": "01a1b0ea",
+  "question_id": "01a1b0ea-0000-4000-8000-0000000000bb",
+  "rows": {
+    "APPROVAL": {
+      "demand": "Утвердить или отклонить текущую спецификацию задачи",
+      "cli_hint": "devai task approve 01a1b0ea --rationale \"<обоснование>\" · devai task reject 01a1b0ea --rationale \"<обоснование>\""
+    },
+    "WAITING_FOR_INPUT": {
+      "demand": "Ответить на припаркованный вопрос задачи",
+      "cli_hint": "devai question answer 01a1b0ea-0000-4000-8000-0000000000bb --text \"<ответ>\""
+    },
+    "WAITING_FOR_INPUT_EMPTY_REWORK": {
+      "demand": "Гейт пустого реворка: ратифицировать отсутствие новых изменений",
+      "cli_hint": "devai task ratify-empty-rework 01a1b0ea --rationale \"<обоснование>\""
+    },
+    "QA": {
+      "demand": "Подписать текущий quality-отчёт: принять или вернуть в реворк",
+      "cli_hint": "devai task accept 01a1b0ea --rationale \"<обоснование>\" · devai task return 01a1b0ea --rationale \"<обоснование>\""
+    },
+    "FAILED": {
+      "demand": "Решить по упавшей задаче: возобновить прогон",
+      "cli_hint": "devai task resume 01a1b0ea"
+    },
+    "PAUSED": {
+      "demand": "Задача остановлена паузой оператора — возобновлять по вашему решению",
+      "cli_hint": "devai task resume 01a1b0ea"
+    },
+    "BLOCKED": {
+      "demand": "Задача заблокирована оператором — снимать блок по вашему решению",
+      "cli_hint": "devai task resume 01a1b0ea"
+    }
+  }
+}

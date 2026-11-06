@@ -245,9 +245,47 @@ export type ArtifactContent =
   | { shape: "text"; artifact_id: string; text: string }
   | { shape: "binary"; artifact_id: string; size: number };
 
-export interface InboxEntry {
+export interface WaitRow {
   task: Task;
+  /** Что платформа требует ОТ оператора (REQ-GATE-03 AC1), не свойство задачи. */
+  demand: string;
+  cli_hint: string;
   open_questions: Question[];
+  spec: SpecPresentation | null;
+  report: QualityReportView | null;
+  report_note: string | null;
+}
+
+// Предъявление APPROVAL-строки (REQ-GATE-04/05): тело REQUIREMENTS_SPEC,
+// пришедшее в снимке секции (`inbox_view` → `inbox.snapshot`, НЕ отдельный
+// artifact.cat_text) и разобранное на стороне предъявления
+// без изменения данных. paragraph_source — честная метка происхождения
+// абзаца (ратифицированное OQ-GATE-4), open_questions — вопросы ДОКУМЕНТА,
+// не platform-вопросы реестра (у них нет id и их не отвечают question.answer).
+export interface SpecPresentation {
+  artifact: Artifact;
+  current: boolean; // false = не CURRENT, approve невозможен (OQ-GATE-3)
+  human_paragraph: string | null;
+  paragraph_source: "spec" | "business_description";
+  open_questions: string[];
+  unavailable_note: string | null;
+}
+
+// Справочная группа ниже списка стоящих (ратифицированное OQ-GATE-1):
+// безответный НЕблокирующий вопрос — заметка на активной задаче, платформа
+// на ней не стоит (workflow.rs:747-748), поэтому это не wait-row. Но строкой
+// снапшота она является, и бейдж её считает: badge == waiting + human_stopped
+// + notes (REQ-GATE-08 AC3, commands.rs::compose_wait_snapshot).
+export interface WaitNote {
+  task: Task;
+  question: Question;
+}
+
+export interface WaitSnapshot {
+  waiting: WaitRow[];
+  human_stopped: WaitRow[];
+  notes: WaitNote[];
+  badge: number;
 }
 
 // --- workspace view (task.workspace_changes / task.workspace_diff) ---

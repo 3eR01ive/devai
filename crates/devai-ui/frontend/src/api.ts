@@ -8,7 +8,6 @@ import type {
   ArtifactContent,
   Decision,
   DependenciesView,
-  InboxEntry,
   LivenessView,
   OpDescriptor,
   ProgressView,
@@ -20,6 +19,7 @@ import type {
   StatusView,
   Task,
   UiError,
+  WaitSnapshot,
   WorkflowEvent,
   WorkspaceChangesView,
   WorkspaceDiffView,
@@ -65,7 +65,9 @@ export const api = {
   executionLiveness: (exec_id: string) =>
     invoke<LivenessView>("execution_liveness", { exec_id }),
 
-  inboxView: () => invoke<InboxEntry[]>("inbox_view"),
+  // Секция ожидания человека (REQ-GATE-01..10): один снимок — строки
+  // гейтов, остановленные, справочные заметки и бейдж на нём же.
+  inboxView: () => invoke<WaitSnapshot>("inbox_view"),
 };
 
 export function toUiError(e: unknown): UiError {

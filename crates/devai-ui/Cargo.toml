@@ -13,6 +13,9 @@ description = "devai-ui: Tauri desktop consumer of the platform API — read-onl
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
+# REQ-GATE-04: the APPROVAL presentation reads the REQUIREMENTS_SPEC JSON
+# body (published artifact.cat_text output) — parsing only, never rewrite.
+serde_json.workspace = true
 dirs.workspace = true
 devai-core.workspace = true
 devai-api.workspace = true

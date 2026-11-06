@@ -58,5 +58,131 @@
     "kind": "BLOCKS",
     "actor": "operator",
     "created_at": "2026-11-06T12:00:00Z"
+  },
+  "wait_snapshot": {
+    "badge": 2,
+    "human_stopped": [],
+    "notes": [
+      {
+        "question": {
+          "answer": null,
+          "answered_at": null,
+          "answered_by": null,
+          "blocking": false,
+          "context": null,
+          "created_at": "2026-11-06T12:00:00Z",
+          "execution_id": null,
+          "id": "01a1b0ea-0000-4000-8000-0000000000cc",
+          "options": [],
+          "status": "OPEN",
+          "task_id": "01a1b0ea-0000-4000-8000-000000000001",
+          "text": "Заметка без блокировки?"
+        },
+        "task": {
+          "business_description": "бизнес-описание",
+          "created_at": "2026-11-06T12:00:00Z",
+          "id": "01a1b0ea-0000-4000-8000-000000000001",
+          "lock_version": 4,
+          "project_id": null,
+          "requirements_seq": 3,
+          "return_state": null,
+          "state": "APPROVAL",
+          "title": "Спека ожидания",
+          "updated_at": "2026-11-06T12:00:00Z",
+          "display": "Спека ожидания",
+          "human_name": null
+        }
+      }
+    ],
+    "waiting": [
+      {
+        "cli_hint": "devai task approve 01a1b0ea --rationale \"<обоснование>\"",
+        "open_questions": [
+          {
+            "answer": null,
+            "answered_at": null,
+            "answered_by": null,
+            "blocking": true,
+            "context": null,
+            "created_at": "2026-11-06T12:00:00Z",
+            "execution_id": null,
+            "id": "01a1b0ea-0000-4000-8000-0000000000bb",
+            "options": [],
+            "status": "OPEN",
+            "task_id": "01a1b0ea-0000-4000-8000-000000000001",
+            "text": "Ответить на вопрос?"
+          }
+        ],
+        "report": null,
+        "report_note": null,
+        "spec": {
+          "artifact": {
+            "category": "ARTIFACT",
+            "contract": null,
+            "created_at": "2026-11-06T12:00:00Z",
+            "created_by": "user",
+            "depends_on": [],
+            "execution_id": null,
+            "id": "01a1b0ea-0000-4000-8000-0000000000aa",
+            "kind": "REQUIREMENTS_SPEC",
+            "media_type": "application/json",
+            "name": "requirements-specification",
+            "seq": 3,
+            "sha256": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "size": 12,
+            "status": "CURRENT",
+            "task_id": "01a1b0ea-0000-4000-8000-000000000001"
+          },
+          "current": true,
+          "human_paragraph": "Коротко: что происходит.",
+          "open_questions": [
+            "OQ-GATE-1: вопрос документа?"
+          ],
+          "paragraph_source": "spec",
+          "unavailable_note": null
+        },
+        "task": {
+          "business_description": "бизнес-описание",
+          "created_at": "2026-11-06T12:00:00Z",
+          "id": "01a1b0ea-0000-4000-8000-000000000001",
+          "lock_version": 4,
+          "project_id": null,
+          "requirements_seq": 3,
+          "return_state": null,
+          "state": "APPROVAL",
+          "title": "Спека ожидания",
+          "updated_at": "2026-11-06T12:00:00Z",
+          "display": "Спека ожидания",
+          "human_name": null
+        },
+        "demand": "Утвердить или отклонить текущую спецификацию задачи"
+      }
+    ]
+  },
+  "spec_presentation": {
+    "artifact": {
+      "category": "ARTIFACT",
+      "contract": null,
+      "created_at": "2026-11-06T12:00:00Z",
+      "created_by": "user",
+      "depends_on": [],
+      "execution_id": null,
+      "id": "01a1b0ea-0000-4000-8000-0000000000aa",
+      "kind": "REQUIREMENTS_SPEC",
+      "media_type": "application/json",
+      "name": "requirements-specification",
+      "seq": 3,
+      "sha256": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "size": 12,
+      "status": "CURRENT",
+      "task_id": "01a1b0ea-0000-4000-8000-000000000001"
+    },
+    "current": true,
+    "human_paragraph": "Коротко: что происходит.",
+    "open_questions": [
+      "OQ-GATE-1: вопрос документа?"
+    ],
+    "paragraph_source": "spec",
+    "unavailable_note": null
   }
 }

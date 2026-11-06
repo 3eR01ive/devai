@@ -89,7 +89,7 @@
 # семантике Probe{pass_exit} выше, не FAIL. Веса проверок не тронуты
 # (гейты бинарны, V7 sum=1.00 сохранён).
 
-version: 13
+version: 15
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -264,7 +264,9 @@ gates:
     desc: Секретов в репозитории нет
     # --exclude: сам профиль хранит regex-паттерны — не даём шлюзу матчиться на себя
     probes:
-      - { cmd: "test -z \"$(grep -RIlE 'api[_-]?key|BEGIN.*PRIVATE KEY' crates config --exclude=quality.yaml 2>/dev/null)\"", pass_exit: [0] }
+      # vendored-каталоги (node_modules/dist/target) исключены: пакеты приносят свои .yml с ключевыми
+      # словами, это не секреты репозитория (та же политика, что у no-network после quality@12)
+      - { cmd: "test -z \"$(grep -RIlE 'api[_-]?key|BEGIN.*PRIVATE KEY' crates config --exclude=quality.yaml --exclude-dir=node_modules --exclude-dir=target --exclude-dir=dist --exclude-dir=.git 2>/dev/null)\"", pass_exit: [0] }
   - id: ui-content
     desc: >
       Критерий «содержимое окна» (docs/ui-content-criteria.md, D1 01a1acec):
@@ -279,6 +281,18 @@ gates:
       невыполненная проба не притворяется проверенной.
     probes:
       - { cmd: "f=crates/devai-ui/tools/ui_content.py; if [ -f \"$f\" ]; then python3 \"$f\" gate; else ui-audit-harness-absent-guard; fi", pass_exit: [0] }
+
+# Разметка нарушений (v15): балл <1.0 обязан нести метку, иначе «0.7» не значит ничего
+# и цикл доработки гоняет одно и то же (наблюдение 07.11: пункты переоткрывались с разными
+# сайтами, часть — осознанные выборы с ролевым обоснованием).
+violation_labels:
+  required: true
+  default: "DEFECT:"
+  desc: >-
+    Каждая запись в violations при балле <1.0 ОБЯЗАНА начинаться с «DEFECT:» (код требует правки)
+    или «NUANCE:» (осознанный выбор, приемлемый в продукте: роль обоснована в коде, риск локальный).
+    Запись без метки трактуется как DEFECT. Возвраты в доработку ведутся ТОЛЬКО по DEFECT;
+    NUANCE идут в отчёт к человеческой приёмке и кодом не чинятся.
 
 evaluations:
   - id: readability
@@ -307,15 +321,19 @@ evaluations:
         evidence: required
         reviewer: either
       - id: cl/short-units
-        statement: Единицы кода читаются целиком (порог 40 строк тела); вложенность управляющего потока ограничена.
+        statement: >-
+          ИСПОЛНЯЕМЫЕ единицы кода читаются целиком (порог 40 строк тела); вложенность управляющего
+          потока ограничена. ВНЕ ОБЛАСТИ проверки: const/static таблицы данных, конфигурационные
+          списки, enum-наборы, реестры операций и прочие декларативные данные — они судятся как
+          данные (arch/registry-in-data), а не как код; длина таблицы данных не является нарушением.
         detects: [clarity/oversized-unit, clarity/deep-nesting]
         verify: hybrid
         probes:
           - { cmd: "python3 crates/devai-store/tools/fn_size.py | head -20", pass_exit: [0, 1] }
         anchors:
-          "1.0": кандидатов нет или все с ролевым обоснованием (константные таблицы, данные)
-          "0.7": единичные длинные с обоснованием роли
-          "0.4": длинные несут доменную логику, есть пирамиды вложенности
+          "1.0": исполняемых тел сверх порога нет; декларативные таблицы данных в область не входят
+          "0.7": единичные исполняемые тела сверх порога с обоснованием роли в коде
+          "0.4": исполняемые тела сверх порога несут доменную логику, есть пирамиды вложенности
           "0.0": структура не читается
         evidence: required
         reviewer: either

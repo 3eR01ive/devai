@@ -181,7 +181,7 @@ fn full_cycle_through_both_human_gates() {
             .find(|a| a.kind == ArtifactKind::QualityReport)
             .unwrap()
             .clone();
-        let body = store.read_blob(&a.sha256).unwrap();
+        let body = store.read_artifact_body(&a).unwrap();
         (a, body)
     };
     // The report is pinned to the strengthened contract version.
@@ -416,7 +416,7 @@ fn approved_decisions_reach_every_post_approve_role() {
         .find(|a| a.kind == ArtifactKind::ImplementationReport)
         .unwrap();
     let body: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&impl_art.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&impl_art).unwrap()).unwrap();
     let notes = body["notes"].as_str().unwrap_or_default();
     assert!(
         notes.contains("APPROVED_DECISIONS"),
@@ -426,7 +426,7 @@ fn approved_decisions_reach_every_post_approve_role() {
         .iter()
         .find(|a| a.kind == ArtifactKind::QualityReport)
         .unwrap();
-    let qa_body = store.read_blob(&qa_art.sha256).unwrap();
+    let qa_body = store.read_artifact_body(&qa_art).unwrap();
     let qa: serde_json::Value = serde_json::from_slice(&qa_body).unwrap();
     assert_eq!(
         qa["verdict"], "ESCALATE",
@@ -791,7 +791,7 @@ fn platform_stamps_spec_echo_fields_from_stored_data() {
         .find(|a| a.kind == ArtifactKind::RequirementsSpec)
         .unwrap();
     let body: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&spec.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&spec).unwrap()).unwrap();
     // REQ-FG-06: the platform completed the echo from STORED data.
     assert_eq!(body["task_id"], serde_json::json!(t.id.to_string()));
     assert_eq!(
@@ -1298,7 +1298,7 @@ fn report_and_execution_rows_never_drift_and_bumps_mark_stale() {
         .unwrap()
         .clone();
     let rep: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&a).unwrap()).unwrap();
     let qa = store
         .list_executions(Some(t.id))
         .unwrap()
@@ -1367,7 +1367,7 @@ fn profile_version_bump_marks_report_stale() {
         .max_by_key(|x| x.seq)
         .unwrap();
     let rep: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&a).unwrap()).unwrap();
     assert_eq!(rep["workspace_revision"]["profile"], "devai@2");
 }
 
@@ -1397,7 +1397,7 @@ fn legacy_unbound_report_leaves_the_gate_inert() {
         .unwrap()
         .clone();
     let mut rep: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&a).unwrap()).unwrap();
     rep.as_object_mut().unwrap().remove("workspace_revision");
     store
         .publish_artifact(devai_store::ArtifactDraft {
@@ -1527,7 +1527,7 @@ fn writing_stage_is_isolated_in_platform_worktree() {
         "the role's declared @3 contract is what got published"
     );
     let body: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&impl_a.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&impl_a).unwrap()).unwrap();
     assert_eq!(body["branch"], branch);
     assert_eq!(body["worktree"], wt.display().to_string());
     // REQ-HP-01/07: the paragraph the role wrote is stored and survives the
@@ -1625,7 +1625,7 @@ fn qa_probes_measure_the_worktree_not_the_main_checkout() {
         .find(|x| x.kind == ArtifactKind::QualityReport)
         .unwrap();
     let rep: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&a.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&a).unwrap()).unwrap();
     let gates = rep["evaluation"]["gates"].as_array().unwrap();
     assert_eq!(gates[0]["id"], "always-green");
     assert_eq!(
@@ -2455,7 +2455,7 @@ fn a_first_run_gets_no_empty_section_and_qa_wait_adds_nothing() {
         .find(|a| a.kind == ArtifactKind::ImplementationReport)
         .unwrap();
     let body: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&rep.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&rep).unwrap()).unwrap();
     assert!(
         !body["notes"]
             .as_str()
@@ -2502,7 +2502,7 @@ fn the_rework_execution_actually_receives_the_assembled_section() {
         })
         .unwrap();
     let body: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&rep.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&rep).unwrap()).unwrap();
     assert!(
         body["notes"]
             .as_str()
@@ -2570,7 +2570,7 @@ fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
         })
         .unwrap();
     let body: serde_json::Value =
-        serde_json::from_slice(&store.read_blob(&rep.sha256).unwrap()).unwrap();
+        serde_json::from_slice(&store.read_artifact_body(&rep).unwrap()).unwrap();
     assert!(
         body["notes"]
             .as_str()

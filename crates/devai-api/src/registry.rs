@@ -403,6 +403,14 @@ pub fn operations() -> Vec<OpDescriptor> {
             output: "String",
             description: "Text presentation of artifact content; NotUtf8 error when the bytes are not text.",
         },
+        // ---- human-wait section (task 01a1b0ea) ----
+        OpDescriptor {
+            name: "inbox.snapshot",
+            class: OpClass::Read,
+            input: "()",
+            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note}>}",
+            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA). One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
+        },
         // ---- questions ----
         OpDescriptor {
             name: "question.ask",

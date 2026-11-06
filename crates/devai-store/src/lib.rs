@@ -1076,12 +1076,39 @@ impl Store {
         Ok(artifact)
     }
 
+    pub fn read_blob(&self, sha: &str) -> StoreResult<Vec<u8>> {
+        Ok(std::fs::read(self.blob_path(sha))?)
+    }
+
     pub fn blob_path(&self, sha: &str) -> PathBuf {
         self.blobs.join(&sha[0..2]).join(&sha[2..4]).join(sha)
     }
 
-    pub fn read_blob(&self, sha: &str) -> StoreResult<Vec<u8>> {
-        Ok(std::fs::read(self.blob_path(sha))?)
+    /// The ONE read of an artifact's stored body: every consumer that needs
+    /// the bytes a stored artifact row names goes through here, so the error
+    /// policy is single and cannot drift site by site. The policy:
+    ///
+    /// * the blob file is ABSENT → `NotFound("artifact blob", <sha>)` — the
+    ///   row outlived its content; whether that reads as a missing body (the
+    ///   gate's typed report-body outcome) or as an export failure (the
+    ///   bundle writer) is the caller's presentation, not the store's;
+    /// * the file EXISTS but cannot be read (permissions, a directory in its
+    ///   place, a broken filesystem) → `Corrupt` naming the artifact — that
+    ///   is a broken store, and folding it into «missing» would call it empty.
+    ///
+    /// Content-addressed, so nothing here re-writes or re-derives the bytes.
+    pub fn read_artifact_body(&self, a: &Artifact) -> StoreResult<Vec<u8>> {
+        match std::fs::read(self.blob_path(&a.sha256)) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StoreError::NotFound(
+                "artifact blob".into(),
+                a.sha256.clone(),
+            )),
+            Err(e) => Err(StoreError::Corrupt(format!(
+                "artifact {} body {} is stored but unreadable: {e}",
+                a.id, a.sha256
+            ))),
+        }
     }
 
     pub fn artifacts(&self, task_id: Id) -> StoreResult<Vec<Artifact>> {
@@ -1090,6 +1117,23 @@ impl Store {
              FROM artifacts WHERE task_id=?1 ORDER BY created_at",
         )?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::artifact_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    /// Every artifact row of the home in ONE snapshot (same ordering as
+    /// `artifacts`). Companion of `questions_all` for the human-wait batch
+    /// read: one gate presentation per APPROVAL/QA row must not cost an
+    /// `artifact.list` call each.
+    pub fn artifacts_all(&self) -> StoreResult<Vec<Artifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,kind,name,seq,category,status,sha256,size,media_type,contract_name,contract_version,created_by,execution_id,depends_on,created_at
+             FROM artifacts ORDER BY created_at",
+        )?;
+        let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(rows::artifact_from_row(r)?);
@@ -1622,6 +1666,22 @@ impl Store {
             "SELECT id,task_id,execution_id,text,context,options,blocking,status,answer,answered_by,answered_at,created_at FROM questions WHERE task_id=?1 ORDER BY created_at",
         )?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::question_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    /// Every question row of the home in ONE snapshot, ordered like
+    /// `list_questions` (task-scoped readers group it themselves). Added for
+    /// the human-wait batch read (REQ-GATE-01..10): the section must not
+    /// issue one `question.list` per task.
+    pub fn questions_all(&self) -> StoreResult<Vec<Question>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,execution_id,text,context,options,blocking,status,answer,answered_by,answered_at,created_at FROM questions ORDER BY created_at",
+        )?;
+        let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(rows::question_from_row(r)?);

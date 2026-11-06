@@ -4,10 +4,12 @@
 //! and render domain results.
 
 pub mod error;
+pub mod inbox;
 pub mod types;
 pub mod workflow;
 
 pub use error::{CoreError, CoreResult};
+pub use inbox::{InboxWaitPolicy, WaitGroup, WaitStatePolicy, WaitVariant};
 pub use types::{
     AgentInstance, Artifact, ArtifactKind, ArtifactStatus, ContractRef, DataCategory, Decision,
     DependencyKind, DependencyNode, EpicVertex, EventDraft, ExecutionStatus, Id, Project, Question,

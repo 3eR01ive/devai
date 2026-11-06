@@ -1,0 +1,80 @@
+# Секция ожидания человека в UI (задача 01a1b0ea, REQ-GATE-01..10).
+# Платформенные данные протокола — тот же идиом, что `humanize:` и
+# `response_form:`: merge-scan `workflow/*.yaml` по ключу `inbox_waits:`
+# (devai_store::config::load_inbox_wait_policy). Дом без этого файла ведёт
+# себя ровно как эти фабричные байты; правка текста/группы не требует
+# пересборки. Опечатка в ключе, неизвестный state-токен или неизвестный
+# предикат `when`— ГРОМКАЯ ошибка конфигурации (devai init / load), не
+# молчаливый дефолт.
+#
+# Контракт таблицы:
+#   states.<STATE_TOKEN>.group    platform | human_stopped | none
+#   states.<STATE_TOKEN>.demand   чего требуют ОТ оператора (человеческие слова)
+#   states.<STATE_TOKEN>.commands дословные CLI-шаблоны; {id} — короткий id
+#                                 задачи, {question_id} — id припаркованного
+#                                 вопроса (в печати плейсхолдеров не остаётся)
+#   states.<STATE_TOKEN>.variants условные формулировки, выбираемые по
+#                                 STORED-данным, а не веткой кода:
+#                                   parked_question — есть stored OPEN-вопрос
+#                                                     с blocking=true
+#                                   no_question     — припаркованного нет
+# Группа `none` — состояние, на котором платформа на человеке не стоит:
+# строки секции у него нет, в бейдж оно не входит.
+inbox_waits:
+  states:
+    DRAFT:
+      group: none
+    ANALYSIS:
+      group: none
+    REVIEW:
+      group: none
+    APPROVAL:
+      group: platform
+      demand: "Утвердить или отклонить текущую спецификацию задачи"
+      commands:
+        - 'devai task approve {id} --rationale "<обоснование>"'
+        - 'devai task reject {id} --rationale "<обоснование>"'
+    IMPLEMENTATION:
+      group: none
+    QA:
+      group: platform
+      demand: "Подписать текущий quality-отчёт: принять или вернуть в реворк"
+      commands:
+        - 'devai task accept {id} --rationale "<обоснование>"'
+        - 'devai task return {id} --rationale "<обоснование>"'
+    REWORK:
+      group: none
+    WAITING_FOR_INPUT:
+      group: platform
+      # Развилка по stored-данным: только БЛОКИРУЮЩИЙ вопрос паркует задачу
+      # (workflow.rs:750-763), неблокирующая заметка рядом не должна
+      # становиться напечатанной командой; задача без OPEN-вопроса — гейт
+      # пустого реворка (снимается ратификацией).
+      variants:
+        - when: parked_question
+          demand: "Ответить на припаркованный вопрос задачи"
+          commands:
+            - 'devai question answer {question_id} --text "<ответ>"'
+        - when: no_question
+          demand: "Гейт пустого реворка: ратифицировать отсутствие новых изменений"
+          commands:
+            - 'devai task ratify-empty-rework {id} --rationale "<обоснование>"'
+    PAUSED:
+      group: human_stopped
+      demand: "Задача остановлена паузой оператора — возобновлять по вашему решению"
+      commands:
+        - 'devai task resume {id}'
+    BLOCKED:
+      group: human_stopped
+      demand: "Задача заблокирована оператором — снимать блок по вашему решению"
+      commands:
+        - 'devai task resume {id}'
+    FAILED:
+      group: platform
+      demand: "Решить по упавшей задаче: возобновить прогон"
+      commands:
+        - 'devai task resume {id}'
+    ACCEPTED:
+      group: none
+    CANCELLED:
+      group: none

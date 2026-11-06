@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use devai_core::inbox::InboxWaitPolicy;
 use devai_core::types::{
     ContractRef, RoleDefinition, Timestamp, Verdict, event_kind, json_field, new_id,
 };
@@ -1723,6 +1724,173 @@ pub fn load_task_name_policy(dir: &Path) -> StoreResult<TaskNamePolicy> {
 
 // ---------------------------------------------------------------------------
 // REWORK CONTEXT delivery policy (R-001..R-007) — platform workflow data.
+// ---------------------------------------------------------------------------
+
+/// The factory table — the embedded `config/workflow/inbox-waits.yaml`.
+/// ONE source for the default: the loader parses these very bytes, so a
+/// home without the file and a home with the untouched factory file render
+/// exactly the same section (no second Rust copy that could drift).
+pub fn factory_inbox_wait_policy() -> StoreResult<InboxWaitPolicy> {
+    parse_inbox_wait_policy(
+        FACTORY_INBOX_WAITS,
+        "embedded config/workflow/inbox-waits.yaml",
+    )
+}
+
+const FACTORY_INBOX_WAITS: &str = include_str!("../../../config/workflow/inbox-waits.yaml");
+
+fn parse_inbox_wait_policy(text: &str, where_: &str) -> StoreResult<InboxWaitPolicy> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| cfg_err(format!("parse {where_}: {e}")))?;
+    let section = doc.get("inbox_waits").ok_or_else(|| {
+        cfg_err(format!(
+            "{where_}: no `inbox_waits:` section — the wait section has no demand table"
+        ))
+    })?;
+    let policy = serde_yaml::from_value::<InboxWaitPolicy>(section.clone())
+        .map_err(|e| cfg_err(format!("{where_}: inbox_waits section is invalid: {e}")))?;
+    validate_inbox_wait_policy(&policy, where_)?;
+    Ok(policy)
+}
+
+/// Vocabulary and completeness validation, LOUD by contract:
+/// * every `TaskState` variant has a row (a new variant must get a membership
+///   decision, not silently drop out of the section);
+/// * no unknown state token (a typo would otherwise be an inert row);
+/// * a wait state carries a demand and at least one CLI command, either
+///   directly or through variants; a non-wait state carries neither (so the
+///   table cannot claim a demand for a state that is not shown);
+/// * every `when` predicate is one the renderer knows;
+/// * every command template mentions an existing placeholder or none.
+fn validate_inbox_wait_policy(policy: &InboxWaitPolicy, where_: &str) -> StoreResult<()> {
+    for state in devai_core::types::TaskState::ALL {
+        if !policy.states.contains_key(state.as_str()) {
+            return Err(cfg_err(format!(
+                "{where_}: inbox_waits.states has no row for `{}` — every TaskState needs a group decision",
+                state.as_str()
+            )));
+        }
+    }
+    for (token, row) in &policy.states {
+        devai_core::types::TaskState::parse(token).map_err(|_| {
+            cfg_err(format!(
+                "{where_}: inbox_waits.states.`{token}` is not a TaskState token (accepted: {})",
+                devai_core::types::TaskState::ALL
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        validate_wait_row(token, row, where_)?;
+    }
+    Ok(())
+}
+
+/// One state's row: the group/demand consistency, its variants and its
+/// command templates.
+fn validate_wait_row(
+    token: &str,
+    row: &devai_core::inbox::WaitStatePolicy,
+    where_: &str,
+) -> StoreResult<()> {
+    let demand = row.demand.trim();
+    let commands: Vec<&str> = row.commands.iter().map(|c| c.trim()).collect();
+    match row.group {
+        devai_core::inbox::WaitGroup::NotWait => {
+            if !demand.is_empty() || !commands.is_empty() || !row.variants.is_empty() {
+                return Err(cfg_err(format!(
+                    "{where_}: `{token}` has group `none` but declares a demand/command/variant — a non-wait state is never shown"
+                )));
+            }
+        }
+        _ => {
+            if row.variants.is_empty()
+                && (demand.is_empty() || commands.iter().all(|c| c.is_empty()))
+            {
+                return Err(cfg_err(format!(
+                    "{where_}: `{token}` is a wait state but has no demand or no CLI command"
+                )));
+            }
+        }
+    }
+    for variant in &row.variants {
+        validate_wait_variant(token, variant, where_)?;
+    }
+    let all_commands = row
+        .commands
+        .iter()
+        .chain(row.variants.iter().flat_map(|v| v.commands.iter()));
+    for command in all_commands {
+        validate_wait_command(token, command, where_)?;
+    }
+    Ok(())
+}
+
+/// One conditional wording: a KNOWN predicate and a non-empty demand plus at
+/// least one command.
+fn validate_wait_variant(
+    token: &str,
+    variant: &devai_core::inbox::WaitVariant,
+    where_: &str,
+) -> StoreResult<()> {
+    if !devai_core::inbox::WHEN_ALL.contains(&variant.when.as_str()) {
+        return Err(cfg_err(format!(
+            "{where_}: `{token}` variant `when: {}` is unknown (accepted: {})",
+            variant.when,
+            devai_core::inbox::WHEN_ALL.join(", ")
+        )));
+    }
+    if variant.demand.trim().is_empty() || variant.commands.iter().all(|c| c.trim().is_empty()) {
+        return Err(cfg_err(format!(
+            "{where_}: `{token}` variant `when: {}` has no demand or no CLI command",
+            variant.when
+        )));
+    }
+    Ok(())
+}
+
+/// A placeholder-carrying template must actually be a CLI invocation, so the
+/// printed hint stays runnable as printed.
+fn validate_wait_command(token: &str, command: &str, where_: &str) -> StoreResult<()> {
+    for placeholder in ["{id}", "{question_id}"] {
+        if command.contains(placeholder) && !command.contains("devai ") {
+            return Err(cfg_err(format!(
+                "{where_}: `{token}` command `{command}` carries a placeholder but is not a CLI template"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Merge-scan `workflow/*.yaml` for the `inbox_waits:` key with the
+/// `load_humanize_policy` idiom: files without the section are inert, the
+/// LAST declared section wins, a malformed table is a LOUD config error
+/// naming the file. An absent directory/file yields the factory table
+/// parsed from the embedded bytes (never an empty section).
+pub fn load_inbox_wait_policy(dir: &Path) -> StoreResult<InboxWaitPolicy> {
+    let mut policy = factory_inbox_wait_policy()?;
+    if !dir.is_dir() {
+        return Ok(policy);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    for p in &paths {
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if doc.get("inbox_waits").is_some() {
+            policy = parse_inbox_wait_policy(&text, &p.display().to_string())?;
+        }
+    }
+    Ok(policy)
+}
+
 // ---------------------------------------------------------------------------
 fn default_verdict_field() -> String {
     "verdict".into()

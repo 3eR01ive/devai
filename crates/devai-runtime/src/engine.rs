@@ -776,7 +776,7 @@ impl<'a> Engine<'a> {
         else {
             return Ok(None);
         };
-        let body = self.store.read_blob(&report.sha256)?;
+        let body = self.store.read_artifact_body(&report)?;
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
             return Ok(None);
         };
@@ -1655,7 +1655,7 @@ impl<'a> Engine<'a> {
     }
 
     fn content(&self, a: &Artifact) -> RuntimeResult<String> {
-        Ok(String::from_utf8_lossy(&self.store.read_blob(&a.sha256)?).to_string())
+        Ok(String::from_utf8_lossy(&self.store.read_artifact_body(a)?).to_string())
     }
 
     fn resolve_agent(&self, name: &str) -> RuntimeResult<AgentInstance> {

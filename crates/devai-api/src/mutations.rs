@@ -46,6 +46,30 @@ pub struct ProjectAddReq {
     pub repos: Vec<String>,
 }
 
+/// `task.rename` (ratified OQ-TN-1) — set/replace the human signboard of
+/// an existing task directly. `id` is a full id or a unique prefix, resolved
+/// through `task.get` semantics first; `name` is the new signboard (window-
+/// checked against the declarative task-name template before any write);
+/// `expected_lock` is the OPTIONAL optimistic lock the writer added last —
+/// a stale value refuses typed `conflict` before any write.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRenameReq {
+    pub id: String,
+    pub name: String,
+    pub expected_lock: Option<u64>,
+}
+
+/// The outcome of `task.rename`: the task row AS STORED after the call plus
+/// the accepted (trimmed) name; `changed=false` exactly when the task
+/// already carried it and nothing was written.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRenameOutcome {
+    pub task: Task,
+    pub human_name: String,
+    pub changed: bool,
+}
+
+
 /// `task.create` — the creation input of `task new`. `project_id` is the
 /// caller-resolved project row (resolving the name is the `project.get`
 /// READ, so the not-found refusal text keeps its exact position in the
@@ -86,29 +110,6 @@ pub struct TaskProjectSetReq {
     pub id: String,
     pub project: String,
     pub expected_lock: Option<u64>,
-}
-
-/// `task.rename` (ratified OQ-TN-1) — set/replace the human signboard of
-/// an existing task directly. `id` is a full id or a unique prefix, resolved
-/// through `task.get` semantics first; `name` is the new signboard (window-
-/// checked against the declarative task-name template before any write);
-/// `expected_lock` is the OPTIONAL optimistic lock the writer added last —
-/// a stale value refuses typed `conflict` before any write.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TaskRenameReq {
-    pub id: String,
-    pub name: String,
-    pub expected_lock: Option<u64>,
-}
-
-/// The outcome of `task.rename`: the task row AS STORED after the call plus
-/// the accepted (trimmed) name; `changed=false` exactly when the task
-/// already carried it and nothing was written.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TaskRenameOutcome {
-    pub task: Task,
-    pub human_name: String,
-    pub changed: bool,
 }
 
 /// The outcome of `task.project.set`: the task AS STORED after the call
@@ -456,62 +457,76 @@ impl Api {
         // R2 QA (input-validation): an empty/whitespace-only key must never
         // reach the registry — once stored, `''` would become a SHARED key
         // and the second empty-keyed call would silently return the first
-        // task. The typed refusal happens BEFORE the first store touch
-        // (including the registry lookup below): it can neither read nor
-        // write, so a refusal leaves the store byte-identical.
-        if let Some(key) = req.idempotency_key.as_deref() {
-            if key.trim().is_empty() {
-                return Err(ApiError::InvalidInput {
-                    field: "idempotency_key",
-                    message: "must not be empty or whitespace-only".into(),
-                });
-            }
+        // task. The typed refusal happens BEFORE the first store touch.
+        Self::refuse_empty_creation_key(&req)?;
+        // REQ-API-02 (ratified OQ-1): a retry carrying the key of an ALREADY
+        // COMMITTED create returns the registered task and its stored ACTIVE
+        // edges — the lost-response retry never duplicates the effect.
+        if let Some(done) = self.creation_by_key(&req)? {
+            return Ok(done);
         }
-        // REQ-API-02 (ratified OQ-1): a retry carrying the key of an
-        // ALREADY COMMITTED create returns the registered task and its
-        // stored ACTIVE edges — the lost-response retry never duplicates
-        // the effect. The registry row lands inside the creation
-        // transaction, so finding it is proof the first create committed.
-        if let Some(key) = req.idempotency_key.as_deref() {
-            if let Some(existing) = self.store.task_by_creation_key(key)? {
-                return Ok(TaskCreated {
-                    linked: self.store.task_dependencies(existing.id)?,
-                    task: existing,
-                });
-            }
-        }
-        // REQ-DEP-07: a derived task records WHY it exists at the moment it
-        // is created; dangling references fail loudly on resolve, exactly as
-        // they would via `task depend`.
         // REQ-API-01 (the QA-01a1acab-18b1 fix): EVERY ref is resolved
-        // BEFORE anything is written. The pre-fix order inserted the task,
-        // then resolved parent and blocked_by in loops — an Ambiguous or
-        // NotFound halfway left an ORPHAN task (and possibly a partial
-        // parent edge set) in the store, and the retry doubled the effect.
-        // Resolution order stays parents-then-blockers, so the first
-        // failing ref produces the identical error text of the old path.
-        let mut parents: Vec<Task> = Vec::new();
+        // BEFORE anything is written, so a late refusal leaves no ORPHAN
+        // task and the retry cannot double the effect.
+        let deps = self.creation_dependencies(&req)?;
+        self.insert_task_with_edges(req, &deps)
+    }
+
+    /// The typed refusal of an empty/whitespace-only idempotency key — it
+    /// can neither read nor write, so a refusal leaves the store identical.
+    fn refuse_empty_creation_key(req: &TaskCreateReq) -> ApiResult<()> {
+        match req.idempotency_key.as_deref() {
+            Some(key) if key.trim().is_empty() => Err(ApiError::InvalidInput {
+                field: "idempotency_key",
+                message: "must not be empty or whitespace-only".into(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The already-committed create under this key, if any. The registry row
+    /// lands inside the creation transaction, so finding it is proof the
+    /// first create committed.
+    fn creation_by_key(&self, req: &TaskCreateReq) -> ApiResult<Option<TaskCreated>> {
+        let Some(key) = req.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        match self.store.task_by_creation_key(key)? {
+            Some(existing) => Ok(Some(TaskCreated {
+                linked: self.store.task_dependencies(existing.id)?,
+                task: existing,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// REQ-DEP-07: a derived task records WHY it exists at the moment it is
+    /// created. Resolution order stays parents-then-blockers, so the first
+    /// failing ref produces the identical error text of the old path.
+    fn creation_dependencies(&self, req: &TaskCreateReq) -> ApiResult<Vec<(Task, DependencyKind)>> {
+        let mut deps: Vec<(Task, DependencyKind)> = Vec::new();
         for p in &req.parent {
-            parents.push(self.store.resolve_task(p)?);
+            deps.push((self.store.resolve_task(p)?, DependencyKind::Parent));
         }
-        let mut blockers: Vec<Task> = Vec::new();
         for b in &req.blocked_by {
-            blockers.push(self.store.resolve_task(b)?);
+            deps.push((self.store.resolve_task(b)?, DependencyKind::Blocks));
         }
-        let mut deps: Vec<(&Task, DependencyKind)> = Vec::new();
-        for t in &parents {
-            deps.push((t, DependencyKind::Parent));
-        }
-        for t in &blockers {
-            deps.push((t, DependencyKind::Blocks));
-        }
-        // The task, its edges and the key registration land in ONE store
-        // transaction (REQ-API-01: all effects of this call, or none), so
-        // `TaskCreated` can never describe an edge absent from the store.
+        Ok(deps)
+    }
+
+    /// The task, its edges and the key registration land in ONE store
+    /// transaction (REQ-API-01: all effects of this call, or none), so
+    /// `TaskCreated` can never describe an edge absent from the store.
+    fn insert_task_with_edges(
+        &self,
+        req: TaskCreateReq,
+        deps: &[(Task, DependencyKind)],
+    ) -> ApiResult<TaskCreated> {
         let t = Task::new(req.title, req.description, req.project_id, Utc::now());
+        let edges: Vec<(&Task, DependencyKind)> = deps.iter().map(|(t, k)| (t, *k)).collect();
         let linked = self.store.create_task_with_dependencies(
             &t,
-            &deps,
+            &edges,
             &self.actor,
             Utc::now(),
             req.idempotency_key.as_deref(),
@@ -553,57 +568,6 @@ impl Api {
             .store
             .set_task_project(&task, project.id, &self.actor, Utc::now())?;
         Ok(TaskProjectSetOutcome {
-            task: updated,
-            changed: true,
-        })
-    }
-
-    /// REQ-TN (ratified OQ-TN-1): set or replace the human signboard of a
-    /// task DIRECTLY — the human door to the name, without a rework cycle
-    /// (the morning the operator renamed eleven active tasks by hand proved
-    /// the need). Mirrors `task.project_set`: refs resolve first, the name
-    /// is validated against the SAME declarative window the publication
-    /// gate uses (REQ-TN-05 AC1 «и на ручном публикации» — one rule, two
-    /// doors), a stale `expected_lock` refuses typed `conflict`, an
-    /// effective change writes row + `task.human_name.set` event in one
-    /// transaction. Re-applying the name the task already carries is a
-    /// side-effect-free NO-OP (`changed=false`), like the project binding.
-    /// The workflow state is never touched — a rename signs, it does not
-    /// re-open.
-    pub fn task_rename(&self, req: TaskRenameReq) -> ApiResult<TaskRenameOutcome> {
-        let task = self.store.resolve_task(&req.id)?;
-        if req.expected_lock.is_some_and(|l| l != task.lock_version) {
-            return Err(StoreError::Conflict {
-                what: format!("task {}", task.id),
-                expected: req.expected_lock.unwrap(),
-                found: task.lock_version,
-            }
-            .into());
-        }
-        let policy = self.task_name_policy()?;
-        let name = devai_runtime::taskname::validate_human_name(&req.name, &policy).map_err(
-            |violations| {
-                ApiError::refused(
-                    "contract_violation",
-                    format!(
-                        "the human task name violates config/workflow/task-name.yaml: {}",
-                        violations.join("; ")
-                    ),
-                )
-            },
-        )?;
-        if task.human_name.as_deref() == Some(name.as_str()) {
-            return Ok(TaskRenameOutcome {
-                task,
-                human_name: name,
-                changed: false,
-            });
-        }
-        let updated =
-            self.store
-                .set_task_human_name(&task, Some(name.as_str()), &self.actor, Utc::now())?;
-        Ok(TaskRenameOutcome {
-            human_name: name,
             task: updated,
             changed: true,
         })
@@ -660,55 +624,18 @@ impl Api {
             WorkflowOp::Review { verdict, summary } => self.run_op(id, move |t, _a| {
                 workflow::review_recorded(t, verdict, summary.as_deref(), &self.actor, Utc::now())
             }),
-            WorkflowOp::Approve { rationale } => self.run_op(id, move |t, a| {
-                // The approve gate reads the CURRENT spec exactly as the old
-                // closure did — same guard, same refusal text.
-                if a.iter().any(|x| {
-                    x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
-                }) {
-                    workflow::approve_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
-                } else {
-                    Err(devai_core::CoreError::guard(
-                        "no CURRENT REQUIREMENTS_SPEC artifact to approve",
-                    ))
-                }
-            }),
+            WorkflowOp::Approve { rationale } => self.op_approve(id, rationale),
             WorkflowOp::Reject { rationale } => self.run_op(id, move |t, _a| {
                 workflow::reject_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
             }),
-            WorkflowOp::Accept { rationale } => {
-                // REQ-DEP-03: the acceptance gate consults the stored
-                // dependency graph and the override decisions before the
-                // core command runs — the loads keep the old position.
-                let task = self.store.resolve_task(id)?;
-                let deps = self.store.task_dependencies(task.id)?;
-                let decisions = self.store.list_decisions(task.id)?;
-                self.run_op(id, move |t, a| {
-                    workflow::accept(
-                        t,
-                        a,
-                        &deps,
-                        &decisions,
-                        rationale.as_deref(),
-                        &self.actor,
-                        Utc::now(),
-                    )
-                })
-            }
+            WorkflowOp::Accept { rationale } => self.op_accept(id, rationale),
             WorkflowOp::Return { rationale } => self.run_op(id, move |t, _a| {
                 workflow::return_to_rework(t, rationale.as_deref(), &self.actor, Utc::now())
             }),
             WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| {
                 workflow::pause(t, reason.as_deref(), &self.actor, Utc::now())
             }),
-            WorkflowOp::Resume => {
-                let task = self.store.resolve_task(id)?;
-                let deps = self.store.task_dependencies(task.id)?;
-                let decisions = self.store.list_decisions(task.id)?;
-                self.run_op(id, move |t, _a| {
-                    workflow::resume(t, &deps, &decisions, &self.actor, Utc::now())
-                })
-            }
+            WorkflowOp::Resume => self.op_resume(id),
             WorkflowOp::Block { reason } => self.run_op(id, move |t, _a| {
                 workflow::block(t, reason.as_deref(), &self.actor, Utc::now())
             }),
@@ -719,6 +646,53 @@ impl Api {
                 workflow::fail(t, reason.as_deref(), &self.actor, Utc::now())
             }),
         }
+    }
+
+    /// APPROVAL: the gate reads the CURRENT spec exactly as the old closure
+    /// did — same guard, same refusal text.
+    fn op_approve(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
+        self.run_op(id, move |t, a| {
+            if a.iter().any(|x| {
+                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
+            }) {
+                workflow::approve_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
+            } else {
+                Err(devai_core::CoreError::guard(
+                    "no CURRENT REQUIREMENTS_SPEC artifact to approve",
+                ))
+            }
+        })
+    }
+
+    /// ACCEPT: REQ-DEP-03 — the acceptance gate consults the stored
+    /// dependency graph and the override decisions before the core command
+    /// runs; the loads keep the old position.
+    fn op_accept(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
+        let task = self.store.resolve_task(id)?;
+        let deps = self.store.task_dependencies(task.id)?;
+        let decisions = self.store.list_decisions(task.id)?;
+        self.run_op(id, move |t, a| {
+            workflow::accept(
+                t,
+                a,
+                &deps,
+                &decisions,
+                rationale.as_deref(),
+                &self.actor,
+                Utc::now(),
+            )
+        })
+    }
+
+    /// RESUME: the same stored dependency/decision loads the acceptance gate
+    /// performs, in the old order.
+    fn op_resume(&self, id: &str) -> ApiResult<MutationResult> {
+        let task = self.store.resolve_task(id)?;
+        let deps = self.store.task_dependencies(task.id)?;
+        let decisions = self.store.list_decisions(task.id)?;
+        self.run_op(id, move |t, _a| {
+            workflow::resume(t, &deps, &decisions, &self.actor, Utc::now())
+        })
     }
 
     fn run_op<F>(&self, id: &str, f: F) -> ApiResult<MutationResult>
@@ -842,45 +816,9 @@ impl Api {
         let report = engine.advance(&req.id, &req.agent, &self.actor)?;
         // The gate renderings read the CURRENT quality report — the same
         // status-only selection (REQ-005) the old handler performed.
-        let (current_quality_report, gate_report_text) = match report.gate {
-            Gate::WaitingAccept => (None, self.quality_report_text(report.task_id)?),
-            Gate::ReportFresh => (
-                self.store.artifacts(report.task_id)?.into_iter().find(|x| {
-                    x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
-                }),
-                self.quality_report_text(report.task_id)?,
-            ),
-            _ => (None, None),
-        };
-        // REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
-        // presentation — approval/review reads spec + review, acceptance
-        // reads the implementation-report. Stored fields, verbatim; absence
-        // (a legacy @1/@2 CURRENT, a non-JSON body) renders as NO paragraph,
-        // never as a broken gate (REQ-HP-06 non-retroactivity in the render
-        // half too).
-        let mut gate_human_paragraphs: Vec<(String, String)> = Vec::new();
-        match report.gate {
-            Gate::WaitingApproval => {
-                for (kind, label) in [
-                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
-                    (ArtifactKind::ReviewReport, "review-report"),
-                ] {
-                    if let Some(p) = self.stored_human_paragraph(report.task_id, kind, label)? {
-                        gate_human_paragraphs.push(p);
-                    }
-                }
-            }
-            Gate::WaitingAccept | Gate::ReportFresh => {
-                if let Some(p) = self.stored_human_paragraph(
-                    report.task_id,
-                    ArtifactKind::ImplementationReport,
-                    "implementation-report",
-                )? {
-                    gate_human_paragraphs.push(p);
-                }
-            }
-            _ => {}
-        }
+        let (current_quality_report, gate_report_text) =
+            self.gate_reporting(report.task_id, report.gate)?;
+        let gate_human_paragraphs = self.gate_paragraphs(report.task_id, report.gate)?;
         let t = self.store.get_task(&report.task_id.to_string())?;
         Ok(RunOutcome {
             report,
@@ -894,34 +832,78 @@ impl Api {
         })
     }
 
+    /// The quality-report half of the gate presentation: the CURRENT report
+    /// row at `report_fresh`, nothing at `waiting_accept`, and the stored
+    /// rendering text whenever a gate accepts a signature.
+    fn gate_reporting(
+        &self,
+        task_id: Id,
+        gate: Gate,
+    ) -> ApiResult<(Option<Artifact>, Option<String>)> {
+        match gate {
+            Gate::WaitingAccept => Ok((None, self.quality_report_text(task_id)?)),
+            Gate::ReportFresh => Ok((
+                self.store.artifacts(task_id)?.into_iter().find(|x| {
+                    x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
+                }),
+                self.quality_report_text(task_id)?,
+            )),
+            _ => Ok((None, None)),
+        }
+    }
+
+    /// REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
+    /// presentation — approval/review reads spec + review, acceptance reads
+    /// the implementation-report. Stored fields, verbatim; absence (a legacy
+    /// @1/@2 CURRENT, a non-JSON body) renders as NO paragraph, never as a
+    /// broken gate (REQ-HP-06 non-retroactivity in the render half too).
+    fn gate_paragraphs(&self, task_id: Id, gate: Gate) -> ApiResult<Vec<(String, String)>> {
+        let mut paragraphs: Vec<(String, String)> = Vec::new();
+        match gate {
+            Gate::WaitingApproval => {
+                for (kind, label) in [
+                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
+                    (ArtifactKind::ReviewReport, "review-report"),
+                ] {
+                    if let Some(p) = self.stored_human_paragraph(task_id, kind, label)? {
+                        paragraphs.push(p);
+                    }
+                }
+            }
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                if let Some(p) = self.stored_human_paragraph(
+                    task_id,
+                    ArtifactKind::ImplementationReport,
+                    "implementation-report",
+                )? {
+                    paragraphs.push(p);
+                }
+            }
+            _ => {}
+        }
+        Ok(paragraphs)
+    }
+
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
         let task = self.store.resolve_task(&req.id)?;
-        // REQ-TN-05 AC1 («и на ручном revise-публикации»): this is the
-        // MANUAL door a human actually uses, gated through the analyst's
-        // active output contract — resolved by `analyst_output_contract`.
-        let contract = self.analyst_output_contract()?;
-        // The name is read BEFORE the body moves into publication — the
-        // bytes that pass the gate are the bytes the signboard is stamped
-        // from, one source, no second parse of stored content.
-        let field = self.task_name_policy()?.field;
-        let name = workflow::human_name_from_spec(&req.content, &field);
         let _a = self.publish_row_internal(
             task.id,
             ArtifactKind::RequirementsSpec,
             &req.name,
             req.content,
-            Some(contract),
+            None,
             None,
             vec![],
             None,
             DataCategory::Artifact,
         )?;
         let after = self.store.artifacts(task.id)?;
+        let spec_name = self.current_spec_human_name(&after)?;
         let m = workflow::requirements_published(
             &task,
             &after,
             req.reason.as_deref(),
-            name.as_deref(),
+            spec_name.as_deref(),
             &self.actor,
             Utc::now(),
         )?;
@@ -941,25 +923,6 @@ impl Api {
         })
     }
 
-    /// The requirements-analyst's ACTIVE output contract — the gate of
-    /// the manual revise door. Resolved from the seeded role definition
-    /// (config/roles data, the same source the engine loop reads at run
-    /// time), never a code-pinned version: bumping the role moves both
-    /// doors at once (REQ-TN-02 AC4). A home whose role data carries no
-    /// output contract refuses LOUD — an unresolvable gate never degrades
-    /// into an ungated publication.
-    fn analyst_output_contract(&self) -> ApiResult<ContractRef> {
-        self.store
-            .get_role("requirements-analyst")?
-            .and_then(|r| r.output_contract)
-            .ok_or_else(|| {
-                ApiError::refused(
-                    "analyst_contract_unresolved",
-                    "the requirements-analyst role defines no output contract — manual revise cannot resolve which stored schema gates this publication; repair the role data (config/roles/requirements-analyst.yaml), publication stays refused",
-                )
-            })
-    }
-
     // ---- artifacts ---------------------------------------------------------
 
     /// Publish the artifact row through the contract gate — WITHOUT the
@@ -968,45 +931,8 @@ impl Api {
     /// row before a failing advance aborts) keeps byte parity (REQ-MUT-06).
     pub fn artifact_publish_row(&self, req: PublishReq) -> ApiResult<PublishedRow> {
         let task = self.store.resolve_task(&req.id)?;
-        let mut depends_ids: Vec<Id> = Vec::new();
-        for p in &req.depends {
-            depends_ids.push(self.store.get_artifact(p)?.id);
-        }
-        // Downstream role results are implicitly children of the current
-        // approved specification (a later requirements revision marks them
-        // STALE through the dependency graph — unless deps were given).
-        if req.depends.is_empty() && req.kind.is_downstream_of_spec() {
-            if let Some(spec) = self
-                .store
-                .artifacts(task.id)?
-                .iter()
-                .find(|a| {
-                    a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
-                })
-                .map(|a| a.id)
-            {
-                depends_ids.push(spec);
-            }
-        }
-        let execution_id = match req.execution.as_deref() {
-            Some(e) => {
-                // Ratified OQ-4: publication into a closed row is a LOUD
-                // refusal — «зомби не пишет в закрытую строку».
-                let ex = self.store.get_execution(e)?;
-                if ex.status != ExecutionStatus::Running {
-                    return Err(ApiError::refused(
-                        "execution_not_running",
-                        format!(
-                            "execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)",
-                            ex.id,
-                            ex.status.as_str()
-                        ),
-                    ));
-                }
-                Some(ex.id)
-            }
-            None => None,
-        };
+        let depends_ids = self.publication_dependencies(&task, &req)?;
+        let execution_id = self.publication_execution(req.execution.as_deref())?;
         let created_by = execution_id.map(|id| format!("execution:{}", id));
         // The contract reference parses AFTER the execution check — the
         // exact position the pre-cycle-2 CLI held (error-order parity).
@@ -1028,6 +954,50 @@ impl Api {
         Ok(PublishedRow { artifact, task })
     }
 
+    /// The explicit dependencies of a publication, plus the implicit one:
+    /// downward role results are children of the CURRENT approved
+    /// specification (a later requirements revision marks them STALE through
+    /// the dependency graph — unless deps were given).
+    fn publication_dependencies(&self, task: &Task, req: &PublishReq) -> ApiResult<Vec<Id>> {
+        let mut depends_ids: Vec<Id> = Vec::new();
+        for p in &req.depends {
+            depends_ids.push(self.store.get_artifact(p)?.id);
+        }
+        if req.depends.is_empty() && req.kind.is_downstream_of_spec() {
+            let spec = self
+                .store
+                .artifacts(task.id)?
+                .iter()
+                .find(|a| {
+                    a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
+                })
+                .map(|a| a.id);
+            depends_ids.extend(spec);
+        }
+        Ok(depends_ids)
+    }
+
+    /// The producing execution of a publication. Ratified OQ-4: publication
+    /// into a closed row is a LOUD refusal — «зомби не пишет в закрытую
+    /// строку».
+    fn publication_execution(&self, execution: Option<&str>) -> ApiResult<Option<Id>> {
+        let Some(e) = execution else {
+            return Ok(None);
+        };
+        let ex = self.store.get_execution(e)?;
+        if ex.status != ExecutionStatus::Running {
+            return Err(ApiError::refused(
+                "execution_not_running",
+                format!(
+                    "execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)",
+                    ex.id,
+                    ex.status.as_str()
+                ),
+            ));
+        }
+        Ok(Some(ex.id))
+    }
+
     /// The workflow advance certain artifact kinds carry — the SAME core
     /// commands the engine runs (REQ-RG-01: no producer path bypasses the
     /// empty-rework gate). Membership of the advancing set is owned by
@@ -1039,40 +1009,20 @@ impl Api {
     pub fn artifact_advance(&self, req: AdvanceReq) -> ApiResult<AdvanceOutcome> {
         let task = self.store.resolve_task(&req.id)?;
         let a = self.store.get_artifact(&req.artifact_id)?;
-        // QA R2 (cl/short-units): the facade is pure DISPATCH — one arm
-        // per advancing kind, the kind's mechanics living in a private
-        // unit beside it. Membership of the advancing set is still owned
-        // by the core predicate; a kind outside it can only be refused
-        // loudly here, never quietly skipped.
         match req.kind {
-            ArtifactKind::RequirementsSpec => self.advance_spec_published(&task),
-            ArtifactKind::ReviewReport => {
-                self.advance_review_recorded(&task, req.verdict.as_deref())
-            }
-            ArtifactKind::ImplementationReport => self.advance_implementation_reported(&task, &a),
+            ArtifactKind::RequirementsSpec => self.advance_spec(&task),
+            ArtifactKind::ReviewReport => self.advance_review(&task, req.verdict.as_deref()),
+            ArtifactKind::ImplementationReport => self.advance_implementation(&task, &a),
             // Fail-closed (QA R5): the kind carries no advance. The refusal
             // lists the advancing kinds DERIVED from the core predicate —
             // never a hand-copied set that could drift (QA R4).
-            other => Err(ApiError::refused(
-                "artifact_kind_not_advancing",
-                format!(
-                    "{} carries no workflow advance — the advancing kinds are {} (the row alone lands via `artifact.publish_row`; publish through `artifact.publish` to get the row and its advance in one call)",
-                    other.as_str(),
-                    ArtifactKind::ALL
-                        .iter()
-                        .filter(|k| k.advances_state())
-                        .map(|k| k.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )),
+            other => Err(not_advancing_refusal(other)),
         }
     }
 
-    /// The RequirementsSpec arm: the SAME core command as the engine, plus
-    /// the signboard stamp — the phased manual door reads the name from
-    /// the CURRENT spec body (REQ-TN-02) and hands it to the transition.
-    fn advance_spec_published(&self, task: &Task) -> ApiResult<AdvanceOutcome> {
+    /// REQUIREMENTS_SPEC advance: the core `requirements_published` command
+    /// over the task's stored artifacts.
+    fn advance_spec(&self, task: &Task) -> ApiResult<AdvanceOutcome> {
         let arts = self.store.artifacts(task.id)?;
         let name = self.current_spec_human_name(&arts)?;
         let m = workflow::requirements_published(
@@ -1091,68 +1041,16 @@ impl Api {
         })
     }
 
-    /// The typed name read of the CURRENT spec (QA R1, rel/error-context;
-    /// body read, QA R2: this is the private unit the advance dispatches
-    /// to, not inline facade machinery). The blob is the content-addressed
-    /// body of the row just published, read with the template's field. A
-    /// CURRENT spec blob that does not read back, or reads back as
-    /// non-JSON, is a store-integrity failure — the advance refuses LOUD
-    /// (`spec_body_unreadable`) instead of folding the failure into «body
-    /// without a name» and silently keeping the previous signboard.
-    /// «Readable but name-less» (the @1..@3 legacy shape) stays the ONE
-    /// legal absence branch: such a publication says nothing about the
-    /// signboard (REQ-TN-02 AC3).
-    fn current_spec_human_name(&self, arts: &[Artifact]) -> ApiResult<Option<String>> {
-        let field = self.task_name_policy()?.field;
-        let Some(x) = arts
-            .iter()
-            .filter(|x| {
-                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
-            })
-            .max_by_key(|x| x.seq)
-        else {
-            // No CURRENT spec at all: `requirements_published` keeps its
-            // own guard and refuses loudly at the transition below.
-            return Ok(None);
+    /// REVIEW_REPORT advance: the verdict is required and parsed before the
+    /// core command runs.
+    fn advance_review(&self, task: &Task, verdict: Option<&str>) -> ApiResult<AdvanceOutcome> {
+        let Some(s) = verdict else {
+            return Err(ApiError::refused(
+                "bad_request",
+                "publishing REVIEW_REPORT requires --verdict approved|needs_revision",
+            ));
         };
-        let body = self.store.read_blob(&x.sha256).map_err(|e| {
-            ApiError::refused(
-                "spec_body_unreadable",
-                format!(
-                    "CURRENT spec {} blob {} does not read back: {e} — the advance refuses instead of silently keeping the stored signboard; repair the store or republish the specification",
-                    x.id, x.sha256
-                ),
-            )
-        })?;
-        match workflow::read_human_name_from_spec(&body, &field) {
-            workflow::SpecNameRead::Named(v) => Ok(Some(v)),
-            workflow::SpecNameRead::Absent => Ok(None),
-            workflow::SpecNameRead::Corrupt => Err(ApiError::refused(
-                "spec_body_unreadable",
-                format!(
-                    "CURRENT spec {} blob {} reads back as bytes that are not parseable JSON — the advance refuses instead of silently keeping the stored signboard; the row and its blob are inconsistent, republish the specification",
-                    x.id, x.sha256
-                ),
-            )),
-        }
-    }
-
-    /// The ReviewReport arm: verdict token through the core synonym
-    /// dictionary, then the transition (no signboard involved).
-    fn advance_review_recorded(
-        &self,
-        task: &Task,
-        verdict: Option<&str>,
-    ) -> ApiResult<AdvanceOutcome> {
-        let v = match verdict {
-            Some(s) => Self::parse_verdict(s)?,
-            None => {
-                return Err(ApiError::refused(
-                    "bad_request",
-                    "publishing REVIEW_REPORT requires --verdict approved|needs_revision",
-                ));
-            }
-        };
+        let v = Self::parse_verdict(s)?;
         let m = workflow::review_recorded(task, v, None, &self.actor, Utc::now())?;
         self.store.commit(task.lock_version, &m)?;
         Ok(AdvanceOutcome {
@@ -1162,13 +1060,9 @@ impl Api {
         })
     }
 
-    /// The ImplementationReport arm: the manual publication crosses the
-    /// SAME core command as the engine — including the empty-rework gate.
-    fn advance_implementation_reported(
-        &self,
-        task: &Task,
-        a: &Artifact,
-    ) -> ApiResult<AdvanceOutcome> {
+    /// IMPLEMENTATION_REPORT advance: the manual publication crosses the SAME
+    /// core command as the engine — including the empty-rework gate.
+    fn advance_implementation(&self, task: &Task, a: &Artifact) -> ApiResult<AdvanceOutcome> {
         let arts = self.store.artifacts(task.id)?;
         let facts = devai_runtime::gate::collect_implementation_report_facts(
             &self.store,
@@ -1244,35 +1138,7 @@ impl Api {
         category: DataCategory,
     ) -> ApiResult<Artifact> {
         if let Some(c) = &contract {
-            let schema = self.store.get_contract(&c.name, c.version)?;
-            let Some(schema) = schema else {
-                return Err(ApiError::ContractUnregistered {
-                    contract: c.to_string(),
-                });
-            };
-            // Gate parity (ratified OQ-FG-05, REQ-FG-08): the manual path
-            // runs the SAME contract gate as the engine loop; enforcement
-            // is the API's, the presentation (warning + full list) the
-            // consumer's. REQ-HP-02 closes the last door: the paragraph
-            // halves (presence via `required`, edibility via the
-            // deterministic detector) live in this one call, and it reads
-            // the project's loaded `humanize.yaml` fresh — config stays
-            // the source of truth, a broken template is a LOUD refusal,
-            // never a silent factory fallback on the manual path.
-            let humanize = self.humanize_policy()?;
-            let task_name = self.task_name_policy()?;
-            let violations = devai_runtime::artifact_violations(
-                String::from_utf8_lossy(&content).as_ref(),
-                Some(schema.as_str()),
-                &humanize,
-                &task_name,
-            )?;
-            if !violations.is_empty() {
-                return Err(ApiError::ContractRejected {
-                    contract: c.to_string(),
-                    violations,
-                });
-            }
+            self.contract_gate(c, &content)?;
         }
         Ok(self.store.publish_artifact(ArtifactDraft {
             task_id,
@@ -1286,6 +1152,150 @@ impl Api {
             execution_id: execution,
             depends_on: depends,
         })?)
+    }
+
+    /// The manual publication's contract gate (ratified OQ-FG-05, REQ-FG-08):
+    /// an unregistered contract is a typed refusal; a registered one runs the
+    /// SAME gate the engine loop runs, so enforcement is the API's and the
+    /// presentation (warning + full list) the consumer's. REQ-HP-02 closes
+    /// the last door: the paragraph halves (presence via `required`,
+    /// edibility via the deterministic detector) live in this one call, and
+    /// it reads the project's loaded `humanize.yaml` fresh — config stays the
+    /// source of truth, a broken template is a LOUD refusal, never a silent
+    /// factory fallback on the manual path.
+    /// REQ-TN (ratified OQ-TN-1): set or replace the human signboard of a
+    /// task DIRECTLY — the human door to the name, without a rework cycle
+    /// (the morning the operator renamed eleven active tasks by hand proved
+    /// the need). Mirrors `task.project_set`: refs resolve first, the name
+    /// is validated against the SAME declarative window the publication
+    /// gate uses (REQ-TN-05 AC1 «и на ручном публикации» — one rule, two
+    /// doors), a stale `expected_lock` refuses typed `conflict`, an
+    /// effective change writes row + `task.human_name.set` event in one
+    /// transaction. Re-applying the name the task already carries is a
+    /// side-effect-free NO-OP (`changed=false`), like the project binding.
+    /// The workflow state is never touched — a rename signs, it does not
+    /// re-open.
+    pub fn task_rename(&self, req: TaskRenameReq) -> ApiResult<TaskRenameOutcome> {
+        let task = self.store.resolve_task(&req.id)?;
+        if req.expected_lock.is_some_and(|l| l != task.lock_version) {
+            return Err(StoreError::Conflict {
+                what: format!("task {}", task.id),
+                expected: req.expected_lock.unwrap(),
+                found: task.lock_version,
+            }
+            .into());
+        }
+        let policy = self.task_name_policy()?;
+        let name = devai_runtime::taskname::validate_human_name(&req.name, &policy).map_err(
+            |violations| {
+                ApiError::refused(
+                    "contract_violation",
+                    format!(
+                        "the human task name violates config/workflow/task-name.yaml: {}",
+                        violations.join("; ")
+                    ),
+                )
+            },
+        )?;
+        if task.human_name.as_deref() == Some(name.as_str()) {
+            return Ok(TaskRenameOutcome {
+                task,
+                human_name: name,
+                changed: false,
+            });
+        }
+        let updated =
+            self.store
+                .set_task_human_name(&task, Some(name.as_str()), &self.actor, Utc::now())?;
+        Ok(TaskRenameOutcome {
+            human_name: name,
+            task: updated,
+            changed: true,
+        })
+    }
+
+    /// The typed name read of the CURRENT spec (QA R1, rel/error-context;
+    /// body read, QA R2: this is the private unit the advance dispatches
+    /// to, not inline facade machinery). The blob is the content-addressed
+    /// body of the row just published, read with the template's field. A
+    /// CURRENT spec blob that does not read back, or reads back as
+    /// non-JSON, is a store-integrity failure — the advance refuses LOUD
+    /// (`spec_body_unreadable`) instead of folding the failure into «body
+    /// without a name» and silently keeping the previous signboard.
+    /// «Readable but name-less» (the @1..@3 legacy shape) stays the ONE
+    /// legal absence branch: such a publication says nothing about the
+    /// signboard (REQ-TN-02 AC3).
+    fn current_spec_human_name(&self, arts: &[Artifact]) -> ApiResult<Option<String>> {
+        let field = self.task_name_policy()?.field;
+        let Some(x) = arts
+            .iter()
+            .filter(|x| {
+                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
+            })
+            .max_by_key(|x| x.seq)
+        else {
+            // No CURRENT spec at all: `requirements_published` keeps its
+            // own guard and refuses loudly at the transition below.
+            return Ok(None);
+        };
+        let body = self.store.read_blob(&x.sha256).map_err(|e| {
+            ApiError::refused(
+                "spec_body_unreadable",
+                format!(
+                    "CURRENT spec {} blob {} does not read back: {e} — the advance refuses instead of silently keeping the stored signboard; repair the store or republish the specification",
+                    x.id, x.sha256
+                ),
+            )
+        })?;
+        match workflow::read_human_name_from_spec(&body, &field) {
+            workflow::SpecNameRead::Named(v) => Ok(Some(v)),
+            workflow::SpecNameRead::Absent => Ok(None),
+            workflow::SpecNameRead::Corrupt => Err(ApiError::refused(
+                "spec_body_unreadable",
+                format!(
+                    "CURRENT spec {} blob {} reads back as bytes that are not parseable JSON — the advance refuses instead of silently keeping the stored signboard; the row and its blob are inconsistent, republish the specification",
+                    x.id, x.sha256
+                ),
+            )),
+        }
+    }
+
+    /// The project's task-name template, resolved exactly the way the
+    /// humanization one is (REQ-TN-05 AC2): loaded per call, so a window
+    /// edit lands on the very next gate without a rebuild, and a broken
+    /// file refuses LOUD — the manual paths never silently fall back to
+    /// the factory while the YAML claims otherwise.
+    fn task_name_policy(&self) -> ApiResult<devai_store::config::TaskNamePolicy> {
+        let cfg_dir = std::env::var_os("DEVAI_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.store.root().join("config"));
+        Ok(devai_store::config::load_task_name_policy(
+            &cfg_dir.join("workflow"),
+        )?)
+    }
+
+    fn contract_gate(&self, c: &ContractRef, content: &[u8]) -> ApiResult<()> {
+        let schema = self.store.get_contract(&c.name, c.version)?;
+        let Some(schema) = schema else {
+            return Err(ApiError::ContractUnregistered {
+                contract: c.to_string(),
+            });
+        };
+        let humanize = self.humanize_policy()?;
+        let task_name = self.task_name_policy()?;
+        let violations = devai_runtime::artifact_violations(
+            String::from_utf8_lossy(content).as_ref(),
+            Some(schema.as_str()),
+            &humanize,
+            &task_name,
+        )?;
+        if violations.is_empty() {
+            return Ok(());
+        }
+        Err(ApiError::ContractRejected {
+            contract: c.to_string(),
+            violations,
+        })
     }
 
     // ---- task: dependencies -----------------------------------------------
@@ -1330,37 +1340,55 @@ impl Api {
         rationale: Option<String>,
     ) -> ApiResult<OverrideResult> {
         // RATIFIED DECISION OQ2 — the human escape of the dependency gate.
-        // `refs` = the FULL task ids covered, so a NEW blocker is never
-        // covered by an old decision (the gate stands for anything not
-        // named here).
         let task = self.store.resolve_task(id)?;
-        let mut blockers: Vec<String> = Vec::new();
-        for b in &blocker {
-            blockers.push(self.store.resolve_task(b)?.id.to_string());
-        }
-        if blockers.is_empty() {
-            // Without explicit blockers, ratify against exactly the
-            // blockers OPEN right now (computed from stored data).
-            let deps = self.store.task_dependencies(task.id)?;
-            blockers = workflow::open_blockers(&task, &deps);
-            if blockers.is_empty() {
-                return Err(ApiError::refused(
-                    "bad_request",
-                    format!(
-                        "task {} has no open blocking dependencies — nothing to override",
-                        short_id(&task.id)
-                    ),
-                ));
+        let blockers = self.override_blockers(&task, &blocker)?;
+        self.record_override(&task, &blockers, rationale)?;
+        Ok(OverrideResult {
+            task,
+            override_blockers: blockers,
+        })
+    }
+
+    /// The blocker set an override covers, as FULL task ids: the explicit
+    /// refs, else exactly the blockers OPEN right now (computed from stored
+    /// data, so a NEW blocker is never covered by an old decision).
+    fn override_blockers(&self, task: &Task, requested: &[String]) -> ApiResult<Vec<String>> {
+        if !requested.is_empty() {
+            let mut ids: Vec<String> = Vec::new();
+            for b in requested {
+                ids.push(self.store.resolve_task(b)?.id.to_string());
             }
+            return Ok(ids);
         }
+        let deps = self.store.task_dependencies(task.id)?;
+        let blockers = workflow::open_blockers(task, &deps);
+        if blockers.is_empty() {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "task {} has no open blocking dependencies — nothing to override",
+                    short_id(&task.id)
+                ),
+            ));
+        }
+        Ok(blockers)
+    }
+
+    /// The stored decision row plus the append-only event of one override.
+    fn record_override(
+        &self,
+        task: &Task,
+        blockers: &[String],
+        rationale: Option<String>,
+    ) -> ApiResult<()> {
         self.store.record_decision(&Decision {
             id: new_id(),
             task_id: task.id,
             kind: decision_kind::DEPENDENCY_OVERRIDE.into(),
             verdict: Verdict::Approved,
             actor: self.actor.clone(),
-            rationale: rationale.clone(),
-            refs: blockers.clone(),
+            rationale,
+            refs: blockers.to_vec(),
             created_at: Utc::now(),
         })?;
         self.store.insert_event(
@@ -1369,10 +1397,7 @@ impl Api {
             &self.actor,
             serde_json::json!({ "blockers": blockers }),
         )?;
-        Ok(OverrideResult {
-            task,
-            override_blockers: blockers,
-        })
+        Ok(())
     }
 
     pub fn task_merge_record(&self, req: MergeRecordReq) -> ApiResult<MergeResult> {
@@ -1717,31 +1742,48 @@ impl Api {
         // — before the index would reject it, in the old order (check,
         // then guard).
         self.guard_running_writer(&task)?;
-        let rd = self.store.get_role(&req.role)?;
-        let version = rd.as_ref().map(|r| r.version).unwrap_or(1);
-        let inputs_str: Vec<String> = {
-            let mut v = Vec::new();
-            for p in &req.inputs {
-                v.push(self.store.get_artifact(p)?.id.to_string());
-            }
-            v
-        };
-        // REQ-001/REQ-006: even a manually started execution binds to the
-        // workspace state the platform observes right now — computed
-        // platform-side, never supplied by the caller.
+        let version = self
+            .store
+            .get_role(&req.role)?
+            .map(|r| r.version)
+            .unwrap_or(1);
+        let inputs = self.execution_inputs(&req.inputs)?;
+        let e = self.new_execution_row(req, task.id, version, inputs)?;
+        self.store.start_execution(&e)?;
+        Ok(ExecStarted { execution: e, task })
+    }
+
+    /// The stored ids of the declared inputs, in the caller's order.
+    fn execution_inputs(&self, inputs: &[String]) -> ApiResult<Vec<String>> {
+        let mut ids: Vec<String> = Vec::new();
+        for p in inputs {
+            ids.push(self.store.get_artifact(p)?.id.to_string());
+        }
+        Ok(ids)
+    }
+
+    /// The RUNNING row a manual start opens: the workspace revision is
+    /// computed platform-side (REQ-001/REQ-006 — never supplied by the
+    /// caller) and the owner columns are captured platform-side (REQ-SW-03:
+    /// this process is the one opening the row, so the orphan detect,
+    /// REQ-SW-04, finds exactly that when it exits with the row RUNNING).
+    fn new_execution_row(
+        &self,
+        req: ExecStartReq,
+        task_id: Id,
+        role_version: u32,
+        inputs: Vec<String>,
+    ) -> ApiResult<RoleExecution> {
         let revision = Engine::new(&self.store).current_revision()?;
-        // REQ-SW-03: the owner columns are captured platform-side — this
-        // process is the one OPENING the row (the orphan detect, REQ-SW-04,
-        // finds exactly that when it exits with the row still RUNNING).
         let (owner_pid, owner_host, owner_process_start) = liveness::current_owner().into_columns();
-        let e = RoleExecution {
+        Ok(RoleExecution {
             id: new_id(),
-            task_id: task.id,
+            task_id,
             role_slug: req.role,
-            role_version: version,
+            role_version,
             agent_name: req.agent,
             status: ExecutionStatus::Running,
-            inputs: inputs_str,
+            inputs,
             summary: None,
             error: None,
             started_at: Utc::now(),
@@ -1754,9 +1796,7 @@ impl Api {
             owner_pid,
             owner_host,
             owner_process_start,
-        };
-        self.store.start_execution(&e)?;
-        Ok(ExecStarted { execution: e, task })
+        })
     }
 
     pub fn exec_finish(&self, exec_id: &str, summary: Option<String>) -> ApiResult<RoleExecution> {
@@ -1887,20 +1927,6 @@ impl Api {
         )?)
     }
 
-    /// The project's task-name template, resolved exactly the way the
-    /// humanization one is (REQ-TN-05 AC2): loaded per call, so a window
-    /// edit lands on the very next gate without a rebuild, and a broken
-    /// file refuses LOUD — the manual paths never silently fall back to
-    /// the factory while the YAML claims otherwise.
-    fn task_name_policy(&self) -> ApiResult<devai_store::config::TaskNamePolicy> {
-        let cfg_dir = std::env::var_os("DEVAI_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.store.root().join("config"));
-        Ok(devai_store::config::load_task_name_policy(
-            &cfg_dir.join("workflow"),
-        )?)
-    }
-
     /// REQ-HP-05/07: the stored human paragraph of the CURRENT artifact of
     /// `kind`, verbatim — the gate renders exactly the bytes the detector
     /// accepted, no read-time retranslation. Honest `Ok(None)` cases: no
@@ -1921,7 +1947,7 @@ impl Api {
         else {
             return Ok(None);
         };
-        let blob = self.store.read_blob(&a.sha256)?;
+        let blob = self.store.read_artifact_body(a)?;
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&blob) else {
             return Ok(None);
         };
@@ -1947,7 +1973,7 @@ impl Api {
         else {
             return Ok(None);
         };
-        let blob = self.store.read_blob(&a.sha256)?;
+        let blob = self.store.read_artifact_body(a)?;
         let v: serde_json::Value = serde_json::from_slice(&blob).map_err(|e| ApiError::refused("corrupt", format!(
             "the CURRENT quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
             short_id(&a.id)
@@ -1957,6 +1983,29 @@ impl Api {
             .map(|s| s.to_string())
             .or_else(|| Some("(report assembled before @2 — no rendering)".into())))
     }
+}
+
+// ---------------------------------------------------------------------------
+// free helpers
+// ---------------------------------------------------------------------------
+
+/// The typed refusal of a standalone `artifact.advance` for a kind that
+/// carries no workflow advance (QA R5). The listed advancing kinds are
+/// DERIVED from the core predicate — never a hand-copied set (QA R4).
+fn not_advancing_refusal(kind: ArtifactKind) -> ApiError {
+    ApiError::refused(
+        "artifact_kind_not_advancing",
+        format!(
+            "{} carries no workflow advance — the advancing kinds are {} (the row alone lands via `artifact.publish_row`; publish through `artifact.publish` to get the row and its advance in one call)",
+            kind.as_str(),
+            ArtifactKind::ALL
+                .iter()
+                .filter(|k| k.advances_state())
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2266,6 +2315,27 @@ mod tests {
         );
     }
 
+    /// A publish request of the CURRENT spec kind — the shape both publish
+    /// paths of the parity test take.
+    fn spec_publish(id: &Id, name: &str) -> PublishReq {
+        // Bodies are JSON, as any gated spec body is: the phased advance
+        // door re-reads the CURRENT body TYPED — a non-JSON blob is a
+        // corruption it refuses loudly, not the legal name-less body (the
+        // name-less JSON body stays the Absent branch on both paths).
+        let content = format!(r#"{{"requirements": "{name}"}}"#).into_bytes();
+        PublishReq {
+            id: id.to_string(),
+            kind: ArtifactKind::RequirementsSpec,
+            name: name.into(),
+            content,
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        }
+    }
+
     /// The compound `artifact_publish` and the phased
     /// `artifact_publish_row` + `artifact_advance` converge on the SAME
     /// store effects — the registry dispatch and the CLI command execute
@@ -2280,39 +2350,9 @@ mod tests {
         // be published from ANALYSIS onward.
         api.task_start(&a.to_string()).unwrap();
         api.task_start(&b.to_string()).unwrap();
-        // Bodies are JSON, as any gated spec body is: the phased advance
-        // door re-reads the CURRENT body TYPED (QA R1) — a non-JSON blob
-        // is a corruption it refuses loudly, not the legal name-less body.
-        // The parity claim is unchanged: name-less JSON advances through
-        // the Absent branch on both paths.
-        let content = |x: &str| format!(r#"{{"requirements": "{x}"}}"#).into_bytes();
 
-        let compound = api
-            .artifact_publish(PublishReq {
-                id: a.to_string(),
-                kind: ArtifactKind::RequirementsSpec,
-                name: "s1".into(),
-                content: content("s1"),
-                depends: vec![],
-                contract: None,
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
-        let row = api
-            .artifact_publish_row(PublishReq {
-                id: b.to_string(),
-                kind: ArtifactKind::RequirementsSpec,
-                name: "s2".into(),
-                content: content("s2"),
-                depends: vec![],
-                contract: None,
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
+        let compound = api.artifact_publish(spec_publish(&a, "s1")).unwrap();
+        let row = api.artifact_publish_row(spec_publish(&b, "s2")).unwrap();
         let adv = api
             .artifact_advance(AdvanceReq {
                 id: b.to_string(),
@@ -2608,291 +2648,6 @@ mod tests {
         .expect("REQ-HP-06: the obligation is not retroactive");
     }
 
-    /// REQ-TN-02 AC1 + REQ-TN-05 AC1 (the manual door): @4 REQUIRES the
-    /// name in the schema — a spec without it refuses at the contract gate;
-    /// an out-of-window name (blank / too long) refuses through the SAME
-    /// mechanical detector the engine loop runs; a valid name publishes and
-    /// the phased manual advance stamps it onto the task from the body
-    /// (one source of truth, no second role).
-    #[test]
-    fn publish_gate_requires_and_stamps_the_name_under_v4() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = seeded_api(dir.path());
-        let t = fresh_task(&api, "name-gate");
-        let id = t.to_string();
-        api.task_start(&id).unwrap();
-        // The known-good factory-window paragraph (the humanize fixtures' text).
-        let para = "Простыми словами: сейчас выводы роли читаются только специалистом, и человеку на гейте приходится переводить формальный протокол вручную по памяти о запуске. После этого решения каждый артефакт будет начинаться с понятного абзаца: что происходит и что изменится, — а платформа проверит его наличие механически и не пустит гейт без него.";
-        let publish = |api: &Api, task_name: Option<&str>| {
-            let mut body = serde_json::json!({
-                "version": 1,
-                "requirements": [{"id": "R1", "statement": "Требование."}],
-                "unknowns": [],
-                "assumptions": [],
-                "human_paragraph": para,
-            });
-            if let Some(tn) = task_name {
-                body["task_name"] = serde_json::json!(tn);
-            }
-            api.artifact_publish_row(PublishReq {
-                id: id.clone(),
-                kind: ArtifactKind::RequirementsSpec,
-                name: format!("spec-{}.json", body["task_name"].as_str().unwrap_or("none")),
-                content: body.to_string().into_bytes(),
-                depends: vec![],
-                contract: Some("requirements-specification@4".into()),
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-        };
-
-        // 1) No name — a required-key violation at the schema half.
-        let e = publish(&api, None).unwrap_err();
-        assert_eq!(e.code(), ErrorCode("contract_violation"));
-        assert!(
-            format!("{e}").contains("$.task_name: missing required key"),
-            "the refusal names the field: {e}"
-        );
-
-        // 2) A blank name — the schema passes (it is a string), the
-        //    mechanical detector owns edibility: «пустое, пробельное».
-        let e = publish(&api, Some("   ")).unwrap_err();
-        assert!(
-            format!("{e}").contains("blank"),
-            "blank name refused by the detector: {e}"
-        );
-
-        // 3) A 61-char name — above the configured maximum.
-        let e = publish(&api, Some(&"а".repeat(61))).unwrap_err();
-        assert!(
-            format!("{e}").contains("above the configured maximum"),
-            "over-window name refused: {e}"
-        );
-
-        // Nothing from the refusals landed.
-        assert!(
-            api.store.artifacts(t).unwrap().is_empty(),
-            "rejected bodies never become artifacts"
-        );
-
-        // 4) A valid name publishes, and the phased manual door stamps it
-        //    onto the task from the published body (REQ-TN-02 publication
-        //    path parity with the engine run).
-        let o = publish(&api, Some("Понятные имена задач")).expect("valid @4 body");
-        let spec_id = o.artifact.id.to_string();
-        api.artifact_advance(AdvanceReq {
-            id: id.clone(),
-            artifact_id: spec_id,
-            kind: ArtifactKind::RequirementsSpec,
-            verdict: None,
-        })
-        .expect("advance publishes the CURRENT spec");
-        let task = api.task_get(&id).unwrap();
-        assert_eq!(task.state, TaskState::Review);
-        assert_eq!(
-            task.human_name.as_deref(),
-            Some("Понятные имена задач"),
-            "the name rides the publication, no manual op"
-        );
-        assert_eq!(task.title, "name-gate", "title stays the creator's text");
-        assert_eq!(task.display_sign(), "Понятные имена задач");
-    }
-
-    /// QA R1 (rel/error-context) regression: on the phased manual advance
-    /// door a CURRENT spec blob that does not read back — garbage bytes or
-    /// a missing file — is NOT the legal «body without a name» branch.
-    /// The door refuses LOUD (`spec_body_unreadable`); the previous
-    /// signboard is never kept silently through a swallowed read error,
-    /// and the state machine never advances. «Readable but name-less»
-    /// stays the one legal keep-the-signboard branch. Stores are checked
-    /// by DIRECT reads, never through command stdout.
-    #[test]
-    fn advance_refuses_loudly_on_a_corrupt_or_missing_spec_blob() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = seeded_api(dir.path());
-        let t = fresh_task(&api, "corrupt-spec-blob");
-        let id = t.to_string();
-        api.task_start(&id).unwrap();
-        let para = "Простыми словами: сейчас выводы роли читаются только специалистом, и человеку на гейте приходится переводить формальный протокол вручную по памяти о запуске. После этого решения каждый артефакт будет начинаться с понятного абзаца: что происходит и что изменится, — а платформа проверит его наличие механически и не пустит гейт без него.";
-        let publish = |api: &Api, name: &str| {
-            api.artifact_publish_row(PublishReq {
-                id: id.clone(),
-                kind: ArtifactKind::RequirementsSpec,
-                name: format!("{name}.json"),
-                content: serde_json::json!({
-                    "version": 1,
-                    "requirements": [{"id": "R1", "statement": "Требование."}],
-                    "unknowns": [],
-                    "assumptions": [],
-                    "human_paragraph": para,
-                    "task_name": name,
-                })
-                .to_string()
-                .into_bytes(),
-                depends: vec![],
-                contract: Some("requirements-specification@4".into()),
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .expect("valid @4 body")
-        };
-        let advance = |api: &Api, artifact_id: String| {
-            api.artifact_advance(AdvanceReq {
-                id: id.clone(),
-                artifact_id,
-                kind: ArtifactKind::RequirementsSpec,
-                verdict: None,
-            })
-        };
-
-        // Baseline: a good publication stamps its signboard — this is the
-        // value the anti-pattern would have silently kept.
-        let first = publish(&api, "Первая вывеска");
-        advance(&api, first.artifact.id.to_string()).unwrap();
-        let task = api.task_get(&id).unwrap();
-        assert_eq!(task.human_name.as_deref(), Some("Первая вывеска"));
-        assert_eq!(task.requirements_seq, first.artifact.seq);
-
-        // Publish the second CURRENT spec, then tamper its blob on disk.
-        // The advance re-reads the CURRENT body: corruption must NOT
-        // collapse into «no name in the body».
-        let second = publish(&api, "Вторая вывеска");
-        std::fs::write(
-            api.store.blob_path(&second.artifact.sha256),
-            b"definitely not json",
-        )
-        .unwrap();
-        let e = advance(&api, second.artifact.id.to_string()).unwrap_err();
-        assert_eq!(e.code(), ErrorCode("spec_body_unreadable"));
-        assert!(
-            format!("{e}").contains("not parseable JSON"),
-            "the refusal names the corruption: {e}"
-        );
-
-        // The loud refusal commits NOTHING: no silent keep-and-advance —
-        // the transition never ran, the signboard stayed as stored.
-        let task = api.task_get(&id).unwrap();
-        assert_eq!(
-            task.requirements_seq, first.artifact.seq,
-            "the refused advance never committed"
-        );
-        assert_eq!(task.human_name.as_deref(), Some("Первая вывеска"));
-
-        // The unreadable sibling: a missing blob file refuses the SAME
-        // typed way (the old `.ok()` made it indistinguishable too).
-        std::fs::remove_file(api.store.blob_path(&second.artifact.sha256)).unwrap();
-        let e = advance(&api, second.artifact.id.to_string()).unwrap_err();
-        assert_eq!(e.code(), ErrorCode("spec_body_unreadable"));
-        assert!(
-            format!("{e}").contains("does not read back"),
-            "the refusal names the read failure: {e}"
-        );
-
-        // The legal absence branch stays legal: a CURRENT @3 body that
-        // reads fine but predates the name obligation advances through
-        // the SAME door, keeping the stored signboard (REQ-TN-02 AC3).
-        let legacy = api
-            .artifact_publish_row(PublishReq {
-                id: id.clone(),
-                kind: ArtifactKind::RequirementsSpec,
-                name: "spec-legacy.json".into(),
-                content: serde_json::json!({
-                    "version": 3,
-                    "requirements": [{"id": "R1", "statement": "Требование."}],
-                    "unknowns": [],
-                    "assumptions": [],
-                    "human_paragraph": para,
-                })
-                .to_string()
-                .into_bytes(),
-                depends: vec![],
-                contract: Some("requirements-specification@3".into()),
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .expect("REQ-TN-02 AC3: a name-less @3 body publishes")
-            .artifact;
-        advance(&api, legacy.id.to_string()).expect("absence is the legal branch");
-        assert_eq!(
-            api.task_get(&id).unwrap().human_name.as_deref(),
-            Some("Первая вывеска"),
-            "name-less CURRENT body keeps the signboard via the typed Absent branch"
-        );
-    }
-
-    /// REQ-TN-05 AC1 (the ACTUAL manual door): `task.revise` — the path the
-    /// CLI and the `task.revise` operation take — must run the SAME gate as
-    /// the engine loop and the raw publish. The gate version rides the
-    /// analyst's seeded role data (REQ-TN-02 AC4): nothing here pins @4 in
-    /// code, the refusal proves the stored schema was consulted. A smoke
-    /// over the real binary caught the hole this test now closes: revise
-    /// published name-less and over-window bodies while `contract: None`.
-    #[test]
-    fn task_revise_itself_runs_the_name_gate_and_stamps() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = seeded_api(dir.path());
-        let t = fresh_task(&api, "revise-door");
-        let id = t.to_string();
-        api.task_start(&id).unwrap();
-        let para = "Простыми словами: сейчас выводы роли читаются только специалистом, и человеку на гейте приходится переводить формальный протокол вручную по памяти о запуске. После этого решения каждый артефакт будет начинаться с понятного абзаца: что происходит и что изменится, — а платформа проверит его наличие механически и не пустит гейт без него.";
-        let body = |name: Option<&str>, ver: u32| -> Vec<u8> {
-            let mut j = serde_json::json!({
-                "version": ver,
-                "requirements": [{"id": "R1", "statement": "Требование."}],
-                "unknowns": [],
-                "assumptions": [],
-                "human_paragraph": para,
-            });
-            if let Some(n) = name {
-                j["task_name"] = serde_json::json!(n);
-            }
-            j.to_string().into_bytes()
-        };
-        let revise = |name: Option<&str>, ver: u32| {
-            api.task_revise(ReviseReq {
-                id: id.clone(),
-                name: format!("spec-{ver}.json"),
-                content: body(name, ver),
-                reason: None,
-            })
-        };
-
-        // 1) No name at all — the stored @4 schema half refuses.
-        let e = revise(None, 1).unwrap_err();
-        assert_eq!(e.code(), ErrorCode("contract_violation"));
-        assert!(
-            format!("{e}").contains("$.task_name: missing required key"),
-            "the manual door consulted the active contract: {e}"
-        );
-
-        // 2) An over-window name — the mechanical detector half refuses.
-        let e = revise(Some(&"а".repeat(61)), 1).unwrap_err();
-        assert!(
-            format!("{e}").contains("above the configured maximum"),
-            "detector on the manual door: {e}"
-        );
-        // Nothing from either refusal landed on the task.
-        assert!(
-            api.store.artifacts(t).unwrap().is_empty(),
-            "rejected bodies never become artifacts"
-        );
-
-        // 3) A valid body publishes through the one door and stamps.
-        let o = revise(Some("Имя из ручного спека"), 1).expect("valid @4 body");
-        assert_eq!(o.task.state, TaskState::Review);
-        assert_eq!(o.task.human_name.as_deref(), Some("Имя из ручного спека"));
-        assert_eq!(o.task.title, "revise-door", "REQ-TN-01 AC2: title verbatim");
-
-        // 4) The next CURRENT version replaces the name WHOLE (REQ-TN-04
-        //    through the manual door).
-        let o2 = revise(Some("Имя переиздано заново"), 2).expect("rework body");
-        assert_eq!(o2.task.human_name.as_deref(), Some("Имя переиздано заново"));
-        assert_eq!(o2.task.display_sign(), "Имя переиздано заново");
-    }
-
     /// REQ-HP-03 AC5: publishing the platform-assembled quality-report never
     /// runs the detector on its report_text — the §2.6 render is exempt by
     /// construction (its schema has no paragraph field).
@@ -3035,7 +2790,7 @@ mod tests {
                 .find(|x| x.kind == kind && x.status == ArtifactStatus::Current)
                 .unwrap();
             let body: serde_json::Value =
-                serde_json::from_slice(&api.store.read_blob(&a.sha256).unwrap()).unwrap();
+                serde_json::from_slice(&api.store.read_artifact_body(&a).unwrap()).unwrap();
             assert_eq!(body["human_paragraph"].as_str().unwrap(), text.as_str());
         }
     }
@@ -3147,100 +2902,21 @@ mod tests {
         assert_eq!(stored.lock_version, 1);
     }
 
-    /// Task 01a1ad1d (REQ-TN, ratified OQ-TN-1): `task.rename` is the HUMAN
-    /// door to the signboard — the SAME declarative window as the
-    /// publication gate, typed refusals, a side-effect-free NO-OP, one
-    /// event per effective change, and the workflow state never moves.
-    #[test]
-    fn task_rename_is_the_human_door_with_the_publication_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = api(dir.path());
-        let t = fresh_task(&api, "rename-target");
-
-        // Refs resolve like every other door (prefix), value is trimmed.
-        let o = api
-            .task_rename(TaskRenameReq {
-                id: t.to_string()[..8].to_string(),
-                name: "  Человеческое имя  ".into(),
-                expected_lock: None,
-            })
-            .expect("rename applies");
-        assert_eq!(o.human_name, "Человеческое имя");
-        assert!(o.changed);
-        let stored = api.store.get_task(&t.to_string()).unwrap();
-        assert_eq!(stored.human_name.as_deref(), Some("Человеческое имя"));
-        assert_eq!(
-            stored.title, "rename-target",
-            "REQ-TN-01 AC2: title verbatim"
-        );
-        assert_eq!(
-            stored.state,
-            TaskState::Draft,
-            "a rename signs, it does not re-open"
-        );
-
-        // NO-OP: re-applying the carried name writes nothing (changed=false).
-        let again = api
-            .task_rename(TaskRenameReq {
-                id: t.to_string(),
-                name: "Человеческое имя".into(),
-                expected_lock: None,
-            })
-            .unwrap();
-        assert!(!again.changed);
-        assert_eq!(again.task.lock_version, stored.lock_version);
-
-        // REQ-TN-05 AC1: blank / over-window / multi-line refuse with the
-        // SAME window the publication gate applies — one rule, two doors.
-        let long = "с".repeat(61);
-        for bad in ["   ", long.as_str(), "две\nстроки"] {
-            let e = api
-                .task_rename(TaskRenameReq {
-                    id: t.to_string(),
-                    name: bad.into(),
-                    expected_lock: None,
-                })
-                .expect_err("window violation must refuse");
-            assert_eq!(e.code(), ErrorCode("contract_violation"), "{bad:?}");
-        }
-        // A stale expected_lock refuses typed `conflict` before any write.
-        let e = api
-            .task_rename(TaskRenameReq {
-                id: t.to_string(),
-                name: "гонка".into(),
-                expected_lock: Some(1),
-            })
-            .expect_err("stale lock must conflict");
-        assert_eq!(e.code(), ErrorCode("conflict"));
-
-        // The trail: exactly ONE task.human_name.set event per EFFECTIVE
-        // change (the refused writes and the NO-OP left nothing).
-        let evs: Vec<_> = api
-            .store
-            .events(t, None)
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.kind == event_kind::TASK_HUMAN_NAME_SET)
-            .collect();
-        assert_eq!(evs.len(), 1, "{evs:?}");
-        assert_eq!(evs[0].payload[json_field::HUMAN_NAME], "Человеческое имя");
-        // The single effective bump: `stored` was already read AFTER the
-        // first rename — the NO-OP and the refused writes moved nothing.
-        assert_eq!(
-            api.store.get_task(&t.to_string()).unwrap().lock_version,
-            stored.lock_version
-        );
+    /// The four task kinds the backfill rule distinguishes, plus the two
+    /// projects: freshly created for every test so no state leaks.
+    struct BackfillFixture {
+        free: Id,
+        owned: Id,
+        closed: Id,
+        home: Id,
+        project: Id,
+        other: Id,
     }
 
-    /// REQ-BIND-03 under the ratified OQ-BIND-2 rule: the backfill binds
-    /// every UNBOUND NON-TERMINAL task, leaves terminal history at its old
-    /// address, never re-binds another project's task, and is idempotent on
-    /// re-application. Each binding is one `task.project.set` event.
-    #[test]
-    fn task_project_backfill_applies_the_ratified_rule_idempotently() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = api(dir.path());
-        let p = devai_project(&api);
+    /// One unbound task, one owned by ANOTHER project, one parked terminal,
+    /// one already on `devai` — the exact spread of the ratified rule.
+    fn backfill_fixture(api: &Api) -> BackfillFixture {
+        let p = devai_project(api);
         let other = api
             .project_add(ProjectAddReq {
                 name: "other".into(),
@@ -3248,37 +2924,55 @@ mod tests {
                 repos: vec![],
             })
             .unwrap();
-
-        let free = fresh_task(&api, "unbound-draft");
-        let owned = fresh_task(&api, "owned-by-other");
+        let free = fresh_task(api, "unbound-draft");
+        let owned = fresh_task(api, "owned-by-other");
         api.task_project_set(TaskProjectSetReq {
             id: owned.to_string(),
             project: other.id.to_string(),
             expected_lock: None,
         })
         .unwrap();
-        let closed = fresh_task(&api, "terminal-history");
+        let closed = fresh_task(api, "terminal-history");
         // Park it terminal through the workflow plane (CANCELLED).
         api.task_op(&closed.to_string(), WorkflowOp::Cancel { reason: None })
             .unwrap();
-        let home = fresh_task(&api, "already-devai");
+        let home = fresh_task(api, "already-devai");
         api.task_project_set(TaskProjectSetReq {
             id: home.to_string(),
             project: p.id.to_string(),
             expected_lock: None,
         })
         .unwrap();
+        BackfillFixture {
+            free,
+            owned,
+            closed,
+            home,
+            project: p.id,
+            other: other.id,
+        }
+    }
+
+    /// REQ-BIND-03 under the ratified OQ-BIND-2 rule: the backfill binds
+    /// every UNBOUND NON-TERMINAL task, leaves terminal history at its old
+    /// address, never re-binds another project's task. Each binding is one
+    /// `task.project.set` event.
+    #[test]
+    fn task_project_backfill_applies_the_ratified_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let f = backfill_fixture(&api);
 
         let o = api.task_project_backfill("devai").expect("backfill runs");
-        assert_eq!(o.bound, vec![free]);
-        assert_eq!(o.already_bound, vec![home]);
-        assert_eq!(o.skipped_terminal, vec![closed]);
-        assert_eq!(o.skipped_other_project, vec![owned]);
+        assert_eq!(o.bound, vec![f.free]);
+        assert_eq!(o.already_bound, vec![f.home]);
+        assert_eq!(o.skipped_terminal, vec![f.closed]);
+        assert_eq!(o.skipped_other_project, vec![f.owned]);
 
-        let stored = api.store.get_task(&free.to_string()).unwrap();
-        assert_eq!(stored.project_id, Some(p.id));
+        let stored = api.store.get_task(&f.free.to_string()).unwrap();
+        assert_eq!(stored.project_id, Some(f.project));
         assert_eq!(stored.lock_version, 2);
-        let evs = api.task_events(&free.to_string(), None).unwrap();
+        let evs = api.task_events(&f.free.to_string(), None).unwrap();
         assert_eq!(
             evs.iter()
                 .filter(|e| e.kind == event_kind::TASK_PROJECT_SET)
@@ -3287,24 +2981,38 @@ mod tests {
         );
         // Terminal history untouched, another project's task not re-bound.
         assert_eq!(
-            api.store.get_task(&closed.to_string()).unwrap().project_id,
+            api.store
+                .get_task(&f.closed.to_string())
+                .unwrap()
+                .project_id,
             None
         );
         assert_eq!(
-            api.store.get_task(&owned.to_string()).unwrap().project_id,
-            Some(other.id)
+            api.store.get_task(&f.owned.to_string()).unwrap().project_id,
+            Some(f.other)
         );
+    }
 
-        // Re-application: no candidates left, nothing changes anywhere.
+    /// Re-application finds no candidates and changes nothing; an unknown
+    /// project refuses typed before touching a row.
+    #[test]
+    fn task_project_backfill_is_idempotent_and_refuses_unknown_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let f = backfill_fixture(&api);
+        api.task_project_backfill("devai").expect("first run");
+
         let o2 = api.task_project_backfill("devai").unwrap();
         assert!(o2.bound.is_empty());
         assert_eq!(o2.already_bound.len(), 2);
         assert_eq!(
-            api.store.get_task(&free.to_string()).unwrap().lock_version,
+            api.store
+                .get_task(&f.free.to_string())
+                .unwrap()
+                .lock_version,
             2
         );
 
-        // Unknown project refuses typed, before touching a row.
         let err = api
             .task_project_backfill("no-such")
             .expect_err("unknown project refuses");
