@@ -1,0 +1,16 @@
+{
+  "ui_error": {
+    "code": "not_found",
+    "message": "task `x1` was not found"
+  },
+  "artifact_text": {
+    "shape": "text",
+    "artifact_id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "text": "hello ipc"
+  },
+  "artifact_binary": {
+    "shape": "binary",
+    "artifact_id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "size": 42
+  }
+}

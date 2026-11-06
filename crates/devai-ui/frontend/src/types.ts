@@ -229,3 +229,47 @@ export interface InboxEntry {
   task: Task;
   open_questions: Question[];
 }
+
+// --- workspace view (task.workspace_changes / task.workspace_diff) ---
+// state — verdict-токен платформы: no_isolation | live | historical |
+// unavailable. UI показывает его как данные и никогда не перефразирует.
+export interface WorkspaceFileChange {
+  status: string; // A | M | D (git --no-renames)
+  path: string;
+}
+
+export interface WorkspaceCommitStamp {
+  execution: string;
+  commit: string;
+  at: string;
+}
+
+export interface WorkspaceChangesView {
+  task: string;
+  state: string;
+  isolated: boolean;
+  zero_changes: boolean;
+  partial: boolean;
+  branch: string | null;
+  worktree: string | null;
+  bound_head: string | null;
+  tip: string | null;
+  head_before: string | null;
+  head_after: string | null;
+  commits: WorkspaceCommitStamp[];
+  files: WorkspaceFileChange[];
+  note: string | null;
+}
+
+export interface WorkspaceDiffView {
+  task: string;
+  path: string;
+  state: string;
+  branch: string | null;
+  baseline: string | null;
+  tip: string | null;
+  binary: boolean;
+  size_bytes: number | null;
+  diff: string | null;
+  note: string | null;
+}

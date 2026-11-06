@@ -18,5 +18,9 @@ devai-core.workspace = true
 devai-api.workspace = true
 tauri = "2"
 
+[dev-dependencies]
+# R4: the ipc serde-output snapshot fixtures are compared as JSON.
+serde_json.workspace = true
+
 [build-dependencies]
 tauri-build = "2"

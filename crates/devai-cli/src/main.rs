@@ -140,6 +140,21 @@ enum TaskCmd {
     /// snapshot, no waiting (with --json: one machine snapshot). Per-task
     /// pipeline detail stays with `task progress`.
     Active,
+    /// What the task's isolated workspace CHANGES against the bound baseline:
+    /// committed file list with A/M/D markers, the stored range (baseline..tip)
+    /// and per-run commit stamps. Read-only view over the task's branch —
+    /// states no_isolation / live / historical / unavailable are verdicts in
+    /// data, never errors (with --json: the full machine view).
+    Workspace {
+        id: String,
+    },
+    /// Readable unified diff of ONE changeset-listed file of the task's
+    /// rework branch against the stored baseline — the same range the
+    /// `task workspace` list used (with --json: the machine view).
+    WorkspaceDiff {
+        id: String,
+        path: String,
+    },
     /// Show the CURRENT quality report — the rendering a human signs at the
     /// QA gate (with --json: the full machine report).
     Report {

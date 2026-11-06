@@ -21,6 +21,9 @@ import type {
   StatusView,
   UiError,
   WorkflowEvent,
+  WorkspaceChangesView,
+  WorkspaceDiffView,
+  WorkspaceFileChange,
 } from "../types";
 
 const props = defineProps<{ id: string }>();
@@ -40,6 +43,13 @@ const error = ref<UiError | null>(null);
 const content = ref<ArtifactContent | null>(null);
 const contentFor = ref<string | null>(null);
 const eventsLimit = ref(50);
+// Воркспейс-панель (REQ-WV-04/05): changeset из task.workspace_changes,
+// дифф выбранного файла из task.workspace_diff — обе операции read-плоскости.
+const ws = ref<WorkspaceChangesView | null>(null);
+const wsError = ref<UiError | null>(null);
+const wsDiff = ref<WorkspaceDiffView | null>(null);
+const wsDiffFor = ref<string | null>(null);
+const wsDiffError = ref<UiError | null>(null);
 
 async function loadAll() {
   error.value = null;
@@ -74,8 +84,37 @@ async function loadAll() {
     }
     await loadEvents();
     await loadReport();
+    await loadWorkspace();
   } catch (e) {
     error.value = toUiError(e);
+  }
+}
+
+// Changeset задачи (task.workspace_changes). Ошибкой loadAll это не
+// становится: панель честно показывает собственный вердикт/ошибку.
+async function loadWorkspace() {
+  wsError.value = null;
+  wsDiff.value = null;
+  wsDiffFor.value = null;
+  wsDiffError.value = null;
+  try {
+    ws.value = await api.taskWorkspaceChanges(props.id);
+  } catch (e) {
+    ws.value = null;
+    wsError.value = toUiError(e);
+  }
+}
+
+// Дифф одного выбранного файла (REQ-WV-05 AC1: выбор меняет только блок
+// диффа); файл вне листа — платформенный not_found по коду (AC2 REQ-WV-02).
+async function openWorkspaceDiff(f: WorkspaceFileChange) {
+  wsDiffFor.value = f.path;
+  wsDiff.value = null;
+  wsDiffError.value = null;
+  try {
+    wsDiff.value = await api.taskWorkspaceDiff(props.id, f.path);
+  } catch (e) {
+    wsDiffError.value = toUiError(e);
   }
 }
 
@@ -173,9 +212,12 @@ onMounted(loadAll);
     </div>
 
     <!-- Воркспейс: branch/worktree только там, где их опубликовала платформа
-         (ActiveRow для RUNNING + событие worktree.prepared) — REQ-UI-11 -->
+         (ActiveRow для RUNNING + событие worktree.prepared) — REQ-UI-11.
+         Changeset против baseline — read-операции task.workspace_changes /
+         task.workspace_diff (REQ-WV-04/05): UI не знает ни о git, ни о
+         путях — вердикты состояний приходят как данные. -->
     <div class="panel">
-      <h3>Воркспейс (worktree задачи)</h3>
+      <h3>Воркспейс (worktree задачи · изменения против baseline)</h3>
       <div class="body">
         <template v-if="activeRows.length">
           <div v-for="r in activeRows" :key="r.id" class="rowflex" style="margin-bottom: 6px">
@@ -185,13 +227,72 @@ onMounted(loadAll);
             <span v-if="r.worktree" class="mono muted">{{ r.worktree }}</span>
           </div>
         </template>
-        <template v-else>
-          <p v-if="events.some((e) => e.kind === 'worktree.prepared')" class="muted" style="margin: 0">
-            Событие <span class="mono">worktree.prepared</span> есть; RUNNING-исполнения нет —
-            строку worktree платформа не публикует отдельно (известный гэп API, следующий срез).
+
+        <div v-if="wsError" class="errorbox" style="margin-bottom: 0">
+          <span class="code">{{ wsError.code }}</span>{{ wsError.message }}
+        </div>
+
+        <template v-else-if="ws">
+          <p v-if="ws.state === 'no_isolation'" class="muted" style="margin: 0">
+            Изоляции не было — у задачи нет события
+            <span class="mono">worktree.prepared</span>; changeset показывать
+            нечего (вердикт платформы <span class="mono">no_isolation</span>).
           </p>
-          <p v-else class="muted" style="margin: 0">Нет RUNNING-исполнения и события worktree.prepared — воркспейс не показываем (ничего не изобретаем).</p>
+          <template v-else>
+            <div class="rowflex" style="margin-bottom: 6px">
+              <StateChip :token="ws.state" />
+              <span v-if="ws.branch" class="mono muted">branch {{ ws.branch }}</span>
+              <span v-if="ws.bound_head" class="mono muted">baseline {{ shortId(ws.bound_head) }}</span>
+              <span v-if="ws.tip" class="mono muted">tip {{ shortId(ws.tip) }}</span>
+            </div>
+            <p v-if="ws.note" class="muted" style="margin: 0 0 6px">{{ ws.note }}</p>
+            <p v-if="ws.zero_changes" style="margin: 0 0 6px">
+              Изоляция состоялась, поверх baseline коммитов нет —
+              <b>ноль изменений</b> (легальный результат, не недоступность).
+            </p>
+            <div v-if="ws.commits.length" style="margin-bottom: 6px">
+              <div v-for="c in ws.commits" :key="c.commit + c.execution" class="rowflex">
+                <span class="mono muted">прогон {{ shortId(c.execution) }}</span>
+                <span class="mono muted">commit {{ shortId(c.commit) }}</span>
+                <span class="mono muted">{{ fmtTime(c.at) }}</span>
+              </div>
+            </div>
+            <p v-if="ws.head_before && ws.head_after" class="muted" style="margin: 0 0 6px">
+              смержено в main: <span class="mono">{{ shortId(ws.head_before) }}</span> →
+              <span class="mono">{{ shortId(ws.head_after) }}</span>
+            </p>
+
+            <table v-if="ws.files.length" class="data">
+              <thead>
+                <tr><th>Что</th><th>Путь</th><th></th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="f in ws.files" :key="f.path">
+                  <td class="mono">{{ f.status }}</td>
+                  <td class="mono">{{ f.path }}</td>
+                  <td><button @click="openWorkspaceDiff(f)">дифф</button></td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div v-if="wsDiffFor">
+              <p class="mono muted" style="margin: 8px 0 0">
+                diff: {{ wsDiffFor }}
+                <template v-if="wsDiff && wsDiff.baseline && wsDiff.tip">
+                  · {{ shortId(wsDiff.baseline) }}..{{ shortId(wsDiff.tip) }}
+                </template>
+              </p>
+              <div v-if="wsDiffError" class="errorbox" style="margin-bottom: 0">
+                <span class="code">{{ wsDiffError.code }}</span>{{ wsDiffError.message }}
+              </div>
+              <pre v-else-if="wsDiff && wsDiff.diff !== null" class="content">{{ wsDiff.diff }}</pre>
+              <p v-else-if="wsDiff && wsDiff.binary" class="muted" style="margin: 4px 0 0">
+                Изменён, бинарный<template v-if="wsDiff.size_bytes !== null"> ({{ wsDiff.size_bytes }} байт)</template> — сырые байты не рендерим.
+              </p>
+            </div>
+          </template>
         </template>
+        <p v-else class="muted" style="margin: 0">Загрузка changeset…</p>
       </div>
     </div>
 

@@ -240,6 +240,47 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Status { id } => status(ctx, &id, json)?,
         TaskCmd::Progress { id } => progress(ctx, &id, json)?,
         TaskCmd::Active => active_overview(ctx, json)?,
+        TaskCmd::Workspace { id } => {
+            // API task.workspace_changes — the committed changeset of the
+            // task's isolated branch against the stored bound baseline
+            // (read-only view; REQ-WV-01/03/07). The CLI renders the state
+            // verdicts as data, never as errors.
+            let v = ctx
+                .api()
+                .task_workspace_changes(&id)
+                .map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                render_workspace_changes(&v);
+            }
+        }
+        TaskCmd::WorkspaceDiff { id, path } => {
+            // API task.workspace_diff — one file's diff over exactly the
+            // range the changeset used (REQ-WV-02). A path outside the list
+            // keeps the platform's not_found refusal (code + text).
+            let v = ctx
+                .api()
+                .task_workspace_diff(&id, &path)
+                .map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&v)?);
+            } else if let Some(diff) = &v.diff {
+                outln!("{}", diff);
+            } else if v.binary {
+                outln!(
+                    "(modified, binary — {} bytes; raw bytes are not rendered)",
+                    v.size_bytes
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "size unknown".into())
+                );
+            } else {
+                outln!("(state {} — no diffable content)", v.state);
+                if let Some(n) = &v.note {
+                    outln!("  {n}");
+                }
+            }
+        }
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
         TaskCmd::Events { id, limit } => task_events(ctx, &id, limit, json)?,
         TaskCmd::Decisions { id } => task_decisions(ctx, &id, json)?,
@@ -962,6 +1003,47 @@ fn render_mutation(m: &MutationResult) -> Result<()> {
         outln!("next: {}", m.allowed_operations.join(" | "));
     }
     Ok(())
+}
+
+/// Text rendering of `task.workspace_changes` — the state verdict is a
+/// presented fact (REQ-WV-07), the file list arrives in the operation's
+/// path order, and the commit stamps show the per-run history.
+fn render_workspace_changes(v: &devai_api::WorkspaceChangesView) {
+    outln!("state: {}  (task {})", v.state, ellipsis(&v.task, 8));
+    if let Some(b) = &v.branch {
+        outln!("branch: {b}");
+    }
+    if let Some(h) = &v.bound_head {
+        outln!("baseline (stored bound head): {h}");
+    }
+    if let Some(t) = &v.tip {
+        outln!("tip: {t}");
+    }
+    if v.partial {
+        outln!("partial: the branch is gone — rebuilt from stored commit stamps");
+    }
+    if let (Some(before), Some(after)) = (&v.head_before, &v.head_after) {
+        outln!("merged into main: {before} -> {after}");
+    }
+    if let Some(n) = &v.note {
+        outln!("note: {n}");
+    }
+    if v.zero_changes {
+        outln!(
+            "(isolation happened; zero changes against the baseline — a legitimate empty result)"
+        );
+    }
+    for c in &v.commits {
+        outln!(
+            "  run {}  commit {}  {}",
+            ellipsis(&c.execution, 8),
+            ellipsis(&c.commit, 12),
+            c.at.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+    for f in &v.files {
+        outln!("  {}  {}", f.status, f.path);
+    }
 }
 
 /// Drive the task through every AUTONOMOUS stage with a real role

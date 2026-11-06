@@ -1,0 +1,18 @@
+{
+  "_comment": "Ожидание window-content критерия для карточки с zero_changes-панелью «Воркспейс» (REQ-WV-01 AC4; прогон test_workspace_window.py, задача ZERO). Отличается от ui_expectations_workspace.json ровно одним: маркер ws-diff-per-file УБРАН — при нулевом changeset таблица с кнопками «дифф» не рендерится по правилам панели (table v-if=\"ws.files.length\"), и отсутствие кнопок — покрытие ветки, а не регресс. Обязателен заголовок панели: «ноль изменений» — успешный вердикт, не пустой экран (note-строка видима на скриншоте пары, DOM-текст в дерево на этой машине webkit не кладётся). min_ax_nodes=35: измеренный край live-карточки без таблицы (прогон 06.11.2026) с запасом вниз по той же методике, что ui_expectations.json.",
+  "error_texts": [
+    "Operation was cancelled",
+    "not managed successfully",
+    "Page not found",
+    "Web Content process crashed"
+  ],
+  "min_ax_nodes": 35,
+  "required_elements": [
+    { "id": "nav-projects", "any_of": ["Проекты", "#/projects"] },
+    { "id": "nav-tasks", "any_of": ["Задачи", "#/tasks"] },
+    { "id": "nav-live", "any_of": ["Активные", "#/live"] },
+    { "id": "nav-inbox", "any_of": ["Вопросы", "#/inbox"] },
+    { "id": "nav-ops", "any_of": ["Операции API", "#/ops"] },
+    { "id": "ws-panel-heading", "any_of": ["изменения против baseline"] }
+  ]
+}

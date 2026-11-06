@@ -40,6 +40,7 @@ use chrono::{DateTime, Utc};
 use devai_core::types::*;
 use devai_core::workflow;
 use devai_runtime::liveness;
+use devai_runtime::{RuntimeError, worktree};
 use devai_store::{Store, bundle};
 use serde::Serialize;
 
@@ -341,6 +342,222 @@ impl Api {
     }
 
     // ------------------------------------------------------------------
+    // workspace view (REQ-WV-01/02/03/07): the committed changeset of the
+    // task's isolated worktree against the stored bound baseline, and the
+    // per-file diff. Pure read: stored facts compose the range, read-only
+    // git plumbing answers the content — nothing here writes to the store
+    // or opens a git write channel (REQ-WV-08).
+    // ------------------------------------------------------------------
+
+    /// The changeset file list of the task's `rework/<task-id>` branch
+    /// against the baseline the platform branched from (REQ-WV-03: exactly
+    /// the `bound_head` stored in the first `worktree.prepared` event —
+    /// never the main branch's moving HEAD). The view distinguishes the
+    /// four states of REQ-WV-01 AC2 / REQ-WV-07 by DATA (`state` token +
+    /// `zero_changes` / `partial` markers); "no isolation" and "zero
+    /// changes" are successful verdicts, not errors.
+    pub fn task_workspace_changes(&self, id_prefix: &str) -> ApiResult<WorkspaceChangesView> {
+        let f = self.workspace_facts(id_prefix)?;
+        let mut view = WorkspaceChangesView {
+            task: f.task.clone(),
+            state: f.state.to_string(),
+            isolated: f.isolated,
+            zero_changes: false,
+            partial: f.partial,
+            branch: f.branch.clone(),
+            worktree: f.worktree.clone(),
+            bound_head: f.bound_head.clone(),
+            tip: f.tip.clone(),
+            head_before: f.head_before.clone(),
+            head_after: f.head_after.clone(),
+            commits: f.commits.clone(),
+            files: Vec::new(),
+            note: f.note.clone(),
+        };
+        if let (Some(repo), Some(baseline), Some(tip)) = (&f.repo, &f.bound_head, &f.tip) {
+            // The range is the one the facts resolved (live branch tip, or
+            // the last stored commit stamp when the branch is gone — the
+            // same resolution the companion diff operation reuses).
+            view.files = worktree::diff_name_status(repo, baseline, tip)
+                .map_err(|e| ApiError::Runtime(RuntimeError::Worktree(e)))?
+                .into_iter()
+                .map(|(status, path)| WorkspaceFileChange { status, path })
+                .collect();
+            view.zero_changes = view.files.is_empty();
+        }
+        Ok(view)
+    }
+
+    /// The readable unified diff of ONE file between exactly the baseline
+    /// and tip the changeset view used (REQ-WV-02 AC1: same range, one
+    /// resolution path — consistency is structural, not a convention).
+    /// A path outside the changeset is a typed `not_found` the consumer
+    /// branches on by code; binary content answers as a binary fact with
+    /// the stored size, raw bytes are never rendered (AC3).
+    pub fn task_workspace_diff(&self, id_prefix: &str, path: &str) -> ApiResult<WorkspaceDiffView> {
+        let f = self.workspace_facts(id_prefix)?;
+        let mut view = WorkspaceDiffView {
+            task: f.task.clone(),
+            path: path.to_string(),
+            state: f.state.to_string(),
+            branch: f.branch.clone(),
+            baseline: f.bound_head.clone(),
+            tip: f.tip.clone(),
+            binary: false,
+            size_bytes: None,
+            diff: None,
+            note: f.note.clone(),
+        };
+        let (Some(repo), Some(baseline), Some(tip)) = (&f.repo, &f.bound_head, &f.tip) else {
+            // No_isolation / unavailable: the typed verdict (state + stored
+            // facts) is the honest answer — there is no list to be in.
+            return Ok(view);
+        };
+        let git_err = |e| ApiError::Runtime(RuntimeError::Worktree(e));
+        let listed = worktree::diff_name_status(repo, baseline, tip)
+            .map_err(git_err)?
+            .into_iter()
+            .any(|(_, p)| p == path);
+        if !listed {
+            // REQ-WV-02 AC2: the UI branches on the API code, not the text.
+            return Err(ApiError::Store(devai_store::StoreError::NotFound(
+                "workspace file".into(),
+                format!(
+                    "`{path}` is not in the changeset of task {}",
+                    devai_core::types::short_id_str(&f.task)
+                ),
+            )));
+        }
+        if worktree::diff_is_binary(repo, baseline, tip, path).map_err(git_err)? {
+            view.binary = true;
+            view.size_bytes = worktree::blob_size(repo, tip, path)
+                .or_else(|| worktree::blob_size(repo, baseline, path));
+            view.note = Some("modified, binary content — raw bytes are not rendered".into());
+            return Ok(view);
+        }
+        view.diff = Some(worktree::diff_text(repo, baseline, tip, path).map_err(git_err)?);
+        Ok(view)
+    }
+
+    /// The one resolution both workspace operations share, split into two
+    /// private units (R2): `workspace_event_facts` — a pure fold over the
+    /// task's stored workflow events — and `resolve_workspace_repo` — the
+    /// reachability question of which recorded directory can answer git.
+    /// Both operations go through this ONE path, which is why list and diff
+    /// cannot disagree; the split changes the shape, not the resolution.
+    /// No re-derivation: baseline = stored `bound_head`, tip = live branch
+    /// or the last stored `worktree.committed` stamp.
+    fn workspace_facts(&self, id_prefix: &str) -> ApiResult<WorkspaceFacts> {
+        let t = self.store.resolve_task(id_prefix)?;
+        let events = self.store.all_events_for_task(t.id)?;
+        let mut f = workspace_event_facts(&t, &events);
+        if f.isolated {
+            self.resolve_workspace_repo(&mut f, &t, &events)?;
+        }
+        Ok(f)
+    }
+
+    /// Repo-resolution unit: candidates strictly from stored paths (the
+    /// recorded worktree directory, the workspace recorded at
+    /// `rework.merged`, then the task's project repositories). The owner of
+    /// the facts is the one that resolves them — REQ-WV-07 AC3 makes this a
+    /// rev-resolvability question. The branch probe is typed
+    /// (`worktree::branch_tip`): "git itself failed" propagates as a
+    /// distinguishable failure (R3) and never degrades into a
+    /// `historical`/`unavailable` verdict masquerading as an honest answer.
+    fn resolve_workspace_repo(
+        &self,
+        f: &mut WorkspaceFacts,
+        t: &Task,
+        events: &[WorkflowEvent],
+    ) -> ApiResult<()> {
+        let git_err = |e| ApiError::Runtime(RuntimeError::Worktree(e));
+        let bound = f.bound_head.clone();
+        let last_commit = f.commits.last().map(|c| c.commit.clone());
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = &f.worktree {
+            candidates.push(PathBuf::from(dir));
+        }
+        if let Some(ev) = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == event_kind::REWORK_MERGED)
+        {
+            if let Some(ws) = string_field(&ev.payload, "workspace") {
+                candidates.push(PathBuf::from(ws));
+            }
+        }
+        if let Some(pid) = t.project_id {
+            if let Some(p) = self.store.get_project(&pid.to_string())? {
+                for r in p.repos {
+                    candidates.push(PathBuf::from(r));
+                }
+            }
+        }
+        // This repository holds the task's branch, or resolves the stored
+        // commits; a git failure in the probe is an Err, not a verdict.
+        let owns_facts = |dir: &Path| -> ApiResult<bool> {
+            match worktree::branch_tip(dir, t.id).map_err(git_err)? {
+                Some(_) => Ok(true),
+                None => Ok(bound
+                    .as_deref()
+                    .is_some_and(|h| worktree::commit_resolvable(dir, h))
+                    || last_commit
+                        .as_deref()
+                        .is_some_and(|c| worktree::commit_resolvable(dir, c))),
+            }
+        };
+        let mut repo: Option<PathBuf> = None;
+        for c in &candidates {
+            if !worktree::is_git_repo(c) {
+                continue;
+            }
+            if owns_facts(c)? {
+                repo = Some(c.clone());
+                break;
+            }
+        }
+        let Some(repo) = repo else {
+            f.state = workspace_state::UNAVAILABLE;
+            f.note = Some(
+                "no recorded repository path is reachable and owns the stored commits — only the stored facts can be shown"
+                    .into(),
+            );
+            return Ok(());
+        };
+        f.repo = Some(repo.clone());
+
+        if let Some(tip) = worktree::branch_tip(&repo, t.id).map_err(git_err)? {
+            f.state = workspace_state::LIVE;
+            f.tip = Some(tip);
+            return Ok(());
+        }
+        // Branch gone: (b) is the stored shas still resolvable in the
+        // object store, (c) is everything else.
+        let both_resolvable = bound
+            .as_deref()
+            .is_some_and(|h| worktree::commit_resolvable(&repo, h))
+            && last_commit
+                .as_deref()
+                .is_some_and(|c| worktree::commit_resolvable(&repo, c));
+        if both_resolvable {
+            f.state = workspace_state::HISTORICAL;
+            f.partial = true;
+            f.tip = last_commit;
+            f.note = Some(
+                "the branch no longer exists — the view is rebuilt between the stored baseline and the last stored commit stamp, resolvable in the object store (partial: content after that stamp is unknowable)".into(),
+            );
+        } else {
+            f.state = workspace_state::UNAVAILABLE;
+            f.note = Some(
+                "the branch is gone and its stored commits no longer resolve in the object store — only the stored facts can be shown"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+    // ------------------------------------------------------------------
     // artifacts
     // ------------------------------------------------------------------
 
@@ -550,4 +767,174 @@ pub struct LivenessView {
     pub owner_process_start: Option<i64>,
     /// "alive" | "dead" | "unknown" — orphan detect as data (REQ-API-07 AC3).
     pub liveness: String,
+}
+
+/// One changed file in the task's committed changeset: git's own status
+/// token (A/M/D — `--no-renames`, the canonical digest precedent) plus the
+/// path, in git's path-sorted order (REQ-WV-05 AC2).
+#[derive(Serialize, Clone, Debug)]
+pub struct WorkspaceFileChange {
+    pub status: String,
+    pub path: String,
+}
+
+/// One platform commit stamp: the `worktree.committed` event data — which
+/// execution produced which commit on the task's branch (REQ-WV-03 AC1:
+/// per-run history).
+#[derive(Serialize, Clone, Debug)]
+pub struct WorkspaceCommitStamp {
+    pub execution: String,
+    pub commit: String,
+    pub at: Timestamp,
+}
+
+/// The workspace-view state tokens (REQ-WV-01 AC2, REQ-WV-07): the split
+/// is a typed verdict in DATA, and "no isolation" / "zero changes" are
+/// successful answers, never errors. `historical` = branch gone, stored
+/// shas still resolvable (partial view); `unavailable` = only the stored
+/// facts can be shown.
+pub mod workspace_state {
+    pub const NO_ISOLATION: &str = "no_isolation";
+    pub const LIVE: &str = "live";
+    pub const HISTORICAL: &str = "historical";
+    pub const UNAVAILABLE: &str = "unavailable";
+}
+
+/// Output of `task.workspace_changes` — the file list plus the stored
+/// facts the range was composed from (baseline, tip, stamps, merge heads).
+#[derive(Serialize, Clone, Debug)]
+pub struct WorkspaceChangesView {
+    pub task: String,
+    pub state: String,
+    pub isolated: bool,
+    /// Marker for the legitimate zero-change run (REQ-WV-01 AC4): isolation
+    /// happened, the list is empty — distinct from `unavailable` by token.
+    pub zero_changes: bool,
+    /// Marker for `historical`: rebuilt from stored stamps, not the live
+    /// branch (REQ-WV-07 AC2: never presented as if the branch were live).
+    pub partial: bool,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    pub bound_head: Option<String>,
+    pub tip: Option<String>,
+    pub head_before: Option<String>,
+    pub head_after: Option<String>,
+    pub commits: Vec<WorkspaceCommitStamp>,
+    pub files: Vec<WorkspaceFileChange>,
+    pub note: Option<String>,
+}
+
+/// Output of `task.workspace_diff` — one file's readable diff over exactly
+/// the range the changeset view used.
+#[derive(Serialize, Clone, Debug)]
+pub struct WorkspaceDiffView {
+    pub task: String,
+    pub path: String,
+    pub state: String,
+    pub branch: Option<String>,
+    pub baseline: Option<String>,
+    pub tip: Option<String>,
+    pub binary: bool,
+    pub size_bytes: Option<u64>,
+    pub diff: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Internal resolution shared by the two workspace operations: the stored
+/// facts, plus the git-reachable repository (if any) that owns them and
+/// the range to present. Never written anywhere — recomputed per call from
+/// the same rows, presentation over single-source facts.
+pub(crate) struct WorkspaceFacts {
+    pub task: String,
+    pub isolated: bool,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    pub bound_head: Option<String>,
+    pub commits: Vec<WorkspaceCommitStamp>,
+    pub head_before: Option<String>,
+    pub head_after: Option<String>,
+    pub state: &'static str,
+    pub repo: Option<PathBuf>,
+    pub tip: Option<String>,
+    pub partial: bool,
+    pub note: Option<String>,
+}
+
+fn string_field(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Events-scan unit (the R2 split): a pure fold over the task's stored
+/// workflow events — which composition facts the workspace has (baseline =
+/// the `bound_head` of the FIRST `worktree.prepared`, per-run commit
+/// stamps, merge heads) and whether isolation happened at all. No git, no
+/// filesystem: data only. The repository question is a separate unit
+/// (`Api::resolve_workspace_repo`), so both workspace operations keep one
+/// shared resolution and the list/diff stay consistent by construction.
+fn workspace_event_facts(t: &Task, events: &[WorkflowEvent]) -> WorkspaceFacts {
+    let mut bound_head: Option<String> = None;
+    let mut worktree_dir: Option<String> = None;
+    let mut merged: Option<(Option<String>, Option<String>)> = None;
+    let mut commits: Vec<WorkspaceCommitStamp> = Vec::new();
+    let mut isolated = false;
+    for ev in events {
+        match ev.kind.as_str() {
+            event_kind::WORKTREE_PREPARED => {
+                isolated = true;
+                // The FIRST prepared stamp owns the baseline: isolation
+                // branched from the bound head of its first composition
+                // (REQ-WV-03); a later rework reuses the branch.
+                if bound_head.is_none() {
+                    bound_head = string_field(&ev.payload, "bound_head");
+                }
+                worktree_dir = string_field(&ev.payload, "worktree");
+            }
+            event_kind::WORKTREE_COMMITTED => {
+                if let Some(commit) = string_field(&ev.payload, "commit") {
+                    commits.push(WorkspaceCommitStamp {
+                        execution: string_field(&ev.payload, "execution").unwrap_or_default(),
+                        commit,
+                        at: ev.created_at,
+                    });
+                }
+            }
+            event_kind::REWORK_MERGED => {
+                merged = Some((
+                    string_field(&ev.payload, "head_before"),
+                    string_field(&ev.payload, "head_after"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let (head_before, head_after) = merged.unwrap_or((None, None));
+
+    let mut f = WorkspaceFacts {
+        task: t.id.to_string(),
+        isolated,
+        // The branch name is deterministic from the task id — the same
+        // spelling task.active publishes for a prepared worktree
+        // (worktree::branch_name is the only place the shape exists).
+        branch: isolated.then(|| worktree::branch_name(t.id)),
+        worktree: worktree_dir,
+        bound_head,
+        commits,
+        head_before,
+        head_after,
+        state: workspace_state::NO_ISOLATION,
+        repo: None,
+        tip: None,
+        partial: false,
+        note: None,
+    };
+    if !isolated {
+        f.note = Some(
+            "the task has no worktree.prepared event — its work was never isolated; there is no changeset to show"
+                .into(),
+        );
+    }
+    f
 }

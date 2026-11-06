@@ -1,0 +1,19 @@
+{
+  "_comment": "Отдельное ожидание window-content критерия для карточки задачи с панелью «Воркспейс» (REQ-WV-04 AC4; форма — docs/ui-content-criteria.md: error_texts / min_ax_nodes / required_elements). Применимо к живому прогону фикстуры test_workspace_window.py (vite 127.0.0.1:1420 + debug-бинарь, задача с состоявшейся изоляцией и коммитом поверх bound head). На этой машине webkit не кладёт DOM-текст в дерево (docs/ui-content-criteria.md:29-31, прецедент образцов: в кэше только имена heading/link/button), поэтому механические обязательные элементы — имена панели: её заголовок «... · изменения против baseline» (новое содержательное имя среза REQ-WV) и пофайловая кнопка «дифф» (есть только при непустом changeset — в no_isolation/zero_changes/unavailable таблица не рендерится). Динамика list/diff (пути файлов, sha диапазона, тело unified diff) проверяются в самом тесте структурно (количество кнопок = размер changeset фикстуры; монтаж diff-блока по клику) и человеком — по скриншоту пары. min_ax_nodes=40: карточка задачи с панелью богаче дома (edge-sparse 19); порог ниже наблюдаемого с запасом.",
+  "error_texts": [
+    "Operation was cancelled",
+    "not managed successfully",
+    "Page not found",
+    "Web Content process crashed"
+  ],
+  "min_ax_nodes": 40,
+  "required_elements": [
+    { "id": "nav-projects", "any_of": ["Проекты", "#/projects"] },
+    { "id": "nav-tasks", "any_of": ["Задачи", "#/tasks"] },
+    { "id": "nav-live", "any_of": ["Активные", "#/live"] },
+    { "id": "nav-inbox", "any_of": ["Вопросы", "#/inbox"] },
+    { "id": "nav-ops", "any_of": ["Операции API", "#/ops"] },
+    { "id": "ws-panel-heading", "any_of": ["изменения против baseline"] },
+    { "id": "ws-diff-per-file", "any_of": ["дифф"] }
+  ]
+}
