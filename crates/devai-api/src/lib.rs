@@ -48,6 +48,20 @@ use devai_runtime::{RuntimeError, worktree};
 use devai_store::{Store, bundle};
 use serde::Serialize;
 
+/// Child rows (questions / artifacts) indexed by their stored task id:
+/// built in one pass, consumed in one lookup per task. `Id` is the stored
+/// uuid, never a display prefix.
+type TaskIndex<T> = HashMap<Id, Vec<T>>;
+
+/// Group stored rows by task id in a single pass (R2 of the QA return).
+fn group_by_task<T>(rows: Vec<T>, task_id: impl Fn(&T) -> Id) -> TaskIndex<T> {
+    let mut index: TaskIndex<T> = HashMap::new();
+    for row in rows {
+        index.entry(task_id(&row)).or_default().push(row);
+    }
+    index
+}
+
 /// One store home behind the typed operation surface. The `Store` handle
 /// is OWNED here and never exposed (REQ-MUT-03): cycle 1 borrowed it from
 /// the CLI (the accepted cycle-1 boundary); cycle 2 inverted the
@@ -318,48 +332,26 @@ impl Api {
     /// «not current» mark, ratified OQ-GATE-3) and QA → the CURRENT quality
     /// report (or the platform's text when there is none). Membership and
     /// grouping are the UI's one decision site (`wait_group_of`).
+    ///
+    /// R5 of the QA return (ratified by the operator, 07.11): this ONE
+    /// batch operation replaces the spec's `task.list` composition and
+    /// `artifact.cat_text` calls — an approved improvement, not a
+    /// deviation; the old operations are not to be restored.
     pub fn inbox_snapshot(&self) -> ApiResult<InboxSnapshotView> {
         let snapshot_at = Utc::now();
         let policy =
             devai_store::config::load_inbox_wait_policy(&self.config_dir().join("workflow"))?;
         let tasks = self.store.list_tasks()?;
-        let questions = self.store.questions_all()?;
-        let artifacts = self.store.artifacts_all()?;
+        // R2 of the QA return: index the two child tables by task id in one
+        // pass each, so the per-task loop below is O(T+Q+A), not O(T×(Q+A)).
+        // `list_tasks` returns each task once, so taking rows OUT of the
+        // index (remove) is safe and avoids cloning every row.
+        let mut questions = group_by_task(self.store.questions_all()?, |q| q.task_id);
+        let mut artifacts = group_by_task(self.store.artifacts_all()?, |a| a.task_id);
 
         let facts = tasks
             .into_iter()
-            .map(|task| {
-                let task_questions: Vec<Question> = questions
-                    .iter()
-                    .filter(|q| q.task_id == task.id)
-                    .cloned()
-                    .collect();
-                let task_artifacts: Vec<Artifact> = artifacts
-                    .iter()
-                    .filter(|a| a.task_id == task.id)
-                    .cloned()
-                    .collect();
-                let spec = if task.state == TaskState::Approval {
-                    self.spec_facts(&task_artifacts)?
-                } else {
-                    None
-                };
-                let (report, report_note) = if task.state == TaskState::Qa {
-                    match self.quality_report_view(&task, &task_artifacts) {
-                        Ok(view) => (Some(view), None),
-                        Err(e) => (None, Some(e.to_string())),
-                    }
-                } else {
-                    (None, None)
-                };
-                Ok(InboxTaskFacts {
-                    task,
-                    questions: task_questions,
-                    spec,
-                    report,
-                    report_note,
-                })
-            })
+            .map(|task| self.task_facts(task, &mut questions, &mut artifacts))
             .collect::<ApiResult<Vec<_>>>()?;
 
         Ok(InboxSnapshotView {
@@ -367,6 +359,49 @@ impl Api {
             policy,
             tasks: facts,
         })
+    }
+
+    /// One task's slice of the batch read: its stored questions and the
+    /// click-presentation of its gate, taken out of the pre-built indexes.
+    fn task_facts(
+        &self,
+        task: Task,
+        questions: &mut TaskIndex<Question>,
+        artifacts: &mut TaskIndex<Artifact>,
+    ) -> ApiResult<InboxTaskFacts> {
+        let owned_questions = questions.remove(&task.id).unwrap_or_default();
+        let owned_artifacts = artifacts.remove(&task.id).unwrap_or_default();
+        let (spec, report, report_note) = self.gate_presentation(&task, &owned_artifacts)?;
+        Ok(InboxTaskFacts {
+            task,
+            questions: owned_questions,
+            spec,
+            report,
+            report_note,
+        })
+    }
+
+    /// The gate presentation for the stored state that presents one:
+    /// APPROVAL → the spec body (ratified OQ-GATE-3/4), QA → the CURRENT
+    /// quality report (or the platform's honest text). Any other state has
+    /// no click-presentation — that decision stays in ONE place.
+    fn gate_presentation(
+        &self,
+        task: &Task,
+        arts: &[Artifact],
+    ) -> ApiResult<(Option<SpecFacts>, Option<QualityReportView>, Option<String>)> {
+        let spec = match task.state {
+            TaskState::Approval => self.spec_facts(arts)?,
+            _ => None,
+        };
+        let (report, note) = match task.state {
+            TaskState::Qa => match self.quality_report_view(task, arts) {
+                Ok(view) => (Some(view), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+            _ => (None, None),
+        };
+        Ok((spec, report, note))
     }
 
     /// The APPROVAL text of the spec artifact: CURRENT REQUIREMENTS_SPEC when

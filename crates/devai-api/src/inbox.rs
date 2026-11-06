@@ -12,9 +12,21 @@
 //! is read in bulk snapshots (`list_tasks`, `questions_all`,
 //! `artifacts_all`) instead of per-task queries.
 //!
+//! Cost is linear and bounded by the home itself, with no declared task
+//! cap needed: three store snapshots plus one grouping pass over questions
+//! and artifacts (O(T+Q+A)) and one hash lookup per task — the per-task
+//! loop never rescans either table (R2 of the QA return).
+//!
 //! Membership is NOT decided here: the section groups rows by the table's
 //! `group` and by exact stored tokens on the UI side (one place,
 //! `devai-ui::commands::wait_group_of`). This module only carries data.
+//!
+//! R5 of the QA return — SPEC-FIDELITY, RATIFIED: the spec named
+//! `task.list`-composition + `artifact.cat_text` as the source operations;
+//! this batch read replaces them with `inbox.snapshot`. The operator
+//! ratified the replacement in words ("ратифицирую", 07.11, R5 of the QA
+//! return) as an improvement — one call instead of N+1. The old operations
+//! are NOT to be restored; this note records the ratification in code.
 
 use chrono::{DateTime, Utc};
 use devai_core::inbox::InboxWaitPolicy;

@@ -16,21 +16,29 @@
 // сравниваются через общий словарь states.ts (R5), длинные машинные
 // тела режутся именованной константой.
 import { onMounted, onUnmounted, ref } from "vue";
-import { api, toUiError } from "../api";
 import { pollMs, setPollMs, POLL_CHOICES, shortId } from "../settings";
+import {
+  refreshWait,
+  setWaitInterval,
+  subscribeWait,
+  waitError,
+  waitSnapshot,
+} from "../inbox";
 import { TaskStateToken } from "../states";
 import WaitTaskHeader from "../components/WaitTaskHeader.vue";
-import type { UiError, WaitSnapshot } from "../types";
 
 // Сколько символов машинного JSON показывать, когда у quality-отчёта нет
 // человеческой части: одна строка-факт, не дамп (R5, arch/no-magic).
 const REPORT_SNIPPET_LEN = 400;
 
-const snap = ref<WaitSnapshot | null>(null);
-const error = ref<UiError | null>(null);
+// Снимок секции — общий стор (R3 QA-возврата): шапка и вкладка читают
+// один и тот же снимок и один интервал опроса (inbox.ts), своего второго
+// таймера и второго вызова `inbox_view` здесь нет.
+const snap = waitSnapshot;
+const error = waitError;
 const interval = ref(pollMs());
 const expanded = ref<Record<string, boolean>>({});
-let timer: number | undefined;
+let unsubscribe: (() => void) | undefined;
 
 function isExpanded(taskId: string): boolean {
   return expanded.value[taskId] === true;
@@ -40,28 +48,15 @@ function toggle(taskId: string) {
   expanded.value[taskId] = !isExpanded(taskId);
 }
 
-async function load() {
-  try {
-    snap.value = await api.inboxView();
-    error.value = null;
-  } catch (e) {
-    error.value = toUiError(e);
-  }
-}
-
 function applyInterval(ms: number) {
   setPollMs(ms);
-  if (timer) window.clearInterval(timer);
-  timer = window.setInterval(load, ms);
+  setWaitInterval(ms);
 }
 
-onMounted(async () => {
-  await load();
-  applyInterval(interval.value);
+onMounted(() => {
+  unsubscribe = subscribeWait();
 });
-onUnmounted(() => {
-  if (timer) window.clearInterval(timer);
-});
+onUnmounted(() => unsubscribe?.());
 </script>
 
 <template>
@@ -74,7 +69,7 @@ onUnmounted(() => {
           <option v-for="ms in POLL_CHOICES" :key="ms" :value="ms">{{ ms / 1000 }} с</option>
         </select>
       </label>
-      <button @click="load">Обновить</button>
+      <button @click="refreshWait">Обновить</button>
     </div>
     <div v-if="error" class="errorbox">
       <span class="code">{{ error.code }}</span>{{ error.message }}

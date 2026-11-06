@@ -4,26 +4,20 @@
 // цепочке (DEVAI_HOME > ~/.devai); фронт только показывает данные сессии.
 // Бейдж «Ожидания» (REQ-GATE-08): число строк секции на том же снимке
 // данных — поле snapshot'а, вычисленное платформенной композицией, UI
-// ничего не пересчитывает и не кэширует между load.
-import { onMounted, onUnmounted, ref } from "vue";
+// ничего не пересчитывает и не кэширует между load. Опрос — ОДИН на всё
+// приложение (R3 QA-возврата): шапка читает общий стор секции (inbox.ts),
+// собственного таймера и второго вызова `inbox_view` здесь нет.
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { api, toUiError } from "./api";
-import { fmtTime, pollMs } from "./settings";
+import { subscribeWait, waitError, waitSnapshot } from "./inbox";
+import { fmtTime } from "./settings";
 import type { SessionInfo, UiError } from "./types";
 
 const session = ref<SessionInfo | null>(null);
 const error = ref<UiError | null>(null);
-const waitBadge = ref(0);
-let timer: number | undefined;
-
-async function loadBadge() {
-  try {
-    const snap = await api.inboxView();
-    waitBadge.value = snap.badge;
-  } catch (e) {
-    // Статус-бар owns its facts; the badge keeps its last published value.
-    error.value = toUiError(e);
-  }
-}
+const shownError = computed(() => error.value ?? waitError.value);
+const waitBadge = computed(() => waitSnapshot.value?.badge ?? 0);
+let unsubscribe: (() => void) | undefined;
 
 onMounted(async () => {
   try {
@@ -31,12 +25,9 @@ onMounted(async () => {
   } catch (e) {
     error.value = toUiError(e);
   }
-  await loadBadge();
-  timer = window.setInterval(loadBadge, pollMs());
+  unsubscribe = subscribeWait();
 });
-onUnmounted(() => {
-  if (timer) window.clearInterval(timer);
-});
+onUnmounted(() => unsubscribe?.());
 </script>
 
 <template>
@@ -58,8 +49,8 @@ onUnmounted(() => {
       </div>
     </header>
     <main class="content">
-      <div v-if="error" class="errorbox">
-        <span class="code">{{ error.code }}</span>{{ error.message }}
+      <div v-if="shownError" class="errorbox">
+        <span class="code">{{ shownError.code }}</span>{{ shownError.message }}
       </div>
       <RouterView />
     </main>

@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import vue from "@vitejs/plugin-vue";
 
 // Tauri expects a fixed dev port (devUrl in tauri.conf.json); production
@@ -14,5 +14,12 @@ export default defineConfig({
   },
   build: {
     target: "es2021",
+  },
+  // Компонентные тесты шаблонов (R4 QA-возврата): jsdom даёт localStorage
+  // (настройки интервала) и DOM; IPC-слой в тестах замокан.
+  test: {
+    environment: "jsdom",
+    setupFiles: ["src/__tests__/setup.ts"],
+    include: ["src/__tests__/**/*.test.ts"],
   },
 });
