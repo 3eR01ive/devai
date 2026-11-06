@@ -354,7 +354,8 @@ impl Api {
     /// report (or the platform's text when there is none). Membership and
     /// grouping are the UI's one decision site (`wait_group_of`).
     ///
-    /// R5 of the QA return (ratified by the operator, 07.11): this ONE
+    /// R6 of the QA return (operation replacement ratified by the operator,
+    /// 07.11): this ONE
     /// batch operation replaces the spec's `task.list` composition and
     /// `artifact.cat_text` calls — an approved improvement, not a
     /// deviation; the old operations are not to be restored.

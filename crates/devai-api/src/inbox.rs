@@ -21,11 +21,12 @@
 //! `group` and by exact stored tokens on the UI side (one place,
 //! `devai-ui::commands::wait_group_of`). This module only carries data.
 //!
-//! R5 of the QA return — SPEC-FIDELITY, RATIFIED: the spec named
-//! `task.list`-composition + `artifact.cat_text` as the source operations;
-//! this batch read replaces them with `inbox.snapshot`. The operator
-//! ratified the replacement in words ("ратифицирую", 07.11, R5 of the QA
-//! return) as an improvement — one call instead of N+1. The old operations
+//! R6 of the QA return (ratification of the operation replacement) —
+//! SPEC-FIDELITY, RATIFIED: the spec named `task.list`-composition +
+//! `artifact.cat_text` as the source operations; this batch read replaces
+//! them with `inbox.snapshot`. The operator ratified the replacement in
+//! words ("ратифицирую", 07.11, R6 of the QA return) as an improvement —
+//! one call instead of N+1. The old operations
 //! are NOT to be restored; this note records the ratification in code.
 
 use chrono::{DateTime, Utc};

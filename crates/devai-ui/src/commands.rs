@@ -86,8 +86,10 @@ pub struct WaitRow {
     /// The literal CLI command for that decision (REQ-GATE-06 AC2) — the
     /// section observes, it never acts (read-only base, OQ-UI-6).
     pub cli_hint: String,
-    /// Platform registry questions of the task, stored OPEN token only
-    /// (question.list composition, REQ-GATE-03 AC2).
+    /// Platform registry questions of the task, stored OPEN token only:
+    /// they arrive with the section's single batch read (`inbox.snapshot`,
+    /// `commands.rs:673` → `devai-api/src/lib.rs:361`; R2 of the QA return),
+    /// not from a `question.list` composition (REQ-GATE-03 AC2).
     pub open_questions: Vec<Question>,
     /// APPROVAL presentation: the spec the human is asked to sign
     /// (REQ-GATE-04/05 + ratified OQ-GATE-3/4).
