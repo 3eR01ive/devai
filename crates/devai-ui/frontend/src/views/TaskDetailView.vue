@@ -8,7 +8,6 @@ import { onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
-import { taskSignboard } from "../types";
 import type {
   ActiveRow,
   Artifact,
@@ -157,7 +156,7 @@ onMounted(loadAll);
 
   <section v-if="status">
     <div class="rowflex" style="margin-bottom: 12px">
-      <h2 style="margin: 0">{{ taskSignboard(status.task) }}</h2>
+      <h2 style="margin: 0">{{ status.task.display }}</h2>
       <StateChip :token="status.task.state" />
       <StateChip v-if="status.task.return_state" :token="status.task.return_state" />
       <div class="spacer" />
@@ -165,7 +164,7 @@ onMounted(loadAll);
       <button @click="loadAll">Обновить</button>
     </div>
     <p
-      v-if="taskSignboard(status.task) !== status.task.title"
+      v-if="status.task.display !== status.task.title"
       class="muted mono"
       style="margin: 0 0 10px"
     >заголовок создавшего: {{ status.task.title }}</p>

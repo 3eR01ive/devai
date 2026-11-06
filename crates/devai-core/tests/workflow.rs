@@ -1393,3 +1393,45 @@ fn signboard_rule_name_then_draft_sentence_then_title() {
         "title"
     );
 }
+
+/// R1 (mt/dry): the signboard crosses the Rust↔TS boundary as FINISHED
+/// data — `Task` serializes a `display` field computed by the ONE rule.
+/// There is no client-side copy of the rule any more (types.ts renders
+/// `task.display` verbatim), so this test pins the producer's field for
+/// the edge cases the deleted TS mirror used to cover: empty statement,
+/// ellipsis, newline, and the untouched formal title alongside the name.
+#[test]
+fn serialized_task_carries_the_finished_signboard() {
+    let mut named = Task::new("formal title", "другая постановка. детали", None, now());
+    named.human_name = Some("Имя по смыслу спека".into());
+    let v = serde_json::to_value(&named).unwrap();
+    assert_eq!(v["display"], "Имя по смыслу спека");
+    assert_eq!(v["title"], "formal title", "заголовок создавшего не тронут");
+    assert_eq!(v["human_name"], "Имя по смыслу спека");
+
+    // DRAFT: first sentence, ellipsis counts as a sentence end, and a
+    // newline terminates the showcase without punctuation.
+    for (statement, expected) in [
+        (
+            "Первое предложение. Второе — детали.",
+            "Первое предложение.",
+        ),
+        ("Готово… остальное потом", "Готово…"),
+        ("до перевода строки\nпосле", "до перевода строки"),
+        ("версия v1.2 готова", "версия v1.2 готова"),
+    ] {
+        let d = Task::new("formal title", statement, None, now());
+        assert_eq!(
+            serde_json::to_value(&d).unwrap()["display"],
+            expected,
+            "statement {statement:?}"
+        );
+    }
+
+    // Empty / whitespace-only statement: the signboard is never blank.
+    let bare = Task::new("just the title", "   ", None, now());
+    assert_eq!(
+        serde_json::to_value(&bare).unwrap()["display"],
+        "just the title"
+    );
+}

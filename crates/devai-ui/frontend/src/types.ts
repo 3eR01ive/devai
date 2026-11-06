@@ -35,6 +35,12 @@ export interface Task {
   // spec publication; editable by the human `task rename`). null = имени
   // ещё нет. Формальный title остаётся текстом создавшего всегда.
   human_name: string | null;
+  // REQ-TN-03: the FINISHED signboard, computed ONCE by the producer
+  // (`devai_core::types::Task::display_sign`, serialized as `display`):
+  // human name → first sentence of the DRAFT statement → formal title.
+  // The frontend renders this string verbatim and NEVER re-derives it
+  // (no-read-time-rederivation): there is no client-side copy of the rule.
+  display: string;
   state: string;
   return_state: string | null;
   requirements_seq: number;
@@ -43,49 +49,11 @@ export interface Task {
   updated_at: string;
 }
 
-// REQ-TN-03: ЕДИНОЕ правило вывески для фронта — одна функция, все вьюхи и
-// списки берут вывеску из неё (не копия правила в каждом рендерере).
-// Зеркало Rust-правила `devai_core::types::Task::display_sign`:
-//  * есть человеческое имя → оно;
-//  * нет имени и задача в DRAFT (анализа ещё не было) → ПЕРВОЕ ПРЕДЛОЖЕНИЕ
-//    исходной постановки (ратифицировано OQ-TN-3: не целиком, не обрезком);
-//  * иначе — формальный заголовок.
-export function taskSignboard(t: Task): string {
-  if (t.human_name && t.human_name.trim().length > 0) return t.human_name;
-  if (t.state === "DRAFT") {
-    const first = firstSentence(t.business_description);
-    if (first.length > 0) return first;
-  }
-  return t.title;
-}
-
-// Первое предложение: до первой концевой пунктуации (. ! ? …), за которой
-// пробел или конец, либо до перевода строки; внутренние пробелы схлопнуты.
-// Детерминированно, то же поведение, что `first_sentence` в devai-core.
-export function firstSentence(text: string): string {
-  const chars = Array.from(text);
-  let cut = chars.length;
-  for (let i = 0; i < chars.length; i++) {
-    const c = chars[i];
-    if (c === "\n" || c === "\r") {
-      cut = i;
-      break;
-    }
-    if (c === "." || c === "!" || c === "?" || c === "…") {
-      const next = i + 1 < chars.length ? chars[i + 1] : " ";
-      if (next.trim() === "") {
-        cut = i + 1;
-        break;
-      }
-    }
-  }
-  return chars
-    .slice(0, cut)
-    .join("")
-    .split(/\s+/)
-    .filter((w) => w.length > 0)
-    .join(" ");
-}
+// REQ-TN-03 / R1: the signboard comes from the API as finished data
+// (`Task.display`) — the ONE rule lives in devai-core and is computed on
+// the producer side. This file holds NO client-side copy of the rule:
+// no `firstSentence`, no re-derivation per renderer (no-read-time-
+// rederivation). Views print `task.display` / `edge.task_display`.
 
 export interface ContractRef {
   name: string;

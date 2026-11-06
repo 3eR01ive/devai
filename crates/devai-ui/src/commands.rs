@@ -436,9 +436,10 @@ mod tests {
         );
     }
 
-    /// QA R4 (mt/change-isolation + ux/contract-stability): the
-    /// name/signboard plane crosses the Rust↔TS boundary in exactly THREE
-    /// serde shapes — the task row (the signage field `human_name`), the
+    /// QA R4 (mt/change-isolation + ux/contract-stability) + R1
+    /// (no-read-time-rederivation): the name/signboard plane crosses the
+    /// Rust↔TS boundary in exactly THREE serde shapes — the task row (the
+    /// stored name `human_name` AND the finished signboard `display`), the
     /// `task.rename` outcome (`TaskRenameOutcome`), and the dependency
     /// edge (both-end signage `task_display`/`depends_on_display`). The
     /// fixture pins their exact JSON form (the `ui_error`/artifact idiom

@@ -163,7 +163,7 @@ impl Project {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct Task {
     pub id: Id,
     pub project_id: Option<Id>,
@@ -190,6 +190,33 @@ pub struct Task {
     pub lock_version: u64,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+/// The serde output of a task CARRIES THE FINISHED SIGNBOARD: `display` is
+/// produced here, on the producer side, by `display_sign()` — the ONE
+/// REQ-TN-03 rule. Consumers (CLI human output, the UI's typed data, any
+/// future surface) render this string verbatim and never re-derive it
+/// (doctrine: no read-time rederivation; ratified OQ-TN-3/4/5). The
+/// formal `title` still travels alongside it for traceability, so a detail
+/// view can show the creator's text next to the name (OQ-TN-4).
+impl Serialize for Task {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("Task", 12)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("project_id", &self.project_id)?;
+        st.serialize_field("title", &self.title)?;
+        st.serialize_field("business_description", &self.business_description)?;
+        st.serialize_field("human_name", &self.human_name)?;
+        st.serialize_field("state", &self.state)?;
+        st.serialize_field("return_state", &self.return_state)?;
+        st.serialize_field("requirements_seq", &self.requirements_seq)?;
+        st.serialize_field("lock_version", &self.lock_version)?;
+        st.serialize_field("created_at", &self.created_at)?;
+        st.serialize_field("updated_at", &self.updated_at)?;
+        st.serialize_field("display", &self.display_sign())?;
+        st.end()
+    }
 }
 
 impl Task {
