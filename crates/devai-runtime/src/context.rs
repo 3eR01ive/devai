@@ -47,7 +47,7 @@
 //! so assembly is deterministic and byte-stable for identical store state.
 
 use devai_core::types::{
-    ArtifactKind, ArtifactStatus, ExecutionStatus, Task, event_kind, json_field,
+    Artifact, ArtifactKind, ArtifactStatus, ExecutionStatus, Task, event_kind, json_field,
 };
 use devai_store::Store;
 use devai_store::config::ReworkPolicy;
@@ -193,14 +193,35 @@ pub fn rework_context(
 ///   recognise", never to a silently empty or half-empty quote.
 fn quality_findings(store: &Store, task: &Task) -> Result<Option<String>, RuntimeError> {
     let artifacts = store.artifacts(task.id)?;
-    let Some(report) = artifacts
+    // R1: the QA→REWORK return now moves the rejected report CURRENT→STALE
+    // (workflow.rs:743-759, ratified OQ-QH-3). A CURRENT-only selection would
+    // therefore report «no findings» on exactly the path that needs them —
+    // existing data becoming indistinguishable from absence. CURRENT still
+    // wins; when there is none, the newest STALE report is quoted and the
+    // block says so in its own header.
+    let reports: Vec<&Artifact> = artifacts
         .iter()
-        .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
+        .filter(|a| a.kind == ArtifactKind::QualityReport)
+        .collect();
+    let fallback = reports
+        .iter()
+        .copied()
+        .filter(|a| a.status == ArtifactStatus::Stale)
+        .max_by_key(|a| a.seq);
+    let (report, from_stale) = match reports
+        .iter()
+        .copied()
+        .filter(|a| a.status == ArtifactStatus::Current)
         .max_by_key(|a| a.seq)
-    else {
-        return Ok(None);
+    {
+        Some(current) => (current, false),
+        None => match fallback {
+            Some(stale) => (stale, true),
+            None => return Ok(None),
+        },
     };
-    // Legacy dispatch on the stored ref BEFORE any body read.
+    // Legacy dispatch on the stored ref BEFORE any body read. A stale legacy
+    // body has no machine block to quote at all: honest nothing, not a fake.
     if !report.contract.as_ref().is_some_and(|c| c.version >= 3) {
         return Ok(None);
     }
@@ -212,9 +233,10 @@ fn quality_findings(store: &Store, task: &Task) -> Result<Option<String>, Runtim
     let body = store.read_blob(&report.sha256)?;
     // ONE pass over the whole document, through the very struct `assemble`
     // emits — producer and consumer share one shape (R-003).
+    let status = if from_stale { "STALE" } else { "CURRENT" };
     let doc: QualityReportDoc = serde_json::from_slice(&body).map_err(|e| {
         RuntimeError::ReportShape(format!(
-            "CURRENT {contract} report v{} is a body the typed quality-report model cannot recognise: {e}",
+            "{status} {contract} report v{} is a body the typed quality-report model cannot recognise: {e}",
             report.seq
         ))
     })?;
@@ -264,9 +286,18 @@ fn quality_findings(store: &Store, task: &Task) -> Result<Option<String>, Runtim
         return Ok(None);
     }
 
-    Ok(Some(format!(
-        "\nQUALITY REPORT FINDINGS — failing / sub-threshold items of the CURRENT {contract} report v{seq}, quoted as stored:\n\n{}\n",
-        lines.join("\n"),
-        seq = report.seq,
-    )))
+    let headline = if from_stale {
+        format!(
+            "\nQUALITY REPORT FINDINGS — отчёт STALE: findings прошлого возврата — failing / sub-threshold items of the STALE {contract} report v{seq} (это findings отклонённого возвратом отчёта, не решение по текущей ревизии), quoted as stored:\n\n{}\n",
+            lines.join("\n"),
+            seq = report.seq,
+        )
+    } else {
+        format!(
+            "\nQUALITY REPORT FINDINGS — failing / sub-threshold items of the CURRENT {contract} report v{seq}, quoted as stored:\n\n{}\n",
+            lines.join("\n"),
+            seq = report.seq,
+        )
+    };
+    Ok(Some(headline))
 }

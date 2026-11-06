@@ -1107,8 +1107,8 @@ fn task_run(
             }
             // The assembled report (the stored human form) is for the human
             // at the gate.
-            if let Some(f) = o.gate_report_freshness.as_ref().filter(|f| f.stale) {
-                outln!("{}", f.marker);
+            if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
+                outln!("{marker}");
             }
             if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
@@ -1137,8 +1137,8 @@ fn task_run(
                     "⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run"
                 );
             }
-            if let Some(f) = o.gate_report_freshness.as_ref().filter(|f| f.stale) {
-                outln!("{}", f.marker);
+            if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
+                outln!("{marker}");
             }
             if let Some(text) = &o.gate_report_text {
                 outln!("── quality report (platform-assembled) ──");
@@ -1380,8 +1380,8 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     // REQ-QH-05: the on-demand report channel takes the freshness fact from
     // the API view — a report the line has already left behind is announced
     // here too, never passed off as the current decision.
-    if let Some(f) = v.freshness.as_ref().filter(|f| f.stale) {
-        outln!("{}", f.marker);
+    if let Some(marker) = freshness_marker(v.freshness.as_ref()) {
+        outln!("{marker}");
     }
     match v.report_text {
         Some(text) => outln!("{text}"),
@@ -2151,6 +2151,13 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// REQ-QH-05: the one freshness line a CLI channel prints before the report
+/// — the stored marker when the report is outdated, nothing when it is not.
+/// `None`/fresh report => no line, never an empty marker pretending to be one.
+fn freshness_marker(f: Option<&devai_api::ReportFreshness>) -> Option<&str> {
+    f.filter(|f| f.stale).map(|f| f.marker.as_str())
+}
+
 fn ellipsis(s: &str, n: usize) -> String {
     let c: Vec<char> = s.chars().collect();
     if c.len() <= n {
@@ -2177,4 +2184,44 @@ pub(crate) fn short(id: &Uuid) -> String {
 /// Display-short of an id that already arrives as a string (API views).
 pub(crate) fn short_str(id: &str) -> String {
     devai_core::types::short_id_str(id)
+}
+
+#[cfg(test)]
+mod freshness_line_tests {
+    //! REQ-QH-05 (rework R3): the gate/report freshness line is printed for a
+    //! stale report and for nothing else. Both failing branches live here so a
+    //! regression in the filter is caught without a full engine drive.
+    use super::freshness_marker;
+    use devai_api::ReportFreshness;
+
+    fn freshness(stale: bool, marker: &str) -> ReportFreshness {
+        ReportFreshness {
+            stale,
+            marker: marker.to_string(),
+            report_seq: 1,
+            report_status: "STALE".to_string(),
+            task_state: "REWORK".to_string(),
+            execution: None,
+            execution_status: None,
+        }
+    }
+
+    #[test]
+    fn only_a_stale_report_prints_a_marker_line() {
+        assert_eq!(freshness_marker(None), None, "no report, no line");
+        assert_eq!(
+            freshness_marker(Some(&freshness(false, ""))),
+            None,
+            "a CURRENT report prints no staleness line"
+        );
+        let stale = freshness(
+            true,
+            "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит не завершён",
+        );
+        assert_eq!(
+            freshness_marker(Some(&stale)),
+            Some("⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит не завершён"),
+            "the stored marker is printed verbatim"
+        );
+    }
 }

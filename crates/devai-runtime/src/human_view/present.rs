@@ -179,47 +179,15 @@ pub fn freshness(task: &Task, a: &Artifact, execs: &[RoleExecution]) -> ReportFr
         .max_by_key(|e| e.started_at);
     let last = execs.iter().max_by_key(|e| e.started_at);
     if !stale {
-        return ReportFreshness {
-            stale: false,
-            marker: String::new(),
-            report_seq: a.seq,
-            report_status: a.status.as_str().to_string(),
-            task_state: task.state.as_str().to_string(),
-            execution: last.map(|e| e.id.to_string()),
-            execution_status: last.map(|e| e.status.as_str().to_string()),
-        };
+        return current_report(task, a, last.copied());
     }
-    let tail = if let Some(e) = running {
-        // «в работе» is claimed ONLY when a live RUNNING execution exists.
-        format!(
-            "готовится ре-аудит (execution {}, в работе)",
-            short_id(&e.id)
-        )
-    } else if let Some(e) = last.filter(|e| e.status == ExecutionStatus::Completed) {
-        // The newest auditor run is the COMPLETED one that produced the very
-        // report on screen: there is no re-audit in flight, and calling that
-        // run «не завершён» would invent one (rework R1).
-        format!(
-            "возврат без ре-аудита; последний прогон {} COMPLETED {}",
-            short_id(&e.id),
-            fmt_ts(e.finished_at.as_ref().unwrap_or(&e.started_at))
-        )
-    } else if let Some(e) = last {
-        format!(
-            "ре-аудит не завершён (execution {}, {})",
-            short_id(&e.id),
-            e.status.as_str()
-        )
-    } else {
-        "ре-аудит ещё не запущен".to_string()
-    };
     ReportFreshness {
         stale: true,
         marker: format!(
             "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {}",
             a.seq,
             task.state.as_str(),
-            tail
+            stale_tail(running.copied(), last.copied())
         ),
         report_seq: a.seq,
         report_status: a.status.as_str().to_string(),
@@ -227,4 +195,58 @@ pub fn freshness(task: &Task, a: &Artifact, execs: &[RoleExecution]) -> ReportFr
         execution: last.map(|e| e.id.to_string()),
         execution_status: last.map(|e| e.status.as_str().to_string()),
     }
+}
+
+/// A report that is still the last word: no marker, but the same raw facts.
+fn current_report(task: &Task, a: &Artifact, last: Option<&RoleExecution>) -> ReportFreshness {
+    ReportFreshness {
+        stale: false,
+        marker: String::new(),
+        report_seq: a.seq,
+        report_status: a.status.as_str().to_string(),
+        task_state: task.state.as_str().to_string(),
+        execution: last.map(|e| e.id.to_string()),
+        execution_status: last.map(|e| e.status.as_str().to_string()),
+    }
+}
+
+/// What is happening to the outdated report, as stored: one branch per
+/// store fact (a live re-audit / a return without one / an unfinished run /
+/// nothing launched). Texts are unchanged from the previous ladder.
+fn stale_tail(running: Option<&RoleExecution>, last: Option<&RoleExecution>) -> String {
+    if let Some(e) = running {
+        // «в работе» is claimed ONLY when a live RUNNING execution exists.
+        return reaudit_running(e);
+    }
+    match last {
+        // The newest auditor run is the COMPLETED one that produced the very
+        // report on screen: there is no re-audit in flight, and calling that
+        // run «не завершён» would invent one (rework R1).
+        Some(e) if e.status == ExecutionStatus::Completed => reaudit_absent(e),
+        Some(e) => reaudit_unfinished(e),
+        None => "ре-аудит ещё не запущен".to_string(),
+    }
+}
+
+fn reaudit_running(e: &RoleExecution) -> String {
+    format!(
+        "готовится ре-аудит (execution {}, в работе)",
+        short_id(&e.id)
+    )
+}
+
+fn reaudit_absent(e: &RoleExecution) -> String {
+    format!(
+        "возврат без ре-аудита; последний прогон {} COMPLETED {}",
+        short_id(&e.id),
+        fmt_ts(e.finished_at.as_ref().unwrap_or(&e.started_at))
+    )
+}
+
+fn reaudit_unfinished(e: &RoleExecution) -> String {
+    format!(
+        "ре-аудит не завершён (execution {}, {})",
+        short_id(&e.id),
+        e.status.as_str()
+    )
 }

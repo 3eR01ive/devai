@@ -2552,6 +2552,84 @@ fn the_rework_execution_actually_receives_the_assembled_section() {
 }
 
 #[test]
+fn a_returned_reports_findings_are_delivered_labelled_stale_never_dropped() {
+    // Rework R1 (regression): the ratified OQ-QH-3 moves the rejected report
+    // CURRENT→STALE at the return. A CURRENT-only reader then found nothing
+    // and the whole QUALITY REPORT FINDINGS block silently vanished from the
+    // implementer prompt — existing data indistinguishable from absence.
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new(
+        "StaleFindings",
+        "a return must still hand the implementer the findings it rejected",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+    craft_report(
+        &store,
+        t.id,
+        serde_json::to_value(failing_doc()).unwrap(),
+        4,
+    );
+
+    // The return fires the findings trigger; before any return there is no
+    // section at all (the first-run pin), so the two branches below are the
+    // two ways the reader can now answer: CURRENT report vs STALE fallback.
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("вернись к находкам"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+    assert!(
+        store
+            .artifacts(t.id)
+            .unwrap()
+            .iter()
+            .filter(|a| a.kind == ArtifactKind::QualityReport)
+            .all(|a| a.status != ArtifactStatus::Current),
+        "the return really moved the rejected report out of CURRENT"
+    );
+
+    let stale = rework_context(&store, &t, "implementation-agent", &policy())
+        .unwrap()
+        .expect("STALE findings of the rejected report are still delivered");
+    assert!(
+        stale.contains("отчёт STALE: findings прошлого возврата")
+            && stale.contains("FINDING-MARKER-4e7b")
+            && stale.contains("spec-coverage=0.40<floor 0.70"),
+        "the stale report's findings are quoted with the label: {stale}"
+    );
+    assert!(
+        stale.contains("вернись к находкам"),
+        "the rationale half is unchanged: {stale}"
+    );
+
+    // A fresh audit's CURRENT report wins again and drops the label.
+    craft_report(
+        &store,
+        t.id,
+        serde_json::to_value(failing_doc()).unwrap(),
+        4,
+    );
+    let refresh = rework_context(&store, &t, "implementation-agent", &policy())
+        .unwrap()
+        .unwrap();
+    assert!(
+        refresh.contains("CURRENT quality-report@4 report v")
+            && refresh.contains("FINDING-MARKER-4e7b")
+            && !refresh.contains("отчёт STALE"),
+        "a newer CURRENT report is quoted as CURRENT: {refresh}"
+    );
+}
+
+#[test]
 fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
     let (_d, store) = store();
     std::fs::remove_dir_all(store.root().join("config/workflow")).unwrap();
