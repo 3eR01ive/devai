@@ -250,9 +250,11 @@ export interface SpecPresentation {
   unavailable_note: string | null;
 }
 
-// Справочная группа (ратифицированное OQ-GATE-1): безответный
-// НЕблокирующий вопрос — заметка на активной задаче, платформа на ней
-// не стоит; в бейдж ожидания не входит (REQ-GATE-10).
+// Справочная группа ниже списка стоящих (ратифицированное OQ-GATE-1):
+// безответный НЕблокирующий вопрос — заметка на активной задаче, платформа
+// на ней не стоит (workflow.rs:747-748), поэтому это не wait-row. Но строкой
+// снапшота она является, и бейдж её считает: badge == waiting + human_stopped
+// + notes (REQ-GATE-08 AC3, commands.rs::build_wait_snapshot).
 export interface WaitNote {
   task: Task;
   question: Question;
