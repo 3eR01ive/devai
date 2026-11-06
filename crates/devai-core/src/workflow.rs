@@ -130,24 +130,60 @@ fn current_spec(artifacts: &[Artifact]) -> Option<&Artifact> {
         .max_by_key(|a| a.seq)
 }
 
+/// Typed outcome of reading the signboard field out of a stored CURRENT
+/// spec body (QA R1, rel/error-context): «does not read as JSON» and «no
+/// name in the body» are DIFFERENT facts. The second is the legal absence
+/// a @1..@3 legacy body means; the first is a store-integrity failure that
+/// no door may fold into the absence branch — collapsing them is what
+/// let a swallowed read error keep the previous signboard silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecNameRead {
+    /// The field is present and non-blank — the name this publication
+    /// stamps.
+    Named(String),
+    /// The body parses as JSON but names no usable signboard (missing
+    /// field, non-string, blank): the publication says NOTHING about the
+    /// signboard, the stored one is kept (REQ-TN-02 AC3).
+    Absent,
+    /// The bytes are not parseable JSON — corruption, not absence.
+    Corrupt,
+}
+
+/// The typed half: a door that RE-READS a stored body uses this so an
+/// integrity failure stays distinguishable from the legal absence
+/// (QA R1); doors handed bytes that already passed the contract gate use
+/// the [`human_name_from_spec`] wrapper below.
+pub fn read_human_name_from_spec(content: &[u8], field: &str) -> SpecNameRead {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(content) else {
+        return SpecNameRead::Corrupt;
+    };
+    let Some(raw) = value.get(field).and_then(|v| v.as_str()) else {
+        return SpecNameRead::Absent;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return SpecNameRead::Absent;
+    }
+    SpecNameRead::Named(trimmed.to_string())
+}
+
 /// REQ-TN-02: read the human name out of a published CURRENT spec BODY.
 /// The body arrives already contract-gated (`task_name` is REQUIRED by the
 /// @4 schema, the mechanical window detector already rejected anything the
 /// project template disallows), so this half is a pure read: the field
 /// named by the loaded `config/workflow/task-name.yaml` policy, trimmed,
-/// returned when non-blank. A body with no such field (a spec published
-/// under @1..@3, an unparseable non-JSON body on a legacy row) returns
-/// `None` — the obligation is NOT retroactive (REQ-TN-02 AC3), absence
-/// means "this publication says nothing about the signboard", never
-/// "clear it".
+/// returned when non-blank. A body with no such field returns `None` — the
+/// obligation is NOT retroactive (REQ-TN-02 AC3), absence means "this
+/// publication says nothing about the signboard", never "clear it". The
+/// `Corrupt` outcome maps to `None` HERE because every caller of this
+/// wrapper holds bytes that just passed the JSON-Schema gate; a door that
+/// reads the body back from the store uses [`read_human_name_from_spec`]
+/// instead and refuses on `Corrupt` (QA R1).
 pub fn human_name_from_spec(content: &[u8], field: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(content).ok()?;
-    let raw = value.get(field)?.as_str()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
+    match read_human_name_from_spec(content, field) {
+        SpecNameRead::Named(v) => Some(v),
+        SpecNameRead::Absent | SpecNameRead::Corrupt => None,
     }
-    Some(trimmed.to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -1042,15 +1042,51 @@ impl Api {
                 // the CURRENT spec body too — the content-addressed blob
                 // of the row just published, read with the template's field.
                 let field = self.task_name_policy()?.field;
-                let name = arts
+                // QA R1 (rel/error-context): the re-read is TYPED. A
+                // CURRENT spec blob that does not read back, or reads back
+                // as non-JSON, is a store-integrity failure — the advance
+                // refuses LOUD (`spec_body_unreadable`) instead of folding
+                // the failure into «body without a name» and silently
+                // keeping the previous signboard. «Readable but
+                // name-less» (the @1..@3 legacy shape) stays the ONE
+                // legal absence branch: such a publication says nothing
+                // about the signboard (REQ-TN-02 AC3).
+                let name = match arts
                     .iter()
                     .filter(|x| {
                         x.kind == ArtifactKind::RequirementsSpec
                             && x.status == ArtifactStatus::Current
                     })
                     .max_by_key(|x| x.seq)
-                    .and_then(|x| self.store.read_blob(&x.sha256).ok())
-                    .and_then(|b| workflow::human_name_from_spec(&b, &field));
+                {
+                    Some(x) => {
+                        let body = self.store.read_blob(&x.sha256).map_err(|e| {
+                            ApiError::refused(
+                                "spec_body_unreadable",
+                                format!(
+                                    "CURRENT spec {} blob {} does not read back: {e} — the advance refuses instead of silently keeping the stored signboard; repair the store or republish the specification",
+                                    x.id, x.sha256
+                                ),
+                            )
+                        })?;
+                        match workflow::read_human_name_from_spec(&body, &field) {
+                            workflow::SpecNameRead::Named(v) => Some(v),
+                            workflow::SpecNameRead::Absent => None,
+                            workflow::SpecNameRead::Corrupt => {
+                                return Err(ApiError::refused(
+                                    "spec_body_unreadable",
+                                    format!(
+                                        "CURRENT spec {} blob {} reads back as bytes that are not parseable JSON — the advance refuses instead of silently keeping the stored signboard; the row and its blob are inconsistent, republish the specification",
+                                        x.id, x.sha256
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    // No CURRENT spec at all: `requirements_published`
+                    // keeps its own guard and refuses loudly below.
+                    None => None,
+                };
                 let m = workflow::requirements_published(
                     &task,
                     &arts,
@@ -2216,7 +2252,12 @@ mod tests {
         // be published from ANALYSIS onward.
         api.task_start(&a.to_string()).unwrap();
         api.task_start(&b.to_string()).unwrap();
-        let content = |x: &str| x.as_bytes().to_vec();
+        // Bodies are JSON, as any gated spec body is: the phased advance
+        // door re-reads the CURRENT body TYPED (QA R1) — a non-JSON blob
+        // is a corruption it refuses loudly, not the legal name-less body.
+        // The parity claim is unchanged: name-less JSON advances through
+        // the Absent branch on both paths.
+        let content = |x: &str| format!(r#"{{"requirements": "{x}"}}"#).into_bytes();
 
         let compound = api
             .artifact_publish(PublishReq {
@@ -2628,6 +2669,130 @@ mod tests {
         );
         assert_eq!(task.title, "name-gate", "title stays the creator's text");
         assert_eq!(task.display_sign(), "Понятные имена задач");
+    }
+
+    /// QA R1 (rel/error-context) regression: on the phased manual advance
+    /// door a CURRENT spec blob that does not read back — garbage bytes or
+    /// a missing file — is NOT the legal «body without a name» branch.
+    /// The door refuses LOUD (`spec_body_unreadable`); the previous
+    /// signboard is never kept silently through a swallowed read error,
+    /// and the state machine never advances. «Readable but name-less»
+    /// stays the one legal keep-the-signboard branch. Stores are checked
+    /// by DIRECT reads, never through command stdout.
+    #[test]
+    fn advance_refuses_loudly_on_a_corrupt_or_missing_spec_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "corrupt-spec-blob");
+        let id = t.to_string();
+        api.task_start(&id).unwrap();
+        let para = "Простыми словами: сейчас выводы роли читаются только специалистом, и человеку на гейте приходится переводить формальный протокол вручную по памяти о запуске. После этого решения каждый артефакт будет начинаться с понятного абзаца: что происходит и что изменится, — а платформа проверит его наличие механически и не пустит гейт без него.";
+        let publish = |api: &Api, name: &str| {
+            api.artifact_publish_row(PublishReq {
+                id: id.clone(),
+                kind: ArtifactKind::RequirementsSpec,
+                name: format!("{name}.json"),
+                content: serde_json::json!({
+                    "version": 1,
+                    "requirements": [{"id": "R1", "statement": "Требование."}],
+                    "unknowns": [],
+                    "assumptions": [],
+                    "human_paragraph": para,
+                    "task_name": name,
+                })
+                .to_string()
+                .into_bytes(),
+                depends: vec![],
+                contract: Some("requirements-specification@4".into()),
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
+            .expect("valid @4 body")
+        };
+        let advance = |api: &Api, artifact_id: String| {
+            api.artifact_advance(AdvanceReq {
+                id: id.clone(),
+                artifact_id,
+                kind: ArtifactKind::RequirementsSpec,
+                verdict: None,
+            })
+        };
+
+        // Baseline: a good publication stamps its signboard — this is the
+        // value the anti-pattern would have silently kept.
+        let first = publish(&api, "Первая вывеска");
+        advance(&api, first.artifact.id.to_string()).unwrap();
+        let task = api.task_get(&id).unwrap();
+        assert_eq!(task.human_name.as_deref(), Some("Первая вывеска"));
+        assert_eq!(task.requirements_seq, first.artifact.seq);
+
+        // Publish the second CURRENT spec, then tamper its blob on disk.
+        // The advance re-reads the CURRENT body: corruption must NOT
+        // collapse into «no name in the body».
+        let second = publish(&api, "Вторая вывеска");
+        std::fs::write(
+            api.store.blob_path(&second.artifact.sha256),
+            b"definitely not json",
+        )
+        .unwrap();
+        let e = advance(&api, second.artifact.id.to_string()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode("spec_body_unreadable"));
+        assert!(
+            format!("{e}").contains("not parseable JSON"),
+            "the refusal names the corruption: {e}"
+        );
+
+        // The loud refusal commits NOTHING: no silent keep-and-advance —
+        // the transition never ran, the signboard stayed as stored.
+        let task = api.task_get(&id).unwrap();
+        assert_eq!(
+            task.requirements_seq, first.artifact.seq,
+            "the refused advance never committed"
+        );
+        assert_eq!(task.human_name.as_deref(), Some("Первая вывеска"));
+
+        // The unreadable sibling: a missing blob file refuses the SAME
+        // typed way (the old `.ok()` made it indistinguishable too).
+        std::fs::remove_file(api.store.blob_path(&second.artifact.sha256)).unwrap();
+        let e = advance(&api, second.artifact.id.to_string()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode("spec_body_unreadable"));
+        assert!(
+            format!("{e}").contains("does not read back"),
+            "the refusal names the read failure: {e}"
+        );
+
+        // The legal absence branch stays legal: a CURRENT @3 body that
+        // reads fine but predates the name obligation advances through
+        // the SAME door, keeping the stored signboard (REQ-TN-02 AC3).
+        let legacy = api
+            .artifact_publish_row(PublishReq {
+                id: id.clone(),
+                kind: ArtifactKind::RequirementsSpec,
+                name: "spec-legacy.json".into(),
+                content: serde_json::json!({
+                    "version": 3,
+                    "requirements": [{"id": "R1", "statement": "Требование."}],
+                    "unknowns": [],
+                    "assumptions": [],
+                    "human_paragraph": para,
+                })
+                .to_string()
+                .into_bytes(),
+                depends: vec![],
+                contract: Some("requirements-specification@3".into()),
+                execution: None,
+                category: DataCategory::Artifact,
+                verdict: None,
+            })
+            .expect("REQ-TN-02 AC3: a name-less @3 body publishes")
+            .artifact;
+        advance(&api, legacy.id.to_string()).expect("absence is the legal branch");
+        assert_eq!(
+            api.task_get(&id).unwrap().human_name.as_deref(),
+            Some("Первая вывеска"),
+            "name-less CURRENT body keeps the signboard via the typed Absent branch"
+        );
     }
 
     /// REQ-TN-05 AC1 (the ACTUAL manual door): `task.revise` — the path the
