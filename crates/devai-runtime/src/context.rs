@@ -47,6 +47,7 @@
 //! so assembly is deterministic and byte-stable for identical store state.
 
 use devai_core::types::{Artifact, ExecutionStatus, Task, event_kind, json_field};
+use devai_core::vocab::CheckState;
 use devai_store::Store;
 use devai_store::config::ReworkPolicy;
 
@@ -292,12 +293,13 @@ fn failed_gates(doc: &QualityReportDoc) -> Vec<String> {
 /// The checks the assembler stored as MECHANICAL_FAIL, with score and the
 /// stored violation bodies.
 fn mechanical_fails(doc: &QualityReportDoc) -> Vec<String> {
+    let mech_fail = CheckState::MechanicalFail.as_str();
     doc.evaluation
         .checks
         .iter()
-        .filter(|c| c.state == "MECHANICAL_FAIL")
+        .filter(|c| c.state == mech_fail)
         .map(|c| {
-            let mut line = format!("- check `{}`: MECHANICAL_FAIL", c.id);
+            let mut line = format!("- check `{}`: {mech_fail}", c.id);
             if let Some(s) = c.score {
                 line.push_str(&format!(" score {s:.2}"));
             }

@@ -48,6 +48,36 @@ use crate::evaluation::{CheckOutcome, GateOutcome, ProbeState};
 /// are no longer findings (decision of 07.11, R4).
 pub const HUMAN_VIEW_VERSION: u32 = 2;
 
+/// The staleness cause tokens the workflow writes on `artifacts.staled`
+/// (`devai_core::types::stale_cause`), re-exported BESIDE the version: their
+/// text directly fixes the wording of the «устарел» marker, so the writer and
+/// the reader of that token are edited in one place (rework R2).
+pub use devai_core::types::stale_cause::{
+    REQUIREMENTS_REVISION as STALE_CAUSE_REQUIREMENTS_REVISION,
+    REWORK_RETURN as STALE_CAUSE_REWORK_RETURN,
+};
+
+/// Every human sentence of the «устарел» marker, in ONE place — the
+/// TIER_*/SUMMARY_MAX precedent. `{}` marks a value the presentation
+/// substitutes left to right (`present::filled`); nothing else in the
+/// marker's wording lives outside this block.
+pub const STALE_MARKER: &str = "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {}";
+pub const STALE_NOT_THE_DECISION: &str =
+    "(показан отчёт v{} в статусе {} — это НЕ текущее решение)";
+/// Cause token → plain words. A token this build does not know is quoted as
+/// the store fact it is ([`STALE_REASON_FOREIGN`]), never rounded to a reason.
+pub const STALE_REASON_REWORK_RETURN: &str = "отчёт возвращён человеком на реворк";
+pub const STALE_REASON_REQUIREMENTS_REVISION: &str = "выпущена новая ревизия требований";
+pub const STALE_REASON_UNRECORDED: &str = "причина устаревания в сторе не записана";
+pub const STALE_REASON_FOREIGN: &str = "событие стора: причина «{}»";
+/// What is happening to the outdated report — one sentence per store fact
+/// (a live re-audit / a return without one / an unfinished run / nothing).
+pub const REAUDIT_NOT_STARTED: &str = "ре-аудит ещё не запущен";
+pub const REAUDIT_RUNNING: &str = "готовится ре-аудит (execution {}, в работе)";
+pub const REAUDIT_NOT_RUNNING: &str =
+    "новый прогон аудитора не идёт; последний прогон {} COMPLETED {}";
+pub const REAUDIT_UNFINISHED: &str = "ре-аудит не завершён (execution {}, {})";
+
 pub const GROUP_BLOCKS: &str = "blocks";
 pub const GROUP_NUANCES: &str = "nuances";
 pub const GROUP_ANCHORS: &str = "anchors";

@@ -304,7 +304,7 @@ pub fn requirements_published(
             m.events.push(EventDraft {
                 kind: event_kind::ARTIFACTS_STALED,
                 actor: actor.to_string(),
-                payload: json!({ (json_field::STALED): staled.iter().map(|i| i.to_string()).collect::<Vec<_>>(), (json_field::CAUSE): "requirements revision" }),
+                payload: json!({ (json_field::STALED): staled.iter().map(|i| i.to_string()).collect::<Vec<_>>(), (json_field::CAUSE): stale_cause::REQUIREMENTS_REVISION }),
             });
         }
     }
@@ -753,7 +753,7 @@ pub fn return_to_rework(
             actor: actor.to_string(),
             payload: json!({
                 (json_field::STALED): rejected.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
-                (json_field::CAUSE): "rework: quality report returned by the human",
+                (json_field::CAUSE): stale_cause::REWORK_RETURN,
             }),
         });
     }

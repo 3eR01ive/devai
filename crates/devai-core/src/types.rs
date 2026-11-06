@@ -621,6 +621,23 @@ pub mod failure_class {
     pub const PLATFORM: &str = "platform";
 }
 
+/// The closed vocabulary of the `cause` token on `artifacts.staled` events —
+/// WHY an artifact stopped being CURRENT. The workflow WRITES these strings
+/// and the report presentation READS them back to word its «устарел» marker,
+/// so the token text directly fixes what the operator is told: one literal on
+/// either side is how the marker silently stops naming the stored cause
+/// (rework R2, criterion arch/no-magic). Wire strings are frozen history —
+/// changing a value here changes the reading of already-stored events.
+pub mod stale_cause {
+    /// `workflow::return_to_rework` retired the quality report the human
+    /// rejected (ratified OQ-QH-3): the return is a DATA change, not only a
+    /// presentation one.
+    pub const REWORK_RETURN: &str = "rework: quality report returned by the human";
+    /// A requirements revision superseded the spec the result was built on;
+    /// the stale closure retired its downstream artifacts.
+    pub const REQUIREMENTS_REVISION: &str = "requirements revision";
+}
+
 // ---------------------------------------------------------------------------
 // Decisions, questions, events
 // ---------------------------------------------------------------------------

@@ -822,7 +822,7 @@ fn render(
 
     let blocked: Vec<String> = checks
         .iter()
-        .filter(|c| c.state == "BLOCKED")
+        .filter(|c| c.state == CheckState::Blocked.as_str())
         .map(|c| format!("{} — {}", c.id, c.reason))
         .collect();
     if !blocked.is_empty() {

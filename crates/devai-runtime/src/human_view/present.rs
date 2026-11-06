@@ -14,7 +14,23 @@ use devai_core::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{HumanReportView, render_text};
+use super::{
+    HumanReportView, REAUDIT_NOT_RUNNING, REAUDIT_NOT_STARTED, REAUDIT_RUNNING, REAUDIT_UNFINISHED,
+    STALE_CAUSE_REQUIREMENTS_REVISION, STALE_CAUSE_REWORK_RETURN, STALE_MARKER,
+    STALE_NOT_THE_DECISION, STALE_REASON_FOREIGN, STALE_REASON_REQUIREMENTS_REVISION,
+    STALE_REASON_REWORK_RETURN, STALE_REASON_UNRECORDED, render_text,
+};
+
+/// Substitute the `{}` placeholders of a wording constant, left to right.
+/// The marker's sentences are stored as `const`s (one place to edit, rework
+/// R2) and `format!` only takes a literal, so a template is filled here.
+fn filled(template: &str, args: &[&str]) -> String {
+    let mut out = template.to_string();
+    for a in args {
+        out = out.replacen("{}", a, 1);
+    }
+    out
+}
 
 /// The role whose executions are the re-audit the freshness marker may name
 /// (rework R10: a slug, not a literal at the filter site).
@@ -155,10 +171,15 @@ impl PresentedReport {
             return self.text.clone();
         }
         format!(
-            "{}\n(показан отчёт v{} в статусе {} — это НЕ текущее решение)\n\n{}",
+            "{}\n{}\n\n{}",
             self.freshness.marker,
-            self.freshness.report_seq,
-            self.freshness.report_status,
+            filled(
+                STALE_NOT_THE_DECISION,
+                &[
+                    &self.freshness.report_seq.to_string(),
+                    &self.freshness.report_status
+                ]
+            ),
             self.text
         )
     }
@@ -211,10 +232,10 @@ pub fn stale_cause(events: &[WorkflowEvent], artifact: Id) -> Option<StaleCause>
 /// a store fact, never rounded to a known reason.
 fn stale_reason(c: &StaleCause) -> String {
     let what = match c.cause.as_str() {
-        "rework: quality report returned by the human" => "отчёт возвращён человеком на реворк",
-        "requirements revision" => "выпущена новая ревизия требований",
-        "" => return "причина устаревания в сторе не записана".to_string(),
-        other => return format!("событие стора: причина «{other}»"),
+        STALE_CAUSE_REWORK_RETURN => STALE_REASON_REWORK_RETURN,
+        STALE_CAUSE_REQUIREMENTS_REVISION => STALE_REASON_REQUIREMENTS_REVISION,
+        "" => return STALE_REASON_UNRECORDED.to_string(),
+        other => return filled(STALE_REASON_FOREIGN, &[other]),
     };
     format!("{what} ({})", c.actor)
 }
@@ -250,10 +271,9 @@ pub fn freshness(
     };
     ReportFreshness {
         stale: true,
-        marker: format!(
-            "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {tail}",
-            a.seq,
-            task.state.as_str()
+        marker: filled(
+            STALE_MARKER,
+            &[&a.seq.to_string(), task.state.as_str(), &tail],
         ),
         report_seq: a.seq,
         report_status: a.status.as_str().to_string(),
@@ -292,31 +312,26 @@ fn stale_tail(running: Option<&RoleExecution>, last: Option<&RoleExecution>) -> 
         // RUNNING row is the only thing said.
         Some(e) if e.status == ExecutionStatus::Completed => reaudit_not_running(e),
         Some(e) => reaudit_unfinished(e),
-        None => "ре-аудит ещё не запущен".to_string(),
+        None => REAUDIT_NOT_STARTED.to_string(),
     }
 }
 
 fn reaudit_running(e: &RoleExecution) -> String {
-    format!(
-        "готовится ре-аудит (execution {}, в работе)",
-        short_id(&e.id)
-    )
+    filled(REAUDIT_RUNNING, &[&short_id(&e.id)])
 }
 
 fn reaudit_not_running(e: &RoleExecution) -> String {
-    format!(
-        "новый прогон аудитора не идёт; последний прогон {} COMPLETED {}",
-        short_id(&e.id),
-        fmt_ts(e.finished_at.as_ref().unwrap_or(&e.started_at))
+    filled(
+        REAUDIT_NOT_RUNNING,
+        &[
+            &short_id(&e.id),
+            &fmt_ts(e.finished_at.as_ref().unwrap_or(&e.started_at)),
+        ],
     )
 }
 
 fn reaudit_unfinished(e: &RoleExecution) -> String {
-    format!(
-        "ре-аудит не завершён (execution {}, {})",
-        short_id(&e.id),
-        e.status.as_str()
-    )
+    filled(REAUDIT_UNFINISHED, &[&short_id(&e.id), e.status.as_str()])
 }
 
 #[cfg(test)]
