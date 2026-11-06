@@ -80,6 +80,12 @@ nav.modes a.router-link-active {
   background: var(--orange);
   font-weight: 600;
 }
+/* Бейдж ожидания на nav-элементе секции (REQ-GATE-08): число строк
+   снимка, цвет наследуется от ссылки — различим и в active, и в idle. */
+nav.modes a .badge {
+  font-family: var(--mono);
+  font-weight: 800;
+}
 
 .statusbar {
   margin-left: auto;

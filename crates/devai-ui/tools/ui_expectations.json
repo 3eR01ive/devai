@@ -11,7 +11,7 @@
     { "id": "nav-projects", "any_of": ["Проекты", "#/projects"] },
     { "id": "nav-tasks", "any_of": ["Задачи", "#/tasks"] },
     { "id": "nav-live", "any_of": ["Активные", "#/live"] },
-    { "id": "nav-inbox", "any_of": ["Вопросы", "#/inbox"] },
+    { "id": "nav-inbox", "any_of": ["Вопросы", "Ожидание", "#/inbox"] },
     { "id": "nav-ops", "any_of": ["Операции API", "#/ops"] }
   ]
 }

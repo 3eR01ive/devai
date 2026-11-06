@@ -37,8 +37,11 @@ standalone (tauri://localhost + release-бинарь) дают одно и то 
 (c) Обязательные навигационные элементы присутствуют. Набор зафиксирован
     исполнителем по `crates/devai-ui/frontend/src` (App.vue nav +
     router.ts/routes): nav-projects Проекты|#/projects, nav-tasks
-    Задачи|#/tasks, nav-live Активные|#/live, nav-inbox Вопросы|#/inbox,
-    nav-ops Операции API|#/ops. TaskDetail — не элемент навигации: это
+    Задачи|#/tasks, nav-live Активные|#/live, nav-inbox
+    Ожидание|#/inbox (задача 01a1b0ea: вкладка расширена из
+    question-inbox в секцию ожидания человека; label переименован,
+    адрес и прежний токен «Вопросы» сохранены в any_of ожиданий —
+    ASM-GATE-2), nav-ops Операции API|#/ops. TaskDetail — не элемент навигации: это
     drill-маршрут `/task/:id`, недоступный из свежего окна без данных;
     его присутствие в прогоне обеспечивают router.ts и переходы, а не
     порог снимка (пункт порога — про СТАТИЧНУЮ навигацию окна).
