@@ -401,7 +401,7 @@ impl Store {
         Ok(rows::unwrap_row(
             self.conn
                 .query_row(
-                    "SELECT t.id,t.project_id,t.title,t.business_description,t.state,t.return_state,t.requirements_seq,t.lock_version,t.created_at,t.updated_at
+                    "SELECT t.id,t.project_id,t.title,t.business_description,t.state,t.return_state,t.requirements_seq,t.lock_version,t.created_at,t.updated_at,t.human_name
                      FROM task_creation_keys k JOIN tasks t ON t.id = k.task_id
                      WHERE k.idempotency_key = ?1",
                     params![key],
@@ -870,7 +870,7 @@ impl Store {
     pub fn epic_heads(&self) -> StoreResult<Vec<EpicVertex>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.project_id, t.title, t.business_description, t.state, t.return_state,
-                    t.requirements_seq, t.lock_version, t.created_at, t.updated_at,
+                    t.requirements_seq, t.lock_version, t.created_at, t.updated_at, t.human_name,
                     (SELECT count(*) FROM task_dependencies c
                       WHERE c.depends_on_id = t.id AND c.kind = 'parent' AND c.status = 'ACTIVE')
              FROM tasks t
@@ -885,7 +885,9 @@ impl Store {
         while let Some(r) = rows.next()? {
             out.push(EpicVertex {
                 task: rows::task_from_row(r)?,
-                derived_children: r.get::<_, i64>(10)? as usize,
+                // column 10 is the task's own `human_name` (v9), 11 the
+                // derived-children count (the task projection moved to 11 cols).
+                derived_children: r.get::<_, i64>(11)? as usize,
             });
         }
         Ok(out)
@@ -2315,6 +2317,17 @@ mod migration_tests {
             let conn = Connection::open(dir.path().join("devai.db")).unwrap();
             conn.execute_batch(
                 "PRAGMA user_version=1;
+                 CREATE TABLE tasks(
+                   id TEXT PRIMARY KEY,
+                   project_id TEXT NULL,
+                   title TEXT NOT NULL,
+                   business_description TEXT NOT NULL DEFAULT '',
+                   state TEXT NOT NULL,
+                   return_state TEXT NULL,
+                   requirements_seq INTEGER NOT NULL DEFAULT 0,
+                   lock_version INTEGER NOT NULL DEFAULT 1,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL);
                  CREATE TABLE role_executions(
                    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, role_slug TEXT NOT NULL,
                    role_version INTEGER NOT NULL, agent_name TEXT NULL, status TEXT NOT NULL,
@@ -2459,6 +2472,17 @@ mod migration_tests {
             let conn = Connection::open(mig_dir.path().join("devai.db")).unwrap();
             conn.execute_batch(
                 "PRAGMA user_version=1;
+                 CREATE TABLE tasks(
+                   id TEXT PRIMARY KEY,
+                   project_id TEXT NULL,
+                   title TEXT NOT NULL,
+                   business_description TEXT NOT NULL DEFAULT '',
+                   state TEXT NOT NULL,
+                   return_state TEXT NULL,
+                   requirements_seq INTEGER NOT NULL DEFAULT 0,
+                   lock_version INTEGER NOT NULL DEFAULT 1,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL);
                  CREATE TABLE role_executions(
                    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, role_slug TEXT NOT NULL,
                    role_version INTEGER NOT NULL, agent_name TEXT NULL, status TEXT NOT NULL,

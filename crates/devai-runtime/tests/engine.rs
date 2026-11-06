@@ -2850,3 +2850,63 @@ items:
     );
     assert!(!pb.checks().iter().any(|c| c.id == "dom/x"));
 }
+
+/// REQ-TN-02 e2e: the ANALYST run alone gives the task its human name —
+/// the field arrives in the published CURRENT spec body and the platform
+/// stamps it onto the task in the same publication that moves the state
+/// (AC1: no manual operation, no second role; AC "one source of truth":
+/// the stored name equals the CURRENT body's field). REQ-TN-01 AC2: the
+/// formal title survives byte-for-byte.
+#[test]
+fn analyst_run_stamps_the_human_name_on_the_task() {
+    let (_d, store) = store();
+    let t = Task::new(
+        "Понятные имена задач после аналитика",
+        "Названия задач неразборчивы в списках и морде",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    let engine = mk_engine(&store);
+    let r = engine
+        .advance(&t.id.to_string(), "mock", "tester")
+        .expect("analyst + reviewer run autonomously");
+    assert_eq!(r.gate, Gate::WaitingApproval);
+
+    let task = store.get_task(&t.id.to_string()).unwrap();
+    let name = task
+        .human_name
+        .as_deref()
+        .expect("publication stamped the human name on the task");
+    assert!(!name.trim().is_empty());
+    assert!(
+        name.chars().count() <= 60 && !name.contains('\n'),
+        "inside the configured window and one line: {name:?}"
+    );
+    assert_eq!(
+        task.title, "Понятные имена задач после аналитика",
+        "the creator's verbatim title is never rewritten"
+    );
+    // The list signboard now reads the analyst's name, not the raw title.
+    assert_eq!(task.display_sign(), name);
+
+    // One source of truth: the stored value is the CURRENT spec field.
+    let spec = store
+        .artifacts(task.id)
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current)
+        .max_by_key(|a| a.seq)
+        .expect("a CURRENT spec was published");
+    let body: serde_json::Value =
+        serde_json::from_slice(&store.read_blob(&spec.sha256).unwrap()).unwrap();
+    assert_eq!(body["task_name"].as_str().unwrap().trim(), name);
+    // The name rides the requirements.published payload too (audit trail).
+    let ev = store
+        .events(task.id, None)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == event_kind::REQUIREMENTS_PUBLISHED)
+        .expect("publication event");
+    assert_eq!(ev.payload[json_field::HUMAN_NAME].as_str(), Some(name));
+}

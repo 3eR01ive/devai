@@ -222,6 +222,7 @@ impl Task {
     ///    SENTENCE of the stored business description (ratified OQ-TN-3:
     ///    neither the whole statement nor a mid-word cut);
     ///  * neither yields a non-blank value → the formal title.
+    ///
     /// Reads only stored task fields — never an artifact body.
     pub fn display_sign(&self) -> String {
         task_display_sign(
@@ -243,10 +244,8 @@ pub fn task_display_sign(
     business_description: &str,
     title: &str,
 ) -> String {
-    if let Some(n) = human_name {
-        if !n.trim().is_empty() {
-            return n.to_string();
-        }
+    if let Some(n) = human_name.filter(|n| !n.trim().is_empty()) {
+        return n.to_string();
     }
     if state == TaskState::Draft {
         let first = first_sentence(business_description);

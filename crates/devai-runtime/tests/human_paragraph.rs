@@ -7,6 +7,7 @@
 use chrono::Utc;
 use devai_core::types::*;
 use devai_runtime::{Engine, artifact_violations, validate_reply};
+use devai_store::config::TaskNamePolicy;
 use devai_store::{Store, seed};
 use serde_json::{Value, json};
 
@@ -112,16 +113,44 @@ fn role_contracts_point_at_the_paragraph_versions() {
             .input_contract
             .map(|c| c.to_string())
     };
-    assert_eq!(out("requirements-analyst"), "requirements-specification@3");
+    // Task 01a1ad1d (REQ-TN-02 AC4): the role half moved to @4 — the
+    // paragraph obligation is INHERITED by @4 (it still requires
+    // human_paragraph), so "points at the paragraph version" holds at the
+    // current version; the name bump must not silently unpin this check.
+    assert_eq!(out("requirements-analyst"), "requirements-specification@4");
     assert_eq!(out("requirements-reviewer"), "review-report@2");
     assert_eq!(out("implementation-agent"), "implementation-report@3");
     assert_eq!(
         inp("requirements-reviewer").as_deref(),
-        Some("requirements-specification@3")
+        Some("requirements-specification@4")
     );
     assert_eq!(
         inp("implementation-agent").as_deref(),
-        Some("requirements-specification@3")
+        Some("requirements-specification@4")
+    );
+    // @3 stays seeded as history with the paragraph required (insert-only).
+    let s3: Value =
+        serde_json::from_str(&contract(&store, "requirements-specification", 3)).unwrap();
+    assert!(
+        s3["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "human_paragraph"),
+        "@3 keeps the paragraph obligation"
+    );
+    // …and @4 adds the name on top of it (REQ-TN-01/02: one field, required).
+    let s4: Value =
+        serde_json::from_str(&contract(&store, "requirements-specification", 4)).unwrap();
+    let r4: Vec<&str> = s4["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        r4.contains(&"task_name") && r4.contains(&"human_paragraph"),
+        "{r4:?}"
     );
 }
 
@@ -151,7 +180,13 @@ fn the_seeded_gate_rejects_absence_and_chatter_accepts_a_real_paragraph() {
 
     // 1) No paragraph — the presence half of the gate (REQ-HP-02): the
     //    violation names the field with its json path.
-    let v = artifact_violations(&skeleton(None).to_string(), Some(&schema), &policy).unwrap();
+    let v = artifact_violations(
+        &skeleton(None).to_string(),
+        Some(&schema),
+        &policy,
+        &TaskNamePolicy::default(),
+    )
+    .unwrap();
     assert!(
         v.iter()
             .any(|e| e == "$.human_paragraph: missing required key"),
@@ -163,6 +198,7 @@ fn the_seeded_gate_rejects_absence_and_chatter_accepts_a_real_paragraph() {
         &skeleton(Some("всё хорошо, работа выполнена")).to_string(),
         Some(&schema),
         &policy,
+        &TaskNamePolicy::default(),
     )
     .unwrap();
     assert!(
@@ -173,7 +209,13 @@ fn the_seeded_gate_rejects_absence_and_chatter_accepts_a_real_paragraph() {
 
     // 3) A real paragraph passes the whole gate.
     let good = "Простыми словами: сейчас выводы ролей читаются только специалистом, и человеку на гейте приходится переводить формальный протокол вручную по памяти о запуске. После этого решения каждый артефакт будет начинаться с понятного абзаца: что происходит и что изменится, — а платформа проверит его наличие механически и не пустит гейт без него.";
-    let v = artifact_violations(&skeleton(Some(good)).to_string(), Some(&schema), &policy).unwrap();
+    let v = artifact_violations(
+        &skeleton(Some(good)).to_string(),
+        Some(&schema),
+        &policy,
+        &TaskNamePolicy::default(),
+    )
+    .unwrap();
     assert_eq!(
         v,
         Vec::<String>::new(),
@@ -182,11 +224,23 @@ fn the_seeded_gate_rejects_absence_and_chatter_accepts_a_real_paragraph() {
 
     // Parity (REQ-HP-02): the engine half raises the SAME facts as a
     // response_form rejection with the full list — one gate, one function.
-    let e = validate_reply(&skeleton(None).to_string(), Some(&schema), &policy).unwrap_err();
+    let e = validate_reply(
+        &skeleton(None).to_string(),
+        Some(&schema),
+        &policy,
+        &TaskNamePolicy::default(),
+    )
+    .unwrap_err();
     assert_eq!(e.failure_class(), failure_class::RESPONSE_FORM);
     match e {
         devai_runtime::AdapterError::BadOutput { violations } => assert_eq!(violations, {
-            artifact_violations(&skeleton(None).to_string(), Some(&schema), &policy).unwrap()
+            artifact_violations(
+                &skeleton(None).to_string(),
+                Some(&schema),
+                &policy,
+                &TaskNamePolicy::default(),
+            )
+            .unwrap()
         }),
         other => panic!("form class expected: {other}"),
     }
@@ -215,7 +269,13 @@ fn quality_report_text_never_meets_the_detector() {
         },
         "evaluation": { "verdict": "PASS", "score": 0.9, "theta": 0.8, "gates": [], "checks": [] }
     });
-    let v = artifact_violations(&body.to_string(), Some(&schema), &policy).unwrap();
+    let v = artifact_violations(
+        &body.to_string(),
+        Some(&schema),
+        &policy,
+        &TaskNamePolicy::default(),
+    )
+    .unwrap();
     assert!(
         v.iter()
             .all(|e| !e.contains("human_paragraph") && !e.contains("paragraph")),
@@ -266,7 +326,8 @@ fn volume_and_thresholds_are_config_data_not_code() {
     })
     .to_string();
     // Rejected at the factory minimum…
-    let strict = artifact_violations(&body, Some(&schema), &absent).unwrap();
+    let strict =
+        artifact_violations(&body, Some(&schema), &absent, &TaskNamePolicy::default()).unwrap();
     assert!(
         strict
             .iter()
@@ -274,7 +335,8 @@ fn volume_and_thresholds_are_config_data_not_code() {
         "{strict:?}"
     );
     // …accepted at the project window — no code changed anywhere.
-    let lenient = artifact_violations(&body, Some(&schema), &project).unwrap();
+    let lenient =
+        artifact_violations(&body, Some(&schema), &project, &TaskNamePolicy::default()).unwrap();
     assert_eq!(lenient, Vec::<String>::new(), "{lenient:?}");
 
     // Typo'd key: LOUD at load (AC2), naming the file.
@@ -357,12 +419,13 @@ fn obligation_binds_the_new_versions_only() {
     .to_string();
     let policy = devai_store::config::HumanizePolicy::default();
     assert!(
-        artifact_violations(&body, Some(&legacy), &policy)
+        artifact_violations(&body, Some(&legacy), &policy, &TaskNamePolicy::default())
             .unwrap()
             .is_empty(),
         "a body published under @2 stays legal — the obligation is not retroactive"
     );
-    let v = artifact_violations(&body, Some(&current), &policy).unwrap();
+    let v =
+        artifact_violations(&body, Some(&current), &policy, &TaskNamePolicy::default()).unwrap();
     assert_eq!(
         v,
         vec!["$.human_paragraph: missing required key".to_string()]
@@ -423,14 +486,20 @@ fn factory_max_fits_the_reply_limit_and_truncation_is_rejected() {
     assert!(parsed["human_paragraph"].is_string());
     assert!(parsed.get("change_history").is_some(), "tail keys survive");
     // …and passes the gate (max itself is legal, it is the window boundary).
-    let v = artifact_violations(&parsed.to_string(), Some(&schema), &policy).unwrap();
+    let v = artifact_violations(
+        &parsed.to_string(),
+        Some(&schema),
+        &policy,
+        &TaskNamePolicy::default(),
+    )
+    .unwrap();
     assert_eq!(v, Vec::<String>::new(), "exactly-max paragraph: {v:?}");
 
     // A truncated reply (the incident shape: the budget ate the tail) stays
     // a FORM-class rejection — silence here would re-open the 3× incident.
     let chars: Vec<char> = text.chars().collect();
     let cut: String = chars[..chars.len() - 50].iter().collect();
-    let v = artifact_violations(&cut, Some(&schema), &policy);
+    let v = artifact_violations(&cut, Some(&schema), &policy, &TaskNamePolicy::default());
     match v {
         Ok(list) => assert!(!list.is_empty(), "truncated body must not pass: {list:?}"),
         Err(devai_runtime::AdapterError::BadOutput { violations }) => {

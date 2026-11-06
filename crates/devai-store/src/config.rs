@@ -2324,7 +2324,7 @@ scoring:
     /// the historical incident key is declared in properties now.
     #[test]
     fn requirements_specification_v2_makes_echo_fields_optional_and_declared() {
-        let (_, v2, schema) = crate::seed::contracts()
+        let (_, _v2, schema) = crate::seed::contracts()
             .into_iter()
             .find(|(name, ver, _)| *name == "requirements-specification" && *ver == 2)
             .expect("requirements-specification@2 is seeded");
@@ -2658,6 +2658,76 @@ scoring:
         assert_eq!(
             fs::read_to_string(cfgdir.join("criteria/review.yaml")).unwrap(),
             "mine"
+        );
+    }
+
+    /// REQ-TN-05 AC2 (task 01a1ad1d): the name template is the humanize /
+    /// response-form discipline again — factory materialisation, an edit
+    /// without rebuild, an absent file behaving exactly like the factory
+    /// bytes, and a broken declaration FAILING LOUD, never swallowed.
+    #[test]
+    fn task_name_template_is_declarative_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfgdir = dir.path().join("config");
+        materialize_if_absent(&cfgdir).unwrap();
+        let wf = cfgdir.join("workflow");
+        // The factory file lands in the home next to humanize.yaml.
+        assert!(
+            wf.join("task-name.yaml").exists(),
+            "init must materialise the task-name template"
+        );
+        let pol = load_task_name_policy(&wf).unwrap();
+        assert_eq!(pol.field, "task_name");
+        assert_eq!(
+            (pol.min_chars, pol.max_chars, pol.single_line),
+            (3, 60, true)
+        );
+
+        // A home predating the file: the factory meaning, no error.
+        fs::remove_file(wf.join("task-name.yaml")).unwrap();
+        assert_eq!(
+            load_task_name_policy(&wf).unwrap(),
+            TaskNamePolicy::default()
+        );
+        fs::remove_dir_all(&wf).unwrap();
+        assert_eq!(
+            load_task_name_policy(&wf).unwrap(),
+            TaskNamePolicy::default(),
+            "absent dir is not an error"
+        );
+
+        // Operator edit — no rebuild (AC2).
+        fs::create_dir_all(&wf).unwrap();
+        fs::write(
+            wf.join("task-name.yaml"),
+            "task_name:\n  field: task_name\n  min_chars: 5\n  max_chars: 40\n  single_line: false\n",
+        )
+        .unwrap();
+        let pol = load_task_name_policy(&wf).unwrap();
+        assert_eq!(
+            (pol.min_chars, pol.max_chars, pol.single_line),
+            (5, 40, false)
+        );
+
+        // Inverted window: a LOUD config error naming the file (AC1: an
+        // empty window would reject every name — never a silent default).
+        fs::write(
+            wf.join("task-name.yaml"),
+            "task_name:\n  min_chars: 80\n  max_chars: 40\n",
+        )
+        .unwrap();
+        let e = load_task_name_policy(&wf).unwrap_err().to_string();
+        assert!(
+            e.contains("min_chars") && e.contains("task-name.yaml"),
+            "inverted window must name itself: {e}"
+        );
+
+        // Typo'd key: deny_unknown_fields names it — the humanize idiom.
+        fs::write(wf.join("task-name.yaml"), "task_name:\n  max_char: 40\n").unwrap();
+        let e = load_task_name_policy(&wf).unwrap_err().to_string();
+        assert!(
+            e.contains("task_name section is invalid"),
+            "a typo'd key must be loud: {e}"
         );
     }
 }

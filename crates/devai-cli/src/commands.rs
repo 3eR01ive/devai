@@ -23,8 +23,7 @@ use crate::{
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
     MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq,
-    TaskRenameReq,
-    TaskProjectSetReq,
+    TaskProjectSetReq, TaskRenameReq,
 };
 
 pub struct Ctx {
@@ -665,7 +664,7 @@ fn task_binding_plane(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
 /// The `task rename` arm (REQ-TN, ratified OQ-TN-1): the human door to the
 /// signboard, delegating to the registered `task.rename` operation. This
 /// layer owns presentation only — the name window is the API's contract-
-/// gated refusal (`contract_rejected` renders the violation list), never a
+/// gated refusal (`contract_violation` renders the violation list), never a
 /// CLI-side copy.
 fn task_rename_arm(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     let TaskCmd::Rename {

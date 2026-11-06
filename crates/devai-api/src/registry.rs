@@ -309,7 +309,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Mutation,
             input: "TaskRenameReq{id, name, expected_lock}",
             output: "TaskRenameOutcome{task, human_name, changed}",
-            description: "HUMAN door to the signboard (ratified OQ-TN-1): set or replace the task's human name directly — no rework cycle, the workflow state is never touched. The name is validated against the SAME declarative window as spec publication (config/workflow/task-name.yaml: blank / too-short / too-long / multi-line values refuse typed `contract_rejected`); refs resolve first, a stale `expected_lock` refuses typed `conflict`, re-applying the name the task already carries is a side-effect-free NO-OP (`changed=false`), an effective change bumps lock_version and appends one `task.human_name.set` event in the SAME transaction. The formal title is never rewritten (REQ-TN-01). Mirrors `task rename`.",
+            description: "HUMAN door to the signboard (ratified OQ-TN-1): set or replace the task's human name directly — no rework cycle, the workflow state is never touched. The name is validated against the SAME declarative window as spec publication (config/workflow/task-name.yaml: blank / too-short / too-long / multi-line values refuse typed `contract_violation`); refs resolve first, a stale `expected_lock` refuses typed `conflict`, re-applying the name the task already carries is a side-effect-free NO-OP (`changed=false`), an effective change bumps lock_version and appends one `task.human_name.set` event in the SAME transaction. The formal title is never rewritten (REQ-TN-01). Mirrors `task rename`.",
         },
         OpDescriptor {
             name: "task.depend",

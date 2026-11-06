@@ -342,7 +342,12 @@ impl AgentRuntime {
         let parsed: Value = serde_json::from_str(&json).map_err(|e| AdapterError::BadOutput {
             violations: vec![format!("extracted object is not valid JSON: {e}")],
         })?;
-        validate_reply(&json, req.contract_schema.as_deref(), &req.humanize, &req.task_name)?;
+        validate_reply(
+            &json,
+            req.contract_schema.as_deref(),
+            &req.humanize,
+            &req.task_name,
+        )?;
         Ok(ExecOutput {
             content: json.into_bytes(),
             summary: summarize(contract.map(|c| c.0), &parsed),
@@ -412,7 +417,12 @@ impl AgentRuntime {
         let parsed: Value = serde_json::from_str(&json).map_err(|e| AdapterError::BadOutput {
             violations: vec![format!("extracted object is not valid JSON: {e}")],
         })?;
-        validate_reply(&json, req.contract_schema.as_deref(), &req.humanize, &req.task_name)?;
+        validate_reply(
+            &json,
+            req.contract_schema.as_deref(),
+            &req.humanize,
+            &req.task_name,
+        )?;
         let contract = req.role.output_contract.as_ref().map(|c| c.name.as_str());
         Ok(ExecOutput {
             content: json.into_bytes(),
@@ -929,7 +939,9 @@ pub fn artifact_violations(
         // the paragraph's: it fires only when the stored schema REQUIRES
         // the configured name field, so @1..@3 and every non-bearing
         // contract are exempt by construction, never by a kind branch.
-        errs.extend(crate::taskname::name_violations(&value, &schema_v, task_name));
+        errs.extend(crate::taskname::name_violations(
+            &value, &schema_v, task_name,
+        ));
     }
     Ok(errs)
 }
@@ -1141,9 +1153,7 @@ fn mock_task_name(title: &str, max_chars: usize) -> String {
     let mut count = 0usize;
     for w in title.split_whitespace() {
         let add = if out.is_empty() { w } else { " " };
-        let projected = count
-            + add.chars().count()
-            + w.chars().count();
+        let projected = count + add.chars().count() + w.chars().count();
         if projected > max_chars {
             break;
         }
@@ -1207,6 +1217,7 @@ mod tests {
             evidence: None,
             repair: None,
             humanize: HumanizePolicy::default(),
+            task_name: devai_store::config::TaskNamePolicy::default(),
         }
     }
 

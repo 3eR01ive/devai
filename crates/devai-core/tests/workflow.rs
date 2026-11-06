@@ -663,7 +663,8 @@ fn revise_supersedes_old_spec_and_stales_dependents() {
     );
     artifacts.push(spec2.clone());
     let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now()).unwrap();
+        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now())
+            .unwrap();
     t = m.task;
     assert_eq!(t.state, TaskState::Review);
     assert_eq!(t.requirements_seq, 2);
@@ -766,7 +767,8 @@ fn revise_from_v3_shaped_snapshot_stales_dependents_without_double_flip() {
         .collect();
 
     let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now()).unwrap();
+        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now())
+            .unwrap();
     assert_eq!(m.task.state, TaskState::Review);
     assert_eq!(m.task.requirements_seq, 2);
 
@@ -1252,5 +1254,142 @@ fn form_escalation_retells_an_unreadable_paragraph_in_plain_words() {
         m.questions[0]
             .text
             .contains("человеческий абзац не прошёл проверку читаемости")
+    );
+}
+
+// --- task 01a1ad1d: the human name on publication and the signboard rule
+// (REQ-TN-01/02/03/04, ratified OQ-TN-2/3) ------------------------------------
+
+#[test]
+fn publication_stamps_and_replaces_the_human_name() {
+    let base = draft_task();
+    let mut artifacts = vec![];
+    let mut t = workflow::start(&base, "u", now()).unwrap().task;
+
+    // REQ-TN-01/02: publishing a CURRENT spec with a name stamps it on the
+    // task in the SAME mutation; the formal title stays byte-for-byte the
+    // creator's text (AC2); the event payload carries the value.
+    let spec1 = artifact(
+        &t,
+        ArtifactKind::RequirementsSpec,
+        1,
+        ArtifactStatus::Current,
+        vec![],
+    );
+    artifacts.push(spec1);
+    let m = workflow::requirements_published(
+        &t,
+        &artifacts,
+        None,
+        Some("Понятные имена задач"),
+        "analyst",
+        now(),
+    )
+    .unwrap();
+    assert_eq!(m.task.human_name.as_deref(), Some("Понятные имена задач"));
+    assert_eq!(m.task.title, "t", "AC2: the title is never rewritten");
+    let ev = m
+        .events
+        .iter()
+        .find(|e| e.kind == event_kind::REQUIREMENTS_PUBLISHED)
+        .expect("the publication event");
+    assert_eq!(ev.payload[json_field::HUMAN_NAME], "Понятные имена задач");
+    t = m.task;
+
+    // REQ-TN-04: a rework spec re-signs the task WHOLE from its own body —
+    // replacement, not accumulation (REQ-TN-01 AC3).
+    let spec2 = artifact(
+        &t,
+        ArtifactKind::RequirementsSpec,
+        2,
+        ArtifactStatus::Current,
+        vec![],
+    );
+    artifacts.push(spec2);
+    let m = workflow::requirements_published(
+        &t,
+        &artifacts,
+        Some("scope change"),
+        Some("Новая вывеска"),
+        "u",
+        now(),
+    )
+    .unwrap();
+    assert_eq!(m.task.human_name.as_deref(), Some("Новая вывеска"));
+    t = m.task;
+
+    // REQ-TN-02 AC3 (non-retroactivity): a publication whose body predates
+    // the name obligation (None — @1..@3 shape) says NOTHING about the
+    // signboard: it neither clears nor changes the current value.
+    let spec3 = artifact(
+        &t,
+        ArtifactKind::RequirementsSpec,
+        3,
+        ArtifactStatus::Current,
+        vec![],
+    );
+    artifacts.push(spec3);
+    let m = workflow::requirements_published(&t, &artifacts, Some("legacy body"), None, "u", now())
+        .unwrap();
+    assert_eq!(m.task.human_name.as_deref(), Some("Новая вывеска"));
+    assert_eq!(m.task.requirements_seq, 3);
+}
+
+#[test]
+fn signboard_rule_name_then_draft_sentence_then_title() {
+    // 1) A human name wins in ANY state.
+    let mut named = draft_task();
+    named.human_name = Some("Имя по смыслу спека".into());
+    assert_eq!(named.display_sign(), "Имя по смыслу спека");
+
+    // 2) DRAFT without a name shows the FIRST SENTENCE of the statement
+    //    (ratified OQ-TN-3), not the whole text and not a mid-word cut.
+    let d = Task::new(
+        "formal title",
+        "Первое предложение. Второе — детали.\nТретья строка.",
+        None,
+        now(),
+    );
+    assert_eq!(d.display_sign(), "Первое предложение.");
+    // A period NOT followed by whitespace stays inside the sentence; a
+    // decimal point inside a token never cuts.
+    let p = Task::new("t", "версия v1.2 готова", None, now());
+    assert_eq!(
+        p.display_sign(),
+        "версия v1.2 готова",
+        "no cut inside a token"
+    );
+    // Whitespace inside the first line collapses — the signboard is ONE line.
+    let w = Task::new("t", "много    пробелов   тут", None, now());
+    assert_eq!(w.display_sign(), "много пробелов тут");
+    // A newline terminates the showcase even without punctuation.
+    let n = Task::new("t", "до перевода строки\nпосле", None, now());
+    assert_eq!(n.display_sign(), "до перевода строки");
+
+    // 3) A DRAFT with no statement at all keeps the title — вывеска не пуста.
+    let empty = Task::new("just the title", "   ", None, now());
+    assert_eq!(empty.display_sign(), "just the title");
+
+    // 4) Past DRAFT with no name (legacy, ratified OQ-TN-2): the title —
+    //    the statement showcase belongs to DRAFT only.
+    let mut artifacts = vec![];
+    let reviewed = in_state(
+        &Task::new("ttl", "не показывать это.", None, now()),
+        TaskState::Review,
+        &mut artifacts,
+    );
+    assert_eq!(reviewed.human_name, None);
+    assert_eq!(reviewed.display_sign(), "ttl");
+
+    // The bare-fields twin serves edge ends identically.
+    assert_eq!(
+        task_display_sign(TaskState::Draft, None, "болью словами. детали", "title"),
+        "болью словами."
+    );
+    // A whitespace-only stored name is NOT a signboard: the rule falls
+    // through to the state limb (QA → title), never renders blank.
+    assert_eq!(
+        task_display_sign(TaskState::Qa, Some("   "), "x. y", "title"),
+        "title"
     );
 }

@@ -119,8 +119,7 @@ pub fn validate_human_name(name: &str, policy: &TaskNamePolicy) -> Result<String
     }
     if policy.single_line && trimmed.chars().any(|c| c == '\n' || c == '\r') {
         errs.push(
-            "the name carries a newline — it must fit ONE line of a list or a graph"
-                .to_string(),
+            "the name carries a newline — it must fit ONE line of a list or a graph".to_string(),
         );
     }
     if errs.is_empty() {
@@ -219,7 +218,11 @@ mod tests {
 
     #[test]
     fn good_name_passes() {
-        let errs = name_violations(&body("Понятные имена задач в списках"), &spec_schema(), &policy());
+        let errs = name_violations(
+            &body("Понятные имена задач в списках"),
+            &spec_schema(),
+            &policy(),
+        );
         assert_eq!(errs, Vec::<String>::new(), "{errs:?}");
     }
 
@@ -237,7 +240,8 @@ mod tests {
         let long = "а".repeat(61);
         let errs = name_violations(&body(&long), &spec_schema(), &policy());
         assert!(
-            errs.iter().any(|e| e.contains("above the configured maximum")),
+            errs.iter()
+                .any(|e| e.contains("above the configured maximum")),
             "{errs:?}"
         );
     }
@@ -259,7 +263,8 @@ mod tests {
         // …and one that lowers the max rejects one char over.
         let errs = name_violations(&body("имя456"), &spec_schema(), &lenient);
         assert!(
-            errs.iter().any(|e| e.contains("above the configured maximum")),
+            errs.iter()
+                .any(|e| e.contains("above the configured maximum")),
             "{errs:?}"
         );
         // @3-style schema: no name requirement ⇒ zero checks (non-retroactive).

@@ -13,7 +13,9 @@ use chrono::Utc;
 use devai_core::error::CoreError;
 use devai_core::types::*;
 use devai_core::workflow;
-use devai_store::config::{HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy};
+use devai_store::config::{
+    HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
+};
 use devai_store::{ArtifactDraft, Store, StoreError};
 
 use crate::adapters::{
@@ -1382,9 +1384,12 @@ impl<'a> Engine<'a> {
                                 QUALITY_REPORT_CONTRACT.1,
                             )
                         })?;
-                    if let Err(e) =
-                        adapters::validate_reply(&text, Some(&schema), &self.humanize, &self.task_name)
-                    {
+                    if let Err(e) = adapters::validate_reply(
+                        &text,
+                        Some(&schema),
+                        &self.humanize,
+                        &self.task_name,
+                    ) {
                         let _ = self.store.finish_execution_classified(
                             &execution,
                             ExecutionStatus::Failed,
@@ -1567,9 +1572,9 @@ impl<'a> Engine<'a> {
         // gate after touching the reply — the FULL gate, human paragraph
         // included (REQ-HP-02: no bypass door; the echo stamping must not
         // break what the role wrote).
-        adapters::validate_reply(&text, contract_schema, &self.humanize, &self.task_name).map_err(|e| {
-            AdapterError::Platform(format!("platform stamping broke the spec contract: {e}"))
-        })?;
+        adapters::validate_reply(&text, contract_schema, &self.humanize, &self.task_name).map_err(
+            |e| AdapterError::Platform(format!("platform stamping broke the spec contract: {e}")),
+        )?;
         Ok(ExecOutput {
             content: text.into_bytes(),
             summary: out.summary,

@@ -155,7 +155,8 @@ fn revision_marks_dependents_stale_persistently() {
         vec![],
     );
     let arts = store.artifacts(t.id).unwrap();
-    let m = workflow::requirements_published(&t, &arts, Some("scope change"), None, "u", now()).unwrap();
+    let m = workflow::requirements_published(&t, &arts, Some("scope change"), None, "u", now())
+        .unwrap();
     commit(&store, &t, m);
 
     let arts = store.artifacts(t.id).unwrap();
@@ -865,4 +866,144 @@ fn set_task_project_binds_bumps_lock_appends_event_refuses_stale() {
         1,
         "the refused write left no event"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 01a1ad1d (REQ-TN-01/03, ratified OQ-TN-1/2/5): the human signboard
+// is task DATA — write path, event trail, read-plane signboards on edges —
+// and the formal title is never rewritten.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn human_name_roundtrip_event_and_title_immutable() {
+    let (_d, store) = open();
+    let t = draft(&store);
+    // A fresh task carries no name (legacy shape — ratified OQ-TN-2).
+    assert_eq!(t.human_name, None);
+
+    let updated = store
+        .set_task_human_name(&t, Some("Понятные имена"), "guerrero", now())
+        .unwrap();
+    assert_eq!(updated.human_name.as_deref(), Some("Понятные имена"));
+    assert_eq!(updated.lock_version, t.lock_version + 1);
+
+    let reloaded = store.get_task(&t.id.to_string()).unwrap();
+    assert_eq!(reloaded.human_name.as_deref(), Some("Понятные имена"));
+    // REQ-TN-01 AC2: the rename never touches the creator's verbatim title.
+    assert_eq!(reloaded.title, "test task");
+
+    // REQ-TN-01 AC3: ONE current name — the second write REPLACES the value
+    // (no accumulation), and each EFFECTIVE change appends one event.
+    let second = store
+        .set_task_human_name(&reloaded, Some("Второе имя"), "guerrero", now())
+        .unwrap();
+    assert_eq!(second.human_name.as_deref(), Some("Второе имя"));
+    assert_eq!(
+        store
+            .get_task(&t.id.to_string())
+            .unwrap()
+            .human_name
+            .as_deref(),
+        Some("Второе имя")
+    );
+    let names: Vec<_> = store
+        .events(t.id, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == event_kind::TASK_HUMAN_NAME_SET)
+        .collect();
+    assert_eq!(names.len(), 2, "one append-only event per effective change");
+    assert_eq!(names[0].payload[json_field::HUMAN_NAME], "Понятные имена");
+
+    // Optimistic lock: a stale base refuses typed Conflict, writes nothing.
+    let err = store
+        .set_task_human_name(&t, Some("race"), "x", now())
+        .expect_err("stale lock must refuse");
+    assert!(matches!(err, StoreError::Conflict { .. }), "{err}");
+}
+
+#[test]
+fn read_plane_hands_finished_signboards_on_edges_and_graph() {
+    let (_d, store) = open();
+
+    // a: a named task — the stamp travels the REAL publication-shaped path
+    // (manual rename door writes the same column the publication stamps).
+    let mut a = draft(&store);
+    a = store
+        .set_task_human_name(&a, Some("Имя по смыслу спека"), "guerrero", now())
+        .unwrap();
+
+    // b: DRAFT with a multi-sentence, multi-line statement (REQ-TN-03 showcase).
+    let b = {
+        let t = Task::new(
+            "formal title b",
+            "Первое предложение боли.\nВторое — уже детали запуска.",
+            None,
+            now(),
+        );
+        store.create_task(&t).unwrap();
+        store.get_task(&t.id.to_string()).unwrap()
+    };
+
+    // c: legacy task past analysis WITHOUT a name (OQ-TN-2: keeps the title).
+    let mut c = draft(&store);
+    commit(&store, &c, workflow::start(&c, "u", now()).unwrap());
+    c = store.get_task(&c.id.to_string()).unwrap();
+    publish(
+        &store,
+        &c,
+        ArtifactKind::RequirementsSpec,
+        b"legacy spec",
+        vec![],
+    );
+    let arts = store.artifacts(c.id).unwrap();
+    commit(
+        &store,
+        &c,
+        workflow::requirements_published(&c, &arts, None, None, "analyst", now()).unwrap(),
+    );
+    let c = store.get_task(&c.id.to_string()).unwrap();
+    assert_eq!(c.human_name, None);
+    assert_eq!(c.state, TaskState::Review);
+
+    // a depends on b and on c: the EDGE rows must carry finished signboards
+    // for BOTH ends (ratified OQ-TN-5), titles stay machine-readable.
+    let e1 = store
+        .link_task_dependency(a.id, b.id, DependencyKind::Blocks, "tester", now())
+        .unwrap();
+    assert_eq!(e1.task_display, "Имя по смыслу спека");
+    assert_eq!(e1.depends_on_display, "Первое предложение боли.");
+    assert_eq!(e1.task_title, "test task");
+    assert_eq!(e1.depends_on_title, "formal title b");
+
+    let e2 = store
+        .link_task_dependency(a.id, c.id, DependencyKind::Parent, "tester", now())
+        .unwrap();
+    assert_eq!(e2.depends_on_display, "test task"); // REVIEW без имени → title
+
+    // The same rule arrives through the graph read (dependency_graph).
+    let graph = store.dependency_graph().unwrap();
+    let node_a = graph.iter().find(|n| n.task.id == a.id).unwrap();
+    assert_eq!(node_a.task.display_sign(), "Имя по смыслу спека");
+    let outs: Vec<_> = node_a
+        .dependencies
+        .iter()
+        .map(|d| (d.depends_on_id, d.depends_on_display.clone()))
+        .collect();
+    assert!(outs.contains(&(b.id, "Первое предложение боли.".into())));
+    assert!(outs.contains(&(c.id, "test task".into())));
+
+    // DRAFT without a name reads its FIRST SENTENCE through task.get/list.
+    let listed = store.list_tasks().unwrap();
+    let lb = listed.iter().find(|t| t.id == b.id).unwrap();
+    assert_eq!(lb.display_sign(), "Первое предложение боли.");
+    // A DRAFT without any statement falls to the title (AC3: вывеска не пуста).
+    let bare = {
+        let t = Task::new("bare title", "", None, now());
+        store.create_task(&t).unwrap();
+        store.get_task(&t.id.to_string()).unwrap()
+    };
+    assert_eq!(bare.display_sign(), "bare title");
+    // Legacy REVIEW keeps the title as its signboard (OQ-TN-2, no forced rename).
+    assert_eq!(c.display_sign(), "test task");
 }
