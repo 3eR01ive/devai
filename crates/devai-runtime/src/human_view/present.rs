@@ -16,6 +16,10 @@ use serde_json::Value;
 
 use super::{HumanReportView, render_text};
 
+/// The role whose executions are the re-audit the freshness marker may name
+/// (rework R10: a slug, not a literal at the filter site).
+pub const AUDITOR_ROLE: &str = "quality-auditor";
+
 /// REQ-005 / REQ-QH-06: status-only selection. CURRENT wins; when there is
 /// none, the newest STALE/SUPERSEDED row is still selected — it is then shown
 /// under an explicit «устарел» marker, never as the current decision and
@@ -39,8 +43,25 @@ pub enum RenderSource {
     FlatText,
     /// A `human_view` that does not parse: marker + flat text (if any).
     CorruptForm,
+    /// The blob itself does not parse as JSON: marker, never «no report»
+    /// and never the generic «assembled before @2» placeholder (rework R4).
+    CorruptBody,
     /// Neither a form nor a flat text (pre-@2 body).
     Absent,
+}
+
+impl RenderSource {
+    /// The token the API publishes with the view, so a consumer can tell a
+    /// rendered form from a fallback without sniffing the text.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RenderSource::HumanForm => "human_form",
+            RenderSource::FlatText => "flat_text",
+            RenderSource::CorruptForm => "corrupt_form",
+            RenderSource::CorruptBody => "corrupt_body",
+            RenderSource::Absent => "absent",
+        }
+    }
 }
 
 /// One rendered report body plus the distinguishable source it came from.
@@ -48,6 +69,15 @@ pub enum RenderSource {
 pub struct RenderedReport {
     pub text: String,
     pub source: RenderSource,
+}
+
+/// The text of a report whose BLOB does not parse as JSON at all (rework R4):
+/// a typed, distinguishable outcome instead of an empty success or the
+/// «assembled before @2» placeholder that used to stand in for it.
+pub fn corrupt_body_text(artifact_short: &str, err: &str) -> String {
+    format!(
+        "⚠ отчёт качества {artifact_short} повреждён: тело блоба не разбирается как JSON ({err}) — рендеринга нет, отчёт нельзя предъявлять как решение"
+    )
 }
 
 /// The text of ONE stored report body. Pure layout: a stored form is laid out
@@ -98,11 +128,12 @@ pub struct ReportFreshness {
     pub execution_status: Option<String>,
 }
 
-/// One presented report: the text a human signs plus why it is (or is not)
-/// the last word.
+/// One presented report: the text a human signs, the distinguishable source it
+/// was rendered from, and why it is (or is not) the last word.
 #[derive(Debug, Clone)]
 pub struct PresentedReport {
     pub text: String,
+    pub source: RenderSource,
     pub freshness: ReportFreshness,
 }
 
@@ -134,7 +165,7 @@ pub fn freshness(task: &Task, a: &Artifact, execs: &[RoleExecution]) -> ReportFr
     let stale = (reworking || a.status != ArtifactStatus::Current) && !task.state.is_terminal();
     let execs: Vec<&RoleExecution> = execs
         .iter()
-        .filter(|e| e.role_slug == "quality-auditor")
+        .filter(|e| e.role_slug == AUDITOR_ROLE)
         .collect();
     let running = execs
         .iter()

@@ -16,6 +16,7 @@ use std::process::Command;
 
 use std::sync::LazyLock;
 
+use devai_core::vocab::CheckState;
 use devai_store::config::{Probe, Profile, unresolved_slot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -477,7 +478,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "MECHANICAL_PASS".into(),
+                        state: CheckState::MechanicalPass.as_str().into(),
                         score: Some(1.0),
                         floor,
                         weight,
@@ -492,7 +493,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "MECHANICAL_FAIL".into(),
+                        state: CheckState::MechanicalFail.as_str().into(),
                         score: Some(0.0),
                         floor,
                         weight,
@@ -507,7 +508,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -523,7 +524,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -538,7 +539,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -554,7 +555,7 @@ pub fn assemble(
             CheckOutcome {
                 id: c.id.clone(),
                 verify: c.verify.clone(),
-                state: "PENDING_HUMAN".into(),
+                state: CheckState::PendingHuman.as_str().into(),
                 score: None,
                 floor,
                 weight,
@@ -576,7 +577,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -600,7 +601,7 @@ pub fn assemble(
                         CheckOutcome {
                             id: c.id.clone(),
                             verify: c.verify.clone(),
-                            state: "BLOCKED".into(),
+                            state: CheckState::Blocked.as_str().into(),
                             score: None,
                             floor,
                             weight,
@@ -621,7 +622,7 @@ pub fn assemble(
                         CheckOutcome {
                             id: c.id.clone(),
                             verify: c.verify.clone(),
-                            state: "SCORED".into(),
+                            state: CheckState::Scored.as_str().into(),
                             score: Some(*s),
                             floor,
                             weight,

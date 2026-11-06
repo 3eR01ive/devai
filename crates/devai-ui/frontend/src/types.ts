@@ -136,9 +136,34 @@ export interface ActiveSnapshot {
   rows: ActiveRow[];
 }
 
+// Contract lexicon (rework R3): these tokens are declared ONCE in
+// `devai_core::vocab` and pinned here by a parity test in `src/commands.rs`
+// (`ts_types_match_the_rust_vocabulary`). A state or kind added on the Rust
+// side without this file fails `cargo test`, before the window ever opens.
+export type CheckStateToken =
+  | "MECHANICAL_PASS"
+  | "MECHANICAL_FAIL"
+  | "SCORED"
+  | "BLOCKED"
+  | "PENDING_HUMAN";
+
+export type HumanItemKind =
+  | "gate"
+  | "gate-unperformed"
+  | "cap"
+  | "pending"
+  | "floor"
+  | "mechanical"
+  | "scored"
+  | "blocked"
+  | "anchor"
+  | "passed"
+  | "no-score"
+  | "unknown";
+
 export interface HumanFormItem {
   id: string;
-  kind: string;
+  kind: HumanItemKind;
   summary: string;
   site: string;
   score: number | null;
@@ -192,6 +217,10 @@ export interface QualityReportView {
   status: string;
   report: unknown;
   report_text: string | null;
+  // Что именно отрендерено: human_form | flat_text | corrupt_form |
+  // corrupt_body | absent (rework R4) — UI различает форму и fallback, не
+  // угадывая по тексту.
+  source: string;
   freshness: ReportFreshness | null;
 }
 

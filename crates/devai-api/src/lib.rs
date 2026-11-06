@@ -264,33 +264,25 @@ impl Api {
     /// a «QA has not run» lie or a stale text posing as the decision.
     pub fn task_report(&self, id_prefix: &str) -> ApiResult<QualityReportView> {
         let t = self.store.resolve_task(id_prefix)?;
-        // ONE artifacts snapshot per call: the selected row is picked from it
-        // and the freshness verdict is computed from the same list, so the
-        // view can never describe two different store states.
-        let arts = self.store.artifacts(t.id)?;
-        let a = devai_runtime::human_view::present::select_report(&arts).ok_or_else(|| {
-            ApiError::Store(devai_store::StoreError::NotFound(
+        // ONE presentation pipeline (rework R2): row selection, blob read,
+        // rendering, corrupt-body outcome and the freshness fact all come from
+        // `presented_quality` — the same call the CLI gates use. The view can
+        // never describe a different store state than the gate text.
+        let Some(p) = self.presented_quality(&t)? else {
+            return Err(ApiError::Store(devai_store::StoreError::NotFound(
                 "quality report".into(),
                 format!(
                     "task {} has no quality report yet — QA has not run",
                     short_hint(&t.id)
                 ),
-            ))
-        })?;
-        let blob = self.store.read_blob(&a.sha256)?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
+            )));
+        };
+        let a = &p.artifact;
         let contract = a
             .contract
             .as_ref()
             .map(|c| format!("{}@{}", c.name, c.version))
             .unwrap_or_else(|| "—".into());
-        // ONE rendering path shared with the CLI gate: the stored human form
-        // when present, the stored legacy text for pre-@5 bodies, and an
-        // explicit marker for a damaged form.
-        let rendered = devai_runtime::human_view::present::render_stored_report(&value);
-        let execs = self.store.list_executions(Some(t.id))?;
-        let freshness = devai_runtime::human_view::present::freshness(&t, a, &execs);
         Ok(QualityReportView {
             task: t.id.to_string(),
             artifact: a.id.to_string(),
@@ -299,9 +291,10 @@ impl Api {
             created_at: a.created_at,
             execution: a.execution_id.map(|e| e.to_string()),
             status: a.status.as_str().to_string(),
-            report: value,
-            report_text: Some(rendered.text),
-            freshness: Some(freshness),
+            report: p.body,
+            report_text: Some(p.presented.text),
+            source: p.presented.source.as_str().to_string(),
+            freshness: Some(p.presented.freshness),
         })
     }
 
@@ -756,6 +749,10 @@ pub struct QualityReportView {
     /// the report carries one, the legacy flat `report_text` for pre-@5
     /// bodies.
     pub report_text: Option<String>,
+    /// What that rendering came from — `human_form`, `flat_text`,
+    /// `corrupt_form`, `corrupt_body` or `absent` (REQ-QH-06 / rework R4):
+    /// a consumer can tell a form from a fallback without sniffing the text.
+    pub source: String,
     /// REQ-QH-05: freshness as store fact — `stale` plus the marker and the
     /// re-audit execution it names. Never inferred from the report body.
     pub freshness: Option<ReportFreshness>,

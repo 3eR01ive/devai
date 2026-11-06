@@ -488,4 +488,42 @@ mod tests {
             );
         }
     }
+
+    /// Rework R3: `types.ts` is the FOURTH surface of the same check-state and
+    /// item-kind vocabulary. A state or kind added in `devai_core::vocab`
+    /// without the TS union fails HERE (cargo test), not as a silent
+    /// `undefined` in the window.
+    #[test]
+    fn ts_types_match_the_rust_vocabulary() {
+        let ts = include_str!("../frontend/src/types.ts");
+        let states = quoted_union(ts, "CheckStateToken");
+        let expected: Vec<&str> = devai_core::vocab::CheckState::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(states, expected, "types.ts CheckStateToken drifted");
+        let kinds = quoted_union(ts, "HumanItemKind");
+        let expected: Vec<&str> = devai_core::vocab::ItemKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(kinds, expected, "types.ts HumanItemKind drifted");
+    }
+
+    /// The double-quoted members of `export type NAME = "a" | "b";`.
+    fn quoted_union(ts: &str, name: &str) -> Vec<String> {
+        let head = format!("export type {name} =");
+        let start = ts
+            .find(&head)
+            .unwrap_or_else(|| panic!("types.ts declares `{name}`"))
+            + head.len();
+        let body = &ts[start..];
+        let end = body.find(';').expect("the union ends with a semicolon");
+        body[..end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    }
 }

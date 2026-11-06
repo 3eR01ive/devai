@@ -580,7 +580,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             r#"{
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Quality Report v5 — machine-assembled; the human form is stored with the report",
-  "description": "v4 plus `human_view`: the human PRESENTATION of the same report, assembled ONCE by the platform at publication from already-decided values (scores, weights, floors, pending, gates, ratified anchors) and quoted verbatim by every reader — never regrouped, re-scored or re-sorted at read time. Four groups in a fixed order: blocks (gates, floor breaches, blocking, pending signature), nuances (every remaining scored point below 1.0, each with score, weight and importance = (1-score)*weight, most important first), anchors (positions with an explicit ratified_by decision link plus fully passed points marked as such, names only), unchecked (BLOCKED checks and unknown states, with reason and weight). Code and probe output live in the per-item evidence layer, never in the visible one-line summary. report_text keeps its v3/v4 §2.6 form: it is the fallback for bodies published before this version, not a second source of truth.",
+  "description": "v4 plus `human_view`: the human PRESENTATION of the same report, assembled ONCE by the platform at publication from already-decided values (scores, weights, floors, pending, gates, ratified anchors) and quoted verbatim by every reader — never regrouped, re-scored or re-sorted at read time. Four groups in a fixed order: blocks (gates, floor breaches, blocking, pending signature), nuances (every remaining scored point, each with score, weight and importance = (1-score)*weight, most important first; a fully passed point without a decision link is here too, at importance 0), anchors (ONLY positions with an explicit ratified_by decision link, names only), unchecked (BLOCKED checks and unknown states, with reason and weight). Code and probe output live in the per-item evidence layer, never in the visible one-line summary. report_text keeps its v3/v4 §2.6 form: it is the fallback for bodies published before this version, not a second source of truth.",
   "type": "object",
   "required": ["verdict", "recommendation_basis", "report_text", "profile", "workspace_revision", "human_view", "evaluation"],
   "properties": {
@@ -634,7 +634,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
                   "required": ["id", "kind", "summary", "site"],
                   "properties": {
                     "id": { "type": "string" },
-                    "kind": { "type": "string", "description": "gate | gate-unperformed | pending | floor | mechanical | scored | blocked | anchor" },
+                    "kind": { "type": "string", "description": "gate | gate-unperformed | cap | pending | floor | mechanical | scored | blocked | anchor | passed | no-score | unknown" },
                     "summary": { "type": "string", "description": "ONE short visible line — no code, no paragraphs (REQ-QH-04)" },
                     "site": { "type": "string", "description": "file:line of the finding, empty when there is none" },
                     "score": { "type": ["number", "null"] },
@@ -787,4 +787,52 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
     ]
+}
+
+/// Rework R3/R5/R8: the schema's state enum and `kind` list are the SAME
+/// vocabulary the producer and the human form use (`devai_core::vocab`).
+/// Adding a state or a kind without updating every surface fails here — the
+/// store schema can no longer drift into describing a smaller or larger set
+/// than the code emits.
+#[cfg(test)]
+mod tests {
+    use devai_core::vocab::{CheckState, ItemKind};
+
+    use super::*;
+
+    /// The CURRENT quality-report contract (the highest seeded version).
+    fn quality_report_schema() -> serde_json::Value {
+        let (_, _, raw) = contracts()
+            .into_iter()
+            .filter(|(name, _, _)| *name == "quality-report")
+            .max_by_key(|(_, version, _)| *version)
+            .expect("quality-report contract is seeded");
+        serde_json::from_str(raw).expect("the seeded schema is valid JSON")
+    }
+
+    #[test]
+    fn the_check_state_enum_is_the_producer_vocabulary() {
+        let schema = quality_report_schema();
+        let states: Vec<&str> = schema["properties"]["evaluation"]["properties"]["checks"]["items"]
+            ["properties"]["state"]["enum"]
+            .as_array()
+            .expect("checks.state enum exists")
+            .iter()
+            .map(|v| v.as_str().expect("enum entries are strings"))
+            .collect();
+        let expected: Vec<&str> = CheckState::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(states, expected);
+    }
+
+    #[test]
+    fn the_item_kind_list_is_the_form_vocabulary() {
+        let schema = quality_report_schema();
+        let desc = schema["properties"]["human_view"]["properties"]["groups"]["items"]
+            ["properties"]["items"]["items"]["properties"]["kind"]["description"]
+            .as_str()
+            .expect("kind description exists");
+        let listed: Vec<&str> = desc.split(" | ").map(str::trim).collect();
+        let expected: Vec<&str> = ItemKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(listed, expected);
+    }
 }

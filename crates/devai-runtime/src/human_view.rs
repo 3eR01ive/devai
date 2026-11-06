@@ -11,14 +11,15 @@
 //! Grouping is by DECISION WEIGHT, not by check id:
 //!   1. blocks    — «бьёт по вердикту / требует твоего решения» (gates,
 //!                  floor breaches, mechanical fails, pending human signature);
-//!   2. nuances   — every remaining scored point with score < 1.0 (ratified
-//!                  OQ-QH-1: no 0.8–0.9 band filter; 0.4 without a breach is
-//!                  still the human's business), ordered by lost-points×weight;
-//!   3. anchors   — positions with an EXPLICIT ratified_by link to a stored
-//!                  decision; names only, junk-drawer forbidden (OQ-QH-2) —
-//!                  plus fully passed points (score 1.0, no breach): they are
-//!                  presented as names too, with an explicit «пройдено» mark,
-//!                  so no scored point can fall out of the form;
+//!   2. nuances   — every remaining scored point (ratified OQ-QH-1: no
+//!                  0.8–0.9 band filter; 0.4 without a breach is still the
+//!                  human's business), ordered by lost-points×weight. A point
+//!                  scored 1.0 WITHOUT a ratified_by link has no other group
+//!                  to go to (OQ-QH-2: not an anchor), so it lands here with
+//!                  importance 0 — presented, never silently dropped;
+//!   3. anchors   — ONLY positions with an EXPLICIT ratified_by link to a
+//!                  stored decision; names only, junk-drawer forbidden
+//!                  (ratified OQ-QH-2);
 //!   4. unchecked — BLOCKED checks with their reason and weight, and any
 //!                  check state this build does not know (named, never
 //!                  silently folded into a known branch).
@@ -30,6 +31,7 @@ pub mod present;
 
 use std::collections::BTreeMap;
 
+use devai_core::vocab::{CheckState, ItemKind};
 use devai_store::config::Profile;
 use serde::{Deserialize, Serialize};
 
@@ -109,33 +111,9 @@ impl HumanCounts {
     }
 }
 
-/// The check states the evaluator emits, as STRINGS on `CheckOutcome::state`
-/// (`evaluation.rs` is their only producer). Parsed once, here, so that
-/// grouping is one exhaustive match instead of scattered string comparisons
-/// with a silent default: an unknown state is a named branch, never folded
-/// into «scored».
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckState {
-    Scored,
-    MechanicalFail,
-    Blocked,
-    PendingHuman,
-    /// A state this build does not know — presented in «не проверено» with
-    /// the raw token named, so the operator sees that something was skipped.
-    Unknown,
-}
-
-impl CheckState {
-    pub fn of(raw: &str) -> Self {
-        match raw {
-            "SCORED" => Self::Scored,
-            "MECHANICAL_FAIL" => Self::MechanicalFail,
-            "BLOCKED" => Self::Blocked,
-            "PENDING_HUMAN" => Self::PendingHuman,
-            _ => Self::Unknown,
-        }
-    }
-}
+/// The check states live in ONE place (`devai_core::vocab::CheckState`) — the
+/// producer, this parser and the stored schema all read the same constants
+/// (rework R3/R5). An unknown token is `None`, never a default.
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct HumanGroup {
@@ -197,37 +175,65 @@ pub fn build(
     max_blocked_weight: f64,
     ratified: &BTreeMap<String, Ratified>,
 ) -> HumanReportView {
-    // One read-only context (profile statements + decided flags) shared by
-    // every classification step, then three passes: the cap row, the gates,
-    // and one row per check. Each step below lives in its own unit so the
-    // classification, the ordering and the layout can be read separately.
     let ctx = Assembly::new(profile, floors_breached, ratified);
+    let groups = collect(
+        &ctx,
+        checks,
+        gates,
+        pending,
+        blocked_weight,
+        max_blocked_weight,
+    );
+    HumanReportView {
+        version: HUMAN_VIEW_VERSION,
+        lang: "ru".into(),
+        headline: headline_of(machine_verdict, score, theta, basis, &groups),
+        groups,
+        blocked_weight,
+        max_blocked_weight,
+    }
+}
+
+/// Every row of the form, in one pass: the cap row, the gates, then one row
+/// per check. Classification lives in `Buckets`, ordering in `into_groups`.
+fn collect(
+    ctx: &Assembly,
+    checks: &[CheckOutcome],
+    gates: &[GateOutcome],
+    pending: &[String],
+    blocked_weight: f64,
+    max_blocked_weight: f64,
+) -> Vec<HumanGroup> {
     let mut buckets = Buckets::default();
     buckets.push_cap(blocked_weight, max_blocked_weight);
     buckets.push_gates(gates);
     for c in checks {
-        buckets.push_check(&ctx, c, pending);
+        buckets.push_check(ctx, c, pending);
     }
-    let groups = buckets.into_groups();
-    HumanReportView {
-        version: HUMAN_VIEW_VERSION,
-        lang: "ru".into(),
-        headline: HumanHeadline {
-            verdict: match machine_verdict {
-                "PASS" => "ПРОШЁЛ",
-                "FAIL" => "НЕ ПРОШЁЛ",
-                _ => "ВЕРДИКТ НЕ ГОТОВ",
-            }
-            .into(),
-            machine_verdict: machine_verdict.into(),
-            score,
-            theta,
-            basis: basis.into(),
-            counts: HumanCounts::of(&groups),
-        },
-        groups,
-        blocked_weight,
-        max_blocked_weight,
+    buckets.into_groups()
+}
+
+/// The verdict line and the «what hits the verdict, what is noise» counts —
+/// read OFF THE FINAL GROUPS, never from a second source that could drift.
+fn headline_of(
+    machine_verdict: &str,
+    score: f64,
+    theta: f64,
+    basis: &str,
+    groups: &[HumanGroup],
+) -> HumanHeadline {
+    HumanHeadline {
+        verdict: match machine_verdict {
+            "PASS" => "ПРОШЁЛ",
+            "FAIL" => "НЕ ПРОШЁЛ",
+            _ => "ВЕРДИКТ НЕ ГОТОВ",
+        }
+        .into(),
+        machine_verdict: machine_verdict.into(),
+        score,
+        theta,
+        basis: basis.into(),
+        counts: HumanCounts::of(groups),
     }
 }
 
@@ -288,10 +294,18 @@ impl<'a> Assembly<'a> {
     }
 }
 
+/// Decision tiers of group 1 («бьёт по вердикту»), in presentation order.
+/// Named constants, not bare numbers (rework R10): a row is placed by the
+/// weight of its decision, and the order is readable where it is defined.
+const TIER_CAP_OR_GATE: u8 = 0;
+const TIER_PENDING_SIGNATURE: u8 = 1;
+const TIER_FLOOR_BREACH: u8 = 2;
+const TIER_MECHANICAL_FAIL: u8 = 3;
+
 /// The four groups under construction, each with its own ordering key.
 #[derive(Default)]
 struct Buckets {
-    /// `(tier, importance, item)`: the tier keeps cap < gates < floor <
+    /// `(tier, importance, item)`: the tier keeps cap/gate < pending < floor <
     /// mechanical; inside a tier importance desc, then id.
     blocks: Vec<(u8, Option<f64>, HumanItem)>,
     nuances: Vec<(Option<f64>, HumanItem)>,
@@ -308,11 +322,11 @@ impl Buckets {
             return;
         }
         self.blocks.push((
-            0,
+            TIER_CAP_OR_GATE,
             None,
             HumanItem {
                 id: "blocked-weight".into(),
-                kind: "cap".into(),
+                kind: ItemKind::Cap.as_str().into(),
                 summary: format!(
                     "невыполненных проверок на вес {blocked_weight:.2} > {max_blocked_weight:.2} — вердикт не может быть готовым"
                 ),
@@ -331,14 +345,14 @@ impl Buckets {
     fn push_gates(&mut self, gates: &[GateOutcome]) {
         for g in gates.iter().filter(|g| g.state != ProbeState::Pass) {
             self.blocks.push((
-                0,
+                TIER_CAP_OR_GATE,
                 None,
                 HumanItem {
                     id: g.id.clone(),
                     kind: if g.state == ProbeState::Fail {
-                        "gate".into()
+                        ItemKind::Gate.as_str().into()
                     } else {
-                        "gate-unperformed".into()
+                        ItemKind::GateUnperformed.as_str().into()
                     },
                     summary: match g.state {
                         ProbeState::Fail => "шлюз не пройден — вердикт возвращается".to_string(),
@@ -358,24 +372,30 @@ impl Buckets {
 
     /// One row for one check — the state decides the group, and every known
     /// state has its own branch (no silent `_` that folds a new state into
-    /// «scored»).
+    /// «scored»). `None` from the parser is the explicit unknown branch.
     fn push_check(&mut self, ctx: &Assembly, c: &CheckOutcome, pending: &[String]) {
-        match CheckState::of(&c.state) {
-            CheckState::PendingHuman => self.push_pending(ctx, c, pending),
-            CheckState::Blocked => self.push_blocked(ctx, c),
-            CheckState::Scored | CheckState::MechanicalFail => self.push_scored(ctx, c),
-            CheckState::Unknown => self.push_unknown(ctx, c),
+        match CheckState::parse(&c.state) {
+            Some(CheckState::PendingHuman) => self.push_pending(ctx, c, pending),
+            Some(CheckState::Blocked) => self.push_blocked(ctx, c),
+            // MECHANICAL_PASS and SCORED are both scored points: the platform's
+            // own 1.0 and the auditor's rubric score go through ONE placement
+            // rule (rework R5/R6 — a passed mechanical check used to fall into
+            // «не проверено» as an unknown token).
+            Some(CheckState::Scored)
+            | Some(CheckState::MechanicalPass)
+            | Some(CheckState::MechanicalFail) => self.push_scored(ctx, c),
+            None => self.push_unknown(ctx, c),
         }
     }
 
     fn push_pending(&mut self, ctx: &Assembly, c: &CheckOutcome, pending: &[String]) {
         let t = ctx.statement(&c.id);
         self.blocks.push((
-            1,
+            TIER_PENDING_SIGNATURE,
             None,
             HumanItem {
                 id: c.id.clone(),
-                kind: "pending".into(),
+                kind: ItemKind::Pending.as_str().into(),
                 summary: one_line(t, "нужна твоя подпись — вердикт не готов"),
                 site: String::new(),
                 score: None,
@@ -397,7 +417,7 @@ impl Buckets {
             c.weight,
             HumanItem {
                 id: c.id.clone(),
-                kind: "blocked".into(),
+                kind: ItemKind::Blocked.as_str().into(),
                 summary: one_line(t, "проверка не выполнена — балла нет"),
                 site: String::new(),
                 score: None,
@@ -410,76 +430,50 @@ impl Buckets {
         ));
     }
 
-    /// A scored (or mechanically failed) check lands in exactly one place:
-    /// anchor, fully passed, floor/mechanical decision row, or nuance.
+    /// A scored / mechanically passed / mechanically failed check lands in
+    /// exactly one place: a ratified anchor, a decision row, the nuances, or
+    /// «не проверено» when there is no number to weigh.
     fn push_scored(&mut self, ctx: &Assembly, c: &CheckOutcome) {
-        let score = c.score;
         let statement = ctx.statement(&c.id);
         let is_breach = ctx.is_breached(&c.id);
-        let is_mech_fail = CheckState::of(&c.state) == CheckState::MechanicalFail;
-        let importance = score
-            .map(|s| 1.0 - s)
-            .filter(|lost| *lost > LOST_SCORE_EPSILON)
-            .map(|lost| lost * c.weight);
-        // Anchors: an explicit ratified_by link and NOTHING to fix (OQ-QH-2 —
-        // a breached anchored check is a decision item, never filed away as a
-        // name).
-        if let Some(r) = ctx.ratified_by(&c.id) {
-            if importance.is_none() && !is_breach && !is_mech_fail {
-                self.anchors
-                    .push(anchor_item(c, statement, score, Some(r.display())));
+        let is_mech_fail = CheckState::parse(&c.state) == Some(CheckState::MechanicalFail);
+        // OQ-QH-2 (ratified): ONLY an explicit decision link is an anchor, and
+        // only a point with nothing to fix — a breached anchored check is a
+        // decision item, never filed away as a name.
+        if let Some(link) = ctx.ratified_by(&c.id) {
+            if is_perfect(c) && !is_breach && !is_mech_fail {
+                self.anchors.push(ratified_item(c, statement, link.display()));
                 return;
             }
         }
-        let item = HumanItem {
-            id: c.id.clone(),
-            kind: if is_breach {
-                "floor".into()
-            } else if is_mech_fail {
-                "mechanical".into()
-            } else {
-                "scored".into()
-            },
-            summary: visible_summary(c, statement),
-            site: visible_site(c),
-            score,
-            weight: Some(c.weight),
-            importance,
-            ratified_by: ctx.ratified_by(&c.id).map(|r| r.display()),
-            reason: None,
-            evidence: collapsed_layer(c),
-        };
+        let item = scored_item(c, statement, ctx, is_breach, is_mech_fail);
+        self.place_scored(c, statement, item, is_breach, is_mech_fail);
+    }
+
+    /// Where a non-anchor scored point belongs — ONE rule, decided at
+    /// assembly: a floor breach or a mechanical fail is a decision row; every
+    /// other scored point with a number is a nuance (fully passed ones too,
+    /// at importance 0 — OQ-QH-2 leaves them no other group); a scored point
+    /// without a number is named as unchecked, since there is nothing to weigh.
+    fn place_scored(
+        &mut self,
+        c: &CheckOutcome,
+        statement: &str,
+        item: HumanItem,
+        is_breach: bool,
+        is_mech_fail: bool,
+    ) {
         if is_breach || is_mech_fail {
-            // Floor breach = «нарушенный порог», mechanical FAIL =
-            // «блокирующее»: both land above every nuance, in the operator's
-            // decision block.
-            self.blocks
-                .push((if is_breach { 2 } else { 3 }, importance, item));
-        } else if importance.is_some() {
-            self.nuances.push((importance, item));
-        } else if score.is_some_and(|s| (1.0 - s) <= LOST_SCORE_EPSILON) {
-            // Fully passed and no decision link: presented as a NAME with an
-            // explicit «пройдено» mark (REQ-QH-03 AC2 — a 1.0 point must
-            // still land in exactly one group instead of vanishing).
-            self.anchors.push(anchor_item(c, statement, score, None));
+            let tier = if is_breach {
+                TIER_FLOOR_BREACH
+            } else {
+                TIER_MECHANICAL_FAIL
+            };
+            self.blocks.push((tier, item.importance, item));
+        } else if item.importance.is_some() {
+            self.nuances.push((item.importance, item));
         } else {
-            // Scored state without a score: no number to weigh, so it cannot
-            // be presented as a nuance — it is named as uncheckable instead.
-            self.unchecked.push((
-                c.weight,
-                HumanItem {
-                    id: c.id.clone(),
-                    kind: "no-score".into(),
-                    summary: one_line(statement, "проверка завершена без балла"),
-                    site: String::new(),
-                    score: None,
-                    weight: Some(c.weight),
-                    importance: None,
-                    ratified_by: None,
-                    reason: Some("состояние SCORED без балла — предъявить нечего".into()),
-                    evidence: collapsed_layer(c),
-                },
-            ));
+            self.unchecked.push((c.weight, no_score_item(c, statement)));
         }
     }
 
@@ -492,7 +486,7 @@ impl Buckets {
             c.weight,
             HumanItem {
                 id: c.id.clone(),
-                kind: "unknown".into(),
+                kind: ItemKind::Unknown.as_str().into(),
                 summary: one_line(t, "состояние проверки не распознано"),
                 site: String::new(),
                 score: c.score,
@@ -521,11 +515,6 @@ impl Buckets {
         self.unchecked
             .sort_by(|a, b| desc(Some(a.0), Some(b.0)).then_with(|| a.1.id.cmp(&b.1.id)));
         self.anchors.sort_by(|a, b| a.id.cmp(&b.id));
-        let anchors_lead = if self.anchors.iter().any(|i| i.ratified_by.is_none()) {
-            "«закреплено» — чьим решением держится; «пройдено» — без замечаний и без отсылки на решение"
-        } else {
-            ""
-        };
         vec![
             HumanGroup {
                 key: GROUP_BLOCKS.into(),
@@ -536,13 +525,13 @@ impl Buckets {
             HumanGroup {
                 key: GROUP_NUANCES.into(),
                 title: TITLE_NUANCES.into(),
-                lead: "построчно: проверка, балл, вес, важность, сайт, суть".into(),
+                lead: "построчно: проверка, балл, вес, важность, сайт, суть; полностью пройденное — в конце (важность 0)".into(),
                 items: self.nuances.into_iter().map(|(_, i)| i).collect(),
             },
             HumanGroup {
                 key: GROUP_ANCHORS.into(),
                 title: TITLE_ANCHORS.into(),
-                lead: anchors_lead.into(),
+                lead: "«закреплено» — чьим решением держится; без отсылки на решение пункт сюда не попадает".into(),
                 items: self.anchors,
             },
             HumanGroup {
@@ -555,31 +544,89 @@ impl Buckets {
     }
 }
 
-/// A name-only row of the anchors group: either kept by a ratified decision
-/// (`ratified_by`) or simply fully passed (no link, marked «пройдено»).
-fn anchor_item(
-    c: &CheckOutcome,
-    statement: &str,
-    score: Option<f64>,
-    ratified_by: Option<String>,
-) -> HumanItem {
-    let anchored = ratified_by.is_some();
+/// A name-only row of the anchors group: kept in force by a NAMED ratified
+/// decision (ratified OQ-QH-2 — no link, no anchor).
+fn ratified_item(c: &CheckOutcome, statement: &str, ratified_by: String) -> HumanItem {
     HumanItem {
         id: c.id.clone(),
-        kind: if anchored { "anchor" } else { "passed" }.into(),
-        summary: if anchored {
-            one_line(statement, "закреплено решением")
-        } else {
-            one_line(statement, "пройдено без замечаний")
-        },
+        kind: ItemKind::Anchor.as_str().into(),
+        summary: one_line(statement, "закреплено решением"),
         site: String::new(),
-        score,
+        score: c.score,
         weight: Some(c.weight),
         importance: None,
-        ratified_by,
+        ratified_by: Some(ratified_by),
         reason: None,
         evidence: Vec::new(),
     }
+}
+
+/// The visible row of a scored point that is NOT an anchor. `importance` is
+/// `None` only when the point carries no score at all; a point scored 1.0
+/// carries `Some(0.0)` so it is presented (importance 0) instead of vanishing.
+fn scored_item(
+    c: &CheckOutcome,
+    statement: &str,
+    ctx: &Assembly,
+    is_breach: bool,
+    is_mech_fail: bool,
+) -> HumanItem {
+    let kind = if is_breach {
+        ItemKind::Floor
+    } else if is_mech_fail {
+        ItemKind::Mechanical
+    } else if is_perfect(c) {
+        ItemKind::Passed
+    } else {
+        ItemKind::Scored
+    };
+    HumanItem {
+        id: c.id.clone(),
+        kind: kind.as_str().into(),
+        summary: if is_perfect(c) && !is_breach && !is_mech_fail {
+            one_line(statement, "пройдено без замечаний")
+        } else {
+            visible_summary(c, statement)
+        },
+        site: visible_site(c),
+        score: c.score,
+        weight: Some(c.weight),
+        importance: importance_of(c),
+        ratified_by: ctx.ratified_by(&c.id).map(|r| r.display()),
+        reason: None,
+        evidence: collapsed_layer(c),
+    }
+}
+
+/// A scored point with no number to weigh: named as unchecked, never as a
+/// nuance with an invented score.
+fn no_score_item(c: &CheckOutcome, statement: &str) -> HumanItem {
+    HumanItem {
+        id: c.id.clone(),
+        kind: ItemKind::NoScore.as_str().into(),
+        summary: one_line(statement, "проверка завершена без балла"),
+        site: String::new(),
+        score: None,
+        weight: Some(c.weight),
+        importance: None,
+        ratified_by: None,
+        reason: Some("состояние SCORED без балла — предъявить нечего".into()),
+        evidence: collapsed_layer(c),
+    }
+}
+
+/// Lost points × weight, decided at assembly (REQ-QH-02). `None` only when
+/// there is no score; a 1.0 point yields `Some(0.0)` — a real number, printed
+/// as 0.000, so «nothing lost» is visible instead of absent.
+fn importance_of(c: &CheckOutcome) -> Option<f64> {
+    c.score
+        .map(|s| (1.0 - s).max(0.0) * c.weight)
+        .map(|lost| if lost <= LOST_SCORE_EPSILON { 0.0 } else { lost })
+}
+
+/// Exactly 1.0 (within f64 noise) — the only score an anchor may carry.
+fn is_perfect(c: &CheckOutcome) -> bool {
+    c.score.is_some_and(|s| (1.0 - s) <= LOST_SCORE_EPSILON)
 }
 
 /// A ratified-by reference as printed to the human: the decision id plus,
@@ -753,55 +800,73 @@ fn first_site(text: &str) -> Option<String> {
 /// order below is read from the struct — nothing is recomputed here, so the
 /// CLI text of one stored form is byte-identical on every read.
 pub fn render_text(view: &HumanReportView) -> String {
-    let h = &view.headline;
-    let mut out: Vec<String> = Vec::new();
-    out.push("ОТЧЁТ КАЧЕСТВА · человеческая форма".to_string());
-    out.push(String::new());
-    out.push(format!(
-        "ВЕРДИКТ: {} ({}) — S={:.3}/1.00, порог {:.2}: {}",
-        h.verdict, h.machine_verdict, h.score, h.theta, h.basis
-    ));
-    out.push(format!(
-        "бьёт по вердикту: {} · нюансы: {} · якоря: {} · не проверено: {}",
-        h.counts.blocks, h.counts.nuances, h.counts.anchors, h.counts.unchecked
-    ));
+    let mut out = render_headline(&view.headline);
     for (gi, g) in view.groups.iter().enumerate() {
-        if g.items.is_empty() {
-            // The conditional-section precedent: an empty group prints no
-            // heading at all.
-            continue;
-        }
-        out.push(String::new());
-        out.push(format!("{}) {} ({})", gi + 1, g.title, g.items.len()));
-        if !g.lead.is_empty() {
-            out.push(format!("   {}", g.lead));
-        }
-        for (ii, it) in g.items.iter().enumerate() {
-            if g.key == GROUP_ANCHORS {
-                out.push(anchor_line(it));
-                continue;
-            }
-            out.push(format!("  {}. {}", ii + 1, item_headline(it)));
-            if !it.summary.is_empty() {
-                out.push(format!("     суть: {}", it.summary));
-            }
-            if let Some(reason) = &it.reason {
-                out.push(format!("     причина: {}", reason));
-            }
-            if !it.evidence.is_empty() {
-                out.push(format!(
-                    "     └ доказательства (свёрнуто, {}):",
-                    it.evidence.len()
-                ));
-                for e in &it.evidence {
-                    for line in e.lines() {
-                        out.push(format!("       │ {}", line.trim_end()));
-                    }
-                }
-            }
-        }
+        render_group(&mut out, gi, g);
     }
     out.join("\n")
+}
+
+/// The verdict block: machine verdict, S against the threshold, basis, and the
+/// per-group counts — all read off the stored struct.
+fn render_headline(h: &HumanHeadline) -> Vec<String> {
+    vec![
+        "ОТЧЁТ КАЧЕСТВА · человеческая форма".to_string(),
+        String::new(),
+        format!(
+            "ВЕРДИКТ: {} ({}) — S={:.3}/1.00, порог {:.2}: {}",
+            h.verdict, h.machine_verdict, h.score, h.theta, h.basis
+        ),
+        format!(
+            "бьёт по вердикту: {} · нюансы: {} · якоря: {} · не проверено: {}",
+            h.counts.blocks, h.counts.nuances, h.counts.anchors, h.counts.unchecked
+        ),
+    ]
+}
+
+/// One group: heading, lead, then its rows. An empty group prints no heading
+/// (the conditional-section precedent of §2.6 `render`).
+fn render_group(out: &mut Vec<String>, gi: usize, g: &HumanGroup) {
+    if g.items.is_empty() {
+        return;
+    }
+    out.push(String::new());
+    out.push(format!("{}) {} ({})", gi + 1, g.title, g.items.len()));
+    if !g.lead.is_empty() {
+        out.push(format!("   {}", g.lead));
+    }
+    for (ii, it) in g.items.iter().enumerate() {
+        if g.key == GROUP_ANCHORS {
+            out.push(anchor_line(it));
+            continue;
+        }
+        render_item(out, ii, it);
+    }
+}
+
+/// One stored item as the subordinated block of the CLI channel (REQ-QH-04):
+/// the short visible row, the essence, the reason, then the collapsed proof
+/// layer indented UNDER it — never code inside the sentence.
+fn render_item(out: &mut Vec<String>, ii: usize, it: &HumanItem) {
+    out.push(format!("  {}. {}", ii + 1, item_headline(it)));
+    if !it.summary.is_empty() {
+        out.push(format!("     суть: {}", it.summary));
+    }
+    if let Some(reason) = &it.reason {
+        out.push(format!("     причина: {}", reason));
+    }
+    if it.evidence.is_empty() {
+        return;
+    }
+    out.push(format!(
+        "     └ доказательства (свёрнуто, {}):",
+        it.evidence.len()
+    ));
+    for e in &it.evidence {
+        for line in e.lines() {
+            out.push(format!("       │ {}", line.trim_end()));
+        }
+    }
 }
 
 /// One name-only row of the anchors group — the SAME line in every channel:
@@ -1006,37 +1071,38 @@ scoring:
         // importance = (1-0.4)*0.20
         assert!((floor.importance.unwrap() - 0.12).abs() < 1e-9);
 
-        // Nuances: EVERY remaining scored<1.0 (0.3 included — ratified
-        // OQ-QH-1 has no 0.8-0.9 band), most lost-points×weight first.
+        // Nuances: EVERY remaining scored point (0.3 included — ratified
+        // OQ-QH-1 has no 0.8-0.9 band), most lost-points×weight first; a
+        // fully passed point without a decision link is here too, at
+        // importance 0 (OQ-QH-2 gives it no anchor seat).
         let nuances: Vec<&str> = v.groups[1].items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(nuances, vec!["n/big", "n/small"]);
+        assert_eq!(nuances, vec!["n/big", "n/small", "ok/full"]);
         assert!((v.groups[1].items[0].importance.unwrap() - 0.35).abs() < 1e-9);
         assert!((v.groups[1].items[1].importance.unwrap() - 0.01).abs() < 1e-9);
         for it in &v.groups[1].items {
             assert!(it.score.is_some() && it.weight.is_some() && it.importance.is_some());
         }
+        assert_eq!(v.groups[1].items[2].kind, "passed");
+        assert_eq!(v.groups[1].items[2].importance, Some(0.0));
+        assert!(v.groups[1].items[2].ratified_by.is_none());
 
-        // Anchors: names only — an explicit ratified_by link OR a fully
-        // passed point (no decision needed, but it must not vanish).
-        assert_eq!(v.headline.counts.anchors, 2);
+        // Anchors: names only, and ONLY an explicit ratified_by link — a
+        // fully passed point without one is not an anchor (ratified OQ-QH-2).
+        assert_eq!(v.headline.counts.anchors, 1);
         let anchors: Vec<&str> = v.groups[2].items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(anchors, vec!["anch/a", "ok/full"]);
+        assert_eq!(anchors, vec!["anch/a"]);
         assert_eq!(
             v.groups[2].items[0].ratified_by.as_deref(),
             Some("решение 01a1b1b8-dec (guerrero)")
         );
         assert_eq!(v.groups[2].items[0].kind, "anchor");
-        // The perfect, unanchored point is present — under an explicit
-        // «пройдено» mark, not silently dropped (REQ-QH-03 AC2).
-        assert_eq!(v.groups[2].items[1].kind, "passed");
-        assert!(v.groups[2].items[1].ratified_by.is_none());
         assert!(
-            v.groups[2].items[0].evidence.is_empty() && v.groups[2].items[1].evidence.is_empty(),
-            "anchor/passed = name only"
+            v.groups[2].items[0].evidence.is_empty(),
+            "anchor = name only"
         );
         assert!(
             !v.groups[2].lead.is_empty(),
-            "the lead explains what «пройдено» means"
+            "the lead names what «закреплено» means"
         );
 
         // Unchecked: the BLOCKED check with its reason and weight.
@@ -1097,6 +1163,71 @@ scoring:
                 .contains("SOMETHING_NEW")
         );
         assert!(v.groups[1].items.is_empty(), "not guessed into nuances");
+    }
+
+    /// R5/R6a: EVERY state the producer emits is placed by the form — a
+    /// passed mechanical check (MECHANICAL_PASS, seven of them in the live
+    /// profile) used to fall into «не проверено» as an unknown token. The
+    /// parser's total coverage is asserted against the producer vocabulary
+    /// itself, so adding a state without teaching the form fails here.
+    #[test]
+    fn every_emitted_state_lands_in_exactly_one_group() {
+        let p = profile();
+        let checks: Vec<CheckOutcome> = CheckState::ALL
+            .iter()
+            .map(|s| {
+                let (score, weight) = match s {
+                    CheckState::Scored => (Some(0.9), 0.10),
+                    CheckState::MechanicalPass => (Some(1.0), 0.00),
+                    CheckState::MechanicalFail => (Some(0.0), 0.05),
+                    CheckState::Blocked | CheckState::PendingHuman => (None, 0.05),
+                };
+                let mut c = check(&format!("st/{s:?}"), s.as_str(), score, weight);
+                if *s == CheckState::Blocked {
+                    c.reason = "probe could not run".into();
+                }
+                c
+            })
+            .collect();
+        let v = build(
+            &p,
+            "INCONCLUSIVE",
+            0.5,
+            0.8,
+            "b",
+            &checks,
+            &[],
+            &[],
+            &[],
+            0.0,
+            0.2,
+            &BTreeMap::new(),
+        );
+        for s in CheckState::ALL {
+            let id = format!("st/{s:?}");
+            let hits: Vec<&HumanItem> = v
+                .groups
+                .iter()
+                .flat_map(|g| g.items.iter())
+                .filter(|i| i.id == id)
+                .collect();
+            assert_eq!(hits.len(), 1, "{} must be in exactly one group", s.as_str());
+            assert_ne!(
+                hits[0].kind, "unknown",
+                "{} is a state the producer emits — never an unknown token",
+                s.as_str()
+            );
+        }
+        // The passed mechanical check is a presented point with importance 0,
+        // not a hole in the report.
+        let passed = v
+            .groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .find(|i| i.id == "st/MechanicalPass")
+            .expect("mechanical pass is presented");
+        assert_eq!(passed.kind, "passed");
+        assert_eq!(passed.importance, Some(0.0));
     }
 
     #[test]
@@ -1160,8 +1291,12 @@ scoring:
         assert!(a.contains("важность 0.120"));
         assert!(a.contains("закреплено: решение 01a1b1b8-dec (guerrero)"));
         assert!(
-            a.contains("ok/full — полностью пройдено"),
-            "a passed point is named, not shown as an empty «закреплено»: {a}"
+            a.contains("суть: nothing to fix here"),
+            "a fully passed point is presented in the nuances with importance 0, not as an anchor: {a}"
+        );
+        assert!(
+            a.contains("важность 0.000"),
+            "its 0.000 importance is printed, so «nothing lost» is visible: {a}"
         );
         assert!(a.contains("└ доказательства"));
         // An empty group prints no heading (the §2.6 conditional-section

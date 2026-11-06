@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod types;
+pub mod vocab;
 pub mod workflow;
 
 pub use error::{CoreError, CoreResult};

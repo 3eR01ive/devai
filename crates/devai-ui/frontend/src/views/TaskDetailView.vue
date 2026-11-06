@@ -371,6 +371,9 @@ onMounted(loadAll);
           <div class="rowflex" style="margin-bottom: 6px">
             <span class="mono muted">artifact {{ shortId(report.artifact) }} · seq {{ report.seq }} · {{ report.contract }}</span>
             <span class="mono muted">создан {{ fmtTime(report.created_at) }}</span>
+            <!-- Что именно отрендерено (rework R4): форма, плоский текст
+                 или маркер повреждения — не угадывается по тексту. -->
+            <span class="mono muted">источник: {{ report.source }}</span>
             <StateChip :token="report.status" />
           </div>
           <!-- Человеческая форма (REQ-QH-03/04): группы читаются из
@@ -395,8 +398,7 @@ onMounted(loadAll);
                 <li v-for="it in g.items" :key="it.id">
                   <template v-if="g.key === 'anchors'">
                     <span class="mono">{{ it.id }}</span>
-                    <span class="muted" v-if="it.ratified_by"> — закреплено: {{ it.ratified_by }}</span>
-                    <span class="muted" v-else> — полностью пройдено, замечаний нет</span>
+                    <span class="muted"> — закреплено: {{ it.ratified_by ?? "отсылка на решение не указана" }}</span>
                   </template>
                   <template v-else>
                     <div class="qr-item-line">

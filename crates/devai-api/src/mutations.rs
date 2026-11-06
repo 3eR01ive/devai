@@ -1770,21 +1770,57 @@ impl Api {
     /// `devai_runtime::human_view::present`.
     pub fn presented_quality_report(&self, task_id: Id) -> ApiResult<Option<PresentedReport>> {
         let task = self.store.get_task(&task_id.to_string())?;
-        let arts = self.store.artifacts(task_id)?;
+        Ok(self.presented_quality(&task)?.map(|p| p.presented))
+    }
+
+    /// REQ-QH-06 / rework R2/R4: the ONE presentation pipeline. Both public
+    /// readers (`presented_quality_report` for the gates, `task_report` for
+    /// the UI) call this, so row selection, blob read, rendering, the
+    /// distinguishable render source and the freshness fact can never drift
+    /// between two hand-copied paths.
+    ///
+    /// `Ok(None)` is the honest «no quality report»; a blob that does not
+    /// parse as JSON is a TYPED outcome of its own (`RenderSource::CorruptBody`
+    /// with a marker naming the damaged artifact), never an empty success and
+    /// never accidentally equal to «QA has not run».
+    pub(crate) fn presented_quality(&self, task: &Task) -> ApiResult<Option<PresentedQuality>> {
+        let arts = self.store.artifacts(task.id)?;
         let Some(a) = present::select_report(&arts) else {
             return Ok(None);
         };
         let blob = self.store.read_blob(&a.sha256)?;
-        let v: serde_json::Value = serde_json::from_slice(&blob).map_err(|e| ApiError::refused("corrupt", format!(
-            "the quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
-            short_id(&a.id)
-        )))?;
         let execs = self.store.list_executions(Some(task.id))?;
-        Ok(Some(PresentedReport {
-            text: present::render_stored_report(&v).text,
-            freshness: present::freshness(&task, a, &execs),
+        let freshness = present::freshness(task, a, &execs);
+        let (body, text, source) = match serde_json::from_slice::<serde_json::Value>(&blob) {
+            Ok(body) => {
+                let rendered = present::render_stored_report(&body);
+                (body, rendered.text, rendered.source)
+            }
+            Err(e) => (
+                serde_json::Value::Null,
+                present::corrupt_body_text(&short_id(&a.id), &e.to_string()),
+                devai_runtime::human_view::present::RenderSource::CorruptBody,
+            ),
+        };
+        Ok(Some(PresentedQuality {
+            artifact: a.clone(),
+            body,
+            presented: PresentedReport {
+                text,
+                source,
+                freshness,
+            },
         }))
     }
+}
+
+/// Everything the two presentation readers need from ONE store read: the
+/// artifact row that is shown, the parsed machine body, and the presented
+/// text plus its freshness verdict.
+pub(crate) struct PresentedQuality {
+    pub artifact: Artifact,
+    pub body: serde_json::Value,
+    pub presented: PresentedReport,
 }
 
 // ---------------------------------------------------------------------------
@@ -2259,6 +2295,98 @@ mod tests {
         );
     }
 
+    /// Rework R7: the API tests build the quality report through the REAL
+    /// assembly pipeline (`evaluation::assemble` → `human_view::build`), not
+    /// through a hand-written JSON form. A hand-built form hid the
+    /// producer/consumer dictionary mismatch (MECHANICAL_PASS was emitted on
+    /// every passed mechanical check but unknown to the form parser), because
+    /// the fixture simply never contained one.
+    const FORM_PROFILE_YAML: &str = r#"
+version: 1
+project: formtest
+applies_to_roles: [quality-auditor]
+error_types:
+  correctness/state-transition: { desc: d, severity: catastrophic }
+  process/untested-branch: { desc: d, severity: minor }
+gates: []
+evaluations:
+  - id: correctness
+    title: T
+    checks:
+      - id: mech/pass
+        statement: mechanical probe passes
+        detects: [process/untested-branch]
+        verify: mechanical
+        anchors: { "1.0": ok }
+        reviewer: tool
+      - id: corr/floor
+        statement: state transition is checked
+        detects: [correctness/state-transition]
+        verify: rubric
+        anchors: { "1.0": ok, "0.4": mid, "0.0": bad }
+        reviewer: either
+      - id: cl/y
+        statement: style drift
+        detects: [process/untested-branch]
+        verify: rubric
+        anchors: { "1.0": ok }
+        reviewer: either
+scoring:
+  theta: 0.8
+  floors: { catastrophic: 0.7, major: 0.4, minor: null }
+  blocked_policy: { max_blocked_weight: 0.2 }
+  weights:
+    mech/pass: 0.10
+    corr/floor: 0.20
+    cl/y: 0.10
+"#;
+
+    /// One quality-report document produced by the platform's own assembler:
+    /// a passed MECHANICAL check, a breached floor and a nuance, each with a
+    /// stored one-line summary and a collapsed evidence layer.
+    fn assembled_report_doc() -> serde_json::Value {
+        let profile: devai_store::config::Profile =
+            serde_yaml::from_str(FORM_PROFILE_YAML).expect("form fixture profile parses");
+        let mut mech = std::collections::HashMap::new();
+        mech.insert(
+            "mech/pass".to_string(),
+            devai_runtime::evaluation::ProbeOutcome {
+                state: devai_runtime::evaluation::ProbeState::Pass,
+                detail: "cargo test: 12 passed".into(),
+                output: "12 passed".into(),
+            },
+        );
+        let run = devai_runtime::evaluation::EvalRun {
+            gates: vec![],
+            mech,
+            hybrid: std::collections::HashMap::new(),
+            evidence_text: String::new(),
+        };
+        let assessment = serde_json::json!({
+            "scores": { "corr/floor": 0.4, "cl/y": 0.9 },
+            "findings": [{
+                "check": "corr/floor",
+                "text": "the guard is missing at src/a.rs:7",
+                "evidence": ["fn step() { unchecked() }"]
+            }]
+        });
+        let revision = WorkspaceRevision {
+            git_head: None,
+            dirty_digest: None,
+            profile: None,
+            roles: vec![],
+        };
+        devai_runtime::evaluation::assemble(
+            &profile,
+            &run,
+            &assessment,
+            "ex-form",
+            &revision,
+            &std::collections::BTreeMap::new(),
+        )
+        .json
+    }
+
     /// REQ-QH-01/05/06: the presentation channel quotes the STORED human form
     /// (never re-assembles one), and a report that is no longer the last word
     /// is announced as stale — with the task phase — instead of being passed
@@ -2269,44 +2397,7 @@ mod tests {
         let api = seeded_api(dir.path());
         let t = fresh_task(&api, "form-presentation");
 
-        let form = serde_json::json!({
-            "version": 1,
-            "lang": "ru",
-            "headline": {
-                "verdict": "НЕ ПРОШЁЛ",
-                "machine_verdict": "FAIL",
-                "score": 0.5,
-                "theta": 0.8,
-                "basis": "красные линии: x",
-                "counts": {"blocks": 1, "nuances": 1, "anchors": 0, "unchecked": 0}
-            },
-            "groups": [
-                {"key": "blocks", "title": "БЬЁТ ПО ВЕРДИКТУ / ТРЕБУЕТ ТВОЕГО РЕШЕНИЯ", "lead": "",
-                 "items": [{"id": "corr/x", "kind": "floor", "summary": "guard missing", "site": "src/a.rs:7",
-                            "score": 0.4, "weight": 0.2, "importance": 0.12, "evidence": ["body of the finding"]}]},
-                {"key": "nuances", "title": "НЮАНСЫ", "lead": "",
-                 "items": [{"id": "cl/y", "kind": "scored", "summary": "style drift", "site": "",
-                            "score": 0.9, "weight": 0.1, "importance": 0.01}]},
-                {"key": "anchors", "title": "ЯКОРЯ / РАТИФИЦИРОВАНО", "lead": "", "items": []},
-                {"key": "unchecked", "title": "НЕ ПРОВЕРЕНО / ЖДЁТ", "lead": "", "items": []}
-            ],
-            "blocked_weight": 0.0,
-            "max_blocked_weight": 0.2
-        });
-        let body = serde_json::json!({
-            "verdict": "RETURN",
-            "recommendation_basis": "красные линии: x",
-            "report_text": "RAW-FLAT-TEXT-MARKER",
-            "human_view": form,
-            "profile": { "project": "p", "version": 1 },
-            "workspace_revision": {
-                "git_head": null, "dirty_digest": null, "profile": null, "roles": []
-            },
-            "evaluation": {
-                "verdict": "FAIL", "score": 0.5, "theta": 0.8,
-                "gates": [], "checks": []
-            },
-        });
+        let body = assembled_report_doc();
         let row = api
             .artifact_publish_row(PublishReq {
                 id: t.to_string(),
@@ -2322,18 +2413,31 @@ mod tests {
             .unwrap();
 
         let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(p.source, present::RenderSource::HumanForm);
         assert!(
-            p.text.contains("НЮАНСЫ"),
-            "the stored form is what gets rendered: {}",
+            p.text.contains("БЬЁТ ПО ВЕРДИКТУ") && p.text.contains("НЮАНСЫ"),
+            "the stored form is what gets rendered, grouped by decision weight: {}",
             p.text
         );
         assert!(p.text.contains("важность 0.120"));
+        // R7/R5: the passed mechanical check came through the real producer
+        // and is PRESENTED — not an «unknown state» hole.
+        assert!(p.text.contains("mech/pass"), "{}", p.text);
+        assert!(
+            !p.text.contains("не распознано"),
+            "no producer state may fall through as unknown: {}",
+            p.text
+        );
         assert!(
             !p.text.contains("RAW-FLAT-TEXT-MARKER"),
             "the flat text is the fallback, not the channel, for @5 bodies"
         );
         assert!(!p.freshness.stale);
         assert_eq!(p.freshness.report_status, "CURRENT");
+        // The UI view is the SAME read: same text, same source, same verdict.
+        let view = api.task_report(&t.to_string()).unwrap();
+        assert_eq!(view.report_text.as_deref(), Some(p.text.as_str()));
+        assert_eq!(view.source, "human_form");
 
         // A pre-@5 body still renders its own stored text, byte for byte.
         let t2 = fresh_task(&api, "legacy");
@@ -2383,9 +2487,11 @@ mod tests {
         assert!(view.freshness.expect("freshness is part of the view").stale);
     }
 
-    /// QA R2: `quality_report_text` distinguishes «no report» (Ok(None))
-    /// from «report unreadable» (Err with a machine code). A corrupt CURRENT
-    /// blob must never be silently rendered as absence of a report.
+    /// QA R2 / rework R4: «no report» (Ok(None)), «damaged form» and «the blob
+    /// is not JSON at all» are three DISTINGUISHABLE outcomes. A corrupt
+    /// CURRENT blob is presented with a marker naming the artifact and a
+    /// distinct render source — never as absence of a report and never as the
+    /// generic «assembled before @2» placeholder.
     #[test]
     fn quality_report_text_distinguishes_absence_from_corruption() {
         let dir = tempfile::tempdir().unwrap();
@@ -2416,15 +2522,23 @@ mod tests {
         );
 
         // Corrupt the stored blob under the CURRENT row: the next read must
-        // fail loudly, not fall through to None.
+        // say so, not fall through to «no report» and not show the
+        // pre-@2 placeholder.
         std::fs::write(
             api.store.blob_path(&row.artifact.sha256),
             b"not-json-at-all",
         )
         .unwrap();
-        let e = api.quality_report_text(t).unwrap_err();
-        assert_eq!(e.code(), ErrorCode("corrupt"));
-        assert!(format!("{e}").contains("does not parse as JSON"), "{e}");
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(p.source, present::RenderSource::CorruptBody);
+        assert!(p.text.contains("повреждён"), "{}", p.text);
+        assert!(!p.text.contains("before @2"), "{}", p.text);
+        let view = api.task_report(&t.to_string()).unwrap();
+        assert_eq!(view.source, "corrupt_body");
+        assert!(
+            view.report_text.unwrap_or_default().contains("повреждён"),
+            "the UI view carries the same marker"
+        );
     }
 
     /// R3: a structurally damaged `human_view` (a valid JSON body whose form
