@@ -799,3 +799,70 @@ fn artifact_and_question_resolvers_fail_loudly_on_ambiguity() {
         q1.id
     );
 }
+
+/// REQ-BIND-02 (C5 D1): the project-binding writer at store level. An
+/// effective change bumps `lock_version`, moves `project_id`, and appends
+/// ONE `task.project.set` event carrying the vocabulary payload keys — all
+/// in one transaction. A stale optimistic base refuses with `Conflict` and
+/// leaves the row exactly as it was. `workflow_events` stays append-only
+/// throughout: the `wf_events_no_update`/`wf_events_no_delete` triggers are
+/// never exercised by this path (it only INSERTs).
+#[test]
+fn set_task_project_binds_bumps_lock_appends_event_refuses_stale() {
+    let (_d, store) = open();
+    let t = draft(&store);
+    let p = Project::new("binding", "", vec![], now());
+    store.create_project(&p).unwrap();
+
+    let before = store.get_task(&t.id.to_string()).unwrap();
+    let updated = store
+        .set_task_project(&before, p.id, "operator", now())
+        .expect("binding lands");
+    assert_eq!(updated.project_id, Some(p.id));
+    assert_eq!(updated.lock_version, before.lock_version + 1);
+
+    let stored = store.get_task(&t.id.to_string()).unwrap();
+    assert_eq!(stored.project_id, Some(p.id));
+    assert_eq!(stored.lock_version, before.lock_version + 1);
+    assert_eq!(stored.state, before.state);
+    assert_eq!(stored.requirements_seq, before.requirements_seq);
+
+    // Exactly one new event of the binding kind, payload speaks the
+    // json_field vocabulary (project_id / previous_project_id).
+    let events = store.all_events_for_task(t.id).unwrap();
+    let sets: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == event_kind::TASK_PROJECT_SET)
+        .collect();
+    assert_eq!(sets.len(), 1, "one append-only event per effective change");
+    assert_eq!(sets[0].actor, "operator");
+    assert_eq!(
+        sets[0].payload[json_field::PROJECT_ID].as_str(),
+        Some(p.id.to_string().as_str())
+    );
+    assert!(sets[0].payload[json_field::PREVIOUS_PROJECT_ID].is_null());
+
+    // Stale base (someone else moved the row since `before` was loaded):
+    // typed Conflict, the row keeps the FIRST binding, no second event.
+    let err = store
+        .set_task_project(&before, p.id, "late-writer", now())
+        .expect_err("a stale lock_version must refuse");
+    assert!(
+        matches!(&err, StoreError::Conflict { expected, found, .. }
+            if *expected == before.lock_version && *found == stored.lock_version),
+        "{err}"
+    );
+    assert_eq!(
+        store.get_task(&t.id.to_string()).unwrap().lock_version,
+        stored.lock_version
+    );
+    let events = store.all_events_for_task(t.id).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == event_kind::TASK_PROJECT_SET)
+            .count(),
+        1,
+        "the refused write left no event"
+    );
+}

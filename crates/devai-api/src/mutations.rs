@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
 use devai_runtime::{Engine, Gate, RunReport, liveness};
-use devai_store::{ArtifactDraft, bundle, guess_media_type, seed};
+use devai_store::{ArtifactDraft, StoreError, bundle, guess_media_type, seed};
 use uuid::Uuid;
 
 use crate::{Api, ApiError, ApiResult};
@@ -70,6 +70,45 @@ pub struct TaskCreateReq {
 pub struct TaskCreated {
     pub task: Task,
     pub linked: Vec<TaskDependency>,
+}
+
+/// `task.project.set` (REQ-BIND-02, C5 D1) — assign/replace the OWNING
+/// project of an EXISTING task. `id` is the task ref (full id or unique
+/// prefix, resolved by the store exactly like every other task read);
+/// `project` is a project ref (full id or name, resolved by `project.get`
+/// semantics) — an unknown ref on either side refuses with the typed
+/// `not_found`, never silently. `expected_lock` is the OPTIONAL optimistic
+/// base for machine consumers that loaded the task earlier: a stale version
+/// refuses with the typed `conflict` BEFORE anything is written. The CLI
+/// passes `None` and gets the store's own concurrency guard.
+#[derive(Debug, Clone)]
+pub struct TaskProjectSetReq {
+    pub id: String,
+    pub project: String,
+    pub expected_lock: Option<u64>,
+}
+
+/// The outcome of `task.project.set`: the task AS STORED after the call
+/// (lock bumped only when the binding actually changed) and `changed` —
+/// false for an idempotent re-apply of the project already bound, which
+/// writes NO row change and NO event (REQ-BIND-02 AC2).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskProjectSetOutcome {
+    pub task: Task,
+    pub changed: bool,
+}
+
+/// The outcome of the REQ-BIND-03 backfill: the four disjoint task-id
+/// groups the ratified rule (bind every NON-TERMINAL unbound task —
+/// terminal history and other projects' tasks are left untouched) sorts
+/// the store into. `bound` lists what the call changed; the rest document
+/// what it deliberately did NOT.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TaskProjectBackfillOutcome {
+    pub bound: Vec<Id>,
+    pub already_bound: Vec<Id>,
+    pub skipped_terminal: Vec<Id>,
+    pub skipped_other_project: Vec<Id>,
 }
 
 /// The workflow mutations the old CLI `op()` helper dispatched over a
@@ -455,6 +494,83 @@ impl Api {
             req.idempotency_key.as_deref(),
         )?;
         Ok(TaskCreated { task: t, linked })
+    }
+
+    // ---- task: project binding --------------------------------------------
+
+    /// REQ-BIND-02 (C5 D1): assign/replace the owning project of an
+    /// existing task. Reads resolve FIRST (a bad task ref or a bad project
+    /// ref refuses typed `not_found` before any write — the atomicity
+    /// discipline of `task_create`, REQ-API-01); a stale `expected_lock`
+    /// refuses typed `conflict` before any write; re-applying the project
+    /// the task already carries is a NO-OP (same row, no lock bump, no
+    /// event); an effective change goes through the store's one-transaction
+    /// writer (row + append-only `task.project.set` event together).
+    pub fn task_project_set(&self, req: TaskProjectSetReq) -> ApiResult<TaskProjectSetOutcome> {
+        let task = self.store.resolve_task(&req.id)?;
+        let project = self
+            .store
+            .get_project(&req.project)?
+            .ok_or_else(|| StoreError::NotFound("project".into(), req.project.clone()))?;
+        if req.expected_lock.is_some_and(|l| l != task.lock_version) {
+            return Err(StoreError::Conflict {
+                what: format!("task {}", task.id),
+                expected: req.expected_lock.unwrap(),
+                found: task.lock_version,
+            }
+            .into());
+        }
+        if task.project_id == Some(project.id) {
+            return Ok(TaskProjectSetOutcome {
+                task,
+                changed: false,
+            });
+        }
+        let updated = self
+            .store
+            .set_task_project(&task, project.id, &self.actor, Utc::now())?;
+        Ok(TaskProjectSetOutcome {
+            task: updated,
+            changed: true,
+        })
+    }
+
+    /// REQ-BIND-03 (C5 D1, backfill under the ratified OQ-BIND-2 rule):
+    /// bind `project` to EVERY task that lives unbound and non-terminal —
+    /// terminal (ACCEPTED/CANCELLED) history stays where it lived and
+    /// judged, tasks owned by ANOTHER project are never re-bound. Each
+    /// binding goes through [`Api::task_project_set`] — one registered
+    /// operation, one event, one lock bump per task; repeated application
+    /// finds no candidates and changes nothing (idempotent). Returns the
+    /// task ids bound NOW, the ids already carrying this project, the
+    /// terminal ids skipped and the ids bound to another project.
+    pub fn task_project_backfill(&self, project: &str) -> ApiResult<TaskProjectBackfillOutcome> {
+        let p = self
+            .store
+            .get_project(project)?
+            .ok_or_else(|| StoreError::NotFound("project".into(), project.to_string()))?;
+        let mut outcome = TaskProjectBackfillOutcome::default();
+        for t in self.store.list_tasks()? {
+            if t.project_id == Some(p.id) {
+                outcome.already_bound.push(t.id);
+                continue;
+            }
+            if t.state.is_terminal() {
+                outcome.skipped_terminal.push(t.id);
+                continue;
+            }
+            if t.project_id.is_some() {
+                outcome.skipped_other_project.push(t.id);
+                continue;
+            }
+            let set = self.task_project_set(TaskProjectSetReq {
+                id: t.id.to_string(),
+                project: p.id.to_string(),
+                expected_lock: None,
+            })?;
+            outcome.bound.push(set.task.id);
+        }
+        Ok(outcome)
     }
 
     // ---- task: workflow dispatch (the former CLI `op()` helper) -----------
@@ -2434,5 +2550,191 @@ mod tests {
                 serde_json::from_slice(&api.store.read_blob(&a.sha256).unwrap()).unwrap();
             assert_eq!(body["human_paragraph"].as_str().unwrap(), text.as_str());
         }
+    }
+
+    // --- REQ-BIND-02/03 (C5 D1): the project-binding plane ----------------
+
+    fn devai_project(api: &Api) -> Project {
+        api.project_add(ProjectAddReq {
+            name: "devai".into(),
+            description: String::new(),
+            repos: vec![],
+        })
+        .expect("project add")
+    }
+
+    /// REQ-BIND-02 AC1/AC2/AC3: an effective set bumps the lock, moves the
+    /// row and appends the event; re-applying the SAME project is a
+    /// documented side-effect-free NO-OP; a stale `expected_lock` refuses
+    /// BEFORE any write.
+    #[test]
+    fn task_project_set_binds_noops_on_replay_and_refuses_stale_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let p = devai_project(&api);
+        let t = fresh_task(&api, "to-bind");
+
+        let o = api
+            .task_project_set(TaskProjectSetReq {
+                id: t.to_string(),
+                project: p.name.clone(),
+                expected_lock: None,
+            })
+            .expect("binding lands");
+        assert!(o.changed);
+        assert_eq!(o.task.project_id, Some(p.id));
+        assert_eq!(o.task.lock_version, 2);
+
+        // The event landed append-only with the vocabulary payload.
+        let evs = api.task_events(&t.to_string(), None).unwrap();
+        let set = evs
+            .iter()
+            .find(|e| e.kind == event_kind::TASK_PROJECT_SET)
+            .expect("task.project.set event");
+        assert_eq!(
+            set.payload["project_id"].as_str(),
+            Some(p.id.to_string().as_str())
+        );
+        assert!(set.payload["previous_project_id"].is_null());
+
+        // Idempotent re-apply: same project → `changed=false`, NO lock bump,
+        // NO new event.
+        let o2 = api
+            .task_project_set(TaskProjectSetReq {
+                id: t.to_string(),
+                project: p.id.to_string(),
+                expected_lock: None,
+            })
+            .expect("replay succeeds");
+        assert!(!o2.changed);
+        assert_eq!(o2.task.lock_version, 2);
+        let evs2 = api.task_events(&t.to_string(), None).unwrap();
+        assert_eq!(evs2.len(), evs.len(), "the replay wrote nothing");
+
+        // Stale `expected_lock` refuses typed `conflict` — and the row stays.
+        let err = api
+            .task_project_set(TaskProjectSetReq {
+                id: t.to_string(),
+                project: p.name.clone(),
+                expected_lock: Some(1),
+            })
+            .expect_err("a stale lock must refuse");
+        assert_eq!(err.code(), ErrorCode("conflict"));
+        assert_eq!(api.store.get_task(&t.to_string()).unwrap().lock_version, 2);
+    }
+
+    /// REQ-BIND-02 AC1: both refusal families are TYPED — an unknown task
+    /// ref and an unknown project ref each carry the machine code
+    /// `not_found`; nothing is written on either path.
+    #[test]
+    fn task_project_set_refusals_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let p = devai_project(&api);
+        let t = fresh_task(&api, "typed");
+
+        let err = api
+            .task_project_set(TaskProjectSetReq {
+                id: "no-such-task".into(),
+                project: p.name.clone(),
+                expected_lock: None,
+            })
+            .expect_err("unknown task refuses");
+        assert_eq!(err.code(), ErrorCode("not_found"));
+        assert!(format!("{err}").contains("task"), "{err}");
+
+        let err = api
+            .task_project_set(TaskProjectSetReq {
+                id: t.to_string(),
+                project: "no-such-project".into(),
+                expected_lock: None,
+            })
+            .expect_err("unknown project refuses");
+        assert_eq!(err.code(), ErrorCode("not_found"));
+        assert!(format!("{err}").contains("project"), "{err}");
+
+        // Neither refusal moved the row.
+        let stored = api.store.get_task(&t.to_string()).unwrap();
+        assert_eq!(stored.project_id, None);
+        assert_eq!(stored.lock_version, 1);
+    }
+
+    /// REQ-BIND-03 under the ratified OQ-BIND-2 rule: the backfill binds
+    /// every UNBOUND NON-TERMINAL task, leaves terminal history at its old
+    /// address, never re-binds another project's task, and is idempotent on
+    /// re-application. Each binding is one `task.project.set` event.
+    #[test]
+    fn task_project_backfill_applies_the_ratified_rule_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let p = devai_project(&api);
+        let other = api
+            .project_add(ProjectAddReq {
+                name: "other".into(),
+                description: String::new(),
+                repos: vec![],
+            })
+            .unwrap();
+
+        let free = fresh_task(&api, "unbound-draft");
+        let owned = fresh_task(&api, "owned-by-other");
+        api.task_project_set(TaskProjectSetReq {
+            id: owned.to_string(),
+            project: other.id.to_string(),
+            expected_lock: None,
+        })
+        .unwrap();
+        let closed = fresh_task(&api, "terminal-history");
+        // Park it terminal through the workflow plane (CANCELLED).
+        api.task_op(&closed.to_string(), WorkflowOp::Cancel { reason: None })
+            .unwrap();
+        let home = fresh_task(&api, "already-devai");
+        api.task_project_set(TaskProjectSetReq {
+            id: home.to_string(),
+            project: p.id.to_string(),
+            expected_lock: None,
+        })
+        .unwrap();
+
+        let o = api.task_project_backfill("devai").expect("backfill runs");
+        assert_eq!(o.bound, vec![free]);
+        assert_eq!(o.already_bound, vec![home]);
+        assert_eq!(o.skipped_terminal, vec![closed]);
+        assert_eq!(o.skipped_other_project, vec![owned]);
+
+        let stored = api.store.get_task(&free.to_string()).unwrap();
+        assert_eq!(stored.project_id, Some(p.id));
+        assert_eq!(stored.lock_version, 2);
+        let evs = api.task_events(&free.to_string(), None).unwrap();
+        assert_eq!(
+            evs.iter()
+                .filter(|e| e.kind == event_kind::TASK_PROJECT_SET)
+                .count(),
+            1
+        );
+        // Terminal history untouched, another project's task not re-bound.
+        assert_eq!(
+            api.store.get_task(&closed.to_string()).unwrap().project_id,
+            None
+        );
+        assert_eq!(
+            api.store.get_task(&owned.to_string()).unwrap().project_id,
+            Some(other.id)
+        );
+
+        // Re-application: no candidates left, nothing changes anywhere.
+        let o2 = api.task_project_backfill("devai").unwrap();
+        assert!(o2.bound.is_empty());
+        assert_eq!(o2.already_bound.len(), 2);
+        assert_eq!(
+            api.store.get_task(&free.to_string()).unwrap().lock_version,
+            2
+        );
+
+        // Unknown project refuses typed, before touching a row.
+        let err = api
+            .task_project_backfill("no-such")
+            .expect_err("unknown project refuses");
+        assert_eq!(err.code(), ErrorCode("not_found"));
     }
 }

@@ -714,3 +714,40 @@ fn projectless_resolution_prefers_bound_profile_over_open_base() {
         "factory base must still carry unbound slots — the fallback distinction lives"
     );
 }
+
+/// REQ-BIND-04 (C5 D1, the court-unchanged guarantee of the binding slice):
+/// binding a task to the devai project moves NO court. The owned-path
+/// resolution without an overlay (config.rs:1294-1317) hands the bound task
+/// the SAME profile the projectless bound-preference fallback hands today —
+/// byte-for-byte. No overlay file exists in this slice (REQ-BIND-05: D1
+/// creates no profiles/), so both addresses land on quality.yaml v13.
+#[test]
+fn bound_task_is_judged_byte_identical_to_the_projectless_fallback() {
+    let (_d, store, cfg) = home();
+    let src = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/evaluation/quality.yaml"
+    );
+    fs::copy(src, cfg.join("evaluation").join("quality.yaml")).unwrap();
+    // The project row of the devai home: the owned-profile match works by
+    // projects.name == profile.project.
+    let prj = project(&store, "devai");
+    let projectless = config::resolve_effective_profile(&store, &cfg, None)
+        .unwrap()
+        .profile
+        .expect("a devai-shaped home yields the bound court even projectless");
+    let bound = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string()))
+        .unwrap()
+        .profile
+        .expect("the bound task resolves a court too");
+    assert_eq!(bound.name.as_deref(), Some("quality"));
+    assert_eq!(bound.version, projectless.version);
+    // Byte-for-byte over the serialized resolved profiles: binding changed
+    // nothing the auditor sees — the transition rules of REQ-BIND-04 hold.
+    assert_eq!(
+        serde_json::to_vec(&bound).unwrap(),
+        serde_json::to_vec(&projectless).unwrap(),
+        "binding a task must not move its court"
+    );
+    assert!(!profile_has_open_slots(&bound));
+}

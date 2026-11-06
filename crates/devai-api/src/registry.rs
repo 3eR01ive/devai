@@ -101,7 +101,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Mutation,
             input: "TaskCreateReq{title, project_id, description, parent, blocked_by, idempotency_key}",
             output: "TaskCreated{task, linked}",
-            description: "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. The project name resolves through the `project.get` read, so its not-found refusal keeps the exact position the command had.",
+            description: "Create a task in DRAFT and register 'parent'/'blocks' dependency edges at the moment of creation (REQ-DEP-07); dangling references fail loudly. The project name resolves through the `project.get` read, so its not-found refusal keeps the exact position the command had. A NULL `project_id` means unbound: the CLI applies the ratified OQ-BIND-1 default BEFORE this operation (working directory matched against the projects' repos — explicit `--project` always wins), the operation itself stays neutral.",
         },
         OpDescriptor {
             name: "task.list",
@@ -273,6 +273,21 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "id_prefix, reason",
             output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
             description: "Record a runtime failure; the task parks in FAILED for `resume`. Mirrors `task fail`.",
+        },
+        // ---- task: project binding (C5 D1, REQ-BIND-02/03) ----
+        OpDescriptor {
+            name: "task.project.set",
+            class: OpClass::Mutation,
+            input: "TaskProjectSetReq{id, project, expected_lock}",
+            output: "TaskProjectSetOutcome{task, changed}",
+            description: "Assign or replace the OWNING project of an existing task: refs resolve first (unknown task or project refuses typed `not_found`), a stale `expected_lock` refuses typed `conflict`, re-applying the already-bound project is a side-effect-free NO-OP (`changed=false`, no lock bump, no event), an effective change bumps lock_version and appends one `task.project.set` event in the SAME transaction. Touches no workflow state. Mirrors `task set-project`.",
+        },
+        OpDescriptor {
+            name: "task.project.backfill",
+            class: OpClass::Mutation,
+            input: "id_or_name",
+            output: "TaskProjectBackfillOutcome{bound, already_bound, skipped_terminal, skipped_other_project}",
+            description: "REQ-BIND-03 under the ratified OQ-BIND-2 rule: bind the given project to every task that lives UNBOUND and NON-TERMINAL, each through `task.project.set` (one event, one lock bump per task). Terminal history keeps the address it lived and judged at; tasks owned by another project are never re-bound. Re-application finds no candidates and changes nothing (idempotent). Mirrors `task backfill-project`.",
         },
         OpDescriptor {
             name: "task.depend",
@@ -635,6 +650,8 @@ mod tests {
             "task.block",
             "task.cancel",
             "task.fail",
+            "task.project.set",
+            "task.project.backfill",
             "task.depend",
             "task.unlink",
             "task.override",

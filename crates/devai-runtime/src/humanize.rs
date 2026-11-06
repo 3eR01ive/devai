@@ -197,15 +197,34 @@ pub fn paragraph_language(policy: &HumanizePolicy, business: &str) -> String {
 
 /// The declarative template rendered into the role's prompt (REQ-HP-04:
 /// the «очеловечивание» requirements are config, and this is their only
-/// second home — the gate itself never re-reads the prompt). Returns None
-/// for contracts that do not require the field — the template is shown
-/// exactly where the gate enforces it.
+/// second home — the gate itself never re-reads the prompt). Three honest
+/// branches, never collapsed: None schema or a schema that does not
+/// require the field => None (template shown exactly where the gate
+/// enforces it); an unparseable schema => Some with an explicit corruption
+/// marker — a broken contract is distinguishable from "requirement not
+/// declared" and the role is told not to invent meaning (rework C5 R3).
 pub fn template_section(
     policy: &HumanizePolicy,
     contract_schema: Option<&str>,
     business: &str,
 ) -> Option<String> {
-    let schema_v: Value = serde_json::from_str(contract_schema?).ok()?;
+    let raw = contract_schema?;
+    let schema_v: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(format!(
+                concat!(
+                    "\n=== HUMAN PARAGRAPH: СХЕМА КОНТРАКТА ПОВРЕЖДЕНА ===\n",
+                    "JSON выходного контракта не разобран: {err}. Требование поля `{field}` ",
+                    "из такой схемы не читается — это повреждение контракта, а не «поле не ",
+                    "требуется». Смысл не додумывай: зафиксируй повреждение вопросом ",
+                    "существующим путём (`devai question ask`) и не публикуй абзац наугад.\n"
+                ),
+                err = e,
+                field = policy.field,
+            ));
+        }
+    };
     if !schema_requires_paragraph(&schema_v, policy) {
         return None;
     }
@@ -462,5 +481,30 @@ mod tests {
         let qr = json!({"type":"object","required":["report_text"],"properties":{"report_text":{"type":"string"}}}).to_string();
         assert!(template_section(&p, Some(&qr), business).is_none());
         assert!(template_section(&p, None, business).is_none());
+    }
+
+    /// Rework C5 R3: an unparseable contract schema must NOT collapse into
+    /// the honest None — the corruption prints an explicit marker naming
+    /// the parse error, while "not declared" stays silent.
+    #[test]
+    fn corrupted_contract_schema_is_distinguishable_from_absent() {
+        let p = policy();
+        let business = "Требования стали формальными, но не читаемыми.";
+        let broken = r#"{ "type": "object", "required": ["human_paragraph""#;
+        let s = template_section(&p, Some(broken), business)
+            .expect("corrupt schema yields an explicit marker, not silence");
+        assert!(s.contains("СХЕМА КОНТРАКТА ПОВРЕЖДЕНА"), "{s}");
+        let err = serde_json::from_str::<Value>(broken)
+            .unwrap_err()
+            .to_string();
+        assert!(s.contains(&err), "the parse error is named verbatim: {s}");
+        assert!(
+            !s.contains("Обязательные слоты") && !s.contains("Структура объяснения"),
+            "the corruption branch never renders the normal template: {s}"
+        );
+        // The honest branches are untouched by the repair.
+        assert!(template_section(&p, None, business).is_none());
+        let qr = json!({"type":"object","required":["report_text"],"properties":{"report_text":{"type":"string"}}}).to_string();
+        assert!(template_section(&p, Some(&qr), business).is_none());
     }
 }

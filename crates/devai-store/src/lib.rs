@@ -522,6 +522,67 @@ impl Store {
         Ok(())
     }
 
+    /// REQ-BIND-02 (C5 D1): assign/replace the OWNING project of an
+    /// existing task — the write half of the `task.project.set` operation.
+    /// Optimistic concurrency exactly like `commit`: the UPDATE is keyed on
+    /// the caller's loaded `lock_version` and bumps it; a stale base yields
+    /// `Conflict` with the version actually found. The row change and its
+    /// append-only `task.project.set` event land in ONE transaction — the
+    /// binding and its provenance are never half-written (the
+    /// `wf_events_no_delete`/`wf_events_no_update` triggers stay untouched:
+    /// this INSERTS, never rewrites). Workflow state is NOT involved: the
+    /// task keeps its state, seq and edges.
+    pub fn set_task_project(
+        &self,
+        t: &Task,
+        project_id: Id,
+        actor: &str,
+        now: Timestamp,
+    ) -> StoreResult<Task> {
+        let next_lock = t.lock_version + 1;
+        let tx = self.conn.unchecked_transaction()?;
+        let affected = tx.execute(
+            "UPDATE tasks SET project_id=?1, lock_version=?2, updated_at=?3
+             WHERE id=?4 AND lock_version=?5",
+            params![
+                project_id.to_string(),
+                next_lock as i64,
+                rows::ts(&now),
+                t.id.to_string(),
+                t.lock_version as i64,
+            ],
+        )?;
+        if affected == 0 {
+            drop(tx);
+            return Err(StoreError::Conflict {
+                what: format!("task {}", t.id),
+                expected: t.lock_version,
+                found: self.get_task(&t.id.to_string())?.lock_version,
+            });
+        }
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                t.id.to_string(),
+                event_kind::TASK_PROJECT_SET,
+                actor,
+                json_string(&serde_json::json!({
+                    (json_field::PROJECT_ID): project_id.to_string(),
+                    (json_field::PREVIOUS_PROJECT_ID): t.project_id.map(|p| p.to_string()),
+                })),
+                rows::ts(&now),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Task {
+            project_id: Some(project_id),
+            lock_version: next_lock,
+            updated_at: now,
+            ..t.clone()
+        })
+    }
+
     // ------------------------------------------------------------------
     // task dependency graph (REQ-01/02/07)
     // ------------------------------------------------------------------

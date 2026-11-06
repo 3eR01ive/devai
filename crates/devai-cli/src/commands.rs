@@ -23,6 +23,7 @@ use crate::{
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
     MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq,
+    TaskProjectSetReq,
 };
 
 pub struct Ctx {
@@ -260,6 +261,10 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Block { .. }
         | TaskCmd::Cancel { .. }
         | TaskCmd::Fail { .. }) => task_state_ops(ctx, cmd)?,
+        // — the project-binding plane (C5 D1; one group handler) —
+        cmd @ (TaskCmd::SetProject { .. } | TaskCmd::BackfillProject { .. }) => {
+            task_binding_plane(ctx, cmd, json)?
+        }
         // — the dependency plane (one group handler) —
         cmd @ (TaskCmd::Depend { .. }
         | TaskCmd::Dependencies { .. }
@@ -306,6 +311,11 @@ fn task_new(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
 
 /// The project name resolves through the API read FIRST, so its
 /// not-found refusal keeps the exact position the command had.
+/// Without `--project`, the ratified OQ-BIND-1 default applies (REQ-BIND-01,
+/// C5 D1): the working directory is matched against the registered projects'
+/// `repos` — repo=home — and an unambiguous single match binds the new task
+/// to that project. Ambiguity binds NOTHING (the explicit flag is then the
+/// only source of truth), no match keeps yesterday's projectless create.
 fn resolve_new_task_project(ctx: &Ctx, project: Option<&str>) -> Result<Option<Id>> {
     let id = match project {
         Some(name) => Some(
@@ -315,9 +325,47 @@ fn resolve_new_task_project(ctx: &Ctx, project: Option<&str>) -> Result<Option<I
                 .context(format!("project `{name}` not found"))?
                 .id,
         ),
-        None => None,
+        None => default_project_for_cwd(ctx)?,
     };
     Ok(id)
+}
+
+/// REQ-BIND-01 (ratified OQ-BIND-1, mechanism (a)): auto-resolve the
+/// owning project of a NEW task by the working directory. A project
+/// matches when one of its `repos` EQUALS the cwd or is a DIRECTORY
+/// ANCESTOR of it (component-wise, so `/home/a/dev` never matches a cwd
+/// of `/home/a/development`). Exactly one matching project → bind it;
+/// zero or several → bind nothing and let the explicit `--project` be
+/// the source of truth. This read lives BEFORE creation; it never writes.
+fn default_project_for_cwd(ctx: &Ctx) -> Result<Option<Id>> {
+    let cwd =
+        std::env::current_dir().context("resolve the working directory for the default project")?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let projects = ctx.api().project_list().map_err(render_api_error)?;
+    let mut matched: Vec<Id> = Vec::new();
+    for p in projects {
+        for repo in &p.repos {
+            if repo.is_empty() {
+                continue;
+            }
+            let raw = Path::new(repo);
+            let r = raw.canonicalize().unwrap_or_else(|_| raw.to_path_buf());
+            if r.as_os_str().is_empty() {
+                continue;
+            }
+            if cwd == r || cwd.starts_with(&r) {
+                if !matched.contains(&p.id) {
+                    matched.push(p.id);
+                }
+                break;
+            }
+        }
+    }
+    if matched.len() == 1 {
+        Ok(matched.pop())
+    } else {
+        Ok(None)
+    }
 }
 
 /// Description source: `--description-file` wins over `--description`.
@@ -552,6 +600,83 @@ fn task_revise(ctx: &Ctx, cmd: TaskCmd) -> Result<()> {
         outln!("old versions are kept in history; nothing was deleted");
     }
     outln!("next: {}", o.allowed_operations.join(" | "));
+    Ok(())
+}
+
+/// The project-binding plane (C5 D1, REQ-BIND-02/03): the explicit
+/// `task set-project` write and the ratified `task backfill-project`.
+/// Both delegate to the registered API operations — this layer owns
+/// presentation, never a second copy of the binding rules.
+fn task_binding_plane(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
+    match cmd {
+        TaskCmd::SetProject { id, project } => task_set_project(ctx, &id, &project, json),
+        TaskCmd::BackfillProject { project } => task_backfill_project(ctx, &project, json),
+        _ => unreachable!("the dispatcher routes only the binding arms here"),
+    }
+}
+
+fn task_set_project(ctx: &Ctx, id: &str, project: &str, json: bool) -> Result<()> {
+    let o = ctx
+        .api()
+        .task_project_set(TaskProjectSetReq {
+            id: id.to_string(),
+            project: project.to_string(),
+            expected_lock: None,
+        })
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&o)?);
+    } else if o.changed {
+        outln!(
+            "task {} bound to project `{project}` (lock {})",
+            short(&o.task.id),
+            o.task.lock_version
+        );
+    } else {
+        outln!(
+            "task {} already carries project `{project}` — nothing changed (lock {})",
+            short(&o.task.id),
+            o.task.lock_version
+        );
+    }
+    Ok(())
+}
+
+fn task_backfill_project(ctx: &Ctx, project: &str, json: bool) -> Result<()> {
+    let o = ctx
+        .api()
+        .task_project_backfill(project)
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&o)?);
+        return Ok(());
+    }
+    outln!("backfill `{project}` (ratified rule: unbound NON-TERMINAL tasks only):");
+    for id in &o.bound {
+        outln!("  bound     {}", short(id));
+    }
+    for id in &o.already_bound {
+        outln!("  already   {}", short(id));
+    }
+    for id in &o.skipped_terminal {
+        outln!(
+            "  terminal  {} — closed history keeps its old address",
+            short(id)
+        );
+    }
+    for id in &o.skipped_other_project {
+        outln!(
+            "  owned     {} — another project, never re-bound",
+            short(id)
+        );
+    }
+    outln!(
+        "--- bound now {} · already {} · terminal {} · other {}",
+        o.bound.len(),
+        o.already_bound.len(),
+        o.skipped_terminal.len(),
+        o.skipped_other_project.len()
+    );
     Ok(())
 }
 

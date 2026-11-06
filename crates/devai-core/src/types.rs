@@ -802,6 +802,12 @@ pub mod event_kind {
     /// (approved OQ2 human-escape): recorded with the same decisions
     /// mechanism as every other human gate act.
     pub const TASK_DEPENDENCY_OVERRIDDEN: &str = "task.dependency.overridden";
+    /// REQ-BIND-02 (C5 D1): the OWNING project of an existing task was
+    /// assigned/replaced by the `task.project.set` operation. One append-only
+    /// event per EFFECTIVE change — an idempotent re-apply of the same
+    /// project writes nothing. Payload: the new `project_id` and the
+    /// `previous_project_id` (null when the task was projectless).
+    pub const TASK_PROJECT_SET: &str = "task.project.set";
     pub const WORKFLOW_STARTED: &str = "workflow.started";
     pub const STATE_CHANGED: &str = "workflow.state_changed";
     pub const REQUIREMENTS_PUBLISHED: &str = "requirements.published";
@@ -905,6 +911,7 @@ pub mod event_kind {
         TASK_DEPENDENCY_LINKED,
         TASK_DEPENDENCY_UNLINKED,
         TASK_DEPENDENCY_OVERRIDDEN,
+        TASK_PROJECT_SET,
         WORKFLOW_STARTED,
         STATE_CHANGED,
         REQUIREMENTS_PUBLISHED,
@@ -994,6 +1001,12 @@ pub mod json_field {
     pub const DEPENDENCY_ID: &str = "dependency_id";
     pub const DEPENDS_ON_ID: &str = "depends_on_id";
     pub const DEPENDENCY_KIND: &str = "dependency_kind";
+    /// Project binding (REQ-BIND-02, store `set_task_project`): the payload
+    /// keys of the `task.project.set` event — the project the task is bound
+    /// to NOW and the one it was bound to BEFORE (null for a projectless
+    /// task). Producer and reader speak one vocabulary.
+    pub const PROJECT_ID: &str = "project_id";
+    pub const PREVIOUS_PROJECT_ID: &str = "previous_project_id";
     /// Source workflow events a backfill extracted from, and the decision
     /// rows it created (rung 005 fact-event payload; the ids are also cited
     /// row-to-event via `decisions.refs`).
@@ -1055,6 +1068,8 @@ pub mod json_field {
         DEPENDENCY_ID,
         DEPENDS_ON_ID,
         DEPENDENCY_KIND,
+        PROJECT_ID,
+        PREVIOUS_PROJECT_ID,
         SOURCE_EVENTS,
         DECISION_IDS,
         RATIONALE,
