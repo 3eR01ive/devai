@@ -1022,6 +1022,23 @@ impl Store {
         Ok(out)
     }
 
+    /// Every artifact row of the home in ONE snapshot (same ordering as
+    /// `artifacts`). Companion of `questions_all` for the human-wait batch
+    /// read (R2): one gate presentation per APPROVAL/QA row must not cost an
+    /// `artifact.list` call each.
+    pub fn artifacts_all(&self) -> StoreResult<Vec<Artifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,kind,name,seq,category,status,sha256,size,media_type,contract_name,contract_version,created_by,execution_id,depends_on,created_at
+             FROM artifacts ORDER BY created_at",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::artifact_from_row(r)?);
+        }
+        Ok(out)
+    }
+
     /// Resolve an artifact by full id or unique prefix (OQ-3, ratified:
     /// EVERY entity resolver keeps ONE rule — a unique prefix resolves, a
     /// prefix matching several rows fails LOUDLY, the `resolve_task` /
@@ -1547,6 +1564,22 @@ impl Store {
             "SELECT id,task_id,execution_id,text,context,options,blocking,status,answer,answered_by,answered_at,created_at FROM questions WHERE task_id=?1 ORDER BY created_at",
         )?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::question_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    /// Every question row of the home in ONE snapshot, ordered like
+    /// `list_questions` (task-scoped readers group it themselves). Added for
+    /// the human-wait batch read (REQ-GATE-01..10, R2): the section must not
+    /// issue one `question.list` per task.
+    pub fn questions_all(&self) -> StoreResult<Vec<Question>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,execution_id,text,context,options,blocking,status,answer,answered_by,answered_at,created_at FROM questions ORDER BY created_at",
+        )?;
+        let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(rows::question_from_row(r)?);

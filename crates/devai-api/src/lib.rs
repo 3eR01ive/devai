@@ -19,10 +19,14 @@
 //! store access in consumers is total.
 
 mod error;
+mod inbox;
 mod mutations;
 mod registry;
 
 pub use error::{ApiError, ApiResult, ErrorCode};
+pub use inbox::{
+    InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts, factory_inbox_wait_policy,
+};
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
     ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
@@ -260,6 +264,13 @@ impl Api {
     pub fn task_report(&self, id_prefix: &str) -> ApiResult<QualityReportView> {
         let t = self.store.resolve_task(id_prefix)?;
         let arts = self.store.artifacts(t.id)?;
+        self.quality_report_view(&t, &arts)
+    }
+
+    /// The report view over an already-read artifact slice: the ONE builder
+    /// of the presentation, shared by `task.report` and the wait section's
+    /// batch read (no per-row re-derivation of the same shape).
+    fn quality_report_view(&self, t: &Task, arts: &[Artifact]) -> ApiResult<QualityReportView> {
         let a = arts
             .iter()
             .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
@@ -294,6 +305,115 @@ impl Api {
             report: value,
             report_text,
         })
+    }
+
+    /// The human-wait section in ONE batch read (REQ-GATE-01..10; R2 of the
+    /// QA return): the declarative demand table of this home plus every
+    /// task's stored questions and gate presentation. One store snapshot per
+    /// data type (tasks / questions / artifacts) instead of a per-task
+    /// fan-out — the caller's per-row cost is O(1) IPC (one call per load).
+    ///
+    /// The presentation is loaded for the stored gate tokens that present
+    /// it: APPROVAL → the spec (CURRENT, else the LAST one with the honest
+    /// «not current» mark, ratified OQ-GATE-3) and QA → the CURRENT quality
+    /// report (or the platform's text when there is none). Membership and
+    /// grouping are the UI's one decision site (`wait_group_of`).
+    pub fn inbox_snapshot(&self) -> ApiResult<InboxSnapshotView> {
+        let snapshot_at = Utc::now();
+        let policy =
+            devai_store::config::load_inbox_wait_policy(&self.config_dir().join("workflow"))?;
+        let tasks = self.store.list_tasks()?;
+        let questions = self.store.questions_all()?;
+        let artifacts = self.store.artifacts_all()?;
+
+        let facts = tasks
+            .into_iter()
+            .map(|task| {
+                let task_questions: Vec<Question> = questions
+                    .iter()
+                    .filter(|q| q.task_id == task.id)
+                    .cloned()
+                    .collect();
+                let task_artifacts: Vec<Artifact> = artifacts
+                    .iter()
+                    .filter(|a| a.task_id == task.id)
+                    .cloned()
+                    .collect();
+                let spec = if task.state == TaskState::Approval {
+                    self.spec_facts(&task_artifacts)?
+                } else {
+                    None
+                };
+                let (report, report_note) = if task.state == TaskState::Qa {
+                    match self.quality_report_view(&task, &task_artifacts) {
+                        Ok(view) => (Some(view), None),
+                        Err(e) => (None, Some(e.to_string())),
+                    }
+                } else {
+                    (None, None)
+                };
+                Ok(InboxTaskFacts {
+                    task,
+                    questions: task_questions,
+                    spec,
+                    report,
+                    report_note,
+                })
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+
+        Ok(InboxSnapshotView {
+            snapshot_at,
+            policy,
+            tasks: facts,
+        })
+    }
+
+    /// The APPROVAL text of the spec artifact: CURRENT REQUIREMENTS_SPEC when
+    /// one exists, else the LAST one with `current: false`. A binary body is
+    /// an honest size fact; a read failure is the platform's text — the
+    /// presentation never presents raw bytes or an empty body (ratified
+    /// OQ-GATE-3/4).
+    fn spec_facts(&self, arts: &[Artifact]) -> ApiResult<Option<SpecFacts>> {
+        let specs: Vec<&Artifact> = arts
+            .iter()
+            .filter(|a| a.kind == ArtifactKind::RequirementsSpec)
+            .collect();
+        let current = specs
+            .iter()
+            .find(|a| a.status == ArtifactStatus::Current)
+            .copied();
+        let (artifact, current) = match current {
+            Some(a) => (a, true),
+            None => match specs.into_iter().max_by_key(|a| (a.seq, a.created_at)) {
+                Some(a) => (a, false),
+                None => return Ok(None),
+            },
+        };
+        let body = match self.store.read_blob(&artifact.sha256) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => SpecBodyView::Text { text },
+                Err(_) => SpecBodyView::Binary {
+                    size: artifact.size,
+                },
+            },
+            Err(e) => SpecBodyView::Error {
+                message: e.to_string(),
+            },
+        };
+        Ok(Some(SpecFacts {
+            artifact: artifact.clone(),
+            current,
+            body,
+        }))
+    }
+
+    /// The home's config directory, resolved like the engine's humanize
+    /// policy (REQ-HP-04): `DEVAI_CONFIG` when set, else `<home>/config`.
+    fn config_dir(&self) -> PathBuf {
+        std::env::var_os("DEVAI_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.store.root().join("config"))
     }
 
     pub fn task_events(
