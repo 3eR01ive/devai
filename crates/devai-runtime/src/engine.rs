@@ -564,7 +564,7 @@ impl<'a> Engine<'a> {
     /// the writing agent actually changed, not the user's main checkout), the
     /// main checkout before any writing stage ran. The freshness gate
     /// recomputes on the SAME basis an audit bound itself to, so isolation
-    /// never silently breaks the @4 comparison.
+    /// never silently breaks the current-contract comparison.
     fn eval_workspace(&self, task: &Task) -> PathBuf {
         let dir = worktree::path_for(self.store.root(), task.id);
         if worktree::has_branch(&self.workspace, task.id) && dir.is_dir() {

@@ -8,8 +8,8 @@
 //! «how is the body laid out» live with the human form itself.
 
 use devai_core::types::{
-    Artifact, ArtifactKind, ArtifactStatus, ExecutionStatus, RoleExecution, Task, TaskState,
-    Timestamp, short_id,
+    Artifact, ArtifactKind, ArtifactStatus, ExecutionStatus, Id, RoleExecution, Task, TaskState,
+    Timestamp, WorkflowEvent, event_kind, json_field, short_id,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -170,10 +170,65 @@ fn fmt_ts(t: &Timestamp) -> String {
     t.format("%Y-%m-%d %H:%M:%SZ").to_string()
 }
 
+/// The `artifacts.staled` event that moved THIS artifact out of CURRENT, read
+/// as stored (workflow.rs writes the affected ids and a cause token on one
+/// row — `workflow.rs:303-308`, `workflow.rs:750-757`). The marker may repeat
+/// that token; it must never substitute a cause of its own (REQ-QH-05).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StaleCause {
+    pub cause: String,
+    pub actor: String,
+}
+
+/// The STALED event whose `staled` list names this artifact, newest first —
+/// `None` when the store recorded no such event (the marker then names only
+/// what it can see: phase, status, executions).
+pub fn stale_cause(events: &[WorkflowEvent], artifact: Id) -> Option<StaleCause> {
+    let target = artifact.to_string();
+    events
+        .iter()
+        .filter(|e| e.kind == event_kind::ARTIFACTS_STALED)
+        .filter(|e| {
+            e.payload
+                .get(json_field::STALED)
+                .and_then(|v| v.as_array())
+                .is_some_and(|ids| ids.iter().any(|i| i.as_str() == Some(target.as_str())))
+        })
+        .max_by_key(|e| e.created_at)
+        .map(|e| StaleCause {
+            cause: e
+                .payload
+                .get(json_field::CAUSE)
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            actor: e.actor.clone(),
+        })
+}
+
+/// The stored cause token in plain words, for the two tokens the workflow
+/// writes. Anything else — including an absent cause — is quoted verbatim as
+/// a store fact, never rounded to a known reason.
+fn stale_reason(c: &StaleCause) -> String {
+    let what = match c.cause.as_str() {
+        "rework: quality report returned by the human" => "отчёт возвращён человеком на реворк",
+        "requirements revision" => "выпущена новая ревизия требований",
+        "" => return "причина устаревания в сторе не записана".to_string(),
+        other => return format!("событие стора: причина «{other}»"),
+    };
+    format!("{what} ({})", c.actor)
+}
+
 /// REQ-QH-05: freshness as a FACT of the store — task phase, stored artifact
-/// status, role executions. Nothing is inferred from the report body, and the
-/// report content is not touched.
-pub fn freshness(task: &Task, a: &Artifact, execs: &[RoleExecution]) -> ReportFreshness {
+/// status, role executions, and the STALED event that retired the report.
+/// Nothing is inferred from the report body, and the report content is not
+/// touched.
+pub fn freshness(
+    task: &Task,
+    a: &Artifact,
+    execs: &[RoleExecution],
+    cause: Option<&StaleCause>,
+) -> ReportFreshness {
     let reworking = task.state == TaskState::Rework || task.return_state == Some(TaskState::Rework);
     let stale = (reworking || a.status != ArtifactStatus::Current) && !task.state.is_terminal();
     let execs: Vec<&RoleExecution> = execs
@@ -188,13 +243,17 @@ pub fn freshness(task: &Task, a: &Artifact, execs: &[RoleExecution]) -> ReportFr
     if !stale {
         return current_report(task, a, last.copied());
     }
+    let tail = stale_tail(running.copied(), last.copied());
+    let tail = match cause {
+        Some(c) => format!("{}; {tail}", stale_reason(c)),
+        None => tail,
+    };
     ReportFreshness {
         stale: true,
         marker: format!(
-            "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {}",
+            "⚠ отчёт v{} УСТАРЕЛ — задача в {}: {tail}",
             a.seq,
-            task.state.as_str(),
-            stale_tail(running.copied(), last.copied())
+            task.state.as_str()
         ),
         report_seq: a.seq,
         report_status: a.status.as_str().to_string(),
@@ -228,8 +287,10 @@ fn stale_tail(running: Option<&RoleExecution>, last: Option<&RoleExecution>) -> 
     match last {
         // The newest auditor run is the COMPLETED one that produced the very
         // report on screen: there is no re-audit in flight, and calling that
-        // run «не завершён» would invent one (rework R1).
-        Some(e) if e.status == ExecutionStatus::Completed => reaudit_not_launched(e),
+        // run «не завершён» or naming a return as the cause would invent a
+        // fact the store did not record here (rework R1/R2). Absence of a
+        // RUNNING row is the only thing said.
+        Some(e) if e.status == ExecutionStatus::Completed => reaudit_not_running(e),
         Some(e) => reaudit_unfinished(e),
         None => "ре-аудит ещё не запущен".to_string(),
     }
@@ -242,9 +303,9 @@ fn reaudit_running(e: &RoleExecution) -> String {
     )
 }
 
-fn reaudit_not_launched(e: &RoleExecution) -> String {
+fn reaudit_not_running(e: &RoleExecution) -> String {
     format!(
-        "возврат без ре-аудита; последний прогон {} COMPLETED {}",
+        "новый прогон аудитора не идёт; последний прогон {} COMPLETED {}",
         short_id(&e.id),
         fmt_ts(e.finished_at.as_ref().unwrap_or(&e.started_at))
     )
@@ -358,19 +419,20 @@ mod tests {
     /// REQ-QH-05: the marker names a STORE fact, never a guess. This unit
     /// pins the three non-live branches — nothing launched, a last run that
     /// is neither RUNNING nor COMPLETED («не завершён», never «в работе»),
-    /// and a COMPLETED last run (a return without a re-audit). The live
-    /// RUNNING branch is covered end-to-end through the API.
+    /// and a COMPLETED last run (no re-audit in flight; the old code called
+    /// that a «return», which the store had not recorded). The live RUNNING
+    /// branch is covered end-to-end through the API.
     #[test]
     fn the_freshness_marker_names_only_store_facts() {
         let now = Utc::now();
         let a = art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale);
 
-        let none = freshness(&task_in(TaskState::Rework), &a, &[]);
+        let none = freshness(&task_in(TaskState::Rework), &a, &[], None);
         assert!(none.stale && none.marker.contains("ре-аудит ещё не запущен"));
         assert_eq!(none.execution, None);
 
         let failed = exec(ExecutionStatus::Failed, now - chrono::Duration::seconds(5));
-        let unfinished = freshness(&task_in(TaskState::Rework), &a, &[failed]);
+        let unfinished = freshness(&task_in(TaskState::Rework), &a, &[failed], None);
         assert!(
             unfinished.marker.contains("ре-аудит не завершён")
                 && unfinished.marker.contains("FAILED"),
@@ -380,12 +442,93 @@ mod tests {
         assert_eq!(unfinished.execution_status.as_deref(), Some("FAILED"));
 
         let done = exec(ExecutionStatus::Completed, now);
-        let no_reaudit = freshness(&task_in(TaskState::Rework), &a, &[done]);
+        let no_reaudit = freshness(&task_in(TaskState::Rework), &a, &[done], None);
         assert!(
-            no_reaudit.marker.contains("возврат без ре-аудита"),
-            "a COMPLETED last run is not an unfinished re-audit: {}",
+            no_reaudit.marker.contains("новый прогон аудитора не идёт")
+                && no_reaudit.marker.contains("COMPLETED")
+                && !no_reaudit.marker.contains("возврат"),
+            "a COMPLETED last run is not an unfinished re-audit, and no cause is claimed: {}",
             no_reaudit.marker
         );
+    }
+
+    /// One `artifacts.staled` row in the shape `workflow.rs` commits.
+    fn staled(cause: &str, actor: &str, artifact: Id, at: chrono::DateTime<Utc>) -> WorkflowEvent {
+        WorkflowEvent {
+            id: new_id(),
+            task_id: None,
+            kind: event_kind::ARTIFACTS_STALED.into(),
+            actor: actor.into(),
+            payload: serde_json::json!({
+                (json_field::STALED): [artifact.to_string()],
+                (json_field::CAUSE): cause,
+            }),
+            created_at: at,
+        }
+    }
+
+    /// R2 (rework): the cause is the token the store recorded for THIS
+    /// artifact — each known cause reads as itself, an unknown one is quoted
+    /// verbatim, and with no event nothing is claimed. A different artifact's
+    /// event never leaks onto this report.
+    #[test]
+    fn the_stale_cause_comes_from_the_recorded_event_only() {
+        let now = Utc::now();
+        let a = art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale);
+        let task = task_in(TaskState::Rework);
+        let done = exec(ExecutionStatus::Completed, now);
+
+        let returned = staled(
+            "rework: quality report returned by the human",
+            "guerrero",
+            a.id,
+            now,
+        );
+        let cause = stale_cause(&[returned], a.id).expect("the event names this report");
+        let m = freshness(&task, &a, &[done.clone()], Some(&cause)).marker;
+        assert!(
+            m.contains("отчёт возвращён человеком на реворк (guerrero)")
+                && m.contains("новый прогон аудитора не идёт"),
+            "{m}"
+        );
+
+        let revised = staled("requirements revision", "platform", a.id, now);
+        let cause = stale_cause(&[revised], a.id).unwrap();
+        let m = freshness(&task, &a, &[done.clone()], Some(&cause)).marker;
+        assert!(
+            m.contains("выпущена новая ревизия требований (platform)"),
+            "{m}"
+        );
+
+        let unknown = staled("something-new", "platform", a.id, now);
+        let cause = stale_cause(&[unknown], a.id).unwrap();
+        let m = freshness(&task, &a, &[done.clone()], Some(&cause)).marker;
+        assert!(
+            m.contains("причина «something-new»"),
+            "an unknown token is quoted, never rounded: {m}"
+        );
+
+        // The newest event for this artifact wins; another artifact's event
+        // is not this report's cause.
+        let older = staled("requirements revision", "platform", a.id, now);
+        let newer = staled(
+            "rework: quality report returned by the human",
+            "guerrero",
+            a.id,
+            now + chrono::Duration::seconds(30),
+        );
+        let other = staled(
+            "requirements revision",
+            "platform",
+            new_id(),
+            now + chrono::Duration::seconds(60),
+        );
+        let cause = stale_cause(&[older, newer, other.clone()], a.id).unwrap();
+        assert_eq!(cause.actor, "guerrero");
+        assert!(stale_cause(&[other], a.id).is_none(), "no event, no cause");
+
+        let m = freshness(&task, &a, &[done], None).marker;
+        assert!(!m.contains("причина") && !m.contains("ревизия"), "{m}");
     }
 
     /// The two ways a report IS the last word: CURRENT on a non-terminal
@@ -394,7 +537,7 @@ mod tests {
     #[test]
     fn a_current_report_on_a_live_task_carries_no_marker() {
         let a = art(ArtifactKind::QualityReport, 1, ArtifactStatus::Current);
-        let fresh = freshness(&task_in(TaskState::Qa), &a, &[]);
+        let fresh = freshness(&task_in(TaskState::Qa), &a, &[], None);
         assert!(!fresh.stale);
         assert!(fresh.marker.is_empty());
         assert_eq!(fresh.report_seq, 1);
@@ -406,6 +549,7 @@ mod tests {
             &task_in(TaskState::Accepted),
             &art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale),
             &[],
+            None,
         );
         assert!(!settled.stale);
         assert!(settled.marker.is_empty());

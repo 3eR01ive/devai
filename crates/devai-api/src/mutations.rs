@@ -1790,7 +1790,9 @@ impl Api {
         };
         let blob = self.store.read_blob(&a.sha256)?;
         let execs = self.store.list_executions(Some(task.id))?;
-        let freshness = present::freshness(task, a, &execs);
+        let events = self.store.events(task.id, None)?;
+        let cause = present::stale_cause(&events, a.id);
+        let freshness = present::freshness(task, a, &execs, cause.as_ref());
         let (body, text, source) = match serde_json::from_slice::<serde_json::Value>(&blob) {
             Ok(body) => {
                 let rendered = present::render_stored_report(&body);
@@ -2601,15 +2603,58 @@ scoring:
         assert_eq!(
             p.freshness.marker,
             format!(
-                "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: возврат без ре-аудита; последний прогон {} COMPLETED 2026-11-06 10:05:00Z",
+                "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: новый прогон аудитора не идёт; последний прогон {} COMPLETED 2026-11-06 10:05:00Z",
                 short_id(&done.id)
             ),
-            "the completed run that produced the report is not an unfinished re-audit"
+            "the completed run that produced the report is not an unfinished re-audit, and no cause is claimed without a staled event"
         );
         assert!(!p.freshness.marker.contains("в работе"));
         assert!(!p.freshness.marker.contains("не завершён"));
         // The text channel carries the same full marker, not a summary.
         assert_eq!(reported_marker(&api, t), p.freshness.marker);
+    }
+
+    /// …and a real return records its cause as a workflow event
+    /// (`artifacts.staled` with `cause`), which the marker then repeats: the
+    /// cause is READ from the store, not reconstructed at presentation time.
+    #[test]
+    fn the_stale_marker_repeats_the_recorded_stale_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "freshness-cause");
+        publish_form_report(&api, t);
+
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let mut open = Mutation {
+            task: task.clone(),
+            events: vec![],
+            artifact_status: vec![],
+            questions: vec![],
+        };
+        open.task.state = TaskState::Qa;
+        api.store.commit(task.lock_version, &open).unwrap();
+
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let arts = api.store.artifacts(t).unwrap();
+        let returned = workflow::return_to_rework(
+            &task,
+            &arts,
+            Some("ещё раз, с тестами"),
+            "guerrero",
+            Utc::now(),
+        )
+        .unwrap();
+        api.store.commit(task.lock_version, &returned).unwrap();
+
+        let marker = reported_marker(&api, t);
+        assert!(
+            marker.contains("отчёт возвращён человеком на реворк (guerrero)"),
+            "the recorded cause is repeated: {marker}"
+        );
+        assert!(
+            !marker.contains("возврат без ре-аудита"),
+            "no cause is invented alongside the recorded one: {marker}"
+        );
     }
 
     /// …and only a live RUNNING row earns «в работе»: the marker then names

@@ -171,7 +171,7 @@ fn full_cycle_through_both_human_gates() {
     assert_eq!(r2.steps[0].role, "implementation-agent");
     assert_eq!(r2.steps[1].role, "quality-auditor");
 
-    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@4: probes ran
+    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@5: probes ran
     // in code, the mock auditor contributed no fabricated scores, and the
     // verdict function stayed "not ready" because a human check is unsigned.
     let (qa_artifact, qa) = {
@@ -184,22 +184,23 @@ fn full_cycle_through_both_human_gates() {
         let body = store.read_blob(&a.sha256).unwrap();
         (a, body)
     };
-    // The report is pinned to the strengthened contract version.
+    // The report is pinned to the strengthened contract version — read from
+    // the one constant, never a literal that can drift from the seed.
     assert_eq!(
         qa_artifact
             .contract
             .as_ref()
             .map(|c| (c.name.as_str(), c.version)),
-        Some(("quality-report", 5)),
-        "QA artifact must be published under quality-report@5"
+        Some(QUALITY_REPORT_CONTRACT),
+        "QA artifact must be published under the current quality-report contract"
     );
     let rep: serde_json::Value = serde_json::from_slice(&qa).unwrap();
     assert_eq!(rep["verdict"], "ESCALATE");
     assert_eq!(rep["profile"]["project"], "devai");
 
     // REQ-001/REQ-004: EVERY engine stage records a workspace revision with
-    // all four components, and the assembled @4 report embeds EXACTLY the
-    // revision stored on the auditor's execution row — no drift.
+    // all four components, and the assembled current-contract report embeds
+    // EXACTLY the revision stored on the auditor's execution row — no drift.
     {
         use devai_runtime::revision;
         let execs = store.list_executions(Some(t.id)).unwrap();
@@ -2624,14 +2625,16 @@ fn a_returned_reports_findings_are_delivered_labelled_stale_never_dropped() {
         &store,
         t.id,
         serde_json::to_value(failing_doc()).unwrap(),
-        4,
+        QUALITY_REPORT_CONTRACT.1,
     );
     let refresh = rework_context(&store, &t, "implementation-agent", &policy())
         .unwrap()
         .unwrap();
     assert!(
-        refresh.contains("CURRENT quality-report@4 report v")
-            && refresh.contains("FINDING-MARKER-4e7b")
+        refresh.contains(&format!(
+            "CURRENT {}@{} report v",
+            QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1
+        )) && refresh.contains("FINDING-MARKER-4e7b")
             && !refresh.contains("отчёт STALE"),
         "a newer CURRENT report is quoted as CURRENT: {refresh}"
     );
