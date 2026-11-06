@@ -433,62 +433,76 @@ impl Api {
         // R2 QA (input-validation): an empty/whitespace-only key must never
         // reach the registry — once stored, `''` would become a SHARED key
         // and the second empty-keyed call would silently return the first
-        // task. The typed refusal happens BEFORE the first store touch
-        // (including the registry lookup below): it can neither read nor
-        // write, so a refusal leaves the store byte-identical.
-        if let Some(key) = req.idempotency_key.as_deref() {
-            if key.trim().is_empty() {
-                return Err(ApiError::InvalidInput {
-                    field: "idempotency_key",
-                    message: "must not be empty or whitespace-only".into(),
-                });
-            }
+        // task. The typed refusal happens BEFORE the first store touch.
+        Self::refuse_empty_creation_key(&req)?;
+        // REQ-API-02 (ratified OQ-1): a retry carrying the key of an ALREADY
+        // COMMITTED create returns the registered task and its stored ACTIVE
+        // edges — the lost-response retry never duplicates the effect.
+        if let Some(done) = self.creation_by_key(&req)? {
+            return Ok(done);
         }
-        // REQ-API-02 (ratified OQ-1): a retry carrying the key of an
-        // ALREADY COMMITTED create returns the registered task and its
-        // stored ACTIVE edges — the lost-response retry never duplicates
-        // the effect. The registry row lands inside the creation
-        // transaction, so finding it is proof the first create committed.
-        if let Some(key) = req.idempotency_key.as_deref() {
-            if let Some(existing) = self.store.task_by_creation_key(key)? {
-                return Ok(TaskCreated {
-                    linked: self.store.task_dependencies(existing.id)?,
-                    task: existing,
-                });
-            }
-        }
-        // REQ-DEP-07: a derived task records WHY it exists at the moment it
-        // is created; dangling references fail loudly on resolve, exactly as
-        // they would via `task depend`.
         // REQ-API-01 (the QA-01a1acab-18b1 fix): EVERY ref is resolved
-        // BEFORE anything is written. The pre-fix order inserted the task,
-        // then resolved parent and blocked_by in loops — an Ambiguous or
-        // NotFound halfway left an ORPHAN task (and possibly a partial
-        // parent edge set) in the store, and the retry doubled the effect.
-        // Resolution order stays parents-then-blockers, so the first
-        // failing ref produces the identical error text of the old path.
-        let mut parents: Vec<Task> = Vec::new();
+        // BEFORE anything is written, so a late refusal leaves no ORPHAN
+        // task and the retry cannot double the effect.
+        let deps = self.creation_dependencies(&req)?;
+        self.insert_task_with_edges(req, &deps)
+    }
+
+    /// The typed refusal of an empty/whitespace-only idempotency key — it
+    /// can neither read nor write, so a refusal leaves the store identical.
+    fn refuse_empty_creation_key(req: &TaskCreateReq) -> ApiResult<()> {
+        match req.idempotency_key.as_deref() {
+            Some(key) if key.trim().is_empty() => Err(ApiError::InvalidInput {
+                field: "idempotency_key",
+                message: "must not be empty or whitespace-only".into(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The already-committed create under this key, if any. The registry row
+    /// lands inside the creation transaction, so finding it is proof the
+    /// first create committed.
+    fn creation_by_key(&self, req: &TaskCreateReq) -> ApiResult<Option<TaskCreated>> {
+        let Some(key) = req.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        match self.store.task_by_creation_key(key)? {
+            Some(existing) => Ok(Some(TaskCreated {
+                linked: self.store.task_dependencies(existing.id)?,
+                task: existing,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// REQ-DEP-07: a derived task records WHY it exists at the moment it is
+    /// created. Resolution order stays parents-then-blockers, so the first
+    /// failing ref produces the identical error text of the old path.
+    fn creation_dependencies(&self, req: &TaskCreateReq) -> ApiResult<Vec<(Task, DependencyKind)>> {
+        let mut deps: Vec<(Task, DependencyKind)> = Vec::new();
         for p in &req.parent {
-            parents.push(self.store.resolve_task(p)?);
+            deps.push((self.store.resolve_task(p)?, DependencyKind::Parent));
         }
-        let mut blockers: Vec<Task> = Vec::new();
         for b in &req.blocked_by {
-            blockers.push(self.store.resolve_task(b)?);
+            deps.push((self.store.resolve_task(b)?, DependencyKind::Blocks));
         }
-        let mut deps: Vec<(&Task, DependencyKind)> = Vec::new();
-        for t in &parents {
-            deps.push((t, DependencyKind::Parent));
-        }
-        for t in &blockers {
-            deps.push((t, DependencyKind::Blocks));
-        }
-        // The task, its edges and the key registration land in ONE store
-        // transaction (REQ-API-01: all effects of this call, or none), so
-        // `TaskCreated` can never describe an edge absent from the store.
+        Ok(deps)
+    }
+
+    /// The task, its edges and the key registration land in ONE store
+    /// transaction (REQ-API-01: all effects of this call, or none), so
+    /// `TaskCreated` can never describe an edge absent from the store.
+    fn insert_task_with_edges(
+        &self,
+        req: TaskCreateReq,
+        deps: &[(Task, DependencyKind)],
+    ) -> ApiResult<TaskCreated> {
         let t = Task::new(req.title, req.description, req.project_id, Utc::now());
+        let edges: Vec<(&Task, DependencyKind)> = deps.iter().map(|(t, k)| (t, *k)).collect();
         let linked = self.store.create_task_with_dependencies(
             &t,
-            &deps,
+            &edges,
             &self.actor,
             Utc::now(),
             req.idempotency_key.as_deref(),
@@ -586,55 +600,18 @@ impl Api {
             WorkflowOp::Review { verdict, summary } => self.run_op(id, move |t, _a| {
                 workflow::review_recorded(t, verdict, summary.as_deref(), &self.actor, Utc::now())
             }),
-            WorkflowOp::Approve { rationale } => self.run_op(id, move |t, a| {
-                // The approve gate reads the CURRENT spec exactly as the old
-                // closure did — same guard, same refusal text.
-                if a.iter().any(|x| {
-                    x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
-                }) {
-                    workflow::approve_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
-                } else {
-                    Err(devai_core::CoreError::guard(
-                        "no CURRENT REQUIREMENTS_SPEC artifact to approve",
-                    ))
-                }
-            }),
+            WorkflowOp::Approve { rationale } => self.op_approve(id, rationale),
             WorkflowOp::Reject { rationale } => self.run_op(id, move |t, _a| {
                 workflow::reject_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
             }),
-            WorkflowOp::Accept { rationale } => {
-                // REQ-DEP-03: the acceptance gate consults the stored
-                // dependency graph and the override decisions before the
-                // core command runs — the loads keep the old position.
-                let task = self.store.resolve_task(id)?;
-                let deps = self.store.task_dependencies(task.id)?;
-                let decisions = self.store.list_decisions(task.id)?;
-                self.run_op(id, move |t, a| {
-                    workflow::accept(
-                        t,
-                        a,
-                        &deps,
-                        &decisions,
-                        rationale.as_deref(),
-                        &self.actor,
-                        Utc::now(),
-                    )
-                })
-            }
+            WorkflowOp::Accept { rationale } => self.op_accept(id, rationale),
             WorkflowOp::Return { rationale } => self.run_op(id, move |t, _a| {
                 workflow::return_to_rework(t, rationale.as_deref(), &self.actor, Utc::now())
             }),
             WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| {
                 workflow::pause(t, reason.as_deref(), &self.actor, Utc::now())
             }),
-            WorkflowOp::Resume => {
-                let task = self.store.resolve_task(id)?;
-                let deps = self.store.task_dependencies(task.id)?;
-                let decisions = self.store.list_decisions(task.id)?;
-                self.run_op(id, move |t, _a| {
-                    workflow::resume(t, &deps, &decisions, &self.actor, Utc::now())
-                })
-            }
+            WorkflowOp::Resume => self.op_resume(id),
             WorkflowOp::Block { reason } => self.run_op(id, move |t, _a| {
                 workflow::block(t, reason.as_deref(), &self.actor, Utc::now())
             }),
@@ -645,6 +622,53 @@ impl Api {
                 workflow::fail(t, reason.as_deref(), &self.actor, Utc::now())
             }),
         }
+    }
+
+    /// APPROVAL: the gate reads the CURRENT spec exactly as the old closure
+    /// did — same guard, same refusal text.
+    fn op_approve(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
+        self.run_op(id, move |t, a| {
+            if a.iter().any(|x| {
+                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
+            }) {
+                workflow::approve_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
+            } else {
+                Err(devai_core::CoreError::guard(
+                    "no CURRENT REQUIREMENTS_SPEC artifact to approve",
+                ))
+            }
+        })
+    }
+
+    /// ACCEPT: REQ-DEP-03 — the acceptance gate consults the stored
+    /// dependency graph and the override decisions before the core command
+    /// runs; the loads keep the old position.
+    fn op_accept(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
+        let task = self.store.resolve_task(id)?;
+        let deps = self.store.task_dependencies(task.id)?;
+        let decisions = self.store.list_decisions(task.id)?;
+        self.run_op(id, move |t, a| {
+            workflow::accept(
+                t,
+                a,
+                &deps,
+                &decisions,
+                rationale.as_deref(),
+                &self.actor,
+                Utc::now(),
+            )
+        })
+    }
+
+    /// RESUME: the same stored dependency/decision loads the acceptance gate
+    /// performs, in the old order.
+    fn op_resume(&self, id: &str) -> ApiResult<MutationResult> {
+        let task = self.store.resolve_task(id)?;
+        let deps = self.store.task_dependencies(task.id)?;
+        let decisions = self.store.list_decisions(task.id)?;
+        self.run_op(id, move |t, _a| {
+            workflow::resume(t, &deps, &decisions, &self.actor, Utc::now())
+        })
     }
 
     fn run_op<F>(&self, id: &str, f: F) -> ApiResult<MutationResult>
@@ -768,45 +792,9 @@ impl Api {
         let report = engine.advance(&req.id, &req.agent, &self.actor)?;
         // The gate renderings read the CURRENT quality report — the same
         // status-only selection (REQ-005) the old handler performed.
-        let (current_quality_report, gate_report_text) = match report.gate {
-            Gate::WaitingAccept => (None, self.quality_report_text(report.task_id)?),
-            Gate::ReportFresh => (
-                self.store.artifacts(report.task_id)?.into_iter().find(|x| {
-                    x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
-                }),
-                self.quality_report_text(report.task_id)?,
-            ),
-            _ => (None, None),
-        };
-        // REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
-        // presentation — approval/review reads spec + review, acceptance
-        // reads the implementation-report. Stored fields, verbatim; absence
-        // (a legacy @1/@2 CURRENT, a non-JSON body) renders as NO paragraph,
-        // never as a broken gate (REQ-HP-06 non-retroactivity in the render
-        // half too).
-        let mut gate_human_paragraphs: Vec<(String, String)> = Vec::new();
-        match report.gate {
-            Gate::WaitingApproval => {
-                for (kind, label) in [
-                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
-                    (ArtifactKind::ReviewReport, "review-report"),
-                ] {
-                    if let Some(p) = self.stored_human_paragraph(report.task_id, kind, label)? {
-                        gate_human_paragraphs.push(p);
-                    }
-                }
-            }
-            Gate::WaitingAccept | Gate::ReportFresh => {
-                if let Some(p) = self.stored_human_paragraph(
-                    report.task_id,
-                    ArtifactKind::ImplementationReport,
-                    "implementation-report",
-                )? {
-                    gate_human_paragraphs.push(p);
-                }
-            }
-            _ => {}
-        }
+        let (current_quality_report, gate_report_text) =
+            self.gate_reporting(report.task_id, report.gate)?;
+        let gate_human_paragraphs = self.gate_paragraphs(report.task_id, report.gate)?;
         let t = self.store.get_task(&report.task_id.to_string())?;
         Ok(RunOutcome {
             report,
@@ -818,6 +806,58 @@ impl Api {
                 .map(|s| s.to_string())
                 .collect(),
         })
+    }
+
+    /// The quality-report half of the gate presentation: the CURRENT report
+    /// row at `report_fresh`, nothing at `waiting_accept`, and the stored
+    /// rendering text whenever a gate accepts a signature.
+    fn gate_reporting(
+        &self,
+        task_id: Id,
+        gate: Gate,
+    ) -> ApiResult<(Option<Artifact>, Option<String>)> {
+        match gate {
+            Gate::WaitingAccept => Ok((None, self.quality_report_text(task_id)?)),
+            Gate::ReportFresh => Ok((
+                self.store.artifacts(task_id)?.into_iter().find(|x| {
+                    x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
+                }),
+                self.quality_report_text(task_id)?,
+            )),
+            _ => Ok((None, None)),
+        }
+    }
+
+    /// REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
+    /// presentation — approval/review reads spec + review, acceptance reads
+    /// the implementation-report. Stored fields, verbatim; absence (a legacy
+    /// @1/@2 CURRENT, a non-JSON body) renders as NO paragraph, never as a
+    /// broken gate (REQ-HP-06 non-retroactivity in the render half too).
+    fn gate_paragraphs(&self, task_id: Id, gate: Gate) -> ApiResult<Vec<(String, String)>> {
+        let mut paragraphs: Vec<(String, String)> = Vec::new();
+        match gate {
+            Gate::WaitingApproval => {
+                for (kind, label) in [
+                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
+                    (ArtifactKind::ReviewReport, "review-report"),
+                ] {
+                    if let Some(p) = self.stored_human_paragraph(task_id, kind, label)? {
+                        paragraphs.push(p);
+                    }
+                }
+            }
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                if let Some(p) = self.stored_human_paragraph(
+                    task_id,
+                    ArtifactKind::ImplementationReport,
+                    "implementation-report",
+                )? {
+                    paragraphs.push(p);
+                }
+            }
+            _ => {}
+        }
+        Ok(paragraphs)
     }
 
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
@@ -865,45 +905,8 @@ impl Api {
     /// row before a failing advance aborts) keeps byte parity (REQ-MUT-06).
     pub fn artifact_publish_row(&self, req: PublishReq) -> ApiResult<PublishedRow> {
         let task = self.store.resolve_task(&req.id)?;
-        let mut depends_ids: Vec<Id> = Vec::new();
-        for p in &req.depends {
-            depends_ids.push(self.store.get_artifact(p)?.id);
-        }
-        // Downstream role results are implicitly children of the current
-        // approved specification (a later requirements revision marks them
-        // STALE through the dependency graph — unless deps were given).
-        if req.depends.is_empty() && req.kind.is_downstream_of_spec() {
-            if let Some(spec) = self
-                .store
-                .artifacts(task.id)?
-                .iter()
-                .find(|a| {
-                    a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
-                })
-                .map(|a| a.id)
-            {
-                depends_ids.push(spec);
-            }
-        }
-        let execution_id = match req.execution.as_deref() {
-            Some(e) => {
-                // Ratified OQ-4: publication into a closed row is a LOUD
-                // refusal — «зомби не пишет в закрытую строку».
-                let ex = self.store.get_execution(e)?;
-                if ex.status != ExecutionStatus::Running {
-                    return Err(ApiError::refused(
-                        "execution_not_running",
-                        format!(
-                            "execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)",
-                            ex.id,
-                            ex.status.as_str()
-                        ),
-                    ));
-                }
-                Some(ex.id)
-            }
-            None => None,
-        };
+        let depends_ids = self.publication_dependencies(&task, &req)?;
+        let execution_id = self.publication_execution(req.execution.as_deref())?;
         let created_by = execution_id.map(|id| format!("execution:{}", id));
         // The contract reference parses AFTER the execution check — the
         // exact position the pre-cycle-2 CLI held (error-order parity).
@@ -925,6 +928,50 @@ impl Api {
         Ok(PublishedRow { artifact, task })
     }
 
+    /// The explicit dependencies of a publication, plus the implicit one:
+    /// downward role results are children of the CURRENT approved
+    /// specification (a later requirements revision marks them STALE through
+    /// the dependency graph — unless deps were given).
+    fn publication_dependencies(&self, task: &Task, req: &PublishReq) -> ApiResult<Vec<Id>> {
+        let mut depends_ids: Vec<Id> = Vec::new();
+        for p in &req.depends {
+            depends_ids.push(self.store.get_artifact(p)?.id);
+        }
+        if req.depends.is_empty() && req.kind.is_downstream_of_spec() {
+            let spec = self
+                .store
+                .artifacts(task.id)?
+                .iter()
+                .find(|a| {
+                    a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
+                })
+                .map(|a| a.id);
+            depends_ids.extend(spec);
+        }
+        Ok(depends_ids)
+    }
+
+    /// The producing execution of a publication. Ratified OQ-4: publication
+    /// into a closed row is a LOUD refusal — «зомби не пишет в закрытую
+    /// строку».
+    fn publication_execution(&self, execution: Option<&str>) -> ApiResult<Option<Id>> {
+        let Some(e) = execution else {
+            return Ok(None);
+        };
+        let ex = self.store.get_execution(e)?;
+        if ex.status != ExecutionStatus::Running {
+            return Err(ApiError::refused(
+                "execution_not_running",
+                format!(
+                    "execution {} is {}, not RUNNING — artifact publication requires the producing execution to be RUNNING (a closed row stays closed: work that continues starts a new execution)",
+                    ex.id,
+                    ex.status.as_str()
+                ),
+            ));
+        }
+        Ok(Some(ex.id))
+    }
+
     /// The workflow advance certain artifact kinds carry — the SAME core
     /// commands the engine runs (REQ-RG-01: no producer path bypasses the
     /// empty-rework gate). Membership of the advancing set is owned by
@@ -937,71 +984,66 @@ impl Api {
         let task = self.store.resolve_task(&req.id)?;
         let a = self.store.get_artifact(&req.artifact_id)?;
         match req.kind {
-            ArtifactKind::RequirementsSpec => {
-                let arts = self.store.artifacts(task.id)?;
-                let m =
-                    workflow::requirements_published(&task, &arts, None, &self.actor, Utc::now())?;
-                self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome {
-                    from: task.state,
-                    to: m.task.state,
-                    rework_gate: false,
-                })
-            }
-            ArtifactKind::ReviewReport => {
-                let v = match req.verdict.as_deref() {
-                    Some(s) => Self::parse_verdict(s)?,
-                    None => {
-                        return Err(ApiError::refused(
-                            "bad_request",
-                            "publishing REVIEW_REPORT requires --verdict approved|needs_revision",
-                        ));
-                    }
-                };
-                let m = workflow::review_recorded(&task, v, None, &self.actor, Utc::now())?;
-                self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome {
-                    from: task.state,
-                    to: m.task.state,
-                    rework_gate: false,
-                })
-            }
-            ArtifactKind::ImplementationReport => {
-                // The manual publication crosses the SAME core command as
-                // the engine — including the empty-rework gate.
-                let arts = self.store.artifacts(task.id)?;
-                let facts = devai_runtime::gate::collect_implementation_report_facts(
-                    &self.store,
-                    task.id,
-                    &a,
-                    &arts,
-                    None,
-                )?;
-                let m = workflow::implementation_reported(&task, &facts, &self.actor, Utc::now())?;
-                self.store.commit(task.lock_version, &m)?;
-                Ok(AdvanceOutcome {
-                    from: task.state,
-                    to: m.task.state,
-                    rework_gate: m.task.state == TaskState::WaitingForInput,
-                })
-            }
+            ArtifactKind::RequirementsSpec => self.advance_spec(&task),
+            ArtifactKind::ReviewReport => self.advance_review(&task, req.verdict.as_deref()),
+            ArtifactKind::ImplementationReport => self.advance_implementation(&task, &a),
             // Fail-closed (QA R5): the kind carries no advance. The refusal
             // lists the advancing kinds DERIVED from the core predicate —
             // never a hand-copied set that could drift (QA R4).
-            other => Err(ApiError::refused(
-                "artifact_kind_not_advancing",
-                format!(
-                    "{} carries no workflow advance — the advancing kinds are {} (the row alone lands via `artifact.publish_row`; publish through `artifact.publish` to get the row and its advance in one call)",
-                    other.as_str(),
-                    ArtifactKind::ALL
-                        .iter()
-                        .filter(|k| k.advances_state())
-                        .map(|k| k.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )),
+            other => Err(not_advancing_refusal(other)),
         }
+    }
+
+    /// REQUIREMENTS_SPEC advance: the core `requirements_published` command
+    /// over the task's stored artifacts.
+    fn advance_spec(&self, task: &Task) -> ApiResult<AdvanceOutcome> {
+        let arts = self.store.artifacts(task.id)?;
+        let m = workflow::requirements_published(task, &arts, None, &self.actor, Utc::now())?;
+        self.store.commit(task.lock_version, &m)?;
+        Ok(AdvanceOutcome {
+            from: task.state,
+            to: m.task.state,
+            rework_gate: false,
+        })
+    }
+
+    /// REVIEW_REPORT advance: the verdict is required and parsed before the
+    /// core command runs.
+    fn advance_review(&self, task: &Task, verdict: Option<&str>) -> ApiResult<AdvanceOutcome> {
+        let Some(s) = verdict else {
+            return Err(ApiError::refused(
+                "bad_request",
+                "publishing REVIEW_REPORT requires --verdict approved|needs_revision",
+            ));
+        };
+        let v = Self::parse_verdict(s)?;
+        let m = workflow::review_recorded(task, v, None, &self.actor, Utc::now())?;
+        self.store.commit(task.lock_version, &m)?;
+        Ok(AdvanceOutcome {
+            from: task.state,
+            to: m.task.state,
+            rework_gate: false,
+        })
+    }
+
+    /// IMPLEMENTATION_REPORT advance: the manual publication crosses the SAME
+    /// core command as the engine — including the empty-rework gate.
+    fn advance_implementation(&self, task: &Task, a: &Artifact) -> ApiResult<AdvanceOutcome> {
+        let arts = self.store.artifacts(task.id)?;
+        let facts = devai_runtime::gate::collect_implementation_report_facts(
+            &self.store,
+            task.id,
+            a,
+            &arts,
+            None,
+        )?;
+        let m = workflow::implementation_reported(task, &facts, &self.actor, Utc::now())?;
+        self.store.commit(task.lock_version, &m)?;
+        Ok(AdvanceOutcome {
+            from: task.state,
+            to: m.task.state,
+            rework_gate: m.task.state == TaskState::WaitingForInput,
+        })
     }
 
     /// `artifact.publish` — the compound operation: the row through the
@@ -1062,33 +1104,7 @@ impl Api {
         category: DataCategory,
     ) -> ApiResult<Artifact> {
         if let Some(c) = &contract {
-            let schema = self.store.get_contract(&c.name, c.version)?;
-            let Some(schema) = schema else {
-                return Err(ApiError::ContractUnregistered {
-                    contract: c.to_string(),
-                });
-            };
-            // Gate parity (ratified OQ-FG-05, REQ-FG-08): the manual path
-            // runs the SAME contract gate as the engine loop; enforcement
-            // is the API's, the presentation (warning + full list) the
-            // consumer's. REQ-HP-02 closes the last door: the paragraph
-            // halves (presence via `required`, edibility via the
-            // deterministic detector) live in this one call, and it reads
-            // the project's loaded `humanize.yaml` fresh — config stays
-            // the source of truth, a broken template is a LOUD refusal,
-            // never a silent factory fallback on the manual path.
-            let humanize = self.humanize_policy()?;
-            let violations = devai_runtime::artifact_violations(
-                String::from_utf8_lossy(&content).as_ref(),
-                Some(schema.as_str()),
-                &humanize,
-            )?;
-            if !violations.is_empty() {
-                return Err(ApiError::ContractRejected {
-                    contract: c.to_string(),
-                    violations,
-                });
-            }
+            self.contract_gate(c, &content)?;
         }
         Ok(self.store.publish_artifact(ArtifactDraft {
             task_id,
@@ -1102,6 +1118,37 @@ impl Api {
             execution_id: execution,
             depends_on: depends,
         })?)
+    }
+
+    /// The manual publication's contract gate (ratified OQ-FG-05, REQ-FG-08):
+    /// an unregistered contract is a typed refusal; a registered one runs the
+    /// SAME gate the engine loop runs, so enforcement is the API's and the
+    /// presentation (warning + full list) the consumer's. REQ-HP-02 closes
+    /// the last door: the paragraph halves (presence via `required`,
+    /// edibility via the deterministic detector) live in this one call, and
+    /// it reads the project's loaded `humanize.yaml` fresh — config stays the
+    /// source of truth, a broken template is a LOUD refusal, never a silent
+    /// factory fallback on the manual path.
+    fn contract_gate(&self, c: &ContractRef, content: &[u8]) -> ApiResult<()> {
+        let schema = self.store.get_contract(&c.name, c.version)?;
+        let Some(schema) = schema else {
+            return Err(ApiError::ContractUnregistered {
+                contract: c.to_string(),
+            });
+        };
+        let humanize = self.humanize_policy()?;
+        let violations = devai_runtime::artifact_violations(
+            String::from_utf8_lossy(content).as_ref(),
+            Some(schema.as_str()),
+            &humanize,
+        )?;
+        if violations.is_empty() {
+            return Ok(());
+        }
+        Err(ApiError::ContractRejected {
+            contract: c.to_string(),
+            violations,
+        })
     }
 
     // ---- task: dependencies -----------------------------------------------
@@ -1146,37 +1193,55 @@ impl Api {
         rationale: Option<String>,
     ) -> ApiResult<OverrideResult> {
         // RATIFIED DECISION OQ2 — the human escape of the dependency gate.
-        // `refs` = the FULL task ids covered, so a NEW blocker is never
-        // covered by an old decision (the gate stands for anything not
-        // named here).
         let task = self.store.resolve_task(id)?;
-        let mut blockers: Vec<String> = Vec::new();
-        for b in &blocker {
-            blockers.push(self.store.resolve_task(b)?.id.to_string());
-        }
-        if blockers.is_empty() {
-            // Without explicit blockers, ratify against exactly the
-            // blockers OPEN right now (computed from stored data).
-            let deps = self.store.task_dependencies(task.id)?;
-            blockers = workflow::open_blockers(&task, &deps);
-            if blockers.is_empty() {
-                return Err(ApiError::refused(
-                    "bad_request",
-                    format!(
-                        "task {} has no open blocking dependencies — nothing to override",
-                        short_id(&task.id)
-                    ),
-                ));
+        let blockers = self.override_blockers(&task, &blocker)?;
+        self.record_override(&task, &blockers, rationale)?;
+        Ok(OverrideResult {
+            task,
+            override_blockers: blockers,
+        })
+    }
+
+    /// The blocker set an override covers, as FULL task ids: the explicit
+    /// refs, else exactly the blockers OPEN right now (computed from stored
+    /// data, so a NEW blocker is never covered by an old decision).
+    fn override_blockers(&self, task: &Task, requested: &[String]) -> ApiResult<Vec<String>> {
+        if !requested.is_empty() {
+            let mut ids: Vec<String> = Vec::new();
+            for b in requested {
+                ids.push(self.store.resolve_task(b)?.id.to_string());
             }
+            return Ok(ids);
         }
+        let deps = self.store.task_dependencies(task.id)?;
+        let blockers = workflow::open_blockers(task, &deps);
+        if blockers.is_empty() {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "task {} has no open blocking dependencies — nothing to override",
+                    short_id(&task.id)
+                ),
+            ));
+        }
+        Ok(blockers)
+    }
+
+    /// The stored decision row plus the append-only event of one override.
+    fn record_override(
+        &self,
+        task: &Task,
+        blockers: &[String],
+        rationale: Option<String>,
+    ) -> ApiResult<()> {
         self.store.record_decision(&Decision {
             id: new_id(),
             task_id: task.id,
             kind: decision_kind::DEPENDENCY_OVERRIDE.into(),
             verdict: Verdict::Approved,
             actor: self.actor.clone(),
-            rationale: rationale.clone(),
-            refs: blockers.clone(),
+            rationale,
+            refs: blockers.to_vec(),
             created_at: Utc::now(),
         })?;
         self.store.insert_event(
@@ -1185,10 +1250,7 @@ impl Api {
             &self.actor,
             serde_json::json!({ "blockers": blockers }),
         )?;
-        Ok(OverrideResult {
-            task,
-            override_blockers: blockers,
-        })
+        Ok(())
     }
 
     pub fn task_merge_record(&self, req: MergeRecordReq) -> ApiResult<MergeResult> {
@@ -1533,31 +1595,48 @@ impl Api {
         // — before the index would reject it, in the old order (check,
         // then guard).
         self.guard_running_writer(&task)?;
-        let rd = self.store.get_role(&req.role)?;
-        let version = rd.as_ref().map(|r| r.version).unwrap_or(1);
-        let inputs_str: Vec<String> = {
-            let mut v = Vec::new();
-            for p in &req.inputs {
-                v.push(self.store.get_artifact(p)?.id.to_string());
-            }
-            v
-        };
-        // REQ-001/REQ-006: even a manually started execution binds to the
-        // workspace state the platform observes right now — computed
-        // platform-side, never supplied by the caller.
+        let version = self
+            .store
+            .get_role(&req.role)?
+            .map(|r| r.version)
+            .unwrap_or(1);
+        let inputs = self.execution_inputs(&req.inputs)?;
+        let e = self.new_execution_row(req, task.id, version, inputs)?;
+        self.store.start_execution(&e)?;
+        Ok(ExecStarted { execution: e, task })
+    }
+
+    /// The stored ids of the declared inputs, in the caller's order.
+    fn execution_inputs(&self, inputs: &[String]) -> ApiResult<Vec<String>> {
+        let mut ids: Vec<String> = Vec::new();
+        for p in inputs {
+            ids.push(self.store.get_artifact(p)?.id.to_string());
+        }
+        Ok(ids)
+    }
+
+    /// The RUNNING row a manual start opens: the workspace revision is
+    /// computed platform-side (REQ-001/REQ-006 — never supplied by the
+    /// caller) and the owner columns are captured platform-side (REQ-SW-03:
+    /// this process is the one opening the row, so the orphan detect,
+    /// REQ-SW-04, finds exactly that when it exits with the row RUNNING).
+    fn new_execution_row(
+        &self,
+        req: ExecStartReq,
+        task_id: Id,
+        role_version: u32,
+        inputs: Vec<String>,
+    ) -> ApiResult<RoleExecution> {
         let revision = Engine::new(&self.store).current_revision()?;
-        // REQ-SW-03: the owner columns are captured platform-side — this
-        // process is the one OPENING the row (the orphan detect, REQ-SW-04,
-        // finds exactly that when it exits with the row still RUNNING).
         let (owner_pid, owner_host, owner_process_start) = liveness::current_owner().into_columns();
-        let e = RoleExecution {
+        Ok(RoleExecution {
             id: new_id(),
-            task_id: task.id,
+            task_id,
             role_slug: req.role,
-            role_version: version,
+            role_version,
             agent_name: req.agent,
             status: ExecutionStatus::Running,
-            inputs: inputs_str,
+            inputs,
             summary: None,
             error: None,
             started_at: Utc::now(),
@@ -1570,9 +1649,7 @@ impl Api {
             owner_pid,
             owner_host,
             owner_process_start,
-        };
-        self.store.start_execution(&e)?;
-        Ok(ExecStarted { execution: e, task })
+        })
     }
 
     pub fn exec_finish(&self, exec_id: &str, summary: Option<String>) -> ApiResult<RoleExecution> {
@@ -1759,6 +1836,29 @@ impl Api {
             .map(|s| s.to_string())
             .or_else(|| Some("(report assembled before @2 — no rendering)".into())))
     }
+}
+
+// ---------------------------------------------------------------------------
+// free helpers
+// ---------------------------------------------------------------------------
+
+/// The typed refusal of a standalone `artifact.advance` for a kind that
+/// carries no workflow advance (QA R5). The listed advancing kinds are
+/// DERIVED from the core predicate — never a hand-copied set (QA R4).
+fn not_advancing_refusal(kind: ArtifactKind) -> ApiError {
+    ApiError::refused(
+        "artifact_kind_not_advancing",
+        format!(
+            "{} carries no workflow advance — the advancing kinds are {} (the row alone lands via `artifact.publish_row`; publish through `artifact.publish` to get the row and its advance in one call)",
+            kind.as_str(),
+            ArtifactKind::ALL
+                .iter()
+                .filter(|k| k.advances_state())
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2068,6 +2168,22 @@ mod tests {
         );
     }
 
+    /// A publish request of the CURRENT spec kind — the shape both publish
+    /// paths of the parity test take.
+    fn spec_publish(id: &Id, name: &str) -> PublishReq {
+        PublishReq {
+            id: id.to_string(),
+            kind: ArtifactKind::RequirementsSpec,
+            name: name.into(),
+            content: name.as_bytes().to_vec(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        }
+    }
+
     /// The compound `artifact_publish` and the phased
     /// `artifact_publish_row` + `artifact_advance` converge on the SAME
     /// store effects — the registry dispatch and the CLI command execute
@@ -2082,34 +2198,9 @@ mod tests {
         // be published from ANALYSIS onward.
         api.task_start(&a.to_string()).unwrap();
         api.task_start(&b.to_string()).unwrap();
-        let content = |x: &str| x.as_bytes().to_vec();
 
-        let compound = api
-            .artifact_publish(PublishReq {
-                id: a.to_string(),
-                kind: ArtifactKind::RequirementsSpec,
-                name: "s1".into(),
-                content: content("s1"),
-                depends: vec![],
-                contract: None,
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
-        let row = api
-            .artifact_publish_row(PublishReq {
-                id: b.to_string(),
-                kind: ArtifactKind::RequirementsSpec,
-                name: "s2".into(),
-                content: content("s2"),
-                depends: vec![],
-                contract: None,
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
+        let compound = api.artifact_publish(spec_publish(&a, "s1")).unwrap();
+        let row = api.artifact_publish_row(spec_publish(&b, "s2")).unwrap();
         let adv = api
             .artifact_advance(AdvanceReq {
                 id: b.to_string(),
@@ -2659,15 +2750,21 @@ mod tests {
         assert_eq!(stored.lock_version, 1);
     }
 
-    /// REQ-BIND-03 under the ratified OQ-BIND-2 rule: the backfill binds
-    /// every UNBOUND NON-TERMINAL task, leaves terminal history at its old
-    /// address, never re-binds another project's task, and is idempotent on
-    /// re-application. Each binding is one `task.project.set` event.
-    #[test]
-    fn task_project_backfill_applies_the_ratified_rule_idempotently() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = api(dir.path());
-        let p = devai_project(&api);
+    /// The four task kinds the backfill rule distinguishes, plus the two
+    /// projects: freshly created for every test so no state leaks.
+    struct BackfillFixture {
+        free: Id,
+        owned: Id,
+        closed: Id,
+        home: Id,
+        project: Id,
+        other: Id,
+    }
+
+    /// One unbound task, one owned by ANOTHER project, one parked terminal,
+    /// one already on `devai` — the exact spread of the ratified rule.
+    fn backfill_fixture(api: &Api) -> BackfillFixture {
+        let p = devai_project(api);
         let other = api
             .project_add(ProjectAddReq {
                 name: "other".into(),
@@ -2675,37 +2772,55 @@ mod tests {
                 repos: vec![],
             })
             .unwrap();
-
-        let free = fresh_task(&api, "unbound-draft");
-        let owned = fresh_task(&api, "owned-by-other");
+        let free = fresh_task(api, "unbound-draft");
+        let owned = fresh_task(api, "owned-by-other");
         api.task_project_set(TaskProjectSetReq {
             id: owned.to_string(),
             project: other.id.to_string(),
             expected_lock: None,
         })
         .unwrap();
-        let closed = fresh_task(&api, "terminal-history");
+        let closed = fresh_task(api, "terminal-history");
         // Park it terminal through the workflow plane (CANCELLED).
         api.task_op(&closed.to_string(), WorkflowOp::Cancel { reason: None })
             .unwrap();
-        let home = fresh_task(&api, "already-devai");
+        let home = fresh_task(api, "already-devai");
         api.task_project_set(TaskProjectSetReq {
             id: home.to_string(),
             project: p.id.to_string(),
             expected_lock: None,
         })
         .unwrap();
+        BackfillFixture {
+            free,
+            owned,
+            closed,
+            home,
+            project: p.id,
+            other: other.id,
+        }
+    }
+
+    /// REQ-BIND-03 under the ratified OQ-BIND-2 rule: the backfill binds
+    /// every UNBOUND NON-TERMINAL task, leaves terminal history at its old
+    /// address, never re-binds another project's task. Each binding is one
+    /// `task.project.set` event.
+    #[test]
+    fn task_project_backfill_applies_the_ratified_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let f = backfill_fixture(&api);
 
         let o = api.task_project_backfill("devai").expect("backfill runs");
-        assert_eq!(o.bound, vec![free]);
-        assert_eq!(o.already_bound, vec![home]);
-        assert_eq!(o.skipped_terminal, vec![closed]);
-        assert_eq!(o.skipped_other_project, vec![owned]);
+        assert_eq!(o.bound, vec![f.free]);
+        assert_eq!(o.already_bound, vec![f.home]);
+        assert_eq!(o.skipped_terminal, vec![f.closed]);
+        assert_eq!(o.skipped_other_project, vec![f.owned]);
 
-        let stored = api.store.get_task(&free.to_string()).unwrap();
-        assert_eq!(stored.project_id, Some(p.id));
+        let stored = api.store.get_task(&f.free.to_string()).unwrap();
+        assert_eq!(stored.project_id, Some(f.project));
         assert_eq!(stored.lock_version, 2);
-        let evs = api.task_events(&free.to_string(), None).unwrap();
+        let evs = api.task_events(&f.free.to_string(), None).unwrap();
         assert_eq!(
             evs.iter()
                 .filter(|e| e.kind == event_kind::TASK_PROJECT_SET)
@@ -2714,24 +2829,38 @@ mod tests {
         );
         // Terminal history untouched, another project's task not re-bound.
         assert_eq!(
-            api.store.get_task(&closed.to_string()).unwrap().project_id,
+            api.store
+                .get_task(&f.closed.to_string())
+                .unwrap()
+                .project_id,
             None
         );
         assert_eq!(
-            api.store.get_task(&owned.to_string()).unwrap().project_id,
-            Some(other.id)
+            api.store.get_task(&f.owned.to_string()).unwrap().project_id,
+            Some(f.other)
         );
+    }
 
-        // Re-application: no candidates left, nothing changes anywhere.
+    /// Re-application finds no candidates and changes nothing; an unknown
+    /// project refuses typed before touching a row.
+    #[test]
+    fn task_project_backfill_is_idempotent_and_refuses_unknown_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let f = backfill_fixture(&api);
+        api.task_project_backfill("devai").expect("first run");
+
         let o2 = api.task_project_backfill("devai").unwrap();
         assert!(o2.bound.is_empty());
         assert_eq!(o2.already_bound.len(), 2);
         assert_eq!(
-            api.store.get_task(&free.to_string()).unwrap().lock_version,
+            api.store
+                .get_task(&f.free.to_string())
+                .unwrap()
+                .lock_version,
             2
         );
 
-        // Unknown project refuses typed, before touching a row.
         let err = api
             .task_project_backfill("no-such")
             .expect_err("unknown project refuses");

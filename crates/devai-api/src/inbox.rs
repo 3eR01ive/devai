@@ -30,7 +30,7 @@
 
 use chrono::{DateTime, Utc};
 use devai_core::inbox::InboxWaitPolicy;
-use devai_core::types::{Artifact, Question, Task};
+use devai_core::types::{Artifact, ArtifactKind, ArtifactStatus, Question, Task};
 use serde::Serialize;
 
 use crate::{ApiResult, QualityReportView};
@@ -105,4 +105,88 @@ impl SpecBodyView {
 /// same data the window uses (no test-only copy of the wording).
 pub fn factory_inbox_wait_policy() -> ApiResult<InboxWaitPolicy> {
     Ok(devai_store::config::factory_inbox_wait_policy()?)
+}
+
+/// Which REQUIREMENTS_SPEC an APPROVAL row presents, and whether it is the
+/// CURRENT one: CURRENT when the task has one, else the LAST spec artifact
+/// (`current: false` — ratified OQ-GATE-3: the row says «not current, the
+/// approve is impossible» instead of showing nothing). Selection is a pure
+/// function of stored artifact rows, so it is tested without a store.
+pub fn pick_spec_artifact(arts: &[Artifact]) -> Option<(&Artifact, bool)> {
+    let specs: Vec<&Artifact> = arts
+        .iter()
+        .filter(|a| a.kind == ArtifactKind::RequirementsSpec)
+        .collect();
+    if let Some(current) = specs
+        .iter()
+        .find(|a| a.status == ArtifactStatus::Current)
+        .copied()
+    {
+        return Some((current, true));
+    }
+    specs
+        .into_iter()
+        .max_by_key(|a| (a.seq, a.created_at))
+        .map(|a| (a, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devai_core::types::{ArtifactStatus, DataCategory, new_id};
+
+    fn spec(seq: u32, status: ArtifactStatus) -> Artifact {
+        Artifact {
+            id: new_id(),
+            task_id: new_id(),
+            kind: ArtifactKind::RequirementsSpec,
+            name: format!("spec-v{seq}.json"),
+            seq,
+            category: DataCategory::Artifact,
+            status,
+            sha256: "0".repeat(64),
+            size: 2,
+            media_type: "application/json".into(),
+            contract: None,
+            created_by: "user".into(),
+            execution_id: None,
+            depends_on: vec![],
+            created_at: "2026-11-06T12:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        }
+    }
+
+    /// Ratified OQ-GATE-3: CURRENT wins; with no CURRENT the LAST spec rides
+    /// with `current: false`; the row is never empty when a spec exists.
+    #[test]
+    fn spec_selection_prefers_current_then_the_last() {
+        let current = spec(3, ArtifactStatus::Current);
+        let stale = spec(2, ArtifactStatus::Stale);
+        let arts = vec![stale.clone(), current.clone()];
+        let (picked, is_current) = pick_spec_artifact(&arts).unwrap();
+        assert_eq!(picked.id, current.id);
+        assert!(is_current);
+
+        // No CURRENT row: the highest seq is the one presented, labelled.
+        let arts = vec![
+            spec(1, ArtifactStatus::Superseded),
+            spec(2, ArtifactStatus::Stale),
+        ];
+        let (picked, is_current) = pick_spec_artifact(&arts).unwrap();
+        assert_eq!(picked.seq, 2);
+        assert!(!is_current, "the not-current label rides on the same view");
+
+        // No spec at all: nothing to present (the caller keeps the empty
+        // presentation honest rather than inventing one).
+        assert!(pick_spec_artifact(&[]).is_none());
+    }
+
+    /// A non-spec artifact never becomes the APPROVAL presentation.
+    #[test]
+    fn spec_selection_ignores_other_kinds() {
+        let mut report = spec(1, ArtifactStatus::Current);
+        report.kind = ArtifactKind::QualityReport;
+        assert!(pick_spec_artifact(&[report]).is_none());
+    }
 }

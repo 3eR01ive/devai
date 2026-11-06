@@ -26,6 +26,7 @@ mod registry;
 pub use error::{ApiError, ApiResult, ErrorCode};
 pub use inbox::{
     InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts, factory_inbox_wait_policy,
+    pick_spec_artifact,
 };
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
@@ -207,69 +208,89 @@ impl Api {
     /// AC3: orphans are distinguishable by data, not by operator pgrep).
     pub fn task_active(&self) -> ApiResult<ActiveSnapshot> {
         let now = Utc::now();
+        let running = self.running_executions()?;
+        let facts = self.execution_task_facts(&running)?;
+        let rows = running
+            .iter()
+            .map(|e| self.active_row(e, &facts, now))
+            .collect();
+        Ok(ActiveSnapshot {
+            snapshot_at: now,
+            rows,
+        })
+    }
+
+    /// The RUNNING rows, oldest work first; the id tie-break keeps snapshots
+    /// deterministic.
+    fn running_executions(&self) -> ApiResult<Vec<RoleExecution>> {
         let mut running: Vec<RoleExecution> = self
             .store
             .list_executions(None)?
             .into_iter()
             .filter(|e| e.status == ExecutionStatus::Running)
             .collect();
-        // Oldest work first, id tie-break keeps snapshots deterministic.
         running.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
+        Ok(running)
+    }
 
+    /// One task read per DISTINCT task of the snapshot, plus whether its
+    /// worktree was ever prepared — the per-row facts, computed once.
+    fn execution_task_facts(
+        &self,
+        running: &[RoleExecution],
+    ) -> ApiResult<HashMap<Id, (Task, bool)>> {
         let mut facts: HashMap<Id, (Task, bool)> = HashMap::new();
-        for e in &running {
-            if !facts.contains_key(&e.task_id) {
-                let t = self.store.resolve_task(&e.task_id.to_string())?;
-                let prepared = self
-                    .store
-                    .all_events_for_task(t.id)?
-                    .iter()
-                    .any(|ev| ev.kind == event_kind::WORKTREE_PREPARED);
-                facts.insert(e.task_id, (t, prepared));
+        for e in running {
+            if facts.contains_key(&e.task_id) {
+                continue;
             }
+            let t = self.store.resolve_task(&e.task_id.to_string())?;
+            let prepared = self
+                .store
+                .all_events_for_task(t.id)?
+                .iter()
+                .any(|ev| ev.kind == event_kind::WORKTREE_PREPARED);
+            facts.insert(e.task_id, (t, prepared));
         }
+        Ok(facts)
+    }
 
-        // One liveness observation per row, computed ONCE (read-only:
-        // REQ-SW-06 — detection never writes and never signals a process).
-        let rows = running
-            .iter()
-            .map(|e| {
-                let (t, prepared) = &facts[&e.task_id];
-                let live = liveness::check_owner(
-                    e.owner_pid,
-                    e.owner_host.as_deref(),
-                    e.owner_process_start,
-                );
-                let terminal = t.state.is_terminal();
-                ActiveRow {
-                    id: e.id.to_string(),
-                    task_id: e.task_id.to_string(),
-                    role: format!("{}@{}", e.role_slug, e.role_version),
-                    role_slug: e.role_slug.clone(),
-                    role_version: e.role_version,
-                    agent_name: e.agent_name.clone(),
-                    started_at: e.started_at,
-                    elapsed_seconds: (now - e.started_at).num_seconds().max(0),
-                    state: t.state.as_str().to_string(),
-                    stale: terminal || live == liveness::Liveness::Dead,
-                    stale_terminal_task: terminal,
-                    stale_dead_owner: live == liveness::Liveness::Dead,
-                    owner_pid: e.owner_pid,
-                    owner_host: e.owner_host.clone(),
-                    owner_liveness: live.as_str().to_string(),
-                    branch: prepared.then(|| devai_runtime::worktree::branch_name(e.task_id)),
-                    worktree: prepared.then(|| {
-                        devai_runtime::worktree::path_for(&self.home, e.task_id)
-                            .display()
-                            .to_string()
-                    }),
-                }
-            })
-            .collect();
-        Ok(ActiveSnapshot {
-            snapshot_at: now,
-            rows,
-        })
+    /// One row of the snapshot: the stored facts plus ONE liveness
+    /// observation (read-only: REQ-SW-06 — detection never writes and never
+    /// signals a process).
+    fn active_row(
+        &self,
+        e: &RoleExecution,
+        facts: &HashMap<Id, (Task, bool)>,
+        now: DateTime<Utc>,
+    ) -> ActiveRow {
+        let (t, prepared) = &facts[&e.task_id];
+        let live =
+            liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
+        let terminal = t.state.is_terminal();
+        ActiveRow {
+            id: e.id.to_string(),
+            task_id: e.task_id.to_string(),
+            role: format!("{}@{}", e.role_slug, e.role_version),
+            role_slug: e.role_slug.clone(),
+            role_version: e.role_version,
+            agent_name: e.agent_name.clone(),
+            started_at: e.started_at,
+            elapsed_seconds: (now - e.started_at).num_seconds().max(0),
+            state: t.state.as_str().to_string(),
+            stale: terminal || live == liveness::Liveness::Dead,
+            stale_terminal_task: terminal,
+            stale_dead_owner: live == liveness::Liveness::Dead,
+            owner_pid: e.owner_pid,
+            owner_host: e.owner_host.clone(),
+            owner_liveness: live.as_str().to_string(),
+            branch: prepared.then(|| devai_runtime::worktree::branch_name(e.task_id)),
+            worktree: prepared.then(|| {
+                devai_runtime::worktree::path_for(&self.home, e.task_id)
+                    .display()
+                    .to_string()
+            }),
+        }
     }
 
     /// The CURRENT quality report the human signs at the QA gate — full
@@ -410,20 +431,10 @@ impl Api {
     /// presentation never presents raw bytes or an empty body (ratified
     /// OQ-GATE-3/4).
     fn spec_facts(&self, arts: &[Artifact]) -> ApiResult<Option<SpecFacts>> {
-        let specs: Vec<&Artifact> = arts
-            .iter()
-            .filter(|a| a.kind == ArtifactKind::RequirementsSpec)
-            .collect();
-        let current = specs
-            .iter()
-            .find(|a| a.status == ArtifactStatus::Current)
-            .copied();
-        let (artifact, current) = match current {
-            Some(a) => (a, true),
-            None => match specs.into_iter().max_by_key(|a| (a.seq, a.created_at)) {
-                Some(a) => (a, false),
-                None => return Ok(None),
-            },
+        // Selection is a pure unit (`inbox::pick_spec_artifact`): CURRENT,
+        // else the LAST one with `current: false`.
+        let Some((artifact, current)) = inbox::pick_spec_artifact(arts) else {
+            return Ok(None);
         };
         let body = match self.store.read_blob(&artifact.sha256) {
             Ok(bytes) => match String::from_utf8(bytes) {
@@ -551,47 +562,65 @@ impl Api {
     /// the stored size, raw bytes are never rendered (AC3).
     pub fn task_workspace_diff(&self, id_prefix: &str, path: &str) -> ApiResult<WorkspaceDiffView> {
         let f = self.workspace_facts(id_prefix)?;
-        let mut view = WorkspaceDiffView {
-            task: f.task.clone(),
-            path: path.to_string(),
-            state: f.state.to_string(),
-            branch: f.branch.clone(),
-            baseline: f.bound_head.clone(),
-            tip: f.tip.clone(),
-            binary: false,
-            size_bytes: None,
-            diff: None,
-            note: f.note.clone(),
-        };
+        let mut view = workspace_diff_view(&f, path);
         let (Some(repo), Some(baseline), Some(tip)) = (&f.repo, &f.bound_head, &f.tip) else {
             // No_isolation / unavailable: the typed verdict (state + stored
             // facts) is the honest answer — there is no list to be in.
             return Ok(view);
         };
-        let git_err = |e| ApiError::Runtime(RuntimeError::Worktree(e));
+        Self::require_in_changeset(
+            repo,
+            baseline,
+            tip,
+            path,
+            &devai_core::types::short_id_str(&f.task),
+        )?;
+        Self::fill_diff(&mut view, repo, baseline, tip, path)?;
+        Ok(view)
+    }
+
+    /// REQ-WV-02 AC2: a path outside the changeset is a typed `not_found`
+    /// the consumer branches on by code, not by text.
+    fn require_in_changeset(
+        repo: &Path,
+        baseline: &str,
+        tip: &str,
+        path: &str,
+        task: &str,
+    ) -> ApiResult<()> {
         let listed = worktree::diff_name_status(repo, baseline, tip)
-            .map_err(git_err)?
+            .map_err(|e| ApiError::Runtime(RuntimeError::Worktree(e)))?
             .into_iter()
             .any(|(_, p)| p == path);
-        if !listed {
-            // REQ-WV-02 AC2: the UI branches on the API code, not the text.
-            return Err(ApiError::Store(devai_store::StoreError::NotFound(
-                "workspace file".into(),
-                format!(
-                    "`{path}` is not in the changeset of task {}",
-                    devai_core::types::short_id_str(&f.task)
-                ),
-            )));
+        if listed {
+            return Ok(());
         }
+        Err(ApiError::Store(devai_store::StoreError::NotFound(
+            "workspace file".into(),
+            format!("`{path}` is not in the changeset of task {task}"),
+        )))
+    }
+
+    /// The content half (REQ-WV-02 AC3): binary content is a binary fact with
+    /// the stored size, raw bytes are never rendered; text is the unified
+    /// diff over exactly the range the changeset view used.
+    fn fill_diff(
+        view: &mut WorkspaceDiffView,
+        repo: &Path,
+        baseline: &str,
+        tip: &str,
+        path: &str,
+    ) -> ApiResult<()> {
+        let git_err = |e| ApiError::Runtime(RuntimeError::Worktree(e));
         if worktree::diff_is_binary(repo, baseline, tip, path).map_err(git_err)? {
             view.binary = true;
             view.size_bytes = worktree::blob_size(repo, tip, path)
                 .or_else(|| worktree::blob_size(repo, baseline, path));
             view.note = Some("modified, binary content — raw bytes are not rendered".into());
-            return Ok(view);
+            return Ok(());
         }
         view.diff = Some(worktree::diff_text(repo, baseline, tip, path).map_err(git_err)?);
-        Ok(view)
+        Ok(())
     }
 
     /// The one resolution both workspace operations share, split into two
@@ -626,54 +655,8 @@ impl Api {
         t: &Task,
         events: &[WorkflowEvent],
     ) -> ApiResult<()> {
-        let git_err = |e| ApiError::Runtime(RuntimeError::Worktree(e));
-        let bound = f.bound_head.clone();
-        let last_commit = f.commits.last().map(|c| c.commit.clone());
-
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Some(dir) = &f.worktree {
-            candidates.push(PathBuf::from(dir));
-        }
-        if let Some(ev) = events
-            .iter()
-            .rev()
-            .find(|e| e.kind == event_kind::REWORK_MERGED)
-        {
-            if let Some(ws) = string_field(&ev.payload, "workspace") {
-                candidates.push(PathBuf::from(ws));
-            }
-        }
-        if let Some(pid) = t.project_id {
-            if let Some(p) = self.store.get_project(&pid.to_string())? {
-                for r in p.repos {
-                    candidates.push(PathBuf::from(r));
-                }
-            }
-        }
-        // This repository holds the task's branch, or resolves the stored
-        // commits; a git failure in the probe is an Err, not a verdict.
-        let owns_facts = |dir: &Path| -> ApiResult<bool> {
-            match worktree::branch_tip(dir, t.id).map_err(git_err)? {
-                Some(_) => Ok(true),
-                None => Ok(bound
-                    .as_deref()
-                    .is_some_and(|h| worktree::commit_resolvable(dir, h))
-                    || last_commit
-                        .as_deref()
-                        .is_some_and(|c| worktree::commit_resolvable(dir, c))),
-            }
-        };
-        let mut repo: Option<PathBuf> = None;
-        for c in &candidates {
-            if !worktree::is_git_repo(c) {
-                continue;
-            }
-            if owns_facts(c)? {
-                repo = Some(c.clone());
-                break;
-            }
-        }
-        let Some(repo) = repo else {
+        let candidates = self.repo_candidates(f, t, events)?;
+        let Some(repo) = Self::owning_repo(&candidates, t.id, f)? else {
             f.state = workspace_state::UNAVAILABLE;
             f.note = Some(
                 "no recorded repository path is reachable and owns the stored commits — only the stored facts can be shown"
@@ -682,8 +665,84 @@ impl Api {
             return Ok(());
         };
         f.repo = Some(repo.clone());
+        Self::resolve_workspace_tip(f, &repo, t.id)?;
+        Ok(())
+    }
 
-        if let Some(tip) = worktree::branch_tip(&repo, t.id).map_err(git_err)? {
+    /// The candidate directories, strictly from stored paths: the recorded
+    /// worktree directory, the workspace recorded at `rework.merged`, then
+    /// the task's project repositories.
+    fn repo_candidates(
+        &self,
+        f: &WorkspaceFacts,
+        t: &Task,
+        events: &[WorkflowEvent],
+    ) -> ApiResult<Vec<PathBuf>> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = &f.worktree {
+            candidates.push(PathBuf::from(dir));
+        }
+        if let Some(ws) = Self::merged_workspace(events) {
+            candidates.push(PathBuf::from(ws));
+        }
+        if let Some(pid) = t.project_id {
+            if let Some(p) = self.store.get_project(&pid.to_string())? {
+                for r in p.repos {
+                    candidates.push(PathBuf::from(r));
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// The workspace recorded by the LAST `rework.merged` event, if any.
+    fn merged_workspace(events: &[WorkflowEvent]) -> Option<String> {
+        events
+            .iter()
+            .rev()
+            .find(|e| e.kind == event_kind::REWORK_MERGED)
+            .and_then(|ev| string_field(&ev.payload, "workspace"))
+    }
+
+    /// The first candidate that is a git repository AND owns the task's
+    /// stored facts (its branch, or the stored commits). A git failure in
+    /// the probe propagates as an Err, never as a verdict.
+    fn owning_repo(
+        candidates: &[PathBuf],
+        task_id: Id,
+        f: &WorkspaceFacts,
+    ) -> ApiResult<Option<PathBuf>> {
+        let bound = f.bound_head.as_deref();
+        let last_commit = f.commits.last().map(|c| c.commit.as_str());
+        for c in candidates {
+            if !worktree::is_git_repo(c) {
+                continue;
+            }
+            let owns = match worktree::branch_tip(c, task_id)
+                .map_err(|e| ApiError::Runtime(RuntimeError::Worktree(e)))?
+            {
+                Some(_) => true,
+                None => {
+                    bound.is_some_and(|h| worktree::commit_resolvable(c, h))
+                        || last_commit.is_some_and(|k| worktree::commit_resolvable(c, k))
+                }
+            };
+            if owns {
+                return Ok(Some(c.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Live branch first; branch gone → the stored commits still resolvable
+    /// in the object store (`historical`, partial) or neither (`unavailable`).
+    /// A git failure of the probe is an Err (R3: never a verdict).
+    fn resolve_workspace_tip(f: &mut WorkspaceFacts, repo: &Path, task_id: Id) -> ApiResult<()> {
+        let bound = f.bound_head.clone();
+        let last_commit = f.commits.last().map(|c| c.commit.clone());
+        if let Some(tip) = worktree::branch_tip(repo, task_id)
+            .map_err(|e| ApiError::Runtime(RuntimeError::Worktree(e)))?
+        {
             f.state = workspace_state::LIVE;
             f.tip = Some(tip);
             return Ok(());
@@ -692,10 +751,10 @@ impl Api {
         // object store, (c) is everything else.
         let both_resolvable = bound
             .as_deref()
-            .is_some_and(|h| worktree::commit_resolvable(&repo, h))
+            .is_some_and(|h| worktree::commit_resolvable(repo, h))
             && last_commit
                 .as_deref()
-                .is_some_and(|c| worktree::commit_resolvable(&repo, c));
+                .is_some_and(|c| worktree::commit_resolvable(repo, c));
         if both_resolvable {
             f.state = workspace_state::HISTORICAL;
             f.partial = true;
@@ -1022,34 +1081,64 @@ fn string_field(payload: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Events-scan unit (the R2 split): a pure fold over the task's stored
-/// workflow events — which composition facts the workspace has (baseline =
-/// the `bound_head` of the FIRST `worktree.prepared`, per-run commit
-/// stamps, merge heads) and whether isolation happened at all. No git, no
-/// filesystem: data only. The repository question is a separate unit
-/// (`Api::resolve_workspace_repo`), so both workspace operations keep one
-/// shared resolution and the list/diff stay consistent by construction.
-fn workspace_event_facts(t: &Task, events: &[WorkflowEvent]) -> WorkspaceFacts {
-    let mut bound_head: Option<String> = None;
-    let mut worktree_dir: Option<String> = None;
-    let mut merged: Option<(Option<String>, Option<String>)> = None;
-    let mut commits: Vec<WorkspaceCommitStamp> = Vec::new();
-    let mut isolated = false;
-    for ev in events {
+/// The stored-facts half of `task.workspace_diff`: the typed verdict and the
+/// range as RESOLVED (before any content is read). Shared by the diff
+/// operation and its tests; the content half is `Api::fill_diff`.
+fn workspace_diff_view(f: &WorkspaceFacts, path: &str) -> WorkspaceDiffView {
+    WorkspaceDiffView {
+        task: f.task.clone(),
+        path: path.to_string(),
+        state: f.state.to_string(),
+        branch: f.branch.clone(),
+        baseline: f.bound_head.clone(),
+        tip: f.tip.clone(),
+        binary: false,
+        size_bytes: None,
+        diff: None,
+        note: f.note.clone(),
+    }
+}
+
+/// The raw composition facts of one task's event stream — the fold's output,
+/// before they become a `WorkspaceFacts` view. One struct so the fold and the
+/// constructor are separate cohesive units.
+#[derive(Default)]
+struct EventFacts {
+    isolated: bool,
+    bound_head: Option<String>,
+    worktree_dir: Option<String>,
+    merged: Option<(Option<String>, Option<String>)>,
+    commits: Vec<WorkspaceCommitStamp>,
+}
+
+impl EventFacts {
+    /// A pure fold over the stored events: which composition facts the
+    /// workspace has (baseline = the `bound_head` of the FIRST
+    /// `worktree.prepared`, per-run commit stamps, merge heads) and whether
+    /// isolation happened at all. No git, no filesystem: data only.
+    fn fold(events: &[WorkflowEvent]) -> EventFacts {
+        let mut f = EventFacts::default();
+        for ev in events {
+            f.apply(ev);
+        }
+        f
+    }
+
+    fn apply(&mut self, ev: &WorkflowEvent) {
         match ev.kind.as_str() {
             event_kind::WORKTREE_PREPARED => {
-                isolated = true;
+                self.isolated = true;
                 // The FIRST prepared stamp owns the baseline: isolation
                 // branched from the bound head of its first composition
                 // (REQ-WV-03); a later rework reuses the branch.
-                if bound_head.is_none() {
-                    bound_head = string_field(&ev.payload, "bound_head");
+                if self.bound_head.is_none() {
+                    self.bound_head = string_field(&ev.payload, "bound_head");
                 }
-                worktree_dir = string_field(&ev.payload, "worktree");
+                self.worktree_dir = string_field(&ev.payload, "worktree");
             }
             event_kind::WORKTREE_COMMITTED => {
                 if let Some(commit) = string_field(&ev.payload, "commit") {
-                    commits.push(WorkspaceCommitStamp {
+                    self.commits.push(WorkspaceCommitStamp {
                         execution: string_field(&ev.payload, "execution").unwrap_or_default(),
                         commit,
                         at: ev.created_at,
@@ -1057,7 +1146,7 @@ fn workspace_event_facts(t: &Task, events: &[WorkflowEvent]) -> WorkspaceFacts {
                 }
             }
             event_kind::REWORK_MERGED => {
-                merged = Some((
+                self.merged = Some((
                     string_field(&ev.payload, "head_before"),
                     string_field(&ev.payload, "head_after"),
                 ));
@@ -1065,31 +1154,39 @@ fn workspace_event_facts(t: &Task, events: &[WorkflowEvent]) -> WorkspaceFacts {
             _ => {}
         }
     }
-    let (head_before, head_after) = merged.unwrap_or((None, None));
+}
 
-    let mut f = WorkspaceFacts {
+/// Events-scan unit (the R2 split): the stored workflow events become the
+/// workspace facts of the view. The repository question is a separate unit
+/// (`Api::resolve_workspace_repo`), so both workspace operations keep one
+/// shared resolution and the list/diff stay consistent by construction.
+fn workspace_event_facts(t: &Task, events: &[WorkflowEvent]) -> WorkspaceFacts {
+    let e = EventFacts::fold(events);
+    let (head_before, head_after) = e.merged.unwrap_or((None, None));
+    WorkspaceFacts {
         task: t.id.to_string(),
-        isolated,
+        isolated: e.isolated,
         // The branch name is deterministic from the task id — the same
         // spelling task.active publishes for a prepared worktree
         // (worktree::branch_name is the only place the shape exists).
-        branch: isolated.then(|| worktree::branch_name(t.id)),
-        worktree: worktree_dir,
-        bound_head,
-        commits,
+        branch: e.isolated.then(|| worktree::branch_name(t.id)),
+        worktree: e.worktree_dir,
+        bound_head: e.bound_head,
+        commits: e.commits,
         head_before,
         head_after,
         state: workspace_state::NO_ISOLATION,
         repo: None,
         tip: None,
         partial: false,
-        note: None,
-    };
-    if !isolated {
-        f.note = Some(
-            "the task has no worktree.prepared event — its work was never isolated; there is no changeset to show"
-                .into(),
-        );
+        note: no_isolation_note(e.isolated),
     }
-    f
+}
+
+/// The honest note of a task that never isolated its work (REQ-WV-01 AC2).
+fn no_isolation_note(isolated: bool) -> Option<String> {
+    (!isolated).then(|| {
+        "the task has no worktree.prepared event — its work was never isolated; there is no changeset to show"
+            .to_string()
+    })
 }

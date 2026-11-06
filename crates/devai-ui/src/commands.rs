@@ -183,9 +183,12 @@ pub fn wait_group_of(policy: &InboxWaitPolicy, state: &TaskState) -> Option<Wait
 
 /// Terminal states carry no live demand on the operator: their leftover
 /// unanswered notes are not shown (the reference group speaks about the
-/// line that could continue to need an answer).
+/// line that could continue to need an answer). Terminality is the CORE's
+/// question, not this file's: `TaskState::is_terminal` owns the rule, so a
+/// new terminal variant cannot silently keep its notes visible (R1 of the
+/// QA return).
 pub fn is_note_visible(state: &TaskState) -> bool {
-    !matches!(state, TaskState::Accepted | TaskState::Cancelled)
+    !state.is_terminal()
 }
 
 /// The demand text + CLI hint of one wait row, rendered generically from the
@@ -193,21 +196,28 @@ pub fn is_note_visible(state: &TaskState) -> bool {
 /// variant whose stored-data predicate holds (the WAITING parked/no-question
 /// split). `{id}` and `{question_id}` are substituted with stored ids, so
 /// the printed command is real — never a placeholder (R6 of the earlier
-/// audit). `None` when the table does not list the state as a wait state.
+/// audit). `Ok(None)` when the table does not list the state as a wait
+/// state; `Err` when the table names a predicate this renderer does not
+/// know — fail-closed at the render site, not only in the config validator
+/// (R2 of the QA return): an unknown `when` must never silently match
+/// nothing and leave the row with an empty demand and an empty command.
 pub fn wait_demand_for(
     policy: &InboxWaitPolicy,
     state: &TaskState,
     id: &str,
     open_questions: &[Question],
-) -> Option<WaitDemand> {
-    let row = policy.state(*state)?;
+) -> Result<Option<WaitDemand>, UiError> {
+    let Some(row) = policy.state(*state) else {
+        return Ok(None);
+    };
     if row.group == WaitGroup::NotWait {
-        return None;
+        return Ok(None);
     }
     // Only a BLOCKING question parks the task (workflow.rs:750-763) — a
     // stray non-blocking note must never become the printed command.
     let parked = open_questions.iter().find(|q| q.blocking);
-    let (demand, commands) = match variant_of(row, parked.is_some()) {
+    let variant = variant_of(row, parked.is_some())?;
+    let (demand, commands) = match variant {
         Some(variant) => (variant.demand.as_str(), variant.commands.as_slice()),
         None => (row.demand.as_str(), row.commands.as_slice()),
     };
@@ -216,10 +226,10 @@ pub fn wait_demand_for(
         .map(|template| substitute(template, id, parked))
         .collect::<Vec<_>>()
         .join(" · ");
-    Some(WaitDemand {
+    Ok(Some(WaitDemand {
         demand: demand.to_string(),
         cli_hint,
-    })
+    }))
 }
 
 /// One rendered demand.
@@ -229,16 +239,36 @@ pub struct WaitDemand {
     pub cli_hint: String,
 }
 
-/// The variant whose `when` predicate the stored data satisfies.
-fn variant_of<'a>(
-    row: &'a WaitStatePolicy,
+/// The variant whose `when` predicate the stored data satisfies. FAIL-CLOSED
+/// (R2 of the QA return): a token outside [`WHEN_ALL`] is an error at the
+/// render site — the config validator rejects it too, but a table that
+/// reached this point (an older home, a hand-edited snapshot) must never
+/// degrade into "matches nothing" and an empty demand with an empty
+/// command. `Ok(None)` = the row has no conditional wording at all.
+fn variant_of(
+    row: &WaitStatePolicy,
     has_parked_question: bool,
-) -> Option<&'a devai_core::inbox::WaitVariant> {
-    row.variants.iter().find(|v| match v.when.as_str() {
-        WHEN_PARKED_QUESTION => has_parked_question,
-        WHEN_NO_QUESTION => !has_parked_question,
-        _ => false,
-    })
+) -> Result<Option<&devai_core::inbox::WaitVariant>, UiError> {
+    for variant in &row.variants {
+        let matched = match variant.when.as_str() {
+            WHEN_PARKED_QUESTION => has_parked_question,
+            WHEN_NO_QUESTION => !has_parked_question,
+            unknown => {
+                return Err(UiError {
+                    code: "invalid_config".to_string(),
+                    message: format!(
+                        "inbox_waits: unknown variant predicate `{unknown}` (accepted: {}); \
+                         the row cannot be rendered",
+                        devai_core::inbox::WHEN_ALL.join(", ")
+                    ),
+                });
+            }
+        };
+        if matched {
+            return Ok(Some(variant));
+        }
+    }
+    Ok(None)
 }
 
 /// Placeholder substitution of one command template.
@@ -641,7 +671,7 @@ pub fn execution_liveness(
 #[tauri::command]
 pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
     let facts = state.api().inbox_snapshot()?;
-    Ok(compose_wait_snapshot(facts))
+    compose_wait_snapshot(facts)
 }
 
 /// The section composer: PURE — data in, section out. No Tauri state, no
@@ -650,37 +680,82 @@ pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
 /// without a live window). Membership is read from the declarative table by
 /// the exact stored state token; grouping, ordering (REQ-GATE-08: longest
 /// waiting first) and the badge are computed here on the same snapshot.
-pub fn compose_wait_snapshot(facts: InboxSnapshotView) -> WaitSnapshot {
+/// `Err` only for a table the renderer cannot read (R2: fail-closed).
+pub fn compose_wait_snapshot(facts: InboxSnapshotView) -> Result<WaitSnapshot, UiError> {
     let InboxSnapshotView { policy, tasks, .. } = facts;
-    let mut waiting: Vec<WaitRow> = Vec::new();
-    let mut human_stopped: Vec<WaitRow> = Vec::new();
-    let mut notes: Vec<WaitNote> = Vec::new();
-    for facts in tasks {
-        match wait_group_of(&policy, &facts.task.state) {
-            Some(WaitGroup::Platform) => {
-                if let Some(row) = wait_row_from(&policy, facts) {
-                    waiting.push(row);
-                }
+    let mut section = SectionRows::default();
+    for task_facts in tasks {
+        section.push(&policy, task_facts)?;
+    }
+    Ok(section.finish())
+}
+
+/// The three lists of the section, filled row by row: the platform's wait
+/// rows, the operator-stopped rows and the reference notes (ratified
+/// OQ-GATE-1). One struct so the grouping decision is made once per task and
+/// the badge in `finish` sees the very rows that were produced.
+#[derive(Default)]
+struct SectionRows {
+    waiting: Vec<WaitRow>,
+    human_stopped: Vec<WaitRow>,
+    notes: Vec<WaitNote>,
+}
+
+impl SectionRows {
+    /// File one task's facts into its group. The group comes from the
+    /// declarative table (`wait_group_of`); `None` — a state the table does
+    /// not know — carries no wait row but may still own reference notes.
+    fn push(&mut self, policy: &InboxWaitPolicy, facts: InboxTaskFacts) -> Result<(), UiError> {
+        let target = match wait_group_of(policy, &facts.task.state) {
+            Some(WaitGroup::Platform) => &mut self.waiting,
+            Some(WaitGroup::HumanStopped) => &mut self.human_stopped,
+            // `NotWait` rows have no place in the section; the arm exists
+            // because the group vocabulary is shared with the table.
+            Some(WaitGroup::NotWait) => return Ok(()),
+            None => {
+                self.notes.extend(reference_notes_from(facts));
+                return Ok(());
             }
-            Some(WaitGroup::HumanStopped) => {
-                if let Some(row) = wait_row_from(&policy, facts) {
-                    human_stopped.push(row);
-                }
-            }
-            // `wait_group_of` never yields NotWait (it maps it to None); the
-            // arm exists only because the type is the shared three-token
-            // vocabulary — no state is silently dropped either way.
-            Some(WaitGroup::NotWait) => {}
-            None => notes.extend(reference_notes_from(facts)),
+        };
+        if let Some(row) = wait_row_from(policy, facts)? {
+            target.push(row);
+        }
+        Ok(())
+    }
+
+    /// Ordering by wait age (REQ-GATE-08) and the badge, in ONE place, so
+    /// `badge == waiting.len() + human_stopped.len() + notes.len()` holds by
+    /// construction (the ratified OQ-GATE-1 shows the notes as rows).
+    fn finish(mut self) -> WaitSnapshot {
+        sort_by_wait_age(&mut self.waiting);
+        sort_by_wait_age(&mut self.human_stopped);
+        self.notes.sort_by(|a, b| {
+            a.task
+                .updated_at
+                .cmp(&b.task.updated_at)
+                .then(a.question.created_at.cmp(&b.question.created_at))
+        });
+        let badge = self.waiting.len() + self.human_stopped.len() + self.notes.len();
+        WaitSnapshot {
+            waiting: self.waiting,
+            human_stopped: self.human_stopped,
+            notes: self.notes,
+            badge,
         }
     }
-    build_wait_snapshot(waiting, human_stopped, notes)
+}
+
+fn sort_by_wait_age(rows: &mut [WaitRow]) {
+    rows.sort_by(|a, b| a.task.updated_at.cmp(&b.task.updated_at));
 }
 
 /// One wait row from the batch facts: stored OPEN questions, the demand
 /// rendered from the data table, and the click-presentation of the gate type
 /// (spec for APPROVAL, report for QA — already read by the batch op).
-fn wait_row_from(policy: &InboxWaitPolicy, facts: InboxTaskFacts) -> Option<WaitRow> {
+fn wait_row_from(
+    policy: &InboxWaitPolicy,
+    facts: InboxTaskFacts,
+) -> Result<Option<WaitRow>, UiError> {
     let InboxTaskFacts {
         task,
         questions,
@@ -692,17 +767,19 @@ fn wait_row_from(policy: &InboxWaitPolicy, facts: InboxTaskFacts) -> Option<Wait
         .into_iter()
         .filter(|q| q.status == QuestionStatus::Open)
         .collect();
-    let demand = wait_demand_for(policy, &task.state, &short_id(&task.id), &open_questions)?;
-    let spec = spec.as_ref().map(|spec| spec_of(&task, spec));
-    Some(WaitRow {
+    let Some(demand) = wait_demand_for(policy, &task.state, &short_id(&task.id), &open_questions)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(WaitRow {
+        spec: spec.as_ref().map(|spec| spec_of(&task, spec)),
         task,
         demand: demand.demand,
         cli_hint: demand.cli_hint,
         open_questions,
-        spec,
         report,
         report_note,
-    })
+    }))
 }
 
 /// Reference-group rows (ratified OQ-GATE-1): stored OPEN NON-blocking
@@ -722,37 +799,6 @@ fn reference_notes_from(facts: InboxTaskFacts) -> Vec<WaitNote> {
             question,
         })
         .collect()
-}
-
-/// Assemble the section from already-grouped rows: ordering by wait age
-/// (REQ-GATE-08) and the badge live in this ONE place, so the AC3 invariant
-/// `badge == waiting.len() + human_stopped.len() + notes.len()` (the
-/// ratified OQ-GATE-1 shows the notes as rows, so they are counted) is
-/// exercised by `badge_counts_every_section_row` rather than restated.
-fn build_wait_snapshot(
-    mut waiting: Vec<WaitRow>,
-    mut human_stopped: Vec<WaitRow>,
-    mut notes: Vec<WaitNote>,
-) -> WaitSnapshot {
-    sort_by_wait_age(&mut waiting);
-    sort_by_wait_age(&mut human_stopped);
-    notes.sort_by(|a, b| {
-        a.task
-            .updated_at
-            .cmp(&b.task.updated_at)
-            .then(a.question.created_at.cmp(&b.question.created_at))
-    });
-    let badge = waiting.len() + human_stopped.len() + notes.len();
-    WaitSnapshot {
-        waiting,
-        human_stopped,
-        notes,
-        badge,
-    }
-}
-
-fn sort_by_wait_age(rows: &mut [WaitRow]) {
-    rows.sort_by(|a, b| a.task.updated_at.cmp(&b.task.updated_at));
 }
 
 /// The APPROVAL presentation (REQ-GATE-04/05): the artifact and body chosen
@@ -968,23 +1014,24 @@ mod tests {
         assert!(is_note_visible(&TaskState::Implementation));
     }
 
+    /// The rendered demand of one state from the FACTORY table — the shared
+    /// seam of the wording tests below (a missing row is a test failure, not
+    /// a silent `None`).
+    fn demand_row(state: TaskState, id: &str, questions: &[Question]) -> WaitDemand {
+        let policy = devai_api::factory_inbox_wait_policy().unwrap();
+        wait_demand_for(&policy, &state, id, questions)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{state:?} missing from the data table"))
+    }
+
     /// REQ-GATE-03 AC1 + REQ-GATE-06 AC2, rendered from the data table (R1):
     /// every wait type carries human wording of the demand and the literal
-    /// CLI command; the tokens of the gate types stay distinguishable. The
-    /// WAITING hint must be runnable as printed: a real question id when a
-    /// BLOCKING question is parked, the empty-rework ratification otherwise.
+    /// CLI command. Ратифицированная «дословная команда» = фактический
+    /// синтаксис CLI: rationale/text — --long-опции (crates/devai-cli), не
+    /// позиционные аргументы.
     #[test]
     fn wait_demand_names_the_operation_and_the_cli() {
-        // Ратифицированная «дословная команда» = фактический синтаксис CLI:
-        // rationale/text — --long-опции (crates/devai-cli/src/main.rs,
-        // Approve/Reject/Accept/Return/Answer), не позиционные аргументы.
-        let policy = devai_api::factory_inbox_wait_policy().unwrap();
-        let row = |state: TaskState, id: &str, questions: &[Question]| {
-            wait_demand_for(&policy, &state, id, questions)
-                .unwrap_or_else(|| panic!("{state:?} missing from the data table"))
-        };
-
-        let approval = row(TaskState::Approval, "01a1b0ea", &[]);
+        let approval = demand_row(TaskState::Approval, "01a1b0ea", &[]);
         assert!(approval.demand.contains("спецификацию"), "{approval:?}");
         assert!(
             approval
@@ -999,42 +1046,7 @@ mod tests {
             "{approval:?}"
         );
 
-        // Parked question: the real id, not a literal placeholder.
-        let parked = question_fixture("01a1b0ea-0000-4000-8000-0000000000bb", true);
-        let waiting = row(TaskState::WaitingForInput, "x", &[parked]);
-        assert!(
-            waiting
-                .cli_hint
-                .contains("question answer 01a1b0ea-0000-4000-8000-0000000000bb --text"),
-            "{waiting:?}"
-        );
-        assert!(!waiting.cli_hint.contains("<вопрос-id>"), "{waiting:?}");
-
-        // A stray non-blocking note beside the parked blocking question must
-        // not steal the printed id: only the blocking one is answerable.
-        let note = question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false);
-        let parked = question_fixture("01a1b0ea-0000-4000-8000-0000000000bb", true);
-        let waiting = row(TaskState::WaitingForInput, "x", &[note, parked]);
-        assert!(
-            waiting
-                .cli_hint
-                .contains("question answer 01a1b0ea-0000-4000-8000-0000000000bb --text"),
-            "{waiting:?}"
-        );
-
-        // No BLOCKING question = the empty-rework gate: the real escape
-        // command (a non-blocking note is not answerable from that gate).
-        let note = question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false);
-        let waiting = row(TaskState::WaitingForInput, "x", &[note]);
-        assert!(waiting.demand.contains("пустого реворка"), "{waiting:?}");
-        assert!(
-            waiting
-                .cli_hint
-                .contains("task ratify-empty-rework x --rationale"),
-            "{waiting:?}"
-        );
-
-        let qa = row(TaskState::Qa, "abc123", &[]);
+        let qa = demand_row(TaskState::Qa, "abc123", &[]);
         assert!(qa.demand.contains("quality-отчёт"), "{qa:?}");
         assert!(
             qa.cli_hint.contains("task accept abc123 --rationale"),
@@ -1044,13 +1056,86 @@ mod tests {
             qa.cli_hint.contains("task return abc123 --rationale"),
             "{qa:?}"
         );
-        let failed = row(TaskState::Failed, "f1", &[]);
+        let failed = demand_row(TaskState::Failed, "f1", &[]);
         assert!(failed.cli_hint.contains("task resume f1"), "{failed:?}");
 
         // A non-wait state has no row at all — the table says so (group
         // `none`), so there is nothing to render: honest emptiness, not a
         // placeholder token dressed as a command.
-        assert!(wait_demand_for(&policy, &TaskState::Implementation, "i1", &[]).is_none());
+        let policy = devai_api::factory_inbox_wait_policy().unwrap();
+        assert!(
+            wait_demand_for(&policy, &TaskState::Implementation, "i1", &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The WAITING hint must be runnable as printed: a real question id when
+    /// a BLOCKING question is parked — a stray non-blocking note beside it
+    /// must not steal the printed id.
+    #[test]
+    fn waiting_demand_names_the_parked_question() {
+        let parked = question_fixture("01a1b0ea-0000-4000-8000-0000000000bb", true);
+        let waiting = demand_row(TaskState::WaitingForInput, "x", &[parked]);
+        assert!(
+            waiting
+                .cli_hint
+                .contains("question answer 01a1b0ea-0000-4000-8000-0000000000bb --text"),
+            "{waiting:?}"
+        );
+        assert!(!waiting.cli_hint.contains("<вопрос-id>"), "{waiting:?}");
+
+        let note = question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false);
+        let parked = question_fixture("01a1b0ea-0000-4000-8000-0000000000bb", true);
+        let waiting = demand_row(TaskState::WaitingForInput, "x", &[note, parked]);
+        assert!(
+            waiting
+                .cli_hint
+                .contains("question answer 01a1b0ea-0000-4000-8000-0000000000bb --text"),
+            "{waiting:?}"
+        );
+    }
+
+    /// No BLOCKING question = the empty-rework gate: the real escape command
+    /// (a non-blocking note is not answerable from that gate).
+    #[test]
+    fn waiting_demand_names_the_empty_rework_gate() {
+        let note = question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false);
+        let waiting = demand_row(TaskState::WaitingForInput, "x", &[note]);
+        assert!(waiting.demand.contains("пустого реворка"), "{waiting:?}");
+        assert!(
+            waiting
+                .cli_hint
+                .contains("task ratify-empty-rework x --rationale"),
+            "{waiting:?}"
+        );
+    }
+
+    /// R2 of the QA return: an unknown `when` predicate in the delivered
+    /// table is a LOUD render error, not a silently non-matching variant.
+    /// Without the parked-question term the row would otherwise print empty
+    /// demand and an empty command — the fail-open shape this test kills.
+    #[test]
+    fn unknown_variant_predicate_is_a_render_error() {
+        let mut policy = devai_api::factory_inbox_wait_policy().unwrap();
+        let row = policy
+            .states
+            .get_mut("WAITING_FOR_INPUT")
+            .expect("factory table has the parking state");
+        row.variants[0].when = "parked".to_string();
+        let err = wait_demand_for(
+            &policy,
+            &TaskState::WaitingForInput,
+            "01a1b0ea",
+            &[question_fixture(
+                "01a1b0ea-0000-4000-8000-0000000000bb",
+                true,
+            )],
+        )
+        .expect_err("an unknown predicate must not render");
+        assert_eq!(err.code, "invalid_config");
+        assert!(err.message.contains("`parked`"), "{}", err.message);
+        assert!(err.message.contains("parked_question"), "{}", err.message);
     }
 
     /// REQ-GATE-04 AC1 + ratified OQ-GATE-4: the paragraph and the spec's
@@ -1109,52 +1194,38 @@ mod tests {
         }
     }
 
+    /// One row of the section with the given title — the minimal shape the
+    /// grouping and badge tests need.
+    fn wait_row_fixture(title: &str, now: chrono::DateTime<chrono::Utc>) -> WaitRow {
+        WaitRow {
+            task: task_fixture(title, "", now),
+            demand: "w".into(),
+            cli_hint: "h".into(),
+            open_questions: vec![],
+            spec: None,
+            report: None,
+            report_note: None,
+        }
+    }
+
     /// Badge discipline (REQ-GATE-08 AC3): the badge is the number of rows
     /// of the section on the same snapshot — waiting + human-stopped + the
     /// ratified OQ-GATE-1 reference notes (they are shown rows, not a
-    /// hidden bucket). Asserted through `build_wait_snapshot` itself, the
-    /// same function `inbox_view` ends with, so a badge formula that
-    /// dropped the notes would fail here.
+    /// hidden bucket). Asserted through `SectionRows::finish` itself, the
+    /// same function `compose_wait_snapshot` ends with, so a badge formula
+    /// that dropped the notes would fail here.
     #[test]
     fn badge_counts_every_section_row() {
         let now = now_fixture();
-        let snapshot = build_wait_snapshot(
-            vec![WaitRow {
-                task: task_fixture("a", "", now),
-                demand: "w".into(),
-                cli_hint: "h".into(),
-                open_questions: vec![],
-                spec: None,
-                report: None,
-                report_note: None,
-            }],
-            vec![WaitRow {
-                task: task_fixture("b", "", now),
-                demand: "w".into(),
-                cli_hint: "h".into(),
-                open_questions: vec![],
-                spec: None,
-                report: None,
-                report_note: None,
-            }],
-            vec![WaitNote {
+        let snapshot = SectionRows {
+            waiting: vec![wait_row_fixture("a", now)],
+            human_stopped: vec![wait_row_fixture("b", now)],
+            notes: vec![WaitNote {
                 task: task_fixture("c", "", now),
-                question: Question {
-                    id: devai_core::types::new_id(),
-                    task_id: devai_core::types::new_id(),
-                    execution_id: None,
-                    text: "заметка".into(),
-                    context: None,
-                    options: vec![],
-                    blocking: false,
-                    status: QuestionStatus::Open,
-                    answer: None,
-                    answered_by: None,
-                    answered_at: None,
-                    created_at: now,
-                },
+                question: question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false),
             }],
-        );
+        }
+        .finish();
         // 1 waiting + 1 human-stopped + 1 note.
         assert_eq!(snapshot.badge, 3);
         assert_eq!(
@@ -1393,6 +1464,7 @@ mod tests {
         ];
         for (token, state, questions) in cases {
             let demand = wait_demand_for(&policy, &state, id, &questions)
+                .unwrap()
                 .unwrap_or_else(|| panic!("{token} missing from the demand table"));
             actual.insert(
                 token.to_string(),
@@ -1406,86 +1478,122 @@ mod tests {
         );
     }
 
-    /// R4 (QA return, ts/coverage-static): the COMPOSER is exercised on an
-    /// injected batch snapshot — all thirteen stored states, both groups,
-    /// the notes group, the gate presentations and their honest absences.
-    /// The earlier iteration only counted badge numbers; the assembly itself
-    /// was uncovered.
-    #[test]
-    fn composer_renders_every_state_and_presentation_branch() {
+    /// The injected batch snapshot the composer tests drive: all thirteen
+    /// stored states, both groups, the notes group, the gate presentations
+    /// and their honest absences. Returns the snapshot input plus the parked
+    /// question id the CLI hint must name.
+    fn composer_fixture() -> (
+        InboxSnapshotView,
+        devai_core::types::Id,
+        chrono::DateTime<chrono::Utc>,
+    ) {
         let policy = devai_api::factory_inbox_wait_policy().unwrap();
         let now = now_fixture();
-        let at = |secs: i64| now + chrono::Duration::seconds(secs);
-        let states = [
-            TaskState::Draft,
-            TaskState::Analysis,
-            TaskState::Review,
-            TaskState::Approval,
-            TaskState::Implementation,
-            TaskState::Qa,
-            TaskState::Rework,
-            TaskState::WaitingForInput,
-            TaskState::Paused,
-            TaskState::Blocked,
-            TaskState::Failed,
-            TaskState::Accepted,
-            TaskState::Cancelled,
-        ];
-        // The parked blocking question of the WAITING row; its id must reach
-        // the printed CLI hint.
         let parked = question_fixture("01a1b0ea-0000-4000-8000-0000000000bb", true);
         let parked_id = parked.id;
-        let mut facts: Vec<InboxTaskFacts> = states
+        let mut facts: Vec<InboxTaskFacts> = ALL_STATES
             .iter()
             .enumerate()
-            .map(|(i, state)| {
-                let mut task = task_fixture(&format!("{state:?}"), "бизнес-описание", at(i as i64));
-                task.state = *state;
-                task.id = devai_core::types::new_id();
-                let mut questions = Vec::new();
-                if *state == TaskState::WaitingForInput {
-                    let mut q = parked.clone();
-                    q.task_id = task.id;
-                    questions.push(q);
-                }
-                if matches!(*state, TaskState::Implementation | TaskState::Accepted) {
-                    // A non-blocking note on an ACTIVE task is the OQ-GATE-1
-                    // reference row; the twin on a TERMINAL task stays out.
-                    let mut q = question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false);
-                    q.task_id = task.id;
-                    questions.push(q);
-                }
-                InboxTaskFacts {
-                    task,
-                    questions,
-                    spec: None,
-                    report: None,
-                    report_note: None,
-                }
-            })
+            .map(|(i, state)| facts_for_state(*state, at(now, i as i64), &parked))
             .collect();
+        attach_approval_spec(&mut facts, now);
+        attach_qa_rows(&mut facts, now, at(now, 600));
 
-        // APPROVAL presents the spec: human paragraph + the document's own
-        // open question, as separate data (REQ-GATE-04/05).
-        let approval_ix = states
+        (
+            InboxSnapshotView {
+                snapshot_at: now,
+                policy,
+                tasks: facts,
+            },
+            parked_id,
+            now,
+        )
+    }
+
+    /// Every stored TaskState in order — the composer tests drive all of them.
+    const ALL_STATES: [TaskState; 13] = [
+        TaskState::Draft,
+        TaskState::Analysis,
+        TaskState::Review,
+        TaskState::Approval,
+        TaskState::Implementation,
+        TaskState::Qa,
+        TaskState::Rework,
+        TaskState::WaitingForInput,
+        TaskState::Paused,
+        TaskState::Blocked,
+        TaskState::Failed,
+        TaskState::Accepted,
+        TaskState::Cancelled,
+    ];
+
+    fn at(base: chrono::DateTime<chrono::Utc>, secs: i64) -> chrono::DateTime<chrono::Utc> {
+        base + chrono::Duration::seconds(secs)
+    }
+
+    /// One task's injected facts for the given stored state: the parked
+    /// blocking question for WAITING_FOR_INPUT, the non-blocking note on the
+    /// ACTIVE row (its TERMINAL twin must stay out).
+    fn facts_for_state(
+        state: TaskState,
+        when: chrono::DateTime<chrono::Utc>,
+        parked: &Question,
+    ) -> InboxTaskFacts {
+        let mut task = task_fixture(&format!("{state:?}"), "бизнес-описание", when);
+        task.state = state;
+        task.id = devai_core::types::new_id();
+        let mut questions = Vec::new();
+        if state == TaskState::WaitingForInput {
+            let mut q = parked.clone();
+            q.task_id = task.id;
+            questions.push(q);
+        }
+        if matches!(state, TaskState::Implementation | TaskState::Accepted) {
+            let mut q = question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false);
+            q.task_id = task.id;
+            questions.push(q);
+        }
+        InboxTaskFacts {
+            task,
+            questions,
+            spec: None,
+            report: None,
+            report_note: None,
+        }
+    }
+
+    /// The APPROVAL row's presentation: human paragraph + the document's own
+    /// open question, as separate data (REQ-GATE-04/05).
+    fn attach_approval_spec(facts: &mut [InboxTaskFacts], now: chrono::DateTime<chrono::Utc>) {
+        let ix = facts
             .iter()
-            .position(|s| *s == TaskState::Approval)
-            .unwrap();
+            .position(|f| f.task.state == TaskState::Approval)
+            .expect("the fixture contains the APPROVAL row");
         let mut artifact = spec_artifact_fixture();
-        artifact.task_id = facts[approval_ix].task.id;
-        facts[approval_ix].spec = Some(SpecFacts {
+        artifact.task_id = facts[ix].task.id;
+        artifact.created_at = now;
+        facts[ix].spec = Some(SpecFacts {
             artifact,
             current: true,
             body: SpecBodyView::Text {
                 text: "{\"version\":3,\"human_paragraph\":\"Абзац спеки.\",\"open_questions\":[\"OQ-1: вопрос документа?\"]}".to_string(),
             },
         });
+    }
 
-        // The QA row with a signable report and a second QA row without one
-        // (honest platform text instead of an empty hole).
-        let qa_ix = states.iter().position(|s| *s == TaskState::Qa).unwrap();
-        facts[qa_ix].report = Some(QualityReportView {
-            task: facts[qa_ix].task.id.to_string(),
+    /// The QA rows: one with a signable report, one without (honest platform
+    /// text in `report_note` instead of an empty hole).
+    fn attach_qa_rows(
+        facts: &mut Vec<InboxTaskFacts>,
+        now: chrono::DateTime<chrono::Utc>,
+        empty_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let ix = facts
+            .iter()
+            .position(|f| f.task.state == TaskState::Qa)
+            .expect("the fixture contains the QA row");
+        facts[ix].report = Some(QualityReportView {
+            task: facts[ix].task.id.to_string(),
             artifact: devai_core::types::new_id().to_string(),
             seq: 2,
             contract: "quality-report@1".to_string(),
@@ -1494,18 +1602,21 @@ mod tests {
             report: serde_json::json!({"verdict": "PASS"}),
             report_text: Some("Отчёт на подпись".to_string()),
         });
-        let mut empty_qa = facts[qa_ix].clone();
+        let mut empty_qa = facts[ix].clone();
         empty_qa.task.id = devai_core::types::new_id();
-        empty_qa.task.updated_at = at(600);
+        empty_qa.task.updated_at = empty_at;
         empty_qa.report = None;
         empty_qa.report_note = Some("task has no CURRENT quality report".to_string());
         facts.push(empty_qa);
+    }
 
-        let snapshot = compose_wait_snapshot(InboxSnapshotView {
-            snapshot_at: now,
-            policy,
-            tasks: facts,
-        });
+    /// Membership and ordering: the stored state token picks the group from
+    /// the data table; the platform's rows sort by wait age; non-wait states
+    /// and the note of a TERMINAL task produce no row.
+    #[test]
+    fn composer_groups_rows_by_stored_state() {
+        let (facts, _, _) = composer_fixture();
+        let snapshot = compose_wait_snapshot(facts).unwrap();
 
         // Membership: APPROVAL, WAITING_FOR_INPUT, QA, QA-without-report,
         // FAILED on the platform group; PAUSED/BLOCKED stopped by the human;
@@ -1527,8 +1638,16 @@ mod tests {
                 .windows(2)
                 .all(|w| w[0].task.updated_at <= w[1].task.updated_at)
         );
+    }
 
-        // Presentation branches are carried through, not dropped.
+    /// The APPROVAL presentation arrives whole: the spec's human paragraph
+    /// and the DOCUMENT's own open questions (not registry questions), plus
+    /// the parked WAITING question whose id the CLI hint must carry.
+    #[test]
+    fn composer_carries_the_approval_and_waiting_presentations() {
+        let (facts, parked_id, _) = composer_fixture();
+        let snapshot = compose_wait_snapshot(facts).unwrap();
+
         let approval = &snapshot.waiting[0];
         let spec = approval.spec.as_ref().expect("APPROVAL presents its spec");
         assert_eq!(spec.human_paragraph.as_deref(), Some("Абзац спеки."));
@@ -1547,6 +1666,15 @@ mod tests {
             waiting_row.cli_hint
         );
         assert_eq!(waiting_row.open_questions.len(), 1);
+    }
+
+    /// The QA presentation arrives whole — the signable report on one row and
+    /// the platform's honest note on the row without one — and non-wait
+    /// states produced no row anywhere.
+    #[test]
+    fn composer_carries_the_qa_presentations() {
+        let (facts, _, _) = composer_fixture();
+        let snapshot = compose_wait_snapshot(facts).unwrap();
 
         let qa_row = snapshot
             .waiting

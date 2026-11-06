@@ -22,6 +22,7 @@ WAITING_FOR_INPUT / QA / FAILED) и ни одной остановленной �
 """
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -43,7 +44,45 @@ FRONTEND = os.path.join(CRATE_DIR, "frontend")
 DEV_PORT = int(os.environ.get("DEVAI_UI_PORT", "1420"))
 HARNESS = os.path.join(TOOLS_DIR, "ui_content.py")
 EXPECT = os.path.join(TOOLS_DIR, "ui_expectations.json")
-PLATFORM_WAIT_STATES = {"APPROVAL", "WAITING_FOR_INPUT", "QA", "FAILED", "PAUSED", "BLOCKED"}
+
+
+def config_dir(home):
+    """The home's config directory, resolved like the engine (REQ-HP-04)."""
+    return os.environ.get("DEVAI_CONFIG") or os.path.join(home, "config")
+
+
+def wait_states(home):
+    """The state tokens of the wait section, read from the DEMAND TABLE.
+
+    The table is platform data (`config/workflow/inbox-waits.yaml`, loaded by
+    `devai_store::config::load_inbox_wait_policy` with the merge-scan idiom:
+    files without the `inbox_waits:` key are inert, the LAST section wins).
+    The tool keeps no copy of the state set (R4 of the QA return): a state
+    that the table assigns to a group other than `none` is a wait state.
+    """
+    try:
+        import yaml
+    except ImportError as e:  # fail loudly — a silently empty set would SKIP
+        raise RuntimeError(f"нужен PyYAML для чтения таблицы ожиданий: {e}")
+    states = {}
+    root = config_dir(home)
+    wf = os.path.join(root, "workflow")
+    paths = sorted(glob.glob(os.path.join(wf, "*.yaml")) + glob.glob(os.path.join(wf, "*.yml")))
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+        if isinstance(doc, dict) and "inbox_waits" in doc:
+            states = (doc["inbox_waits"] or {}).get("states") or {}
+    if not states:
+        # Factory table: the same bytes the loader embeds.
+        with open(os.path.join(WORKSPACE_ROOT, "config", "workflow", "inbox-waits.yaml"),
+                  encoding="utf-8") as fh:
+            states = (yaml.safe_load(fh) or {}).get("inbox_waits", {}).get("states", {})
+    return {
+        token
+        for token, row in states.items()
+        if (row or {}).get("group", "none") != "none"
+    }
 
 
 def port_open(host, port):
@@ -60,7 +99,8 @@ def waiting_states(home):
     if res.returncode != 0:
         raise RuntimeError(res.stdout.decode(errors="replace"))
     tasks = json.loads(res.stdout.decode())
-    return sorted({t["state"] for t in tasks if t["state"] in PLATFORM_WAIT_STATES})
+    waits = wait_states(home)
+    return sorted({t["state"] for t in tasks if t["state"] in waits})
 
 
 class AtspiDriver:

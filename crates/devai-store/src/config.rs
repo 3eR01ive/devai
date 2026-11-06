@@ -1670,55 +1670,82 @@ fn validate_inbox_wait_policy(policy: &InboxWaitPolicy, where_: &str) -> StoreRe
                     .join(", ")
             ))
         })?;
-        let demand = row.demand.trim();
-        let commands: Vec<&str> = row.commands.iter().map(|c| c.trim()).collect();
-        match row.group {
-            devai_core::inbox::WaitGroup::NotWait => {
-                if !demand.is_empty() || !commands.is_empty() || !row.variants.is_empty() {
-                    return Err(cfg_err(format!(
-                        "{where_}: `{token}` has group `none` but declares a demand/command/variant — a non-wait state is never shown"
-                    )));
-                }
-            }
-            _ => {
-                if row.variants.is_empty() {
-                    if demand.is_empty() || commands.iter().all(|c| c.is_empty()) {
-                        return Err(cfg_err(format!(
-                            "{where_}: `{token}` is a wait state but has no demand or no CLI command"
-                        )));
-                    }
-                }
-            }
-        }
-        for variant in &row.variants {
-            if !devai_core::inbox::WHEN_ALL.contains(&variant.when.as_str()) {
+        validate_wait_row(token, row, where_)?;
+    }
+    Ok(())
+}
+
+/// One state's row: the group/demand consistency, its variants and its
+/// command templates.
+fn validate_wait_row(
+    token: &str,
+    row: &devai_core::inbox::WaitStatePolicy,
+    where_: &str,
+) -> StoreResult<()> {
+    let demand = row.demand.trim();
+    let commands: Vec<&str> = row.commands.iter().map(|c| c.trim()).collect();
+    match row.group {
+        devai_core::inbox::WaitGroup::NotWait => {
+            if !demand.is_empty() || !commands.is_empty() || !row.variants.is_empty() {
                 return Err(cfg_err(format!(
-                    "{where_}: `{token}` variant `when: {}` is unknown (accepted: {})",
-                    variant.when,
-                    devai_core::inbox::WHEN_ALL.join(", ")
+                    "{where_}: `{token}` has group `none` but declares a demand/command/variant — a non-wait state is never shown"
                 )));
             }
-            if variant.demand.trim().is_empty()
-                || variant.commands.iter().all(|c| c.trim().is_empty())
+        }
+        _ => {
+            if row.variants.is_empty()
+                && (demand.is_empty() || commands.iter().all(|c| c.is_empty()))
             {
                 return Err(cfg_err(format!(
-                    "{where_}: `{token}` variant `when: {}` has no demand or no CLI command",
-                    variant.when
+                    "{where_}: `{token}` is a wait state but has no demand or no CLI command"
                 )));
             }
         }
-        for command in row
-            .commands
-            .iter()
-            .chain(row.variants.iter().flat_map(|v| v.commands.iter()))
-        {
-            for placeholder in ["{id}", "{question_id}"] {
-                if command.contains(placeholder) && !command.contains("devai ") {
-                    return Err(cfg_err(format!(
-                        "{where_}: `{token}` command `{command}` carries a placeholder but is not a CLI template"
-                    )));
-                }
-            }
+    }
+    for variant in &row.variants {
+        validate_wait_variant(token, variant, where_)?;
+    }
+    let all_commands = row
+        .commands
+        .iter()
+        .chain(row.variants.iter().flat_map(|v| v.commands.iter()));
+    for command in all_commands {
+        validate_wait_command(token, command, where_)?;
+    }
+    Ok(())
+}
+
+/// One conditional wording: a KNOWN predicate and a non-empty demand plus at
+/// least one command.
+fn validate_wait_variant(
+    token: &str,
+    variant: &devai_core::inbox::WaitVariant,
+    where_: &str,
+) -> StoreResult<()> {
+    if !devai_core::inbox::WHEN_ALL.contains(&variant.when.as_str()) {
+        return Err(cfg_err(format!(
+            "{where_}: `{token}` variant `when: {}` is unknown (accepted: {})",
+            variant.when,
+            devai_core::inbox::WHEN_ALL.join(", ")
+        )));
+    }
+    if variant.demand.trim().is_empty() || variant.commands.iter().all(|c| c.trim().is_empty()) {
+        return Err(cfg_err(format!(
+            "{where_}: `{token}` variant `when: {}` has no demand or no CLI command",
+            variant.when
+        )));
+    }
+    Ok(())
+}
+
+/// A placeholder-carrying template must actually be a CLI invocation, so the
+/// printed hint stays runnable as printed.
+fn validate_wait_command(token: &str, command: &str, where_: &str) -> StoreResult<()> {
+    for placeholder in ["{id}", "{question_id}"] {
+        if command.contains(placeholder) && !command.contains("devai ") {
+            return Err(cfg_err(format!(
+                "{where_}: `{token}` command `{command}` carries a placeholder but is not a CLI template"
+            )));
         }
     }
     Ok(())
