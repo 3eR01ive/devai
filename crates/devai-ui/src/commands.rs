@@ -244,77 +244,112 @@ pub fn spec_presentation(
     task: &Task,
     current: bool,
 ) -> SpecPresentation {
-    let text = match body {
-        Ok(text) => text,
-        Err(reason) => {
-            return SpecPresentation {
-                artifact: artifact.clone(),
-                current,
-                human_paragraph: non_empty(task.business_description.as_str()).map(str::to_string),
-                paragraph_source: ParagraphSource::BusinessDescription,
-                open_questions: Vec::new(),
-                unavailable_note: Some(format!("{reason}; показываю бизнес-описание задачи")),
-            };
-        }
-    };
-    let parsed: Result<serde_json::Value, serde_json::Error> = serde_json::from_str(text);
-    match parsed {
-        Ok(value) => {
-            let paragraph = value
-                .get("human_paragraph")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let open_questions = value
-                .get("open_questions")
-                .and_then(|v| v.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| match item {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            match paragraph {
-                Some(paragraph) => SpecPresentation {
-                    artifact: artifact.clone(),
-                    current,
-                    human_paragraph: Some(paragraph),
-                    paragraph_source: ParagraphSource::Spec,
-                    open_questions,
-                    unavailable_note: None,
-                },
-                None => SpecPresentation {
-                    artifact: artifact.clone(),
-                    current,
-                    human_paragraph: non_empty(task.business_description.as_str())
-                        .map(str::to_string),
-                    paragraph_source: ParagraphSource::BusinessDescription,
-                    open_questions,
-                    // Ratified OQ-GATE-4, verbatim wording of the decision.
-                    unavailable_note: Some(
-                        "аналитик абзац не писал — спека до протокола; подставляю бизнес-описание задачи"
-                            .to_string(),
-                    ),
-                },
-            }
-        }
-        Err(_) => SpecPresentation {
-            artifact: artifact.clone(),
+    match body {
+        Ok(text) => document_presentation(artifact, task, current, text),
+        Err(reason) => fallback_presentation(
+            artifact,
+            task,
             current,
-            human_paragraph: non_empty(task.business_description.as_str()).map(str::to_string),
-            paragraph_source: ParagraphSource::BusinessDescription,
-            open_questions: Vec::new(),
-            unavailable_note: Some(
+            Vec::new(),
+            format!("{reason}; показываю бизнес-описание задачи"),
+        ),
+    }
+}
+
+/// The readable-body path: the document's own paragraph when it has one,
+/// else the ratified pre-protocol fallback. The document's `open_questions`
+/// survive either way (they are the document's, not the platform's).
+fn document_presentation(
+    artifact: &Artifact,
+    task: &Task,
+    current: bool,
+    text: &str,
+) -> SpecPresentation {
+    let value = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => value,
+        Err(_) => {
+            return fallback_presentation(
+                artifact,
+                task,
+                current,
+                Vec::new(),
                 "тело артефакта специки не разбирается как JSON; показываю бизнес-описание задачи"
                     .to_string(),
-            ),
+            );
+        }
+    };
+    let open_questions = spec_open_questions(&value);
+    match spec_paragraph(&value) {
+        Some(paragraph) => SpecPresentation {
+            artifact: artifact.clone(),
+            current,
+            human_paragraph: Some(paragraph),
+            paragraph_source: ParagraphSource::Spec,
+            open_questions,
+            unavailable_note: None,
         },
+        // Ratified OQ-GATE-4, verbatim wording of the decision.
+        None => fallback_presentation(
+            artifact,
+            task,
+            current,
+            open_questions,
+            "аналитик абзац не писал — спека до протокола; подставляю бизнес-описание задачи"
+                .to_string(),
+        ),
     }
+}
+
+/// The ONE constructor of the fail-closed shape (ratified OQ-GATE-4: the
+/// presentation is never empty). The three fail-closed branches — body
+/// unreadable, JSON unparsable, spec predating the paragraph protocol —
+/// differ only in `note`, never in the shape, so the wording cannot drift
+/// as a copy.
+fn fallback_presentation(
+    artifact: &Artifact,
+    task: &Task,
+    current: bool,
+    open_questions: Vec<String>,
+    note: String,
+) -> SpecPresentation {
+    SpecPresentation {
+        artifact: artifact.clone(),
+        current,
+        human_paragraph: non_empty(task.business_description.as_str()).map(str::to_string),
+        paragraph_source: ParagraphSource::BusinessDescription,
+        open_questions,
+        unavailable_note: Some(note),
+    }
+}
+
+/// The document's own top-level `human_paragraph`, trimmed; `None` when
+/// the key is absent, empty or not a string.
+fn spec_paragraph(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("human_paragraph")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The REQUIREMENTS_SPEC `open_questions` array verbatim (strings as-is,
+/// other JSON shapes stringified): questions of the document, never
+/// registry questions (REQ-GATE-05 AC2).
+fn spec_open_questions(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("open_questions")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| match item {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn non_empty(s: &str) -> Option<&str> {
@@ -570,70 +605,22 @@ pub fn execution_liveness(
 #[tauri::command]
 pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
     let api = state.api();
-    let tasks = api.task_list()?;
     let mut waiting: Vec<WaitRow> = Vec::new();
     let mut human_stopped: Vec<WaitRow> = Vec::new();
     let mut notes: Vec<WaitNote> = Vec::new();
-    for t in tasks {
-        match wait_group_of(&t.state) {
-            Some(group) => {
-                let (wants, cli_hint) = wait_demand_for(&t.state, &short_id(&t.id));
-                let open_questions: Vec<Question> = api
-                    .question_list(&t.id.to_string())?
-                    .into_iter()
-                    .filter(|q| q.status == QuestionStatus::Open)
-                    .collect();
-                let spec = if t.state == TaskState::Approval {
-                    approval_spec(&api, &t)?
-                } else {
-                    None
-                };
-                let (report, report_note) = if t.state == TaskState::Qa {
-                    match api.task_report(&t.id.to_string()) {
-                        Ok(view) => (Some(view), None),
-                        // The platform's own text on a missing report —
-                        // an honest fact, never an empty hole (REQ-UI-07
-                        // AC2 precedent).
-                        Err(e) => (None, Some(UiError::from(e).message)),
-                    }
-                } else {
-                    (None, None)
-                };
-                let row = WaitRow {
-                    task: t,
-                    wants,
-                    cli_hint,
-                    open_questions,
-                    spec,
-                    report,
-                    report_note,
-                };
-                match group {
-                    WaitGroup::Platform => waiting.push(row),
-                    WaitGroup::StoppedByHuman => human_stopped.push(row),
-                }
-            }
-            None => {
-                if is_note_visible(&t.state) {
-                    for q in api.question_list(&t.id.to_string())? {
-                        // A non-blocking OPEN question is a note on an
-                        // active task — the platform does NOT stand
-                        // (workflow.rs:747-748); reference group only.
-                        if q.status == QuestionStatus::Open && !q.blocking {
-                            notes.push(WaitNote {
-                                task: t.clone(),
-                                question: q,
-                            });
-                        }
-                    }
-                }
-            }
+    for task in api.task_list()? {
+        // Membership is the stored state token, never a UI guess
+        // (REQ-GATE-02); the two groups never mix (OQ-GATE-2).
+        match wait_group_of(&task.state) {
+            Some(WaitGroup::Platform) => waiting.push(wait_row(&api, task)?),
+            Some(WaitGroup::StoppedByHuman) => human_stopped.push(wait_row(&api, task)?),
+            None => notes.extend(reference_notes(&api, &task)?),
         }
     }
     // REQ-GATE-08: the longest-waiting first — task.updated_at ascending,
     // re-ordered here from stored data (task.list itself serves descending).
-    waiting.sort_by(|a, b| a.task.updated_at.cmp(&b.task.updated_at));
-    human_stopped.sort_by(|a, b| a.task.updated_at.cmp(&b.task.updated_at));
+    sort_by_wait_age(&mut waiting);
+    sort_by_wait_age(&mut human_stopped);
     notes.sort_by(|a, b| {
         a.task
             .updated_at
@@ -647,6 +634,78 @@ pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
         notes,
         badge,
     })
+}
+
+/// One wait row, composed from published reads only: the demand copy
+/// keyed by the stored token (REQ-GATE-03/06), the task's stored OPEN
+/// registry questions, and the click-presentation of its gate type
+/// (REQ-GATE-04) — spec for APPROVAL, report for QA.
+fn wait_row(api: &Api, task: Task) -> Result<WaitRow, UiError> {
+    let (wants, cli_hint) = wait_demand_for(&task.state, &short_id(&task.id));
+    let open_questions = open_questions_of(api, &task)?;
+    let spec = if task.state == TaskState::Approval {
+        approval_spec(api, &task)?
+    } else {
+        None
+    };
+    let (report, report_note) = if task.state == TaskState::Qa {
+        qa_report(api, &task)
+    } else {
+        (None, None)
+    };
+    Ok(WaitRow {
+        task,
+        wants,
+        cli_hint,
+        open_questions,
+        spec,
+        report,
+        report_note,
+    })
+}
+
+/// Platform registry questions of the task, stored OPEN token only
+/// (question.list composition, REQ-GATE-03 AC2).
+fn open_questions_of(api: &Api, task: &Task) -> Result<Vec<Question>, UiError> {
+    Ok(api
+        .question_list(&task.id.to_string())?
+        .into_iter()
+        .filter(|q| q.status == QuestionStatus::Open)
+        .collect())
+}
+
+/// QA presentation: the CURRENT quality report (registry.rs:155-161), or
+/// the platform's own text when there is none — an honest fact, never an
+/// empty hole (REQ-UI-07 AC2 precedent).
+fn qa_report(api: &Api, task: &Task) -> (Option<QualityReportView>, Option<String>) {
+    match api.task_report(&task.id.to_string()) {
+        Ok(view) => (Some(view), None),
+        Err(e) => (None, Some(UiError::from(e).message)),
+    }
+}
+
+/// Reference-group rows (ratified OQ-GATE-1): stored OPEN NON-blocking
+/// questions of a task the platform does NOT stand on — a note on an
+/// active task (workflow.rs:747-748), never a wait row and never counted
+/// into the badge (REQ-GATE-10). Terminal tasks carry no live demand, so
+/// their leftovers stay out (is_note_visible).
+fn reference_notes(api: &Api, task: &Task) -> Result<Vec<WaitNote>, UiError> {
+    if !is_note_visible(&task.state) {
+        return Ok(Vec::new());
+    }
+    Ok(api
+        .question_list(&task.id.to_string())?
+        .into_iter()
+        .filter(|q| q.status == QuestionStatus::Open && !q.blocking)
+        .map(|question| WaitNote {
+            task: task.clone(),
+            question,
+        })
+        .collect())
+}
+
+fn sort_by_wait_age(rows: &mut [WaitRow]) {
+    rows.sort_by(|a, b| a.task.updated_at.cmp(&b.task.updated_at));
 }
 
 /// The APPROVAL presentation (REQ-GATE-04/05): the CURRENT
@@ -1019,6 +1078,137 @@ mod tests {
             snapshot.badge as usize + snapshot.notes.len(),
             snapshot.badge
         );
+    }
+
+    /// R3 (ux/contract-stability): the two shapes the wait section
+    /// publishes are pinned exactly like `ui_error`/`artifact_*` — a
+    /// renamed field or a moved tag fails HERE, in cargo test, not as a
+    /// silent `undefined` through types.ts at runtime.
+    #[test]
+    fn wait_section_shapes_are_pinned_by_fixtures() {
+        let fixture = ipc_shapes_fixture();
+        let (snapshot, presentation) = wait_section_fixture();
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap(),
+            fixture["wait_snapshot"]
+        );
+        assert_eq!(
+            serde_json::to_value(&presentation).unwrap(),
+            fixture["spec_presentation"]
+        );
+    }
+
+    /// R3 parity half: every field name the Rust shapes serialize exists
+    /// in the mirrored interface of `types.ts` (snake_case mirror — the
+    /// serde structs carry no rename_all), so a Rust-side rename is caught
+    /// by the fixture test and a TS-side rename by this one.
+    #[test]
+    fn wait_section_shapes_parity_with_types_ts() {
+        let ts = std::fs::read_to_string(format!(
+            "{}/frontend/src/types.ts",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let (snapshot, presentation) = wait_section_fixture();
+        let snapshot = serde_json::to_value(&snapshot).unwrap();
+        let specification = serde_json::to_value(&presentation).unwrap();
+        let pairs: [(&str, &serde_json::Value); 4] = [
+            ("WaitSnapshot", &snapshot),
+            ("WaitRow", &snapshot["waiting"][0]),
+            ("WaitNote", &snapshot["notes"][0]),
+            ("SpecPresentation", &specification),
+        ];
+        for (iface, value) in pairs {
+            let block = ts_interface_block(&ts, iface);
+            for field in value.as_object().expect("object shape").keys() {
+                assert!(
+                    block.contains(&format!("{field}:")),
+                    "types.ts `{iface}` has no field `{field}` the Rust view serializes"
+                );
+            }
+        }
+    }
+
+    /// One deterministic snapshot + presentation used by both R3 tests.
+    fn wait_section_fixture() -> (WaitSnapshot, SpecPresentation) {
+        let now = "2026-11-06T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut task = task_fixture("Спека ожидания", "бизнес-описание", now);
+        task.id = "01a1b0ea-0000-4000-8000-000000000001".parse().unwrap();
+        task.state = TaskState::Approval;
+        task.requirements_seq = 3;
+        task.lock_version = 4;
+        let question = Question {
+            id: "01a1b0ea-0000-4000-8000-0000000000bb".parse().unwrap(),
+            task_id: task.id,
+            execution_id: None,
+            text: "Ответить на вопрос?".into(),
+            context: None,
+            options: vec![],
+            blocking: true,
+            status: QuestionStatus::Open,
+            answer: None,
+            answered_by: None,
+            answered_at: None,
+            created_at: now,
+        };
+        // The reference note is the NON-blocking twin (OQ-GATE-1): the
+        // platform does not stand on it.
+        let note = Question {
+            id: "01a1b0ea-0000-4000-8000-0000000000cc".parse().unwrap(),
+            text: "Заметка без блокировки?".into(),
+            blocking: false,
+            ..question.clone()
+        };
+        let mut artifact = spec_artifact_fixture();
+        artifact.id = "01a1b0ea-0000-4000-8000-0000000000aa".parse().unwrap();
+        artifact.task_id = task.id;
+        artifact.created_at = now;
+        let presentation = SpecPresentation {
+            artifact,
+            current: true,
+            human_paragraph: Some("Коротко: что происходит.".into()),
+            paragraph_source: ParagraphSource::Spec,
+            open_questions: vec!["OQ-GATE-1: вопрос документа?".into()],
+            unavailable_note: None,
+        };
+        let row = WaitRow {
+            task: task.clone(),
+            wants: "Утвердить или отклонить текущую спецификацию задачи".into(),
+            cli_hint: "devai task approve 01a1b0ea --rationale \"<обоснование>\"".into(),
+            open_questions: vec![question.clone()],
+            spec: Some(presentation.clone()),
+            report: None,
+            report_note: None,
+        };
+        let snapshot = WaitSnapshot {
+            waiting: vec![row],
+            human_stopped: vec![],
+            notes: vec![WaitNote {
+                task: task.clone(),
+                question: note,
+            }],
+            badge: 1,
+        };
+        (snapshot, presentation)
+    }
+
+    fn ipc_shapes_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/fixtures/ipc_shapes.json"))
+            .expect("ipc fixtures must be valid JSON")
+    }
+
+    /// The `export interface <name> {` block of types.ts, up to its
+    /// closing brace.
+    fn ts_interface_block<'a>(source: &'a str, name: &str) -> &'a str {
+        let head = format!("export interface {name} {{");
+        let start = source
+            .find(&head)
+            .unwrap_or_else(|| panic!("types.ts has no `{head}`"));
+        let rest = &source[start..];
+        let end = rest.find("\n}").expect("unterminated types.ts interface");
+        &rest[..end]
     }
 
     fn task_fixture(
