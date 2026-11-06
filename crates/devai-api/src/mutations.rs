@@ -1800,7 +1800,7 @@ impl Api {
         else {
             return Ok(None);
         };
-        let blob = self.store.read_blob(&a.sha256)?;
+        let blob = self.store.read_artifact_body(a)?;
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&blob) else {
             return Ok(None);
         };
@@ -1826,7 +1826,7 @@ impl Api {
         else {
             return Ok(None);
         };
-        let blob = self.store.read_blob(&a.sha256)?;
+        let blob = self.store.read_artifact_body(a)?;
         let v: serde_json::Value = serde_json::from_slice(&blob).map_err(|e| ApiError::refused("corrupt", format!(
             "the CURRENT quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
             short_id(&a.id)
@@ -2638,7 +2638,7 @@ mod tests {
                 .find(|x| x.kind == kind && x.status == ArtifactStatus::Current)
                 .unwrap();
             let body: serde_json::Value =
-                serde_json::from_slice(&api.store.read_blob(&a.sha256).unwrap()).unwrap();
+                serde_json::from_slice(&api.store.read_artifact_body(&a).unwrap()).unwrap();
             assert_eq!(body["human_paragraph"].as_str().unwrap(), text.as_str());
         }
     }

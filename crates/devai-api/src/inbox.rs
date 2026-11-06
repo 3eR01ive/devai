@@ -4,30 +4,32 @@
 //! answers with the whole home in one operation — the declarative demand
 //! table (`config/workflow/inbox-waits.yaml`) plus, per task, its questions
 //! and the click-presentation of its gate (spec body for APPROVAL, quality
-//! report for QA). R2 of the QA return: the UI used to issue
-//! `question.list` per active task, `task.status + artifact.list +
-//! artifact.cat_text` per APPROVAL and `task.report` per QA — the number of
-//! IPC calls grew with the row count. Now the UI makes exactly one call per
-//! load whatever the number of rows (O(1) per row); inside the API the store
-//! is read in bulk snapshots (`list_tasks`, `questions_all`,
+//! report for QA). The fan-out this replaces, and why it had to go: the UI
+//! used to issue `question.list` per active task, `task.status +
+//! artifact.list + artifact.cat_text` per APPROVAL and `task.report` per QA
+//! — the number of IPC calls grew with the row count. Now the UI makes
+//! exactly one call per load whatever the number of rows; inside the API the
+//! store is read in bulk snapshots (`list_tasks`, `questions_all`,
 //! `artifacts_all`) instead of per-task queries.
 //!
 //! Cost is linear and bounded by the home itself, with no declared task
 //! cap needed: three store snapshots plus one grouping pass over questions
 //! and artifacts (O(T+Q+A)) and one hash lookup per task — the per-task
-//! loop never rescans either table (R2 of the QA return).
+//! loop never rescans either table.
 //!
 //! Membership is NOT decided here: the section groups rows by the table's
 //! `group` and by exact stored tokens on the UI side (one place,
 //! `devai-ui::commands::wait_group_of`). This module only carries data.
 //!
-//! R6 of the QA return (ratification of the operation replacement) —
-//! SPEC-FIDELITY, RATIFIED: the spec named `task.list`-composition +
-//! `artifact.cat_text` as the source operations; this batch read replaces
-//! them with `inbox.snapshot`. The operator ratified the replacement in
-//! words ("ратифицирую", 07.11, R6 of the QA return) as an improvement —
-//! one call instead of N+1. The old operations
-//! are NOT to be restored; this note records the ratification in code.
+//! Source-of-operations note (SPEC-FIDELITY, RATIFIED). The spec named
+//! `task.list`-composition + `artifact.cat_text` as the section's source
+//! reads; `Api::inbox_snapshot` replaces them with this one batch read —
+//! one call instead of N+1. The operator ratified the replacement in words
+//! («Ратифицирую», 07.11); that word is stored in this task's QA-return
+//! rationale record (it appears as R5 in the 20:25 return and as R6 in the
+//! 20:48 one — the platform has no separate decision row for it), so the
+//! citation here points at the QA-return rationale, not at a decision id.
+//! The old operations are NOT to be restored.
 
 use chrono::{DateTime, Utc};
 use devai_core::inbox::InboxWaitPolicy;

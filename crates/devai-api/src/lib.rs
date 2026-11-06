@@ -54,7 +54,8 @@ use serde::Serialize;
 /// uuid, never a display prefix.
 type TaskIndex<T> = HashMap<Id, Vec<T>>;
 
-/// Group stored rows by task id in a single pass (R2 of the QA return).
+/// Group stored rows by task id in a single pass — the batch read's cost
+/// guard: the per-task loop below is O(T+Q+A), never O(T×(Q+A)).
 fn group_by_task<T>(rows: Vec<T>, task_id: impl Fn(&T) -> Id) -> TaskIndex<T> {
     let mut index: TaskIndex<T> = HashMap::new();
     for row in rows {
@@ -318,7 +319,7 @@ impl Api {
                     ),
                 ))
             })?;
-        let blob = self.store.read_blob(&a.sha256)?;
+        let blob = self.store.read_artifact_body(a)?;
         let value: serde_json::Value =
             serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
         let contract = a
@@ -342,11 +343,11 @@ impl Api {
         })
     }
 
-    /// The human-wait section in ONE batch read (REQ-GATE-01..10; R2 of the
-    /// QA return): the declarative demand table of this home plus every
-    /// task's stored questions and gate presentation. One store snapshot per
-    /// data type (tasks / questions / artifacts) instead of a per-task
-    /// fan-out — the caller's per-row cost is O(1) IPC (one call per load).
+    /// The human-wait section in ONE batch read (REQ-GATE-01..10): the
+    /// declarative demand table of this home plus every task's stored
+    /// questions and gate presentation. One store snapshot per data type
+    /// (tasks / questions / artifacts) instead of a per-task fan-out — the
+    /// caller's per-row cost is O(1) IPC (one call per load).
     ///
     /// The presentation is loaded for the stored gate tokens that present
     /// it: APPROVAL → the spec (CURRENT, else the LAST one with the honest
@@ -354,17 +355,20 @@ impl Api {
     /// report (or the platform's text when there is none). Membership and
     /// grouping are the UI's one decision site (`wait_group_of`).
     ///
-    /// R6 of the QA return (operation replacement ratified by the operator,
-    /// 07.11): this ONE
-    /// batch operation replaces the spec's `task.list` composition and
-    /// `artifact.cat_text` calls — an approved improvement, not a
-    /// deviation; the old operations are not to be restored.
+    /// Source-of-operations note (SPEC-FIDELITY, RATIFIED): this ONE batch
+    /// operation replaces the spec's `task.list` composition and
+    /// `artifact.cat_text` calls. The operator ratified the replacement in
+    /// words («Ратифицирую», 07.11); the word is stored in the QA-return
+    /// rationale of this task (R5 of the 20:25 return, R6 of the 20:48 one)
+    /// — the platform keeps no separate decision row for it. An approved
+    /// improvement, not a deviation; the old operations are not to be
+    /// restored.
     pub fn inbox_snapshot(&self) -> ApiResult<InboxSnapshotView> {
         let snapshot_at = Utc::now();
         let policy =
             devai_store::config::load_inbox_wait_policy(&self.config_dir().join("workflow"))?;
         let tasks = self.store.list_tasks()?;
-        // R2 of the QA return: index the two child tables by task id in one
+        // Batch-read cost: index the two child tables by task id in one
         // pass each, so the per-task loop below is O(T+Q+A), not O(T×(Q+A)).
         // `list_tasks` returns each task once, so taking rows OUT of the
         // index (remove) is safe and avoids cloning every row.
@@ -437,7 +441,7 @@ impl Api {
         let Some((artifact, current)) = inbox::pick_spec_artifact(arts) else {
             return Ok(None);
         };
-        let body = match self.store.read_blob(&artifact.sha256) {
+        let body = match self.store.read_artifact_body(&artifact) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => SpecBodyView::Text { text },
                 Err(_) => SpecBodyView::Binary {
@@ -784,7 +788,7 @@ impl Api {
     /// Raw stored bytes — presentation is the consumer's problem (A-4).
     pub fn artifact_bytes(&self, artifact_id: &str) -> ApiResult<Vec<u8>> {
         let a = self.store.get_artifact(artifact_id)?;
-        Ok(self.store.read_blob(&a.sha256)?)
+        Ok(self.store.read_artifact_body(&a)?)
     }
 
     pub fn artifact_text(&self, artifact_id: &str) -> ApiResult<String> {

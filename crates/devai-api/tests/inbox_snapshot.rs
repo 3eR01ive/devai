@@ -1,5 +1,5 @@
 //! Behaviour pins of `inbox.snapshot` — the ONE batch read behind the
-//! human-wait section (task 01a1b0ea, R3 of the QA return).
+//! human-wait section (task 01a1b0ea).
 //!
 //! The earlier iteration covered only the UI composer; the SERVER path
 //! (`Api::inbox_snapshot` → `task_facts` → `gate_presentation` →
@@ -207,7 +207,7 @@ fn non_gate_states_present_no_gate() {
 }
 
 /// The batch read carries the demand table it was loaded with — the UI
-/// renders wording from DATA, not from code (R1 of the QA return).
+/// renders wording from DATA, not from code.
 #[test]
 fn snapshot_carries_the_demand_table() {
     let s = Seeded::new(TaskState::Approval, "спека", None);
@@ -227,7 +227,7 @@ fn snapshot_carries_the_demand_table() {
     );
 }
 
-/// The selection rule behind `spec` is a pure function (R3): CURRENT wins;
+/// The selection rule behind `spec` is a pure function: CURRENT wins;
 /// with no CURRENT the LAST spec rides with `current: false`.
 #[test]
 fn spec_selection_is_current_then_last() {

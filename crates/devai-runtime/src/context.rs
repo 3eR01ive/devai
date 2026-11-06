@@ -66,8 +66,8 @@ pub const REWORK_CONTEXT_LABEL: &str = "REWORK CONTEXT";
 /// input section at all (R-008).
 ///
 /// Read-only: issues SELECTs only (`store.all_events_for_task`,
-/// `store.artifacts`, `store.read_blob`); writes nothing, moves no state,
-/// bumps no lock version (R-009).
+/// `store.artifacts`, `store.read_artifact_body`); writes nothing, moves no
+/// state, bumps no lock version (R-009).
 pub fn rework_context(
     store: &Store,
     task: &Task,
@@ -209,7 +209,7 @@ fn quality_findings(store: &Store, task: &Task) -> Result<Option<String>, Runtim
         .as_ref()
         .map(|c| format!("{}@{}", c.name, c.version))
         .unwrap_or_else(|| report.name.clone());
-    let body = store.read_blob(&report.sha256)?;
+    let body = store.read_artifact_body(&report)?;
     // ONE pass over the whole document, through the very struct `assemble`
     // emits — producer and consumer share one shape (R-003).
     let doc: QualityReportDoc = serde_json::from_slice(&body).map_err(|e| {

@@ -1,6 +1,6 @@
 // Зеркало хранимых токенов TaskState Rust (devai-core/src/types.rs,
 // str_enum!(TaskState, ...)). UI сравнивает токены как ДАННЫЕ — общий
-// словарь, чтобы в шаблонах не жили сырые литералы (R5, arch/no-magic).
+// словарь, чтобы в шаблонах не жили сырые литералы.
 // Пин: тест states_ts_mirrors_rust_task_state_tokens (devai-ui/src/commands.rs)
 // сверяет каждый вариант с этим файлом; переименование токена в Rust
 // ломает cargo test, а не даёт молчаливый undefined в окне.

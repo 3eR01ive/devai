@@ -1610,8 +1610,8 @@ pub fn load_humanize_policy(dir: &Path) -> StoreResult<HumanizePolicy> {
 }
 
 // ---------------------------------------------------------------------------
-// Declarative demand table of the human-wait section (task 01a1b0ea, R1 of
-// the QA return) — platform workflow data.
+// Declarative demand table of the human-wait section (task 01a1b0ea) —
+// platform workflow data.
 // ---------------------------------------------------------------------------
 
 /// The factory table — the embedded `config/workflow/inbox-waits.yaml`.
@@ -2719,7 +2719,7 @@ scoring:
         );
     }
 
-    /// R1 (task 01a1b0ea): the demand table is DATA. The factory bytes give
+    /// The demand table is DATA (task 01a1b0ea). The factory bytes give
     /// every stored state a group decision (a new TaskState cannot silently
     /// drop out), the two WAITING variants exist, and an absent home config
     /// directory yields the same table instead of an empty section.

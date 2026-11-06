@@ -8,7 +8,8 @@
 //! and is loaded by `devai_store::config::load_inbox_wait_policy`. The
 //! renderer (`devai-ui`) is generic over this table, so adding a wording or
 //! pointing a state at another group is an edit of the file, never a Rust
-//! change (R1 of the QA return: the table was 62 lines of match arms).
+//! change (the per-state demand table was 62 lines of match arms; it is
+//! data now).
 //!
 //! Types live in the domain core because BOTH the loader (`devai-store`) and
 //! the consumers (`devai-api`, `devai-ui`) must name them; the core performs

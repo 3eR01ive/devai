@@ -126,12 +126,7 @@ pub fn export(store: &Store, task: &Task, out_dir: &Path) -> StoreResult<BundleM
         if !seen.insert(a.sha256.clone()) {
             continue;
         }
-        let content = store.read_blob(&a.sha256).map_err(|e| match e {
-            StoreError::Io(_) => {
-                StoreError::Corrupt(format!("artifact {} blob missing: {}", a.id, a.sha256))
-            }
-            other => other,
-        })?;
+        let content = store.read_artifact_body(a)?;
         let rel = format!("blobs/{}", a.sha256);
         let abs = out_dir.join(&rel);
         // invariant: why unreachable — `abs` is `out_dir.join("blobs/<sha>")`:

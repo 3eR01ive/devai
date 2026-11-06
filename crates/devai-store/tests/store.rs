@@ -182,7 +182,46 @@ fn content_addressing_and_seq() {
     let a2 = publish(&store, &t, ArtifactKind::Patch, b"same bytes", vec![]);
     assert_eq!(a1.sha256, a2.sha256);
     assert_ne!(a1.seq, a2.seq);
-    assert_eq!(store.read_blob(&a1.sha256).unwrap(), b"same bytes");
+    assert_eq!(store.read_artifact_body(&a1).unwrap(), b"same bytes");
+}
+
+/// The CURRENT/body pairing has ONE body reader and ONE error policy:
+/// absence is `NotFound` (the row outlived its content), an existing but
+/// unreadable blob is `Corrupt` (a broken store must not read as an empty
+/// one), and a healthy blob returns exactly the stored bytes.
+#[test]
+fn artifact_body_read_policy_is_one_place() {
+    let (_d, store) = open();
+    let t = draft(&store);
+    let healthy = publish(&store, &t, ArtifactKind::Patch, b"body bytes", vec![]);
+    assert_eq!(store.read_artifact_body(&healthy).unwrap(), b"body bytes");
+
+    // The blob is gone, the row is not: NotFound naming the content address.
+    let missing = publish(&store, &t, ArtifactKind::Patch, b"gone", vec![]);
+    std::fs::remove_file(store.blob_path(&missing.sha256)).unwrap();
+    match store.read_artifact_body(&missing).unwrap_err() {
+        StoreError::NotFound(what, sha) => {
+            assert_eq!(what, "artifact blob");
+            assert_eq!(sha, missing.sha256);
+        }
+        other => panic!("absence must be NotFound, got {other:?}"),
+    }
+
+    // Present but unreadable (a directory sits at the content address): an
+    // IO failure that is NOT absence — Corrupt, naming the artifact.
+    let unreadable = publish(&store, &t, ArtifactKind::Patch, b"not a file", vec![]);
+    let path = store.blob_path(&unreadable.sha256);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    match store.read_artifact_body(&unreadable).unwrap_err() {
+        StoreError::Corrupt(message) => {
+            assert!(
+                message.contains(&unreadable.id.to_string()),
+                "the corrupt fact must name the artifact: {message}"
+            );
+        }
+        other => panic!("an unreadable blob must be Corrupt, got {other:?}"),
+    }
 }
 
 #[test]
@@ -364,7 +403,7 @@ fn export_import_roundtrip_restores_everything() {
     assert_eq!(q2.status, QuestionStatus::Answered);
     // blobs carried over and verifiable
     let a = store2.artifacts(t2.id).unwrap().remove(0);
-    store2.read_blob(&a.sha256).unwrap();
+    store2.read_artifact_body(&a).unwrap();
 
     // re-import is a no-op, not a duplicate
     let again = bundle::import(&store2, bundle_dir.path()).unwrap();

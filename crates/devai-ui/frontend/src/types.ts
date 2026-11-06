@@ -237,7 +237,8 @@ export interface WaitRow {
 }
 
 // Предъявление APPROVAL-строки (REQ-GATE-04/05): тело REQUIREMENTS_SPEC,
-// прочитанное через artifact.cat_text и разобранное на стороне предъявления
+// пришедшее в снимке секции (`inbox_view` → `inbox.snapshot`, НЕ отдельный
+// artifact.cat_text) и разобранное на стороне предъявления
 // без изменения данных. paragraph_source — честная метка происхождения
 // абзаца (ратифицированное OQ-GATE-4), open_questions — вопросы ДОКУМЕНТА,
 // не platform-вопросы реестра (у них нет id и их не отвечают question.answer).
@@ -254,7 +255,7 @@ export interface SpecPresentation {
 // безответный НЕблокирующий вопрос — заметка на активной задаче, платформа
 // на ней не стоит (workflow.rs:747-748), поэтому это не wait-row. Но строкой
 // снапшота она является, и бейдж её считает: badge == waiting + human_stopped
-// + notes (REQ-GATE-08 AC3, commands.rs::build_wait_snapshot).
+// + notes (REQ-GATE-08 AC3, commands.rs::compose_wait_snapshot).
 export interface WaitNote {
   task: Task;
   question: Question;

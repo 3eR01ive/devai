@@ -10,7 +10,7 @@
 
 use devai_core::types::{Artifact, ArtifactKind, Decision, Id, decision_kind, event_kind};
 use devai_core::workflow::{ImplementationReportFacts, PriorImplementationReport, ReportBodyRead};
-use devai_store::Store;
+use devai_store::{Store, StoreError};
 
 use crate::engine::RuntimeResult;
 
@@ -22,9 +22,16 @@ use crate::engine::RuntimeResult;
 /// `None` was indistinguishable to the gate before; the decision stays the
 /// same (REQ-RG-04: never guess, proceed incomparable), the RECORD becomes
 /// honest.
+///
+/// The blob read goes through `Store::read_artifact_body`, whose one policy
+/// separates absence (`NotFound`) from a body that exists but cannot be read
+/// (`Corrupt`) — the second is reported as corruption here, not folded into
+/// «missing» as it was when this site read the blob itself.
 fn stamped_commit(store: &Store, a: &Artifact) -> (Option<String>, ReportBodyRead) {
-    let Ok(body) = store.read_blob(&a.sha256) else {
-        return (None, ReportBodyRead::Missing);
+    let body = match store.read_artifact_body(a) {
+        Ok(body) => body,
+        Err(StoreError::NotFound(..)) => return (None, ReportBodyRead::Missing),
+        Err(_) => return (None, ReportBodyRead::Corrupt),
     };
     match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(v) => (

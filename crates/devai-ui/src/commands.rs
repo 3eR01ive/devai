@@ -87,14 +87,15 @@ pub struct WaitRow {
     /// section observes, it never acts (read-only base, OQ-UI-6).
     pub cli_hint: String,
     /// Platform registry questions of the task, stored OPEN token only:
-    /// they arrive with the section's single batch read (`inbox.snapshot`,
-    /// `commands.rs:673` → `devai-api/src/lib.rs:361`; R2 of the QA return),
-    /// not from a `question.list` composition (REQ-GATE-03 AC2).
+    /// they arrive with the section's single batch read — `inbox_view` calls
+    /// `Api::inbox_snapshot`, never a `question.list` composition
+    /// (REQ-GATE-03 AC2).
     pub open_questions: Vec<Question>,
     /// APPROVAL presentation: the spec the human is asked to sign
     /// (REQ-GATE-04/05 + ratified OQ-GATE-3/4).
     pub spec: Option<SpecPresentation>,
-    /// QA presentation: the CURRENT quality report (registry.rs:155-161).
+    /// QA presentation: the CURRENT quality report — the same view the
+    /// registered `task.report` read publishes.
     pub report: Option<QualityReportView>,
     /// Honest fact when the QA row has no signable report (platform error
     /// text, never an empty hole).
@@ -171,10 +172,10 @@ pub struct WaitSnapshot {
 /// The section's membership predicate, read from the DECLARATIVE table
 /// (`config/workflow/inbox-waits.yaml`, loaded through `inbox.snapshot`):
 /// the stored state token selects its row, the row names the group. No
-/// `match` arm per state lives in code any more (R1 of the QA return); a
-/// state that has no row is `None`, and the loader refuses a table that
-/// misses a `TaskState` variant (so a new variant cannot silently drop out
-/// of the section).
+/// `match` arm per state lives in code any more (the demand table, once a
+/// 62-line match, is data now); a state that has no row is `None`, and the
+/// loader refuses a table that misses a `TaskState` variant (so a new
+/// variant cannot silently drop out of the section).
 pub fn wait_group_of(policy: &InboxWaitPolicy, state: &TaskState) -> Option<WaitGroup> {
     let row = policy.state(*state)?;
     match row.group {
@@ -187,8 +188,7 @@ pub fn wait_group_of(policy: &InboxWaitPolicy, state: &TaskState) -> Option<Wait
 /// unanswered notes are not shown (the reference group speaks about the
 /// line that could continue to need an answer). Terminality is the CORE's
 /// question, not this file's: `TaskState::is_terminal` owns the rule, so a
-/// new terminal variant cannot silently keep its notes visible (R1 of the
-/// QA return).
+/// new terminal variant cannot silently keep its notes visible.
 pub fn is_note_visible(state: &TaskState) -> bool {
     !state.is_terminal()
 }
@@ -197,12 +197,12 @@ pub fn is_note_visible(state: &TaskState) -> bool {
 /// data table (REQ-GATE-03/06): the row's unconditional wording, or the
 /// variant whose stored-data predicate holds (the WAITING parked/no-question
 /// split). `{id}` and `{question_id}` are substituted with stored ids, so
-/// the printed command is real — never a placeholder (R6 of the earlier
-/// audit). `Ok(None)` when the table does not list the state as a wait
+/// the printed command is real — never a placeholder left in print.
+/// `Ok(None)` when the table does not list the state as a wait
 /// state; `Err` when the table names a predicate this renderer does not
-/// know — fail-closed at the render site, not only in the config validator
-/// (R2 of the QA return): an unknown `when` must never silently match
-/// nothing and leave the row with an empty demand and an empty command.
+/// know — fail-closed at the render site, not only in the config validator:
+/// an unknown `when` must never silently match nothing and leave the row
+/// with an empty demand and an empty command.
 pub fn wait_demand_for(
     policy: &InboxWaitPolicy,
     state: &TaskState,
@@ -241,8 +241,8 @@ pub struct WaitDemand {
     pub cli_hint: String,
 }
 
-/// The variant whose `when` predicate the stored data satisfies. FAIL-CLOSED
-/// (R2 of the QA return): a token outside [`WHEN_ALL`] is an error at the
+/// The variant whose `when` predicate the stored data satisfies. FAIL-CLOSED:
+/// a token outside [`WHEN_ALL`] is an error at the
 /// render site — the config validator rejects it too, but a table that
 /// reached this point (an older home, a hand-edited snapshot) must never
 /// degrade into "matches nothing" and an empty demand with an empty
@@ -407,7 +407,7 @@ fn non_empty(s: &str) -> Option<&str> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-/// Shape-contract ledger of the command plane (R4, ux/contract-stability).
+/// Shape-contract ledger of the command plane (ux/contract-stability).
 /// `COMMAND_OPERATIONS` pins WHICH published read backs each command; this
 /// const pins the IPC SHAPE each command publishes, so a breaking revision
 /// is a recorded, versioned fact the frontend and its `types.ts` mirror are
@@ -422,7 +422,7 @@ pub struct CommandContract {
     pub breaking: &'static str,
 }
 
-#[allow(dead_code)] // consumed by the contract test (R4)
+#[allow(dead_code)] // consumed by the shape-contract test, not at runtime
 pub const COMMAND_CONTRACTS: &[CommandContract] = &[CommandContract {
     command: "inbox_view",
     version: 2,
@@ -454,7 +454,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("questions_list", "question.list"),
     ("executions_list", "exec.list"),
     ("execution_liveness", "exec.liveness"),
-    // The whole human-wait section is ONE batch read (R2 of the QA return):
+    // The whole human-wait section is ONE batch read:
     // `inbox.snapshot` carries the demand table, the questions and the gate
     // presentations in a single call, so the IPC cost per row is O(1).
     ("inbox_view", "inbox.snapshot"),
@@ -497,7 +497,7 @@ pub fn projects_get(
 }
 
 /// All tasks of the home, ordered by last update BY THE OPERATION
-/// (registry.rs:78-83) — the UI re-sorts nothing.
+/// (the registered `task.list` read) — the UI re-sorts nothing.
 #[tauri::command]
 pub fn tasks_list(state: State<AppState>) -> Result<Vec<Task>, UiError> {
     Ok(state.api().task_list()?)
@@ -644,7 +644,7 @@ pub fn questions_list(state: State<AppState>, id_prefix: String) -> Result<Vec<Q
 }
 
 /// Execution rows of one task (or all): RUNNING/COMPLETED/FAILED/
-/// CANCELLED tokens as stored (types.rs:472-477).
+/// CANCELLED tokens as stored (`ExecutionStatus` in `devai-core`).
 #[tauri::command(rename_all = "snake_case")]
 pub fn executions_list(
     state: State<AppState>,
@@ -667,7 +667,7 @@ pub fn execution_liveness(
 /// QA / FAILED rows — plus the separate "stopped by the operator" group
 /// (PAUSED/BLOCKED) and the reference group of unanswered NON-BLOCKING
 /// questions (ratified OQ-GATE-1/2). ONE published read backs the whole
-/// section (`inbox.snapshot`, R2 of the QA return): the Tauri command is a
+/// section (`inbox.snapshot`): the Tauri command is a
 /// thin adapter — one API call, then the pure composer below. Nothing is
 /// cached between loads (REQ-GATE-07).
 #[tauri::command]
@@ -677,12 +677,13 @@ pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
 }
 
 /// The section composer: PURE — data in, section out. No Tauri state, no
-/// API handle, no IO (R3 of the QA return owns this seam; the test below
-/// exercises it on an injected snapshot, so every render branch is covered
-/// without a live window). Membership is read from the declarative table by
+/// API handle, no IO (the seam is exactly this function: the batch view in,
+/// the section out, so the test below exercises every render branch on an
+/// injected snapshot without a live window). Membership is read from the
+/// declarative table by
 /// the exact stored state token; grouping, ordering (REQ-GATE-08: longest
 /// waiting first) and the badge are computed here on the same snapshot.
-/// `Err` only for a table the renderer cannot read (R2: fail-closed).
+/// `Err` only for a table the renderer cannot read (fail-closed).
 pub fn compose_wait_snapshot(facts: InboxSnapshotView) -> Result<WaitSnapshot, UiError> {
     let InboxSnapshotView { policy, tasks, .. } = facts;
     let mut section = SectionRows::default();
@@ -888,7 +889,8 @@ mod tests {
         }
     }
 
-    /// R4 (ts/coverage-static): the serde output of the ipc command core is
+    /// Static coverage of the command core: the serde output of the ipc
+    /// command core is
     /// the frontend's contract — `types.ts` is written against it. This
     /// fixture pins the exact JSON shape: field names of `UiError`, the
     /// `shape` tag token and the variant field names of `ArtifactContent`.
@@ -1113,7 +1115,7 @@ mod tests {
         );
     }
 
-    /// R2 of the QA return: an unknown `when` predicate in the delivered
+    /// An unknown `when` predicate in the delivered
     /// table is a LOUD render error, not a silently non-matching variant.
     /// Without the parked-question term the row would otherwise print empty
     /// demand and an empty command — the fail-open shape this test kills.
@@ -1236,8 +1238,8 @@ mod tests {
         );
     }
 
-    /// R3 (ux/contract-stability): the two shapes the wait section
-    /// publishes are pinned exactly like `ui_error`/`artifact_*` — a
+    /// Shape pinning for the two shapes the wait section
+    /// publishes — pinned exactly like `ui_error`/`artifact_*`: a
     /// renamed field or a moved tag fails HERE, in cargo test, not as a
     /// silent `undefined` through types.ts at runtime.
     #[test]
@@ -1400,7 +1402,7 @@ mod tests {
         }
     }
 
-    /// R4 (ux/contract-stability): a breaking command shape is a RECORDED,
+    /// A breaking command shape is a RECORDED,
     /// versioned fact — every entry of the ledger is a mapped command with
     /// version >= 2 and a non-empty breaking note, and the section's
     /// breaking revision is present. A new un-versioned break fails here.
@@ -1476,7 +1478,7 @@ mod tests {
         assert_eq!(
             serde_json::Value::Object(actual),
             fixture["rows"],
-            "row texts drifted from the pinned snapshot (R4)"
+            "row texts drifted from the pinned shape/text ledger"
         );
     }
 
@@ -1712,10 +1714,10 @@ mod tests {
         }
     }
 
-    /// R2 (QA return, pf/io-churn): the section's IPC cost per row is O(1) —
-    /// the command is backed by exactly ONE published read, so the number of
-    /// rows cannot multiply the calls (the counter is the mapping itself:
-    /// a second entry, or a fan-out command, fails here).
+    /// IPC cost per row is O(1): the command is backed by exactly ONE
+    /// published read, so the number of rows cannot multiply the calls
+    /// (the counter is the mapping itself: a second entry, or a fan-out
+    /// command, fails here).
     #[test]
     fn inbox_view_is_one_batch_read() {
         let ops: Vec<&str> = COMMAND_OPERATIONS
@@ -1735,15 +1737,15 @@ mod tests {
         assert_eq!(registered.class, devai_api::OpClass::Read);
     }
 
-    /// R5 (arch/no-magic): `frontend/src/states.ts` mirrors EVERY stored
-    /// TaskState token of Rust, and the view compares through that shared
-    /// const instead of carrying raw literals — a Rust token rename fails
-    /// HERE; a raw literal in the template fails the second half.
+    /// The shared token dictionary: `frontend/src/states.ts` mirrors EVERY
+    /// stored TaskState token of Rust, and the view compares through that
+    /// shared const instead of carrying raw literals — a Rust token rename
+    /// fails HERE; a raw literal in the template fails the second half.
     #[test]
     fn states_ts_mirrors_rust_task_state_tokens() {
         let crate_dir = env!("CARGO_MANIFEST_DIR");
         let ts = std::fs::read_to_string(format!("{crate_dir}/frontend/src/states.ts"))
-            .expect("frontend/src/states.ts must exist (R5)");
+            .expect("frontend/src/states.ts must exist");
         let view = std::fs::read_to_string(format!("{crate_dir}/frontend/src/views/InboxView.vue"))
             .expect("InboxView.vue must exist");
         let states: [TaskState; 13] = [

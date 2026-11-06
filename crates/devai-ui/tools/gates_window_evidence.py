@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Window-evidence прогон секции ожидания человека (R5, задача 01a1b0ea).
+"""Window-evidence прогон секции ожидания человека (задача 01a1b0ea).
 
 Поднимает канонический dev-путь (vite на 127.0.0.1:1420 + debug-бинарь
 devai-ui, тот же, что снимают образцы ui-content), открывает вкладку
@@ -57,7 +57,7 @@ def wait_states(home):
     The table is platform data (`config/workflow/inbox-waits.yaml`, loaded by
     `devai_store::config::load_inbox_wait_policy` with the merge-scan idiom:
     files without the `inbox_waits:` key are inert, the LAST section wins).
-    The tool keeps no copy of the state set (R4 of the QA return): a state
+    The tool keeps no copy of the state set: a state
     that the table assigns to a group other than `none` is a wait state.
     """
     try:
