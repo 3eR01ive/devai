@@ -526,9 +526,9 @@ impl Api {
                 changed: false,
             });
         }
-        let updated =
-            self.store
-                .set_task_project(&task, project.id, &self.actor, Utc::now())?;
+        let updated = self
+            .store
+            .set_task_project(&task, project.id, &self.actor, Utc::now())?;
         Ok(TaskProjectSetOutcome {
             task: updated,
             changed: true,
@@ -2591,7 +2591,10 @@ mod tests {
             .iter()
             .find(|e| e.kind == event_kind::TASK_PROJECT_SET)
             .expect("task.project.set event");
-        assert_eq!(set.payload["project_id"].as_str(), Some(p.id.to_string().as_str()));
+        assert_eq!(
+            set.payload["project_id"].as_str(),
+            Some(p.id.to_string().as_str())
+        );
         assert!(set.payload["previous_project_id"].is_null());
 
         // Idempotent re-apply: same project → `changed=false`, NO lock bump,
@@ -2683,7 +2686,8 @@ mod tests {
         .unwrap();
         let closed = fresh_task(&api, "terminal-history");
         // Park it terminal through the workflow plane (CANCELLED).
-        api.task_op(&closed.to_string(), WorkflowOp::Cancel { reason: None }).unwrap();
+        api.task_op(&closed.to_string(), WorkflowOp::Cancel { reason: None })
+            .unwrap();
         let home = fresh_task(&api, "already-devai");
         api.task_project_set(TaskProjectSetReq {
             id: home.to_string(),
@@ -2703,8 +2707,7 @@ mod tests {
         assert_eq!(stored.lock_version, 2);
         let evs = api.task_events(&free.to_string(), None).unwrap();
         assert_eq!(
-            evs
-                .iter()
+            evs.iter()
                 .filter(|e| e.kind == event_kind::TASK_PROJECT_SET)
                 .count(),
             1
@@ -2723,7 +2726,10 @@ mod tests {
         let o2 = api.task_project_backfill("devai").unwrap();
         assert!(o2.bound.is_empty());
         assert_eq!(o2.already_bound.len(), 2);
-        assert_eq!(api.store.get_task(&free.to_string()).unwrap().lock_version, 2);
+        assert_eq!(
+            api.store.get_task(&free.to_string()).unwrap().lock_version,
+            2
+        );
 
         // Unknown project refuses typed, before touching a row.
         let err = api

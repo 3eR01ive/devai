@@ -338,8 +338,8 @@ fn resolve_new_task_project(ctx: &Ctx, project: Option<&str>) -> Result<Option<I
 /// zero or several → bind nothing and let the explicit `--project` be
 /// the source of truth. This read lives BEFORE creation; it never writes.
 fn default_project_for_cwd(ctx: &Ctx) -> Result<Option<Id>> {
-    let cwd = std::env::current_dir()
-        .context("resolve the working directory for the default project")?;
+    let cwd =
+        std::env::current_dir().context("resolve the working directory for the default project")?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let projects = ctx.api().project_list().map_err(render_api_error)?;
     let mut matched: Vec<Id> = Vec::new();

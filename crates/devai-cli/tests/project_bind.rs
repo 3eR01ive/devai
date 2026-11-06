@@ -96,7 +96,13 @@ fn task_new_binds_the_project_of_the_working_directory() {
     devai(
         h,
         &elsewhere.path().to_path_buf(),
-        &["project", "add", "devai", "--repo", &repo_path.display().to_string()],
+        &[
+            "project",
+            "add",
+            "devai",
+            "--repo",
+            &repo_path.display().to_string(),
+        ],
     );
     let pid = project_id(h, "devai");
 
@@ -134,7 +140,11 @@ fn explicit_project_wins_and_ambiguity_binds_nothing() {
     let h = home.path();
     let repo_path = repo.path().canonicalize().unwrap();
     let r = repo_path.display().to_string();
-    devai(h, elsewhere.path(), &["project", "add", "devai", "--repo", &r]);
+    devai(
+        h,
+        elsewhere.path(),
+        &["project", "add", "devai", "--repo", &r],
+    );
     devai(h, elsewhere.path(), &["project", "add", "alpha"]);
     let devai_id = project_id(h, "devai");
     let alpha_id = project_id(h, "alpha");
@@ -159,7 +169,11 @@ fn explicit_project_wins_and_ambiguity_binds_nothing() {
 
     // Two projects claim the same repo: the default cannot pick — it binds
     // nothing, and the operator's explicit flag resolves the ambiguity.
-    devai(h, elsewhere.path(), &["project", "add", "beta", "--repo", &r]);
+    devai(
+        h,
+        elsewhere.path(),
+        &["project", "add", "beta", "--repo", &r],
+    );
     let created = devai_json(h, &repo_path, &["task", "new", "ambiguous"]);
     assert!(created["project_id"].is_null(), "{created}");
     let created = devai_json(
@@ -183,7 +197,13 @@ fn set_project_write_lands_event_and_replays_clean() {
     devai(
         h,
         elsewhere.path(),
-        &["project", "add", "devai", "--repo", &repo_path.display().to_string()],
+        &[
+            "project",
+            "add",
+            "devai",
+            "--repo",
+            &repo_path.display().to_string(),
+        ],
     );
     let pid = project_id(h, "devai");
 
@@ -192,7 +212,11 @@ fn set_project_write_lands_event_and_replays_clean() {
     let full = created["id"].as_str().unwrap().to_string();
     assert!(created["project_id"].is_null());
 
-    let o = devai_json(h, elsewhere.path(), &["task", "set-project", &full, "devai"]);
+    let o = devai_json(
+        h,
+        elsewhere.path(),
+        &["task", "set-project", &full, "devai"],
+    );
     assert_eq!(o["changed"].as_bool(), Some(true));
     assert_eq!(o["task"]["project_id"].as_str(), Some(pid.as_str()));
     assert_eq!(o["task"]["lock_version"].as_u64(), Some(2));
@@ -215,16 +239,32 @@ fn set_project_write_lands_event_and_replays_clean() {
 
     // Re-apply the SAME project: documented NO-OP — exit 0, changed=false,
     // the lock does NOT move, no new event row appears.
-    let o = devai_json(h, elsewhere.path(), &["task", "set-project", &full, "devai"]);
+    let o = devai_json(
+        h,
+        elsewhere.path(),
+        &["task", "set-project", &full, "devai"],
+    );
     assert_eq!(o["changed"].as_bool(), Some(false));
     assert_eq!(o["task"]["lock_version"].as_u64(), Some(2));
     let evs = devai_json(h, elsewhere.path(), &["task", "events", &full]);
-    assert_eq!(evs.as_array().unwrap().len(), n_before, "replay wrote nothing");
+    assert_eq!(
+        evs.as_array().unwrap().len(),
+        n_before,
+        "replay wrote nothing"
+    );
 
     // Typed refusals, nothing written on either path.
-    let err = devai_fail(h, elsewhere.path(), &["task", "set-project", "no-such-task", "devai"]);
+    let err = devai_fail(
+        h,
+        elsewhere.path(),
+        &["task", "set-project", "no-such-task", "devai"],
+    );
     assert!(err.contains("task `no-such-task` not found"), "{err}");
-    let err = devai_fail(h, elsewhere.path(), &["task", "set-project", &full, "no-such-project"]);
+    let err = devai_fail(
+        h,
+        elsewhere.path(),
+        &["task", "set-project", &full, "no-such-project"],
+    );
     assert!(err.contains("project `no-such-project` not found"), "{err}");
     assert_eq!(
         devai_json(h, elsewhere.path(), &["task", "get", &full])["lock_version"].as_u64(),
@@ -245,7 +285,13 @@ fn backfill_project_binds_open_history_only_and_is_idempotent() {
     devai(
         h,
         elsewhere.path(),
-        &["project", "add", "devai", "--repo", &repo_path.display().to_string()],
+        &[
+            "project",
+            "add",
+            "devai",
+            "--repo",
+            &repo_path.display().to_string(),
+        ],
     );
     devai(h, elsewhere.path(), &["project", "add", "alpha"]);
     let pid = project_id(h, "devai");
@@ -261,12 +307,20 @@ fn backfill_project_binds_open_history_only_and_is_idempotent() {
         .as_str()
         .unwrap()
         .to_string();
-    devai(h, elsewhere.path(), &["task", "cancel", &closed, "--reason", "done elsewhere"]);
+    devai(
+        h,
+        elsewhere.path(),
+        &["task", "cancel", &closed, "--reason", "done elsewhere"],
+    );
     let owned = devai_json(h, elsewhere.path(), &["task", "new", "alpha-owned"])["id"]
         .as_str()
         .unwrap()
         .to_string();
-    devai(h, elsewhere.path(), &["task", "set-project", &owned, "alpha"]);
+    devai(
+        h,
+        elsewhere.path(),
+        &["task", "set-project", &owned, "alpha"],
+    );
 
     let o = devai_json(h, elsewhere.path(), &["task", "backfill-project", "devai"]);
     assert_eq!(o["bound"], serde_json::json!([free]));
@@ -288,7 +342,10 @@ fn backfill_project_binds_open_history_only_and_is_idempotent() {
         by_id(&closed)["project_id"].is_null(),
         "terminal history keeps the address it lived at"
     );
-    assert_eq!(by_id(&owned)["project_id"].as_str(), Some(alpha_id.as_str()));
+    assert_eq!(
+        by_id(&owned)["project_id"].as_str(),
+        Some(alpha_id.as_str())
+    );
     assert_eq!(by_id(&free)["lock_version"].as_u64(), Some(2));
 
     // Idempotent re-application: no candidates, no movement anywhere.
@@ -297,6 +354,10 @@ fn backfill_project_binds_open_history_only_and_is_idempotent() {
     assert_eq!(by_id(&free)["lock_version"].as_u64(), Some(2));
 
     // Unknown project: typed not-found refusal, exit nonzero, no writes.
-    let err = devai_fail(h, elsewhere.path(), &["task", "backfill-project", "no-such"]);
+    let err = devai_fail(
+        h,
+        elsewhere.path(),
+        &["task", "backfill-project", "no-such"],
+    );
     assert!(err.contains("project `no-such` not found"), "{err}");
 }
