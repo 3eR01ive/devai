@@ -70,14 +70,16 @@ pub enum ArtifactContent {
 
 /// One human-wait row (REQ-GATE-01..05): a task the section lists as a
 /// point where the platform — or a human decision about a stopped task —
-/// needs the operator. `wants`/`cli_hint` are presentation copy keyed by
+/// needs the operator. `demand`/`cli_hint` are presentation copy keyed by
 /// the EXACT stored state token (never a guess about waiting); `spec` /
 /// `report` are the click-presentation, computed from published reads only.
 #[derive(Serialize, Clone, Debug)]
 pub struct WaitRow {
     pub task: Task,
-    /// What the operator is asked to do, in human words (REQ-GATE-03 AC1).
-    pub wants: String,
+    /// What the platform requires FROM the operator, in human words
+    /// (REQ-GATE-03 AC1) — `demand`, not `wants`: it is a requirement on
+    /// the person, not a property of the task.
+    pub demand: String,
     /// The literal CLI command for that decision (REQ-GATE-06 AC2) — the
     /// section observes, it never acts (read-only base, OQ-UI-6).
     pub cli_hint: String,
@@ -154,8 +156,9 @@ pub struct WaitSnapshot {
     pub human_stopped: Vec<WaitRow>,
     /// Reference group of unanswered non-blocking OPEN questions.
     pub notes: Vec<WaitNote>,
-    /// Badge on the nav element: waiting + human-stopped rows; notes are
-    /// excluded — they do not claim to wait (REQ-GATE-10 AC1).
+    /// Badge on the nav element (REQ-GATE-08 AC3): the number of rows of
+    /// the section on the same snapshot — waiting + human-stopped + notes,
+    /// since the ratified OQ-GATE-1 shows the notes as real rows.
     pub badge: usize,
 }
 
@@ -172,7 +175,16 @@ pub fn wait_group_of(state: &TaskState) -> Option<WaitGroup> {
             Some(WaitGroup::Platform)
         }
         TaskState::Paused | TaskState::Blocked => Some(WaitGroup::StoppedByHuman),
-        _ => None,
+        // Every remaining state is a non-wait state, listed explicitly so a
+        // NEW TaskState variant fails to compile instead of silently
+        // dropping out of the section (R3, mt/change-isolation).
+        TaskState::Draft
+        | TaskState::Analysis
+        | TaskState::Review
+        | TaskState::Implementation
+        | TaskState::Rework
+        | TaskState::Accepted
+        | TaskState::Cancelled => None,
     }
 }
 
@@ -189,47 +201,78 @@ pub fn is_note_visible(state: &TaskState) -> bool {
     !matches!(state, TaskState::Accepted | TaskState::Cancelled)
 }
 
-/// (wants, cli_hint) keyed by the stored token. The operations named here
+/// (demand, cli_hint) keyed by the stored token. The operations named here
 /// are exactly the registry's Mutation ops the human runs in the CLI:
 /// task.approve/task.reject (registry.rs:228-241), question.answer
 /// (registry.rs:395-401), task.accept/task.return (registry.rs:242-255),
-/// task.resume (registry.rs:263-269).
-pub fn wait_demand_for(state: &TaskState, id: &str) -> (String, String) {
-    let (wants, verb) = match state {
+/// task.resume (registry.rs:263-269), task.ratify-empty-rework
+/// (crates/devai-cli/src/main.rs:233).
+///
+/// REQ-GATE-06 AC2: the hint is a REAL command with real ids — the parked
+/// question's id for WAITING_FOR_INPUT (never a literal `<вопрос-id>`),
+/// and the empty-rework ratification when the WAITING task has no OPEN
+/// registry question (that gate is the `task ratify-empty-rework` path).
+pub fn wait_demand_for(
+    state: &TaskState,
+    id: &str,
+    open_questions: &[Question],
+) -> (String, String) {
+    let (demand, verb): (String, String) = match state {
         TaskState::Approval => (
-            "Утвердить или отклонить текущую спецификацию задачи",
-            "devai task approve {id} --rationale \"<обоснование>\" · devai task reject {id} --rationale \"<обоснование>\"",
+            "Утвердить или отклонить текущую спецификацию задачи".into(),
+            "devai task approve {id} --rationale \"<обоснование>\" · devai task reject {id} --rationale \"<обоснование>\"".into(),
         ),
-        TaskState::WaitingForInput => (
-            "Ответить на припаркованный вопрос задачи",
-            "devai question answer <вопрос-id> --text \"<ответ>\"",
-        ),
+        // Only a BLOCKING question parks the task (workflow.rs:750-763), so
+        // the answerable id is the blocking one; a stray non-blocking note
+        // on the same task must never become the printed command (R6).
+        TaskState::WaitingForInput => match open_questions
+            .iter()
+            .find(|q| q.blocking)
+            .or_else(|| open_questions.first())
+        {
+            Some(question) => (
+                "Ответить на припаркованный вопрос задачи".into(),
+                format!(
+                    "devai question answer {} --text \"<ответ>\"",
+                    question.id
+                ),
+            ),
+            None => (
+                "Гейт пустого реворка: ратифицировать отсутствие новых изменений".into(),
+                "devai task ratify-empty-rework {id} --rationale \"<обоснование>\"".into(),
+            ),
+        },
         TaskState::Qa => (
-            "Подписать текущий quality-отчёт: принять или вернуть в реворк",
-            "devai task accept {id} --rationale \"<обоснование>\" · devai task return {id} --rationale \"<обоснование>\"",
+            "Подписать текущий quality-отчёт: принять или вернуть в реворк".into(),
+            "devai task accept {id} --rationale \"<обоснование>\" · devai task return {id} --rationale \"<обоснование>\"".into(),
         ),
         TaskState::Failed => (
-            "Решить по упавшей задаче: возобновить прогон",
-            "devai task resume {id}",
+            "Решить по упавшей задаче: возобновить прогон".into(),
+            "devai task resume {id}".into(),
         ),
         TaskState::Paused => (
-            "Задача остановлена паузой оператора — возобновлять по вашему решению",
-            "devai task resume {id}",
+            "Задача остановлена паузой оператора — возобновлять по вашему решению".into(),
+            "devai task resume {id}".into(),
         ),
         TaskState::Blocked => (
-            "Задача заблокирована оператором — снимать блок по вашему решению",
-            "devai task resume {id}",
+            "Задача заблокирована оператором — снимать блок по вашему решению".into(),
+            "devai task resume {id}".into(),
         ),
-        other => (
-            "Платформа на этом состоянии не стоит",
-            other_placeholder_token(other),
+        // Non-wait states: wait_row is never built for them (wait_group_of
+        // returns None above), so there is no demand and no command. Listed
+        // exhaustively for the same reason as wait_group_of.
+        TaskState::Draft
+        | TaskState::Analysis
+        | TaskState::Review
+        | TaskState::Implementation
+        | TaskState::Rework
+        | TaskState::Accepted
+        | TaskState::Cancelled => (
+            "Платформа на этом состоянии на человеке не стоит".into(),
+            String::new(),
         ),
     };
-    (wants.to_string(), verb.replace("{id}", id))
-}
-
-fn other_placeholder_token(_state: &TaskState) -> &'static str {
-    "—"
+    (demand, verb.replace("{id}", id))
 }
 
 /// Parse the spec artifact body into the gate presentation. The JSON of
@@ -356,6 +399,28 @@ fn non_empty(s: &str) -> Option<&str> {
     let t = s.trim();
     if t.is_empty() { None } else { Some(t) }
 }
+
+/// Shape-contract ledger of the command plane (R4, ux/contract-stability).
+/// `COMMAND_OPERATIONS` pins WHICH published read backs each command; this
+/// const pins the IPC SHAPE each command publishes, so a breaking revision
+/// is a recorded, versioned fact the frontend and its `types.ts` mirror are
+/// reviewed against — not an unwritten convention. `version` starts at 2
+/// for a recorded breaking revision (1 = the un-versioned first shape);
+/// `breaking` is a non-empty human note naming what changed and when.
+#[allow(dead_code)] // the ledger is consumed by the pinning test, not at runtime
+#[derive(Debug, Clone, Copy)]
+pub struct CommandContract {
+    pub command: &'static str,
+    pub version: u32,
+    pub breaking: &'static str,
+}
+
+#[allow(dead_code)] // consumed by the contract test (R4)
+pub const COMMAND_CONTRACTS: &[CommandContract] = &[CommandContract {
+    command: "inbox_view",
+    version: 2,
+    breaking: "v2 (2026-11-06): inbox_view заменил InboxEntry[] на WaitSnapshot (REQ-GATE-01..10) — прежней формы больше нет; frontend/src/types.ts зеркалит v2.",
+}];
 
 /// The (command → registry operation) mapping. Every data command is
 /// backed by a published Read operation; `session_info` is bootstrap state
@@ -627,7 +692,7 @@ pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
             .cmp(&b.task.updated_at)
             .then(a.question.created_at.cmp(&b.question.created_at))
     });
-    let badge = waiting.len() + human_stopped.len();
+    let badge = waiting.len() + human_stopped.len() + notes.len();
     Ok(WaitSnapshot {
         waiting,
         human_stopped,
@@ -641,8 +706,8 @@ pub fn inbox_view(state: State<AppState>) -> Result<WaitSnapshot, UiError> {
 /// registry questions, and the click-presentation of its gate type
 /// (REQ-GATE-04) — spec for APPROVAL, report for QA.
 fn wait_row(api: &Api, task: Task) -> Result<WaitRow, UiError> {
-    let (wants, cli_hint) = wait_demand_for(&task.state, &short_id(&task.id));
     let open_questions = open_questions_of(api, &task)?;
+    let (demand, cli_hint) = wait_demand_for(&task.state, &short_id(&task.id), &open_questions);
     let spec = if task.state == TaskState::Approval {
         approval_spec(api, &task)?
     } else {
@@ -655,7 +720,7 @@ fn wait_row(api: &Api, task: Task) -> Result<WaitRow, UiError> {
     };
     Ok(WaitRow {
         task,
-        wants,
+        demand,
         cli_hint,
         open_questions,
         spec,
@@ -664,14 +729,26 @@ fn wait_row(api: &Api, task: Task) -> Result<WaitRow, UiError> {
     })
 }
 
-/// Platform registry questions of the task, stored OPEN token only
-/// (question.list composition, REQ-GATE-03 AC2).
-fn open_questions_of(api: &Api, task: &Task) -> Result<Vec<Question>, UiError> {
+/// The ONE composition of registry questions: `question.list` filtered to
+/// the stored OPEN token, plus the caller's predicate (R2, mt/dry). The
+/// wait row wants all OPEN questions, the reference group only the
+/// NON-blocking ones — one query shape, two predicates.
+fn open_questions_where(
+    api: &Api,
+    task: &Task,
+    keep: impl Fn(&Question) -> bool,
+) -> Result<Vec<Question>, UiError> {
     Ok(api
         .question_list(&task.id.to_string())?
         .into_iter()
-        .filter(|q| q.status == QuestionStatus::Open)
+        .filter(|q| q.status == QuestionStatus::Open && keep(q))
         .collect())
+}
+
+/// Platform registry questions of the task, stored OPEN token only
+/// (question.list composition, REQ-GATE-03 AC2).
+fn open_questions_of(api: &Api, task: &Task) -> Result<Vec<Question>, UiError> {
+    open_questions_where(api, task, |_| true)
 }
 
 /// QA presentation: the CURRENT quality report (registry.rs:155-161), or
@@ -686,17 +763,15 @@ fn qa_report(api: &Api, task: &Task) -> (Option<QualityReportView>, Option<Strin
 
 /// Reference-group rows (ratified OQ-GATE-1): stored OPEN NON-blocking
 /// questions of a task the platform does NOT stand on — a note on an
-/// active task (workflow.rs:747-748), never a wait row and never counted
-/// into the badge (REQ-GATE-10). Terminal tasks carry no live demand, so
-/// their leftovers stay out (is_note_visible).
+/// active task (workflow.rs:747-748), never a wait row (it is a separate
+/// group and the badge counts rows of the same snapshot). Terminal tasks
+/// carry no live demand, so their leftovers stay out (is_note_visible).
 fn reference_notes(api: &Api, task: &Task) -> Result<Vec<WaitNote>, UiError> {
     if !is_note_visible(&task.state) {
         return Ok(Vec::new());
     }
-    Ok(api
-        .question_list(&task.id.to_string())?
+    Ok(open_questions_where(api, task, |q| !q.blocking)?
         .into_iter()
-        .filter(|q| q.status == QuestionStatus::Open && !q.blocking)
         .map(|question| WaitNote {
             task: task.clone(),
             question,
@@ -913,29 +988,31 @@ mod tests {
     /// WAITING_FOR_INPUT, QA, FAILED), the separate operator-stopped set
     /// (PAUSED/BLOCKED), and nothing else. An ACTIVE task carrying only a
     /// non-blocking OPEN question creates no wait row (workflow.rs:747-748).
+    ///
+    /// R3: the table below names EVERY TaskState variant, so a new variant
+    /// cannot be added without a membership decision here (the exhaustive
+    /// `wait_group_of` match already fails the build; this pins the
+    /// expected verdict per variant).
     #[test]
     fn wait_membership_is_the_state_guard_not_a_guess() {
-        for s in [
-            TaskState::Approval,
-            TaskState::WaitingForInput,
-            TaskState::Qa,
-            TaskState::Failed,
-        ] {
-            assert_eq!(wait_group_of(&s), Some(WaitGroup::Platform), "{s:?}");
-        }
-        for s in [TaskState::Paused, TaskState::Blocked] {
-            assert_eq!(wait_group_of(&s), Some(WaitGroup::StoppedByHuman), "{s:?}");
-        }
-        for s in [
-            TaskState::Draft,
-            TaskState::Analysis,
-            TaskState::Review,
-            TaskState::Implementation,
-            TaskState::Rework,
-            TaskState::Accepted,
-            TaskState::Cancelled,
-        ] {
-            assert_eq!(wait_group_of(&s), None, "{s:?}");
+        use WaitGroup::{Platform, StoppedByHuman};
+        let table: [(TaskState, Option<WaitGroup>); 13] = [
+            (TaskState::Draft, None),
+            (TaskState::Analysis, None),
+            (TaskState::Review, None),
+            (TaskState::Approval, Some(Platform)),
+            (TaskState::Implementation, None),
+            (TaskState::Qa, Some(Platform)),
+            (TaskState::Rework, None),
+            (TaskState::WaitingForInput, Some(Platform)),
+            (TaskState::Paused, Some(StoppedByHuman)),
+            (TaskState::Blocked, Some(StoppedByHuman)),
+            (TaskState::Failed, Some(Platform)),
+            (TaskState::Accepted, None),
+            (TaskState::Cancelled, None),
+        ];
+        for (state, expected) in table {
+            assert_eq!(wait_group_of(&state), expected, "{state:?}");
         }
         // The reference group never speaks for terminal tasks.
         assert!(!is_note_visible(&TaskState::Accepted));
@@ -945,25 +1022,58 @@ mod tests {
 
     /// REQ-GATE-03 AC1 + REQ-GATE-06 AC2: every wait type carries human
     /// wording of the demand and the literal CLI command; the tokens of
-    /// the three platform gate types stay distinguishable.
+    /// the three platform gate types stay distinguishable. The WAITING hint
+    /// must be runnable as printed: a real question id when one is parked,
+    /// the empty-rework ratification when there is none (R6).
     #[test]
     fn wait_demand_names_the_operation_and_the_cli() {
         // Ратифицированная «дословная команда» = фактический синтаксис CLI:
         // rationale/text — --long-опции (crates/devai-cli/src/main.rs,
         // Approve/Reject/Accept/Return/Answer), не позиционные аргументы.
-        let (wants, hint) = wait_demand_for(&TaskState::Approval, "01a1b0ea");
-        assert!(wants.contains("спецификацию"), "{wants}");
+        let (demand, hint) = wait_demand_for(&TaskState::Approval, "01a1b0ea", &[]);
+        assert!(demand.contains("спецификацию"), "{demand}");
         assert!(hint.contains("task approve 01a1b0ea --rationale"), "{hint}");
         assert!(hint.contains("task reject 01a1b0ea --rationale"), "{hint}");
-        let (_, hint) = wait_demand_for(&TaskState::WaitingForInput, "x");
-        assert!(hint.contains("question answer"), "{hint}");
-        assert!(hint.contains("--text"), "{hint}");
-        let (wants, hint) = wait_demand_for(&TaskState::Qa, "abc123");
-        assert!(wants.contains("quality-отчёт"), "{wants}");
+
+        // Parked question: the real id, not a literal placeholder.
+        let parked = question_fixture("01a1b0ea-0000-4000-8000-0000000000bb", true);
+        let (_, hint) = wait_demand_for(&TaskState::WaitingForInput, "x", &[parked]);
+        assert!(
+            hint.contains("question answer 01a1b0ea-0000-4000-8000-0000000000bb --text"),
+            "{hint}"
+        );
+        assert!(!hint.contains("<вопрос-id>"), "{hint}");
+
+        // A stray non-blocking note beside the parked blocking question must
+        // not steal the printed id: only the blocking one is answerable.
+        let note = question_fixture("01a1b0ea-0000-4000-8000-0000000000cc", false);
+        let parked = question_fixture("01a1b0ea-0000-4000-8000-0000000000bb", true);
+        let (_, hint) = wait_demand_for(&TaskState::WaitingForInput, "x", &[note, parked]);
+        assert!(
+            hint.contains("question answer 01a1b0ea-0000-4000-8000-0000000000bb --text"),
+            "{hint}"
+        );
+
+        // No OPEN question = the empty-rework gate: the real escape command.
+        let (demand, hint) = wait_demand_for(&TaskState::WaitingForInput, "x", &[]);
+        assert!(demand.contains("пустого реворка"), "{demand}");
+        assert!(
+            hint.contains("task ratify-empty-rework x --rationale"),
+            "{hint}"
+        );
+
+        let (demand, hint) = wait_demand_for(&TaskState::Qa, "abc123", &[]);
+        assert!(demand.contains("quality-отчёт"), "{demand}");
         assert!(hint.contains("task accept abc123 --rationale"), "{hint}");
         assert!(hint.contains("task return abc123 --rationale"), "{hint}");
-        let (_, hint) = wait_demand_for(&TaskState::Failed, "f1");
+        let (_, hint) = wait_demand_for(&TaskState::Failed, "f1", &[]);
         assert!(hint.contains("task resume f1"), "{hint}");
+
+        // A non-wait state has no demand and no command — honest emptiness,
+        // not a placeholder token dressed as a command (R1).
+        let (demand, hint) = wait_demand_for(&TaskState::Implementation, "i1", &[]);
+        assert!(demand.contains("не стоит"), "{demand}");
+        assert!(hint.is_empty(), "{hint}");
     }
 
     /// REQ-GATE-04 AC1 + ratified OQ-GATE-4: the paragraph and the spec's
@@ -1022,20 +1132,21 @@ mod tests {
         }
     }
 
-    /// Badge discipline (REQ-GATE-08 AC3 / REQ-GATE-10 AC1): the number
-    /// mirrors the wait rows of the same snapshot; reference notes never
-    /// inflate it.
+    /// Badge discipline (REQ-GATE-08 AC3): the badge is the number of rows
+    /// of the section on the same snapshot — waiting + human-stopped + the
+    /// ratified OQ-GATE-1 reference notes (they are shown rows, not a
+    /// hidden bucket).
     #[test]
-    fn badge_counts_wait_rows_not_reference_notes() {
+    fn badge_counts_every_section_row() {
         // The snapshot is composed by inbox_view from live reads; the
-        // invariant itself is `badge == waiting.len() + human_stopped.len()`
+        // invariant itself is `badge == waiting + human_stopped + notes`
         // and is asserted on the live fixture run's JSON (see the
         // implementation report's evidence pointer).
         let now = now_fixture();
         let snapshot = WaitSnapshot {
             waiting: vec![WaitRow {
                 task: task_fixture("a", "", now),
-                wants: "w".into(),
+                demand: "w".into(),
                 cli_hint: "h".into(),
                 open_questions: vec![],
                 spec: None,
@@ -1044,7 +1155,7 @@ mod tests {
             }],
             human_stopped: vec![WaitRow {
                 task: task_fixture("b", "", now),
-                wants: "w".into(),
+                demand: "w".into(),
                 cli_hint: "h".into(),
                 open_questions: vec![],
                 spec: None,
@@ -1068,15 +1179,11 @@ mod tests {
                     created_at: now,
                 },
             }],
-            badge: 2,
+            badge: 3,
         };
         assert_eq!(
             snapshot.badge,
-            snapshot.waiting.len() + snapshot.human_stopped.len()
-        );
-        assert_ne!(
-            snapshot.badge as usize + snapshot.notes.len(),
-            snapshot.badge
+            snapshot.waiting.len() + snapshot.human_stopped.len() + snapshot.notes.len()
         );
     }
 
@@ -1175,7 +1282,7 @@ mod tests {
         };
         let row = WaitRow {
             task: task.clone(),
-            wants: "Утвердить или отклонить текущую спецификацию задачи".into(),
+            demand: "Утвердить или отклонить текущую спецификацию задачи".into(),
             cli_hint: "devai task approve 01a1b0ea --rationale \"<обоснование>\"".into(),
             open_questions: vec![question.clone()],
             spec: Some(presentation.clone()),
@@ -1189,7 +1296,9 @@ mod tests {
                 task: task.clone(),
                 question: note,
             }],
-            badge: 1,
+            // 1 waiting + 1 reference note = every row of the section
+            // (REQ-GATE-08 AC3; the notes are shown, ratified OQ-GATE-1).
+            badge: 2,
         };
         (snapshot, presentation)
     }
@@ -1242,25 +1351,126 @@ mod tests {
         }
     }
 
-    /// Every command operation of the section is a registered READ; the
-    /// extended inbox_view mapping (task.status/artifact.list/
-    /// artifact.cat_text/task.report) is covered by the same table test.
+    /// R4 (ux/contract-stability): a breaking command shape is a RECORDED,
+    /// versioned fact — every entry of the ledger is a mapped command with
+    /// version >= 2 and a non-empty breaking note, and the section's
+    /// breaking revision is present. A new un-versioned break fails here.
     #[test]
-    fn wait_section_commands_stay_registered_reads() {
-        let ops = devai_api::operations();
-        let by_name: std::collections::HashMap<&str, &OpDescriptor> =
-            ops.iter().map(|o| (o.name, o)).collect();
-        for (cmd, op) in COMMAND_OPERATIONS
-            .iter()
-            .filter(|(c, _)| *c == "inbox_view")
-        {
-            let d = *by_name
-                .get(op)
-                .unwrap_or_else(|| panic!("`{cmd}` calls `{op}`: not published"));
-            assert_eq!(
-                d.class,
-                devai_api::OpClass::Read,
-                "`{cmd}`→`{op}` is not Read"
+    fn breaking_command_contracts_are_versioned_and_mapped() {
+        for contract in COMMAND_CONTRACTS {
+            assert!(
+                contract.version >= 2,
+                "{}: a recorded breaking revision starts at v2",
+                contract.command
+            );
+            assert!(
+                !contract.breaking.trim().is_empty(),
+                "{}: a breaking revision must say what changed",
+                contract.command
+            );
+            assert!(
+                COMMAND_OPERATIONS
+                    .iter()
+                    .any(|(cmd, _)| *cmd == contract.command),
+                "{} is versioned but not mapped in COMMAND_OPERATIONS",
+                contract.command
+            );
+        }
+        assert!(
+            COMMAND_CONTRACTS
+                .iter()
+                .any(|c| c.command == "inbox_view" && c.version == 2),
+            "inbox_view changed shape this iteration and must be versioned"
+        );
+    }
+
+    /// R4 parity half: the section's row TEXTS (demand copy + the literal
+    /// CLI hint) are pinned by a snapshot, so a copy drift or a placeholder
+    /// creeping back into the hint fails in cargo test rather than in the
+    /// window. Each hint must be runnable as printed.
+    #[test]
+    fn wait_section_row_texts_are_pinned_by_a_snapshot() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/wait_texts.json"))
+                .expect("wait_texts fixture must be valid JSON");
+        let id = fixture["id"].as_str().unwrap();
+        let question = question_fixture(fixture["question_id"].as_str().unwrap(), true);
+
+        let mut actual = serde_json::Map::new();
+        let cases: [(&str, TaskState, Vec<Question>); 7] = [
+            ("APPROVAL", TaskState::Approval, vec![]),
+            (
+                "WAITING_FOR_INPUT",
+                TaskState::WaitingForInput,
+                vec![question],
+            ),
+            (
+                "WAITING_FOR_INPUT_EMPTY_REWORK",
+                TaskState::WaitingForInput,
+                vec![],
+            ),
+            ("QA", TaskState::Qa, vec![]),
+            ("FAILED", TaskState::Failed, vec![]),
+            ("PAUSED", TaskState::Paused, vec![]),
+            ("BLOCKED", TaskState::Blocked, vec![]),
+        ];
+        for (token, state, questions) in cases {
+            let (demand, cli_hint) = wait_demand_for(&state, id, &questions);
+            actual.insert(
+                token.to_string(),
+                serde_json::json!({ "demand": demand, "cli_hint": cli_hint }),
+            );
+        }
+        assert_eq!(
+            serde_json::Value::Object(actual),
+            fixture["rows"],
+            "row texts drifted from the pinned snapshot (R4)"
+        );
+    }
+
+    /// R5 (arch/no-magic): `frontend/src/states.ts` mirrors EVERY stored
+    /// TaskState token of Rust, and the view compares through that shared
+    /// const instead of carrying raw literals — a Rust token rename fails
+    /// HERE; a raw literal in the template fails the second half.
+    #[test]
+    fn states_ts_mirrors_rust_task_state_tokens() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let ts = std::fs::read_to_string(format!("{crate_dir}/frontend/src/states.ts"))
+            .expect("frontend/src/states.ts must exist (R5)");
+        let view = std::fs::read_to_string(format!("{crate_dir}/frontend/src/views/InboxView.vue"))
+            .expect("InboxView.vue must exist");
+        let states: [TaskState; 13] = [
+            TaskState::Draft,
+            TaskState::Analysis,
+            TaskState::Review,
+            TaskState::Approval,
+            TaskState::Implementation,
+            TaskState::Qa,
+            TaskState::Rework,
+            TaskState::WaitingForInput,
+            TaskState::Paused,
+            TaskState::Blocked,
+            TaskState::Failed,
+            TaskState::Accepted,
+            TaskState::Cancelled,
+        ];
+        for state in states {
+            let token = serde_json::to_value(&state).unwrap();
+            let token = token.as_str().unwrap();
+            assert!(
+                ts.contains(&format!("\"{token}\"")),
+                "states.ts has no mirror for TaskState::{state:?} (`{token}`)"
+            );
+        }
+        for raw in [
+            "\"APPROVAL\"",
+            "'APPROVAL'",
+            "\"WAITING_FOR_INPUT\"",
+            "'WAITING_FOR_INPUT'",
+        ] {
+            assert!(
+                !view.contains(raw),
+                "InboxView.vue carries a raw state token {raw} — use TaskStateToken"
             );
         }
     }
@@ -1269,5 +1479,23 @@ mod tests {
     fn now_fixture() -> chrono::DateTime<chrono::Utc> {
         use chrono::Timelike;
         chrono::Utc::now().with_nanosecond(0).unwrap()
+    }
+
+    fn question_fixture(id: &str, blocking: bool) -> Question {
+        let now = now_fixture();
+        Question {
+            id: id.parse().unwrap(),
+            task_id: devai_core::types::new_id(),
+            execution_id: None,
+            text: "Ответить на вопрос?".into(),
+            context: None,
+            options: vec![],
+            blocking,
+            status: QuestionStatus::Open,
+            answer: None,
+            answered_by: None,
+            answered_at: None,
+            created_at: now,
+        }
     }
 }

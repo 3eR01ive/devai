@@ -227,7 +227,8 @@ export type ArtifactContent =
 
 export interface WaitRow {
   task: Task;
-  wants: string;
+  /** Что платформа требует ОТ оператора (REQ-GATE-03 AC1), не свойство задачи. */
+  demand: string;
   cli_hint: string;
   open_questions: Question[];
   spec: SpecPresentation | null;
