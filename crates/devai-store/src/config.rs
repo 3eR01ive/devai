@@ -455,9 +455,14 @@ impl Config {
     /// budget so its reply is shaped for platform assembly.
     fn compile_profile(profile: &Profile, ins: &mut String) {
         use std::fmt::Write as _;
+        let report_contract = format!(
+            "{}@{}",
+            devai_core::types::QUALITY_REPORT_CONTRACT.0,
+            devai_core::types::QUALITY_REPORT_CONTRACT.1
+        );
         let _ = writeln!(
             ins,
-            "\n\nEvaluation profile `{}` v{}: the PLATFORM runs gates and mechanical probes, computes S, floors and the verdict — you never emit a verdict. Your reply is an evaluation-assessment JSON: `scores` ({{check-id: number}} for the rubric/hybrid checks below), `findings` ([{{check, text, evidence[]}}] — text = what + file:line + what it leads to; `evidence` is a NON-EMPTY array of concrete citations: test output, artifact id, build log), `gaps` ([{{check, reason}}] when you could not verify something honestly — an unperformed check is never a fake score). The platform assembles the quality-report@4 (bound to the workspace revision captured at execution start), and the contract gate rejects any criteria entry whose evidence array is missing or empty — no criterion is ever recorded as a pass without evidence.",
+            "\n\nEvaluation profile `{}` v{}: the PLATFORM runs gates and mechanical probes, computes S, floors and the verdict — you never emit a verdict. Your reply is an evaluation-assessment JSON: `scores` ({{check-id: number}} for the rubric/hybrid checks below), `findings` ([{{check, text, evidence[]}}] — text = what + file:line + what it leads to; `evidence` is a NON-EMPTY array of concrete citations: test output, artifact id, build log), `gaps` ([{{check, reason}}] when you could not verify something honestly — an unperformed check is never a fake score). The platform assembles the {report_contract} (bound to the workspace revision captured at execution start), and the contract gate rejects any criteria entry whose evidence array is missing or empty — no criterion is ever recorded as a pass without evidence.",
             profile.project, profile.version
         );
         let mut human_only: Vec<&str> = Vec::new();
@@ -499,7 +504,7 @@ impl Config {
             if c.evidence == "required" {
                 let _ = writeln!(
                     ins,
-                    "  evidence: REQUIRED — every criteria entry must cite at least one concrete evidence item (test output, artifact id, build log). A score < 1.0 without evidence is discarded (proc/evidence-completeness); a PASS backed only by your judgment is contract-invalid (quality-report@4: minItems 1 per check)."
+                    "  evidence: REQUIRED — every criteria entry must cite at least one concrete evidence item (test output, artifact id, build log). A score < 1.0 without evidence is discarded (proc/evidence-completeness); a PASS backed only by your judgment is contract-invalid ({report_contract}: minItems 1 per check)."
                 );
             }
         }
@@ -2542,6 +2547,51 @@ scoring:
             seen >= 5,
             "the factory role set must be present (saw {seen} files)"
         );
+    }
+
+    /// R3: a contract version is declared ONCE, in `devai_core::types`. The
+    /// role fields that name a contract point at that SAME declaration, and
+    /// no role prose re-spells a `quality-report@N` literal — so a contract
+    /// bump cannot leave a stale version in a role or in the compiled prompt.
+    #[test]
+    fn role_contract_refs_follow_the_platform_declared_versions() {
+        use devai_core::types::{ASSESSMENT_CONTRACT, QUALITY_REPORT_CONTRACT};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+        let cfg = load(&dir).unwrap();
+        let role = |slug: &str| {
+            let mut found = cfg.roles.iter().filter(|r| r.slug == slug);
+            let one = found.next().unwrap_or_else(|| panic!("no role {slug}"));
+            assert!(found.next().is_none(), "duplicate role {slug}");
+            one
+        };
+        let assessment = format!("{}@{}", ASSESSMENT_CONTRACT.0, ASSESSMENT_CONTRACT.1);
+        assert_eq!(
+            role("quality-auditor").output_contract.as_deref(),
+            Some(assessment.as_str()),
+            "the auditor answers in the platform's assessment contract"
+        );
+        let report = format!(
+            "{}@{}",
+            QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1
+        );
+        assert_eq!(
+            role("quality-aggregator").input_contract.as_deref(),
+            Some(report.as_str()),
+            "the aggregator consumes the published report contract"
+        );
+        for r in &cfg.roles {
+            for (field, text) in [
+                ("purpose", &r.purpose),
+                ("instructions", &r.instructions),
+                ("done_criteria", &r.done_criteria),
+            ] {
+                assert!(
+                    !text.contains("quality-report@"),
+                    "{field} of {} spells a contract version instead of naming the gate",
+                    r.slug
+                );
+            }
+        }
     }
 
     #[test]

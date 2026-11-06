@@ -2553,16 +2553,11 @@ scoring:
         assert!(view.freshness.expect("freshness is part of the view").stale);
     }
 
-    /// R1/R5: the freshness marker names the STORE fact. A return whose last
-    /// auditor run is the COMPLETED one that produced the report is NOT an
-    /// unfinished re-audit (the old code invented one).
-    #[test]
-    fn a_completed_auditor_run_is_not_an_unfinished_reaudit() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = seeded_api(dir.path());
-        let t = fresh_task(&api, "freshness-completed");
-        let artifact = publish_form_report(&api, t);
-
+    /// Fixture for the freshness facts below: publish a form report, then
+    /// return the task to rework after a COMPLETED auditor run that produced
+    /// that very report. Returns the completed run.
+    fn completed_audit_then_rework(api: &Api, t: Id) -> RoleExecution {
+        let artifact = publish_form_report(api, t);
         let started = chrono::DateTime::parse_from_rfc3339("2026-11-06T10:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -2577,7 +2572,30 @@ scoring:
                 started + chrono::Duration::minutes(5),
             )
             .unwrap();
-        return_to_rework_state(&api, t, artifact.id);
+        return_to_rework_state(api, t, artifact.id);
+        done
+    }
+
+    /// The first line of the CLI text channel — the freshness marker.
+    fn reported_marker(api: &Api, t: Id) -> String {
+        api.quality_report_text(t)
+            .unwrap()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// R1/R5: the freshness marker names the STORE fact. A return whose last
+    /// auditor run is the COMPLETED one that produced the report is NOT an
+    /// unfinished re-audit (the old code invented one).
+    #[test]
+    fn a_completed_auditor_run_is_not_an_unfinished_reaudit() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "freshness-completed");
+        let done = completed_audit_then_rework(&api, t);
 
         let p = api.presented_quality_report(t).unwrap().unwrap();
         assert_eq!(
@@ -2591,15 +2609,7 @@ scoring:
         assert!(!p.freshness.marker.contains("в работе"));
         assert!(!p.freshness.marker.contains("не завершён"));
         // The text channel carries the same full marker, not a summary.
-        assert_eq!(
-            api.quality_report_text(t)
-                .unwrap()
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap_or(""),
-            p.freshness.marker
-        );
+        assert_eq!(reported_marker(&api, t), p.freshness.marker);
     }
 
     /// …and only a live RUNNING row earns «в работе»: the marker then names

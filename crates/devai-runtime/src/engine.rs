@@ -24,13 +24,12 @@ use crate::gate;
 use crate::prompt::build_user_prompt;
 use crate::worktree;
 
-/// Stage the auditor answers in: the agent emits an
-/// evaluation-assessment; the PLATFORM assembles the quality report.
-const ASSESSMENT_CONTRACT: (&str, u32) = ("evaluation-assessment", 1);
-/// The quality-report contract version is pinned in CODE (`human_view`), so
-/// the mechanical gate cannot be bypassed by an old schema text lingering in
-/// a home's contract table (seeding is insert-only; older versions stay in
-/// the store untouched as history). Nothing else spells the version.
+// The quality-report contract version is pinned in CODE (`devai_core`), so
+// the mechanical gate cannot be bypassed by an old schema text lingering in
+// a home's contract table (seeding is insert-only; older versions stay in
+// the store untouched as history). Nothing else spells the version; the
+// auditor's own answer contract (`ASSESSMENT_CONTRACT`) comes from the same
+// `devai_core::types` declaration through the glob import above (rework R3).
 use crate::human_view::QUALITY_REPORT_CONTRACT;
 
 /// Run-artifact root under the data directory (REQ-WT-05): evidence is

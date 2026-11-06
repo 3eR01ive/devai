@@ -126,9 +126,15 @@ export function presentReport(report: QualityReportView): ReportBody {
   return { kind: "absent", text: "(отчёт без рендеринга — пустое тело)" };
 }
 
+/** Width of the short artifact label used in the panel (R4: a named
+ * constant, not a literal at the slice site). The canonical task-id width
+ * lives in Rust (`devai_core::types::ID_PREFIX_CHARS`); an artifact label is
+ * the panel's own display choice, so its width is declared here. */
+export const ARTIFACT_SHORT_CHARS = 8;
+
 /** The short artifact label used in the damaged-form marker. */
 export function shortArtifact(id: string): string {
-  return id.length > 8 ? id.slice(0, 8) : id;
+  return id.length > ARTIFACT_SHORT_CHARS ? id.slice(0, ARTIFACT_SHORT_CHARS) : id;
 }
 
 /** The freshness banner of the panel, as one decision: «no banner» or the

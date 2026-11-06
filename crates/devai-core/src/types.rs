@@ -26,6 +26,16 @@ pub fn new_id() -> Id {
 /// `resolve_task` still fails loudly on any genuine ambiguity.
 pub const ID_PREFIX_CHARS: usize = 13;
 
+/// Contract versions the PLATFORM owns, declared ONCE (rework R3): the
+/// runtime assembles/publishes under these versions, the seeded schemas are
+/// keyed by them, and the store-side prompt text formats them instead of
+/// spelling a literal. A bump here is the only place a version changes.
+pub const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 5);
+
+/// The shape the QA agent actually answers in; the platform assembles the
+/// quality report from it afterwards.
+pub const ASSESSMENT_CONTRACT: (&str, u32) = ("evaluation-assessment", 1);
+
 /// Typed accessor for the canonical short display of an id. Taking `&Uuid`
 /// (not a `&str`) guarantees the canonical 36-char `to_string` form, so the
 /// byte slice below is always inside an ASCII boundary — no length check at

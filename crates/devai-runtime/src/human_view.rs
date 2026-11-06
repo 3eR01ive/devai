@@ -30,11 +30,11 @@ pub mod present;
 
 use std::collections::BTreeMap;
 
-/// The quality-report contract THIS platform assembles and publishes.
-/// Spelled once: assembly, publication and the messages that name a version
-/// read it from here (rework R2), so a contract bump cannot leave a stale
-/// «@4» in a doc comment or an assertion.
-pub const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 5);
+// The quality-report contract THIS platform assembles and publishes lives in
+// ONE declaration (`devai_core::types`), shared with the store-side prompt
+// text; re-exported here so assembly/publication keep reading it from the
+// human-form module (rework R3).
+pub use devai_core::types::QUALITY_REPORT_CONTRACT;
 
 use devai_core::vocab::{CheckState, ItemKind};
 use devai_store::config::Profile;
@@ -417,8 +417,11 @@ impl Buckets {
         ));
     }
 
-    /// Gates first: a gate that is not PASS (failed OR unperformed) is the
-    /// decision, not a nuance.
+    /// A gate that is not PASS (failed OR unperformed) is a decision row of
+    /// this group, not a nuance. It is NOT printed first: `sort_all` orders
+    /// the group by tier, then importance desc, then id — the cap row
+    /// (`blocked-weight`) shares the cap/gate tier with the gates (R1: the
+    /// old comment claimed an order the sort never applied).
     fn push_gates(&mut self, gates: &[GateOutcome]) {
         for g in gates.iter().filter(|g| g.state != ProbeState::Pass) {
             self.blocks.push((
