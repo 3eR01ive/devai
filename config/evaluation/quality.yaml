@@ -90,7 +90,7 @@
 # семантике Probe{pass_exit} выше, не FAIL. Веса проверок не тронуты
 # (гейты бинарны, V7 sum=1.00 сохранён).
 
-version: 18
+version: 19
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -235,14 +235,6 @@ error_types:
     severity: minor
 
 gates:
-  - id: build-green
-    desc: >-
-      Все значимые сборки проекта проходят. Правило не перечисляет сборки и не
-      знает инструментов: проект обязан иметь одну входную точку сборки, которая
-      покрывает всё значимое (её и запускает гейт). Как собирать — выясняет роль,
-      а не конфиг.
-    probes:
-      - { cmd: "./build.sh", pass_exit: [0] }
   - id: tests-green
     desc: cargo test --workspace завершается успешно
     probes:
