@@ -131,7 +131,7 @@ fn empty_registry_launch_registers_and_activates_the_launch_home() {
         "the first record of an empty registry is created by this launch"
     );
     let active = active.active;
-    assert_eq!(active, launch.canonicalize().unwrap());
+    assert_eq!(active, Some(launch.canonicalize().unwrap()));
     assert_eq!(homes.entries().len(), 1);
     let e = &homes.entries()[0];
     assert!(e.enabled && e.active);
@@ -161,7 +161,7 @@ fn launch_from_a_new_home_registers_it_without_losing_records_or_env_priority() 
     // B launches WITHOUT env: the record appears, the saved active stays
     // with A (ratified OQ-HOME-7: no env → the stored record wins).
     let active = homes.bootstrap_launch(&b, false).unwrap().active;
-    assert_eq!(active, a.canonicalize().unwrap());
+    assert_eq!(active, Some(a.canonicalize().unwrap()));
     assert_eq!(homes.entries().len(), 2);
     assert!(homes.entries().iter().all(|e| e.enabled));
     assert_eq!(
@@ -174,7 +174,7 @@ fn launch_from_a_new_home_registers_it_without_losing_records_or_env_priority() 
     // record, A's record survives.
     let mut homes = load(&control);
     let active = homes.bootstrap_launch(&b, true).unwrap().active;
-    assert_eq!(active, b.canonicalize().unwrap());
+    assert_eq!(active, Some(b.canonicalize().unwrap()));
     assert_eq!(homes.entries().len(), 2);
     let reloaded = load(&control);
     assert_eq!(
@@ -272,22 +272,28 @@ fn add_registers_a_live_home_and_readd_reuses_the_recent_record() {
     assert_eq!(homes.entries().len(), 1);
 }
 
-#[test]
-fn enable_disable_and_the_ratified_active_handover() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let control = dir.path().join("control");
+/// Fixture of the disable tests: a control home and one seeded home already
+/// registered and active. Returns the registry and that home's registry key.
+fn single_home_registry(dir: &Path) -> (Homes, String) {
+    let control = dir.join("control");
     std::fs::create_dir_all(&control).unwrap();
-    let a = dir.path().join("a");
+    let a = dir.join("a");
     seed_home(&a, "alpha", &["x"]);
     let mut homes = load(&control);
     homes.bootstrap_launch(&a, true).unwrap();
+    let key = homes.entries()[0].path.clone();
+    (homes, key)
+}
+
+#[test]
+fn disabling_the_only_enabled_home_leaves_no_active_home() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut homes, key) = single_home_registry(dir.path());
 
     // Ratified OQ-HOME-8: switching the ACTIVE home off is a normal action.
     // With no other enabled record it leaves the honest "no active home"
     // state — no refusal, no silently chosen default.
-    let recs = homes
-        .set_enabled(&homes.entries()[0].path.clone(), false)
-        .unwrap();
+    let recs = homes.set_enabled(&key, false).unwrap();
     assert_eq!(
         recs.len(),
         1,
@@ -302,6 +308,13 @@ fn enable_disable_and_the_ratified_active_handover() {
         homes.active_entry().is_none(),
         "no enabled home remains: no active home, not a default one"
     );
+}
+
+#[test]
+fn disabling_keeps_each_home_on_disk_and_leaves_the_merged_view_empty() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut homes, key) = single_home_registry(dir.path());
+    homes.set_enabled(&key, false).unwrap();
 
     // Disabling keeps the record and the home's data on disk (REQ-HOME-03).
     let b = dir.path().join("b");
@@ -320,36 +333,43 @@ fn enable_disable_and_the_ratified_active_handover() {
         2,
         "the disabled record survives in the registry"
     );
-    let view = homes.tasks_all(None).unwrap();
     assert!(
-        view.is_empty(),
+        homes.tasks_all(None).unwrap().is_empty(),
         "both homes are switched off: the merged view is honestly empty"
     );
-    assert!(a.join("devai.db").exists() && PathBuf::from(&bp).join("devai.db").exists());
+    assert!(
+        PathBuf::from(&key).join("devai.db").exists()
+            && PathBuf::from(&bp).join("devai.db").exists()
+    );
+}
+
+/// Fixture of the handover tests: three seeded homes (alpha active, beta,
+/// gamma) in registry order. Returns the registry and the three keys.
+fn three_home_registry(dir: &Path) -> (Homes, Vec<String>) {
+    let control = dir.join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    let mut homes = load(&control);
+    for (dir_name, project) in [("a", "alpha"), ("b", "beta"), ("c", "gamma")] {
+        seed_home(&dir.join(dir_name), project, &[]);
+    }
+    homes.bootstrap_launch(&dir.join("a"), true).unwrap();
+    homes.add(&dir.join("b")).unwrap();
+    homes.add(&dir.join("c")).unwrap();
+    let keys = homes.entries().iter().map(|e| e.path.clone()).collect();
+    (homes, keys)
 }
 
 /// Ratified OQ-HOME-8, successor rule: the next ENABLED record in registry
-/// order becomes active after the active one is switched off; the tail
-/// wrapping picks the first enabled record when nothing follows, and the
+/// order becomes active after the active one is switched off, and the
 /// registry never holds two actives.
 #[test]
 fn switching_the_active_home_off_hands_the_marker_to_the_next_enabled() {
     let dir = tempfile::TempDir::new().unwrap();
-    let control = dir.path().join("control");
-    std::fs::create_dir_all(&control).unwrap();
-    let a = dir.path().join("a");
-    let b = dir.path().join("b");
-    let c = dir.path().join("c");
-    seed_home(&a, "alpha", &[]);
-    seed_home(&b, "beta", &[]);
-    seed_home(&c, "gamma", &[]);
-    let mut homes = load(&control);
-    homes.bootstrap_launch(&a, true).unwrap();
-    homes.add(&b).unwrap();
-    homes.add(&c).unwrap();
-    let ap = homes.entries()[0].path.clone();
-    let bp = homes.entries()[1].path.clone();
+    let (mut homes, keys) = three_home_registry(dir.path());
+    let (ap, bp) = (keys[0].clone(), keys[1].clone());
+
     let recs = homes.set_enabled(&ap, false).unwrap();
+
     let active: Vec<&str> = recs
         .iter()
         .filter(|r| r.active)
@@ -365,22 +385,73 @@ fn switching_the_active_home_off_hands_the_marker_to_the_next_enabled() {
         1,
         "exactly one active record — never two"
     );
+}
 
-    // Disable the new active: gamma follows. Then disable the last one and
-    // enable the FIRST record again: it becomes active by wrapping.
-    let cp = recs
-        .iter()
-        .find(|r| r.project == "gamma")
-        .map(|r| r.path.clone())
-        .unwrap();
-    let recs = homes.set_enabled(&bp, false).unwrap();
-    assert!(recs.iter().find(|r| r.path == cp).unwrap().active);
+/// Ratified OQ-HOME-8, tail wrap: disabling the last enabled records leaves
+/// "no active home"; enabling one afterwards adopts exactly the home the
+/// operator named (the FIRST record here, reached by wrapping).
+#[test]
+fn disabling_every_home_then_enabling_one_adopts_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut homes, keys) = three_home_registry(dir.path());
+    let (ap, bp, cp) = (keys[0].clone(), keys[1].clone(), keys[2].clone());
+    homes.set_enabled(&ap, false).unwrap();
+    homes.set_enabled(&bp, false).unwrap();
+    assert!(
+        homes
+            .entries()
+            .iter()
+            .find(|e| e.path == cp)
+            .unwrap()
+            .active
+    );
+
     let _ = homes.set_enabled(&cp, false).unwrap();
     assert!(homes.active_entry().is_none());
     let recs = homes.set_enabled(&ap, true).unwrap();
     assert!(
         recs.iter().find(|r| r.path == ap).unwrap().active,
         "enabling a home while no active remains adopts it"
+    );
+}
+
+/// R1 quality return (ratified OQ-HOME-8): starting the process from inside
+/// a switched-off home does NOT switch anything on. With every record
+/// switched off the registry keeps the honest "no active home" state —
+/// `enabled` and `active` stay false and `bootstrap_launch` reports no
+/// active path instead of silently picking one.
+#[test]
+fn launch_with_every_home_switched_off_changes_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let control = dir.path().join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    seed_home(&a, "alpha", &[]);
+    seed_home(&b, "beta", &[]);
+    let mut homes = load(&control);
+    homes.bootstrap_launch(&a, true).unwrap();
+    homes.add(&b).unwrap();
+    let paths: Vec<String> = homes.entries().iter().map(|e| e.path.clone()).collect();
+    for path in &paths {
+        homes.set_enabled(path, false).unwrap();
+    }
+    assert!(
+        homes.active_entry().is_none(),
+        "precondition: every home is switched off"
+    );
+
+    let resolution = homes.bootstrap_launch(&a, false).unwrap();
+
+    assert_eq!(
+        resolution.active, None,
+        "a launch must not pick an active home when none is enabled"
+    );
+    let reloaded = load(&control);
+    assert!(
+        reloaded.entries().iter().all(|e| !e.enabled && !e.active),
+        "the launch re-enabled or reactivated a switched-off record: {:?}",
+        reloaded.entries()
     );
 }
 
@@ -501,29 +572,32 @@ fn assert_lagging_tasks_are_read(block: &HomeRecordsView<Task>) {
     );
 }
 
-#[test]
-fn activation_validates_then_flips_the_stored_active_exactly_once() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let control = dir.path().join("control");
+/// Fixture of the activation tests: control home plus seeded alpha (active)
+/// and beta homes. Returns the registry, both home dirs and the keys.
+fn two_home_registry(dir: &Path) -> (Homes, PathBuf, PathBuf, String, String) {
+    let control = dir.join("control");
     std::fs::create_dir_all(&control).unwrap();
-    let a = dir.path().join("a");
-    let b = dir.path().join("b");
+    let a = dir.join("a");
+    let b = dir.join("b");
     seed_home(&a, "alpha", &[]);
     seed_home(&b, "beta", &[]);
     let mut homes = load(&control);
     homes.bootstrap_launch(&a, true).unwrap();
     homes.add(&b).unwrap();
-    let bp = homes
-        .entries()
-        .iter()
-        .find(|e| e.project == "beta")
-        .unwrap()
-        .path
-        .clone();
+    let keys: Vec<String> = homes.entries().iter().map(|e| e.path.clone()).collect();
+    (homes, a, b, keys[0].clone(), keys[1].clone())
+}
+
+#[test]
+fn activation_flips_the_stored_active_exactly_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut homes, _a, b, _ap, bp) = two_home_registry(dir.path());
+    let control = dir.path().join("control");
 
     let target = homes.activation_target(&bp).unwrap();
     assert_eq!(target, b.canonicalize().unwrap());
     homes.set_active(&target).unwrap();
+
     assert_eq!(homes.active_entry().unwrap().path, bp);
     let reloaded = load(&control);
     assert_eq!(reloaded.active_entry().unwrap().path, bp);
@@ -532,6 +606,12 @@ fn activation_validates_then_flips_the_stored_active_exactly_once() {
         1,
         "the flip keeps exactly one active"
     );
+}
+
+#[test]
+fn activation_target_refuses_unknown_and_vanished_homes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (homes, a, _b, ap, _bp) = two_home_registry(dir.path());
 
     // Unknown path: typed not_found. Missing dir: typed home_unavailable.
     assert_eq!(
@@ -542,18 +622,9 @@ fn activation_validates_then_flips_the_stored_active_exactly_once() {
             .0,
         "not_found"
     );
-    let gone = {
-        homes
-            .entries()
-            .iter()
-            .find(|e| e.project == "alpha")
-            .unwrap()
-            .path
-            .clone()
-    };
     std::fs::remove_dir_all(a.canonicalize().unwrap()).unwrap();
     assert_eq!(
-        homes.activation_target(&gone).unwrap_err().code().0,
+        homes.activation_target(&ap).unwrap_err().code().0,
         "home_unavailable"
     );
 }
@@ -973,6 +1044,46 @@ fn records_carry_attributes_for_the_view_layer() {
     }
 }
 
+/// The domain-plane snapshot the AC names: schema rank plus the ids of every
+/// table the registry plane must not touch. Read straight from the file.
+type DomainSnapshot = (
+    i64,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn domain_snapshot(control: &Path) -> DomainSnapshot {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        control.join("devai.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rank: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    let ids = |sql: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    };
+    (
+        rank,
+        ids("SELECT id FROM projects ORDER BY id"),
+        ids("SELECT id FROM tasks ORDER BY id"),
+        ids("SELECT id FROM artifacts ORDER BY id"),
+        ids("SELECT id FROM workflow_events ORDER BY id"),
+        ids("SELECT id FROM decisions ORDER BY id"),
+    )
+}
+
 /// REQ-HOME-06 AC3: the control home may itself be a WORKING home — the
 /// registry file lives inside it. Adding, disabling, re-enabling and
 /// activating homes must leave its domain plane exactly as it was: same
@@ -982,42 +1093,12 @@ fn records_carry_attributes_for_the_view_layer() {
 /// tables and rows, not API shapes.
 #[test]
 fn registry_management_changes_only_the_registry_of_the_control_home() {
-    use rusqlite::OpenFlags;
-
     let dir = tempfile::TempDir::new().unwrap();
     let control = dir.path().join("control");
     seed_home(&control, "devai", &["existing task"]);
     let other = dir.path().join("tripsales");
     seed_home(&other, "tripsales", &["gate task"]);
-
-    let domain = || {
-        let conn = rusqlite::Connection::open_with_flags(
-            control.join("devai.db"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let rank: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
-        let ids = |sql: &str| -> Vec<String> {
-            let mut stmt = conn.prepare(sql).unwrap();
-            let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .unwrap()
-                .map(|r| r.unwrap())
-                .collect();
-            rows
-        };
-        (
-            rank,
-            ids("SELECT id FROM projects ORDER BY id"),
-            ids("SELECT id FROM tasks ORDER BY id"),
-            ids("SELECT id FROM artifacts ORDER BY id"),
-            ids("SELECT id FROM workflow_events ORDER BY id"),
-            ids("SELECT id FROM decisions ORDER BY id"),
-        )
-    };
-    let before = domain();
+    let before = domain_snapshot(&control);
 
     let mut homes = load(&control);
     homes.bootstrap_launch(&other, true).unwrap();
@@ -1026,9 +1107,9 @@ fn registry_management_changes_only_the_registry_of_the_control_home() {
     homes.set_enabled(&rec.path, true).unwrap();
     devai_api::Api::activate_home(&mut homes, &rec.path, "tester").unwrap();
 
-    let after = domain();
     assert_eq!(
-        after, before,
+        domain_snapshot(&control),
+        before,
         "registry management gained or lost domain rows (or moved the schema rank) \
          in the home where the registry lives"
     );

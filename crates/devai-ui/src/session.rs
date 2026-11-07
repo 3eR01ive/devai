@@ -339,9 +339,26 @@ pub(crate) fn gone_failure(active: &Path) -> HomeFailure {
     )
 }
 
+/// The degradation fact of a registry with NO active record (every home is
+/// switched off, ratified OQ-HOME-8): a defined state, not an error, and it
+/// names the control home the session falls back to. ONE source for the
+/// startup bootstrap and the post-registry rebind (`commands.rs`).
+pub(crate) fn no_active_failure(control: &Path) -> HomeFailure {
+    HomeFailure::new(
+        devai_api::codes::HOME_NONE_ACTIVE,
+        control,
+        "no active home — enable or add a home; the registry keeps every record",
+    )
+}
+
 /// Open the active home for observation, or degrade to the control home and
 /// say honestly why (REQ-HOME-07). Only a refusal of the CONTROL home itself
 /// has nowhere left to degrade to, so that one is the startup error.
+///
+/// `resolution.active == None` is the ratified "no active home" state
+/// (OQ-HOME-8): every record is switched off, so the session observes
+/// through the control home and reports `home_none_active` — no home is
+/// invented and no record is re-enabled by starting the process (R1).
 fn open_active_or_control(
     homes: &Homes,
     launch: &Path,
@@ -349,7 +366,11 @@ fn open_active_or_control(
     actor: &str,
     env_set: bool,
 ) -> Result<(Api, Option<HomeFailure>), BootstrapError> {
-    let active = resolution.active.as_path();
+    let Some(active) = resolution.active.as_deref() else {
+        let failure = no_active_failure(homes.control_home());
+        let fallback = degrade_to_control(homes.control_home(), &failure, actor)?;
+        return Ok((fallback, Some(failure)));
+    };
     let state = active_disk_state(
         launch,
         active,
@@ -515,21 +536,19 @@ mod tests {
     /// older schema rank (v7; the fixture is the v8 shape minus the 008 rung,
     /// generated once with sqlite3 and inert since) must come out of startup
     /// with its rank untouched, marked "behind", and readable.
-    #[test]
-    fn startup_with_a_stored_active_home_of_an_older_schema_never_migrates_it() {
+    /// Fixture of the startup-observation test: a control home, the v7
+    /// lagging home with a stored active marker (a registry fact, not a
+    /// domain write), and the session opened without `$DEVAI_HOME`.
+    fn open_lagging_active_session(dir: &Path) -> (PathBuf, Session) {
         const FIXTURE: &str = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/lagging_home_v7.db"
         );
-        let dir = tempfile::TempDir::new().unwrap();
-        let control = dir.path().join("control");
-        let lagging = dir.path().join("lagging");
+        let control = dir.join("control");
+        let lagging = dir.join("lagging");
         std::fs::create_dir_all(&control).unwrap();
         std::fs::create_dir_all(&lagging).unwrap();
         std::fs::copy(FIXTURE, lagging.join(DB_FILE_NAME)).unwrap();
-
-        // Registration and the stored active marker are registry facts
-        // (homes.json), not domain writes into the observed home.
         let mut homes = Homes::load(&control).unwrap();
         assert_eq!(
             homes.add(&lagging).unwrap().schema_version,
@@ -537,28 +556,21 @@ mod tests {
             "fixture carries the older rank this build (v8) would migrate"
         );
         homes.set_active(&lagging).unwrap();
-
         // Launch home == stored active home; no $DEVAI_HOME, so the saved
         // record wins (OQ-HOME-7).
-        let mut session = Session::open_resolved(
+        let session = Session::open_resolved(
             lagging.clone(),
             "tester".to_string(),
             control.clone(),
             false,
         )
         .expect("an old-schema active home is observable, not a startup death");
-        assert_eq!(
-            std::fs::canonicalize(session.api.home()).unwrap(),
-            std::fs::canonicalize(&lagging).unwrap(),
-            "the session holds the stored active home itself"
-        );
-        assert!(
-            session.info.degraded_from.is_none(),
-            "observation is not a degradation"
-        );
+        (lagging, session)
+    }
 
-        // The rank is still 7: no rung ran, no `user_version` bump. The
-        // probe is the API's own live attribute, not a test-side sqlite read.
+    /// The rank is still 7: no rung ran, no `user_version` bump. The probe
+    /// is the API's own live attribute, not a test-side sqlite read.
+    fn assert_lagging_rank_untouched(session: &mut Session) {
         let rec = session.homes.records().unwrap().remove(0);
         assert_eq!(rec.schema_version, Some(7), "startup migrated the home");
         assert!(rec.active, "the stored active marker is unchanged");
@@ -569,15 +581,16 @@ mod tests {
             "the home is marked behind by its version, not hidden: {:?}",
             rec.version_note
         );
+    }
 
-        // Reading through the session handle works on the v7 rows.
+    /// R1/R2 quality return: the v7 tasks table has no `human_name` and the
+    /// fixture carries real rows — the task plane reads them (no
+    /// missing-column failure), both through the session and through the
+    /// merged home view.
+    fn assert_lagging_rows_are_read(session: &mut Session) {
         let projects = session.api.project_list().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "lagging");
-        // R1/R2 quality return: the v7 tasks table has no `human_name` and
-        // the fixture carries real rows — the task plane reads them (no
-        // missing-column failure), both through the session and through the
-        // merged home view.
         let tasks = session.api.task_list().unwrap();
         assert_eq!(tasks.len(), 2, "the lagging home's tasks are readable");
         assert!(tasks.iter().all(|t| t.human_name.is_none()));
@@ -588,6 +601,24 @@ mod tests {
             .expect("the enabled home answers");
         assert_eq!(block.records.len(), 2);
         assert!(block.error.is_none());
+    }
+
+    #[test]
+    fn startup_with_a_stored_active_home_of_an_older_schema_never_migrates_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (lagging, mut session) = open_lagging_active_session(dir.path());
+
+        assert_eq!(
+            std::fs::canonicalize(session.api.home()).unwrap(),
+            std::fs::canonicalize(&lagging).unwrap(),
+            "the session holds the stored active home itself"
+        );
+        assert!(
+            session.info.degraded_from.is_none(),
+            "observation is not a degradation"
+        );
+        assert_lagging_rank_untouched(&mut session);
+        assert_lagging_rows_are_read(&mut session);
     }
 
     /// R4 quality return: creating a store is the FIRST registration's act.
@@ -637,6 +668,69 @@ mod tests {
         );
     }
 
+    /// R1 quality return (ratified OQ-HOME-8): starting the process while
+    /// every home is switched off is NOT a switch-on. The launch home keeps
+    /// `enabled:false`/`active:false`, the registry stays without an active
+    /// record, and the session observes the control home under the honest
+    /// `home_none_active` fact.
+    #[test]
+    fn startup_with_every_home_switched_off_does_not_switch_anything_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let control = dir.path().join("control");
+        let a = dir.path().join("a/.devai");
+        let b = dir.path().join("b/.devai");
+        std::fs::create_dir_all(&control).unwrap();
+        let mut homes = Homes::load(&control).unwrap();
+        homes.bootstrap_launch(&a, true).unwrap();
+        homes.bootstrap_launch(&b, false).unwrap();
+        let paths: Vec<String> = homes.entries().iter().map(|e| e.path.clone()).collect();
+        for path in &paths {
+            homes.set_enabled(path, false).unwrap();
+        }
+        drop(homes);
+
+        // Launch from inside the switched-off home, WITHOUT $DEVAI_HOME.
+        let session =
+            Session::open_resolved(a.clone(), "tester".to_string(), control.clone(), false)
+                .expect("the no-active state is not a startup death");
+
+        let failure = session.info.degraded_from.as_ref().expect("reported");
+        assert_eq!(failure.code, devai_api::codes::HOME_NONE_ACTIVE);
+        assert_eq!(
+            std::fs::canonicalize(session.api.home()).unwrap(),
+            std::fs::canonicalize(&control).unwrap(),
+            "the session observes the control home, no domain home is picked"
+        );
+        let reloaded = Homes::load(&control).unwrap();
+        assert!(
+            reloaded.entries().iter().all(|e| !e.enabled && !e.active),
+            "the startup re-enabled or reactivated a record: {:?}",
+            reloaded.entries()
+        );
+    }
+
+    /// Fixture: a control home and a stored active home whose folder exists
+    /// without a store, opened without `$DEVAI_HOME` (the saved record wins).
+    fn open_with_storeless_active(dir: &Path) -> (PathBuf, PathBuf, Session) {
+        let control = dir.join("control");
+        let broken = dir.join("project/.devai");
+        std::fs::create_dir_all(&control).unwrap();
+        std::fs::create_dir_all(&broken).unwrap();
+        // Registry fact only: the record of a home whose store never
+        // existed (bootstrap_launch registers without needing one).
+        let mut homes = Homes::load(&control).unwrap();
+        homes.bootstrap_launch(&broken, true).unwrap();
+        drop(homes);
+        let session = Session::open_resolved(
+            control.clone(),
+            "tester".to_string(),
+            control.clone(),
+            false,
+        )
+        .expect("a broken active home degrades the session, it is no startup death");
+        (control, broken, session)
+    }
+
     /// R5 (rel/error-context): the bootstrap boundary must not flatten the
     /// domain's typed refusal into prose. A stored active home whose folder
     /// is still there but whose store is gone degrades with the
@@ -645,25 +739,7 @@ mod tests {
     #[test]
     fn degraded_startup_keeps_the_typed_home_failure() {
         let dir = tempfile::TempDir::new().unwrap();
-        let control = dir.path().join("control");
-        let broken = dir.path().join("project/.devai");
-        std::fs::create_dir_all(&control).unwrap();
-        std::fs::create_dir_all(&broken).unwrap();
-
-        // Registry fact only: the record of a home whose store never
-        // existed (bootstrap_launch registers without needing one).
-        let mut homes = Homes::load(&control).unwrap();
-        homes.bootstrap_launch(&broken, true).unwrap();
-        drop(homes);
-
-        // No $DEVAI_HOME: the saved active record wins, and it is broken.
-        let session = Session::open_resolved(
-            control.clone(),
-            "tester".to_string(),
-            control.clone(),
-            false,
-        )
-        .expect("a broken active home degrades the session, it is no startup death");
+        let (control, broken, session) = open_with_storeless_active(dir.path());
 
         let failure = session
             .info

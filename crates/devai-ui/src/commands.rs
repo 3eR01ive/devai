@@ -640,15 +640,10 @@ fn reopen_active(
 }
 
 /// The degradation fact of a registry with NO active record (every home is
-/// switched off, ratified OQ-HOME-8): a defined state, not an error, and it
-/// names the control home the session falls back to.
+/// switched off, ratified OQ-HOME-8): one source with the startup bootstrap
+/// (`crate::session::no_active_failure`), so the two tokens cannot drift.
 fn no_active_failure(control: &std::path::Path) -> HomeFailure {
-    HomeFailure {
-        code: devai_api::codes::HOME_NONE_ACTIVE,
-        home: control.display().to_string(),
-        message: "no active home — enable or add a home; the registry keeps every record"
-            .to_string(),
-    }
+    crate::session::no_active_failure(control)
 }
 
 /// Observe the control home (no migration of a watched home, REQ-HOME-09);

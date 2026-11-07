@@ -27,11 +27,17 @@ fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .active;
     println!("control home: {}", control.display());
-    println!(
-        "stored active: {} (env set: {})",
-        active.display(),
-        std::env::var("DEVAI_HOME").is_ok()
-    );
+    match &active {
+        Some(path) => println!(
+            "stored active: {} (env set: {})",
+            path.display(),
+            std::env::var("DEVAI_HOME").is_ok()
+        ),
+        None => println!(
+            "stored active: none — every home is switched off (env set: {})",
+            std::env::var("DEVAI_HOME").is_ok()
+        ),
+    }
 
     for path in argv {
         match homes.add(Path::new(&path)) {

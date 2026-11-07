@@ -809,24 +809,33 @@ fn apply_label(e: &mut HomeEntry, probe: &LabelProbe) -> bool {
 }
 
 /// The outcome of the startup launch registration (REQ-HOME-02): the path
-/// the process must treat as active, plus the honest fact whether THIS
-/// launch created the record. Only a home the registry did not know before
-/// may be created on disk; a recorded home whose path vanished is
-/// `home_unavailable` (R4 quality return — REQ-HOME-07 in private).
+/// the process must treat as active — `None` in the ratified "no active
+/// home" state (every registered home is switched off, OQ-HOME-8) — plus
+/// the honest fact whether THIS launch created the record. Only a home the
+/// registry did not know before may be created on disk; a recorded home
+/// whose path vanished is `home_unavailable` (R4 quality return —
+/// REQ-HOME-07 in private).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchResolution {
-    pub active: PathBuf,
+    pub active: Option<PathBuf>,
     pub registered_here: bool,
 }
 
 /// Merge the launch home into the registry and apply the ratified active
-/// rule (OQ-HOME-7). Returns `(changed, registered_here)`:
+/// rule (OQ-HOME-7, OQ-HOME-8). Returns `(changed, registered_here)`:
 ///   * the launch home always ends up registered (REQ-HOME-02);
 ///   * a label pinned while the store was unreadable is re-derived here
 ///     (R3 quality return) instead of staying pinned forever;
 ///   * `$DEVAI_HOME` set wins, otherwise the stored active record wins, and
-///     an empty registry (or one without an active mark) adopts the launch
-///     home. Activation implies inclusion (`mark_active`).
+///     an empty registry adopts the launch home. Activation implies
+///     inclusion (`mark_active`).
+///
+/// R1 quality return (ratified OQ-HOME-8): a NON-empty registry with no
+/// stored active marker and NO enabled record is the honest "no active
+/// home" state, not a licence to re-enable and activate the launch home.
+/// The launch never flips `enabled:false → true` on its own; when some
+/// enabled record exists but carries no active mark (a repaired/reordered
+/// document), the marker is restored onto an already-enabled record only.
 ///
 /// The adoption rule is documented verbatim in docs/homes-registry.md,
 /// section «Реестр без активной метки».
@@ -849,11 +858,32 @@ fn merge_launch(
         }
         Some(_) => {}
     }
-    let saved_active = entries.iter().any(|e| e.active && e.path != key);
-    if env_set || !registry_had_entries || !saved_active {
-        changed = mark_active(entries, key) || changed;
+    let adopted = if env_set || !registry_had_entries {
+        // An explicit env choice (and the first launch of an empty
+        // registry) is the operator's act: activation implies inclusion.
+        Some(key.to_string())
+    } else if entries.iter().any(|e| e.active) {
+        None
+    } else {
+        // No stored active marker: restore it on an ENABLED record only —
+        // never on a switched-off one, and never by enabling anything.
+        adoption_target(entries, key)
+    };
+    if let Some(target) = adopted {
+        changed = mark_active(entries, &target) || changed;
     }
     (changed, registered_here)
+}
+
+/// The record that may adopt an absent active marker without re-enabling
+/// anything (R1): the launch home when it is enabled, otherwise the first
+/// enabled record. `None` when every record is switched off — the ratified
+/// "no active home" state.
+fn adoption_target(entries: &[HomeEntry], key: &str) -> Option<String> {
+    if entries.iter().any(|e| e.path == key && e.enabled) {
+        return Some(key.to_string());
+    }
+    entries.iter().find(|e| e.enabled).map(|e| e.path.clone())
 }
 
 impl Homes {
@@ -953,12 +983,11 @@ impl Homes {
             let active = entries
                 .iter()
                 .find(|e| e.active)
-                .map(|e| e.path.clone())
-                .unwrap_or_else(|| key.clone());
+                .map(|e| PathBuf::from(e.path.clone()));
             Ok((
                 changed,
                 LaunchResolution {
-                    active: PathBuf::from(active),
+                    active,
                     registered_here,
                 },
             ))
@@ -1270,7 +1299,8 @@ mod tests {
             .expect("the first launch registers the launch home, it is no startup death");
 
         assert_eq!(
-            resolution.active, launch,
+            resolution.active,
+            Some(launch.clone()),
             "the registry names the launch home (no store is created by registration alone)"
         );
         assert!(
@@ -1301,13 +1331,9 @@ mod tests {
         }
     }
 
-    /// R4 (rl/edge-cases), first case: an explicit `$DEVAI_HOME` naming a
-    /// home the operator had switched off is the ratified env priority
-    /// (OQ-HOME-7) — the record becomes active AND enabled. The registry
-    /// must never hold `active && !enabled`: that row would be active in
-    /// fact but absent from every merged view.
-    #[test]
-    fn explicit_env_reactivates_and_includes_a_disabled_home() {
+    /// Fixture of the R4 launch tests: control home, an active `other` home
+    /// and a `home` record the operator has switched off.
+    fn switched_off_home_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Homes) {
         let dir = tempfile::TempDir::new().unwrap();
         let control = dir.path().join("control");
         let home = dir.path().join("project/.devai");
@@ -1320,17 +1346,24 @@ mod tests {
         homes.bootstrap_launch(&home, false).unwrap();
         let key = norm(&home);
         homes.set_enabled(&key, false).unwrap();
-        assert!(
-            !homes
-                .entries()
-                .iter()
-                .find(|e| e.path == key)
-                .unwrap()
-                .enabled,
-            "precondition: the operator switched the home off"
-        );
+        (dir, home, other, homes)
+    }
 
-        let active = homes.bootstrap_launch(&home, true).unwrap().active;
+    /// R4 (rl/edge-cases), first case: an explicit `$DEVAI_HOME` naming a
+    /// home the operator had switched off is the ratified env priority
+    /// (OQ-HOME-7) — the record becomes active AND enabled. The registry
+    /// must never hold `active && !enabled`: that row would be active in
+    /// fact but absent from every merged view.
+    #[test]
+    fn explicit_env_reactivates_and_includes_a_disabled_home() {
+        let (_dir, home, other, mut homes) = switched_off_home_fixture();
+        let key = norm(&home);
+
+        let active = homes
+            .bootstrap_launch(&home, true)
+            .unwrap()
+            .active
+            .expect("an explicit env launch activates a home");
 
         assert_eq!(
             fs::canonicalize(&active).unwrap(),
@@ -1360,20 +1393,14 @@ mod tests {
     /// reports the home as switched off.
     #[test]
     fn launch_without_env_leaves_a_disabled_home_switched_off() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let control = dir.path().join("control");
-        let home = dir.path().join("project/.devai");
-        let other = dir.path().join("other/.devai");
-        for p in [&control, &home, &other] {
-            fs::create_dir_all(p).unwrap();
-        }
-        let mut homes = Homes::load(&control).unwrap();
-        homes.bootstrap_launch(&other, true).unwrap();
-        homes.bootstrap_launch(&home, false).unwrap();
+        let (_dir, home, other, mut homes) = switched_off_home_fixture();
         let key = norm(&home);
-        homes.set_enabled(&key, false).unwrap();
 
-        let active = homes.bootstrap_launch(&home, false).unwrap().active;
+        let active = homes
+            .bootstrap_launch(&home, false)
+            .unwrap()
+            .active
+            .expect("the saved active record stays active");
 
         assert_eq!(
             fs::canonicalize(&active).unwrap(),
