@@ -908,7 +908,13 @@ impl Homes {
                 Some(_) => {}
             }
             // Who is active (the stored fact — never read-time env
-            // re-derivation beyond the ratified OQ-HOME-7 rule itself):
+            // re-derivation beyond the ratified OQ-HOME-7 rule itself).
+            // The adoption rule below is documented verbatim in
+            // docs/homes-registry.md, section «Реестр без активной метки»:
+            // the launch home is activated when it came from an explicitly
+            // set DEVAI_HOME, when the registry had no records at all, or
+            // when no OTHER record carries the active mark; otherwise the
+            // stored activity is left untouched.
             let saved_active = entries.iter().any(|e| e.active && e.path != key);
             if env_set || !registry_had_entries || !saved_active {
                 changed = mark_active(entries, &key) || changed;

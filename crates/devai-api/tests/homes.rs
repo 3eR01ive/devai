@@ -565,12 +565,174 @@ fn merged_views_attribute_live_rows_and_localize_dead_homes() {
     assert_eq!(e.code().0, "not_found");
 }
 
-/// rl/idempotency (report v1 residual gap, closed): two loaded instances
-/// — the shape of two UI processes on one control home — must not lose
-/// records to last-writer-wins. Every registry change is a
-/// read-modify-write transaction that re-reads the disk document under an
-/// exclusive lock, so the second writer commits on top of the first one's
-/// truth, not on top of a stale in-memory copy.
+/// rl/idempotency, process-level (R4 quality return): the RMW window is
+/// serialized across PROCESSES, not merely across calls in one process.
+/// Two falsifiable facts, both driven through the real `Homes` code:
+///   1. mutual exclusion is DETERMINISTIC, not statistical: this test
+///      process takes the registry lock like any other writer, then lets
+///      the two child processes into their write loops. While the lock is
+///      held nothing may land in the document — a process-local mutex
+///      would fail exactly here, because the holder is another process;
+///   2. no record is lost and exactly one home ends active once both
+///      children race for the whole run (CHILD_WRITES add+activate cycles
+///      each, after the release).
+/// The child side is this same function re-executed with a sentinel env
+/// var, so the spawned processes are ordinary registry writers.
+#[cfg(unix)]
+#[test]
+fn registry_writes_from_two_processes_never_lose_records() {
+    if let Some(role) = std::env::var_os(CHILD_ROLE_ENV) {
+        let control = PathBuf::from(std::env::var_os(CHILD_CONTROL_ENV).expect("child control"));
+        let root = PathBuf::from(std::env::var_os(CHILD_ROOT_ENV).expect("child root"));
+        child_registry_writer(&role.to_string_lossy(), &control, &root);
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let control = dir.path().join("control");
+    std::fs::create_dir_all(&control).unwrap();
+    let root = dir.path().join("homes");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let mut first = spawn_writer("a", &control, &root);
+    let mut second = spawn_writer("b", &control, &root);
+
+    // (1) Hold the lock, release the children into their loops, then look:
+    // a child that committed during the hold was not serialized by it.
+    let gate = hold_registry_lock(&control);
+    std::fs::write(root.join(GO_FILE), b"go").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(HOLD_MS));
+    let parked = load(&control).entries().len();
+    drop(gate);
+    assert_eq!(
+        parked,
+        0,
+        "{parked} record(s) landed while another process held {} — the write \
+         window is not exclusive across processes",
+        devai_api::HOMES_LOCK_FILE
+    );
+
+    let (ok1, log1) = collect(&mut first);
+    let (ok2, log2) = collect(&mut second);
+    let logs = format!("--- writer a ---\n{log1}\n--- writer b ---\n{log2}");
+    assert!(ok1 && ok2, "a registry writer process died:\n{logs}");
+
+    let mut on_disk = load(&control);
+    let recs = on_disk.records().unwrap();
+    assert_eq!(
+        recs.len(),
+        2 * CHILD_WRITES,
+        "records lost to a concurrent writer ({} on disk, {} expected)\n{logs}",
+        recs.len(),
+        2 * CHILD_WRITES
+    );
+    let mut paths: Vec<&str> = recs.iter().map(|r| r.path.as_str()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    assert_eq!(
+        paths.len(),
+        2 * CHILD_WRITES,
+        "the same home was recorded twice"
+    );
+    let active: Vec<&str> = recs
+        .iter()
+        .filter(|r| r.active)
+        .map(|r| r.path.as_str())
+        .collect();
+    assert_eq!(
+        active.len(),
+        1,
+        "exactly one active home after concurrent activation: {active:?}"
+    );
+}
+
+const CHILD_ROLE_ENV: &str = "DEVAI_HOMES_TEST_CHILD_ROLE";
+const CHILD_CONTROL_ENV: &str = "DEVAI_HOMES_TEST_CHILD_CONTROL";
+const CHILD_ROOT_ENV: &str = "DEVAI_HOMES_TEST_CHILD_ROOT";
+/// Homes added per process: enough interleaving that an unlocked RMW
+/// window loses a record with near-certainty.
+const CHILD_WRITES: usize = 25;
+/// The parent's lock hold: far longer than one registry transaction, so a
+/// write that is not serialized lands inside it.
+const HOLD_MS: u64 = 400;
+/// The parent's release marker: children start writing only after it.
+const GO_FILE: &str = "go";
+
+/// Spawn one registry writer process: the same test binary, re-executed
+/// with the sentinel env vars so it takes the child branch.
+#[cfg(unix)]
+fn spawn_writer(role: &str, control: &Path, root: &Path) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("registry_writes_from_two_processes_never_lose_records")
+        .env(CHILD_ROLE_ENV, role)
+        .env(CHILD_CONTROL_ENV, control)
+        .env(CHILD_ROOT_ENV, root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn registry writer process")
+}
+
+/// Take the registry lock exactly the way the platform does (flock on the
+/// lock anchor). Dropping the handle releases it.
+#[cfg(unix)]
+fn hold_registry_lock(control: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(control.join(devai_api::HOMES_LOCK_FILE))
+        .unwrap();
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "flock the registry lock anchor");
+    file
+}
+
+/// Drain a child's pipes to EOF, then reap it: reading before waiting means
+/// a chatty child can never deadlock on a full pipe buffer.
+#[cfg(unix)]
+fn collect(c: &mut std::process::Child) -> (bool, String) {
+    use std::io::Read;
+    let mut buf = String::new();
+    if let Some(mut o) = c.stdout.take() {
+        let _ = o.read_to_string(&mut buf);
+    }
+    if let Some(mut e) = c.stderr.take() {
+        let _ = e.read_to_string(&mut buf);
+    }
+    let ok = c.wait().map(|s| s.success()).unwrap_or(false);
+    (ok, buf)
+}
+
+/// One concurrent writer: wait for the parent's release, then seed a fresh
+/// home, register it, make it active — repeatedly, under contention with
+/// the sibling process.
+#[cfg(unix)]
+fn child_registry_writer(role: &str, control: &Path, root: &Path) {
+    let go = root.join(GO_FILE);
+    let mut released = false;
+    for _ in 0..5_000 {
+        if go.exists() {
+            released = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(released, "the parent never released the writer ({role})");
+    let mut homes = load(control);
+    for i in 0..CHILD_WRITES {
+        let home = root.join(format!("{role}{i}"));
+        seed_home(&home, &format!("{role}-project-{i}"), &[]);
+        homes.add(&home).unwrap();
+        homes.set_active(&home).unwrap();
+    }
+}
+
+/// Same-process RMW rebase: two loaded handles on one control home must
+/// not lose records to last-writer-wins — every registry write re-reads
+/// the disk document inside the lock, so the second writer commits on top
+/// of the first one's truth. The cross-PROCESS proof is the test above;
+/// this one pins the transaction semantics for a single process.
 #[test]
 fn concurrent_managers_never_lose_registry_records() {
     let dir = tempfile::TempDir::new().unwrap();

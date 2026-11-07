@@ -551,10 +551,13 @@ pub fn homes_add(state: State<AppState>, path: String) -> Result<HomeRecord, UiE
 /// Ratified OQ-HOME-8: disabling the ACTIVE home is allowed and its
 /// outcome is defined by the platform (next enabled record, or no active
 /// home at all). This command therefore also follows the stored marker:
-/// the session reopens the home the registry now names — or, when no home
-/// remains active, observes the control home and reports the honest
-/// `home_none_active` fact — so domain reads never keep pointing at a home
-/// the operator just switched off.
+/// the session reopens the home the registry now names. When no home
+/// remains active the session DEGRADES to observing the control home and
+/// reports the honest `home_none_active` fact — and the control home may
+/// itself be a record the operator has switched off (it is the home the
+/// registry file lives in, not necessarily an enabled record), so "the
+/// handle follows the registry" is the guarantee, not "the handle always
+/// points at an enabled home".
 #[tauri::command(rename_all = "snake_case")]
 pub fn homes_set_enabled(
     state: State<AppState>,
@@ -582,67 +585,93 @@ pub fn homes_set_enabled(
 ///     operator gets the enable/add affordances of the homes view.
 /// A reopen refusal degrades to the control home with its own typed cause
 /// (the REQ-HOME-07 shape) instead of leaving a dead handle behind.
+///
+/// Three units, ≤40 lines each (R2 quality return, cl/short-units): pick
+/// the handle (`reopen_active`) → apply it to the session
+/// (`apply_session_home`).
 fn follow_active(state: &State<AppState>, active: Option<String>, actor: &str, control_home: &str) {
     let current = state.session().home.clone();
-    if active.as_deref().is_some_and(|p| p == current) {
+    if active.as_deref() == Some(current.as_str()) {
         return;
     }
     let control = std::path::PathBuf::from(control_home);
-    let (handle, failure) = match active.as_deref() {
-        Some(path)
-            if std::path::Path::new(path)
-                .join(devai_api::DB_FILE_NAME)
-                .exists() =>
-        {
-            match Api::open_observed(std::path::Path::new(path), actor) {
-                Ok(api) => {
-                    let info_home = api.home().display().to_string();
-                    *state.api() = api;
-                    let mut info = state.session();
-                    info.home = info_home;
-                    info.opened_at = Utc::now();
-                    info.degraded_from = None;
-                    return;
-                }
-                Err(e) => {
-                    let api = Api::open_observed(&control, actor)
-                        .or_else(|_| Api::open(&control, actor))
-                        .map_err(UiError::from);
-                    let failure = HomeFailure {
-                        code: devai_api::codes::home_failure_code(e.code().0),
-                        home: path.to_string(),
-                        message: format!("cannot open home {path}: {e}"),
-                    };
-                    (api, Some(failure))
-                }
+    let (api, failure) = reopen_active(&control, active.as_deref(), actor);
+    apply_session_home(state, api, failure, control_home);
+}
+
+/// The handle for the stored active marker: the active home observed
+/// read-only, or — when there is no readable active home — the control
+/// home plus the typed degradation the window shows. The failure never
+/// hides the registry write that already committed.
+fn reopen_active(
+    control: &std::path::Path,
+    active: Option<&str>,
+    actor: &str,
+) -> (Result<Api, UiError>, Option<HomeFailure>) {
+    let on_disk = active.filter(|p| {
+        std::path::Path::new(p)
+            .join(devai_api::DB_FILE_NAME)
+            .exists()
+    });
+    match on_disk {
+        Some(path) => match Api::open_observed(std::path::Path::new(path), actor) {
+            Ok(api) => (Ok(api), None),
+            Err(e) => {
+                let failure = HomeFailure {
+                    code: devai_api::codes::home_failure_code(e.code().0),
+                    home: path.to_string(),
+                    message: format!("cannot open home {path}: {e}"),
+                };
+                (observe_control(control, actor), Some(failure))
             }
+        },
+        None => {
+            let failure = absent_active_failure(active, control);
+            (observe_control(control, actor), Some(failure))
         }
-        _ => {
-            // No active home (every record switched off) — or a marker
-            // whose home vanished: observe the control home, say why.
-            let code = match active {
-                Some(_) => devai_api::codes::HOME_UNAVAILABLE,
-                None => devai_api::codes::HOME_NONE_ACTIVE,
-            };
-            let failure = HomeFailure {
-                code,
-                home: control_home.to_string(),
-                message: match (code, active.as_deref()) {
-                    (devai_api::codes::HOME_NONE_ACTIVE, _) => {
-                        "no active home — enable or add a home; the registry keeps every record"
-                            .to_string()
-                    }
-                    (_, Some(path)) => format!("home {path} is not on disk"),
-                    _ => "no active home".to_string(),
-                },
-            };
-            let api = Api::open_observed(&control, actor)
-                .or_else(|_| Api::open(&control, actor))
-                .map_err(UiError::from);
-            (api, Some(failure))
-        }
+    }
+}
+
+/// The degradation fact of a registry whose active home cannot be read:
+/// `home_unavailable` when a stored marker points at a home that vanished
+/// from disk (or lost its store), `home_none_active` when every record is
+/// switched off. Both name the control home the session falls back to.
+fn absent_active_failure(active: Option<&str>, control: &std::path::Path) -> HomeFailure {
+    let (code, message) = match active {
+        Some(path) => (
+            devai_api::codes::HOME_UNAVAILABLE,
+            format!("home {path} is not on disk"),
+        ),
+        None => (
+            devai_api::codes::HOME_NONE_ACTIVE,
+            "no active home — enable or add a home; the registry keeps every record".to_string(),
+        ),
     };
-    match handle {
+    HomeFailure {
+        code,
+        home: control.display().to_string(),
+        message,
+    }
+}
+
+/// Observe the control home (no migration of a watched home, REQ-HOME-09);
+/// the bootstrap open is the last resort for a control home that cannot be
+/// observed read-only.
+fn observe_control(control: &std::path::Path, actor: &str) -> Result<Api, UiError> {
+    Api::open_observed(control, actor)
+        .or_else(|_| Api::open(control, actor))
+        .map_err(UiError::from)
+}
+
+/// Install the chosen handle as THE session handle and record the
+/// degradation fact it came with (none when the stored active home opened).
+fn apply_session_home(
+    state: &State<AppState>,
+    api: Result<Api, UiError>,
+    failure: Option<HomeFailure>,
+    control_home: &str,
+) {
+    match api {
         Ok(api) => {
             let info_home = api.home().display().to_string();
             *state.api() = api;

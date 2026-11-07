@@ -30,10 +30,12 @@ use chrono::{DateTime, Utc};
 use devai_api::{Api, ApiError, ApiResult, DB_FILE_NAME, HOME_DIR_NAME, Homes};
 use serde::Serialize;
 
-/// A resolved launch home for the GUI window (the unchanged OQ-UI-1 chain;
-/// REQ-HOME-02 keeps this resolver byte-for-byte — the one-home run is the
-/// degenerate case of the registry). `lookup` is injectable so the chain is
-/// testable without mutating the process env.
+/// A resolved launch home for the GUI window. REQ-HOME-02 keeps the CHAIN
+/// unchanged — `$DEVAI_HOME` (non-blank), else `~/.devai` — and the one-home
+/// run stays the degenerate case of the registry; the default literal is now
+/// the shared `HOME_DIR_NAME` instead of an inline `".devai"`, same path.
+/// `lookup` is injectable so the chain is testable without mutating the
+/// process env.
 pub fn resolve_home(lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     if let Some(v) = lookup("DEVAI_HOME") {
         if !v.trim().is_empty() {

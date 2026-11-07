@@ -70,7 +70,6 @@ pub struct TaskRenameOutcome {
     pub changed: bool,
 }
 
-
 /// `task.create` — the creation input of `task new`. `project_id` is the
 /// caller-resolved project row (resolving the name is the `project.get`
 /// READ, so the not-found refusal text keeps its exact position in the
