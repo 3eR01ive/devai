@@ -14,11 +14,18 @@
 use serde::{Deserialize, Serialize};
 
 /// Whether the operation writes to the store through workflow rules.
+/// `Registry` is the platform plane introduced by the homes-registry cycle
+/// (REQ-HOME-05: reading domain records and managing the registry are NOT
+/// mixed in one operation): a Registry operation's single writable target
+/// is the homes-registry file of the control home — it never touches any
+/// home's domain rows, which stay governed by Read (UI) and Mutation
+/// (CLI/engine) exactly as before.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OpClass {
     Read,
     Mutation,
+    Registry,
 }
 
 /// One API operation as published contract.
@@ -48,13 +55,17 @@ pub struct OpDescriptor {
 /// lazily later and never for a prose-only edit; grep finds ONE
 /// declaration — there is no second copy to drift.
 /// `@2` named the cycle that moved the mutation plane onto the surface
-/// (REQ-MUT-*). `@3` names the human-signboard increment shipped with it:
-/// the surface gained the rename/advance name doors (`task.rename`, the
-/// spec-advance signboard stamp) and the read shapes now carry the name
-/// plane (`Task.human_name`, `TaskDependency.task_display`/
-/// `depends_on_display`) — a consumer typed against `@2` reads those
-/// fields as unknown-absent, so the stamp must move with them.
-pub const SURFACE_VERSION: &str = "api-surface@3";
+/// (REQ-MUT-*). `@3` named the human-signboard increment: the surface
+/// gained the rename/advance name doors (`task.rename`, the spec-advance
+/// signboard stamp) and the read shapes now carry the name plane
+/// (`Task.human_name`, `TaskDependency.task_display`/
+/// `depends_on_display`). `@4` names the homes-registry increment built
+/// ON TOP of that main surface: the operation vocabulary grew a class
+/// token (`registry`) and the `home.*` plane (list/projects_all/tasks_all
+/// plus the add/set_enabled/activate management doors) — additive for
+/// tolerant readers, but wire-visible, so the version says so (a
+/// vocabulary change never travels without the stamp).
+pub const SURFACE_VERSION: &str = "api-surface@4";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -563,6 +574,53 @@ pub fn operations() -> Vec<OpDescriptor> {
             output: "Vec<OpDescriptor>",
             description: "The published operation registry itself — every operation with typed input/output names and textual semantics. Backs `devai api registry`.",
         },
+        // ---- registry plane (homes registry: platform data, REQ-HOME-01…09).
+        // The Registry class is the separated write plane: its single
+        // writable target is `homes.json` of the control home. Reading home
+        // records and managing the registry are distinct operations and
+        // never mix (REQ-HOME-05). ----
+        OpDescriptor {
+            name: "home.list",
+            class: OpClass::Read,
+            input: "()",
+            output: "Vec<HomeRecord>",
+            description: "Enumerate the stored homes registry with attributes: path, project, project_source and project_error (how the project label was derived — store / path / unreadable — plus the read cause when the store could not be read), added_at, enabled, the single stored active marker, plus live-probed available, the home's schema_version and a version_note; read_error carries the typed cause of an unreadable home. The stored document is re-read at each enumeration (a registration committed by another session is visible without a restart); availability is the only read-time probe; activity is a saved fact, never process memory. An absent home renders with its path and cause and stays registered (REQ-HOME-07).",
+        },
+        OpDescriptor {
+            name: "home.add",
+            class: OpClass::Registry,
+            input: "path",
+            output: "HomeRecord",
+            description: "Register an existing devai home in the registry: writes the home descriptor into homes.json of the control home ONLY. A missing directory refuses typed invalid_input, a directory without devai.db refuses typed home_no_store — the managed home's content is never copied or migrated by adding it. Re-adding a known path re-enables the record and keeps its original added_at (recent-homes).",
+        },
+        OpDescriptor {
+            name: "home.set_enabled",
+            class: OpClass::Registry,
+            input: "path, enabled",
+            output: "Vec<HomeRecord>",
+            description: "Include/exclude a registered home from the merged observation without restarting the process; the registry row itself survives (removal from the registry IS disabling — ratified OQ-HOME-3, physical deletion is out of scope) and the home's data on disk is untouched. Switching the ACTIVE home off is a normal action with a defined outcome (ratified OQ-HOME-8): the next ENABLED record in registry order becomes active (wrapping to the first enabled record when the tail holds none), and when no enabled record remains the registry holds the honest no-active-home state — `home.list` then reports every record with active=false and domain records stay unavailable until the operator enables or adds a home. No home is chosen silently. Returns the fresh records.",
+        },
+        OpDescriptor {
+            name: "home.activate",
+            class: OpClass::Registry,
+            input: "path",
+            output: "Api",
+            description: "Store the selected enabled home as the single active home (exactly-one-active flip in homes.json of the control home — the only registry write) and RETURN the reopened observation handle for that home — the act's output is the session's new active API handle, never `()`. The whole transaction — validate the record, re-probe the store on disk, reopen the chosen home as an observation (`Api::open_observed` over the store's read-only open), commit the flip — is one API-plane act: a failed reopen returns before the commit, so the registry can never point at a home the session does not hold (da/architecture-consistency at report v1 moved this orchestration out of the consumer). Activation selects what the session watches; it never opens the target with the migrating bootstrap, so a home of any schema rank keeps its rank and rows untouched (`home.list` stamps the version note). No domain data of any other home is mutated here; activation of a missing/disabled home refuses typed home_unavailable/home_disabled.",
+        },
+        OpDescriptor {
+            name: "home.projects_all",
+            class: OpClass::Read,
+            input: "Option<home_path>",
+            output: "Vec<HomeRecordsView<Project>>",
+            description: "Merged projects plane of all enabled homes (or one home when a path filter is given): one attributed block per home — home_path, home_project, active marker, schema version note — with the projects read LIVE from that home's store at snapshot_at. A home that cannot be read localizes its error in its own block and keeps an honestly empty records list; other homes keep rendering. No copies are stored in the control plane (REQ-HOME-08).",
+        },
+        OpDescriptor {
+            name: "home.tasks_all",
+            class: OpClass::Read,
+            input: "Option<home_path>",
+            output: "Vec<HomeRecordsView<Task>>",
+            description: "Merged tasks plane across enabled homes with the same per-home attribution, live resolution and localized-error semantics as home.projects_all; same-named tasks from different homes are distinct rows because blocks never collapse (per-home identity is the block, task ids stay inside it).",
+        },
         // ---- excluded units (RATIFIED OQ-10, encapsulated per human-ratified
         // cycle-2 Q2) ----
         // init/seed stay the bootstrap pair and are NOT operations of this
@@ -652,17 +710,18 @@ mod tests {
     }
 
     #[test]
-    fn surface_version_v3_ships_the_name_plane() {
+    fn surface_version_v4_ships_the_name_plane_and_homes() {
         // QA R5 (da/api-contract): the stamp and its increment are
-        // pinned TOGETHER — @3 is by this test defined as "the
-        // human-signboard surface": if the constant moves without the
-        // rename door/shape moving with it, or the name plane leaves the
-        // table while the stamp claims it, this fails. The literal is
-        // the deliberate second writing of the version: bumping the
-        // constant is an author's decision documented at the declaration
-        // (see the bump mechanics comment there), and this test forces
-        // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@3");
+        // pinned TOGETHER — @4 is by this test defined as "the
+        // human-signboard surface PLUS the homes-registry plane": if the
+        // constant moves without the rename door/shape moving with it, or
+        // the name plane or the home plane leaves the table while the
+        // stamp claims it, this fails. The literal is the deliberate
+        // second writing of the version: bumping the constant is an
+        // author's decision documented at the declaration (see the bump
+        // mechanics comment there), and this test forces that decision to
+        // be taken consciously, twice, in one change.
+        assert_eq!(SURFACE_VERSION, "api-surface@4");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -673,6 +732,11 @@ mod tests {
             "the rename outcome shape must carry the signboard: {}",
             rename.output
         );
+        let homes = operations()
+            .into_iter()
+            .find(|o| o.name == "home.list")
+            .expect("@4 surface must publish home.list (the homes registry plane)");
+        assert_eq!(homes.class, OpClass::Read);
     }
 
     #[test]
@@ -740,6 +804,73 @@ mod tests {
                 muts.contains(n),
                 "{n}: mutation of the API surface missing from the registry"
             );
+        }
+    }
+
+    /// R1 quality return (da/api-contract): a descriptor must not declare
+    /// `()` for an operation that hands a value back. `home.activate`
+    /// declared `()` while the act returns the reopened `Api` handle — a
+    /// second consumer building on the descriptor would have discarded it.
+    /// The mechanical keeper: any operation whose own description promises
+    /// a return cannot declare the empty output, and the one operation this
+    /// cycle fixed is pinned by name.
+    #[test]
+    fn value_returning_operations_never_declare_the_empty_output() {
+        let ops = operations();
+        for o in &ops {
+            let promises_a_value = o.description.contains("RETURN")
+                || o.description.contains("Returns ")
+                || o.description.contains("returns the")
+                || o.description.contains("returns a");
+            if promises_a_value {
+                assert_ne!(
+                    o.output, "()",
+                    "{}: the description promises a value while output says ()",
+                    o.name
+                );
+            }
+        }
+        let activate = ops
+            .iter()
+            .find(|o| o.name == "home.activate")
+            .expect("home.activate is published");
+        assert_eq!(
+            activate.output, "Api",
+            "home.activate returns the reopened observation handle, not ()"
+        );
+    }
+
+    /// REQ-HOME-05/06: the homes plane is published, and its Registry class
+    /// covers ONLY the home.* management operations — reading home records
+    /// stays class Read, managing the registry stays class Registry, and no
+    /// domain mutation ever hides in the registry plane.
+    #[test]
+    fn homes_plane_is_published_and_separated() {
+        let ops = operations();
+        let by_name: std::collections::HashMap<&str, &OpDescriptor> =
+            ops.iter().map(|o| (o.name, o)).collect();
+        for (name, class) in [
+            ("home.list", OpClass::Read),
+            ("home.projects_all", OpClass::Read),
+            ("home.tasks_all", OpClass::Read),
+            ("home.add", OpClass::Registry),
+            ("home.set_enabled", OpClass::Registry),
+            ("home.activate", OpClass::Registry),
+        ] {
+            let d = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("{name}: not published"));
+            assert_eq!(d.class, class, "{name}: wrong class in the homes plane");
+        }
+        // Separation invariant: Registry exists only under `home.`.
+        for o in &ops {
+            if o.class == OpClass::Registry {
+                assert!(
+                    o.name.starts_with("home."),
+                    "{}: a Registry-class op must live in the homes plane",
+                    o.name
+                );
+            }
         }
     }
 }

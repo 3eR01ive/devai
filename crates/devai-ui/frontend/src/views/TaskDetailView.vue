@@ -4,8 +4,17 @@
 // исполнения и воркспейс — каждое поле из готовой typed-view платформы.
 // UI не хранит свою очерёдность стадий, не переприсваивает статусы
 // артефактов и не выдумывает строки воркспейсов.
+// Дом-гейт (REQ-HOME-04 AC3, ратифицировано OQ-HOME-2/5): детали читаются
+// только из АКТИВНОГО дома — ссылка из совмещённого взгляда несёт ?home=.
+// Если это не активный дом, экран честно говорит «запись из другого дома»
+// и предлагает активацию в один клик; скрытого переключения нет — оператор
+// нажимает кнопку. После активации контекст сбрасывается на список
+// проектов (без фантомных id между домами).
 import { computed, onMounted, ref } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { api, toUiError } from "../api";
+import { activateHome } from "../activation";
+import { foreignHome as foreignHomeOf } from "../homes-view";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
 import {
@@ -36,6 +45,11 @@ import type {
 } from "../types";
 
 const props = defineProps<{ id: string }>();
+const route = useRoute();
+const router = useRouter();
+const foreignHome = ref<string | null>(null);
+const gateError = ref<UiError | null>(null);
+const gateBusy = ref(false);
 
 const status = ref<StatusView | null>(null);
 const progress = ref<ProgressView | null>(null);
@@ -172,10 +186,65 @@ async function openContent(a: Artifact) {
   }
 }
 
-onMounted(loadAll);
+async function gateAndLoad() {
+  // Источником дома для записи является блок совмещённого взгляда (?home
+  // из tasks_all). Чужой дом НЕ читаем этим api-хендлом: фантомных id
+  // между домами не допускаем (ратифицировано OQ-HOME-5).
+  const home = (route.query.home as string) ?? null;
+  if (home) {
+    try {
+      const s = await api.sessionInfo();
+      foreignHome.value = foreignHomeOf(home, s.home);
+      if (foreignHome.value) return;
+    } catch (e) {
+      error.value = toUiError(e);
+      return;
+    }
+  }
+  await loadAll();
+}
+onMounted(gateAndLoad);
+
+async function activateForeignHome() {
+  if (!foreignHome.value) return;
+  gateBusy.value = true;
+  gateError.value = null;
+  try {
+    // R1 quality return: тот же единый путь, что и в реестре домов, —
+    // активация публикует свежий SessionInfo в стор окна, иначе
+    // статус-бар/деградированный баннер держали бы старый дом.
+    await activateHome(foreignHome.value);
+    // OQ-HOME-5: после переключения — сброс контекста на список проектов.
+    await router.push("/projects");
+  } catch (e) {
+    gateError.value = toUiError(e);
+  } finally {
+    gateBusy.value = false;
+  }
+}
 </script>
 
 <template>
+  <section v-if="foreignHome" class="panel">
+    <h3>Запись из другого дома</h3>
+    <div class="body">
+      <p class="muted" style="margin: 0 0 8px">
+        Дом <span class="mono">{{ foreignHome }}</span> не является активным.
+        Детали задачи читаются только из активного дома — скрытого
+        переключения ради одного просмотра нет (ратифицировано OQ-HOME-2).
+      </p>
+      <div v-if="gateError" class="errorbox">
+        <span class="code">{{ gateError.code }}</span>{{ gateError.message }}
+      </div>
+      <div class="rowflex">
+        <button :disabled="gateBusy" @click="activateForeignHome">
+          {{ gateBusy ? "Активация…" : "Активировать этот дом" }}
+        </button>
+        <RouterLink to="/tasks" style="margin-left: 10px">Назад к задачам</RouterLink>
+      </div>
+    </div>
+  </section>
+
   <section v-if="error" class="errorbox">
     <span class="code">{{ error.code }}</span>{{ error.message }}
   </section>
@@ -520,7 +589,7 @@ onMounted(loadAll);
       </div>
     </div>
   </section>
-  <section v-else-if="!error" class="empty">Загрузка…</section>
+  <section v-else-if="!error && !foreignHome" class="empty">Загрузка…</section>
 </template>
 
 <style scoped>

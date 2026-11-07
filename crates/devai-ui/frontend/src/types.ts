@@ -7,11 +7,24 @@ export interface SessionInfo {
   home: string;
   actor: string;
   opened_at: string;
+  // homes-registry cycle: где живёт реестр (OQ-HOME-1) и честно
+  // простампованный факт деградированного открытия активного дома.
+  control_home: string;
+  degraded_from: HomeFailure | null;
+}
+
+// Типизированная причина, по которой дом не открылся на bootstrap-границе
+// (R5): code — машинный токен домена (home_unavailable / home_no_store /
+// home_schema_version), home — путь, message — операторский текст.
+export interface HomeFailure {
+  code: string;
+  home: string;
+  message: string;
 }
 
 export interface OpDescriptor {
   name: string;
-  class: "read" | "mutation";
+  class: "read" | "mutation" | "registry";
   input: string;
   output: string;
   description: string;
@@ -360,6 +373,53 @@ export interface WaitSnapshot {
   human_stopped: WaitRow[];
   notes: WaitNote[];
   badge: number;
+}
+
+// --- homes registry (REQ-HOME-01…09) ---
+// HomeIssue — типизированная причина недоступности дома на проводе
+// (R2 ревью, rel/error-context): code — машинный токен, по которому UI
+// ветвит (home_unavailable / home_no_store / home_schema_version), path —
+// дом, о котором вердикт, hint — подсказка платформы, message — текст для
+// человека. UI не перефразирует message и не выводит code из текста.
+export interface HomeIssue {
+  code: string;
+  path: string;
+  message: string;
+  hint: string | null;
+}
+
+// HomeRecord — хранимая запись реестра + атрибуты, снятые операцией
+// перечисления (доступность — единственный read-time probe). version_note
+// и read_error — данные платформы, UI их не перефразирует.
+export interface HomeRecord {
+  path: string;
+  project: string;
+  // project_source — откуда взята метка проекта (R3): "store" — из проектов
+  // самого дома, "path" — стор прочитан, проектов нет (метка из формы
+  // пути), "unreadable" — стор не прочитался (причина в project_error),
+  // "unknown" — запись старше этого маркера.
+  project_source: "store" | "path" | "unreadable" | "unknown";
+  project_error: string | null;
+  added_at: string;
+  enabled: boolean;
+  active: boolean;
+  available: boolean;
+  schema_version: number | null;
+  version_note: string | null;
+  read_error: HomeIssue | null;
+}
+
+// Блок совмещённого взгляда: одна запись = один включённый дом,
+// атрибуция в каждом блоке, записи прочитаны live из дома-источника.
+export interface HomeRecordsView<T> {
+  snapshot_at: string;
+  home_path: string;
+  home_project: string;
+  is_active: boolean;
+  available: boolean;
+  version_note: string | null;
+  error: HomeIssue | null;
+  records: T[];
 }
 
 // --- workspace view (task.workspace_changes / task.workspace_diff) ---

@@ -1,33 +1,67 @@
 <script setup lang="ts">
-// Список задач (REQ-UI-04): task.list отдаёт порядок по обновлению — UI
-// ничего не сортирует сам. Токен Task.state печатается буквально.
-// Фильтр по проекту (REQ-UI-03 AC2) — проекция данных task.project_id.
+// Список задач — совмещённый взгляд всех включённых домов (REQ-HOME-04):
+// task-блоки home.tasks_all несут атрибуцию дома; порядок внутри блока
+// отдаёт операция (обновление), UI ничего не сортирует и не схлопывает
+// одноимённые задачи разных домов. Фильтр: по умолчанию все включённые
+// дома, по запросу — один (home в query). Детали читаются только из
+// активного дома — ссылка на чужую задачу несёт home, а экран деталей
+// показывает гейт и предлагает активацию этого дома явным кликом
+// (ратифицировано OQ-HOME-2/5; сам список ничего не активирует).
 import { computed, onMounted, ref } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { api, toUiError } from "../api";
+import {
+  blockIssueCode,
+  blockIssueText,
+  homeAttribution,
+  homeFilterOptions,
+  rowsFor,
+  taskDetailLink,
+  tasksEmptyText,
+  tasksForProject,
+} from "../homes-view";
 import { fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
-import { type Task, type UiError } from "../types";
+import type { HomeRecordsView, Task, UiError } from "../types";
 
 const route = useRoute();
-const tasks = ref<Task[]>([]);
+const router = useRouter();
+const blocks = ref<HomeRecordsView<Task>[]>([]);
 const error = ref<UiError | null>(null);
 const loading = ref(true);
 
+const homeFilter = computed(() => (route.query.home as string) ?? null);
 const projectFilter = computed(() => (route.query.project as string) ?? null);
-const projectName = computed(() => (route.query.name as string) ?? projectFilter.value);
+const projectName = computed(
+  () => (route.query.name as string) ?? projectFilter.value,
+);
+
+async function setFilter(v: string) {
+  const q = { ...route.query };
+  if (v) q.home = v;
+  else {
+    delete q.home;
+    delete q.project;
+    delete q.name;
+  }
+  await router.replace({ path: "/tasks", query: q });
+  // R3 quality return: re-read the merged view for the chosen home; the
+  // query change alone left the previously loaded blocks on screen.
+  await load();
+}
 
 const visible = computed(() =>
-  projectFilter.value
-    ? tasks.value.filter((t) => t.project_id === projectFilter.value)
-    : tasks.value,
+  tasksForProject(blocks.value, projectFilter.value),
 );
+
+const rows = (b: HomeRecordsView<Task>) =>
+  rowsFor(visible.value, b.home_path);
 
 async function load() {
   loading.value = true;
   error.value = null;
   try {
-    tasks.value = await api.tasksList();
+    blocks.value = await api.tasksAll(homeFilter.value);
   } catch (e) {
     error.value = toUiError(e);
   } finally {
@@ -35,6 +69,10 @@ async function load() {
   }
 }
 onMounted(load);
+
+function taskLink(b: HomeRecordsView<Task>, t: Task) {
+  return taskDetailLink(b, t);
+}
 </script>
 
 <template>
@@ -44,37 +82,75 @@ onMounted(load);
         Задачи<span v-if="projectName" class="muted"> · проект {{ projectName }}</span>
       </h2>
       <div class="spacer" />
-      <RouterLink v-if="projectFilter" to="/tasks">все задачи home</RouterLink>
+      <label class="muted">
+        дом
+        <select :value="homeFilter ?? ''" @change="setFilter(($event.target as HTMLSelectElement).value)">
+          <option value="">все включённые</option>
+          <option
+            v-for="o in homeFilterOptions(blocks)"
+            :key="'f-' + o.value"
+            :value="o.value"
+          >
+            {{ o.label }}
+          </option>
+        </select>
+      </label>
+      <RouterLink v-if="projectFilter && !homeFilter" to="/tasks">сбросить проект</RouterLink>
       <button @click="load">Обновить</button>
     </div>
     <div v-if="error" class="errorbox">
       <span class="code">{{ error.code }}</span>{{ error.message }}
     </div>
-    <div v-if="!loading && visible.length === 0" class="empty">
-      {{ projectFilter ? "У проекта пока нет задач" : "Home без задач — пустое состояние, не ошибка" }}
+    <div v-if="!loading && blocks.length === 0" class="empty">
+      Нет включённых домов в реестре — добавьте дом на вкладке «Дома».
     </div>
-    <table v-if="visible.length" class="data">
-      <thead>
-        <tr>
-          <th>Задача</th>
-          <th>id</th>
-          <th>Состояние</th>
-          <th>Обновлена</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="t in visible" :key="t.id">
-          <td>
-            <RouterLink class="title-link" :to="`/task/${t.id}`">{{ t.display }}</RouterLink>
-          </td>
-          <td class="mono muted">{{ shortId(t.id) }}</td>
-          <td>
-            <StateChip :token="t.state" />
-            <StateChip v-if="t.return_state" :token="t.return_state" />
-          </td>
-          <td class="mono muted">{{ fmtTime(t.updated_at) }}</td>
-        </tr>
-      </tbody>
-    </table>
+
+    <div v-for="b in blocks" :key="b.home_path" style="margin-bottom: 18px">
+      <div class="rowflex" style="margin-bottom: 6px">
+        <b>{{ b.home_project }}</b>
+        <StateChip v-if="b.is_active" token="ACTIVE" />
+        <span class="mono muted" style="font-size: 12px">{{ b.home_path }}</span>
+        <div class="spacer" />
+        <span v-if="b.version_note" class="muted" style="font-size: 12px">{{ b.version_note }}</span>
+        <span class="muted mono" style="font-size: 12px">снимок {{ fmtTime(b.snapshot_at) }}</span>
+      </div>
+      <div v-if="!b.available" class="errorbox">
+        <span class="code">{{ blockIssueCode(b) }}</span
+        >{{ blockIssueText(b) || "дом недоступен" }}
+      </div>
+      <div v-else-if="rows(b).length === 0" class="empty" style="padding: 8px 12px">
+        {{ tasksEmptyText(projectFilter) }}
+      </div>
+      <table v-else class="data">
+        <thead>
+          <tr>
+            <th>Задача</th>
+            <th>id</th>
+            <th>Дом</th>
+            <th>Состояние</th>
+            <th>Обновлена</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="t in rows(b)" :key="b.home_path + ':' + t.id">
+            <td>
+              <RouterLink class="title-link" :to="taskLink(b, t)">{{ t.display }}</RouterLink>
+            </td>
+            <td class="mono muted">{{ shortId(t.id) }}</td>
+            <td class="muted" :title="b.home_path">
+              <!-- REQ-HOME-04 AC1 (R7 quality return): карточка несёт и имя
+                   дома, и путь — видимым текстом, не только в title. -->
+              <div>{{ homeAttribution(b) }}</div>
+              <div class="mono" style="font-size: 12px">{{ b.home_path }}</div>
+            </td>
+            <td>
+              <StateChip :token="t.state" />
+              <StateChip v-if="t.return_state" :token="t.return_state" />
+            </td>
+            <td class="mono muted">{{ fmtTime(t.updated_at) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 </template>

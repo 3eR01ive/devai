@@ -8,6 +8,8 @@ import type {
   ArtifactContent,
   Decision,
   DependenciesView,
+  HomeRecord,
+  HomeRecordsView,
   LivenessView,
   OpDescriptor,
   ProgressView,
@@ -68,6 +70,20 @@ export const api = {
   // Секция ожидания человека (REQ-GATE-01..10): один снимок — строки
   // гейтов, остановленные, справочные заметки и бейдж на нём же.
   inboxView: () => invoke<WaitSnapshot>("inbox_view"),
+
+  // --- homes registry (REQ-HOME-01…09) ---
+  // Чтение: home.list / home.projects_all / home.tasks_all (Read-плоскость).
+  // Управление реестром: home.add / home.set_enabled / home.activate
+  // (Registry-плоскость, пишет только homes.json контрольного дома).
+  homesList: () => invoke<HomeRecord[]>("homes_list"),
+  homesAdd: (path: string) => invoke<HomeRecord>("homes_add", { path }),
+  homesSetEnabled: (path: string, enabled: boolean) =>
+    invoke<HomeRecord[]>("homes_set_enabled", { path, enabled }),
+  homesActivate: (path: string) => invoke<SessionInfo>("homes_activate", { path }),
+  projectsAll: (home: string | null) =>
+    invoke<HomeRecordsView<Project>[]>("projects_all", { home }),
+  tasksAll: (home: string | null) =>
+    invoke<HomeRecordsView<Task>[]>("tasks_all", { home }),
 };
 
 export function toUiError(e: unknown): UiError {
