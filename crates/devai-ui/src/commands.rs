@@ -774,11 +774,22 @@ fn wait_row_from(
     else {
         return Ok(None);
     };
+    // QA-строка без CURRENT-отчёта подписывать нечего: платформа ещё не судила
+    // (наблюдение оператора 07.11: «ждёт подписи», а отчёта нет). Вместо
+    // требования подписи показываем факт и честное действие — прогнать аудит.
+    let (demand_text, cli_hint) = if task.state == TaskState::Qa && report.is_none() {
+        (
+            "QA ещё не прогонялся: подписывать нечего, гейт ждёт аудита".to_string(),
+            format!("devai task run {}", short_id(&task.id)),
+        )
+    } else {
+        (demand.demand, demand.cli_hint)
+    };
     Ok(Some(WaitRow {
         spec: spec.as_ref().map(|spec| spec_of(&task, spec)),
         task,
-        demand: demand.demand,
-        cli_hint: demand.cli_hint,
+        demand: demand_text,
+        cli_hint,
         open_questions,
         report,
         report_note,

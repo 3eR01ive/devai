@@ -11,3 +11,6 @@ crates/devai-ui/gen/
 docs/internal/
 /bin/*
 !/bin/.keep
+
+# случайно созданный дом внутри репо (не трекаем)
+.devai/

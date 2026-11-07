@@ -113,22 +113,36 @@ pub fn paragraph_violations(value: &Value, schema: &Value, policy: &HumanizePoli
         }
     }
 
-    // «пустая болтовня», half 2: every declared explanation slot must be
-    // filled by at least one of its marker phrases (case-insensitive).
+    // «пустая болтовня», half 2 (calibrated 07.11): the paragraph must fill
+    // AT LEAST ONE declared explanation slot — a verdict may legitimately be
+    // about the current state only («что происходит») or about the
+    // consequence only («что изменится»). Demanding BOTH slots turned a
+    // stylistic preference into 15 false rejections in 6 hours on live runs
+    // (замер 07.11: 10 × «что происходит», 5 × «что изменится»), while the
+    // real readability floors — presence, min/max size, no protocol markers,
+    // no restatement of the formal body — stay hard. A paragraph that fills
+    // NEITHER slot is still «пустая болтовня» and refuses.
+    let mut filled: Vec<&str> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
     for slot in &policy.slots {
         if slot.markers.is_empty() {
             continue;
         }
-        if !slot
+        if slot
             .markers
             .iter()
             .any(|m| !m.trim().is_empty() && lower.contains(&m.to_lowercase()))
         {
-            errs.push(format!(
-                "{path}: explanation slot «{name}» is not filled — none of the configured marker phrases appears",
-                name = slot.name
-            ));
+            filled.push(slot.name.as_str());
+        } else {
+            missing.push(slot.name.as_str());
         }
+    }
+    if !policy.slots.is_empty() && filled.is_empty() {
+        errs.push(format!(
+            "{path}: ни один объяснительный слот не заполнен (ожидались формулировки про «{}») — абзац не объясняет ни что происходит, ни что изменится",
+            missing.join("», «")
+        ));
     }
 
     // «пересказ формализма»: overlap of the paragraph's n-grams with the
@@ -344,14 +358,27 @@ mod tests {
     }
 
     #[test]
-    fn unfilled_slot_is_rejected() {
-        // Long enough, no formal markers, but only narrates the present —
-        // «что изменится» never appears.
-        let p = "Сегодня все выводы ролей выглядят как сухой формальный протокол, и оператору приходится самому переводить их на человеческий язык, опираясь на контекст запуска и память о предыдущих обсуждениях; так происходит на гейтахapproval, на гейтах приёмки, и каждый раз человек тратит время на расшифровку того, что модель уже знала и могла сказать просто.".to_string();
+    fn one_filled_slot_is_enough() {
+        // Калибровка 07.11: абзац, который честно рассказывает, что происходит
+        // СЕЙЧАС (и не обещает будущего), больше не отвергается — вердикт
+        // ревьювера может быть именно про текущее состояние.
+        let p = "Сегодня все выводы ролей выглядят как сухой формальный протокол, и оператору приходится самому переводить их на человеческий язык, опираясь на контекст запуска и память о предыдущих обсуждениях; так происходит на гейтах approval, на гейтах приёмки, и каждый раз человек тратит время на расшифровку того, что модель уже знала и могла сказать просто.".to_string();
         let errs = paragraph_violations(&body(&p), &spec_schema(), &policy());
         assert!(
-            errs.iter().any(|e| e.contains("explanation slot")),
-            "unfilled slot must be rejected: {errs:?}"
+            !errs.iter().any(|e| e.contains("объяснительный слот")),
+            "one filled slot must pass: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn paragraph_filling_no_slot_is_rejected() {
+        // Абзац без единой формулировки ни про «сейчас», ни про «после» —
+        // это и есть «пустая болтовня», он по-прежнему отвергается.
+        let p = "Артефакт описывает набор правил, которые применяются к документу целиком и по частям, причём каждая часть проверяется отдельно от остальных силами соответствующих ролей, а результат фиксируется в протоколе прогона с указанием источника.".to_string();
+        let errs = paragraph_violations(&body(&p), &spec_schema(), &policy());
+        assert!(
+            errs.iter().any(|e| e.contains("объяснительный слот")),
+            "a paragraph with no explanation cue must be rejected: {errs:?}"
         );
     }
 

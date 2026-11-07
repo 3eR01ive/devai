@@ -882,58 +882,6 @@ impl Api {
         })
     }
 
-    /// The quality-report half of the gate presentation: the CURRENT report
-    /// row at `report_fresh`, nothing at `waiting_accept`, and the stored
-    /// rendering text whenever a gate accepts a signature.
-    fn gate_reporting(
-        &self,
-        task_id: Id,
-        gate: Gate,
-    ) -> ApiResult<(Option<Artifact>, Option<String>)> {
-        match gate {
-            Gate::WaitingAccept => Ok((None, self.quality_report_text(task_id)?)),
-            Gate::ReportFresh => Ok((
-                self.store.artifacts(task_id)?.into_iter().find(|x| {
-                    x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
-                }),
-                self.quality_report_text(task_id)?,
-            )),
-            _ => Ok((None, None)),
-        }
-    }
-
-    /// REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
-    /// presentation — approval/review reads spec + review, acceptance reads
-    /// the implementation-report. Stored fields, verbatim; absence (a legacy
-    /// @1/@2 CURRENT, a non-JSON body) renders as NO paragraph, never as a
-    /// broken gate (REQ-HP-06 non-retroactivity in the render half too).
-    fn gate_paragraphs(&self, task_id: Id, gate: Gate) -> ApiResult<Vec<(String, String)>> {
-        let mut paragraphs: Vec<(String, String)> = Vec::new();
-        match gate {
-            Gate::WaitingApproval => {
-                for (kind, label) in [
-                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
-                    (ArtifactKind::ReviewReport, "review-report"),
-                ] {
-                    if let Some(p) = self.stored_human_paragraph(task_id, kind, label)? {
-                        paragraphs.push(p);
-                    }
-                }
-            }
-            Gate::WaitingAccept | Gate::ReportFresh => {
-                if let Some(p) = self.stored_human_paragraph(
-                    task_id,
-                    ArtifactKind::ImplementationReport,
-                    "implementation-report",
-                )? {
-                    paragraphs.push(p);
-                }
-            }
-            _ => {}
-        }
-        Ok(paragraphs)
-    }
-
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
         let task = self.store.resolve_task(&req.id)?;
         let _a = self.publish_row_internal(

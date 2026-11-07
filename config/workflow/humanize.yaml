@@ -24,7 +24,7 @@ humanize:
   # reply inside the physical response limit together with the complete
   # schema skeleton.
   min_chars: 200
-  max_chars: 1200
+  max_chars: 1500
   # Detector of «restatement of formalism»: the fraction of the paragraph's
   # word n-grams already present in the formal body of the same artifact
   # (echo fields excluded — see overlap_ignore). Above the ratio: reject.
@@ -62,6 +62,26 @@ humanize:
         - today
     - name: "что изменится"
       markers:
+        # Добавлено 07.11 по слову оператора: модель естественно пишет
+        # «после принятия решения», «должен», «позволит» — это тот же слот,
+        # и гейт не должен парковать задачу из-за синонима.
+        - после принятия
+        - после этого
+        - позволит
+        - предстоит
+        - следующим шагом
+        - в результате
+        - дальше
+        - затем
+        - закроет
+        - уберёт
+        - снимет
+        - исправ
+        - перейдёт
+        - даст
+        - должен
+        - должна
+        - будем
         - изменится
         - изменят
         - изменит

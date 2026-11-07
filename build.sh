@@ -23,8 +23,16 @@ cargo build --workspace $CARGO_FLAGS
 mkdir -p bin
 for b in devai devai-ui; do
     if [ -f "target/$PROFILE/$b" ]; then
-        cp "target/$PROFILE/$b" "bin/$b"
-        echo "bin/$b <- target/$PROFILE/$b"
+        # Атомарная подмена: cp поверх РАБОТАЮЩЕГО бинаря даёт ETXTBSY
+        # («Text file busy») и валит весь скрипт (set -eu). Копируем рядом
+        # и переименовываем — работающий процесс держит старый inode.
+        tmp="bin/.$b.new.$$"
+        if cp "target/$PROFILE/$b" "$tmp" && mv -f "$tmp" "bin/$b"; then
+            echo "bin/$b <- target/$PROFILE/$b"
+        else
+            rm -f "$tmp"
+            echo "build.sh: не удалось обновить bin/$b (занят?) — продолжаю" >&2
+        fi
     fi
 done
 echo "built ($PROFILE). launch: ./bin/devai-ui  (with vite on 127.0.0.1:1420 for debug)"
