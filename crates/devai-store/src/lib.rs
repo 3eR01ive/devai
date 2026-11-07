@@ -175,6 +175,10 @@ pub struct Store {
     pub(crate) conn: Connection,
     root: PathBuf,
     pub(crate) blobs: PathBuf,
+    /// Cached column verdict of `tasks.human_name` for THIS handle (a
+    /// property of the stored schema rank, asked once — R1 quality return:
+    /// a home behind this build is READ, not failed on a missing column).
+    task_human_name: std::cell::OnceCell<bool>,
 }
 
 /// Reader handle of an EXISTING home for observation: strictly read-only
@@ -288,6 +292,7 @@ impl Store {
             conn,
             root: root.to_path_buf(),
             blobs,
+            task_human_name: std::cell::OnceCell::new(),
         })
     }
 
@@ -316,6 +321,7 @@ impl Store {
             conn,
             root: root.to_path_buf(),
             blobs: root.join("blobs"),
+            task_human_name: std::cell::OnceCell::new(),
         })
     }
 
@@ -534,11 +540,51 @@ impl Store {
         )?)
     }
 
+    /// Does this store carry `column` on `table`? Asked per HANDLE: the
+    /// answer is a property of the stored schema rank, not of the query, and
+    /// a read must not re-derive it every time (REQ-HOME-09).
+    fn has_column(&self, table: &str, column: &str) -> StoreResult<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The task projection this store can answer: a home OBSERVED by this
+    /// build may be behind it (v8 has no `tasks.human_name`), and a merged
+    /// view of such a home must READ its rows, not fail on the missing
+    /// column (REQ-HOME-08 AC3 / REQ-HOME-09, R1 quality return). The
+    /// absent column is projected as a typed NULL in the same position, so
+    /// every task row mapper stays one shape. Probe cached per handle.
+    fn task_projection(&self) -> StoreResult<&'static str> {
+        let present = match self.task_human_name.get() {
+            Some(v) => *v,
+            None => {
+                let v = self.has_column("tasks", "human_name")?;
+                let _ = self.task_human_name.set(v);
+                v
+            }
+        };
+        Ok(if present {
+            "id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name"
+        } else {
+            "id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,NULL AS human_name"
+        })
+    }
+
     pub fn get_task(&self, id: &str) -> StoreResult<Task> {
         rows::unwrap_row(
             self.conn
                 .query_row(
-                    "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name FROM tasks WHERE id = ?1",
+                    &format!(
+                        "SELECT {} FROM tasks WHERE id = ?1",
+                        self.task_projection()?
+                    ),
                     params![id],
                     |r| rows::r2sql(rows::task_from_row(r)),
                 )
@@ -549,10 +595,10 @@ impl Store {
 
     /// Resolves a task by a unique id prefix (human-friendly CLI usage).
     pub fn resolve_task(&self, prefix: &str) -> StoreResult<Task> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name
-             FROM tasks WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 2",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM tasks WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 2",
+            self.task_projection()?
+        ))?;
         let mut rows = stmt.query(params![prefix.to_lowercase()])?;
         let mut found: Vec<Task> = Vec::new();
         while let Some(r) = rows.next()? {
@@ -570,10 +616,10 @@ impl Store {
     }
 
     pub fn list_tasks(&self) -> StoreResult<Vec<Task>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name
-             FROM tasks ORDER BY updated_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM tasks ORDER BY updated_at DESC",
+            self.task_projection()?
+        ))?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {

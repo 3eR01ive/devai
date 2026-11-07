@@ -808,6 +808,54 @@ fn apply_label(e: &mut HomeEntry, probe: &LabelProbe) -> bool {
     true
 }
 
+/// The outcome of the startup launch registration (REQ-HOME-02): the path
+/// the process must treat as active, plus the honest fact whether THIS
+/// launch created the record. Only a home the registry did not know before
+/// may be created on disk; a recorded home whose path vanished is
+/// `home_unavailable` (R4 quality return — REQ-HOME-07 in private).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchResolution {
+    pub active: PathBuf,
+    pub registered_here: bool,
+}
+
+/// Merge the launch home into the registry and apply the ratified active
+/// rule (OQ-HOME-7). Returns `(changed, registered_here)`:
+///   * the launch home always ends up registered (REQ-HOME-02);
+///   * a label pinned while the store was unreadable is re-derived here
+///     (R3 quality return) instead of staying pinned forever;
+///   * `$DEVAI_HOME` set wins, otherwise the stored active record wins, and
+///     an empty registry (or one without an active mark) adopts the launch
+///     home. Activation implies inclusion (`mark_active`).
+///
+/// The adoption rule is documented verbatim in docs/homes-registry.md,
+/// section «Реестр без активной метки».
+fn merge_launch(
+    entries: &mut Vec<HomeEntry>,
+    key: &str,
+    probe: &LabelProbe,
+    env_set: bool,
+) -> (bool, bool) {
+    let registry_had_entries = !entries.is_empty();
+    let mut changed = false;
+    let registered_here = !entries.iter().any(|e| e.path == key);
+    match entries.iter_mut().find(|e| e.path == key) {
+        None => {
+            entries.push(new_entry(key, probe, Utc::now()));
+            changed = true;
+        }
+        Some(entry) if entry.project_source == ProjectSource::Unreadable => {
+            changed = apply_label(entry, probe);
+        }
+        Some(_) => {}
+    }
+    let saved_active = entries.iter().any(|e| e.active && e.path != key);
+    if env_set || !registry_had_entries || !saved_active {
+        changed = mark_active(entries, key) || changed;
+    }
+    (changed, registered_here)
+}
+
 impl Homes {
     /// Load the registry of a control home. A missing file is the valid
     /// empty state (REQ-HOME-02 AC: before the first registration the
@@ -886,47 +934,36 @@ impl Homes {
     ///     adopted record is enabled in the same flip.
     ///
     /// Existing records are never lost by a launch (REQ-HOME-02 AC2).
-    pub fn bootstrap_launch(&mut self, launch: &Path, env_set: bool) -> ApiResult<PathBuf> {
+    ///
+    /// The returned [`LaunchResolution`] also states whether THIS launch
+    /// created the record — creating a store is allowed only for a home the
+    /// registry did not know before (R4 quality return: a recorded home that
+    /// vanished is `not on disk`, never a fresh empty home).
+    pub fn bootstrap_launch(
+        &mut self,
+        launch: &Path,
+        env_set: bool,
+    ) -> ApiResult<LaunchResolution> {
         let key = norm(launch);
         // The label may read the launch store; probe it OUTSIDE the lock
         // (read-only opens never serialize against the registry file).
         let probe = label_probe(launch);
-        let active = self.transact(|entries| {
-            let registry_had_entries = !entries.is_empty();
-            let mut changed = false;
-            match entries.iter_mut().find(|e| e.path == key) {
-                None => {
-                    entries.push(new_entry(&key, &probe, Utc::now()));
-                    changed = true;
-                }
-                // R3 quality return: a label that was persisted while the
-                // store could not be read is re-derived on re-registration
-                // instead of pinning the transient failure forever.
-                Some(entry) if entry.project_source == ProjectSource::Unreadable => {
-                    changed = apply_label(entry, &probe);
-                }
-                Some(_) => {}
-            }
-            // Who is active (the stored fact — never read-time env
-            // re-derivation beyond the ratified OQ-HOME-7 rule itself).
-            // The adoption rule below is documented verbatim in
-            // docs/homes-registry.md, section «Реестр без активной метки»:
-            // the launch home is activated when it came from an explicitly
-            // set DEVAI_HOME, when the registry had no records at all, or
-            // when no OTHER record carries the active mark; otherwise the
-            // stored activity is left untouched.
-            let saved_active = entries.iter().any(|e| e.active && e.path != key);
-            if env_set || !registry_had_entries || !saved_active {
-                changed = mark_active(entries, &key) || changed;
-            }
+        let resolution = self.transact(|entries| {
+            let (changed, registered_here) = merge_launch(entries, &key, &probe, env_set);
             let active = entries
                 .iter()
                 .find(|e| e.active)
                 .map(|e| e.path.clone())
                 .unwrap_or_else(|| key.clone());
-            Ok((changed, PathBuf::from(active)))
+            Ok((
+                changed,
+                LaunchResolution {
+                    active: PathBuf::from(active),
+                    registered_here,
+                },
+            ))
         })?;
-        Ok(active)
+        Ok(resolution)
     }
 
     /// `home.add`: register an existing devai home. Validation is the
@@ -1228,13 +1265,17 @@ mod tests {
         let mut homes = Homes::load(&control).unwrap();
         assert!(homes.entries().is_empty(), "empty registry is valid");
 
-        let active = homes
+        let resolution = homes
             .bootstrap_launch(&launch, true)
             .expect("the first launch registers the launch home, it is no startup death");
 
         assert_eq!(
-            active, launch,
+            resolution.active, launch,
             "the registry names the launch home (no store is created by registration alone)"
+        );
+        assert!(
+            resolution.registered_here,
+            "an empty registry means this launch created the record"
         );
         let file = control.join(HOMES_FILE);
         assert!(file.is_file(), "the registry document was created");
@@ -1289,7 +1330,7 @@ mod tests {
             "precondition: the operator switched the home off"
         );
 
-        let active = homes.bootstrap_launch(&home, true).unwrap();
+        let active = homes.bootstrap_launch(&home, true).unwrap().active;
 
         assert_eq!(
             fs::canonicalize(&active).unwrap(),
@@ -1332,7 +1373,7 @@ mod tests {
         let key = norm(&home);
         homes.set_enabled(&key, false).unwrap();
 
-        let active = homes.bootstrap_launch(&home, false).unwrap();
+        let active = homes.bootstrap_launch(&home, false).unwrap().active;
 
         assert_eq!(
             fs::canonicalize(&active).unwrap(),

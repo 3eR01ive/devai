@@ -626,31 +626,28 @@ fn reopen_active(
             }
         },
         None => {
-            let failure = absent_active_failure(active, control);
+            let failure = match active {
+                // ONE source with the startup path (R3 quality return): a
+                // directory without a store is `home_no_store`, a vanished
+                // path is `home_unavailable` — the tokens cannot drift
+                // between bootstrap and the post-registry rebind.
+                Some(path) => crate::session::gone_failure(std::path::Path::new(path)),
+                None => no_active_failure(control),
+            };
             (observe_control(control, actor), Some(failure))
         }
     }
 }
 
-/// The degradation fact of a registry whose active home cannot be read:
-/// `home_unavailable` when a stored marker points at a home that vanished
-/// from disk (or lost its store), `home_none_active` when every record is
-/// switched off. Both name the control home the session falls back to.
-fn absent_active_failure(active: Option<&str>, control: &std::path::Path) -> HomeFailure {
-    let (code, message) = match active {
-        Some(path) => (
-            devai_api::codes::HOME_UNAVAILABLE,
-            format!("home {path} is not on disk"),
-        ),
-        None => (
-            devai_api::codes::HOME_NONE_ACTIVE,
-            "no active home — enable or add a home; the registry keeps every record".to_string(),
-        ),
-    };
+/// The degradation fact of a registry with NO active record (every home is
+/// switched off, ratified OQ-HOME-8): a defined state, not an error, and it
+/// names the control home the session falls back to.
+fn no_active_failure(control: &std::path::Path) -> HomeFailure {
     HomeFailure {
-        code,
+        code: devai_api::codes::HOME_NONE_ACTIVE,
         home: control.display().to_string(),
-        message,
+        message: "no active home — enable or add a home; the registry keeps every record"
+            .to_string(),
     }
 }
 
@@ -1117,6 +1114,44 @@ mod tests {
                 "`{cmd}` calls `{op}` — a non-Read operation is forbidden in the data plane (OQ-UI-6)"
             );
         }
+    }
+
+    /// R3 quality return: the post-registry rebind states why the active home
+    /// could not be read with the SAME verdict the startup path uses
+    /// (`session::gone_failure`) — `home_no_store` when the folder is there
+    /// without a store, `home_unavailable` when the path vanished — instead
+    /// of collapsing both into "not on disk" with one code.
+    #[test]
+    fn the_rebind_never_states_a_missing_store_as_a_vanished_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let control = dir.path().join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        let recorded = dir.path().join("project/.devai");
+        let path = recorded.display().to_string();
+
+        std::fs::create_dir_all(&recorded).unwrap();
+        let (_, failure) = reopen_active(&control, Some(&path), "tester");
+        let failure = failure.expect("a storeless home degrades, it is not opened");
+        assert_eq!(failure.code, devai_api::codes::HOME_NO_STORE);
+        assert_eq!(failure.home, path, "the failure names the home it is about");
+        assert!(
+            failure.message.contains("devai init"),
+            "the operator gets the way out: {}",
+            failure.message
+        );
+
+        std::fs::remove_dir_all(&recorded).unwrap();
+        let (_, failure) = reopen_active(&control, Some(&path), "tester");
+        let failure = failure.expect("a vanished home degrades, it is not created");
+        assert_eq!(failure.code, devai_api::codes::HOME_UNAVAILABLE);
+        assert!(failure.message.contains("not on disk"));
+        assert!(
+            !recorded.exists(),
+            "the rebind created a home over a vanished record"
+        );
+
+        let none = no_active_failure(&control);
+        assert_eq!(none.code, devai_api::codes::HOME_NONE_ACTIVE);
     }
 
     /// REQ-HOME-05/06: the registry-management commands map onto the
@@ -2461,6 +2496,47 @@ mod tests {
                 "`{needle}` is declared in the record schema but no view reads it — the attribute never reaches the operator"
             );
         }
+    }
+
+    /// R5 quality return: `SessionInfo` is a wire shape too. It is described
+    /// once (`session::SESSION_INFO_SCHEMA`), pinned in the IPC fixture and
+    /// mirrored by `types.ts` — the same discipline the home records have, so
+    /// `session_info` and `homes_activate` cannot drift from the frontend.
+    #[test]
+    fn session_info_schema_is_pinned_on_the_wire_fixture_and_types() {
+        use crate::session::SESSION_INFO_SCHEMA;
+        let info = SessionInfo {
+            home: "/h/.devai".into(),
+            actor: "op".into(),
+            opened_at: Utc::now(),
+            control_home: "/c/.devai".into(),
+            degraded_from: None,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_schema_keys(SESSION_INFO_SCHEMA, &json, "SessionInfo");
+
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ipc_shapes.json")).unwrap();
+        let mut declared = devai_api::schema_names(SESSION_INFO_SCHEMA);
+        declared.sort_unstable();
+        let mut pinned: Vec<&str> = fixture["session_info"]
+            .as_object()
+            .expect("ipc_shapes.json pins the session_info shape")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        pinned.sort_unstable();
+        assert_eq!(
+            declared, pinned,
+            "the wire fixture must carry every session_info field (same names)"
+        );
+
+        let types_ts = std::fs::read_to_string(format!(
+            "{}/frontend/src/types.ts",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert_schema_matches_ts(SESSION_INFO_SCHEMA, &types_ts, "SessionInfo");
     }
 
     /// R2 quality return: the homes attributes are described ONCE

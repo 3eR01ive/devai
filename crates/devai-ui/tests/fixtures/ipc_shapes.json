@@ -3,6 +3,13 @@
     "code": "not_found",
     "message": "task `x1` was not found"
   },
+  "session_info": {
+    "home": "/home/op/project/.devai",
+    "actor": "op",
+    "opened_at": "2026-11-06T12:00:00Z",
+    "control_home": "/home/op/.devai",
+    "degraded_from": null
+  },
   "artifact_text": {
     "shape": "text",
     "artifact_id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",

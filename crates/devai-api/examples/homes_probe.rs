@@ -24,7 +24,8 @@ fn main() -> Result<(), String> {
     let mut homes = Homes::load(&control).map_err(|e| e.to_string())?;
     let active = homes
         .bootstrap_launch(&launch, std::env::var("DEVAI_HOME").is_ok())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .active;
     println!("control home: {}", control.display());
     println!(
         "stored active: {} (env set: {})",

@@ -32,7 +32,7 @@ pub use error::{ApiError, ApiResult, ErrorCode};
 pub use homes::{
     HOME_ENTRY_SCHEMA, HOME_ISSUE_SCHEMA, HOME_RECORD_SCHEMA, HOME_VIEW_SCHEMA, HOMES_FILE,
     HOMES_FORMAT_VERSION, HOMES_LOCK_FILE, HomeEntry, HomeIssue, HomeRecord, HomeRecordsView,
-    Homes, ProjectSource, schema_names,
+    Homes, LaunchResolution, ProjectSource, schema_names,
 };
 pub use inbox::{
     InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts, factory_inbox_wait_policy,

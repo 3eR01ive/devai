@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use devai_api::Homes;
+use devai_api::{HomeRecordsView, Homes};
 use devai_core::types::*;
 use devai_store::Store;
 
@@ -46,6 +46,65 @@ fn seed_home(root: &Path, project: &str, titles: &[&str]) {
     }
 }
 
+/// A home as the PREVIOUS build wrote it (schema 7): projects and tasks
+/// rows, and no `tasks.human_name` — the 009 rung has not run. Built with
+/// plain SQL on purpose: `Store::open` would migrate it, which is exactly
+/// what an observer must never do (REQ-HOME-09).
+fn seed_lagging_home(root: &Path, project: &str, titles: &[&str]) {
+    std::fs::create_dir_all(root).unwrap();
+    let conn = rusqlite::Connection::open(root.join("devai.db")).unwrap();
+    conn.execute_batch(
+        "PRAGMA user_version=7;
+         CREATE TABLE projects(id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+           description TEXT NOT NULL DEFAULT '', repos TEXT NOT NULL DEFAULT '[]',
+           created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+         CREATE TABLE tasks(id TEXT PRIMARY KEY, project_id TEXT NULL REFERENCES projects(id),
+           title TEXT NOT NULL, business_description TEXT NOT NULL DEFAULT '',
+           state TEXT NOT NULL, return_state TEXT NULL,
+           requirements_seq INTEGER NOT NULL DEFAULT 0, lock_version INTEGER NOT NULL DEFAULT 1,
+           created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
+    )
+    .unwrap();
+    let pid = new_id().to_string();
+    conn.execute(
+        "INSERT INTO projects(id,name,created_at,updated_at)
+           VALUES(?1,?2,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        rusqlite::params![pid, project],
+    )
+    .unwrap();
+    for (i, t) in titles.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO tasks(id,project_id,title,state,updated_at,created_at)
+               VALUES(?1,?2,?3,'DRAFT',?4,'2026-01-01T00:00:00Z')",
+            rusqlite::params![
+                new_id().to_string(),
+                pid,
+                t,
+                format!("2026-01-0{}T00:00:00Z", i + 2)
+            ],
+        )
+        .unwrap();
+    }
+}
+
+/// The stored rank and table count of a home, read straight from the file:
+/// the observer's own claims are checked against the bytes on disk.
+fn rank_and_tables(root: &Path) -> (i64, i64) {
+    let conn = rusqlite::Connection::open_with_flags(
+        root.join("devai.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rank: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT count(*) FROM sqlite_master WHERE type='table'")
+        .unwrap();
+    let tables: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+    (rank, tables)
+}
+
 /// A control home is a directory that may or may not carry a devai store;
 /// the registry file lives inside it without one (it is a platform file,
 /// not a domain table).
@@ -67,6 +126,11 @@ fn empty_registry_launch_registers_and_activates_the_launch_home() {
         "before the first record: empty, valid"
     );
     let active = homes.bootstrap_launch(&launch, true).unwrap();
+    assert!(
+        active.registered_here,
+        "the first record of an empty registry is created by this launch"
+    );
+    let active = active.active;
     assert_eq!(active, launch.canonicalize().unwrap());
     assert_eq!(homes.entries().len(), 1);
     let e = &homes.entries()[0];
@@ -96,7 +160,7 @@ fn launch_from_a_new_home_registers_it_without_losing_records_or_env_priority() 
 
     // B launches WITHOUT env: the record appears, the saved active stays
     // with A (ratified OQ-HOME-7: no env → the stored record wins).
-    let active = homes.bootstrap_launch(&b, false).unwrap();
+    let active = homes.bootstrap_launch(&b, false).unwrap().active;
     assert_eq!(active, a.canonicalize().unwrap());
     assert_eq!(homes.entries().len(), 2);
     assert!(homes.entries().iter().all(|e| e.enabled));
@@ -109,7 +173,7 @@ fn launch_from_a_new_home_registers_it_without_losing_records_or_env_priority() 
     // B launches WITH env: env is authoritative → B becomes the active
     // record, A's record survives.
     let mut homes = load(&control);
-    let active = homes.bootstrap_launch(&b, true).unwrap();
+    let active = homes.bootstrap_launch(&b, true).unwrap().active;
     assert_eq!(active, b.canonicalize().unwrap());
     assert_eq!(homes.entries().len(), 2);
     let reloaded = load(&control);
@@ -333,42 +397,8 @@ fn activation_never_migrates_the_activated_home() {
     let launch = dir.path().join("launch");
     let lagging = dir.path().join("lagging");
     seed_home(&launch, "launcher", &[]);
-    std::fs::create_dir_all(&lagging).unwrap();
-    {
-        let conn = rusqlite::Connection::open(lagging.join("devai.db")).unwrap();
-        conn.execute_batch(
-            "PRAGMA user_version=7;
-             CREATE TABLE projects(id TEXT PRIMARY KEY, name TEXT NOT NULL,
-               description TEXT NOT NULL DEFAULT '', repos TEXT NOT NULL DEFAULT '[]',
-               created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO projects(id,name,created_at,updated_at)
-               VALUES(?1,'lagging','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
-            [new_id().to_string()],
-        )
-        .unwrap();
-    }
-    let rank = || {
-        Store::open_read_only(&lagging)
-            .unwrap()
-            .schema_version()
-            .unwrap()
-    };
-    let tables = || {
-        let conn = rusqlite::Connection::open_with_flags(
-            lagging.join("devai.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let mut stmt = conn
-            .prepare("SELECT count(*) FROM sqlite_master WHERE type='table'")
-            .unwrap();
-        let n: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
-        n
-    };
-    let (rank_before, tables_before) = (rank(), tables());
+    seed_lagging_home(&lagging, "lagging", &[]);
+    let before = rank_and_tables(&lagging);
 
     let mut homes = load(&control);
     homes.bootstrap_launch(&launch, true).unwrap();
@@ -382,18 +412,21 @@ fn activation_never_migrates_the_activated_home() {
     );
     assert_eq!(homes.active_entry().unwrap().path, lp, "the flip landed");
     assert_eq!(
-        rank(),
-        rank_before,
+        rank_and_tables(&lagging),
+        before,
         "activation never runs the migration ladder on the activated home"
     );
-    assert_eq!(tables(), tables_before, "no table was created or dropped");
-    let store = Store::open_read_only(&lagging).unwrap();
+    assert_lagging_home_readable(&mut homes, &lagging, &lp);
+}
+
+/// The activated lagging home reads its rows and is marked by version.
+fn assert_lagging_home_readable(homes: &mut Homes, lagging: &Path, lp: &str) {
+    let store = Store::open_read_only(lagging).unwrap();
     assert_eq!(
         store.list_projects().unwrap().len(),
         1,
         "the lagging rows stay readable, nothing was seeded"
     );
-
     let rec = homes
         .records()
         .unwrap()
@@ -405,6 +438,66 @@ fn activation_never_migrates_the_activated_home() {
     assert!(
         rec.version_note.as_deref().unwrap_or("").contains("behind"),
         "the UI still marks the home as a behind version"
+    );
+}
+
+/// R1/R2 quality return: the live tripsales shape — a home of schema 7,
+/// whose `tasks` table has no `human_name` column. `home.tasks_all` must
+/// READ those rows (REQ-HOME-08 AC3), mark the home "behind", and leave the
+/// file exactly as it was (REQ-HOME-09: the observer never migrates).
+#[test]
+fn tasks_all_reads_a_lagging_home_without_a_human_name_column() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let control = dir.path().join("control");
+    let lagging = dir.path().join("tripsales");
+    seed_home(&control, "devai", &[]);
+    seed_lagging_home(&lagging, "tripsales", &["gate task", "second"]);
+    let before = rank_and_tables(&lagging);
+
+    let mut homes = load(&control);
+    homes.bootstrap_launch(&control, true).unwrap();
+    let lp = homes.add(&lagging).unwrap().path;
+    let view = homes.tasks_all(None).unwrap();
+
+    let block = view
+        .iter()
+        .find(|b| b.home_path == lp)
+        .expect("the lagging home has its own block");
+    assert_lagging_tasks_are_read(block);
+    assert_eq!(
+        rank_and_tables(&lagging),
+        before,
+        "observation migrated or reshaped the lagging home"
+    );
+}
+
+/// The rows are read (not a missing-column failure), the absent v9 name is
+/// NULL and the home is marked by its rank.
+fn assert_lagging_tasks_are_read(block: &HomeRecordsView<Task>) {
+    assert!(
+        block.available,
+        "the lagging home is readable, not failed: {:?}",
+        block.error
+    );
+    let mut titles: Vec<&str> = block.records.iter().map(|t| t.title.as_str()).collect();
+    titles.sort_unstable();
+    assert_eq!(
+        titles,
+        vec!["gate task", "second"],
+        "rows of a home behind this build are read, never dropped"
+    );
+    assert!(
+        block.records.iter().all(|t| t.human_name.is_none()),
+        "the absent v9 column projects as NULL — no name is invented"
+    );
+    assert!(
+        block
+            .version_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("behind"),
+        "the home is marked by its version: {:?}",
+        block.version_note
     );
 }
 
@@ -465,24 +558,32 @@ fn activation_validates_then_flips_the_stored_active_exactly_once() {
     );
 }
 
-#[test]
-fn merged_views_attribute_live_rows_and_localize_dead_homes() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let control = dir.path().join("control");
+/// The shared fixture of the merged-view tests: alpha (active), beta and a
+/// ghost home whose folder is deleted after registration. Returns the
+/// registry and the two non-active home paths.
+fn mixed_registry(dir: &Path) -> (Homes, String, String) {
+    let control = dir.join("control");
     std::fs::create_dir_all(&control).unwrap();
-    let a = dir.path().join("a");
-    let b = dir.path().join("b");
+    let a = dir.join("a");
+    let b = dir.join("b");
     // Same-named tasks in two homes — the view must never collapse them.
     seed_home(&a, "alpha", &["same title", "alpha only"]);
     seed_home(&b, "beta", &["same title"]);
-    let ghost = dir.path().join("ghost");
+    let ghost = dir.join("ghost");
     seed_home(&ghost, "ghosty", &["was here"]);
 
     let mut homes = load(&control);
     homes.bootstrap_launch(&a, true).unwrap();
-    homes.add(&b).unwrap();
+    let beta_path = homes.add(&b).unwrap().path;
     let ghost_path = homes.add(&ghost).unwrap().path;
     std::fs::remove_dir_all(ghost.canonicalize().unwrap()).unwrap();
+    (homes, beta_path, ghost_path)
+}
+
+#[test]
+fn merged_views_attribute_live_rows_and_localize_dead_homes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut homes, beta_path, ghost_path) = mixed_registry(dir.path());
 
     let view = homes.projects_all(None).unwrap();
     assert_eq!(
@@ -512,8 +613,20 @@ fn merged_views_attribute_live_rows_and_localize_dead_homes() {
     assert!(ghost_block.records.is_empty(), "its rows are not invented");
     let beta = view.iter().find(|v| v.home_project == "beta").unwrap();
     assert_eq!(beta.records.len(), 1, "the other homes still read normally");
+    assert_eq!(beta.home_path, beta_path);
+    // The observation NEVER touched a home's store data (REQ-HOME-06 AC2).
+    let sa = Store::open_read_only(Path::new(&beta.home_path)).unwrap();
+    assert_eq!(sa.list_tasks().unwrap().len(), 1);
+}
 
-    // tasks: live reads, attribution per block, snapshot stamped once.
+/// REQ-HOME-04 AC2/AC3: live task reads, attribution per block, one honest
+/// snapshot timestamp per observation, single-home filter, and a typed
+/// refusal when the filter names a switched-off home.
+#[test]
+fn merged_task_view_keeps_same_titles_distinct_and_filters_one_home() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut homes, beta_path, _) = mixed_registry(dir.path());
+
     let tv = homes.tasks_all(None).unwrap();
     let same_titles: Vec<_> = tv
         .iter()
@@ -524,7 +637,7 @@ fn merged_views_attribute_live_rows_and_localize_dead_homes() {
                 .map(move |t| (b.home_path.clone(), t.id))
         })
         .collect();
-    assert_eq!(same_titles.len(), 2);
+    assert_eq!(same_titles.len(), 2, "two homes carry one such task each");
     assert_ne!(
         same_titles[0].0, same_titles[1].0,
         "distinct homes, distinct rows"
@@ -535,19 +648,38 @@ fn merged_views_attribute_live_rows_and_localize_dead_homes() {
     );
 
     // Single-home filter (REQ-HOME-04 AC2: default all, on request one).
-    let one = homes.tasks_all(Some(&beta.home_path)).unwrap();
+    let one = homes.tasks_all(Some(&beta_path)).unwrap();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].home_project, "beta");
 
-    // The observation NEVER touched any home's store data: user_version
-    // and row counts stay exactly as the seeders left them (REQ-HOME-06 AC2,
-    // REQ-HOME-09).
-    let sa = Store::open_read_only(Path::new(&beta.home_path)).unwrap();
-    assert_eq!(sa.list_tasks().unwrap().len(), 1);
+    // A disabled home cannot answer the filter — typed refusal, not silence.
+    homes.set_enabled(&beta_path, false).unwrap();
+    let e = homes.tasks_all(Some(&beta_path)).unwrap_err();
+    assert_eq!(e.code().0, "not_found");
+}
 
-    // REQ-HOME-07 AC4: the path returns — the SAME registry record reads
-    // the home again, with no re-add action by the operator.
-    seed_home(&ghost, "ghosty", &["was here", "and here"]);
+/// REQ-HOME-07 AC4: the path returns — the SAME registry record reads the
+/// home again, with no re-add action by the operator.
+#[test]
+fn a_returning_home_reads_again_without_a_re_add() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (mut homes, _, ghost_path) = mixed_registry(dir.path());
+    assert!(
+        !homes
+            .records()
+            .unwrap()
+            .iter()
+            .find(|r| r.path == ghost_path)
+            .unwrap()
+            .available,
+        "the ghost home starts unavailable"
+    );
+
+    seed_home(
+        &dir.path().join("ghost"),
+        "ghosty",
+        &["was here", "and here"],
+    );
     let back = homes.records().unwrap();
     let g = back.iter().find(|r| r.path == ghost_path).unwrap();
     assert!(
@@ -557,12 +689,6 @@ fn merged_views_attribute_live_rows_and_localize_dead_homes() {
     let tv2 = homes.tasks_all(None).unwrap();
     let g2 = tv2.iter().find(|b| b.home_path == ghost_path).unwrap();
     assert_eq!(g2.records.len(), 2, "returned home reads live again");
-
-    // A disabled home cannot answer the filter — typed refusal, not silence.
-    let bpath = beta.home_path.clone();
-    homes.set_enabled(&bpath, false).unwrap();
-    let e = homes.tasks_all(Some(&bpath)).unwrap_err();
-    assert_eq!(e.code().0, "not_found");
 }
 
 /// rl/idempotency, process-level (R4 quality return): the RMW window is
@@ -595,28 +721,38 @@ fn registry_writes_from_two_processes_never_lose_records() {
 
     let mut first = spawn_writer("a", &control, &root);
     let mut second = spawn_writer("b", &control, &root);
-
-    // (1) Hold the lock, release the children into their loops, then look:
-    // a child that committed during the hold was not serialized by it.
-    let gate = hold_registry_lock(&control);
-    std::fs::write(root.join(GO_FILE), b"go").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(HOLD_MS));
-    let parked = load(&control).entries().len();
-    drop(gate);
-    assert_eq!(
-        parked,
-        0,
-        "{parked} record(s) landed while another process held {} — the write \
-         window is not exclusive across processes",
-        devai_api::HOMES_LOCK_FILE
-    );
-
+    let parked = release_under_the_lock(&control, &root);
     let (ok1, log1) = collect(&mut first);
     let (ok2, log2) = collect(&mut second);
     let logs = format!("--- writer a ---\n{log1}\n--- writer b ---\n{log2}");
     assert!(ok1 && ok2, "a registry writer process died:\n{logs}");
+    assert!(
+        parked == 0,
+        "{parked} record(s) landed while another process held {} — the write \
+         window is not exclusive across processes",
+        devai_api::HOMES_LOCK_FILE
+    );
+    assert_nothing_lost_and_one_active(&control, &logs);
+}
 
-    let mut on_disk = load(&control);
+/// Fact (1): hold the registry lock like a competing writer, release the
+/// children into their loops, and report how many records landed during the
+/// hold. Only a cross-process lock makes that number zero.
+#[cfg(unix)]
+fn release_under_the_lock(control: &Path, root: &Path) -> usize {
+    let gate = hold_registry_lock(control);
+    std::fs::write(root.join(GO_FILE), b"go").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(HOLD_MS));
+    let parked = load(control).entries().len();
+    drop(gate);
+    parked
+}
+
+/// Fact (2): after the race every home is recorded once and exactly one
+/// record carries the active mark.
+#[cfg(unix)]
+fn assert_nothing_lost_and_one_active(control: &Path, logs: &str) {
+    let mut on_disk = load(control);
     let recs = on_disk.records().unwrap();
     assert_eq!(
         recs.len(),

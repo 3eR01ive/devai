@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use devai_api::{Api, ApiError, ApiResult, DB_FILE_NAME, HOME_DIR_NAME, Homes};
+use devai_api::{Api, ApiError, ApiResult, DB_FILE_NAME, HOME_DIR_NAME, Homes, LaunchResolution};
 use serde::Serialize;
 
 /// A resolved launch home for the GUI window. REQ-HOME-02 keeps the CHAIN
@@ -210,6 +210,20 @@ pub struct SessionInfo {
     pub degraded_from: Option<HomeFailure>,
 }
 
+/// Fields of the `session_info` wire shape (R5 quality return): the title
+/// bar facts are a contract like every domain record — described once,
+/// pinned in `tests/fixtures/ipc_shapes.json` and mirrored by
+/// `frontend/src/types.ts`. `session_info` and `homes_activate` both return
+/// this object, so the shape cannot drift between the two commands.
+#[allow(dead_code)] // consumed by the IPC parity test (commands.rs)
+pub const SESSION_INFO_SCHEMA: &[(&str, &str)] = &[
+    ("home", "string"),
+    ("actor", "string"),
+    ("opened_at", "string"),
+    ("control_home", "string"),
+    ("degraded_from", "HomeFailure | null"),
+];
+
 /// Symlink-free equality key for a path the process was handed. A launch
 /// path may not exist yet, so the raw path is the honest fallback.
 fn canonical_path(path: &Path) -> PathBuf {
@@ -228,11 +242,13 @@ fn load_registry(control: &Path) -> Result<Homes, BootstrapError> {
 /// resolution (OQ-HOME-7) lives in the registry itself. A refusal to write
 /// the registry is a typed bootstrap error about the registry path, not
 /// about the launch home (which the operator did not fail to provide).
+/// The resolution also says whether THIS launch created the record — the
+/// only case where a missing store may be created (R4 quality return).
 fn register_launch(
     homes: &mut Homes,
     launch: &Path,
     env_set: bool,
-) -> Result<PathBuf, BootstrapError> {
+) -> Result<LaunchResolution, BootstrapError> {
     homes.bootstrap_launch(launch, env_set).map_err(|e| {
         let mut failure = registry_failure(homes.control_home(), &e);
         failure.message = format!(
@@ -262,9 +278,9 @@ fn open_home(home: &Path, actor: &str) -> ApiResult<Api> {
 /// state decision is its own unit, apart from registry resolution and from
 /// opening).
 enum ActiveDiskState {
-    /// The home may be opened: its store is on disk, OR this launch named
-    /// it through `$DEVAI_HOME` and may create it (REQ-HOME-02 first
-    /// launch), OR it IS the control home (created on first use).
+    /// The home may be opened: its store is on disk, OR this launch CREATED
+    /// its registry record and named it through `$DEVAI_HOME` (REQ-HOME-02
+    /// first launch), OR it IS the control home (created on first use).
     Openable,
     /// A registered home whose store is gone. NOT a first launch: opening
     /// it would resurrect an empty home and hide the real one behind a lie
@@ -272,19 +288,22 @@ enum ActiveDiskState {
     Gone(HomeFailure),
 }
 
+/// `registered_here` is the R4 distinction: only a record THIS launch
+/// created may be materialised as a fresh home — a home the registry already
+/// knew and that vanished from disk is `not on disk`, never a new empty home
+/// (REQ-HOME-02 AC1 / REQ-HOME-07).
 fn active_disk_state(
     launch: &Path,
     active: &Path,
     control: &Path,
     env_set: bool,
+    registered_here: bool,
 ) -> ActiveDiskState {
     let is = |a: &Path, b: &Path| canonical_path(a) == canonical_path(b);
     if active.join(DB_FILE_NAME).exists() || is(active, control) {
         return ActiveDiskState::Openable;
     }
-    // R2 quality return: a launch path that does not exist AT ALL is the
-    // first launch of that home and may be created (REQ-HOME-02).
-    if env_set && is(launch, active) && !active.exists() {
+    if registered_here && env_set && is(launch, active) && !active.exists() {
         return ActiveDiskState::Openable;
     }
     ActiveDiskState::Gone(gone_failure(active))
@@ -295,7 +314,10 @@ fn active_disk_state(
 /// different case from a path that vanished — creating a fresh empty store
 /// over either would hide the real data behind a clean session, so nothing is
 /// written and the registry record stays.
-fn gone_failure(active: &Path) -> HomeFailure {
+///
+/// ONE source for this verdict (R3 quality return): the session bootstrap and
+/// the UI's post-registry rebind both call it, so the tokens cannot drift.
+pub(crate) fn gone_failure(active: &Path) -> HomeFailure {
     let (code, state) = if active.is_dir() {
         (
             devai_api::codes::HOME_NO_STORE,
@@ -323,11 +345,19 @@ fn gone_failure(active: &Path) -> HomeFailure {
 fn open_active_or_control(
     homes: &Homes,
     launch: &Path,
-    active: &Path,
+    resolution: &LaunchResolution,
     actor: &str,
     env_set: bool,
 ) -> Result<(Api, Option<HomeFailure>), BootstrapError> {
-    let failure = match active_disk_state(launch, active, homes.control_home(), env_set) {
+    let active = resolution.active.as_path();
+    let state = active_disk_state(
+        launch,
+        active,
+        homes.control_home(),
+        env_set,
+        resolution.registered_here,
+    );
+    let failure = match state {
         ActiveDiskState::Openable => match open_home(active, actor) {
             Ok(api) => return Ok((api, None)),
             Err(error) => {
@@ -345,18 +375,30 @@ fn open_active_or_control(
         },
         ActiveDiskState::Gone(failure) => failure,
     };
-    let fallback_handle = open_home(homes.control_home(), actor).map_err(|e| {
-        let control = HomeFailure::from_open(homes.control_home(), &e);
+    let fallback = degrade_to_control(homes.control_home(), &failure, actor)?;
+    Ok((fallback, Some(failure)))
+}
+
+/// The last resort of a session whose active home cannot be observed: the
+/// control home's handle. Only a refusal of the CONTROL home itself is a
+/// startup error — it has nowhere left to degrade to — and it names both
+/// causes.
+fn degrade_to_control(
+    control: &Path,
+    active_failure: &HomeFailure,
+    actor: &str,
+) -> Result<Api, BootstrapError> {
+    open_home(control, actor).map_err(|e| {
+        let control_failure = HomeFailure::from_open(control, &e);
         BootstrapError::new(
-            control.code,
-            homes.control_home(),
+            control_failure.code,
+            control,
             format!(
                 "{}; the active home could not be observed either: {}",
-                control.message, failure.message
+                control_failure.message, active_failure.message
             ),
         )
-    })?;
-    Ok((fallback_handle, Some(failure)))
+    })
 }
 
 impl Session {
@@ -393,9 +435,9 @@ impl Session {
         env_set: bool,
     ) -> Result<Session, BootstrapError> {
         let mut homes = load_registry(&control)?;
-        let active = register_launch(&mut homes, &launch, env_set)?;
+        let resolution = register_launch(&mut homes, &launch, env_set)?;
         let (api, degraded_from) =
-            open_active_or_control(&homes, &launch, &active, &actor, env_set)?;
+            open_active_or_control(&homes, &launch, &resolution, &actor, env_set)?;
         let info = SessionInfo {
             home: api.home().display().to_string(),
             actor: api.actor().to_string(),
@@ -532,6 +574,67 @@ mod tests {
         let projects = session.api.project_list().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "lagging");
+        // R1/R2 quality return: the v7 tasks table has no `human_name` and
+        // the fixture carries real rows — the task plane reads them (no
+        // missing-column failure), both through the session and through the
+        // merged home view.
+        let tasks = session.api.task_list().unwrap();
+        assert_eq!(tasks.len(), 2, "the lagging home's tasks are readable");
+        assert!(tasks.iter().all(|t| t.human_name.is_none()));
+        let mut view = session.homes.tasks_all(None).unwrap();
+        let block = view
+            .iter_mut()
+            .find(|b| b.available)
+            .expect("the enabled home answers");
+        assert_eq!(block.records.len(), 2);
+        assert!(block.error.is_none());
+    }
+
+    /// R4 quality return: creating a store is the FIRST registration's act.
+    /// A home the registry already recorded, whose folder vanished, is
+    /// `not on disk` even when `$DEVAI_HOME` names it — the bootstrap must
+    /// not materialise a fresh empty home over the record (REQ-HOME-02 AC1
+    /// vs REQ-HOME-07).
+    #[test]
+    fn a_recorded_home_that_vanished_is_not_recreated_by_an_env_launch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let control = dir.path().join("control");
+        let other = dir.path().join("other/.devai");
+        let vanished = dir.path().join("gone/.devai");
+        std::fs::create_dir_all(&control).unwrap();
+
+        let mut homes = Homes::load(&control).unwrap();
+        homes.bootstrap_launch(&other, true).unwrap();
+        std::fs::create_dir_all(&vanished).unwrap();
+        homes.bootstrap_launch(&vanished, false).unwrap();
+        std::fs::remove_dir_all(&vanished).unwrap();
+
+        // $DEVAI_HOME names the vanished home: env wins the ACTIVE marker,
+        // but the record predates this launch, so nothing may be created.
+        let session = Session::open_resolved(
+            vanished.clone(),
+            "tester".to_string(),
+            control.clone(),
+            true,
+        )
+        .expect("a vanished recorded home degrades the session, it is no startup death");
+
+        let failure = session
+            .info
+            .degraded_from
+            .as_ref()
+            .expect("the degrade is reported, not hidden");
+        assert_eq!(failure.code, devai_api::codes::HOME_UNAVAILABLE);
+        assert!(failure.home.ends_with("gone/.devai"));
+        assert!(
+            !vanished.exists(),
+            "the bootstrap created a home over a vanished registry record"
+        );
+        assert_eq!(
+            std::fs::canonicalize(session.api.home()).unwrap(),
+            std::fs::canonicalize(&control).unwrap(),
+            "observation falls back to the control home"
+        );
     }
 
     /// R5 (rel/error-context): the bootstrap boundary must not flatten the
