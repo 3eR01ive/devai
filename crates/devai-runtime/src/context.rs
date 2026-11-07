@@ -46,9 +46,8 @@
 //! is `workflow_events.seq` order (the store returns events ORDER BY seq),
 //! so assembly is deterministic and byte-stable for identical store state.
 
-use devai_core::types::{
-    ArtifactKind, ArtifactStatus, ExecutionStatus, Task, event_kind, json_field,
-};
+use devai_core::types::{Artifact, ExecutionStatus, Task, event_kind, json_field};
+use devai_core::vocab::CheckState;
 use devai_store::Store;
 use devai_store::config::ReworkPolicy;
 
@@ -192,63 +191,78 @@ pub fn rework_context(
 ///   a mangled block — maps to an explicit `Err(ReportShape)` "cannot
 ///   recognise", never to a silently empty or half-empty quote.
 fn quality_findings(store: &Store, task: &Task) -> Result<Option<String>, RuntimeError> {
+    // R2 (rework): ONE selection rule, shared with the presented report — a
+    // second hand-copied ladder is exactly how the panel and the prompt came
+    // to disagree on a STALE/SUPERSEDED pair.
     let artifacts = store.artifacts(task.id)?;
-    let Some(report) = artifacts
-        .iter()
-        .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
-        .max_by_key(|a| a.seq)
-    else {
+    let Some(report) = crate::human_view::present::select_report(&artifacts) else {
         return Ok(None);
     };
-    // Legacy dispatch on the stored ref BEFORE any body read.
+    // Legacy dispatch on the stored ref BEFORE any body read. A stale legacy
+    // body has no machine block to quote at all: honest nothing, not a fake.
     if !report.contract.as_ref().is_some_and(|c| c.version >= 3) {
         return Ok(None);
     }
-    let contract = report
+    let contract = contract_ref(report);
+    let status = report.status.as_str();
+    let doc = read_report_doc(store, report, &contract)?;
+    let lines = quoted_findings(&doc);
+    if lines.is_empty() {
+        // The stored document literally says nothing is failing (a human
+        // return against a green report): no empty findings sub-block is
+        // invented (R-008).
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "\n{}\n\n{}\n",
+        findings_header(&contract, report.seq, status),
+        lines.join("\n")
+    )))
+}
+
+/// `name@version` of the report as stored; the body name when no ref exists.
+fn contract_ref(report: &Artifact) -> String {
+    report
         .contract
         .as_ref()
         .map(|c| format!("{}@{}", c.name, c.version))
-        .unwrap_or_else(|| report.name.clone());
-    let body = store.read_artifact_body(&report)?;
-    // ONE pass over the whole document, through the very struct `assemble`
-    // emits — producer and consumer share one shape (R-003).
-    let doc: QualityReportDoc = serde_json::from_slice(&body).map_err(|e| {
+        .unwrap_or_else(|| report.name.clone())
+}
+
+/// The one typed read of the stored body: a single `from_slice` into the
+/// very struct `assemble` emits (producer and consumer share one shape,
+/// R-003). A mangled block is an explicit «cannot recognise», never an
+/// empty quote.
+fn read_report_doc(
+    store: &Store,
+    report: &Artifact,
+    contract: &str,
+) -> Result<QualityReportDoc, RuntimeError> {
+    let body = store.read_blob(&report.sha256)?;
+    serde_json::from_slice(&body).map_err(|e| {
         RuntimeError::ReportShape(format!(
-            "CURRENT {contract} report v{} is a body the typed quality-report model cannot recognise: {e}",
+            "{} {contract} report v{} is a body the typed quality-report model cannot recognise: {e}",
+            report.status.as_str(),
             report.seq
         ))
-    })?;
+    })
+}
 
-    // One line per item the stored document ALREADY says is failing, in
-    // stored order — pure quoting, selection only over stored categorical
-    // values (state strings, the stored red-line list).
+/// One line per item the stored document ALREADY says is failing, in stored
+/// order — pure quoting, selection only over stored categorical values
+/// (state strings, the stored red-line list). No predicate is re-run here.
+fn quoted_findings(doc: &QualityReportDoc) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    for g in &doc.evaluation.gates {
-        if g.state == ProbeState::Fail {
-            lines.push(if g.detail.is_empty() {
-                format!("- gate `{}`: FAIL", g.id)
-            } else {
-                format!("- gate `{}`: FAIL — {}", g.id, g.detail)
-            });
-        }
-    }
-    for c in &doc.evaluation.checks {
-        if c.state == "MECHANICAL_FAIL" {
-            let mut line = format!("- check `{}`: MECHANICAL_FAIL", c.id);
-            if let Some(s) = c.score {
-                line.push_str(&format!(" score {s:.2}"));
-            }
-            if !c.violations.is_empty() {
-                line.push_str(&format!(" — violations: {}", c.violations.join(" | ")));
-            }
-            lines.push(line);
-        }
-    }
+    lines.extend(failed_gates(doc));
+    lines.extend(mechanical_fails(doc));
     // The stored red-line list: assembled strings quoted verbatim; the
     // reader never compares score to floor itself.
-    for f in &doc.evaluation.floors_breached {
-        lines.push(format!("- {f}"));
-    }
+    lines.extend(
+        doc.evaluation
+            .floors_breached
+            .iter()
+            .map(|f| format!("- {f}")),
+    );
     if lines.is_empty() && doc.evaluation.verdict == "FAIL" {
         // FAIL with no per-item line is the S<theta case; §2.5 stored its
         // own explanation — quote it instead of recomputing the compare.
@@ -257,16 +271,61 @@ fn quality_findings(store: &Store, task: &Task) -> Result<Option<String>, Runtim
             doc.recommendation_basis
         ));
     }
-    if lines.is_empty() {
-        // The stored document literally says nothing is failing (a human
-        // return against a green report): no empty findings sub-block is
-        // invented (R-008).
-        return Ok(None);
-    }
+    lines
+}
 
-    Ok(Some(format!(
-        "\nQUALITY REPORT FINDINGS — failing / sub-threshold items of the CURRENT {contract} report v{seq}, quoted as stored:\n\n{}\n",
-        lines.join("\n"),
-        seq = report.seq,
-    )))
+/// The stored gate states that are FAIL, quoted with their stored detail.
+fn failed_gates(doc: &QualityReportDoc) -> Vec<String> {
+    doc.evaluation
+        .gates
+        .iter()
+        .filter(|g| g.state == ProbeState::Fail)
+        .map(|g| {
+            if g.detail.is_empty() {
+                format!("- gate `{}`: FAIL", g.id)
+            } else {
+                format!("- gate `{}`: FAIL — {}", g.id, g.detail)
+            }
+        })
+        .collect()
+}
+
+/// The checks the assembler stored as MECHANICAL_FAIL, with score and the
+/// stored violation bodies.
+fn mechanical_fails(doc: &QualityReportDoc) -> Vec<String> {
+    let mech_fail = CheckState::MechanicalFail.as_str();
+    doc.evaluation
+        .checks
+        .iter()
+        .filter(|c| c.state == mech_fail)
+        .map(|c| {
+            let mut line = format!("- check `{}`: {mech_fail}", c.id);
+            if let Some(s) = c.score {
+                line.push_str(&format!(" score {s:.2}"));
+            }
+            if !c.violations.is_empty() {
+                line.push_str(&format!(" — violations: {}", c.violations.join(" | ")));
+            }
+            line
+        })
+        .collect()
+}
+
+/// The header of the findings block: which stored report is quoted and
+/// whether it is the current one. Every non-CURRENT status is named by its
+/// own stored token — «устарел» is a fact, never a silent substitution.
+fn findings_header(contract: &str, seq: u32, status: &str) -> String {
+    let report = format!("{status} {contract} report v{seq}");
+    let lead = match status {
+        "CURRENT" => {
+            format!("failing / sub-threshold items of the CURRENT {report}, quoted as stored:")
+        }
+        "STALE" => format!(
+            "отчёт STALE: findings прошлого возврата — failing / sub-threshold items of the STALE {report} (это findings отклонённого возвратом отчёта, не решение по текущей ревизии), quoted as stored:"
+        ),
+        _ => format!(
+            "отчёт {status} (не текущий): failing / sub-threshold items of the {report} (это findings не-текущего отчёта, не решение по текущей ревизии), quoted as stored:"
+        ),
+    };
+    format!("QUALITY REPORT FINDINGS — {lead}")
 }

@@ -215,6 +215,7 @@ pre.content {
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
+
   max-height: 420px;
   margin: 8px 0;
 }
@@ -226,4 +227,71 @@ pre.content {
 }
 .spacer {
   flex: 1;
+}
+
+/* Human form of the quality report (REQ-QH-03/04/05): stored grouping is
+   laid out as written — loud staleness banner, group headings, one line per
+   point, code/proofs folded under the point. */
+.stale-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--orange);
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: rgba(243, 106, 22, 0.1);
+  color: var(--orange);
+  padding: 8px 12px;
+  margin-bottom: 10px;
+}
+.qr-headline {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: 14px;
+}
+.qr-group {
+  margin-top: 14px;
+}
+.qr-group-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--orange);
+}
+.qr-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.qr-items > li {
+  padding: 6px 0;
+  border-top: 1px solid var(--panel-border);
+}
+.qr-item-line {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.qr-id {
+  font-weight: 700;
+}
+.qr-importance {
+  color: var(--orange);
+}
+.qr-summary {
+  margin-top: 2px;
+}
+.qr-reason {
+  font-size: 12px;
+  margin-top: 2px;
+}
+.qr-evidence {
+  margin-top: 4px;
+}
+.qr-evidence summary {
+  cursor: pointer;
+  font-size: 12px;
 }

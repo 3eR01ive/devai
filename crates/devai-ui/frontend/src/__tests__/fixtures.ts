@@ -88,6 +88,11 @@ export function report(overrides: Partial<QualityReportView> = {}): QualityRepor
     contract: "quality-report@1",
     created_at: "2026-11-06T11:00:00Z",
     execution: null,
+    // @5: статус строки, источник человеческой формы и факт свежести —
+    // фикстура изображает свежий CURRENT-отчёт с плоским текстом.
+    status: "CURRENT",
+    source: "flat_text",
+    freshness: null,
     report: { score: 0.7 },
     report_text: "человеческий отчёт качества",
     ...overrides,

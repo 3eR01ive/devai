@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
+use devai_runtime::human_view::present::{self, PresentedReport, ReportFreshness};
 use devai_runtime::{Engine, Gate, RunReport, liveness};
 use devai_store::{ArtifactDraft, StoreError, bundle, guess_media_type, seed};
 use uuid::Uuid;
@@ -213,8 +214,14 @@ pub struct RunOutcome {
     pub report: RunReport,
     /// The CURRENT quality report row (the `ReportFresh` gate names it).
     pub current_quality_report: Option<Artifact>,
-    /// The stored §2.6 rendering shown at the human gates, when present.
+    /// The rendered quality report shown at the human gates, when present:
+    /// the stored human form for quality-report@5 bodies, the legacy flat
+    /// `report_text` for pre-@5 bodies (a damaged form renders an explicit
+    /// marker, never silence).
     pub gate_report_text: Option<String>,
+    /// REQ-QH-05: whether the report shown at the gate is still the last
+    /// word — the marker names the task phase and the re-audit execution.
+    pub gate_report_freshness: Option<ReportFreshness>,
     /// REQ-HP-05: the human paragraphs the gate presents FIRST, before any
     /// formal structure — `(artifact label, stored paragraph)` pairs read
     /// verbatim from the CURRENT artifacts' bodies (REQ-HP-07: the gate
@@ -629,8 +636,8 @@ impl Api {
                 workflow::reject_requirements(t, rationale.as_deref(), &self.actor, Utc::now())
             }),
             WorkflowOp::Accept { rationale } => self.op_accept(id, rationale),
-            WorkflowOp::Return { rationale } => self.run_op(id, move |t, _a| {
-                workflow::return_to_rework(t, rationale.as_deref(), &self.actor, Utc::now())
+            WorkflowOp::Return { rationale } => self.run_op(id, move |t, a| {
+                workflow::return_to_rework(t, a, rationale.as_deref(), &self.actor, Utc::now())
             }),
             WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| {
                 workflow::pause(t, reason.as_deref(), &self.actor, Utc::now())
@@ -814,16 +821,59 @@ impl Api {
             engine = engine.with_workspace(w);
         }
         let report = engine.advance(&req.id, &req.agent, &self.actor)?;
-        // The gate renderings read the CURRENT quality report — the same
-        // status-only selection (REQ-005) the old handler performed.
-        let (current_quality_report, gate_report_text) =
-            self.gate_reporting(report.task_id, report.gate)?;
-        let gate_human_paragraphs = self.gate_paragraphs(report.task_id, report.gate)?;
+        // The gate renderings read the presented quality report — the same
+        // status-aware selection (REQ-005, REQ-QH-05/06) the UI panel uses:
+        // the stored human form when present, the §2.6 text otherwise, plus
+        // the freshness marker when the report is no longer the last word.
+        let presented = match report.gate {
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                self.presented_quality_report(report.task_id)?
+            }
+            _ => None,
+        };
+        let gate_report_text = presented.as_ref().map(|p| p.text.clone());
+        let gate_report_freshness = presented.map(|p| p.freshness);
+        let current_quality_report = match report.gate {
+            Gate::ReportFresh => self.store.artifacts(report.task_id)?.into_iter().find(|x| {
+                x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
+            }),
+            _ => None,
+        };
+        // REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
+        // presentation — approval/review reads spec + review, acceptance
+        // reads the implementation-report. Stored fields, verbatim; absence
+        // (a legacy @1/@2 CURRENT, a non-JSON body) renders as NO paragraph,
+        // never as a broken gate (REQ-HP-06 non-retroactivity in the render
+        // half too).
+        let mut gate_human_paragraphs: Vec<(String, String)> = Vec::new();
+        match report.gate {
+            Gate::WaitingApproval => {
+                for (kind, label) in [
+                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
+                    (ArtifactKind::ReviewReport, "review-report"),
+                ] {
+                    if let Some(p) = self.stored_human_paragraph(report.task_id, kind, label)? {
+                        gate_human_paragraphs.push(p);
+                    }
+                }
+            }
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                if let Some(p) = self.stored_human_paragraph(
+                    report.task_id,
+                    ArtifactKind::ImplementationReport,
+                    "implementation-report",
+                )? {
+                    gate_human_paragraphs.push(p);
+                }
+            }
+            _ => {}
+        }
         let t = self.store.get_task(&report.task_id.to_string())?;
         Ok(RunOutcome {
             report,
             current_quality_report,
             gate_report_text,
+            gate_report_freshness,
             gate_human_paragraphs,
             allowed_operations: workflow::allowed_ops(&t)
                 .into_iter()
@@ -1957,32 +2007,82 @@ impl Api {
         Ok(Some((format!("{label} v{}", a.seq), paragraph.to_string())))
     }
 
-    /// The §2.6 rendering of the CURRENT quality report, when one is
-    /// present (the human gate's viewing channel; reports assembled before
-    /// @2 render the placeholder the old CLI printed). `Ok(None)` is the
-    /// honest «no CURRENT quality report»; a store failure or an unreadable
-    /// (non-JSON) blob propagates as `Err` with its machine code — never a
-    /// silent «absence» (QA R2: `.ok()?` swallowed corrupt data into None,
-    /// indistinguishable from «no report»).
+    /// The rendered quality report shown at the human gates, when one is
+    /// present (the gate's viewing channel). `Ok(None)` is the honest «no
+    /// quality report»; a store failure or a body that is not JSON at all
+    /// propagates as `Err` with its machine code — never a silent «absence».
+    ///
+    /// REQ-QH-05/06: the rendering (stored human form, legacy flat text, or
+    /// the damaged-form marker) and the freshness fact both come from
+    /// `human_view::present` — raw rows in, stored fields out. When the shown
+    /// report is no longer the last word (rework in flight, or the selected
+    /// row is not CURRENT), the freshness marker is prepended so an outdated
+    /// report never reads as the decision.
     pub fn quality_report_text(&self, task_id: Id) -> ApiResult<Option<String>> {
-        let arts = self.store.artifacts(task_id)?;
-        // REQ-005: status-only selection (single CURRENT pinned at v3).
-        let Some(a) = arts
-            .iter()
-            .find(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
-        else {
+        Ok(self
+            .presented_quality_report(task_id)?
+            .map(|p| p.text_with_freshness()))
+    }
+
+    /// The presented report plus its freshness verdict — the same single
+    /// read the CLI gates and the UI panel consume. Thin on purpose: the
+    /// row selection, the rendering and the freshness marker live in
+    /// `devai_runtime::human_view::present`.
+    pub fn presented_quality_report(&self, task_id: Id) -> ApiResult<Option<PresentedReport>> {
+        let task = self.store.get_task(&task_id.to_string())?;
+        Ok(self.presented_quality(&task)?.map(|p| p.presented))
+    }
+
+    /// REQ-QH-06 / rework R2/R4: the ONE presentation pipeline. Both public
+    /// readers (`presented_quality_report` for the gates, `task_report` for
+    /// the UI) call this, so row selection, blob read, rendering, the
+    /// distinguishable render source and the freshness fact can never drift
+    /// between two hand-copied paths.
+    ///
+    /// `Ok(None)` is the honest «no quality report»; a blob that does not
+    /// parse as JSON is a TYPED outcome of its own (`RenderSource::CorruptBody`
+    /// with a marker naming the damaged artifact), never an empty success and
+    /// never accidentally equal to «QA has not run».
+    pub(crate) fn presented_quality(&self, task: &Task) -> ApiResult<Option<PresentedQuality>> {
+        let arts = self.store.artifacts(task.id)?;
+        let Some(a) = present::select_report(&arts) else {
             return Ok(None);
         };
-        let blob = self.store.read_artifact_body(a)?;
-        let v: serde_json::Value = serde_json::from_slice(&blob).map_err(|e| ApiError::refused("corrupt", format!(
-            "the CURRENT quality report {} is stored but does not parse as JSON: {e} (re-publish the report; the gate cannot render a corrupt blob as «no report»)",
-            short_id(&a.id)
-        )))?;
-        Ok(v.get("report_text")
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| Some("(report assembled before @2 — no rendering)".into())))
+        let blob = self.store.read_blob(&a.sha256)?;
+        let execs = self.store.list_executions(Some(task.id))?;
+        let events = self.store.events(task.id, None)?;
+        let cause = present::stale_cause(&events, a.id);
+        let freshness = present::freshness(task, a, &execs, cause.as_ref());
+        let (body, text, source) = match serde_json::from_slice::<serde_json::Value>(&blob) {
+            Ok(body) => {
+                let rendered = present::render_stored_report(&body);
+                (body, rendered.text, rendered.source)
+            }
+            Err(e) => (
+                serde_json::Value::Null,
+                present::corrupt_body_text(&short_id(&a.id), &e.to_string()),
+                devai_runtime::human_view::present::RenderSource::CorruptBody,
+            ),
+        };
+        Ok(Some(PresentedQuality {
+            artifact: a.clone(),
+            body,
+            presented: PresentedReport {
+                text,
+                source,
+                freshness,
+            },
+        }))
     }
+}
+
+/// Everything the two presentation readers need from ONE store read: the
+/// artifact row that is shown, the parsed machine body, and the presented
+/// text plus its freshness verdict.
+pub(crate) struct PresentedQuality {
+    pub artifact: Artifact,
+    pub body: serde_json::Value,
+    pub presented: PresentedReport,
 }
 
 // ---------------------------------------------------------------------------
@@ -2476,9 +2576,398 @@ mod tests {
         );
     }
 
-    /// QA R2: `quality_report_text` distinguishes «no report» (Ok(None))
-    /// from «report unreadable» (Err with a machine code). A corrupt CURRENT
-    /// blob must never be silently rendered as absence of a report.
+    /// Rework R7: the API tests build the quality report through the REAL
+    /// assembly pipeline (`evaluation::assemble` → `human_view::build`), not
+    /// through a hand-written JSON form. A hand-built form hid the
+    /// producer/consumer dictionary mismatch (MECHANICAL_PASS was emitted on
+    /// every passed mechanical check but unknown to the form parser), because
+    /// the fixture simply never contained one.
+    const FORM_PROFILE_YAML: &str = r#"
+version: 1
+project: formtest
+applies_to_roles: [quality-auditor]
+error_types:
+  correctness/state-transition: { desc: d, severity: catastrophic }
+  process/untested-branch: { desc: d, severity: minor }
+gates: []
+evaluations:
+  - id: correctness
+    title: T
+    checks:
+      - id: mech/pass
+        statement: mechanical probe passes
+        detects: [process/untested-branch]
+        verify: mechanical
+        anchors: { "1.0": ok }
+        reviewer: tool
+      - id: corr/floor
+        statement: state transition is checked
+        detects: [correctness/state-transition]
+        verify: rubric
+        anchors: { "1.0": ok, "0.4": mid, "0.0": bad }
+        reviewer: either
+      - id: cl/y
+        statement: style drift
+        detects: [process/untested-branch]
+        verify: rubric
+        anchors: { "1.0": ok }
+        reviewer: either
+scoring:
+  theta: 0.8
+  floors: { catastrophic: 0.7, major: 0.4, minor: null }
+  blocked_policy: { max_blocked_weight: 0.2 }
+  weights:
+    mech/pass: 0.10
+    corr/floor: 0.20
+    cl/y: 0.10
+"#;
+
+    /// One quality-report document produced by the platform's own assembler:
+    /// a passed MECHANICAL check, a breached floor and a nuance, each with a
+    /// stored one-line summary and a collapsed evidence layer.
+    fn assembled_report_doc() -> serde_json::Value {
+        devai_runtime::evaluation::assemble(
+            &form_profile(),
+            &form_eval_run(),
+            &form_assessment(),
+            "ex-form",
+            &unbound_revision(),
+            &std::collections::BTreeMap::new(),
+        )
+        .json
+    }
+
+    fn form_profile() -> devai_store::config::Profile {
+        serde_yaml::from_str(FORM_PROFILE_YAML).expect("form fixture profile parses")
+    }
+
+    /// The mechanical probe results the assembler consumes: one passed check.
+    fn form_eval_run() -> devai_runtime::evaluation::EvalRun {
+        let mut mech = std::collections::HashMap::new();
+        mech.insert(
+            "mech/pass".to_string(),
+            devai_runtime::evaluation::ProbeOutcome {
+                state: devai_runtime::evaluation::ProbeState::Pass,
+                detail: "cargo test: 12 passed".into(),
+                output: "12 passed".into(),
+            },
+        );
+        devai_runtime::evaluation::EvalRun {
+            gates: vec![],
+            mech,
+            hybrid: std::collections::HashMap::new(),
+            evidence_text: String::new(),
+        }
+    }
+
+    /// The auditor's assessment answer: one breached floor and one nuance.
+    fn form_assessment() -> serde_json::Value {
+        serde_json::json!({
+            "scores": { "corr/floor": 0.4, "cl/y": 0.9 },
+            "findings": [{
+                "check": "corr/floor",
+                "text": "the guard is missing at src/a.rs:7",
+                "evidence": ["fn step() { unchecked() }"]
+            }]
+        })
+    }
+
+    fn unbound_revision() -> WorkspaceRevision {
+        WorkspaceRevision {
+            git_head: None,
+            dirty_digest: None,
+            profile: None,
+            roles: vec![],
+        }
+    }
+
+    /// Publish the assembler-produced @5 document and return its artifact row.
+    fn publish_form_report(api: &Api, t: Id) -> Artifact {
+        api.artifact_publish_row(PublishReq {
+            id: t.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: serde_json::to_vec(&assembled_report_doc()).unwrap(),
+            depends: vec![],
+            contract: Some("quality-report@5".into()),
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap()
+        .artifact
+    }
+
+    /// The ratified return as the store records it: task → REWORK and the
+    /// rejected report CURRENT → STALE (OQ-QH-3, a data change).
+    fn return_to_rework_state(api: &Api, t: Id, artifact: Id) {
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let mut m = Mutation {
+            task: task.clone(),
+            events: vec![],
+            artifact_status: vec![(artifact, ArtifactStatus::Stale)],
+            questions: vec![],
+        };
+        m.task.state = TaskState::Rework;
+        api.store.commit(task.lock_version, &m).unwrap();
+    }
+
+    /// One auditor execution row in the shape the freshness fact reads. The
+    /// row is left RUNNING; a caller that needs a finished run closes it with
+    /// `finish_execution`.
+    fn auditor_exec(task_id: Id, started: Timestamp) -> RoleExecution {
+        RoleExecution {
+            id: new_id(),
+            task_id,
+            role_slug: present::AUDITOR_ROLE.into(),
+            role_version: 1,
+            agent_name: None,
+            status: ExecutionStatus::Running,
+            inputs: vec![],
+            summary: None,
+            error: None,
+            started_at: started,
+            finished_at: None,
+            workspace_revision: None,
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
+            owner_pid: None,
+            owner_host: None,
+            owner_process_start: None,
+        }
+    }
+
+    /// REQ-QH-01/06: the panel quotes the STORED human form (it never
+    /// re-assembles one), and the UI view is the same read — same text,
+    /// same source token.
+    #[test]
+    fn the_stored_human_form_is_what_both_channels_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "form-presentation");
+        publish_form_report(&api, t);
+
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(p.source, present::RenderSource::HumanForm);
+        assert!(
+            p.text.contains("БЬЁТ ПО ВЕРДИКТУ") && p.text.contains("важность 0.120"),
+            "the stored form is rendered, grouped by decision weight: {}",
+            p.text
+        );
+        // R7/R5 + R4 (decision of 07.11): the passed mechanical check comes
+        // through the real producer and is NOT an «unknown state» hole; a 1.0
+        // with no decision link is the norm, so it is counted, not listed.
+        assert!(!p.text.contains("mech/pass"), "{}", p.text);
+        assert!(p.text.contains("пройдено без замечаний: 1"), "{}", p.text);
+        assert!(!p.text.contains("не распознано"), "{}", p.text);
+        assert!(
+            !p.text.contains("RAW-FLAT-TEXT-MARKER"),
+            "the flat text is the fallback, not the channel, for @5 bodies"
+        );
+        assert!(!p.freshness.stale);
+        assert_eq!(p.freshness.report_status, "CURRENT");
+
+        let view = api.task_report(&t.to_string()).unwrap();
+        assert_eq!(view.report_text.as_deref(), Some(p.text.as_str()));
+        assert_eq!(view.source, "human_form");
+    }
+
+    /// REQ-QH-06 fallback: a pre-@5 body still renders its own stored text,
+    /// byte for byte — no form is invented for it.
+    #[test]
+    fn a_legacy_body_still_renders_its_own_flat_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "legacy");
+        api.artifact_publish_row(PublishReq {
+            id: t.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: br#"{"report_text":"LEGACY-FLAT-TEXT"}"#.to_vec(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap();
+        assert_eq!(
+            api.quality_report_text(t).unwrap().as_deref(),
+            Some("LEGACY-FLAT-TEXT")
+        );
+        assert_eq!(
+            api.presented_quality_report(t).unwrap().unwrap().source,
+            present::RenderSource::FlatText
+        );
+    }
+
+    /// REQ-QH-05: after a return the stored report is announced as stale —
+    /// with the task phase and the stored status — instead of being shown as
+    /// the decision; both channels carry the same fact.
+    #[test]
+    fn rework_announces_the_stored_report_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "rework-stale");
+        let artifact = publish_form_report(&api, t);
+        return_to_rework_state(&api, t, artifact.id);
+
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert!(p.freshness.stale);
+        assert_eq!(p.freshness.report_status, "STALE");
+        assert_eq!(p.freshness.task_state, "REWORK");
+        let text = api.quality_report_text(t).unwrap().unwrap();
+        assert_eq!(
+            text.lines().next().unwrap_or(""),
+            "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит ещё не запущен",
+            "the full formulation is pinned: no execution exists, so none is named"
+        );
+        assert!(text.contains("НЕ текущее решение"), "{text}");
+        assert!(
+            text.contains("БЬЁТ ПО ВЕРДИКТУ"),
+            "the stored form is still readable: {text}"
+        );
+
+        let view = api.task_report(&t.to_string()).unwrap();
+        assert_eq!(view.status, "STALE");
+        assert!(view.freshness.expect("freshness is part of the view").stale);
+    }
+
+    /// Fixture for the freshness facts below: publish a form report, then
+    /// return the task to rework after a COMPLETED auditor run that produced
+    /// that very report. Returns the completed run.
+    fn completed_audit_then_rework(api: &Api, t: Id) -> RoleExecution {
+        let artifact = publish_form_report(api, t);
+        let started = chrono::DateTime::parse_from_rfc3339("2026-11-06T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let done = auditor_exec(t, started);
+        api.store.start_execution(&done).unwrap();
+        api.store
+            .finish_execution(
+                &done,
+                ExecutionStatus::Completed,
+                Some("report published"),
+                None,
+                started + chrono::Duration::minutes(5),
+            )
+            .unwrap();
+        return_to_rework_state(api, t, artifact.id);
+        done
+    }
+
+    /// The first line of the CLI text channel — the freshness marker.
+    fn reported_marker(api: &Api, t: Id) -> String {
+        api.quality_report_text(t)
+            .unwrap()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// R1/R5: the freshness marker names the STORE fact. A return whose last
+    /// auditor run is the COMPLETED one that produced the report is NOT an
+    /// unfinished re-audit (the old code invented one).
+    #[test]
+    fn a_completed_auditor_run_is_not_an_unfinished_reaudit() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "freshness-completed");
+        let done = completed_audit_then_rework(&api, t);
+
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(
+            p.freshness.marker,
+            format!(
+                "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: новый прогон аудитора не идёт; последний прогон {} COMPLETED 2026-11-06 10:05:00Z",
+                short_id(&done.id)
+            ),
+            "the completed run that produced the report is not an unfinished re-audit, and no cause is claimed without a staled event"
+        );
+        assert!(!p.freshness.marker.contains("в работе"));
+        assert!(!p.freshness.marker.contains("не завершён"));
+        // The text channel carries the same full marker, not a summary.
+        assert_eq!(reported_marker(&api, t), p.freshness.marker);
+    }
+
+    /// …and a real return records its cause as a workflow event
+    /// (`artifacts.staled` with `cause`), which the marker then repeats: the
+    /// cause is READ from the store, not reconstructed at presentation time.
+    #[test]
+    fn the_stale_marker_repeats_the_recorded_stale_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "freshness-cause");
+        publish_form_report(&api, t);
+
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let mut open = Mutation {
+            task: task.clone(),
+            events: vec![],
+            artifact_status: vec![],
+            questions: vec![],
+        };
+        open.task.state = TaskState::Qa;
+        api.store.commit(task.lock_version, &open).unwrap();
+
+        let task = api.store.get_task(&t.to_string()).unwrap();
+        let arts = api.store.artifacts(t).unwrap();
+        let returned = workflow::return_to_rework(
+            &task,
+            &arts,
+            Some("ещё раз, с тестами"),
+            "guerrero",
+            Utc::now(),
+        )
+        .unwrap();
+        api.store.commit(task.lock_version, &returned).unwrap();
+
+        let marker = reported_marker(&api, t);
+        assert!(
+            marker.contains("отчёт возвращён человеком на реворк (guerrero)"),
+            "the recorded cause is repeated: {marker}"
+        );
+        assert!(
+            !marker.contains("возврат без ре-аудита"),
+            "no cause is invented alongside the recorded one: {marker}"
+        );
+    }
+
+    /// …and only a live RUNNING row earns «в работе»: the marker then names
+    /// that execution and its own stored status.
+    #[test]
+    fn in_work_is_claimed_only_with_a_live_audit_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "freshness-running");
+        let artifact = publish_form_report(&api, t);
+        return_to_rework_state(&api, t, artifact.id);
+
+        let running = auditor_exec(t, Utc::now());
+        api.store.start_execution(&running).unwrap();
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(
+            p.freshness.marker,
+            format!(
+                "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: готовится ре-аудит (execution {}, в работе)",
+                short_id(&running.id)
+            )
+        );
+        assert_eq!(
+            p.freshness.execution_status.as_deref(),
+            Some("RUNNING"),
+            "the view names the live execution, not a finished one"
+        );
+    }
+
+    /// QA R2 / rework R4: «no report» (Ok(None)), «damaged form» and «the blob
+    /// is not JSON at all» are three DISTINGUISHABLE outcomes. A corrupt
+    /// CURRENT blob is presented with a marker naming the artifact and a
+    /// distinct render source — never as absence of a report and never as the
+    /// generic «assembled before @2» placeholder.
     #[test]
     fn quality_report_text_distinguishes_absence_from_corruption() {
         let dir = tempfile::tempdir().unwrap();
@@ -2509,15 +2998,60 @@ mod tests {
         );
 
         // Corrupt the stored blob under the CURRENT row: the next read must
-        // fail loudly, not fall through to None.
+        // say so, not fall through to «no report» and not show the
+        // pre-@2 placeholder.
         std::fs::write(
             api.store.blob_path(&row.artifact.sha256),
             b"not-json-at-all",
         )
         .unwrap();
-        let e = api.quality_report_text(t).unwrap_err();
-        assert_eq!(e.code(), ErrorCode("corrupt"));
-        assert!(format!("{e}").contains("does not parse as JSON"), "{e}");
+        let p = api.presented_quality_report(t).unwrap().unwrap();
+        assert_eq!(p.source, present::RenderSource::CorruptBody);
+        assert!(p.text.contains("повреждён"), "{}", p.text);
+        assert!(!p.text.contains("before @2"), "{}", p.text);
+        let view = api.task_report(&t.to_string()).unwrap();
+        assert_eq!(view.source, "corrupt_body");
+        assert!(
+            view.report_text.unwrap_or_default().contains("повреждён"),
+            "the UI view carries the same marker"
+        );
+    }
+
+    /// R3: a structurally damaged `human_view` (a valid JSON body whose form
+    /// does not deserialize) is ANNOUNCED. The flat text may still be shown,
+    /// but never silently as if it were the stored form.
+    #[test]
+    fn a_damaged_human_view_is_announced_not_silently_flattened() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let t = fresh_task(&api, "damaged-form");
+        let body = serde_json::json!({
+            "verdict": "RETURN",
+            "recommendation_basis": "красные линии: x",
+            "report_text": "FLAT-BODY-STILL-HERE",
+            "human_view": { "version": "not-a-number", "headline": 42 },
+            "profile": { "project": "p", "version": 1 },
+            "evaluation": { "verdict": "FAIL", "score": 0.5, "theta": 0.8, "gates": [], "checks": [] },
+        });
+        api.artifact_publish_row(PublishReq {
+            id: t.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: serde_json::to_vec(&body).unwrap(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap();
+
+        let text = api.quality_report_text(t).unwrap().unwrap();
+        assert!(
+            text.contains("форма отчёта повреждена"),
+            "the damaged form must be announced: {text}"
+        );
+        assert!(text.contains("FLAT-BODY-STILL-HERE"), "{text}");
     }
 
     /// REQ-MUT-03/04 + human Q2: `Api::open` is the only bootstrap entry —

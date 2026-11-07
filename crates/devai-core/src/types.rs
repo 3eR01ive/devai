@@ -26,6 +26,16 @@ pub fn new_id() -> Id {
 /// `resolve_task` still fails loudly on any genuine ambiguity.
 pub const ID_PREFIX_CHARS: usize = 13;
 
+/// Contract versions the PLATFORM owns, declared ONCE (rework R3): the
+/// runtime assembles/publishes under these versions, the seeded schemas are
+/// keyed by them, and the store-side prompt text formats them instead of
+/// spelling a literal. A bump here is the only place a version changes.
+pub const QUALITY_REPORT_CONTRACT: (&str, u32) = ("quality-report", 5);
+
+/// The shape the QA agent actually answers in; the platform assembles the
+/// quality report from it afterwards.
+pub const ASSESSMENT_CONTRACT: (&str, u32) = ("evaluation-assessment", 1);
+
 /// Typed accessor for the canonical short display of an id. Taking `&Uuid`
 /// (not a `&str`) guarantees the canonical 36-char `to_string` form, so the
 /// byte slice below is always inside an ASCII boundary — no length check at
@@ -733,6 +743,23 @@ pub mod failure_class {
     /// Never replayed to the role (REQ-FG-03 AC2) — the role is not guilty
     /// of a shape the platform assembled.
     pub const PLATFORM: &str = "platform";
+}
+
+/// The closed vocabulary of the `cause` token on `artifacts.staled` events —
+/// WHY an artifact stopped being CURRENT. The workflow WRITES these strings
+/// and the report presentation READS them back to word its «устарел» marker,
+/// so the token text directly fixes what the operator is told: one literal on
+/// either side is how the marker silently stops naming the stored cause
+/// (rework R2, criterion arch/no-magic). Wire strings are frozen history —
+/// changing a value here changes the reading of already-stored events.
+pub mod stale_cause {
+    /// `workflow::return_to_rework` retired the quality report the human
+    /// rejected (ratified OQ-QH-3): the return is a DATA change, not only a
+    /// presentation one.
+    pub const REWORK_RETURN: &str = "rework: quality report returned by the human";
+    /// A requirements revision superseded the spec the result was built on;
+    /// the stale closure retired its downstream artifacts.
+    pub const REQUIREMENTS_REVISION: &str = "requirements revision";
 }
 
 // ---------------------------------------------------------------------------

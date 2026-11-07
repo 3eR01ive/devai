@@ -294,43 +294,35 @@ impl Api {
         }
     }
 
-    /// The CURRENT quality report the human signs at the QA gate — full
-    /// machine body plus the stored rendering (REQ-API-07: observable
-    /// outside the session that produced it).
+    /// The quality report the human signs at the QA gate — full machine body
+    /// plus the stored human rendering (REQ-API-07: observable outside the
+    /// session that produced it).
+    ///
+    /// REQ-QH-05/06: CURRENT is preferred, but when the task has been
+    /// returned to rework the rejected report is still SHOWN — with its
+    /// STALE status and a freshness marker naming the re-audit — instead of
+    /// a «QA has not run» lie or a stale text posing as the decision.
     pub fn task_report(&self, id_prefix: &str) -> ApiResult<QualityReportView> {
         let t = self.store.resolve_task(id_prefix)?;
-        let arts = self.store.artifacts(t.id)?;
-        self.quality_report_view(&t, &arts)
-    }
-
-    /// The report view over an already-read artifact slice: the ONE builder
-    /// of the presentation, shared by `task.report` and the wait section's
-    /// batch read (no per-row re-derivation of the same shape).
-    fn quality_report_view(&self, t: &Task, arts: &[Artifact]) -> ApiResult<QualityReportView> {
-        let a = arts
-            .iter()
-            .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current)
-            .ok_or_else(|| {
-                ApiError::Store(devai_store::StoreError::NotFound(
-                    "quality report".into(),
-                    format!(
-                        "task {} has no CURRENT quality report — QA has not run",
-                        short_hint(&t.id)
-                    ),
-                ))
-            })?;
-        let blob = self.store.read_artifact_body(a)?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&blob).unwrap_or(serde_json::Value::Null);
+        // ONE presentation pipeline (rework R2): row selection, blob read,
+        // rendering, corrupt-body outcome and the freshness fact all come from
+        // `presented_quality` — the same call the CLI gates use. The view can
+        // never describe a different store state than the gate text.
+        let Some(p) = self.presented_quality(&t)? else {
+            return Err(ApiError::Store(devai_store::StoreError::NotFound(
+                "quality report".into(),
+                format!(
+                    "task {} has no quality report yet — QA has not run",
+                    short_hint(&t.id)
+                ),
+            )));
+        };
+        let a = &p.artifact;
         let contract = a
             .contract
             .as_ref()
             .map(|c| format!("{}@{}", c.name, c.version))
             .unwrap_or_else(|| "—".into());
-        let report_text = value
-            .get("report_text")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
         Ok(QualityReportView {
             task: t.id.to_string(),
             artifact: a.id.to_string(),
@@ -338,8 +330,11 @@ impl Api {
             contract,
             created_at: a.created_at,
             execution: a.execution_id.map(|e| e.to_string()),
-            report: value,
-            report_text,
+            status: a.status.as_str().to_string(),
+            report: p.body,
+            report_text: Some(p.presented.text),
+            source: p.presented.source.as_str().to_string(),
+            freshness: Some(p.presented.freshness),
         })
     }
 
@@ -421,7 +416,7 @@ impl Api {
             _ => None,
         };
         let (report, note) = match task.state {
-            TaskState::Qa => match self.quality_report_view(task, arts) {
+            TaskState::Qa => match self.task_report(&task.id.to_string()) {
                 Ok(view) => (Some(view), None),
                 Err(e) => (None, Some(e.to_string())),
             },
@@ -957,11 +952,30 @@ pub struct QualityReportView {
     pub contract: String,
     pub created_at: Timestamp,
     pub execution: Option<String>,
+    /// The stored artifact status of the row being shown: CURRENT, or the
+    /// STALE/SUPERSEDED predecessor shown under a «устарел» marker.
+    pub status: String,
     /// The machine body of the report (the stored artifact content).
     pub report: serde_json::Value,
-    /// The §2.6 rendering the human signs, when the report carries one.
+    /// The human rendering the operator signs: the STORED human form when
+    /// the report carries one, the legacy flat `report_text` for pre-@5
+    /// bodies.
     pub report_text: Option<String>,
+    /// What that rendering came from — `human_form`, `flat_text`,
+    /// `corrupt_form`, `corrupt_body` or `absent` (REQ-QH-06 / rework R4):
+    /// a consumer can tell a form from a fallback without sniffing the text.
+    pub source: String,
+    /// REQ-QH-05: freshness as store fact — `stale` plus the marker and the
+    /// re-audit execution it names. Never inferred from the report body.
+    pub freshness: Option<ReportFreshness>,
 }
+
+/// Why the report on screen is (or is not) the last word — raw store facts:
+/// the task phase, the stored artifact status, and the auditor execution.
+/// The shape lives with the human form's presentation module (one owner for
+/// writers and readers) and is re-exported here because the API views publish
+/// it.
+pub use devai_runtime::human_view::present::ReportFreshness;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct DependenciesView {
@@ -1194,4 +1208,83 @@ fn no_isolation_note(isolated: bool) -> Option<String> {
         "the task has no worktree.prepared event — its work was never isolated; there is no changeset to show"
             .to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReportFreshness;
+
+    /// The CURRENT quality-report contract, as seeded (highest version).
+    fn quality_report_schema() -> serde_json::Value {
+        let (_, _, raw) = devai_store::seed::contracts()
+            .into_iter()
+            .filter(|(name, _, _)| *name == "quality-report")
+            .max_by_key(|(_, version, _)| *version)
+            .expect("the quality-report contract is seeded");
+        serde_json::from_str(&raw).expect("the seeded schema is valid JSON")
+    }
+
+    /// R1 (da/api-contract 0.7): the freshness marker this view publishes is
+    /// declared by the quality-report contract — every field the view
+    /// serialises is declared, and `required` is exactly the set a reader
+    /// cannot do without (the two execution facts are nullable, so they stay
+    /// optional). A panel reading `freshness.task_state` must never face an
+    /// undeclared field.
+    #[test]
+    fn the_freshness_marker_matches_the_declared_shape() {
+        let schema = quality_report_schema();
+        let declared = &schema["properties"]["freshness"];
+        let marker = ReportFreshness {
+            stale: true,
+            marker: "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK".into(),
+            report_seq: 1,
+            report_status: "STALE".into(),
+            task_state: "REWORK".into(),
+            execution: Some("01a1b1b8-exec".into()),
+            execution_status: Some("RUNNING".into()),
+        };
+        let value = serde_json::to_value(&marker).expect("the freshness fact serialises");
+        let props = declared["properties"]
+            .as_object()
+            .expect("the contract declares freshness properties");
+        for key in value.as_object().expect("serialises to an object").keys() {
+            assert!(
+                props.contains_key(key),
+                "the API publishes freshness.{key}, the contract does not declare it"
+            );
+        }
+        let required: Vec<&str> = declared["required"]
+            .as_array()
+            .expect("the contract declares freshness.required")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            required,
+            vec![
+                "stale",
+                "marker",
+                "report_seq",
+                "report_status",
+                "task_state"
+            ],
+            "required = the facts a reader cannot do without"
+        );
+        for key in &required {
+            assert!(
+                value.get(key).is_some(),
+                "freshness.{key} is required, the writer does not emit it"
+            );
+        }
+        // The nullable execution facts are honestly OPTIONAL: a marker with
+        // only the required facts still loads as the reader's own type.
+        let mut minimal = value.clone();
+        let obj = minimal.as_object_mut().expect("object");
+        obj.remove("execution");
+        obj.remove("execution_status");
+        let loaded: ReportFreshness =
+            serde_json::from_value(minimal).expect("required-only freshness loads");
+        assert_eq!(loaded.execution, None);
+        assert_eq!(loaded.execution_status, None);
+    }
 }

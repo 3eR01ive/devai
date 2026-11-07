@@ -1588,6 +1588,20 @@ impl Store {
     /// force, and this works already in C1-without-C3, where the table holds
     /// no such rows). Rejected/other-kind rows are absent by construction.
     pub fn ratified_profile_refs(&self) -> StoreResult<BTreeMap<String, Vec<String>>> {
+        Ok(self
+            .ratified_profile_decisions()?
+            .into_iter()
+            .map(|(id, (refs, _actor))| (id, refs))
+            .collect())
+    }
+
+    /// The same ratification index, WITH the ratifying actor: decision id ->
+    /// (refs, actor). REQ-QH-03/OQ-QH-2 need «чьим решением закреплено» on
+    /// the human form of a report, and the author of the decision is a store
+    /// fact — never something the presentation layer may invent.
+    pub fn ratified_profile_decisions(
+        &self,
+    ) -> StoreResult<BTreeMap<String, (Vec<String>, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id,task_id,kind,verdict,actor,rationale,refs,created_at FROM decisions WHERE kind=?1 AND verdict=?2 ORDER BY created_at",
         )?;
@@ -1598,7 +1612,7 @@ impl Store {
         let mut map = BTreeMap::new();
         while let Some(r) = rows.next()? {
             let d = rows::decision_from_row(r)?;
-            map.insert(d.id.to_string(), d.refs);
+            map.insert(d.id.to_string(), (d.refs, d.actor));
         }
         Ok(map)
     }

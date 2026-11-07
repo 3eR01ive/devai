@@ -168,7 +168,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Read,
             input: "id_prefix",
             output: "QualityReportView",
-            description: "The CURRENT quality report the human signs at the QA gate: artifact identity, contract, machine body and rendering. Mirrors `task report`.",
+            description: "The quality report shown at the QA gate: the CURRENT report, or — when the task was returned to rework and no re-audit has published yet — the STALE predecessor under an explicit freshness marker (never passed off as the decision). Artifact identity, contract, machine body and the stored human rendering. Mirrors `task report`.",
         },
         OpDescriptor {
             name: "task.events",
@@ -219,7 +219,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.run",
             class: OpClass::Mutation,
             input: "RunReq{id, agent, workspace, force_reaudit}",
-            output: "RunOutcome{report, current_quality_report, gate_report_text, allowed_operations}",
+            output: "RunOutcome{report, current_quality_report, gate_report_text, gate_report_freshness, gate_human_paragraphs, allowed_operations}",
             description: "Drive assigned roles through all autonomous stages to the next human gate; refuses while a RUNNING execution exists (single writer). force_reaudit carries the --force-reaudit gate semantics. Mirrors `task run`.",
         },
         OpDescriptor {

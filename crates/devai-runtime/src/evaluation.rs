@@ -16,9 +16,12 @@ use std::process::Command;
 
 use std::sync::LazyLock;
 
+use devai_core::vocab::CheckState;
 use devai_store::config::{Probe, Profile, unresolved_slot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::human_view::{self, HumanReportView, Ratified};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -355,6 +358,13 @@ pub struct QualityReportDoc {
     pub recommendation_basis: String,
     #[serde(default)]
     pub report_text: String,
+    /// The stored HUMAN FORM of this report (quality-report@5, REQ-QH-01):
+    /// assembled once, here, from decided values — every reader quotes it.
+    /// `None` only for bodies written before the field existed (a doc built
+    /// by hand in a test, a legacy artifact) — the readers' honest fallback
+    /// is `report_text`, never a read-time rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_view: Option<HumanReportView>,
     #[serde(default)]
     pub assessment_execution: String,
     pub profile: ProfileIdentity,
@@ -364,7 +374,8 @@ pub struct QualityReportDoc {
 }
 
 pub struct Assembled {
-    /// Full quality-report@4 document (evidence rule from @3 + the
+    /// Full quality-report document of the contract pinned in
+    /// `QUALITY_REPORT_CONTRACT` (evidence rule from @3 + the
     /// platform-captured `workspace_revision` block).
     pub json: Value,
     /// ACCEPT | RETURN | ESCALATE — platform recommendation for the human.
@@ -375,7 +386,7 @@ pub struct Assembled {
     pub report_text: String,
 }
 
-/// Merge probe results + the auditor's assessment into quality-report@4 and
+/// Merge probe results + the auditor's assessment into the quality report and
 /// apply the deterministic verdict function (§2.5). `revision` is the
 /// workspace state the PLATFORM captured at execution start — embedded
 /// verbatim so every file:line finding is traceable to a bound workspace.
@@ -385,6 +396,7 @@ pub fn assemble(
     assessment: &Value,
     assessment_execution: &str,
     revision: &devai_core::types::WorkspaceRevision,
+    ratified: &std::collections::BTreeMap<String, Ratified>,
 ) -> Assembled {
     let scores: HashMap<String, f64> = assessment
         .get("scores")
@@ -467,7 +479,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "MECHANICAL_PASS".into(),
+                        state: CheckState::MechanicalPass.as_str().into(),
                         score: Some(1.0),
                         floor,
                         weight,
@@ -482,7 +494,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "MECHANICAL_FAIL".into(),
+                        state: CheckState::MechanicalFail.as_str().into(),
                         score: Some(0.0),
                         floor,
                         weight,
@@ -497,7 +509,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -513,7 +525,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -528,7 +540,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -544,7 +556,7 @@ pub fn assemble(
             CheckOutcome {
                 id: c.id.clone(),
                 verify: c.verify.clone(),
-                state: "PENDING_HUMAN".into(),
+                state: CheckState::PendingHuman.as_str().into(),
                 score: None,
                 floor,
                 weight,
@@ -566,7 +578,7 @@ pub fn assemble(
                     CheckOutcome {
                         id: c.id.clone(),
                         verify: c.verify.clone(),
-                        state: "BLOCKED".into(),
+                        state: CheckState::Blocked.as_str().into(),
                         score: None,
                         floor,
                         weight,
@@ -590,7 +602,7 @@ pub fn assemble(
                         CheckOutcome {
                             id: c.id.clone(),
                             verify: c.verify.clone(),
-                            state: "BLOCKED".into(),
+                            state: CheckState::Blocked.as_str().into(),
                             score: None,
                             floor,
                             weight,
@@ -611,7 +623,7 @@ pub fn assemble(
                         CheckOutcome {
                             id: c.id.clone(),
                             verify: c.verify.clone(),
-                            state: "SCORED".into(),
+                            state: CheckState::Scored.as_str().into(),
                             score: Some(*s),
                             floor,
                             weight,
@@ -704,6 +716,23 @@ pub fn assemble(
         &pending,
         blocked_weight,
     );
+    // REQ-QH-01/02/03: the human FORM is assembled ONCE, here, from the same
+    // decided values the verdict was computed from (scores, weights, floors,
+    // pending, gates) — stored in the document, never rebuilt at read time.
+    let form = human_view::build(
+        profile,
+        verdict,
+        score,
+        theta,
+        &basis,
+        &checks,
+        &run.gates,
+        &floors_breached,
+        &pending,
+        blocked_weight,
+        cap,
+        ratified,
+    );
     // ONE shape model for both sides (R-003): the producer writes the stored
     // document THROUGH the same type every reader parses it back into — the
     // keys and their order are exactly what `assemble` has always emitted,
@@ -714,6 +743,7 @@ pub fn assemble(
         verdict: rec.into(),
         recommendation_basis: basis,
         report_text: report_text.clone(),
+        human_view: Some(form),
         assessment_execution: assessment_execution.into(),
         profile: ProfileIdentity {
             project: profile.project.clone(),
@@ -792,7 +822,7 @@ fn render(
 
     let blocked: Vec<String> = checks
         .iter()
-        .filter(|c| c.state == "BLOCKED")
+        .filter(|c| c.state == CheckState::Blocked.as_str())
         .map(|c| format!("{} — {}", c.id, c.reason))
         .collect();
     if !blocked.is_empty() {
@@ -918,7 +948,14 @@ scoring:
         let p = tiny_profile("true", "true");
         let run = run_ok(&p);
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         assert_eq!(out.recommendation, "ESCALATE");
         assert!(
@@ -934,12 +971,26 @@ scoring:
         let p = tiny_profile("true", "false");
         let run = run_ok(&p);
         let a = assessment(&[], &[("rub/b", "no access")], &[]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         // gate ok, but mech FAIL -> S drops; pending human -> inconclusive first.
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         let p2 = tiny_profile("false", "true");
         let run2 = execute(&p2, Path::new(env!("CARGO_MANIFEST_DIR")));
-        let out2 = assemble(&p2, &run2, &a, "exec-2", &fixture_revision());
+        let out2 = assemble(
+            &p2,
+            &run2,
+            &a,
+            "exec-2",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out2.evaluation_verdict, "FAIL");
         assert_eq!(out2.recommendation, "RETURN");
         assert!(out2.report_text.contains("ШЛЮЗ: gate-1 — FAIL"));
@@ -951,7 +1002,14 @@ scoring:
         let run = run_ok(&p);
         // No assessment at all: mech blocked (127) weight .5 > cap .2.
         let a = assessment(&[], &[], &[]);
-        let _out = assemble(&p, &run, &a, "exec-0", &fixture_revision());
+        let _out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-0",
+            &fixture_revision(),
+            &Default::default(),
+        );
         // pending human fires first here; drop hum/c to test the cap path:
         let mut p2 = p.clone();
         p2.evaluations[0].checks.retain(|c| c.id != "hum/c");
@@ -960,7 +1018,14 @@ scoring:
             .collect();
         // V7 sum != 1 by design for this check path — validate isn't called here.
         let run2 = execute(&p2, Path::new(env!("CARGO_MANIFEST_DIR")));
-        let out2 = assemble(&p2, &run2, &a, "exec-1", &fixture_revision());
+        let out2 = assemble(
+            &p2,
+            &run2,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out2.evaluation_verdict, "INCONCLUSIVE");
         assert!(
             out2.report_text.contains("НЕ ПРОВЕРЕНО"),
@@ -976,7 +1041,14 @@ scoring:
         p.evaluations[0].checks.retain(|c| c.id != "hum/c");
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let a = assessment(&[("rub/b", 0.4)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         let j = &out.json["evaluation"]["checks"];
         let b = j
             .as_array()
@@ -999,7 +1071,14 @@ scoring:
             &[],
             &[("rub/b", "single style drift", &["x.rs:1"])],
         );
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "PASS");
         assert_eq!(out.recommendation, "ACCEPT");
         assert!(
@@ -1018,7 +1097,14 @@ scoring:
         p.evaluations[0].checks[1].detects = vec!["correctness/state-transition".into()];
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let a = assessment(&[("rub/b", 0.4)], &[], &[("rub/b", "leak", &["x.rs:1"])]);
-        let out = assemble(&p, &run, &a, "exec-1", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "FAIL");
         assert!(
             out.report_text.contains("красные линии"),
@@ -1087,7 +1173,14 @@ scoring:
         p.gates[0].probes[0].cmd = "{{build_cmd}}".into();
         let run = execute(&p, ws.path());
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-slot", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-slot",
+            &fixture_revision(),
+            &Default::default(),
+        );
         assert_eq!(out.evaluation_verdict, "INCONCLUSIVE");
         assert_eq!(out.recommendation, "ESCALATE");
         // The gate outcome is BLOCKED — not FAIL/gate=0, not PASS/gate=1.
@@ -1122,7 +1215,14 @@ scoring:
         p.evaluations[0].checks[0].probes[0].cmd = "{{unbound}}".into();
         let run = execute(&p, ws.path());
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-w", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-w",
+            &fixture_revision(),
+            &Default::default(),
+        );
         let bw = out.json["evaluation"]["blocked_weight"].as_f64().unwrap();
         assert!((bw - 0.5).abs() < 1e-9, "blocked weight carried: {bw}");
         // 0.5 > cap 0.2 → INCONCLUSIVE per the existing blocked policy.
@@ -1140,13 +1240,20 @@ scoring:
         let run = execute(&p, Path::new(env!("CARGO_MANIFEST_DIR")));
         let schema = devai_store::seed::contracts()
             .into_iter()
-            .find(|(n, v, _)| *n == "quality-report" && *v == 4)
-            .expect("quality-report@4 is seeded")
+            .find(|(n, v, _)| *n == "quality-report" && *v == 5)
+            .expect("quality-report@5 is seeded")
             .2;
 
         // Rubric 1.0 with no findings: previously an evidence-less entry.
         let a = assessment(&[("rub/b", 1.0)], &[], &[]);
-        let out = assemble(&p, &run, &a, "exec-42", &fixture_revision());
+        let out = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-42",
+            &fixture_revision(),
+            &Default::default(),
+        );
         let checks = out.json["evaluation"]["checks"].as_array().unwrap();
         assert!(!checks.is_empty());
         for c in checks {
@@ -1175,13 +1282,26 @@ scoring:
             serde_json::json!(fixture_revision()),
             "assemble must embed the platform revision verbatim"
         );
-        crate::adapters::validate_against_contract(&out.json.to_string(), Some(schema))
-            .expect("assembled report must satisfy quality-report@4");
+        crate::adapters::validate_against_contract(&out.json.to_string(), Some(&schema))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "assembled report must satisfy {}@{}: {e}",
+                    crate::human_view::QUALITY_REPORT_CONTRACT.0,
+                    crate::human_view::QUALITY_REPORT_CONTRACT.1
+                )
+            });
 
         // Gap-only assessment (mock-cycle shape): BLOCKED entries cite their
         // gap record, the report still satisfies the contract.
         let a2 = assessment(&[], &[("rub/b", "offline: no access to the diff")], &[]);
-        let out2 = assemble(&p, &run, &a2, "exec-43", &fixture_revision());
+        let out2 = assemble(
+            &p,
+            &run,
+            &a2,
+            "exec-43",
+            &fixture_revision(),
+            &Default::default(),
+        );
         for c in out2.json["evaluation"]["checks"].as_array().unwrap() {
             let ev = c["evidence"].as_array().unwrap();
             assert!(
@@ -1191,7 +1311,13 @@ scoring:
                 c["id"]
             );
         }
-        crate::adapters::validate_against_contract(&out2.json.to_string(), Some(schema))
-            .expect("blocked-mix report must satisfy quality-report@4");
+        crate::adapters::validate_against_contract(&out2.json.to_string(), Some(&schema))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "blocked-mix report must satisfy {}@{}: {e}",
+                    crate::human_view::QUALITY_REPORT_CONTRACT.0,
+                    crate::human_view::QUALITY_REPORT_CONTRACT.1
+                )
+            });
     }
 }

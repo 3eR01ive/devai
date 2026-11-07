@@ -159,8 +159,11 @@ fn qa_without_a_current_report_carries_the_platform_note() {
         .report_note
         .as_deref()
         .expect("an honest platform note instead of an empty presentation");
+    // Текст заметки принадлежит презентации (QRPT, @5): «отчёта ещё нет» —
+    // после мержа единый сборщик отдаёт свою формулировку; тест держит
+    // обещание «заметка называет недостающее», а не литерал старого текста.
     assert!(
-        note.contains("no CURRENT quality report"),
+        note.contains("no quality report"),
         "the note names what is missing: {note}"
     );
 }

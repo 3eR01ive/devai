@@ -71,7 +71,7 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
 
     for (name, version, schema) in contracts() {
         if store.get_contract(name, version)?.is_none() {
-            store.put_contract(name, version, schema)?;
+            store.put_contract(name, version, &schema)?;
         }
     }
 
@@ -102,7 +102,26 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
 /// Output-contract schemas (JSON Schema draft-07). These define the SHAPE
 /// of role results; the per-check acceptance rules live in
 /// `config/criteria/*.yaml`.
-pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
+pub fn contracts() -> Vec<(&'static str, u32, String)> {
+    contracts_raw()
+        .into_iter()
+        .map(|(name, version, raw)| (name, version, fill_vocabulary(raw)))
+        .collect()
+}
+
+/// Rework R4: fill the vocabulary placeholders of a schema with the ONE
+/// generated vocabulary ([`devai_core::vocab`]). The seeded contract can then
+/// never list a check state or item kind the code does not emit, and adding a
+/// token is a `vocab.json` edit — not a hunt through hand-copied JSON.
+fn fill_vocabulary(raw: &str) -> String {
+    raw.replace(
+        "@CHECK_STATE_ENUM@",
+        devai_core::vocab::CheckState::JSON_ENUM,
+    )
+    .replace("@ITEM_KIND_LIST@", devai_core::vocab::ItemKind::LIST)
+}
+
+fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
     vec![
         (
             "requirements-specification",
@@ -473,7 +492,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             "properties": {
               "id": { "type": "string" },
               "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
-              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
               "score": { "type": "number" },
               "floor": { "type": "number" },
               "weight": { "type": "number" },
@@ -539,7 +558,7 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             "properties": {
               "id": { "type": "string" },
               "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
-              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
               "score": { "type": "number" },
               "floor": { "type": "number" },
               "weight": { "type": "number" },
@@ -616,7 +635,167 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
             "properties": {
               "id": { "type": "string" },
               "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
-              "state": { "type": "string", "enum": ["MECHANICAL_PASS", "MECHANICAL_FAIL", "SCORED", "BLOCKED", "PENDING_HUMAN"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
+              "score": { "type": "number" },
+              "floor": { "type": "number" },
+              "weight": { "type": "number" },
+              "detects": { "type": "array", "items": { "type": "string" } },
+              "violations": { "type": "array", "items": { "type": "string" } },
+              "evidence": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "concrete citations: test output excerpt, artifact id, build log reference — at least one per check entry" },
+              "reason": { "type": "string", "description": "why BLOCKED / unscored" }
+            }
+          }
+        }
+      }
+    }
+  }
+}"#,
+        ),
+        (
+            "quality-report",
+            5,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Quality Report v5 — machine-assembled; the human form is stored with the report",
+  "description": "v4 plus `human_view`: the human PRESENTATION of the same report, assembled ONCE by the platform at publication from already-decided values (scores, weights, floors, pending, gates, ratified anchors) and quoted verbatim by every reader — never regrouped, re-scored or re-sorted at read time. Four groups in a fixed order: blocks (the S<theta threshold breach, gates, floor breaches, blocking, pending signature), nuances (every point still below 1.0, each with score, weight and importance = (1-score)*weight, most important first; a fully passed point with no decision link is the norm and is counted in headline.counts.passed instead of being listed), anchors (ONLY positions with an explicit ratified_by decision link, names only), unchecked (BLOCKED checks and unknown states, with reason and weight). Code and probe output live in the per-item evidence layer, never in the visible one-line summary. report_text keeps its v3/v4 §2.6 form: it is the fallback for bodies published before this version, not a second source of truth.",
+  "type": "object",
+  "required": ["verdict", "recommendation_basis", "report_text", "profile", "workspace_revision", "human_view", "evaluation"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["ACCEPT", "RETURN", "ESCALATE"] },
+    "recommendation_basis": { "type": "string" },
+    "report_text": { "type": "string" },
+    "human_view": {
+      "type": "object",
+      "description": "The stored human form (REQ-QH-01..04). Readers quote it; nothing here is recomputed on read.",
+      "required": ["version", "lang", "headline", "groups", "blocked_weight", "max_blocked_weight"],
+      "properties": {
+        "version": { "type": "integer" },
+        "lang": { "type": "string", "description": "language of every human string in this shape (task language, ru)" },
+        "headline": {
+          "type": "object",
+          "required": ["verdict", "machine_verdict", "score", "theta", "basis", "numbers", "counts"],
+          "properties": {
+            "verdict": { "type": "string", "description": "human verdict word (ПРОШЁЛ / НЕ ПРОШЁЛ / ВЕРДИКТ НЕ ГОТОВ)" },
+            "machine_verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+            "score": { "type": "number", "description": "S as decided by the deterministic verdict function at assembly" },
+            "theta": { "type": "number", "description": "the verdict threshold the profile scored against" },
+            "basis": { "type": "string", "description": "the recommendation basis, quoted from the decided values" },
+            "numbers": { "type": "string", "description": "REQUIRED: S and threshold already formatted by the one formatter at assembly; every reader (CLI and panel) prints it verbatim and cannot load the form without it (rework R3/R1)" },
+            "counts": {
+              "type": "object",
+              "required": ["blocks", "nuances", "anchors", "unchecked"],
+              "properties": {
+                "blocks": { "type": "integer" },
+                "nuances": { "type": "integer" },
+                "anchors": { "type": "integer" },
+                "unchecked": { "type": "integer" },
+                "passed": { "type": "integer", "description": "fully passed points (1.0, no decision link): the norm, counted not listed (optional in v1 forms)" }
+              }
+            }
+          }
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "description": "always four, in the fixed order blocks, nuances, anchors, unchecked; an empty group prints no heading",
+          "items": {
+            "type": "object",
+            "required": ["key", "title", "lead", "items"],
+            "properties": {
+              "key": { "type": "string", "enum": ["blocks", "nuances", "anchors", "unchecked"] },
+              "title": { "type": "string" },
+              "lead": { "type": "string" },
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id", "kind", "summary", "line", "site"],
+                  "properties": {
+                    "id": { "type": "string", "description": "check id or gate id — the identity the operator cites back" },
+                    "kind": { "type": "string", "description": "@ITEM_KIND_LIST@" },
+                    "summary": { "type": "string", "description": "ONE short visible line — no code, no paragraphs (REQ-QH-04)" },
+                    "line": { "type": "string", "description": "REQUIRED: the COMPLETE visible row (id, score, weight, importance, site — or the anchor sentence), formatted once at assembly; every channel prints it verbatim and neither the CLI nor the panel can load the form without it (rework R3/R1)" },
+                    "site": { "type": "string", "description": "file:line of the finding, empty when there is none" },
+                    "score": { "type": ["number", "null"], "description": "optional: the decided score; always emitted by the v5 writer, null for items without a score (gates, pending, blocked)" },
+                    "weight": { "type": ["number", "null"], "description": "optional: the profile weight; always emitted by the v5 writer, null when the item carries no weight" },
+                    "importance": { "type": ["number", "null"], "description": "optional: (1-score)*weight as decided at assembly; always emitted by the v5 writer, null when the item has no score" },
+                    "ratified_by": { "type": "string", "description": "optional, OMITTED when absent: the stored decision that keeps this anchor in force" },
+                    "reason": { "type": "string", "description": "optional, OMITTED when absent: the BLOCKED reason / gate detail — a fact, not a judgement" },
+                    "evidence": { "type": "array", "items": { "type": "string" }, "description": "optional, OMITTED when empty: the collapsed proof layer — citation bodies and probe output, verbatim" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "blocked_weight": { "type": "number" },
+        "max_blocked_weight": { "type": "number" }
+      }
+    },
+    "freshness": {
+      "type": "object",
+      "description": "NOT stored in the body: the export of a reader (REQ-QH-05) beside the shown report — which row is shown, and whether it is still the last word. Assembled at READ time from raw store facts (task phase, stored artifact status, auditor executions); it re-derives no report content. Declared in this contract so the freshness marker has ONE shape owner and the API/panel cannot drift from its required fields (rework R1).",
+      "required": ["stale", "marker", "report_seq", "report_status", "task_state"],
+      "properties": {
+        "stale": { "type": "boolean", "description": "true when the shown row is not the last word and the task is not terminal" },
+        "marker": { "type": "string", "description": "ready-to-show marker naming the stored facts; empty when the report is current" },
+        "report_seq": { "type": "integer", "description": "seq of the shown artifact row" },
+        "report_status": { "type": "string", "description": "stored status of the shown row: CURRENT / STALE / SUPERSEDED" },
+        "task_state": { "type": "string", "description": "the task phase the marker names" },
+        "execution": { "type": ["string", "null"], "description": "optional: id of the newest auditor execution, null when none ran" },
+        "execution_status": { "type": ["string", "null"], "description": "optional: status of that execution (RUNNING is named «в работе» only from this fact)" }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "required": ["project", "version"],
+      "properties": { "project": { "type": "string" }, "version": { "type": "integer" } }
+    },
+    "workspace_revision": {
+      "type": "object",
+      "description": "Workspace provenance captured platform-side (never by a model) at execution start. All four components are required; git_head/dirty_digest are null outside a git repo, profile is null when no evaluation profile is loaded — such a revision is not comparable and freshness is never claimed from it.",
+      "required": ["git_head", "dirty_digest", "profile", "roles"],
+      "properties": {
+        "git_head": { "type": ["string", "null"] },
+        "dirty_digest": { "type": ["string", "null"] },
+        "profile": { "type": ["string", "null"] },
+        "roles": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "assessment_execution": { "type": "string", "description": "role execution id of the auditor run" },
+    "evaluation": {
+      "type": "object",
+      "required": ["verdict", "score", "theta", "gates", "checks"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "score": { "type": "number" },
+        "theta": { "type": "number" },
+        "blocked_weight": { "type": "number" },
+        "max_blocked_weight": { "type": "number" },
+        "floors_breached": { "type": "array", "items": { "type": "string" } },
+        "pending_human": { "type": "array", "items": { "type": "string" } },
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "state"],
+            "properties": {
+              "id": { "type": "string" },
+              "state": { "type": "string", "enum": ["PASS", "FAIL", "BLOCKED"] },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "verify", "state", "weight", "detects", "evidence"],
+            "properties": {
+              "id": { "type": "string" },
+              "verify": { "type": "string", "enum": ["mechanical", "rubric", "hybrid"] },
+              "state": { "type": "string", "enum": @CHECK_STATE_ENUM@ },
               "score": { "type": "number" },
               "floor": { "type": "number" },
               "weight": { "type": "number" },
@@ -702,4 +881,52 @@ pub fn contracts() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
     ]
+}
+
+/// Rework R3/R5/R8: the schema's state enum and `kind` list are the SAME
+/// vocabulary the producer and the human form use (`devai_core::vocab`).
+/// Adding a state or a kind without updating every surface fails here — the
+/// store schema can no longer drift into describing a smaller or larger set
+/// than the code emits.
+#[cfg(test)]
+mod tests {
+    use devai_core::vocab::{CheckState, ItemKind};
+
+    use super::*;
+
+    /// The CURRENT quality-report contract (the highest seeded version).
+    fn quality_report_schema() -> serde_json::Value {
+        let (_, _, raw) = contracts()
+            .into_iter()
+            .filter(|(name, _, _)| *name == "quality-report")
+            .max_by_key(|(_, version, _)| *version)
+            .expect("quality-report contract is seeded");
+        serde_json::from_str(&raw).expect("the seeded schema is valid JSON")
+    }
+
+    #[test]
+    fn the_check_state_enum_is_the_producer_vocabulary() {
+        let schema = quality_report_schema();
+        let states: Vec<&str> = schema["properties"]["evaluation"]["properties"]["checks"]["items"]
+            ["properties"]["state"]["enum"]
+            .as_array()
+            .expect("checks.state enum exists")
+            .iter()
+            .map(|v| v.as_str().expect("enum entries are strings"))
+            .collect();
+        let expected: Vec<&str> = CheckState::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(states, expected);
+    }
+
+    #[test]
+    fn the_item_kind_list_is_the_form_vocabulary() {
+        let schema = quality_report_schema();
+        let desc = schema["properties"]["human_view"]["properties"]["groups"]["items"]
+            ["properties"]["items"]["items"]["properties"]["kind"]["description"]
+            .as_str()
+            .expect("kind description exists");
+        let listed: Vec<&str> = desc.split(" | ").map(str::trim).collect();
+        let expected: Vec<&str> = ItemKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(listed, expected);
+    }
 }

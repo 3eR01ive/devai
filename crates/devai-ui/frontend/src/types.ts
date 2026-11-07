@@ -152,6 +152,74 @@ export interface ActiveSnapshot {
   rows: ActiveRow[];
 }
 
+// Contract lexicon (rework R3/R4): these tokens are declared ONCE in
+// `crates/devai-core/vocab.json`; the unions below are GENERATED from that
+// data by `crates/devai-ui/build.rs` into `./vocab.generated.ts` and only
+// re-exported here. Do not hand-write a token here — edit vocab.json and
+// rebuild; `ts_types_match_the_rust_vocabulary` in `src/commands.rs` fails if
+// the generated file stops matching the Rust enums.
+import type { CheckStateToken, HumanItemKind } from "./vocab.generated";
+export type { CheckStateToken, HumanItemKind } from "./vocab.generated";
+
+export interface HumanFormItem {
+  id: string;
+  kind: HumanItemKind;
+  summary: string;
+  // The COMPLETE visible row, formatted once in Rust at assembly; the panel
+  // prints it verbatim (rework R3: no second wording, no second precision).
+  line: string;
+  site: string;
+  score: number | null;
+  weight: number | null;
+  importance: number | null;
+  ratified_by?: string;
+  reason?: string;
+  evidence?: string[];
+}
+
+export interface HumanFormGroup {
+  key: "blocks" | "nuances" | "anchors" | "unchecked";
+  title: string;
+  lead: string;
+  items: HumanFormItem[];
+}
+
+export interface HumanForm {
+  version: number;
+  lang: string;
+  headline: {
+    verdict: string;
+    machine_verdict: string;
+    score: number;
+    theta: number;
+    // «S=…/1.00, порог …» — already formatted by the one Rust formatter.
+    numbers: string;
+    basis: string;
+    counts: {
+      blocks: number;
+      nuances: number;
+      anchors: number;
+      unchecked: number;
+      // fully passed points (1.0, no decision link): the norm, counted not
+      // listed — absent in v1 forms, so optional.
+      passed?: number;
+    };
+  };
+  groups: HumanFormGroup[];
+  blocked_weight: number;
+  max_blocked_weight: number;
+}
+
+export interface ReportFreshness {
+  stale: boolean;
+  marker: string;
+  report_seq: number;
+  report_status: string;
+  task_state: string;
+  execution: string | null;
+  execution_status: string | null;
+}
+
 export interface QualityReportView {
   task: string;
   artifact: string;
@@ -159,8 +227,14 @@ export interface QualityReportView {
   contract: string;
   created_at: string;
   execution: string | null;
+  status: string;
   report: unknown;
   report_text: string | null;
+  // Что именно отрендерено: human_form | flat_text | corrupt_form |
+  // corrupt_body | absent (rework R4) — UI различает форму и fallback, не
+  // угадывая по тексту.
+  source: string;
+  freshness: ReportFreshness | null;
 }
 
 export interface TaskDependency {

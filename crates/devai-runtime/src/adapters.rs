@@ -667,7 +667,7 @@ impl AgentRuntime {
             }),
             "quality-report" | "evaluation-assessment" => {
                 // The QA agent answers with an evaluation-assessment; the
-                // platform (engine) assembles the machine quality-report@4.
+                // platform (engine) assembles the machine quality report.
                 // The mock never fabricates rubric scores offline — its gap
                 // record becomes the cited evidence on the assembled checks.
                 serde_json::json!({

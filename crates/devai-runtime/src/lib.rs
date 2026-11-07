@@ -11,6 +11,7 @@ pub mod context;
 mod engine;
 pub mod evaluation;
 pub mod gate;
+pub mod human_view;
 pub mod humanize;
 pub mod liveness;
 mod prompt;

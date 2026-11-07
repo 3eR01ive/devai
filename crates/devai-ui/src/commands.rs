@@ -1727,6 +1727,11 @@ mod tests {
             execution: None,
             report: serde_json::json!({"verdict": "PASS"}),
             report_text: Some("Отчёт на подпись".to_string()),
+            // Поля свежести/источника (@5): фикстура изображает свежий CURRENT
+            // отчёт с плоским текстом (до человеческой формы).
+            status: "CURRENT".to_string(),
+            source: "flat_text".to_string(),
+            freshness: None,
         });
         let mut empty_qa = facts[ix].clone();
         empty_qa.task.id = devai_core::types::new_id();
@@ -1928,5 +1933,60 @@ mod tests {
             answered_at: None,
             created_at: now,
         }
+    }
+
+    /// Rework R4: the check-state and item-kind unions are GENERATED from
+    /// `crates/devai-core/vocab.json` by `build.rs` into
+    /// `frontend/src/vocab.generated.ts`; `types.ts` only re-exports them.
+    /// This test keeps two promises: the generated file matches the Rust
+    /// enums (no drift, no hand-edit), and `types.ts` really re-exports it
+    /// (deleting the re-export would silently unhook the UI from the data).
+    #[test]
+    fn ts_types_match_the_rust_vocabulary() {
+        let generated = include_str!("../frontend/src/vocab.generated.ts");
+        assert!(
+            generated.starts_with("// @generated"),
+            "vocab.generated.ts must announce itself as generated"
+        );
+        let states = quoted_union(generated, "CheckStateToken");
+        let expected: Vec<&str> = devai_core::vocab::CheckState::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            states, expected,
+            "vocab.generated.ts CheckStateToken drifted"
+        );
+        let kinds = quoted_union(generated, "HumanItemKind");
+        let expected: Vec<&str> = devai_core::vocab::ItemKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(kinds, expected, "vocab.generated.ts HumanItemKind drifted");
+
+        let ts = include_str!("../frontend/src/types.ts");
+        assert!(
+            ts.contains(
+                "export type { CheckStateToken, HumanItemKind } from \"./vocab.generated\";"
+            ),
+            "types.ts must re-export both unions from the generated vocabulary"
+        );
+    }
+
+    /// The double-quoted members of `export type NAME = "a" | "b";`.
+    fn quoted_union(ts: &str, name: &str) -> Vec<String> {
+        let head = format!("export type {name} =");
+        let start = ts
+            .find(&head)
+            .unwrap_or_else(|| panic!("types.ts declares `{name}`"))
+            + head.len();
+        let body = &ts[start..];
+        let end = body.find(';').expect("the union ends with a semicolon");
+        body[..end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
     }
 }

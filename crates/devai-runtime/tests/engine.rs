@@ -171,7 +171,7 @@ fn full_cycle_through_both_human_gates() {
     assert_eq!(r2.steps[0].role, "implementation-agent");
     assert_eq!(r2.steps[1].role, "quality-auditor");
 
-    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@4: probes ran
+    // The QA artifact is the PLATFORM-ASSEMBLED quality-report@5: probes ran
     // in code, the mock auditor contributed no fabricated scores, and the
     // verdict function stayed "not ready" because a human check is unsigned.
     let (qa_artifact, qa) = {
@@ -184,22 +184,23 @@ fn full_cycle_through_both_human_gates() {
         let body = store.read_artifact_body(&a).unwrap();
         (a, body)
     };
-    // The report is pinned to the strengthened contract version.
+    // The report is pinned to the strengthened contract version — read from
+    // the one constant, never a literal that can drift from the seed.
     assert_eq!(
         qa_artifact
             .contract
             .as_ref()
             .map(|c| (c.name.as_str(), c.version)),
-        Some(("quality-report", 4)),
-        "QA artifact must be published under quality-report@4"
+        Some(QUALITY_REPORT_CONTRACT),
+        "QA artifact must be published under the current quality-report contract"
     );
     let rep: serde_json::Value = serde_json::from_slice(&qa).unwrap();
     assert_eq!(rep["verdict"], "ESCALATE");
     assert_eq!(rep["profile"]["project"], "devai");
 
     // REQ-001/REQ-004: EVERY engine stage records a workspace revision with
-    // all four components, and the assembled @4 report embeds EXACTLY the
-    // revision stored on the auditor's execution row — no drift.
+    // all four components, and the assembled current-contract report embeds
+    // EXACTLY the revision stored on the auditor's execution row — no drift.
     {
         use devai_runtime::revision;
         let execs = store.list_executions(Some(t.id)).unwrap();
@@ -1693,7 +1694,14 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
 
     // QA returns with three concrete points — the precedent's shape.
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::return_to_rework(&cur, Some("п1; п2; п3"), "tester", Utc::now()).unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("п1; п2; п3"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     // The rework execution does nothing either: R2 is stamped with the SAME
@@ -1837,7 +1845,14 @@ fn rework_with_new_commit_still_reaches_qa() {
     store.create_task(&t).unwrap();
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::return_to_rework(&cur, Some("fix the points"), "tester", Utc::now()).unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("fix the points"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     // Real work lands in the task's worktree; the platform commit captures it
@@ -1946,6 +1961,14 @@ fn craft_report(store: &Store, task_id: Id, content: serde_json::Value, version:
         .unwrap();
 }
 
+/// A failing report whose single finding carries `marker` — two of these make
+/// the selection rule's choice observable in the quoted text.
+fn report_marked(marker: &str) -> serde_json::Value {
+    let mut doc = failing_doc();
+    doc.evaluation.checks[0].violations = vec![format!("{marker}: finding")];
+    serde_json::to_value(&doc).unwrap()
+}
+
 fn mk_check(
     id: &str,
     verify: &str,
@@ -1977,6 +2000,7 @@ fn failing_doc() -> QualityReportDoc {
         verdict: "RETURN".into(),
         recommendation_basis: "красные линии: spec-coverage=0.40<floor 0.70".into(),
         report_text: "crafted for delivery tests".into(),
+        human_view: None,
         assessment_execution: "exec-crafted".into(),
         profile: ProfileIdentity {
             project: "devai".into(),
@@ -2481,6 +2505,7 @@ fn the_rework_execution_actually_receives_the_assembled_section() {
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
         &cur,
+        &store.artifacts(t.id).unwrap(),
         Some("THE-WIRING-MARKER — return text as the human wrote it"),
         "tester",
         Utc::now(),
@@ -2536,6 +2561,140 @@ fn the_rework_execution_actually_receives_the_assembled_section() {
 }
 
 #[test]
+fn a_returned_reports_findings_are_delivered_labelled_stale_never_dropped() {
+    // Rework R1 (regression): the ratified OQ-QH-3 moves the rejected report
+    // CURRENT→STALE at the return. A CURRENT-only reader then found nothing
+    // and the whole QUALITY REPORT FINDINGS block silently vanished from the
+    // implementer prompt — existing data indistinguishable from absence.
+    let (_d, store) = store();
+    let (_wsdir, ws) = git_workspace();
+    let t = Task::new(
+        "StaleFindings",
+        "a return must still hand the implementer the findings it rejected",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    drive_to_report(&store, &t, &ws);
+    craft_report(
+        &store,
+        t.id,
+        serde_json::to_value(failing_doc()).unwrap(),
+        4,
+    );
+
+    // The return fires the findings trigger; before any return there is no
+    // section at all (the first-run pin), so the two branches below are the
+    // two ways the reader can now answer: CURRENT report vs STALE fallback.
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("вернись к находкам"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+    assert!(
+        store
+            .artifacts(t.id)
+            .unwrap()
+            .iter()
+            .filter(|a| a.kind == ArtifactKind::QualityReport)
+            .all(|a| a.status != ArtifactStatus::Current),
+        "the return really moved the rejected report out of CURRENT"
+    );
+
+    let stale = rework_context(&store, &t, "implementation-agent", &policy())
+        .unwrap()
+        .expect("STALE findings of the rejected report are still delivered");
+    assert!(
+        stale.contains("отчёт STALE: findings прошлого возврата")
+            && stale.contains("FINDING-MARKER-4e7b")
+            && stale.contains("spec-coverage=0.40<floor 0.70"),
+        "the stale report's findings are quoted with the label: {stale}"
+    );
+    assert!(
+        stale.contains("вернись к находкам"),
+        "the rationale half is unchanged: {stale}"
+    );
+
+    // A fresh audit's CURRENT report wins again and drops the label.
+    craft_report(
+        &store,
+        t.id,
+        serde_json::to_value(failing_doc()).unwrap(),
+        QUALITY_REPORT_CONTRACT.1,
+    );
+    let refresh = rework_context(&store, &t, "implementation-agent", &policy())
+        .unwrap()
+        .unwrap();
+    assert!(
+        refresh.contains(&format!(
+            "CURRENT {}@{} report v",
+            QUALITY_REPORT_CONTRACT.0, QUALITY_REPORT_CONTRACT.1
+        )) && refresh.contains("FINDING-MARKER-4e7b")
+            && !refresh.contains("отчёт STALE"),
+        "a newer CURRENT report is quoted as CURRENT: {refresh}"
+    );
+}
+
+#[test]
+fn the_findings_reader_and_the_panel_share_one_selection_rule() {
+    // R3 (rework): «which report do we show» is ONE rule (`present::select_report`)
+    // for the panel and for the findings quoted into the implementer prompt —
+    // including the SUPERSEDED case, where the two readers used to diverge.
+    let (_d, store) = store();
+    let t = Task::new(
+        "OneRule",
+        "panel and prompt must quote the same report row",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    returned(&store, t.id, "вернись к находкам");
+    craft_report(&store, t.id, report_marked("MARKER-OLD-A"), 4);
+    craft_report(&store, t.id, report_marked("MARKER-NEW-B"), 4);
+
+    // Drop the CURRENT row: both publications are history now, and only the
+    // selection rule decides which one a reader quotes.
+    let task = store.get_task(&t.id.to_string()).unwrap();
+    let supersede: Vec<(Id, ArtifactStatus)> = store
+        .artifacts(t.id)
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
+        .map(|a| (a.id, ArtifactStatus::Superseded))
+        .collect();
+    let m = workflow::Mutation {
+        task: task.clone(),
+        events: vec![],
+        artifact_status: supersede,
+        questions: vec![],
+    };
+    store.commit(task.lock_version, &m).unwrap();
+
+    let arts = store.artifacts(t.id).unwrap();
+    let picked =
+        devai_runtime::human_view::present::select_report(&arts).expect("a report row is selected");
+    assert_eq!(picked.seq, 2, "no CURRENT: the newest row is the one shown");
+    assert_eq!(picked.status, ArtifactStatus::Superseded);
+
+    let section = rework_context(&store, &t, "implementation-agent", &policy())
+        .unwrap()
+        .expect("findings of the selected report are delivered");
+    assert!(
+        section.contains("MARKER-NEW-B") && !section.contains("MARKER-OLD-A"),
+        "the prompt quotes the same row the panel selects: {section}"
+    );
+    assert!(
+        section.contains("это findings не-текущего отчёта, не решение по текущей ревизии"),
+        "a non-CURRENT row is labelled as such, never as the decision: {section}"
+    );
+}
+
+#[test]
 fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
     let (_d, store) = store();
     std::fs::remove_dir_all(store.root().join("config/workflow")).unwrap();
@@ -2557,8 +2716,14 @@ fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
     store.create_task(&t).unwrap();
     drive_to_report(&store, &t, &ws); // the whole cycle runs on a home WITHOUT the workflow dir
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::return_to_rework(&cur, Some("FACTORY-FALLBACK-MARKER"), "tester", Utc::now())
-        .unwrap();
+    let m = workflow::return_to_rework(
+        &cur,
+        &store.artifacts(t.id).unwrap(),
+        Some("FACTORY-FALLBACK-MARKER"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
     let engine = engine_in(&store, &ws, false);
     engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -2731,6 +2896,7 @@ fn the_empty_rework_gate_trips_the_return_text_into_the_next_window() {
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
         &cur,
+        &store.artifacts(t.id).unwrap(),
         Some("GATE-CYCLE-RATIONALE — п1; п2"),
         "tester",
         Utc::now(),
