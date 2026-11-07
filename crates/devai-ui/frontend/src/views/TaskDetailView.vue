@@ -8,6 +8,8 @@ import { computed, onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
+import ConvergenceChart from "../components/ConvergenceChart.vue";
+import type { ChartPoint } from "../convergence_view";
 import {
   freshnessBanner,
   hasEvidence,
@@ -21,6 +23,7 @@ import type {
   ActiveRow,
   Artifact,
   ArtifactContent,
+  ConvergenceView,
   Decision,
   DependenciesView,
   LivenessView,
@@ -59,6 +62,24 @@ const wsError = ref<UiError | null>(null);
 const wsDiff = ref<WorkspaceDiffView | null>(null);
 const wsDiffFor = ref<string | null>(null);
 const wsDiffError = ref<UiError | null>(null);
+// Сходимость стадий (REQ-CV-09/10): один read-срез task.convergence —
+// график по каждой стадии, у которой есть круги. UI не считает ни балл,
+// ни режим: рисует готовые значения.
+const convergence = ref<ConvergenceView | null>(null);
+const convergenceError = ref<UiError | null>(null);
+
+/** Серия точки в форме, которую рисует компонент (поля не пересчитываются). */
+const chartSeries = (stage: string): ChartPoint[] =>
+  (convergence.value?.stages.find((s) => s.stage === stage)?.series ?? []).map((p) => ({
+    round: p.round,
+    measured: p.measured,
+    score_milli: p.score_milli,
+    theta_milli: p.theta_milli,
+    requirements_count: p.requirements_count,
+    oq_count: p.oq_count,
+    modes: p.modes,
+    profile: p.profile,
+  }));
 
 async function loadAll() {
   error.value = null;
@@ -94,6 +115,7 @@ async function loadAll() {
     await loadEvents();
     await loadReport();
     await loadWorkspace();
+    await loadConvergence();
   } catch (e) {
     error.value = toUiError(e);
   }
@@ -142,6 +164,18 @@ async function loadReport() {
     report.value = await api.taskReport(props.id);
   } catch (e) {
     reportError.value = toUiError(e); // NotFound «QA has not run» — platform text as-is (REQ-UI-07 AC2)
+  }
+}
+
+// Срез сходимости — отдельная read-операция; ошибка не роняет панель
+// задачи (остальные панели честно показывают своё).
+async function loadConvergence() {
+  convergenceError.value = null;
+  try {
+    convergence.value = await api.taskConvergence(props.id);
+  } catch (e) {
+    convergence.value = null;
+    convergenceError.value = toUiError(e);
   }
 }
 
@@ -213,6 +247,51 @@ onMounted(loadAll);
           вне линейки стадий; текущее состояние — <b class="mono">{{ progress.pipeline.current }}</b>
           <template v-if="progress.pipeline.terminal"> (терминальное)</template>
         </p>
+      </div>
+    </div>
+
+    <!-- Сходимость стадий (REQ-CV-09/10): по графику на каждую стадию с
+         кругами, порядок и значения — от платформы (spec_review → quality).
+         Без кругов — честная строка без осей. -->
+    <div class="panel">
+      <h3>Сходимость стадий (task.convergence)</h3>
+      <div class="body">
+        <div v-if="convergenceError" class="errorbox" style="margin-bottom: 0">
+          <span class="code">{{ convergenceError.code }}</span>{{ convergenceError.message }}
+        </div>
+        <template v-else-if="convergence">
+          <p v-if="convergence.reason === 'no_rounds'" class="muted" style="margin: 0">
+            кругов пока нет — у задачи не опубликовано ни отчёта ревью, ни QA-отчёта
+          </p>
+          <template v-else>
+            <p class="muted" style="margin: 0 0 8px">
+              шаг прироста: <span class="mono">{{ convergence.gap_milli }}</span> тысячных ·
+              снимок <span class="mono">{{ fmtTime(convergence.snapshot_at) }}</span>
+            </p>
+            <div
+              v-for="s in convergence.stages"
+              :key="s.stage"
+              class="conv-stage"
+            >
+              <ConvergenceChart
+                :stage="s.stage"
+                :series="chartSeries(s.stage)"
+                :gap-milli="convergence.gap_milli"
+                :modes="s.series[s.series.length - 1]?.modes ?? []"
+                :mode-note="s.series[s.series.length - 1]?.mode_note ?? null"
+                :missing="s.series[s.series.length - 1]?.missing ?? []"
+                break-on-profile
+              />
+              <p class="muted mono" style="margin: 2px 0 0; font-size: 11px">
+                время стадии {{ s.stage_total_seconds }} с · кругов без времени
+                {{ s.counters.rounds_without_time }} · не измерено {{ s.counters.unmeasured }}<template
+                  v-if="s.stage === 'spec_review'"
+                > · версий спеки без ревью {{ s.counters.spec_versions_without_review }}</template>
+              </p>
+            </div>
+          </template>
+        </template>
+        <p v-else class="muted" style="margin: 0">Загрузка сходимости…</p>
       </div>
     </div>
 

@@ -328,6 +328,89 @@ export interface WaitRow {
   spec: SpecPresentation | null;
   report: QualityReportView | null;
   report_note: string | null;
+  /**
+   * Факт сходимости гейта (REQ-CV-09/10): стадия ЭТОЙ строки —
+   * spec_review для APPROVAL, quality для QA. Вне двух гейтовых состояний
+   * null: график и плейсхолдер не рисуются. Значения (балл, режимы,
+   * причины) уже посчитаны платформой и здесь только раскладываются.
+   */
+  convergence: ConvergenceFact | null;
+}
+
+// --- сходимость стадии (task.convergence, REQ-CV-05/09) ---
+// mode_note и missing — машинные токены платформы; человеческие фразы для
+// них — фиксированный словарь UI (convergence_view.ts), не свободный текст.
+export interface ConvergencePoint {
+  round: number;
+  artifact_id: string;
+  seq: number;
+  status: string;
+  created_at: string;
+  measured: boolean;
+  missing: string[];
+  profile: string | null;
+  comparable: boolean;
+  time_seconds: number | null;
+  score: number | null;
+  score_milli: number | null;
+  theta_milli: number | null;
+  low_count: number | null;
+  unscored_count: number | null;
+  closed_count: number | null;
+  delta_score_milli: number | null;
+  delta_low: number | null;
+  distance: number | null;
+  requirements_count: number | null;
+  oq_count: number | null;
+  verdict: string | null;
+  delta_requirements: number | null;
+  delta_oq: number | null;
+  modes: string[];
+  mode_note: string | null;
+  stuck_applicable: boolean;
+}
+
+export interface ConvergenceCounters {
+  unmeasured: number;
+  spec_versions_without_review: number;
+  rounds_without_time: number;
+}
+
+export interface StageConvergence {
+  stage: string;
+  series: ConvergencePoint[];
+  counters: ConvergenceCounters;
+  stage_total_seconds: number;
+}
+
+export interface ConvergenceView {
+  task: string;
+  snapshot_at: string;
+  gap_milli: number;
+  reason: string | null;
+  stages: StageConvergence[];
+}
+
+/** Один круг мини-графика строки «Ожидания» (REQ-CV-09). */
+export interface ConvergenceTick {
+  round: number;
+  measured: boolean;
+  score_milli: number | null;
+  theta_milli: number | null;
+  requirements_count: number | null;
+  oq_count: number | null;
+  modes: string[];
+}
+
+/** Факт гейтовой строки: серия без тел отчётов, режимы последнего круга. */
+export interface ConvergenceFact {
+  stage: string;
+  gap_milli: number;
+  rounds: number;
+  series: ConvergenceTick[];
+  modes: string[];
+  mode_note: string | null;
+  missing: string[];
 }
 
 // Предъявление APPROVAL-строки (REQ-GATE-04/05): тело REQUIREMENTS_SPEC,

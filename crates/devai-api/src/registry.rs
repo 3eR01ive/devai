@@ -54,7 +54,11 @@ pub struct OpDescriptor {
 /// plane (`Task.human_name`, `TaskDependency.task_display`/
 /// `depends_on_display`) — a consumer typed against `@2` reads those
 /// fields as unknown-absent, so the stamp must move with them.
-pub const SURFACE_VERSION: &str = "api-surface@3";
+/// `@4` names the convergence increment (task 01a1b5be, REQ-CV-09): the
+/// surface gained the `task.convergence` read and `InboxTaskFacts.convergence`
+/// — a consumer typed against `@3` reads the fact as unknown-absent, so the
+/// stamp moves with the new operation and the widened inbox shape.
+pub const SURFACE_VERSION: &str = "api-surface@4";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -162,6 +166,13 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "id_prefix, path",
             output: "WorkspaceDiffView{task, path, state, branch, baseline, tip, binary, size_bytes, diff, note}",
             description: "Readable unified diff of ONE changeset-listed file of the task's rework branch between exactly the baseline and tip task.workspace_changes used (same resolution, so list and diff are consistent by construction). A path outside the changeset is a typed not_found the consumer branches on by code; binary content is a binary fact with the stored size — raw bytes are never rendered. Mirrors `task workspace-diff`.",
+        },
+        OpDescriptor {
+            name: "task.convergence",
+            class: OpClass::Read,
+            input: "id_prefix",
+            output: "ConvergenceView{task, snapshot_at, gap_milli, reason, stages: Vec<StageConvergence{stage, series: Vec<ConvergencePoint>, counters, stage_total_seconds}>}",
+            description: "The convergence slice of the task: per repeatable stage (spec_review, then quality) the rounds read out of stored carrier artifacts — score/theta/threshold from the report body, requirements/OQ volume and verdict from the review round's bound spec, round and accumulated time from the execution rows. Modes (CONVERGING/PLATEAU/DIVERGING/STUCK) and their honest reasons are DATA computed from the series, never a model verdict; nothing is written and no score is re-derived. Mirrors `task convergence`.",
         },
         OpDescriptor {
             name: "task.report",
@@ -408,8 +419,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "inbox.snapshot",
             class: OpClass::Read,
             input: "()",
-            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note}>}",
-            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA). One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
+            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, convergence}>}",
+            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the convergence fact of the gate's stage (APPROVAL → spec_review, QA → quality; null in every other state). One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
         },
         // ---- questions ----
         OpDescriptor {
@@ -662,7 +673,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@3");
+        assert_eq!(SURFACE_VERSION, "api-surface@4");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -672,6 +683,28 @@ mod tests {
             rename.output.contains("human_name"),
             "the rename outcome shape must carry the signboard: {}",
             rename.output
+        );
+    }
+
+    #[test]
+    fn surface_version_v4_ships_the_convergence_slice() {
+        // Task 01a1b5be (REQ-CV-09): the increment and its stamp move
+        // together — the read operation joins the table and the inbox
+        // shape gains the fact a consumer of @3 does not know.
+        let conv = operations()
+            .into_iter()
+            .find(|o| o.name == "task.convergence")
+            .expect("@4 surface must publish task.convergence");
+        assert_eq!(conv.class, OpClass::Read);
+        assert!(conv.output.contains("ConvergenceView"));
+        let inbox = operations()
+            .into_iter()
+            .find(|o| o.name == "inbox.snapshot")
+            .expect("inbox.snapshot stays published");
+        assert!(
+            inbox.output.contains("convergence"),
+            "the inbox fact rides in the published shape: {}",
+            inbox.output
         );
     }
 

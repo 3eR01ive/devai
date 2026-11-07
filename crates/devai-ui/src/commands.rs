@@ -14,7 +14,7 @@ use tauri::State;
 
 use devai_api::{ActiveSnapshot, DependenciesView, ProgressView, QualityReportView, StatusView};
 use devai_api::{Api, ApiError, OpDescriptor};
-use devai_api::{InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts};
+use devai_api::{ConvergenceFact, ConvergenceView, InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts};
 use devai_api::{WorkspaceChangesView, WorkspaceDiffView};
 use devai_core::inbox::{
     InboxWaitPolicy, WHEN_NO_QUESTION, WHEN_PARKED_QUESTION, WaitGroup, WaitStatePolicy,
@@ -100,6 +100,11 @@ pub struct WaitRow {
     /// Honest fact when the QA row has no signable report (platform error
     /// text, never an empty hole).
     pub report_note: Option<String>,
+    /// The gate's convergence fact (REQ-CV-09): the stage of THIS row's
+    /// gate — spec_review for APPROVAL, quality for QA — with the series
+    /// the mini-chart draws and the last round's modes/reasons. `None` for
+    /// every state the platform does not sign at a gate.
+    pub convergence: Option<ConvergenceFact>,
 }
 
 /// The spec body as the gate presents it: the human paragraph and the
@@ -443,6 +448,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("task_progress", "task.progress"),
     ("task_dependencies", "task.dependencies"),
     ("task_report", "task.report"),
+    ("task_convergence", "task.convergence"),
     ("task_events", "task.events"),
     ("task_decisions", "task.decisions"),
     ("task_active", "task.active"),
@@ -544,6 +550,17 @@ pub fn task_report(
     id_prefix: String,
 ) -> Result<QualityReportView, UiError> {
     Ok(state.api().task_report(&id_prefix)?)
+}
+
+/// The convergence curve of the task (REQ-CV-09/10): per stage, the rounds
+/// read out of the store with their computed modes and reasons. The window
+/// draws these values as-is — nothing is recomputed on the UI side.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_convergence(
+    state: State<AppState>,
+    id_prefix: String,
+) -> Result<ConvergenceView, UiError> {
+    Ok(state.api().task_convergence(&id_prefix)?)
 }
 
 /// Event history, newest tail limited by the OPERATION's limit parameter
@@ -765,6 +782,7 @@ fn wait_row_from(
         spec,
         report,
         report_note,
+        convergence,
     } = facts;
     let open_questions: Vec<Question> = questions
         .into_iter()
@@ -782,6 +800,7 @@ fn wait_row_from(
         open_questions,
         report,
         report_note,
+        convergence,
     }))
 }
 
@@ -885,6 +904,35 @@ mod tests {
             assert!(
                 !src.contains(needle.as_str()),
                 "{file}: direct store import — the API is the only door"
+            );
+        }
+    }
+
+    #[test]
+    fn convergence_chart_stays_static_and_dependency_free() {
+        // REQ-CV-10 AC4: инлайн-SVG без интерактива и без chart-зависимостей.
+        // Источник читается как текст — это дешёвая страховка от «одного
+        // клика для подсказки» и от тихой замены на библиотеку графиков.
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let chart = std::fs::read_to_string(format!(
+            "{crate_dir}/frontend/src/components/ConvergenceChart.vue"
+        ))
+        .unwrap();
+        for forbidden in ["@click", "@mouseover", "@mouseenter", "@keydown", "v-on:"] {
+            assert!(
+                !chart.contains(forbidden),
+                "the convergence chart must stay non-interactive: found `{forbidden}`"
+            );
+        }
+        let package: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{crate_dir}/frontend/package.json")).unwrap(),
+        )
+        .unwrap();
+        let deps = package["dependencies"].as_object().unwrap();
+        for name in deps.keys() {
+            assert!(
+                !name.contains("chart") && !name.contains("d3") && !name.contains("plot"),
+                "no chart library may join the frontend: found `{name}`"
             );
         }
     }
@@ -1331,6 +1379,7 @@ mod tests {
             spec: None,
             report: None,
             report_note: None,
+            convergence: None,
         }
     }
 
@@ -1461,6 +1510,7 @@ mod tests {
             spec: Some(presentation.clone()),
             report: None,
             report_note: None,
+            convergence: None,
         };
         let snapshot = WaitSnapshot {
             waiting: vec![row],
@@ -1685,6 +1735,7 @@ mod tests {
             spec: None,
             report: None,
             report_note: None,
+            convergence: None,
         }
     }
 
@@ -1837,6 +1888,54 @@ mod tests {
                 !snapshot.waiting.iter().any(|r| r.task.state == state)
                     && !snapshot.human_stopped.iter().any(|r| r.task.state == state),
                 "{state:?} must not be a wait row"
+            );
+        }
+    }
+
+    /// The gate's convergence fact survives the composer untouched: the row
+    /// carries exactly the stage/reasons the batch read produced, and a row
+    /// without a fact carries `None` (REQ-CV-09/10 — membership of the chart
+    /// is decided by the platform's state table, never by the renderer).
+    #[test]
+    fn composer_carries_the_gate_convergence_fact() {
+        let (mut facts, _, _) = composer_fixture();
+        let fact = devai_api::ConvergenceFact {
+            stage: "quality".into(),
+            gap_milli: 10,
+            rounds: 1,
+            series: vec![devai_api::ConvergenceTick {
+                round: 1,
+                measured: true,
+                score_milli: Some(940),
+                theta_milli: Some(950),
+                requirements_count: None,
+                oq_count: None,
+                modes: vec![],
+            }],
+            modes: vec![],
+            mode_note: Some("no_predecessor".into()),
+            missing: vec![],
+        };
+        let qa = facts
+            .tasks
+            .iter_mut()
+            .find(|f| f.task.state == TaskState::Qa)
+            .expect("fixture has a QA task");
+        qa.convergence = Some(fact.clone());
+
+        let snapshot = compose_wait_snapshot(facts).unwrap();
+        let row = snapshot
+            .waiting
+            .iter()
+            .find(|r| r.task.state == TaskState::Qa)
+            .unwrap();
+        let carried = row.convergence.as_ref().expect("fact rides the row");
+        assert_eq!(carried.stage, "quality");
+        assert_eq!(carried.series[0].score_milli, Some(940));
+        for other in snapshot.waiting.iter().filter(|r| r.task.state != TaskState::Qa) {
+            assert!(
+                other.convergence.is_none(),
+                "states outside the two gates carry no chart"
             );
         }
     }

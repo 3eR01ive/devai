@@ -115,6 +115,7 @@
         ],
         "report": null,
         "report_note": null,
+        "convergence": null,
         "spec": {
           "artifact": {
             "category": "ARTIFACT",

@@ -18,11 +18,16 @@
 //! per the human-ratified cycle-2 answer to Q2: the prohibition on direct
 //! store access in consumers is total.
 
+pub mod convergence;
 mod error;
 mod inbox;
 mod mutations;
 mod registry;
 
+pub use convergence::{
+    ConvergenceCounters, ConvergenceFact, ConvergencePoint, ConvergenceTick, ConvergenceView,
+    GAP_MILLI, STAGE_QUALITY, STAGE_SPEC_REVIEW, StageConvergence, stage_for_state,
+};
 pub use error::{ApiError, ApiResult, ErrorCode};
 pub use inbox::{
     InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts, factory_inbox_wait_policy,
@@ -338,7 +343,19 @@ impl Api {
         })
     }
 
-    /// The human-wait section in ONE batch read (REQ-GATE-01..10): the
+    /// The convergence slice of one task (task 01a1b5be, REQ-CV-09): per
+/// repeatable stage, the rounds read out of stored carriers — a computed
+/// read, nothing written (REQ-CV-01). The task page draws every stage it
+/// answers; the human-wait row draws the one stage of its gate.
+pub fn task_convergence(&self, id_prefix: &str) -> ApiResult<ConvergenceView> {
+    let t = self.store.resolve_task(id_prefix)?;
+    let arts = self.store.artifacts(t.id)?;
+    let execs = self.store.list_executions(Some(t.id))?;
+    let read = |a: &Artifact| self.store.read_artifact_body(a);
+    Ok(convergence::compute(t.id, &arts, &execs, &read))
+}
+
+/// The human-wait section in ONE batch read (REQ-GATE-01..10): the
     /// declarative demand table of this home plus every task's stored
     /// questions and gate presentation. One store snapshot per data type
     /// (tasks / questions / artifacts) instead of a per-task fan-out — the
@@ -369,10 +386,14 @@ impl Api {
         // index (remove) is safe and avoids cloning every row.
         let mut questions = group_by_task(self.store.questions_all()?, |q| q.task_id);
         let mut artifacts = group_by_task(self.store.artifacts_all()?, |a| a.task_id);
+        // ONE execution snapshot for the whole section: the convergence
+        // fact of a gate row needs the rows its carriers name, and a
+        // per-row query would put the fan-out back (REQ-CV-09 AC5).
+        let mut executions = group_by_task(self.store.list_executions(None)?, |e| e.task_id);
 
         let facts = tasks
             .into_iter()
-            .map(|task| self.task_facts(task, &mut questions, &mut artifacts))
+            .map(|task| self.task_facts(task, &mut questions, &mut artifacts, &mut executions))
             .collect::<ApiResult<Vec<_>>>()?;
 
         Ok(InboxSnapshotView {
@@ -389,17 +410,45 @@ impl Api {
         task: Task,
         questions: &mut TaskIndex<Question>,
         artifacts: &mut TaskIndex<Artifact>,
+        executions: &mut TaskIndex<RoleExecution>,
     ) -> ApiResult<InboxTaskFacts> {
         let owned_questions = questions.remove(&task.id).unwrap_or_default();
         let owned_artifacts = artifacts.remove(&task.id).unwrap_or_default();
+        let owned_executions = executions.remove(&task.id).unwrap_or_default();
         let (spec, report, report_note) = self.gate_presentation(&task, &owned_artifacts)?;
+        let convergence = self.convergence_fact(&task, &owned_artifacts, &owned_executions);
         Ok(InboxTaskFacts {
             task,
             questions: owned_questions,
             spec,
             report,
             report_note,
+            convergence,
         })
+    }
+
+    /// The gate row's convergence fact (REQ-CV-09): only the two signable
+    /// gates carry one — APPROVAL reads the spec_review stage, QA the
+    /// quality stage. Computed in the same batch from the already-grouped
+    /// rows; a stage with no carrier still answers an EMPTY fact of its
+    /// stage (rounds 0), so the row can say «кругов пока нет» instead of
+    /// pretending convergence is not applicable here.
+    fn convergence_fact(
+        &self,
+        task: &Task,
+        arts: &[Artifact],
+        execs: &[RoleExecution],
+    ) -> Option<ConvergenceFact> {
+        let stage = stage_for_state(task.state)?;
+        let read = |a: &Artifact| self.store.read_artifact_body(a);
+        let view = convergence::compute(task.id, arts, execs, &read);
+        Some(
+            view.stages
+                .iter()
+                .find(|s| s.stage == stage)
+                .map(ConvergenceFact::of_stage)
+                .unwrap_or_else(|| ConvergenceFact::empty(stage)),
+        )
     }
 
     /// The gate presentation for the stored state that presents one:

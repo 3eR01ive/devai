@@ -26,6 +26,9 @@ import {
 } from "../inbox";
 import { TaskStateToken } from "../states";
 import WaitTaskHeader from "../components/WaitTaskHeader.vue";
+import ConvergenceChart from "../components/ConvergenceChart.vue";
+import type { ChartPoint } from "../convergence_view";
+import type { ConvergenceFact } from "../types";
 
 // Сколько символов машинного JSON показывать, когда у quality-отчёта нет
 // человеческой части: одна строка-факт, не дамп.
@@ -51,6 +54,22 @@ function toggle(taskId: string) {
 function applyInterval(ms: number) {
   setPollMs(ms);
   setWaitInterval(ms);
+}
+
+// Факт гейта → серия графика. Значения (балл, порог, объём, режимы)
+// приходят посчитанными; строка «Ожидания» не несёт profile — линию на
+// границе сегмента она не рвёт (это делает страница задачи).
+function chartOf(fact: ConvergenceFact): ChartPoint[] {
+  return fact.series.map((t) => ({
+    round: t.round,
+    measured: t.measured,
+    score_milli: t.score_milli,
+    theta_milli: t.theta_milli,
+    requirements_count: t.requirements_count,
+    oq_count: t.oq_count,
+    modes: t.modes,
+    profile: null,
+  }));
 }
 
 onMounted(() => {
@@ -104,6 +123,20 @@ onUnmounted(() => unsubscribe?.());
               {{ isExpanded(row.task.id) ? "свернуть" : "показать" }}
             </span>
           </p>
+
+          <!-- Мини-график сходимости стадии гейта (REQ-CV-10): null —
+               строки вне двух подписываемых гейтов, графика и плейсхолдера
+               у них нет вовсе. -->
+          <div v-if="row.convergence" class="conv-mini">
+            <ConvergenceChart
+              :stage="row.convergence.stage"
+              :series="chartOf(row.convergence)"
+              :gap-milli="row.convergence.gap_milli"
+              :modes="row.convergence.modes"
+              :mode-note="row.convergence.mode_note"
+              :missing="row.convergence.missing"
+            />
+          </div>
 
           <template v-if="isExpanded(row.task.id)">
             <!-- APPROVAL: предъявление спеки — абзац и её открытые вопросы
