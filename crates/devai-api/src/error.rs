@@ -82,7 +82,7 @@ impl ApiError {
     }
 }
 
-fn store_code(e: &StoreError) -> ErrorCode {
+pub(crate) fn store_code(e: &StoreError) -> ErrorCode {
     match e {
         StoreError::NotFound(..) => ErrorCode("not_found"),
         StoreError::Ambiguous(..) => ErrorCode("ambiguous"),

@@ -3,6 +3,13 @@
     "code": "not_found",
     "message": "task `x1` was not found"
   },
+  "session_info": {
+    "home": "/home/op/project/.devai",
+    "actor": "op",
+    "opened_at": "2026-11-06T12:00:00Z",
+    "control_home": "/home/op/.devai",
+    "degraded_from": null
+  },
   "artifact_text": {
     "shape": "text",
     "artifact_id": "01a1aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -184,5 +191,33 @@
     ],
     "paragraph_source": "spec",
     "unavailable_note": null
+  },
+  "home_record": {
+    "path": "/home/op/project/.devai",
+    "project": "tripsales",
+    "project_source": "store",
+    "project_error": null,
+    "added_at": "2026-11-06T12:00:00Z",
+    "enabled": true,
+    "active": false,
+    "available": true,
+    "schema_version": 8,
+    "version_note": null,
+    "read_error": null
+  },
+  "home_projects_view": {
+    "snapshot_at": "2026-11-06T12:00:00Z",
+    "home_path": "/home/op/project/.devai",
+    "home_project": "tripsales",
+    "is_active": false,
+    "available": false,
+    "version_note": null,
+    "error": {
+      "code": "home_no_store",
+      "path": "/home/op/project/.devai",
+      "message": "no store",
+      "hint": "initialise the store (`devai init`) or add another path"
+    },
+    "records": []
   }
 }

@@ -14,13 +14,44 @@ pub mod seed;
 pub use bundle::{BundleManifest, ImportOutcome};
 pub use error::{StoreError, StoreResult};
 
+/// The ONE name of the home's store file (arch/no-magic: the homes cycle
+/// spread this literal across api/ui consumers; every join site now reads
+/// this constant, so renaming the file is a one-line act with the grep
+/// proof in the store itself).
+pub const DB_FILE_NAME: &str = "devai.db";
+
+/// The project-home dogma directory name (`<project>/.devai`, ratified
+/// OQ-HOME-1 wording): the layout fact lives with the layout owner — the
+/// store — and the API/UI reach it through re-exports instead of
+/// re-spelling the shape rule.
+pub const HOME_DIR_NAME: &str = ".devai";
+
+/// The home's project label derived from the DIRECTORY SHAPE only: a path
+/// ending in `/.devai` names its parent directory (`<project>/.devai`).
+/// None for any other shape — callers keep their own fallback. This is the
+/// mechanical half of the label rule; reading the home's own project rows
+/// stays an API concern (`label_for` in devai-api).
+pub fn project_label_from_path(root: &Path) -> Option<String> {
+    let raw = root.display().to_string();
+    let suffix = ["/", HOME_DIR_NAME].concat();
+    if raw.ends_with(&suffix) {
+        let parent = raw.trim_end_matches(&suffix[..]);
+        if let Some(name) = Path::new(parent).file_name() {
+            return Some(name.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use devai_core::types::*;
 use devai_core::workflow::Mutation;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -144,6 +175,96 @@ pub struct Store {
     pub(crate) conn: Connection,
     root: PathBuf,
     pub(crate) blobs: PathBuf,
+    /// Cached column verdict of `tasks.human_name` for THIS handle (a
+    /// property of the stored schema rank, asked once — R1 quality return:
+    /// a home behind this build is READ, not failed on a missing column).
+    task_human_name: std::cell::OnceCell<bool>,
+}
+
+/// Reader handle of an EXISTING home for observation: strictly read-only
+/// first (no file handle can write); a WAL home whose wal-index cannot be
+/// built read-only (shm missing) falls back to a read-write handle pinned
+/// with `query_only=ON` — statements still cannot mutate rows, tables or
+/// the schema version. A missing `devai.db` refuses, never creates.
+fn reader_conn(db: &Path) -> StoreResult<Connection> {
+    if !db.exists() {
+        return Err(StoreError::NotFound(
+            "home store".into(),
+            format!("{} — open_read_only never creates a home", db.display()),
+        ));
+    }
+    match Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(c) => Ok(c),
+        Err(_) => {
+            let c = Connection::open(db)?;
+            c.pragma_update(None, "query_only", "ON")?;
+            Ok(c)
+        }
+    }
+}
+
+/// The stored rank of a reader handle, refusing at 0: a file without the
+/// devai schema is not an initialised home, and the observer never seeds
+/// one. Any non-zero rank — behind or ahead of this build — is readable.
+fn read_initialised_rank(conn: &Connection, db: &Path) -> StoreResult<i64> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == 0 {
+        return Err(StoreError::NotFound(
+            "home store schema".into(),
+            format!(
+                "{} carries no devai schema — it is not an initialised home",
+                db.display()
+            ),
+        ));
+    }
+    Ok(version)
+}
+
+/// Generic ladder executor (REQ-004, registry-in-data): walk the manifest
+/// rungs from the stored version up to SCHEMA_VERSION. Which rung runs
+/// next, what SQL it ships and which handler applies it are READ FROM THE
+/// MANIFEST DATA — adding a schema version appends a
+/// `migrations/manifest.json` record and never grows a branch here.
+fn run_ladder(conn: &mut Connection, version: i64) -> StoreResult<()> {
+    // ONE `BEGIN IMMEDIATE … COMMIT` per rung: the DDL, the backfill
+    // UPDATEs, the repair events and the `user_version` bump land atomically
+    // together — a crash can never leave a half-repaired group (REQ-003
+    // acceptance "сбой посреди ранга"). Rungs are additionally idempotent,
+    // so a database found in a hypothetical partial form (index present,
+    // version behind) is carried to completion instead of aborted.
+    let rungs = schema_rungs();
+    let mut from = version;
+    while from < SCHEMA_VERSION {
+        let step = rungs
+            .iter()
+            .find(|s| s.from == from)
+            .ok_or(StoreError::SchemaVersion {
+                found: from,
+                expected: SCHEMA_VERSION,
+            })?;
+        let apply = applier_for(step)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        apply(&tx, step)?;
+        tx.pragma_update(None, "user_version", step.to)?;
+        tx.commit()?;
+        from = step.to;
+    }
+    Ok(())
+}
+
+/// The behavior behind a manifest tag. Fail loud when the catalog names a
+/// handler this build does not know — never silently skip a promised rung.
+fn applier_for(step: &SchemaRung) -> StoreResult<RungApply> {
+    RUNG_APPLIERS
+        .iter()
+        .find(|(name, _)| *name == step.apply)
+        .map(|(_, f)| *f)
+        .ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "manifest rung `{}` names unknown apply handler `{}` — refusing to run a migration it cannot describe",
+                step.id, step.apply
+            ))
+        })
 }
 
 impl Store {
@@ -151,7 +272,7 @@ impl Store {
         std::fs::create_dir_all(root)?;
         let blobs = root.join("blobs");
         std::fs::create_dir_all(&blobs)?;
-        let mut conn = Connection::open(root.join("devai.db"))?;
+        let mut conn = Connection::open(root.join(DB_FILE_NAME))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -165,44 +286,52 @@ impl Store {
                 expected: SCHEMA_VERSION,
             });
         } else {
-            // Generic ladder executor (REQ-004, registry-in-data): walk the
-            // manifest rungs from the stored version up to SCHEMA_VERSION.
-            // Which rung runs next, what SQL it ships and which handler
-            // applies it are READ FROM THE MANIFEST DATA — adding a schema
-            // version appends a `migrations/manifest.json` record and never
-            // grows a branch here. ONE `BEGIN IMMEDIATE … COMMIT` per rung:
-            // the DDL, the backfill UPDATEs, the repair events and the
-            // `user_version` bump land atomically together — a crash can
-            // never leave a half-repaired group (REQ-003 acceptance "сбой
-            // посреди ранга"). Rungs are additionally idempotent, so a
-            // database found in a hypothetical partial form (index present,
-            // version behind) is carried to completion instead of aborted.
-            let rungs = schema_rungs();
-            let mut from = version;
-            while from < SCHEMA_VERSION {
-                let step =
-                    rungs
-                        .iter()
-                        .find(|s| s.from == from)
-                        .ok_or(StoreError::SchemaVersion {
-                            found: from,
-                            expected: SCHEMA_VERSION,
-                        })?;
-                // Fail loud on a manifest tag with no behavior behind it —
-                // never silently skip a rung the catalog promised to run.
-                let apply = RUNG_APPLIERS.iter().find(|(name, _)| *name == step.apply).map(|(_, f)| *f).ok_or_else(|| StoreError::Corrupt(format!("manifest rung `{}` names unknown apply handler `{}` — refusing to run a migration it cannot describe", step.id, step.apply)))?;
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                apply(&tx, step)?;
-                tx.pragma_update(None, "user_version", step.to)?;
-                tx.commit()?;
-                from = step.to;
-            }
+            run_ladder(&mut conn, version)?;
         }
         Ok(Store {
             conn,
             root: root.to_path_buf(),
             blobs,
+            task_human_name: std::cell::OnceCell::new(),
         })
+    }
+
+    /// Observation open (REQ-HOME-09): read an EXISTING home without ever
+    /// mutating it. This is the one entry that never creates directories,
+    /// never seeds, never runs the migration ladder and never bumps
+    /// `user_version`: a store of any schema rank — behind or ahead of this
+    /// build — is opened as it is, so an observer cannot migrate a foreign
+    /// home by the act of opening it. A home newer than the binary is
+    /// readable here (its rows still load; the version is reported through
+    /// [`Store::schema_version`] and stamped by the caller), a home with no
+    /// `devai.db` refuses with `NotFound` — never a silent creation.
+    ///
+    /// The open is attempted strictly read-only first (no file handle can
+    /// write); WAL homes whose wal-index cannot be initialised from a
+    /// read-only connection fall back to a read-write handle pinned with
+    /// `PRAGMA query_only=ON` — statements still cannot mutate rows,
+    /// tables or the schema version. The single-writer guard of a live
+    /// engine inside the home is untouched (REQ-HOME-06): this handle is a
+    /// WAL reader next to it, best-effort snapshot semantics.
+    pub fn open_read_only(root: &Path) -> StoreResult<Store> {
+        let db = root.join(DB_FILE_NAME);
+        let conn = reader_conn(&db)?;
+        read_initialised_rank(&conn, &db)?;
+        Ok(Store {
+            conn,
+            root: root.to_path_buf(),
+            blobs: root.join("blobs"),
+            task_human_name: std::cell::OnceCell::new(),
+        })
+    }
+
+    /// The stored schema rank of this handle (`PRAGMA user_version`). Read
+    /// as data, never compared-and-repaired here: the OBSERVER stamps the
+    /// verdict into its own record (REQ-HOME-09: version + path as cause).
+    pub fn schema_version(&self) -> StoreResult<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 
     pub fn root(&self) -> &Path {
@@ -411,11 +540,51 @@ impl Store {
         )?)
     }
 
+    /// Does this store carry `column` on `table`? Asked per HANDLE: the
+    /// answer is a property of the stored schema rank, not of the query, and
+    /// a read must not re-derive it every time (REQ-HOME-09).
+    fn has_column(&self, table: &str, column: &str) -> StoreResult<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The task projection this store can answer: a home OBSERVED by this
+    /// build may be behind it (v8 has no `tasks.human_name`), and a merged
+    /// view of such a home must READ its rows, not fail on the missing
+    /// column (REQ-HOME-08 AC3 / REQ-HOME-09, R1 quality return). The
+    /// absent column is projected as a typed NULL in the same position, so
+    /// every task row mapper stays one shape. Probe cached per handle.
+    fn task_projection(&self) -> StoreResult<&'static str> {
+        let present = match self.task_human_name.get() {
+            Some(v) => *v,
+            None => {
+                let v = self.has_column("tasks", "human_name")?;
+                let _ = self.task_human_name.set(v);
+                v
+            }
+        };
+        Ok(if present {
+            "id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name"
+        } else {
+            "id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,NULL AS human_name"
+        })
+    }
+
     pub fn get_task(&self, id: &str) -> StoreResult<Task> {
         rows::unwrap_row(
             self.conn
                 .query_row(
-                    "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name FROM tasks WHERE id = ?1",
+                    &format!(
+                        "SELECT {} FROM tasks WHERE id = ?1",
+                        self.task_projection()?
+                    ),
                     params![id],
                     |r| rows::r2sql(rows::task_from_row(r)),
                 )
@@ -426,10 +595,10 @@ impl Store {
 
     /// Resolves a task by a unique id prefix (human-friendly CLI usage).
     pub fn resolve_task(&self, prefix: &str) -> StoreResult<Task> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name
-             FROM tasks WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 2",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM tasks WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 2",
+            self.task_projection()?
+        ))?;
         let mut rows = stmt.query(params![prefix.to_lowercase()])?;
         let mut found: Vec<Task> = Vec::new();
         while let Some(r) = rows.next()? {
@@ -447,10 +616,10 @@ impl Store {
     }
 
     pub fn list_tasks(&self) -> StoreResult<Vec<Task>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id,project_id,title,business_description,state,return_state,requirements_seq,lock_version,created_at,updated_at,human_name
-             FROM tasks ORDER BY updated_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM tasks ORDER BY updated_at DESC",
+            self.task_projection()?
+        ))?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -4015,5 +4184,105 @@ mod single_writer_tests {
             ),
             other => panic!("expected SingleWriterBusy, got {other:?}"),
         }
+    }
+
+    /// REQ-HOME-09: an observation open never migrates and never creates.
+    /// A lagging store (here: rank 7, the shape the tripsales home really
+    /// carries) opens as it is — rows readable, `user_version` untouched,
+    /// no blobs directory materialised, the ladder never runs.
+    #[test]
+    fn read_only_open_never_migrates_and_never_creates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lagging = dir.path().join("lagging");
+        std::fs::create_dir_all(&lagging).unwrap();
+        {
+            let conn = Connection::open(lagging.join("devai.db")).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version=7;
+                 CREATE TABLE projects(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                   description TEXT NOT NULL DEFAULT '', repos TEXT NOT NULL DEFAULT '[]',
+                   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects(id,name,created_at,updated_at) VALUES('p1','lagging','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open_read_only(&lagging).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 7);
+        let n: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "rows of the lagging home are readable");
+        drop(store);
+        let conn =
+            Connection::open_with_flags(lagging.join("devai.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v, 7,
+            "open_read_only never runs the ladder or bumps the rank"
+        );
+        assert!(
+            !lagging.join("blobs").exists(),
+            "the observer creates no directories inside the observed home"
+        );
+    }
+
+    /// REQ-HOME-09: a store whose rank is AHEAD of this binary is
+    /// observable — never a `SchemaVersion` startup failure. The observer
+    /// reports the rank; stamping the cause is the caller's job.
+    #[test]
+    fn read_only_open_tolerates_a_newer_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("ahead");
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            // Store::open would refuse this rank (SchemaVersion); the
+            // hand-built db proves the reader is gate-free.
+            let conn = Connection::open(root.join("devai.db")).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version=9999; CREATE TABLE projects(id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+        let store = Store::open_read_only(&root).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 9999);
+    }
+
+    /// The observation open never creates a home: an absent store file is
+    /// a typed `NotFound`, not a silent initialization (REQ-HOME-03 AC3
+    /// feeds exactly this refusal to the add-dialog error path).
+    #[test]
+    fn read_only_open_refuses_missing_store_and_schemaless_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nowhere");
+        assert!(matches!(
+            Store::open_read_only(&missing),
+            Err(StoreError::NotFound(..))
+        ));
+        let naked = dir.path().join("naked");
+        std::fs::create_dir_all(&naked).unwrap();
+        {
+            let conn = Connection::open(naked.join("devai.db")).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated(x);").unwrap();
+            drop(conn);
+        }
+        assert!(matches!(
+            Store::open_read_only(&naked),
+            Err(StoreError::NotFound(..))
+        ));
+        assert!(
+            std::fs::read_dir(&naked)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name() == "devai.db"),
+            "the probe ran while the file stayed exactly where it was"
+        );
     }
 }

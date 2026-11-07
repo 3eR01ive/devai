@@ -19,15 +19,29 @@
 //! store access in consumers is total.
 
 mod error;
+mod homes;
 mod inbox;
 mod mutations;
 mod registry;
 
+/// Machine codes of the homes vocabulary — one dictionary, referenced by
+/// producers here and by the UI bootstrap (R3 quality return).
+pub mod codes;
+
 pub use error::{ApiError, ApiResult, ErrorCode};
+pub use homes::{
+    HOME_ENTRY_SCHEMA, HOME_ISSUE_SCHEMA, HOME_RECORD_SCHEMA, HOME_VIEW_SCHEMA, HOMES_FILE,
+    HOMES_FORMAT_VERSION, HOMES_LOCK_FILE, HomeEntry, HomeIssue, HomeRecord, HomeRecordsView,
+    Homes, LaunchResolution, ProjectSource, schema_names,
+};
 pub use inbox::{
     InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts, factory_inbox_wait_policy,
     pick_spec_artifact,
 };
+// The home-layout facts of the store crate, re-exported so the UI reaches
+// them through the API door only (REQ-UI-02: the UI graph must not gain a
+// devai-store dependency to name `devai.db` or `.devai` correctly).
+pub use devai_store::{DB_FILE_NAME, HOME_DIR_NAME};
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
     ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
@@ -87,6 +101,51 @@ impl Api {
             home: home.to_path_buf(),
             actor: actor.to_string(),
         })
+    }
+
+    /// Observation entry (REQ-HOME-09): the same handle shape as
+    /// `Api::open`, but backed by the store's read-only observation open.
+    /// The home is read exactly as it is on disk, whatever its schema
+    /// rank — no directory creation, no seeding, no migration ladder, no
+    /// `user_version` bump. This is the entry `home.activate` uses: taking
+    /// the stored-active marker is a REGISTRY act, and it must never
+    /// migrate a home of another version by the act of opening it (the
+    /// ratified OQ-HOME-1/REQ-HOME-09 rule, RA1 quality return).
+    pub fn open_observed(home: &Path, actor: &str) -> ApiResult<Api> {
+        Ok(Api {
+            store: Store::open_read_only(home)?,
+            home: home.to_path_buf(),
+            actor: actor.to_string(),
+        })
+    }
+
+    /// The `home.activate` transaction as ONE API-plane act (the homes
+    /// cycle QA, da/architecture-consistency: the validate→reopen→commit
+    /// orchestration is platform mechanics, not consumer mechanics):
+    ///   1. validate the registry record (`Homes::activation_target`);
+    ///   2. re-probe right before the reopen — `Api::open` BOOTSTRAPS
+    ///      (creates) a home, so an activation may only aim at a store
+    ///      that is on disk at this very moment; a vanished home is never
+    ///      silently resurrected as an empty one (REQ-HOME-07);
+    ///   3. reopen the chosen home as an OBSERVATION (`Api::open_observed`
+    ///      over `Store::open_read_only`): the operator's activation is a
+    ///      selection of what to watch, never a migration of the observed
+    ///      store — a home behind or ahead of this build is opened with
+    ///      its rank untouched (`home.list` stamps the version note);
+    ///   4. only then commit the stored-active flip in the registry.
+    /// A failed reopen returns before step 4, so the registry can never
+    /// point at a home the caller does not hold (REQ-HOME-06 AC1).
+    pub fn activate_home(homes: &mut Homes, path: &str, actor: &str) -> ApiResult<Api> {
+        let target = homes.activation_target(path)?;
+        if !target.join(devai_store::DB_FILE_NAME).exists() {
+            return Err(ApiError::refused(
+                codes::HOME_UNAVAILABLE,
+                format!("home {} disappeared during activation", target.display()),
+            ));
+        }
+        let api = Api::open_observed(&target, actor)?;
+        homes.set_active(&target)?;
+        Ok(api)
     }
 
     pub fn actor(&self) -> &str {

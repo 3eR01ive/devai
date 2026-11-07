@@ -5,15 +5,23 @@
 //! passed through exactly as `devai-api` produced them
 //! (store-is-cache / no read-time rederivation).
 //!
-//! The UI is read-only in this iteration (OQ-UI-6 ratified): no command
-//! here touches a Mutation-class operation. The mapping table
-//! `COMMAND_OPERATIONS` + its test pin that dogmatically.
+//! The UI is read-only for DOMAIN data in this iteration (OQ-UI-6
+//! ratified, read as clarified by the homes cycle: "read-only" means no
+//! task/gate mutations — those live in the CLI). The homes REGISTRY plane
+//! is a separate, allowed class of platform operations (REQ-HOME-06):
+//! `home.add`, `home.set_enabled`, `home.activate` write ONLY the
+//! registry file of the control home and never touch any home's domain
+//! rows. The mapping tables pin the split: `COMMAND_OPERATIONS` maps the
+//! data commands to published Read operations, `COMMAND_REGISTRY_OPERATIONS`
+//! maps the management commands to the home-plane Registry operations —
+//! no Mutation-class operation is reachable from either.
 
 use serde::Serialize;
 use tauri::State;
 
+use chrono::Utc;
 use devai_api::{ActiveSnapshot, DependenciesView, ProgressView, QualityReportView, StatusView};
-use devai_api::{Api, ApiError, OpDescriptor};
+use devai_api::{Api, ApiError, HomeRecord, HomeRecordsView, OpDescriptor};
 use devai_api::{InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts};
 use devai_api::{WorkspaceChangesView, WorkspaceDiffView};
 use devai_core::inbox::{
@@ -23,14 +31,16 @@ use devai_core::types::{
     Artifact, Decision, Project, Question, QuestionStatus, RoleExecution, Task, TaskState, short_id,
 };
 
-use crate::session::SessionInfo;
+use crate::session::{HomeFailure, SessionInfo};
 
 /// Shared state: the open `Api` session behind a mutex (the API takes
 /// `&self`; the store is WAL — concurrent readers with the engine are the
-/// ratified shape, REQ-UI-12), plus the facts for the status bar.
+/// ratified shape, REQ-UI-12), the homes registry of the control home
+/// (REQ-HOME-01), plus the facts for the status bar.
 pub struct AppState {
     pub api: std::sync::Mutex<Api>,
-    pub session: SessionInfo,
+    pub homes: std::sync::Mutex<devai_api::Homes>,
+    pub session: std::sync::Mutex<SessionInfo>,
 }
 
 impl AppState {
@@ -38,6 +48,14 @@ impl AppState {
         // Poisoned only if a command panicked mid-call; the reads leave no
         // mutation, so the handle is still sound.
         self.api.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn homes(&self) -> std::sync::MutexGuard<'_, devai_api::Homes> {
+        self.homes.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn session(&self) -> std::sync::MutexGuard<'_, SessionInfo> {
+        self.session.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -432,7 +450,16 @@ pub const COMMAND_CONTRACTS: &[CommandContract] = &[CommandContract {
 /// The (command → registry operation) mapping. Every data command is
 /// backed by a published Read operation; `session_info` is bootstrap state
 /// (`Api::open`, the ratified OQ-10 exception), not an operation.
-#[allow(dead_code)] // consumed by the test below + mirrors OpsView's `used` list
+///
+/// A new UI command touches FIVE places — the published table in
+/// `devai-api/registry.rs`, the two COMMAND_* tables here, `generate_handler!`
+/// in main.rs, and the frontend pair (api.ts + types.ts). None of them can
+/// half-land silently: the CLI's `match OpClass` is compile-guarded,
+/// `frontend_invokes_are_exactly_mapped_reads` guards the frontend→table
+/// direction, `every_published_home_operation_is_wired_into_the_ui` guards
+/// the registry→table direction (mt/change-isolation: the checklist is
+/// explicit and every entry has a mechanical keeper).
+#[allow(dead_code)] // consumed by the tests below + mirrors OpsView's `used` list
 pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("registry_operations", "api.registry"),
     ("projects_list", "project.list"),
@@ -458,16 +485,35 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // `inbox.snapshot` carries the demand table, the questions and the gate
     // presentations in a single call, so the IPC cost per row is O(1).
     ("inbox_view", "inbox.snapshot"),
+    // Merged multi-home reads (REQ-HOME-04/05): live attributed views over
+    // the enabled homes of the registry, published as home-plane Reads.
+    ("homes_list", "home.list"),
+    ("projects_all", "home.projects_all"),
+    ("tasks_all", "home.tasks_all"),
+];
+
+/// The registry MANAGEMENT mapping (REQ-HOME-05: reading domain records
+/// and managing the registry are separate classes and never mix in one
+/// operation). These commands call Registry-class operations whose single
+/// writable target is `homes.json` of the control home — no command here
+/// mutates any home's domain rows, and none reaches a Mutation-class op.
+#[allow(dead_code)] // consumed by the separation test below
+pub const COMMAND_REGISTRY_OPERATIONS: &[(&str, &str)] = &[
+    ("homes_add", "home.add"),
+    ("homes_set_enabled", "home.set_enabled"),
+    ("homes_activate", "home.activate"),
 ];
 
 // ---------------------------------------------------------------------
 // session / registry
 // ---------------------------------------------------------------------
 
-/// Bootstrap facts for the title/status bar (REQ-UI-01 AC3).
+/// Bootstrap facts for the title/status bar (REQ-UI-01 AC3, plus the
+/// homes-cycle facts: where the registry lives and whether the session is
+/// in a degraded observation open).
 #[tauri::command]
 pub fn session_info(state: State<AppState>) -> SessionInfo {
-    state.session.clone()
+    state.session().clone()
 }
 
 /// `api.registry` — the published operation contract, shown in the UI so
@@ -475,6 +521,221 @@ pub fn session_info(state: State<AppState>) -> SessionInfo {
 #[tauri::command]
 pub fn registry_operations(state: State<AppState>) -> Result<Vec<OpDescriptor>, UiError> {
     Ok(state.api().api_registry())
+}
+
+// ---------------------------------------------------------------------
+// homes registry (REQ-HOME-01…09)
+// ---------------------------------------------------------------------
+
+/// `home.list` — the stored registry with live-probed attributes
+/// (availability, schema rank, version/read cause). Absent homes stay
+/// visible with their path; nothing is invented (REQ-HOME-07).
+#[tauri::command]
+pub fn homes_list(state: State<AppState>) -> Result<Vec<HomeRecord>, UiError> {
+    Ok(state.homes().records()?)
+}
+
+/// `home.add` — register an existing devai home. Writes only the registry
+/// record into the control home; a missing directory or a directory
+/// without a store refuses with the platform's typed error and the window
+/// keeps running (REQ-HOME-03 AC3).
+#[tauri::command(rename_all = "snake_case")]
+pub fn homes_add(state: State<AppState>, path: String) -> Result<HomeRecord, UiError> {
+    Ok(state.homes().add(std::path::Path::new(&path))?)
+}
+
+/// `home.set_enabled` — include/exclude a home without restarting the
+/// process (REQ-HOME-03). Removal from the view IS disabling; the record
+/// and the home's data on disk survive (ratified OQ-HOME-3).
+///
+/// Ratified OQ-HOME-8: disabling the ACTIVE home is allowed and its
+/// outcome is defined by the platform (next enabled record, or no active
+/// home at all). This command therefore also follows the stored marker:
+/// the session reopens the home the registry now names. When no home
+/// remains active the session DEGRADES to observing the control home and
+/// reports the honest `home_none_active` fact — and the control home may
+/// itself be a record the operator has switched off (it is the home the
+/// registry file lives in, not necessarily an enabled record), so "the
+/// handle follows the registry" is the guarantee, not "the handle always
+/// points at an enabled home".
+#[tauri::command(rename_all = "snake_case")]
+pub fn homes_set_enabled(
+    state: State<AppState>,
+    path: String,
+    enabled: bool,
+) -> Result<Vec<HomeRecord>, UiError> {
+    let records = state.homes().set_enabled(&path, enabled)?;
+    let (actor, control_home) = {
+        let s = state.session();
+        (s.actor.clone(), s.control_home.clone())
+    };
+    let stored_active = state.homes().active_entry().map(|e| e.path.clone());
+    follow_active(&state, stored_active, &actor, &control_home);
+    Ok(records)
+}
+
+/// Rebind the session handle to the stored active home after a registry
+/// write changed it (OQ-HOME-8 handover). The handle the window reads
+/// through must be the home the registry names, without a restart:
+///   * unchanged active home → nothing to do;
+///   * a new active home → reopen it as an OBSERVATION (REQ-HOME-09: no
+///     migration by the act of watching a home);
+///   * no active home → observe the control home and mark the session with
+///     the `home_none_active` code so the window says so plainly and the
+///     operator gets the enable/add affordances of the homes view.
+/// A reopen refusal degrades to the control home with its own typed cause
+/// (the REQ-HOME-07 shape) instead of leaving a dead handle behind.
+///
+/// Three units, ≤40 lines each (R2 quality return, cl/short-units): pick
+/// the handle (`reopen_active`) → apply it to the session
+/// (`apply_session_home`).
+fn follow_active(state: &State<AppState>, active: Option<String>, actor: &str, control_home: &str) {
+    let current = state.session().home.clone();
+    if active.as_deref() == Some(current.as_str()) {
+        return;
+    }
+    let control = std::path::PathBuf::from(control_home);
+    let (api, failure) = reopen_active(&control, active.as_deref(), actor);
+    apply_session_home(state, api, failure, control_home);
+}
+
+/// The handle for the stored active marker: the active home observed
+/// read-only, or — when there is no readable active home — the control
+/// home plus the typed degradation the window shows. The failure never
+/// hides the registry write that already committed.
+fn reopen_active(
+    control: &std::path::Path,
+    active: Option<&str>,
+    actor: &str,
+) -> (Result<Api, UiError>, Option<HomeFailure>) {
+    let on_disk = active.filter(|p| {
+        std::path::Path::new(p)
+            .join(devai_api::DB_FILE_NAME)
+            .exists()
+    });
+    match on_disk {
+        Some(path) => match Api::open_observed(std::path::Path::new(path), actor) {
+            Ok(api) => (Ok(api), None),
+            Err(e) => {
+                let failure = HomeFailure {
+                    code: devai_api::codes::home_failure_code(e.code().0),
+                    home: path.to_string(),
+                    message: format!("cannot open home {path}: {e}"),
+                };
+                (observe_control(control, actor), Some(failure))
+            }
+        },
+        None => {
+            let failure = match active {
+                // ONE source with the startup path (R3 quality return): a
+                // directory without a store is `home_no_store`, a vanished
+                // path is `home_unavailable` — the tokens cannot drift
+                // between bootstrap and the post-registry rebind.
+                Some(path) => crate::session::gone_failure(std::path::Path::new(path)),
+                None => no_active_failure(control),
+            };
+            (observe_control(control, actor), Some(failure))
+        }
+    }
+}
+
+/// The degradation fact of a registry with NO active record (every home is
+/// switched off, ratified OQ-HOME-8): one source with the startup bootstrap
+/// (`crate::session::no_active_failure`), so the two tokens cannot drift.
+fn no_active_failure(control: &std::path::Path) -> HomeFailure {
+    crate::session::no_active_failure(control)
+}
+
+/// Observe the control home (no migration of a watched home, REQ-HOME-09);
+/// the bootstrap open is the last resort for a control home that cannot be
+/// observed read-only.
+fn observe_control(control: &std::path::Path, actor: &str) -> Result<Api, UiError> {
+    Api::open_observed(control, actor)
+        .or_else(|_| Api::open(control, actor))
+        .map_err(UiError::from)
+}
+
+/// Install the chosen handle as THE session handle and record the
+/// degradation fact it came with (none when the stored active home opened).
+fn apply_session_home(
+    state: &State<AppState>,
+    api: Result<Api, UiError>,
+    failure: Option<HomeFailure>,
+    control_home: &str,
+) {
+    match api {
+        Ok(api) => {
+            let info_home = api.home().display().to_string();
+            *state.api() = api;
+            let mut info = state.session();
+            info.home = info_home;
+            info.opened_at = Utc::now();
+            info.degraded_from = failure;
+        }
+        Err(e) => {
+            // The control home itself refused observation: the registry
+            // write already committed, so the window keeps running with a
+            // typed error instead of a panic.
+            state.session().degraded_from = Some(HomeFailure {
+                code: devai_api::codes::HOMES_REGISTRY_UNAVAILABLE,
+                home: control_home.to_string(),
+                message: e.message,
+            });
+        }
+    }
+}
+
+/// `home.activate` — make an enabled home the single stored active home
+/// in one click, no process restart (REQ-HOME-06 AC1). The whole
+/// validate→re-probe→reopen→commit transaction is the API plane's
+/// `Api::activate_home` — platform mechanics live with the platform
+/// (report v1, da/architecture-consistency); this command only wires the
+/// outcome into the session state. Returns the fresh session facts; the
+/// frontend resets the view context to projects afterwards (ratified
+/// OQ-HOME-5).
+#[tauri::command(rename_all = "snake_case")]
+pub fn homes_activate(state: State<AppState>, path: String) -> Result<SessionInfo, UiError> {
+    let (actor, control_home) = {
+        let s = state.session();
+        (s.actor.clone(), s.control_home.clone())
+    };
+    let api = {
+        let mut homes = state.homes();
+        Api::activate_home(&mut homes, &path, &actor)?
+    };
+    let info = SessionInfo {
+        home: api.home().display().to_string(),
+        actor,
+        opened_at: Utc::now(),
+        control_home,
+        degraded_from: None,
+    };
+    *state.api() = api;
+    *state.session() = info.clone();
+    Ok(info)
+}
+
+/// `home.projects_all` — the merged projects view over the enabled homes
+/// (REQ-HOME-04): one attributed block per home, records read live from
+/// the source home, a dead home localized to its own block. `home`
+/// narrows the view to a single registered home on request.
+#[tauri::command(rename_all = "snake_case")]
+pub fn projects_all(
+    state: State<AppState>,
+    home: Option<String>,
+) -> Result<Vec<HomeRecordsView<Project>>, UiError> {
+    Ok(state.homes().projects_all(home.as_deref())?)
+}
+
+/// `home.tasks_all` — the merged tasks plane, same discipline as
+/// `projects_all`; same-named tasks from different homes stay distinct
+/// rows in distinct blocks (REQ-HOME-04 AC3).
+#[tauri::command(rename_all = "snake_case")]
+pub fn tasks_all(
+    state: State<AppState>,
+    home: Option<String>,
+) -> Result<Vec<HomeRecordsView<Task>>, UiError> {
+    Ok(state.homes().tasks_all(home.as_deref())?)
 }
 
 // ---------------------------------------------------------------------
@@ -840,7 +1101,7 @@ mod tests {
     use super::*;
     use devai_core::types::ArtifactKind;
 
-    /// REQ-UI-02 AC2: every command's data source is a published registry
+    /// REQ-UI-02 AC2: every data command's source is a published registry
     /// entry of class Read. If a command starts calling something the
     /// registry does not publish (or any Mutation), this test fails.
     #[test]
@@ -856,7 +1117,137 @@ mod tests {
             assert_eq!(
                 d.class,
                 devai_api::OpClass::Read,
-                "`{cmd}` calls `{op}` — a Mutation-class operation is forbidden in the read-only UI (OQ-UI-6)"
+                "`{cmd}` calls `{op}` — a non-Read operation is forbidden in the data plane (OQ-UI-6)"
+            );
+        }
+    }
+
+    /// R3 quality return: the post-registry rebind states why the active home
+    /// could not be read with the SAME verdict the startup path uses
+    /// (`session::gone_failure`) — `home_no_store` when the folder is there
+    /// without a store, `home_unavailable` when the path vanished — instead
+    /// of collapsing both into "not on disk" with one code.
+    #[test]
+    fn the_rebind_never_states_a_missing_store_as_a_vanished_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let control = dir.path().join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        let recorded = dir.path().join("project/.devai");
+        let path = recorded.display().to_string();
+
+        std::fs::create_dir_all(&recorded).unwrap();
+        let (_, failure) = reopen_active(&control, Some(&path), "tester");
+        let failure = failure.expect("a storeless home degrades, it is not opened");
+        assert_eq!(failure.code, devai_api::codes::HOME_NO_STORE);
+        assert_eq!(failure.home, path, "the failure names the home it is about");
+        assert!(
+            failure.message.contains("devai init"),
+            "the operator gets the way out: {}",
+            failure.message
+        );
+
+        std::fs::remove_dir_all(&recorded).unwrap();
+        let (_, failure) = reopen_active(&control, Some(&path), "tester");
+        let failure = failure.expect("a vanished home degrades, it is not created");
+        assert_eq!(failure.code, devai_api::codes::HOME_UNAVAILABLE);
+        assert!(failure.message.contains("not on disk"));
+        assert!(
+            !recorded.exists(),
+            "the rebind created a home over a vanished record"
+        );
+
+        let none = no_active_failure(&control);
+        assert_eq!(none.code, devai_api::codes::HOME_NONE_ACTIVE);
+    }
+
+    /// REQ-HOME-05/06: the registry-management commands map onto the
+    /// published Registry-class home plane ONLY. No domain Mutation hides
+    /// in the management table, and no data command reaches it — reading
+    /// home records and managing the registry never mix in one operation.
+    #[test]
+    fn registry_management_commands_are_the_home_plane_only() {
+        let ops = devai_api::operations();
+        let by_name: std::collections::HashMap<&str, &OpDescriptor> =
+            ops.iter().map(|o| (o.name, o)).collect();
+        assert!(!COMMAND_REGISTRY_OPERATIONS.is_empty());
+        for (cmd, op) in COMMAND_REGISTRY_OPERATIONS {
+            let d = by_name
+                .get(op)
+                .unwrap_or_else(|| panic!("`{cmd}` calls `{op}`: not a published operation"));
+            assert_eq!(
+                d.class,
+                devai_api::OpClass::Registry,
+                "`{cmd}` calls `{op}` — management commands may only use the Registry class"
+            );
+            assert!(
+                op.starts_with("home."),
+                "`{cmd}`: the Registry class exists only in the homes plane"
+            );
+        }
+        for (cmd, op) in COMMAND_OPERATIONS {
+            let d = *by_name
+                .get(op)
+                .unwrap_or_else(|| panic!("`{cmd}` calls `{op}`: not published"));
+            assert_ne!(
+                d.class,
+                devai_api::OpClass::Registry,
+                "`{cmd}` mixes registry management into a data read (`{op}`)"
+            );
+        }
+    }
+
+    /// mt/change-isolation + arch/registry-in-data (report v1): the OTHER
+    /// direction is guarded too. Every published `home.*` operation must
+    /// have a UI command mapping — if the registry plane grows a row and
+    /// the surface does not follow, this fails at `cargo test`, so the
+    /// five-place checklist of a new operation can never half-land
+    /// (the frontend→table direction is guarded by
+    /// `frontend_invokes_are_exactly_mapped_reads`).
+    #[test]
+    fn every_published_home_operation_is_wired_into_the_ui() {
+        let ops = devai_api::operations();
+        let home_ops: Vec<&str> = ops
+            .iter()
+            .filter(|o| o.name.starts_with("home."))
+            .map(|o| o.name)
+            .collect();
+        assert!(
+            !home_ops.is_empty(),
+            "the homes plane vanished from the registry"
+        );
+        for name in home_ops {
+            let mapped = COMMAND_OPERATIONS
+                .iter()
+                .chain(COMMAND_REGISTRY_OPERATIONS.iter())
+                .any(|(_, op)| *op == name);
+            assert!(
+                mapped,
+                "published `{name}` has no UI command mapping — registry grew without the surface following"
+            );
+        }
+    }
+
+    /// ux/contract-stability (report v1): the `class` token dictionary is
+    /// pinned ACROSS the wire. Every `OpClass` variant serializes to its
+    /// lowercase token and every token must appear in the `types.ts`
+    /// union — a class added on the Rust side without extending the TS
+    /// type fails here, not silently at runtime (the homes cycle added
+    /// `registry` exactly this way).
+    #[test]
+    fn op_class_tokens_are_pinned_across_the_wire() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let types_ts =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/types.ts")).unwrap();
+        for class in [
+            devai_api::OpClass::Read,
+            devai_api::OpClass::Mutation,
+            devai_api::OpClass::Registry,
+        ] {
+            let token = serde_json::to_value(class).unwrap();
+            let token = token.as_str().expect("class serializes to a string token");
+            assert!(
+                types_ts.contains(&format!("\"{token}\"")),
+                "class token `{token}` is not in the types.ts union — the CLI/API/TS wire dictionary drifted"
             );
         }
     }
@@ -937,6 +1328,46 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&bin).unwrap(),
             fixture["artifact_binary"]
+        );
+
+        // Homes plane (REQ-HOME-01/05): the registry record and a merged
+        // view block are part of the frontend contract — same pin.
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let rec = devai_api::HomeRecord {
+            path: "/home/op/project/.devai".into(),
+            project: "tripsales".into(),
+            project_source: devai_api::ProjectSource::Store,
+            project_error: None,
+            added_at: ts,
+            enabled: true,
+            active: false,
+            available: true,
+            schema_version: Some(8),
+            version_note: None,
+            read_error: None,
+        };
+        assert_eq!(serde_json::to_value(&rec).unwrap(), fixture["home_record"]);
+
+        let block: devai_api::HomeRecordsView<devai_core::types::Project> =
+            devai_api::HomeRecordsView {
+                snapshot_at: ts,
+                home_path: "/home/op/project/.devai".into(),
+                home_project: "tripsales".into(),
+                is_active: false,
+                available: false,
+                version_note: None,
+                error: Some(devai_api::HomeIssue::new(
+                    devai_api::codes::HOME_NO_STORE,
+                    std::path::Path::new("/home/op/project/.devai"),
+                    "no store",
+                )),
+                records: Vec::new(),
+            };
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
+            fixture["home_projects_view"]
         );
     }
 
@@ -1104,9 +1535,11 @@ mod tests {
             if name == "session_info" {
                 continue;
             }
+            let mapped = COMMAND_OPERATIONS.iter().any(|(c, _)| *c == name)
+                || COMMAND_REGISTRY_OPERATIONS.iter().any(|(c, _)| *c == name);
             assert!(
-                COMMAND_OPERATIONS.iter().any(|(c, _)| *c == name),
-                "api.ts invokes `{name}` with no COMMAND_OPERATIONS mapping"
+                mapped,
+                "api.ts invokes `{name}` with no COMMAND_OPERATIONS/COMMAND_REGISTRY_OPERATIONS mapping"
             );
             assert!(
                 main_rs.contains(&format!("commands::{name},")),
@@ -1999,5 +2432,244 @@ mod tests {
             .step_by(2)
             .map(str::to_string)
             .collect()
+    }
+    // ------------------------------------------------------------------
+    // R2 quality return (mt/change-isolation): the ONE declarative record
+    // schema and the parity test over every site that spells it.
+    // ------------------------------------------------------------------
+
+    /// The key set of a serialized record must be exactly the declared one.
+    fn assert_schema_keys(schema: &[(&str, &str)], v: &serde_json::Value, what: &str) {
+        let mut declared: Vec<&str> = devai_api::schema_names(schema);
+        declared.sort_unstable();
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("{what}: not an object"));
+        let mut actual: Vec<&str> = obj.keys().map(String::as_str).collect();
+        actual.sort_unstable();
+        assert_eq!(
+            declared, actual,
+            "{what}: serde output and the declarative schema drifted — a field landed in one site only"
+        );
+    }
+
+    /// Fields of a TS interface in declaration order: `(name, type)`.
+    /// Comment lines are skipped; every other line must be `name: type;`.
+    fn ts_interface(src: &str, iface: &str) -> Vec<(String, String)> {
+        let head = format!("export interface {iface}");
+        let start = src
+            .find(&head)
+            .unwrap_or_else(|| panic!("types.ts has no `{head}` interface"));
+        let body = &src[start + head.len()..];
+        let body = &body[..body.find("\n}").expect("interface closes")];
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") || line == "{" {
+                continue;
+            }
+            let (name, ty) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("{iface}: not a field line: {line}"));
+            out.push((
+                name.trim().to_string(),
+                ty.trim().trim_end_matches(';').to_string(),
+            ));
+        }
+        out
+    }
+
+    fn assert_schema_matches_ts(schema: &[(&str, &str)], src: &str, iface: &str) {
+        let declared: Vec<(String, String)> = schema
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect();
+        assert_eq!(
+            declared,
+            ts_interface(src, iface),
+            "types.ts `{iface}` and the declarative schema drifted"
+        );
+    }
+
+    /// Every declared field must be referenced by the view layer that
+    /// renders it (`b.<field>` / `h.<field>`), so a schema field cannot
+    /// exist only on the wire and silently never reach the window.
+    fn assert_fields_rendered(schema: &[(&str, &str)], sources: &[&str], var: &str) {
+        for (name, _) in schema {
+            let needle = format!("{var}.{name}");
+            assert!(
+                sources.iter().any(|s| s.contains(&needle)),
+                "`{needle}` is declared in the record schema but no view reads it — the attribute never reaches the operator"
+            );
+        }
+    }
+
+    /// R5 quality return: `SessionInfo` is a wire shape too. It is described
+    /// once (`session::SESSION_INFO_SCHEMA`), pinned in the IPC fixture and
+    /// mirrored by `types.ts` — the same discipline the home records have, so
+    /// `session_info` and `homes_activate` cannot drift from the frontend.
+    #[test]
+    fn session_info_schema_is_pinned_on_the_wire_fixture_and_types() {
+        use crate::session::SESSION_INFO_SCHEMA;
+        let info = SessionInfo {
+            home: "/h/.devai".into(),
+            actor: "op".into(),
+            opened_at: Utc::now(),
+            control_home: "/c/.devai".into(),
+            degraded_from: None,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_schema_keys(SESSION_INFO_SCHEMA, &json, "SessionInfo");
+
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ipc_shapes.json")).unwrap();
+        let mut declared = devai_api::schema_names(SESSION_INFO_SCHEMA);
+        declared.sort_unstable();
+        let mut pinned: Vec<&str> = fixture["session_info"]
+            .as_object()
+            .expect("ipc_shapes.json pins the session_info shape")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        pinned.sort_unstable();
+        assert_eq!(
+            declared, pinned,
+            "the wire fixture must carry every session_info field (same names)"
+        );
+
+        let types_ts = std::fs::read_to_string(format!(
+            "{}/frontend/src/types.ts",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert_schema_matches_ts(SESSION_INFO_SCHEMA, &types_ts, "SessionInfo");
+    }
+
+    /// R2 quality return: the homes attributes are described ONCE
+    /// (`devai_api::HOME_*_SCHEMA`) and checked against all five sites that
+    /// spell them — the persisted `HomeEntry`, the wire `HomeRecord` (whose
+    /// serde output IS the `ipc_shapes.json` fixture pinned by the test
+    /// above), the published registry rows, the `types.ts` interfaces and
+    /// the views. Adding an attribute to one site without the schema fails
+    /// here; adding it to the schema without the TS type or the view usage
+    /// fails right after.
+    #[test]
+    fn homes_record_schema_is_one_description_checked_on_every_site() {
+        use devai_api::{
+            HOME_ENTRY_SCHEMA, HOME_ISSUE_SCHEMA, HOME_RECORD_SCHEMA, HOME_VIEW_SCHEMA, HomeEntry,
+            HomeIssue, HomeRecord, ProjectSource,
+        };
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let read = |rel: &str| std::fs::read_to_string(format!("{crate_dir}/{rel}")).unwrap();
+        let types_ts = read("frontend/src/types.ts");
+
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Site 1: the persisted descriptor (homes.json of the control home).
+        let entry = HomeEntry {
+            path: "/h/.devai".into(),
+            project: "h".into(),
+            project_source: ProjectSource::Store,
+            project_error: None,
+            added_at: ts,
+            enabled: true,
+            active: true,
+        };
+        assert_schema_keys(
+            HOME_ENTRY_SCHEMA,
+            &serde_json::to_value(&entry).unwrap(),
+            "HomeEntry",
+        );
+
+        // Site 2: the wire record (its serde JSON is the frozen fixture).
+        let record = HomeRecord {
+            path: "/h/.devai".into(),
+            project: "h".into(),
+            project_source: ProjectSource::Unreadable,
+            project_error: Some("no store".into()),
+            added_at: ts,
+            enabled: true,
+            active: false,
+            available: false,
+            schema_version: None,
+            version_note: None,
+            read_error: Some(HomeIssue::new(
+                devai_api::codes::HOME_NO_STORE,
+                std::path::Path::new("/h/.devai"),
+                "no store",
+            )),
+        };
+        let record_json = serde_json::to_value(&record).unwrap();
+        assert_schema_keys(HOME_RECORD_SCHEMA, &record_json, "HomeRecord");
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ipc_shapes.json")).unwrap();
+        assert_eq!(
+            record_json.as_object().unwrap().keys().collect::<Vec<_>>(),
+            fixture["home_record"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            "the wire fixture must carry every schema field (same names)"
+        );
+
+        let issue_json = serde_json::to_value(&record.read_error.clone().unwrap()).unwrap();
+        assert_schema_keys(HOME_ISSUE_SCHEMA, &issue_json, "HomeIssue");
+
+        let block = devai_api::HomeRecordsView {
+            snapshot_at: ts,
+            home_path: "/h/.devai".into(),
+            home_project: "h".into(),
+            is_active: true,
+            available: true,
+            version_note: None,
+            error: None,
+            records: Vec::<devai_core::types::Project>::new(),
+        };
+        assert_schema_keys(
+            HOME_VIEW_SCHEMA,
+            &serde_json::to_value(&block).unwrap(),
+            "HomeRecordsView",
+        );
+
+        // Site 3: the published registry rows declare these record types.
+        let ops = devai_api::operations();
+        let by_name: std::collections::HashMap<&str, &devai_api::OpDescriptor> =
+            ops.iter().map(|o| (o.name, o)).collect();
+        assert_eq!(by_name["home.list"].output, "Vec<HomeRecord>");
+        assert_eq!(
+            by_name["home.projects_all"].output,
+            "Vec<HomeRecordsView<Project>>"
+        );
+        assert_eq!(
+            by_name["home.tasks_all"].output,
+            "Vec<HomeRecordsView<Task>>"
+        );
+        for (name, _) in HOME_RECORD_SCHEMA {
+            assert!(
+                by_name["home.list"].description.contains(name),
+                "home.list must describe its `{name}` attribute"
+            );
+        }
+
+        // Site 4: the TS interfaces are the frontend's view of the same
+        // records (field name + type, same order).
+        assert_schema_matches_ts(HOME_RECORD_SCHEMA, &types_ts, "HomeRecord");
+        assert_schema_matches_ts(HOME_VIEW_SCHEMA, &types_ts, "HomeRecordsView<T>");
+        assert_schema_matches_ts(HOME_ISSUE_SCHEMA, &types_ts, "HomeIssue");
+
+        // Site 5: the views read every declared field.
+        let homes_view = read("frontend/src/views/HomesView.vue");
+        let homes_vm = read("frontend/src/homes-view.ts");
+        assert_fields_rendered(HOME_RECORD_SCHEMA, &[&homes_view, &homes_vm], "h");
+        let projects_view = read("frontend/src/views/ProjectsView.vue");
+        let tasks_view = read("frontend/src/views/TasksView.vue");
+        assert_fields_rendered(
+            HOME_VIEW_SCHEMA,
+            &[&projects_view, &tasks_view, &homes_vm],
+            "b",
+        );
     }
 }

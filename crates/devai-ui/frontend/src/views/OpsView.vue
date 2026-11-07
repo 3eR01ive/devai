@@ -18,6 +18,9 @@ const used = [
   "artifact.list", "artifact.cat", "artifact.cat_text",
   "question.list",
   "exec.list", "exec.liveness",
+  "home.list", "home.projects_all", "home.tasks_all",
+  // Registry-плоскость: управление реестром домов (не доменные мутации).
+  "home.add", "home.set_enabled", "home.activate",
 ];
 
 const ops = ref<OpDescriptor[]>([]);

@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window: application commands are always reachable (custom invoke is not ACL-gated); the only core/plugin capability the frontend uses is the native folder picker for the homes registry (REQ-HOME-03 dialog, R1) — `dialog:allow-open` grants opening, never saving.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open"
+  ]
+}

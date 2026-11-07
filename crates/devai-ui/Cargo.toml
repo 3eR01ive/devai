@@ -20,10 +20,18 @@ dirs.workspace = true
 devai-core.workspace = true
 devai-api.workspace = true
 tauri = "2"
+# R1 (operator, rework of the homes cycle): the native folder picker for
+# adding a home (REQ-HOME-03 «диалог выбора пути»). Connected by the stock
+# plugin pattern: crate dep here, init in main.rs, `dialog:allow-open` in
+# capabilities/default.json, `@tauri-apps/plugin-dialog` on the frontend.
+tauri-plugin-dialog = "2"
 
 [dev-dependencies]
 # R4: the ipc serde-output snapshot fixtures are compared as JSON.
 serde_json.workspace = true
+# R1 return (startup-path regression): the session test stages a temp
+# control home and an old-schema home from an inert fixture.
+tempfile = "3"
 
 [build-dependencies]
 tauri-build = "2"

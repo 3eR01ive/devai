@@ -14,7 +14,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+# rl/idempotency (report v1 gap): flock serializes the homes-registry
+# read-modify-write transactions across processes (unix advisory lock).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
 serde_yaml.workspace = true
+# Test-only: hand-building a home of an old schema rank (RA1 return:
+# activation must never migrate the home it activates).
+rusqlite.workspace = true

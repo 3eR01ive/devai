@@ -112,6 +112,9 @@ fn api_registry(ctx: &Ctx, cmd: ApiCmd, json: bool) -> Result<()> {
                     let class = match o.class {
                         devai_api::OpClass::Read => "read",
                         devai_api::OpClass::Mutation => "mutation",
+                        // Homes-registry cycle: the platform plane renders
+                        // as its own token; existing rows stay byte-identical.
+                        devai_api::OpClass::Registry => "registry",
                     };
                     outln!("{}  [{class}]  in={}  out={}", o.name, o.input, o.output);
                     outln!("    {}", o.description);
