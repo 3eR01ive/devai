@@ -36,10 +36,11 @@ if [ ! -x "$BIN" ]; then
     if [ "$PROFILE" = release ]; then "$ROOT/build.sh" --release; else "$ROOT/build.sh"; fi
 fi
 
-# 2) Зависимости фронта (node_modules в git не живёт).
+# 2) Зависимости фронта ставит build.sh (у него же сборка ассетов); лончер
+# только проверяет, что они есть, и подсказывает команду.
 if [ ! -d "$FRONT/node_modules/vite" ]; then
-    echo "run-ui.sh: ставлю зависимости фронта (npm install)"
-    (cd "$FRONT" && npm install --no-audit --no-fund)
+    echo "run-ui.sh: зависимостей фронта нет — выполните ./build.sh" >&2
+    exit 1
 fi
 
 # 3) Дом должен существовать: UI читает его стор и реестр домов.

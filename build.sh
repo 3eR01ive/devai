@@ -18,6 +18,25 @@ for arg in "$@"; do
     esac
 done
 
+# 1) Фронт: зависимости и сборка ассетов ДО cargo — Tauri встраивает dist в бинарь
+# на этапе компиляции, поэтому устаревший node_modules или пустой dist даёт либо
+# нерезолвленный импорт в dev-режиме, либо бинарь без ассетов (07.11:
+# @tauri-apps/plugin-dialog не был установлен после мержа → оверлей вместо окна).
+FRONT="crates/devai-ui/frontend"
+if [ -d "$FRONT" ]; then
+    need_install=0
+    [ -d "$FRONT/node_modules/vite" ] || need_install=1
+    if [ "$need_install" = 0 ] && [ "$FRONT/package.json" -nt "$FRONT/node_modules" ]; then
+        need_install=1
+    fi
+    if [ "$need_install" = 1 ]; then
+        echo "build.sh: ставлю зависимости фронта (npm install)"
+        ( cd "$FRONT" && npm install --no-audit --no-fund )
+    fi
+    echo "build.sh: собираю фронт (vite build)"
+    ( cd "$FRONT" && node node_modules/vite/bin/vite.js build )
+fi
+
 cargo build --workspace $CARGO_FLAGS
 
 mkdir -p bin

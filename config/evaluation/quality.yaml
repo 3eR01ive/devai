@@ -90,7 +90,7 @@
 # семантике Probe{pass_exit} выше, не FAIL. Веса проверок не тронуты
 # (гейты бинарны, V7 sum=1.00 сохранён).
 
-version: 15
+version: 16
 project: devai
 applies_to_roles: [quality-auditor]
 
@@ -236,9 +236,15 @@ error_types:
 
 gates:
   - id: build-green
-    desc: cargo build --workspace завершается успешно
+    desc: >-
+      Все значимые сборки проекта проходят. Список сборок — ДАННЫЕ проекта
+      (config/workflow/builds.yaml), гейт ничего не знает про язык: он требует
+      exit 0 от каждой записи. Для devai это cargo build --workspace и сборка
+      фронта (ассеты вшиваются в бинарь на этапе cargo build, поэтому её пропуск
+      уже один раз пропустил сломанный импорт через приёмку — 08.11).
+      Нет объявленных сборок → BLOCKED, а не PASS.
     probes:
-      - { cmd: "cargo build --workspace", pass_exit: [0] }
+      - { cmd: "python3 tools/check_builds.py", pass_exit: [0] }
   - id: tests-green
     desc: cargo test --workspace завершается успешно
     probes:

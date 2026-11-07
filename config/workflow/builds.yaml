@@ -1,0 +1,12 @@
+# Значимые сборки проекта — ДАННЫЕ для гейта `builds-green` (tools/check_builds.py).
+# Гейт требует exit 0 от каждой записи; никакого знания о языке в профиле нет.
+# Добавляешь язык/сборку в проект — добавляешь строку сюда, профиль не правишь.
+builds:
+  - name: rust-workspace
+    cmd: cargo build --workspace
+    cwd: .
+  # Фронт Tauri: ассеты вшиваются в бинарь на этапе cargo build, поэтому
+  # сборка фронта — значимая. node_modules ставим, если его нет (worktree).
+  - name: ui-frontend
+    cmd: sh -c 'if [ ! -d node_modules/vite ]; then npm ci --no-audit --no-fund; fi && node node_modules/vite/bin/vite.js build'
+    cwd: crates/devai-ui/frontend
