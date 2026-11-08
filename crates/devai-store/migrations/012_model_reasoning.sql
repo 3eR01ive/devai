@@ -1,5 +1,5 @@
 -- v11 -> v12: the REASONING LEVEL of the model bundle (task 01a1b71f,
--- REQ-MS-09 — the ratified answer to OQ-6).
+-- the ratified OQ-6 answer).
 --
 -- The level is part of the chosen bundle: it is selected together with the
 -- LLM-provider and the model, so both the agent record and the run stamp

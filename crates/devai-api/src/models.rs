@@ -16,13 +16,17 @@
 use chrono::{Duration, Utc};
 use devai_core::types::{
     ExecutionBundle, Id, ProbeVerdict, SwitchReason, Timestamp, WorkflowEvent, event_kind,
-    json_field, new_id,
+    evidence_kind, json_field, new_id, status_state, switch_outcome,
 };
 use devai_store::{ModelBundle, ModelCatalog, ProbePolicy};
 use serde::Serialize;
 
 use crate::Api;
 use crate::error::{ApiError, ApiResult};
+
+/// The store step a switch can die in — named in BOTH the `failed` event and
+/// the returned error, so the fact and the answer cannot drift (R7).
+const SWITCH_STEP: &str = "apply_bundle_switch";
 
 /// One declared bundle, as the surface shows it.
 #[derive(Serialize, Clone, Debug)]
@@ -32,9 +36,16 @@ pub struct ModelBundleView {
     pub agent: String,
     pub driver: String,
     pub llm_provider: String,
+    /// The operator word of `llm_provider` (R5 quality return: ONE source —
+    /// the window and the console print this field, they do not re-derive it).
+    pub llm_provider_text: String,
     pub model: String,
-    /// REQ-MS-09: the level of thinking — part of the bundle.
+    /// The operator word of `model` («не передаётся» when empty).
+    pub model_text: String,
+    /// The level of thinking — part of the bundle (the ratified OQ-6 answer).
     pub reasoning: String,
+    /// The operator word of `reasoning` («связка неполна» when empty).
+    pub reasoning_text: String,
     pub probe_phrase: String,
     pub probe_timeout_ms: u64,
     pub fresh_secs: u64,
@@ -50,8 +61,11 @@ impl ModelBundleView {
             agent: b.agent.clone(),
             driver: b.driver.clone(),
             llm_provider: b.llm_provider.clone(),
+            llm_provider_text: devai_core::types::llm_provider_word(&b.llm_provider).to_string(),
             model: b.model.clone(),
+            model_text: devai_core::types::model_word(&b.model).to_string(),
             reasoning: b.reasoning.clone(),
+            reasoning_text: devai_core::types::reasoning_word(&b.reasoning).to_string(),
             probe_phrase: b.probe.phrase.clone(),
             probe_timeout_ms: b.probe.timeout_ms,
             fresh_secs: b.probe.fresh_secs,
@@ -70,10 +84,16 @@ pub struct ActiveBundleView {
     pub agent: String,
     pub driver: String,
     pub llm_provider: String,
+    /// The operator word of `llm_provider` — served, never re-derived.
+    pub llm_provider_text: String,
     pub model: String,
-    /// REQ-MS-09: the level of thinking. Empty on a record outside the
-    /// declared list reads «связка неполна» — not a driver default.
+    /// The operator word of `model` — served, never re-derived.
+    pub model_text: String,
+    /// The level of thinking (the ratified OQ-6 answer). Empty on a record
+    /// outside the declared list reads «связка неполна» — not a driver default.
     pub reasoning: String,
+    /// The operator word of `reasoning` — served, never re-derived.
+    pub reasoning_text: String,
     pub declared: bool,
 }
 
@@ -112,8 +132,8 @@ pub struct BundleStatusView {
 impl BundleStatusView {
     fn unknown() -> Self {
         Self {
-            state: "unknown".into(),
-            state_text: devai_core::types::status_word("unknown").into(),
+            state: status_state::UNKNOWN.into(),
+            state_text: devai_core::types::status_word(status_state::UNKNOWN).into(),
             latency_ms: None,
             verdict: None,
             reason: None,
@@ -127,8 +147,8 @@ impl BundleStatusView {
     }
     fn not_selected() -> Self {
         let mut s = Self::unknown();
-        s.state = "not_selected".into();
-        s.state_text = devai_core::types::status_word("not_selected").into();
+        s.state = status_state::NOT_SELECTED.into();
+        s.state_text = devai_core::types::status_word(status_state::NOT_SELECTED).into();
         s
     }
 }
@@ -297,7 +317,7 @@ impl Api {
     ) -> Option<FailuresBanner> {
         let active = active?;
         match status.state.as_str() {
-            "not_working" => {}
+            status_state::NOT_WORKING => {}
             // Only a proven dead bundle glows; every other state is silent.
             _ => return None,
         }
@@ -386,14 +406,16 @@ impl Api {
     /// `refused_probe` with the SAME verdict, and the record/marker never
     /// move, so `agent_changed` is false (R8 quality return).
     fn refuse_probe(&self, a: &SwitchAttempt) -> ApiResult<SwitchResultView> {
-        self.store.insert_event(
-            None,
-            event_kind::MODEL_SWITCHED,
-            self.actor(),
-            switch_payload(a, "refused_probe", false, None),
-        )?;
+        self.store
+            .insert_event(
+                None,
+                event_kind::MODEL_SWITCHED,
+                self.actor(),
+                switch_payload(a, switch_outcome::REFUSED_PROBE, false, None),
+            )
+            .map_err(|e| ApiError::at_step("record_refusal", e))?;
         Ok(SwitchResultView {
-            outcome: "refused_probe".into(),
+            outcome: switch_outcome::REFUSED_PROBE.into(),
             bundle_id: a.bundle.id.clone(),
             verdict: a.probe.outcome.verdict.as_str().into(),
             latency_ms: a.probe.outcome.latency_ms,
@@ -413,32 +435,49 @@ impl Api {
             model: a.bundle.model.clone(),
             reasoning: a.bundle.reasoning.clone(),
             actor: self.actor().to_string(),
-            payload: switch_payload(a, "applied", a.agent_changed, None),
+            payload: switch_payload(a, switch_outcome::APPLIED, a.agent_changed, None),
             now: Utc::now(),
         };
         if let Err(e) = self.store.apply_bundle_switch(&switch) {
-            // REQ-MS-05: the failed outcome is a fact of its own with the
-            // failing step; the transaction above already rolled back.
-            self.store.insert_event(
-                None,
-                event_kind::MODEL_SWITCHED,
-                self.actor(),
-                switch_payload(a, "failed", false, Some("apply_bundle_switch")),
-            )?;
-            return Err(e.into());
+            return Err(self.record_failed_switch(a, e));
         }
         Ok(SwitchResultView {
-            outcome: "applied".into(),
+            outcome: switch_outcome::APPLIED.into(),
             bundle_id: a.bundle.id.clone(),
             verdict: a.probe.outcome.verdict.as_str().into(),
             latency_ms: a.probe.outcome.latency_ms,
-            code: "applied".into(),
+            code: switch_outcome::APPLIED.into(),
             agent_changed: a.agent_changed,
         })
     }
 
+    /// The rolled-back switch: the `failed` fact is written AFTER the rollback
+    /// (REQ-MS-05 names the step), and BOTH causes survive to the caller (R7)
+    /// — the typed code is the switch's, the text names the step and, if the
+    /// fact could not be written either, that failure too. Never swallowed.
+    fn record_failed_switch(&self, a: &SwitchAttempt, e: devai_store::StoreError) -> ApiError {
+        let code = crate::error::store_code(&e);
+        let fact = self.store.insert_event(
+            None,
+            event_kind::MODEL_SWITCHED,
+            self.actor(),
+            switch_payload(a, switch_outcome::FAILED, false, Some(SWITCH_STEP)),
+        );
+        match fact {
+            Ok(_) => ApiError::at_step(SWITCH_STEP, e),
+            Err(fact) => ApiError::Refused {
+                code,
+                message: format!(
+                    "switch to bundle `{}` failed at `{SWITCH_STEP}`: {e}; the failure fact could not be recorded either: {fact}",
+                    a.bundle.id
+                ),
+            },
+        }
+    }
+
     /// Run one probe and store its fact event — exactly one event per call
-    /// (REQ-MS-03 AC4).
+    /// (REQ-MS-03 AC4). A failure to record the fact names the failing step:
+    /// an answer without its stored proof would be a lie (R7).
     fn run_probe(&self, bundle: &ModelBundle) -> ApiResult<ProbeRecord> {
         let request = devai_runtime::probe::ProbeRequest::new(
             &bundle.driver,
@@ -449,26 +488,28 @@ impl Api {
         .with_policy(&bundle.probe.phrase, bundle.probe.timeout_ms);
         let outcome = (self.probe_runner)(&request);
         let event_id = new_id();
-        self.store.insert_event_with(
-            event_id,
-            None,
-            event_kind::MODEL_PROBE,
-            self.actor(),
-            serde_json::json!({
-                (json_field::BUNDLE_ID): bundle.id,
-                (json_field::BUNDLE): {
-                    (json_field::DRIVER): bundle.driver,
-                    (json_field::LLM_PROVIDER): bundle.llm_provider,
-                    (json_field::MODEL): bundle.model,
-                    (json_field::REASONING): bundle.reasoning,
-                },
-                (json_field::VERDICT): outcome.verdict.as_str(),
-                (json_field::LATENCY_MS): outcome.latency_ms,
-                (json_field::EXIT_CODE): outcome.exit_code,
-                (json_field::OUTPUT_EXCERPT): outcome.output_excerpt,
-            }),
-            outcome.at,
-        )?;
+        self.store
+            .insert_event_with(
+                event_id,
+                None,
+                event_kind::MODEL_PROBE,
+                self.actor(),
+                serde_json::json!({
+                    (json_field::BUNDLE_ID): bundle.id,
+                    (json_field::BUNDLE): {
+                        (json_field::DRIVER): bundle.driver,
+                        (json_field::LLM_PROVIDER): bundle.llm_provider,
+                        (json_field::MODEL): bundle.model,
+                        (json_field::REASONING): bundle.reasoning,
+                    },
+                    (json_field::VERDICT): outcome.verdict.as_str(),
+                    (json_field::LATENCY_MS): outcome.latency_ms,
+                    (json_field::EXIT_CODE): outcome.exit_code,
+                    (json_field::OUTPUT_EXCERPT): outcome.output_excerpt,
+                }),
+                outcome.at,
+            )
+            .map_err(|e| ApiError::at_step("record_probe", e))?;
         Ok(ProbeRecord { event_id, outcome })
     }
 
@@ -514,9 +555,12 @@ impl Api {
     }
 
     /// The suggestion of the refusal banner: a DECLARED bundle — not the one
-    /// already in force (switching to it would be a `no_op`) — whose LAST
-    /// probe is `ok` and still FRESH. None when nothing qualifies; the
-    /// platform never applies a switch by itself.
+    /// already in force (switching to it would be a `no_op`) — whose newest
+    /// SUCCESSFUL probe is still FRESH. Only `ok` rows are candidates here
+    /// (a later failing probe is not consulted by THIS offers-only-live
+    /// rule; the switch into the suggested bundle probes it again anyway).
+    /// None when nothing qualifies; the platform never applies a switch by
+    /// itself.
     fn suggest_live_bundle(
         &self,
         catalog: &ModelCatalog,
@@ -536,8 +580,9 @@ impl Api {
                             && e.bundle_id.as_deref() == Some(b.id.as_str())
                             && e.verdict.as_deref() == Some(ProbeVerdict::Ok.as_str())
                     })
-                    // The LAST probe of that bundle is the newest by time —
-                    // the same rule the status field uses.
+                    // The NEWEST of that bundle's successful probes, by time
+                    // (the history is append-only and may be imported out of
+                    // order) — and that newest success must still be fresh.
                     .max_by_key(|e| e.at)
                     .map(|e| freshness(e.at, b.probe.fresh_secs, now) == "fresh")
                     .unwrap_or(false)
@@ -578,15 +623,14 @@ fn probe_status(probe: &ModelEventView, policy: &ProbePolicy, now: Timestamp) ->
         .and_then(ProbeVerdict::parse)
         .unwrap_or(ProbeVerdict::Unknown);
     let live = verdict == ProbeVerdict::Ok;
-    let dead = verdict.proves_dead();
     let state = if live {
-        "live"
-    } else if dead {
-        "not_working"
+        status_state::LIVE
+    } else if verdict.proves_dead() {
+        status_state::NOT_WORKING
     } else {
-        "not_proven"
+        status_state::NOT_PROVEN
     };
-    let reason = dead.then(|| verdict.as_str().to_string());
+    let reason = (state == status_state::NOT_WORKING).then(|| verdict.as_str().to_string());
     let fresh = freshness(probe.at, policy.fresh_secs, now);
     BundleStatusView {
         state: state.into(),
@@ -598,9 +642,10 @@ fn probe_status(probe: &ModelEventView, policy: &ProbePolicy, now: Timestamp) ->
             .map(devai_core::types::failure_word)
             .map(str::to_string),
         reason,
-        evidence: Some("probe".into()),
+        evidence: Some(evidence_kind::PROBE.into()),
         evidence_at: Some(probe.at),
-        freshness_text: devai_core::types::freshness_word(&fresh, Some("probe")).into(),
+        freshness_text: devai_core::types::freshness_word(&fresh, Some(evidence_kind::PROBE))
+            .into(),
         freshness: fresh,
         probe_older: false,
     }
@@ -617,16 +662,16 @@ fn execution_status(
     probe_older: bool,
 ) -> BundleStatusView {
     let (state, reason) = match exec.status.as_str() {
-        "COMPLETED" => ("live", None),
+        "COMPLETED" => (status_state::LIVE, None),
         "FAILED" => (
-            "not_working",
+            status_state::NOT_WORKING,
             Some(
                 exec.failure_class
                     .clone()
                     .unwrap_or_else(|| "причина не классифицирована".into()),
             ),
         ),
-        _ => ("unknown", None),
+        _ => (status_state::UNKNOWN, None),
     };
     let fresh = match exec.finished_at {
         Some(at) => freshness(at, policy.fresh_secs, now),
@@ -642,9 +687,10 @@ fn execution_status(
             .map(devai_core::types::failure_word)
             .map(str::to_string),
         reason,
-        evidence: Some("execution".into()),
+        evidence: Some(evidence_kind::EXECUTION.into()),
         evidence_at: exec.finished_at,
-        freshness_text: devai_core::types::freshness_word(&fresh, Some("execution")).into(),
+        freshness_text: devai_core::types::freshness_word(&fresh, Some(evidence_kind::EXECUTION))
+            .into(),
         freshness: fresh,
         probe_older,
     }
@@ -745,8 +791,11 @@ impl ActiveBundleView {
             agent: a.name.clone(),
             driver: a.provider.clone(),
             llm_provider: a.runtime.clone(),
+            llm_provider_text: devai_core::types::llm_provider_word(&a.runtime).to_string(),
             model: a.model.clone(),
+            model_text: devai_core::types::model_word(&a.model).to_string(),
             reasoning: a.reasoning.clone(),
+            reasoning_text: devai_core::types::reasoning_word(&a.reasoning).to_string(),
             declared: declared.is_some(),
         }
     }
@@ -876,30 +925,15 @@ fn freshness(at: Timestamp, fresh_secs: u64, now: Timestamp) -> String {
     }
 }
 
-/// The LLM-provider as humans read it: empty AND the neutral `local`
-/// default both mean «the driver chooses» — the value is never shown as a
-/// provider name (REQ-MS-01 AC2).
-fn llm_provider_word(value: &str) -> &str {
-    if value.trim().is_empty() || value == "local" {
-        "не задан — выбирает драйвер"
-    } else {
-        value
-    }
-}
-
 /// The declared bundle a probe/switch id resolved to, for the CLI's
 /// rendering parity. Kept public so the console shows the same words.
 pub fn bundle_identity_text(b: &ModelBundle) -> String {
     format!(
         "driver `{}` · LLM-провайдер `{}` · модель `{}` · уровень размышления `{}` · агент `{}`",
         b.driver,
-        llm_provider_word(&b.llm_provider),
-        if b.model.is_empty() {
-            "не передаётся"
-        } else {
-            &b.model
-        },
-        b.reasoning,
+        devai_core::types::llm_provider_word(&b.llm_provider),
+        devai_core::types::model_word(&b.model),
+        devai_core::types::reasoning_word(&b.reasoning),
         b.agent
     )
 }
@@ -912,17 +946,9 @@ pub fn stamp_text(bundle: &Option<ExecutionBundle>) -> String {
         Some(b) => format!(
             "driver `{}` · LLM-провайдер `{}` · модель `{}` · уровень размышления `{}`",
             b.driver,
-            llm_provider_word(&b.llm_provider),
-            if b.model.is_empty() {
-                "не передаётся"
-            } else {
-                &b.model
-            },
-            if b.reasoning.is_empty() {
-                "не задан — связка неполна"
-            } else {
-                &b.reasoning
-            },
+            devai_core::types::llm_provider_word(&b.llm_provider),
+            devai_core::types::model_word(&b.model),
+            devai_core::types::reasoning_word(&b.reasoning),
         ),
     }
 }
@@ -970,27 +996,28 @@ mod tests {
     #[test]
     fn a_failed_switch_names_its_step_and_never_claims_an_agent_change() {
         let a = attempt();
-        let failed = switch_payload(&a, "failed", false, Some("apply_bundle_switch"));
-        assert_eq!(failed[json_field::OUTCOME], "failed");
-        assert_eq!(failed[json_field::FAILURE_STEP], "apply_bundle_switch");
+        let failed = switch_payload(&a, switch_outcome::FAILED, false, Some(SWITCH_STEP));
+        assert_eq!(failed[json_field::OUTCOME], switch_outcome::FAILED);
+        assert_eq!(failed[json_field::FAILURE_STEP], SWITCH_STEP);
         assert_eq!(failed[json_field::AGENT_CHANGED], false);
         assert_eq!(failed[json_field::VERDICT], "ok");
 
-        let applied = switch_payload(&a, "applied", true, None);
+        let applied = switch_payload(&a, switch_outcome::APPLIED, true, None);
         assert!(applied.get(json_field::FAILURE_STEP).is_none());
         assert_eq!(applied[json_field::AGENT_CHANGED], true);
 
-        let refused = switch_payload(&a, "refused_probe", false, None);
+        let refused = switch_payload(&a, switch_outcome::REFUSED_PROBE, false, None);
         assert!(refused.get(json_field::FAILURE_STEP).is_none());
         assert_eq!(refused[json_field::AGENT_CHANGED], false);
     }
 
     /// The event-count contract of REQ-MS-05 AC4: every outcome carries the
-    /// same keys; only `failed` adds the step.
+    /// same keys; only `failed` adds the step. The outcome set is the CORE
+    /// dictionary — an outcome outside it is a vocabulary break (R2).
     #[test]
     fn every_outcome_carries_the_same_identity_keys() {
         let a = attempt();
-        for outcome in ["applied", "refused_probe", "failed"] {
+        for outcome in switch_outcome::ALL {
             let p = switch_payload(&a, outcome, false, None);
             for key in [
                 json_field::BUNDLE_ID,
@@ -1006,5 +1033,79 @@ mod tests {
                 assert!(p.get(key).is_some(), "outcome {outcome} lacks `{key}`");
             }
         }
+    }
+
+    /// R8 quality return: the freshness window has exactly three outcomes,
+    /// and a clock skew FORWARD reads «seen just now», never «from the
+    /// future» (the status must not go dark because of it).
+    #[test]
+    fn freshness_covers_fresh_stale_and_the_clock_skew() {
+        let now = Utc::now();
+        assert_eq!(freshness(now + Duration::seconds(60), 900, now), "fresh");
+        assert_eq!(freshness(now - Duration::seconds(900), 900, now), "fresh");
+        assert_eq!(freshness(now - Duration::seconds(901), 900, now), "stale");
+    }
+
+    /// R8 quality return: the runtime guard refuses a `mock` bundle BEFORE any
+    /// process or event (the loader rejects it too — this is the hand-built
+    /// catalogue path).
+    #[test]
+    fn a_mock_bundle_is_refused_as_not_probeable() {
+        let mock = ModelBundle {
+            id: "mock".into(),
+            label: "Mock".into(),
+            agent: "mock".into(),
+            driver: "mock".into(),
+            llm_provider: String::new(),
+            model: String::new(),
+            reasoning: "high".into(),
+            probe: ProbePolicy::default(),
+        };
+        let err = refuse_unprobeable(&mock).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode("not_probeable"));
+        assert!(err.to_string().contains("no network leg"), "{err}");
+
+        let mut real = mock.clone();
+        real.driver = "hermes".into();
+        assert!(refuse_unprobeable(&real).is_ok());
+    }
+
+    /// R5 quality return: the surface SERVES the empty-field words from the
+    /// core dictionary instead of each consumer re-deriving them. Both views
+    /// (declared row and active record) must carry the same words.
+    #[test]
+    fn the_views_serve_the_core_words_for_empty_fields() {
+        let bundle = ModelBundle {
+            id: "claude-default".into(),
+            label: "Claude".into(),
+            agent: "claude".into(),
+            driver: "claude".into(),
+            llm_provider: String::new(),
+            model: String::new(),
+            reasoning: "medium".into(),
+            probe: ProbePolicy::default(),
+        };
+        let view = ModelBundleView::of(&bundle, false);
+        assert_eq!(view.llm_provider_text, "не задан — выбирает драйвер");
+        assert_eq!(view.model_text, "не передаётся");
+        assert_eq!(view.reasoning_text, "medium");
+
+        // A record outside the declared list (empty level, `local` runtime)
+        // is worded the same way — the window prints these fields verbatim.
+        let record = devai_core::types::AgentInstance {
+            id: new_id(),
+            name: "manual".into(),
+            provider: "hermes".into(),
+            model: String::new(),
+            runtime: "local".into(),
+            reasoning: String::new(),
+            created_at: Utc::now(),
+            active: true,
+        };
+        let active = ActiveBundleView::of(&ModelCatalog::default(), &record);
+        assert_eq!(active.llm_provider_text, "не задан — выбирает драйвер");
+        assert_eq!(active.model_text, "не передаётся");
+        assert_eq!(active.reasoning_text, "не задан — связка неполна");
+        assert!(!active.declared);
     }
 }

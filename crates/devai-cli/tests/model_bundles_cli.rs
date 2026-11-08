@@ -155,7 +155,7 @@ fn a_clean_home_declares_bundles_and_selects_none() {
         ]
     );
     // Four fields, never one «provider»: the declared view carries the
-    // config vocabulary (REQ-MS-01 + REQ-MS-09).
+    // config vocabulary (REQ-MS-01 + the ratified OQ-6 answer).
     let first = &snap["declared"][0];
     assert_eq!(first["driver"], "hermes");
     assert_eq!(first["llm_provider"], "deepseek");
@@ -215,7 +215,10 @@ fn a_switch_applies_one_transaction_with_record_marker_and_history() {
     assert_eq!(active.provider, "hermes", "driver");
     assert_eq!(active.runtime, "deepseek", "LLM-provider");
     assert_eq!(active.model, "live-1");
-    assert_eq!(active.reasoning, "high", "REQ-MS-09: the level is stored");
+    assert_eq!(
+        active.reasoning, "high",
+        "the ratified OQ-6 answer: the level is stored"
+    );
     assert!(active.active);
     // Exactly ONE marked row (the partial unique index plus the code path).
     assert_eq!(
@@ -435,7 +438,7 @@ fn switching_the_agent_name_keeps_both_records_and_flags_the_change() {
     assert_eq!(back.model, "live-1");
 }
 
-/// REQ-MS-09 / the ratified OQ-6 answer: the level is PART of the bundle, so
+/// the ratified OQ-6 answer: the level is PART of the bundle, so
 /// switching between two bundles that share agent+driver+provider+model but
 /// differ ONLY by the level is a real switch, not a `no_op`. This is the
 /// whole point of the answer: the operator changes the level in one step.
@@ -481,7 +484,7 @@ fn switching_only_the_reasoning_level_applies_and_is_not_a_no_op() {
     );
 }
 
-/// REQ-MS-09: a bundle without a level never loads — the load names the
+/// the ratified OQ-6 answer: a bundle without a level never loads — the load names the
 /// field, and no surface can select an incomplete bundle.
 #[test]
 fn a_bundle_without_a_reasoning_level_fails_the_load() {

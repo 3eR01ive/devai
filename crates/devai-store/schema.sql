@@ -185,7 +185,7 @@ CREATE TABLE agent_instances(
   provider   TEXT NOT NULL DEFAULT '',
   model      TEXT NOT NULL DEFAULT '',
   runtime    TEXT NOT NULL DEFAULT '',
-  -- v12 (REQ-MS-09): the reasoning level of the selection — part of the
+  -- v12 (the ratified OQ-6 answer): the reasoning level of the selection — part of the
   -- bundle, not a driver default. '' on a row that is not a declared bundle.
   reasoning  TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,

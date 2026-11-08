@@ -332,9 +332,15 @@ export interface ModelBundleView {
   agent: string;
   driver: string;
   llm_provider: string;
+  /** Operator word of `llm_provider`, served by the platform dictionary. */
+  llm_provider_text: string;
   model: string;
-  /** REQ-MS-09: the level of thinking — part of the bundle. */
+  /** Operator word of `model` («не передаётся» when empty). */
+  model_text: string;
+  /** The level of thinking — part of the bundle (the ratified OQ-6 answer). */
   reasoning: string;
+  /** Operator word of `reasoning` («связка неполна» when empty). */
+  reasoning_text: string;
   probe_phrase: string;
   probe_timeout_ms: number;
   fresh_secs: number;
@@ -347,9 +353,15 @@ export interface ActiveBundleView {
   agent: string;
   driver: string;
   llm_provider: string;
+  /** Operator word of `llm_provider`, served by the platform dictionary. */
+  llm_provider_text: string;
   model: string;
-  /** REQ-MS-09: empty = an incomplete bundle (a run does not start). */
+  /** Operator word of `model` — served, never re-derived in the window. */
+  model_text: string;
+  /** Empty = an incomplete bundle (a run does not start). */
   reasoning: string;
+  /** Operator word of `reasoning` — served, never re-derived. */
+  reasoning_text: string;
   declared: boolean;
 }
 

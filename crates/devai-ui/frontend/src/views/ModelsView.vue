@@ -14,9 +14,6 @@ import {
   HOLD_TIMER_GRACE_MS,
   HOLD_TO_SWITCH_MS,
   holdCompletes,
-  modelWord,
-  providerWord,
-  reasoningWord,
 } from "../model_view";
 import { fmtTime } from "../settings";
 import type { ModelSnapshot, SwitchResultView, UiError } from "../types";
@@ -146,9 +143,9 @@ onUnmounted(cancelHold);
         <div v-if="snap.active" class="muted">
           агент <span class="mono">{{ snap.active.agent }}</span> ·
           драйвер <span class="mono">{{ snap.active.driver }}</span> ·
-          LLM-провайдер <span class="mono">{{ providerWord(snap.active.llm_provider) }}</span> ·
-          модель <span class="mono">{{ modelWord(snap.active.model) }}</span> ·
-          уровень размышления <span class="mono">{{ reasoningWord(snap.active.reasoning) }}</span>
+          LLM-провайдер <span class="mono">{{ snap.active.llm_provider_text }}</span> ·
+          модель <span class="mono">{{ snap.active.model_text }}</span> ·
+          уровень размышления <span class="mono">{{ snap.active.reasoning_text }}</span>
         </div>
         <div v-if="status?.reason" class="muted">
           причина: {{ status.reason_text ?? "причина не распознана" }}
@@ -184,9 +181,9 @@ onUnmounted(cancelHold);
             </td>
             <td class="mono">{{ b.agent }}</td>
             <td class="mono">{{ b.driver }}</td>
-            <td class="mono">{{ providerWord(b.llm_provider) }}</td>
-            <td class="mono">{{ modelWord(b.model) }}</td>
-            <td class="mono">{{ reasoningWord(b.reasoning) }}</td>
+            <td class="mono">{{ b.llm_provider_text }}</td>
+            <td class="mono">{{ b.model_text }}</td>
+            <td class="mono">{{ b.reasoning_text }}</td>
             <td>
               <button @click="probe(b.id)">Проба</button>
               <div v-if="probeLine[b.id]" class="mono muted">{{ probeLine[b.id] }}</div>

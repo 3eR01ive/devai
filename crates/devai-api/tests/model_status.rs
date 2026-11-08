@@ -386,3 +386,43 @@ fn the_banner_offers_only_a_bundle_with_the_latest_fresh_ok_probe() {
         Some("claude-live")
     );
 }
+
+/// R8 quality return: a CANCELLED row is neither «живая» nor «не работает» —
+/// it proves nothing, so the field says so instead of inventing a verdict.
+#[test]
+fn a_cancelled_run_is_not_evidence_for_either_verdict() {
+    let f = Fixture::new();
+    f.mark_active();
+    f.finish_run(
+        ExecutionStatus::Cancelled,
+        None,
+        Utc::now() - Duration::seconds(10),
+    );
+
+    let snap = f.api().model_snapshot().unwrap();
+    assert_eq!(snap.status.state, "unknown");
+    assert_eq!(snap.status.evidence.as_deref(), Some("execution"));
+    assert!(snap.status.reason.is_none());
+    assert!(snap.failures.is_none(), "an inconclusive row does not glow");
+}
+
+/// A successful probe older than the declared window keeps the bundle «живая»
+/// (the verdict is a fact) while the freshness field SAYS the proof is old —
+/// the two are separate by design.
+#[test]
+fn a_stale_ok_probe_is_live_and_says_the_probe_is_old() {
+    let f = Fixture::new();
+    f.mark_active();
+    f.probe(
+        "hermes-live",
+        "ok",
+        42,
+        Utc::now() - Duration::seconds(2_000),
+    );
+
+    let snap = f.api().model_snapshot().unwrap();
+    assert_eq!(snap.status.state, "live");
+    assert_eq!(snap.status.latency_ms, Some(42));
+    assert_eq!(snap.status.freshness, "stale");
+    assert_eq!(snap.status.freshness_text, "проба устарела");
+}

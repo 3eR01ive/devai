@@ -18,7 +18,7 @@
 //! outcome; the caller decides what to write.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -38,7 +38,7 @@ pub struct ProbeRequest {
     pub driver: String,
     pub llm_provider: String,
     pub model: String,
-    /// REQ-MS-09: the reasoning level of the selection — passed to the driver
+    /// the ratified OQ-6 answer: the reasoning level of the selection — passed to the driver
     /// exactly as a run would pass it (part of the bundle, not a default).
     pub reasoning: String,
     pub phrase: String,
@@ -108,67 +108,77 @@ struct RunOutcome {
 /// buffer would otherwise block forever and defeat the deadline.
 fn run_argv(argv: &[String], timeout_ms: u64) -> RunOutcome {
     let started = Instant::now();
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return RunOutcome {
-                exit_code: None,
-                timed_out: false,
-                combined: bounded(&format!("cannot launch `{}`: {e}", argv[0])),
-                latency_ms: started.elapsed().as_millis() as u64,
-                spawn_error: Some(e.to_string()),
-            };
-        }
+    let mut child = match spawn_argv(argv) {
+        Ok(child) => child,
+        Err(outcome) => return outcome,
     };
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
     let stdout = std::thread::spawn(move || drain(stdout_pipe));
     let stderr = std::thread::spawn(move || drain(stderr_pipe));
+    let (status, timed_out) = wait_child(&mut child, timeout_ms);
+    RunOutcome {
+        exit_code: status.and_then(|s| s.code()),
+        timed_out,
+        combined: join_output(
+            stdout.join().unwrap_or_default(),
+            stderr.join().unwrap_or_default(),
+        ),
+        latency_ms: started.elapsed().as_millis() as u64,
+        spawn_error: None,
+    }
+}
 
+/// Start the child with piped output and no stdin. A binary that cannot be
+/// launched at all is a LOCAL fact: the outcome carries it as `spawn_error`.
+fn spawn_argv(argv: &[String]) -> Result<Child, RunOutcome> {
+    let started = Instant::now();
+    Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| RunOutcome {
+            exit_code: None,
+            timed_out: false,
+            combined: bounded(&format!("cannot launch `{}`: {e}", argv[0])),
+            latency_ms: started.elapsed().as_millis() as u64,
+            spawn_error: Some(e.to_string()),
+        })
+}
+
+/// Poll the child until it exits or the deadline passes. At the deadline the
+/// child is killed AND reaped before this returns (REQ-MS-03 AC1).
+fn wait_child(child: &mut Child, timeout_ms: u64) -> (Option<ExitStatus>, bool) {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
-    let mut timed_out = false;
-    let status = loop {
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Hard deadline: kill, then reap — a probe never outlives
-                    // its declared timeout (REQ-MS-03 AC1).
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(20));
+            Ok(Some(status)) => return (Some(status), false),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (None, true);
             }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                timed_out = true;
-                break None;
+                return (None, true);
             }
         }
-    };
-    let out_text = stdout.join().unwrap_or_default();
-    let err_text = stderr.join().unwrap_or_default();
-    let combined = if err_text.trim().is_empty() {
+    }
+}
+
+/// The evidence text of one run: stderr joins stdout when both spoke, and a
+/// silent side never leaves a stray newline in the fragment.
+fn join_output(out_text: String, err_text: String) -> String {
+    if err_text.trim().is_empty() {
         out_text
     } else if out_text.trim().is_empty() {
         err_text
     } else {
         format!("{out_text}\n{err_text}")
-    };
-    RunOutcome {
-        exit_code: status.as_ref().and_then(|s| s.code()),
-        timed_out,
-        combined,
-        latency_ms: started.elapsed().as_millis() as u64,
-        spawn_error: None,
     }
 }
 
@@ -210,50 +220,54 @@ pub fn probe(req: &ProbeRequest) -> ProbeOutcome {
 /// Build `<binary> <args…>`. `Err(verdict)` means "do not run a process".
 fn argv_of(req: &ProbeRequest) -> Result<Vec<String>, ProbeVerdict> {
     match req.driver.as_str() {
-        "claude" => {
-            let mut argv = vec![
-                "claude".to_string(),
-                "-p".to_string(),
-                req.phrase.clone(),
-                "--output-format".to_string(),
-                "json".to_string(),
-                "--no-session-persistence".to_string(),
-                // No tools: the probe is a phrase, not a role (REQ-MS-03).
-                "--allowedTools".to_string(),
-                String::new(),
-            ];
-            if !req.model.is_empty() {
-                argv.push("--model".into());
-                argv.push(req.model.clone());
-            }
-            // REQ-MS-09: the level rides the driver's own flag; a bundle
-            // without it never loads, so an empty level here is a caller bug,
-            // not a reason to invent a default.
-            if !req.reasoning.is_empty() {
-                argv.push("--effort".into());
-                argv.push(req.reasoning.clone());
-            }
-            Ok(argv)
-        }
-        "hermes" => {
-            let mut argv = vec!["hermes".to_string(), "-z".to_string(), req.phrase.clone()];
-            if !req.model.is_empty() {
-                argv.push("-m".into());
-                argv.push(req.model.clone());
-            }
-            if crate::adapters::has_provider_override(&req.llm_provider) {
-                argv.push("--provider".into());
-                argv.push(req.llm_provider.clone());
-            }
-            if !req.reasoning.is_empty() {
-                argv.push("--reasoning".into());
-                argv.push(req.reasoning.clone());
-            }
-            Ok(argv)
-        }
+        "claude" => Ok(claude_argv(req)),
+        "hermes" => Ok(hermes_argv(req)),
         // `mock` is a diagnostic driver with no network leg: not probeable.
         "mock" => Err(ProbeVerdict::NotProbeable),
         _ => Err(ProbeVerdict::Unknown),
+    }
+}
+
+/// `claude -p <phrase> --output-format json`, no session, no tools, then the
+/// declared model and the declared effort level.
+fn claude_argv(req: &ProbeRequest) -> Vec<String> {
+    let mut argv = vec![
+        "claude".to_string(),
+        "-p".to_string(),
+        req.phrase.clone(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--no-session-persistence".to_string(),
+        // No tools: the probe is a phrase, not a role (REQ-MS-03).
+        "--allowedTools".to_string(),
+        String::new(),
+    ];
+    push_flag(&mut argv, "--model", &req.model);
+    // The level rides the driver's own flag; a bundle without it never
+    // loads, so an empty level here is a caller bug, not a reason to invent
+    // a default.
+    push_flag(&mut argv, "--effort", &req.reasoning);
+    argv
+}
+
+/// `hermes -z <phrase>`, then the declared model, LLM-provider and level —
+/// each flag only when the bundle declares the value.
+fn hermes_argv(req: &ProbeRequest) -> Vec<String> {
+    let mut argv = vec!["hermes".to_string(), "-z".to_string(), req.phrase.clone()];
+    push_flag(&mut argv, "-m", &req.model);
+    if crate::adapters::has_provider_override(&req.llm_provider) {
+        argv.push("--provider".into());
+        argv.push(req.llm_provider.clone());
+    }
+    push_flag(&mut argv, "--reasoning", &req.reasoning);
+    argv
+}
+
+/// Append `flag value` only when the value is declared (empty = not passed).
+fn push_flag(argv: &mut Vec<String>, flag: &str, value: &str) {
+    if !value.is_empty() {
+        argv.push(flag.to_string());
+        argv.push(value.to_string());
     }
 }
 
@@ -411,15 +425,40 @@ mod tests {
         assert!(claude.contains(&"m".to_string()));
         // claude chooses its own LLM-provider: no provider flag is invented.
         assert!(!claude.iter().any(|a| a == "--provider"));
-        // REQ-MS-09: the level rides claude's own `--effort`.
+        // The ratified OQ-6 answer: the level rides claude's own `--effort`.
         let pos = claude.iter().position(|a| a == "--effort").unwrap();
         assert_eq!(claude[pos + 1], "high");
 
         let hermes = argv_of(&ProbeRequest::new("hermes", "deepseek", "m", "medium")).unwrap();
         let pos = hermes.iter().position(|a| a == "--provider").unwrap();
         assert_eq!(hermes[pos + 1], "deepseek");
-        // REQ-MS-09: and hermes' own `--reasoning`.
+        // And hermes' own `--reasoning`.
         let pos = hermes.iter().position(|a| a == "--reasoning").unwrap();
         assert_eq!(hermes[pos + 1], "medium");
+    }
+
+    /// R8 quality return: an EMPTY identity field emits no flag at all — the
+    /// driver must not receive a blank model/provider/level argument.
+    #[test]
+    fn empty_identity_fields_emit_no_flags() {
+        let claude = argv_of(&ProbeRequest::new("claude", "", "", "")).unwrap();
+        assert!(!claude.iter().any(|a| a == "--model" || a == "--effort"));
+        let hermes = argv_of(&ProbeRequest::new("hermes", "", "", "")).unwrap();
+        assert!(
+            !hermes
+                .iter()
+                .any(|a| a == "-m" || a == "--provider" || a == "--reasoning")
+        );
+    }
+
+    /// A binary that cannot be launched is a LOCAL fact, never a provider
+    /// refusal: the outcome says `spawn_error` and carries no exit code.
+    #[test]
+    fn a_missing_binary_is_a_spawn_failure_not_a_provider_verdict() {
+        let run = run_argv(&["/nonexistent/devai-probe-binary".to_string()], 1_000);
+        assert!(run.spawn_error.is_some(), "the failure must stay local");
+        assert_eq!(run.exit_code, None);
+        assert!(!run.timed_out);
+        assert!(run.combined.contains("cannot launch"), "{}", run.combined);
     }
 }

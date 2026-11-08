@@ -137,7 +137,7 @@ pub enum RuntimeError {
         "no active model bundle — the platform has no marked agent record; pick one: `devai model switch <id>` (or name the agent explicitly with `--agent`)"
     )]
     NoActiveBundle,
-    /// REQ-MS-09 (the ratified answer to OQ-6): the marked bundle carries no
+    /// the ratified OQ-6 answer: the marked bundle carries no
     /// reasoning level. The level is PART of the selection, so such a bundle
     /// is incomplete and a run on it does NOT start — the platform never
     /// silently inherits the driver's own default.
@@ -1722,7 +1722,7 @@ impl<'a> Engine<'a> {
                 .store
                 .active_agent()?
                 .ok_or(RuntimeError::NoActiveBundle)?;
-            // REQ-MS-09: the level is part of the bundle; without it the
+            // the ratified OQ-6 answer: the level is part of the bundle; without it the
             // bundle is incomplete and the run does NOT start.
             if active.reasoning.trim().is_empty() {
                 return Err(RuntimeError::IncompleteBundle);

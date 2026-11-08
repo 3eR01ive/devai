@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use devai_api::{Api, ProbeRunner};
+use devai_api::{Api, ErrorCode, ProbeRunner};
 use devai_core::types::*;
 use devai_runtime::probe::{ProbeOutcome, ProbeRequest};
 use devai_store::Store;
@@ -142,4 +142,69 @@ fn a_dead_probe_verdict_is_worded_from_the_dictionary() {
         .unwrap();
     assert_eq!(probe.verdict, "no_key");
     assert_eq!(probe.verdict_text, "нет ключа провайдера");
+}
+
+/// R8 quality return: the three PRE-CONDITION refusals of the switch all
+/// refuse BEFORE the probe and write nothing — an unknown id, a reason
+/// outside the closed vocabulary, and the bundle already in force.
+#[test]
+fn the_preconditions_refuse_with_typed_codes_and_no_event() {
+    let f = Fixture::new();
+    let api = f.api(ProbeVerdict::Ok, 1);
+
+    let unknown = api.model_switch("nope", "manual").unwrap_err();
+    assert_eq!(unknown.code(), ErrorCode("unknown_bundle"));
+    // The refusal carries the WHOLE declared list (REQ-MS-08 AC2).
+    let text = unknown.to_string();
+    assert!(
+        text.contains("hermes-live") && text.contains("claude-live"),
+        "{text}"
+    );
+    assert!(f.events().is_empty(), "unknown id: no probe, no fact");
+
+    let bad_reason = api.model_switch("hermes-live", "because").unwrap_err();
+    assert_eq!(bad_reason.code(), ErrorCode("invalid_input"));
+    assert!(f.events().is_empty(), "bad reason: no probe, no fact");
+
+    api.model_switch("hermes-live", "manual").unwrap();
+    let before = f.events().len();
+    let again = api.model_switch("hermes-live", "manual").unwrap_err();
+    assert_eq!(again.code(), ErrorCode("no_op"));
+    assert_eq!(f.events().len(), before, "no_op writes nothing");
+}
+
+/// A probe id that is not declared never reaches a driver process and never
+/// writes a fact — the same guard the switch uses.
+#[test]
+fn probing_an_undeclared_id_launches_nothing() {
+    let f = Fixture::new();
+    let err = f.api(ProbeVerdict::Ok, 1).model_probe("nope").unwrap_err();
+    assert_eq!(err.code(), ErrorCode("unknown_bundle"));
+    assert!(f.events().is_empty());
+}
+
+/// REQ-MS-04 AC4: a switch onto another AGENT NAME is reported by the flag and
+/// the previous record keeps its own identity (only the marker moves).
+#[test]
+fn a_name_change_is_reported_and_the_previous_record_keeps_its_identity() {
+    let f = Fixture::new();
+    f.api(ProbeVerdict::Ok, 10)
+        .model_switch("hermes-live", "manual")
+        .unwrap();
+
+    let moved = f
+        .api(ProbeVerdict::Ok, 11)
+        .model_switch("claude-live", "manual")
+        .unwrap();
+    assert_eq!(moved.outcome, "applied");
+    assert!(moved.agent_changed, "the NAME moved — the UI must say so");
+
+    let agents = Store::open(f.home.path()).unwrap().list_agents().unwrap();
+    let hermes = agents.iter().find(|a| a.name == "hermes").unwrap();
+    assert_eq!(hermes.provider, "hermes", "the old record keeps its driver");
+    assert_eq!(hermes.model, "live-1");
+    assert_eq!(hermes.runtime, "deepseek");
+    assert!(!hermes.active, "the marker moved off it");
+    let claude = agents.iter().find(|a| a.name == "claude").unwrap();
+    assert!(claude.active);
 }

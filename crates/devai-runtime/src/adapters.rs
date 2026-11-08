@@ -33,7 +33,7 @@ pub struct ExecRequest {
     /// the keys live (R3: keys stay out of the store; OQ-5: the platform
     /// never forces `--ignore-user-config`).
     pub provider_override: String,
-    /// REQ-MS-09 (ratified answer to OQ-6): the REASONING LEVEL of the
+    /// the ratified OQ-6 answer: the REASONING LEVEL of the
     /// selection, filled from `AgentInstance.reasoning`. Part of the bundle,
     /// so it is passed to the driver verbatim (`--reasoning` for hermes,
     /// `--effort` for claude) — never silently replaced by a driver default.
@@ -309,7 +309,7 @@ impl AgentRuntime {
         if !req.model.is_empty() {
             cmd.arg("--model").arg(&req.model);
         }
-        // REQ-MS-09: the reasoning level is part of the bundle; claude spells
+        // the ratified OQ-6 answer: the reasoning level is part of the bundle; claude spells
         // it `--effort`. An empty level is refused by the engine before a
         // bundle run starts, so this is never a "use the default" signal.
         if !req.reasoning.is_empty() {
@@ -519,7 +519,7 @@ impl AgentRuntime {
             argv.push("--provider".into());
             argv.push(req.provider_override.clone());
         }
-        // REQ-MS-09: the level rides hermes' own flag (part of the selection).
+        // the ratified OQ-6 answer: the level rides hermes' own flag (part of the selection).
         if !req.reasoning.is_empty() {
             argv.push("--reasoning".into());
             argv.push(req.reasoning.clone());
@@ -1738,7 +1738,7 @@ mod tests {
             "/evidence/task/exec/usage.json",
             "R5: inside the PLATFORM evidence dir, never the tree"
         );
-        // REQ-MS-09: the level rides hermes' own flag.
+        // the ratified OQ-6 answer: the level rides hermes' own flag.
         assert_eq!(
             argv[pos("--reasoning") + 1],
             "high",
@@ -1752,7 +1752,7 @@ mod tests {
         // Read-only shape (ratified OQ-1): evidence=None => no --usage-file.
         r.evidence = None;
         r.role.tools = vec![];
-        // REQ-MS-09: an EMPTY level (the explicit diagnostic path) emits no
+        // the ratified OQ-6 answer: an EMPTY level (the explicit diagnostic path) emits no
         // flag — the active-bundle path never gets here with an empty level.
         r.reasoning = String::new();
         let argv = AgentRuntime::hermes_argv(&r).unwrap();

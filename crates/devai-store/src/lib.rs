@@ -191,7 +191,7 @@ pub struct BundleSwitch {
     pub driver: String,
     pub llm_provider: String,
     pub model: String,
-    /// REQ-MS-09: the reasoning level of the selection — part of the bundle,
+    /// the ratified OQ-6 answer: the reasoning level of the selection — part of the bundle,
     /// carried into the agent record by the same transaction.
     pub reasoning: String,
     pub actor: String,
@@ -1496,15 +1496,7 @@ impl Store {
     /// the partial unique index (`agent_instances_single_active`), so this is
     /// a plain lookup, not a conflict resolution.
     pub fn active_agent(&self) -> StoreResult<Option<AgentInstance>> {
-        rows::unwrap_row(
-            self.conn
-                .query_row(
-                    "SELECT id,name,provider,model,runtime,reasoning,created_at,active FROM agent_instances WHERE active=1",
-                    [],
-                    |r| rows::r2sql(rows::agent_from_row(r)),
-                )
-                .optional(),
-        )
+        Self::marked_agent(&self.conn)
     }
 
     /// THE switch (REQ-MS-04): upsert the agent record by NAME (its id and
@@ -1518,18 +1510,33 @@ impl Store {
     /// This method only ever performs an approved move.
     pub fn apply_bundle_switch(&self, s: &BundleSwitch) -> StoreResult<Option<AgentInstance>> {
         let tx = self.conn.unchecked_transaction()?;
-        let previous = tx
-            .query_row(
+        let previous = Self::marked_agent(&tx)?;
+        Self::upsert_switch_record(&tx, s)?;
+        Self::move_marker(&tx, &s.agent)?;
+        Self::verify_switch_record(&tx, s)?;
+        Self::append_switch_event(&tx, s, &Self::switch_event_payload(s, previous.as_ref()))?;
+        tx.commit()?;
+        Ok(previous)
+    }
+
+    /// The ONE marked agent record, read on an open connection/transaction
+    /// (`active_agent` serves the same predicate without one).
+    fn marked_agent(conn: &Connection) -> StoreResult<Option<AgentInstance>> {
+        rows::unwrap_row(
+            conn.query_row(
                 "SELECT id,name,provider,model,runtime,reasoning,created_at,active FROM agent_instances WHERE active=1",
                 [],
                 |r| rows::r2sql(rows::agent_from_row(r)),
             )
-            .optional()?;
-        // Upsert by name: id/created_at are preserved (the ON CONFLICT set
-        // deliberately omits both), so the record keeps its identity.
-        // Column order is the STORE's: `provider` holds the DRIVER, `model`
-        // the model, `runtime` the LLM-provider — the opposite of the config
-        // field order (REQ-MS-01: the two vocabularies never swap columns).
+            .optional(),
+        )
+    }
+
+    /// Upsert the record by NAME: id/`created_at` are preserved (the ON
+    /// CONFLICT set deliberately omits both), so the record keeps its
+    /// identity. Column order is the STORE's: `provider` holds the DRIVER,
+    /// `model` the model, `runtime` the LLM-provider (REQ-MS-01).
+    fn upsert_switch_record(tx: &Transaction<'_>, s: &BundleSwitch) -> StoreResult<()> {
         tx.execute(
             "INSERT INTO agent_instances(id,name,provider,model,runtime,reasoning,created_at,active) VALUES(?1,?2,?3,?4,?5,?6,?7,0)
              ON CONFLICT(name) DO UPDATE SET provider=?3, model=?4, runtime=?5, reasoning=?6",
@@ -1543,19 +1550,27 @@ impl Store {
                 rows::ts(&s.now)
             ],
         )?;
-        // Move the marker: clear every other row first (the partial unique
-        // index would reject two marked rows), then mark the target.
+        Ok(())
+    }
+
+    /// Move the marker: clear every other row first (the partial unique index
+    /// would reject two marked rows), then mark the target.
+    fn move_marker(tx: &Transaction<'_>, agent: &str) -> StoreResult<()> {
         tx.execute(
             "UPDATE agent_instances SET active=0 WHERE active=1 AND name<>?1",
-            params![s.agent],
+            params![agent],
         )?;
         tx.execute(
             "UPDATE agent_instances SET active=1 WHERE name=?1",
-            params![s.agent],
+            params![agent],
         )?;
-        // VERIFY inside the transaction: the record now carries the bundle
-        // identity and it is the marked one. A divergence is a corrupt state,
-        // never a silent half-switch.
+        Ok(())
+    }
+
+    /// VERIFY inside the transaction: the record now carries the bundle
+    /// identity and it is the marked one. A divergence is a corrupt state,
+    /// never a silent half-switch.
+    fn verify_switch_record(tx: &Transaction<'_>, s: &BundleSwitch) -> StoreResult<()> {
         let (name, driver, llm_provider, model, reasoning, active): (
             String,
             String,
@@ -1580,11 +1595,21 @@ impl Store {
                 s.agent, s.driver, s.llm_provider, s.model, s.reasoning
             )));
         }
+        Ok(())
+    }
+
+    /// The event payload: the caller's keys plus the two facts only the store
+    /// knows — the «from» snapshot and whether the agent NAME changed (a
+    /// first selection has no name to have changed, REQ-MS-04 AC4).
+    fn switch_event_payload(
+        s: &BundleSwitch,
+        previous: Option<&AgentInstance>,
+    ) -> serde_json::Value {
         let mut payload = s.payload.clone();
         if let serde_json::Value::Object(map) = &mut payload {
             map.insert(
                 json_field::FROM.into(),
-                match &previous {
+                match previous {
                     Some(p) => serde_json::json!({
                         (json_field::DRIVER): p.provider,
                         (json_field::LLM_PROVIDER): p.runtime,
@@ -1596,9 +1621,6 @@ impl Store {
             );
             map.insert(
                 json_field::AGENT_CHANGED.into(),
-                // No previous marker = there is no NAME to have changed: the
-                // flag reports a transition between two records, not the
-                // first selection (REQ-MS-04 AC4).
                 serde_json::Value::Bool(
                     previous
                         .as_ref()
@@ -1607,6 +1629,15 @@ impl Store {
                 ),
             );
         }
+        payload
+    }
+
+    /// Append the immutable `model.switched` fact — no task, home level.
+    fn append_switch_event(
+        tx: &Transaction<'_>,
+        s: &BundleSwitch,
+        payload: &serde_json::Value,
+    ) -> StoreResult<()> {
         tx.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,NULL,?2,?3,?4,?5)",
             params![
@@ -1617,8 +1648,7 @@ impl Store {
                 rows::ts(&s.now)
             ],
         )?;
-        tx.commit()?;
-        Ok(previous)
+        Ok(())
     }
 
     /// Home-level history of the bundle surface (REQ-MS-05): every probe and
@@ -2363,8 +2393,8 @@ fn additive_model_bundle_columns(tx: &Transaction<'_>, step: &SchemaRung) -> Sto
     apply_script_with_column_skip(tx, step.script)
 }
 
-/// Rung v11→v12 (task 01a1b71f, REQ-MS-09): the reasoning level on the
-/// agent record and on the run stamp. Additive only — one defaulted column
+/// Rung v11→v12 (task 01a1b71f, the ratified OQ-6 answer): the reasoning
+/// level on the agent record and on the run stamp. Additive only — one defaulted column
 /// and one nullable column; the shared column-presence skip keeps a re-run
 /// over an already-shaped home a no-op.
 fn additive_model_reasoning_column(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {

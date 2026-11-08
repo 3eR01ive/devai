@@ -16,12 +16,7 @@ import {
   textOf,
   type Harness,
 } from "./support/component-harness.ts";
-import {
-  holdCompletes,
-  modelWord,
-  providerWord,
-  reasoningWord,
-} from "../src/model_view.ts";
+import { holdCompletes } from "../src/model_view.ts";
 
 let harness: Harness;
 
@@ -52,8 +47,11 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
     agent: "hermes",
     driver: "hermes",
     llm_provider: "deepseek",
+    llm_provider_text: "deepseek",
     model: "deepseek-v4.1-flash",
+    model_text: "deepseek-v4.1-flash",
     reasoning: "high",
+    reasoning_text: "high",
     declared: true,
   },
   status: {
@@ -76,8 +74,11 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
       agent: "hermes",
       driver: "hermes",
       llm_provider: "deepseek",
+      llm_provider_text: "deepseek",
       model: "deepseek-v4.1-flash",
+      model_text: "deepseek-v4.1-flash",
       reasoning: "high",
+      reasoning_text: "high",
       probe_phrase: "ping",
       probe_timeout_ms: 20000,
       fresh_secs: 900,
@@ -89,8 +90,11 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
       agent: "hermes",
       driver: "hermes",
       llm_provider: "alibaba",
+      llm_provider_text: "alibaba",
       model: "qwen-max",
+      model_text: "qwen-max",
       reasoning: "medium",
+      reasoning_text: "medium",
       probe_phrase: "ping",
       probe_timeout_ms: 20000,
       fresh_secs: 900,
@@ -103,14 +107,7 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-test("подписи связки — словами, подстановки нет; удержание имеет порог", () => {
-  // Пустые поля — словами, подстановки нет.
-  assert.equal(providerWord(""), "не задан — выбирает драйвер");
-  assert.equal(providerWord("local"), "не задан — выбирает драйвер");
-  assert.equal(modelWord(""), "не передаётся");
-  // Пустой уровень — неполная связка, а не «драйвер решит» (REQ-MS-09).
-  assert.equal(reasoningWord(""), "не задан — связка неполна");
-  assert.equal(reasoningWord("high"), "high");
+test("удержание имеет порог; клик без удержания не применяет", () => {
   assert.equal(holdCompletes(699), false);
   assert.equal(holdCompletes(700), true);
 });
@@ -132,12 +129,48 @@ test("ModelsView: снимок рендерит связку, ОДИН стат�
   assert.match(text, /драйвер/);
   assert.match(text, /LLM-провайдер/);
   assert.match(text, /модель/);
-  // Уровень размышления — часть связки (REQ-MS-09), показан и подписан.
+  // Уровень размышления — часть связки (the ratified OQ-6 answer), показан и подписан.
   assert.match(text, /уровень размышления/);
   assert.match(text, /high/);
   // Обе объявленные связки — списком целиком, без «+N ещё».
   assert.match(text, /hermes-alibaba/);
   assert.doesNotMatch(text, /\+N ещё/);
+});
+
+test("ModelsView: слова полей приходят от платформы и печатаются как есть", async () => {
+  // R5 quality return: the window has NO copy of the «code → word» dictionary.
+  // A served word that differs from what a local re-derivation would produce
+  // must appear verbatim — that is how this pin catches a second dictionary.
+  const served = snapshot({
+    active: {
+      id: null,
+      label: null,
+      agent: "hermes",
+      driver: "hermes",
+      llm_provider: "",
+      llm_provider_text: "слово платформы: провайдер",
+      model: "",
+      model_text: "слово платформы: модель",
+      reasoning: "",
+      reasoning_text: "слово платформы: уровень",
+      declared: false,
+    },
+  });
+  installInvoke((cmd) => {
+    if (cmd === "model_snapshot") return served;
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+
+  const text = textOf(root);
+  assert.match(text, /слово платформы: провайдер/);
+  assert.match(text, /слово платформы: модель/);
+  assert.match(text, /слово платформы: уровень/);
+  // The empty-field words are NOT re-derived in the window.
+  assert.doesNotMatch(text, /не задан — связка неполна/);
+  assert.doesNotMatch(text, /не передаётся/);
 });
 
 test("ModelsView: «не работает» горит баннером и предлагает живую связку", async () => {

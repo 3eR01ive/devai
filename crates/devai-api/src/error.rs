@@ -46,6 +46,16 @@ pub enum ApiError {
     /// Artifact content that cannot be presented to a human as text.
     #[error("artifact content is not valid UTF-8")]
     NotUtf8,
+    /// A STEP of a multi-step operation failed (R7 quality return: the
+    /// cause must not be lost between the store and the caller). The step
+    /// name and the rollback statement travel with the inner error; `code`
+    /// stays the inner, typed token so a consumer branches as before.
+    #[error("step `{step}` failed: {source}; the operation was rolled back")]
+    Step {
+        step: &'static str,
+        #[source]
+        source: Box<ApiError>,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// Cycle 2 (REQ-MUT-01/08): a domain refusal raised by a mutation
@@ -78,6 +88,16 @@ impl ApiError {
         ApiError::Refused {
             code: ErrorCode(code),
             message: message.into(),
+        }
+    }
+
+    /// Name the failing STEP of a multi-step operation (R7 quality return).
+    /// The inner error's typed `code` survives; its text gains the step and
+    /// the rollback statement. A `Step` wrapping a `Step` keeps both names.
+    pub(crate) fn at_step(step: &'static str, source: impl Into<ApiError>) -> ApiError {
+        ApiError::Step {
+            step,
+            source: Box::new(source.into()),
         }
     }
 }
@@ -169,6 +189,7 @@ impl ApiError {
             Self::BadRequest(..) => ErrorCode("bad_request"),
             Self::InvalidInput { .. } => ErrorCode("invalid_input"),
             Self::NotUtf8 => ErrorCode("not_utf8"),
+            Self::Step { source, .. } => source.code(),
             Self::Io(..) => ErrorCode("io"),
             Self::Refused { code, .. } => *code,
             Self::ContractUnregistered { .. } => ErrorCode("contract_unregistered"),
@@ -199,6 +220,20 @@ mod tests {
         assert_eq!(e4.code(), ErrorCode("invalid_input"));
         // Display stays human-readable and carries the inner text (CLI parity).
         assert!(format!("{e}").contains("task `deadbeef` not found"));
+    }
+
+    /// R7 quality return: a named step keeps the INNER typed code (a consumer
+    /// still branches on the cause) while the text gains the step and the
+    /// rollback statement — the cause is never lost on the way out.
+    #[test]
+    fn a_named_step_keeps_the_inner_code_and_adds_the_context() {
+        let inner: ApiError = StoreError::Corrupt("half-switched".into()).into();
+        let stepped = ApiError::at_step("apply_bundle_switch", inner);
+        assert_eq!(stepped.code(), ErrorCode("corrupt"));
+        let text = format!("{stepped}");
+        assert!(text.contains("apply_bundle_switch"), "{text}");
+        assert!(text.contains("rolled back"), "{text}");
+        assert!(text.contains("half-switched"), "{text}");
     }
 
     #[test]

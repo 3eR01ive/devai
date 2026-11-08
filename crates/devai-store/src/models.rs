@@ -31,8 +31,8 @@
 //! own). Unknown keys — `key`, `token`, `base_url` included — fail with the
 //! key's name: they are exactly what the UI must never accept.
 //!
-//! `reasoning` is not optional and is not defaulted (REQ-MS-09, the ratified
-//! answer to OQ-6): the level is part of the chosen bundle, so a bundle
+//! `reasoning` is not optional and is not defaulted (the ratified OQ-6
+//! answer): the level is part of the chosen bundle, so a bundle
 //! without it is INCOMPLETE and a run on it does not start — the load
 //! refuses instead of silently inheriting the driver's own default.
 
@@ -99,14 +99,14 @@ pub struct ModelBundle {
     /// The `agent_instances` name this bundle is materialised under. Two
     /// bundles may name one agent: the record's identity is overwritten by
     /// the switch, which is why switching to another MODEL or REASONING
-    /// LEVEL of the same agent needs no restart (ASM-8, REQ-MS-09).
+    /// LEVEL of the same agent needs no restart (ASM-8, the ratified OQ-6 answer).
     pub agent: String,
     pub driver: String,
     #[serde(default)]
     pub llm_provider: String,
     #[serde(default)]
     pub model: String,
-    /// The level of thinking (REQ-MS-09): REQUIRED. Empty never loads — the
+    /// The level of thinking (the ratified OQ-6 answer): REQUIRED. Empty never loads — the
     /// level is part of the bundle, not a driver default.
     #[serde(default)]
     pub reasoning: String,
@@ -116,7 +116,7 @@ pub struct ModelBundle {
 
 impl ModelBundle {
     /// The declared identity — the quintuple the store row's content must
-    /// match (REQ-MS-02 + REQ-MS-09: agent, driver, LLM-provider, model,
+    /// match (REQ-MS-02 + the ratified OQ-6 answer: agent, driver, LLM-provider, model,
     /// reasoning level).
     pub fn identity(&self) -> (&str, &str, &str, &str, &str) {
         (
@@ -227,10 +227,34 @@ pub fn load_catalog(config_dir: &Path) -> StoreResult<ModelCatalog> {
     if !path.exists() {
         return Ok(ModelCatalog::default());
     }
+    Ok(ModelCatalog {
+        bundles: read_bundles(&path)?,
+    })
+}
+
+/// Read and parse the file into records: document shape, per-record white
+/// list, then the cross-record rules. Each failure is typed and names the
+/// file (and the index) it came from.
+fn read_bundles(path: &Path) -> StoreResult<Vec<ModelBundle>> {
     let text =
-        fs::read_to_string(&path).map_err(|e| cfg(format!("read {}: {e}", path.display())))?;
+        fs::read_to_string(path).map_err(|e| cfg(format!("read {}: {e}", path.display())))?;
     let doc: serde_yaml::Value =
         serde_yaml::from_str(&text).map_err(|e| cfg(format!("parse {}: {e}", path.display())))?;
+    let items = declared_list(&doc, path)?;
+    let mut bundles = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        bundles.push(parse_bundle(item, idx, path)?);
+    }
+    validate(&bundles, path)?;
+    Ok(bundles)
+}
+
+/// The `bundles:` sequence of the document. Any other top-level field is a
+/// typed error: the file declares only one thing.
+fn declared_list<'a>(
+    doc: &'a serde_yaml::Value,
+    path: &Path,
+) -> StoreResult<&'a [serde_yaml::Value]> {
     let mapping = doc.as_mapping().ok_or_else(|| {
         cfg(format!(
             "{}: the document must be a map with a `bundles:` list",
@@ -246,89 +270,84 @@ pub fn load_catalog(config_dir: &Path) -> StoreResult<ModelCatalog> {
             )));
         }
     }
-    let list = match mapping.get(serde_yaml::Value::String("bundles".into())) {
+    match mapping.get(serde_yaml::Value::String("bundles".into())) {
         Some(v) => v
             .as_sequence()
-            .ok_or_else(|| cfg(format!("{}: `bundles` must be a list", path.display())))?
-            .clone(),
-        None => Vec::new(),
-    };
-
-    let mut bundles: Vec<ModelBundle> = Vec::new();
-    for (idx, item) in list.iter().enumerate() {
-        let map = item.as_mapping().ok_or_else(|| {
-            cfg(format!(
-                "{}: bundles[{idx}] must be a map of declared fields",
-                path.display()
-            ))
-        })?;
-        for key in map.keys() {
-            let key = key.as_str().unwrap_or("");
-            if !BUNDLE_KEYS.contains(&key) {
-                return Err(cfg(format!(
-                    "{}: bundles[{idx}]: unknown field `{key}` — declared fields are {}",
-                    path.display(),
-                    BUNDLE_KEYS.join(", ")
-                )));
-            }
-        }
-        if let Some(probe) = map.get(serde_yaml::Value::String("probe".into())) {
-            let probe_map = probe.as_mapping().ok_or_else(|| {
-                cfg(format!(
-                    "{}: bundles[{idx}].probe must be a map",
-                    path.display()
-                ))
-            })?;
-            for key in probe_map.keys() {
-                let key = key.as_str().unwrap_or("");
-                if !PROBE_KEYS.contains(&key) {
-                    return Err(cfg(format!(
-                        "{}: bundles[{idx}].probe: unknown field `{key}` — declared fields are {}",
-                        path.display(),
-                        PROBE_KEYS.join(", ")
-                    )));
-                }
-            }
-        }
-        let bundle: ModelBundle = serde_yaml::from_value(item.clone())
-            .map_err(|e| cfg(format!("{}: bundles[{idx}]: {e}", path.display())))?;
-        bundles.push(bundle);
+            .map(Vec::as_slice)
+            .ok_or_else(|| cfg(format!("{}: `bundles` must be a list", path.display()))),
+        None => Ok(&[]),
     }
-
-    validate(&bundles, &path)?;
-    Ok(ModelCatalog { bundles })
 }
 
-/// The cross-record rules: identity completeness, duplicate id, duplicate
-/// identity, driver whitelist. Each error names the record(s) involved.
+/// One declared record: the deny-by-default key check, then the typed parse.
+fn parse_bundle(item: &serde_yaml::Value, idx: usize, path: &Path) -> StoreResult<ModelBundle> {
+    let map = item.as_mapping().ok_or_else(|| {
+        cfg(format!(
+            "{}: bundles[{idx}] must be a map of declared fields",
+            path.display()
+        ))
+    })?;
+    check_bundle_keys(map, idx, path)?;
+    check_probe_keys(map, idx, path)?;
+    serde_yaml::from_value(item.clone())
+        .map_err(|e| cfg(format!("{}: bundles[{idx}]: {e}", path.display())))
+}
+
+/// The white list of bundle keys: everything else — a key, a token, a
+/// credential name or `base_url` — is a typed error naming the key.
+fn check_bundle_keys(map: &serde_yaml::Mapping, idx: usize, path: &Path) -> StoreResult<()> {
+    check_keys(map, BUNDLE_KEYS, idx, None, path)
+}
+
+/// The white list of `probe:` keys.
+fn check_probe_keys(map: &serde_yaml::Mapping, idx: usize, path: &Path) -> StoreResult<()> {
+    let Some(probe) = map.get(serde_yaml::Value::String("probe".into())) else {
+        return Ok(());
+    };
+    let probe_map = probe.as_mapping().ok_or_else(|| {
+        cfg(format!(
+            "{}: bundles[{idx}].probe must be a map",
+            path.display()
+        ))
+    })?;
+    check_keys(probe_map, PROBE_KEYS, idx, Some("probe"), path)
+}
+
+/// ONE deny-by-default key check for both levels: the caller passes the
+/// white list and the section name (`None` = the record itself).
+fn check_keys(
+    map: &serde_yaml::Mapping,
+    allowed: &[&str],
+    idx: usize,
+    section: Option<&str>,
+    path: &Path,
+) -> StoreResult<()> {
+    let where_ = match section {
+        Some(s) => format!("bundles[{idx}].{s}"),
+        None => format!("bundles[{idx}]"),
+    };
+    for key in map.keys() {
+        let key = key.as_str().unwrap_or("");
+        if !allowed.contains(&key) {
+            return Err(cfg(format!(
+                "{}: {where_}: unknown field `{key}` — declared fields are {}",
+                path.display(),
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The cross-record rules, one responsibility per check: completeness of a
+/// record, its driver, its probe policy, and the two uniqueness rules.
 fn validate(bundles: &[ModelBundle], path: &Path) -> StoreResult<()> {
     let mut ids: HashSet<&str> = HashSet::new();
     let mut identities: Vec<(&str, (&str, &str, &str, &str, &str))> = Vec::new();
     for b in bundles {
-        for (field, value) in [
-            ("id", &b.id),
-            ("label", &b.label),
-            ("agent", &b.agent),
-            ("driver", &b.driver),
-        ] {
-            if value.trim().is_empty() {
-                return Err(cfg(format!(
-                    "{}: bundle `{}` has an empty `{field}`",
-                    path.display(),
-                    b.id
-                )));
-            }
-        }
-        // REQ-MS-09 (the ratified answer to OQ-6): the reasoning level is
-        // PART of the bundle. A bundle without one is incomplete, so the load
-        // refuses instead of letting a run start on a driver default.
-        if b.reasoning.trim().is_empty() {
-            return Err(cfg(format!(
-                "{}: bundle `{}` declares no `reasoning` level — the level is part of the bundle (chosen with the LLM-provider and the model); a bundle without it is incomplete and a run on it does not start",
-                path.display(),
-                b.id
-            )));
-        }
+        check_required(b, path)?;
+        check_driver(b, path)?;
+        check_probe_policy(b, path)?;
         if !ids.insert(b.id.as_str()) {
             return Err(cfg(format!(
                 "{}: duplicate bundle id `{}` — ids are handles, one record per id",
@@ -336,55 +355,107 @@ fn validate(bundles: &[ModelBundle], path: &Path) -> StoreResult<()> {
                 b.id
             )));
         }
-        if b.driver == "mock" {
-            return Err(cfg(format!(
-                "{}: bundle `{}` declares driver `mock` — mock has no network leg and is never a bundle (probe is not_probeable)",
-                path.display(),
-                b.id
-            )));
-        }
-        if !PROBEABLE_DRIVERS.contains(&b.driver.as_str()) {
-            return Err(cfg(format!(
-                "{}: bundle `{}` declares unknown driver `{}` — allowed: {}",
-                path.display(),
-                b.id,
-                b.driver,
-                PROBEABLE_DRIVERS.join(", ")
-            )));
-        }
-        if b.driver == SELF_PROVIDER_DRIVER && !b.llm_provider.is_empty() {
-            return Err(cfg(format!(
-                "{}: bundle `{}` sets `llm_provider: {}` on driver `{}` — that driver chooses its own LLM-provider, the field must be empty",
-                path.display(),
-                b.id,
-                b.llm_provider,
-                b.driver
-            )));
-        }
-        if b.probe.timeout_ms == 0 || b.probe.fresh_secs == 0 || b.probe.phrase.trim().is_empty() {
-            return Err(cfg(format!(
-                "{}: bundle `{}`: probe.phrase/timeout_ms/fresh_secs must be non-empty and positive",
-                path.display(),
-                b.id
-            )));
-        }
-        let identity = (
-            b.agent.as_str(),
-            b.driver.as_str(),
-            b.llm_provider.as_str(),
-            b.model.as_str(),
-            b.reasoning.as_str(),
-        );
-        if let Some((other_id, _)) = identities.iter().find(|entry| entry.1 == identity) {
-            return Err(cfg(format!(
-                "{}: bundles `{other_id}` and `{}` declare the same identity ({}) — one identity, one record",
-                path.display(),
-                b.id,
-                b.identity_text()
-            )));
-        }
-        identities.push((b.id.as_str(), identity));
+        check_unique_identity(&mut identities, b, path)?;
     }
+    Ok(())
+}
+
+/// Every field the surface renders has to be present; the reasoning level is
+/// part of the bundle (the ratified OQ-6 answer), so an empty one is an
+/// INCOMPLETE bundle — the load refuses instead of running on a driver
+/// default.
+fn check_required(b: &ModelBundle, path: &Path) -> StoreResult<()> {
+    for (field, value) in [
+        ("id", &b.id),
+        ("label", &b.label),
+        ("agent", &b.agent),
+        ("driver", &b.driver),
+    ] {
+        if value.trim().is_empty() {
+            return Err(cfg(format!(
+                "{}: bundle `{}` has an empty `{field}`",
+                path.display(),
+                b.id
+            )));
+        }
+    }
+    if b.reasoning.trim().is_empty() {
+        return Err(cfg(format!(
+            "{}: bundle `{}` declares no `reasoning` level — the level is part of the bundle (chosen with the LLM-provider and the model); a bundle without it is incomplete and a run on it does not start",
+            path.display(),
+            b.id
+        )));
+    }
+    Ok(())
+}
+
+/// The driver rules: `mock` is never a bundle, only drivers with a network
+/// leg are declared, and a self-providing driver must leave the field empty.
+fn check_driver(b: &ModelBundle, path: &Path) -> StoreResult<()> {
+    if b.driver == "mock" {
+        return Err(cfg(format!(
+            "{}: bundle `{}` declares driver `mock` — mock has no network leg and is never a bundle (probe is not_probeable)",
+            path.display(),
+            b.id
+        )));
+    }
+    if !PROBEABLE_DRIVERS.contains(&b.driver.as_str()) {
+        return Err(cfg(format!(
+            "{}: bundle `{}` declares unknown driver `{}` — allowed: {}",
+            path.display(),
+            b.id,
+            b.driver,
+            PROBEABLE_DRIVERS.join(", ")
+        )));
+    }
+    if b.driver == SELF_PROVIDER_DRIVER && !b.llm_provider.is_empty() {
+        return Err(cfg(format!(
+            "{}: bundle `{}` sets `llm_provider: {}` on driver `{}` — that driver chooses its own LLM-provider, the field must be empty",
+            path.display(),
+            b.id,
+            b.llm_provider,
+            b.driver
+        )));
+    }
+    Ok(())
+}
+
+/// A probe is one real call: its phrase, timeout and freshness window must be
+/// usable values, never zero.
+fn check_probe_policy(b: &ModelBundle, path: &Path) -> StoreResult<()> {
+    if b.probe.timeout_ms == 0 || b.probe.fresh_secs == 0 || b.probe.phrase.trim().is_empty() {
+        return Err(cfg(format!(
+            "{}: bundle `{}`: probe.phrase/timeout_ms/fresh_secs must be non-empty and positive",
+            path.display(),
+            b.id
+        )));
+    }
+    Ok(())
+}
+
+/// The identity is unique: one record per `(agent, driver, llm_provider,
+/// model, reasoning)`, and the error names BOTH records.
+fn check_unique_identity<'a>(
+    identities: &mut Vec<(&'a str, (&'a str, &'a str, &'a str, &'a str, &'a str))>,
+    b: &'a ModelBundle,
+    path: &Path,
+) -> StoreResult<()> {
+    let identity = (
+        b.agent.as_str(),
+        b.driver.as_str(),
+        b.llm_provider.as_str(),
+        b.model.as_str(),
+        b.reasoning.as_str(),
+    );
+    if let Some((other_id, _)) = identities.iter().find(|entry| entry.1 == identity) {
+        return Err(cfg(format!(
+            "{}: bundles `{other_id}` and `{}` declare the same identity ({}) — one identity, one record",
+            path.display(),
+            b.id,
+            b.identity_text()
+        )));
+    }
+    identities.push((b.id.as_str(), identity));
     Ok(())
 }
 
@@ -440,7 +511,7 @@ bundles:
         assert!(!b.probe.phrase.is_empty());
     }
 
-    /// REQ-MS-09 (ratified OQ-6 answer): the level is part of the bundle and
+    /// the ratified OQ-6 answer: the level is part of the bundle and
     /// is NOT optional — a bundle without it never loads.
     #[test]
     fn a_bundle_without_a_reasoning_level_is_refused_at_load() {

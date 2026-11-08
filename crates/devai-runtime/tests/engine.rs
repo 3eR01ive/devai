@@ -3180,11 +3180,14 @@ fn a_run_without_an_explicit_agent_uses_the_marked_bundle_and_stamps_rows() {
         assert_eq!(b.driver, "mock");
         assert_eq!(b.llm_provider, "", "the seeded mock names no LLM-provider");
         assert_eq!(b.model, "");
-        assert_eq!(b.reasoning, "high", "REQ-MS-09: the level is stamped");
+        assert_eq!(
+            b.reasoning, "high",
+            "the ratified OQ-6 answer: the level is stamped"
+        );
     }
 }
 
-/// REQ-MS-09 (the ratified answer to OQ-6): the marked bundle carries no
+/// the ratified OQ-6 answer: the marked bundle carries no
 /// reasoning level → the bundle is INCOMPLETE and the run does NOT start.
 /// No execution row and no driver call are made.
 #[test]
