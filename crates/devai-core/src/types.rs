@@ -603,10 +603,26 @@ impl RoleDefinition {
 pub struct AgentInstance {
     pub id: Id,
     pub name: String,
+    /// The DRIVER (`mock`/`claude`/`hermes`) — this store column is NOT the
+    /// LLM-provider; the config vocabulary is `driver`/`llm_provider`/`model`
+    /// (REQ-MS-01). The LLM-provider rides `runtime` below.
     pub provider: String,
     pub model: String,
+    /// The LLM-provider for drivers that spell one (empty/`local` = not
+    /// set, the driver chooses). Named `runtime` for storage-compat; the
+    /// read paths that speak the config vocabulary call it `llm_provider`.
     pub runtime: String,
+    /// The REASONING LEVEL of the selected model (REQ-MS-09, ratified answer
+    /// to OQ-6): part of the bundle, chosen together with the LLM-provider
+    /// and the model. Empty = the bundle is INCOMPLETE and a run on it does
+    /// not start — it is never silently delegated to the driver's default.
+    #[serde(default)]
+    pub reasoning: String,
     pub created_at: Timestamp,
+    /// REQ-MS-02/04: this record is the ONE marked bundle in force (a
+    /// partial unique index keeps it unique). `false` = not in force.
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -720,10 +736,172 @@ pub struct RoleExecution {
     /// enough, because a recycled pid would fake liveness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_process_start: Option<i64>,
+    /// The model-bundle STAMP of this run (REQ-MS-05): driver, LLM-provider
+    /// and model captured by the PLATFORM from the agent record at start —
+    /// never supplied by the caller, never rewritten afterwards (a later
+    /// `model.switch` changes the agent record, not this row). `None` on rows
+    /// written before the v11 rung: they read as «связка не записана», never
+    /// as an empty identity and never re-derived from `agent_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ExecutionBundle>,
 }
 
 fn default_attempt() -> u32 {
     1
+}
+
+/// The executed model bundle as STORED on one execution row (REQ-MS-01/05):
+/// four independent fields — the DRIVER (`mock`/`claude`/`hermes`), the
+/// LLM-provider behind it (empty = the driver chooses), the model (empty =
+/// not passed) and the REASONING LEVEL (REQ-MS-09: part of the selection,
+/// never defaulted). «Just provider» is never a name for these: the
+/// store column `agent_instances.provider` holds the DRIVER, its `runtime`
+/// column holds the LLM-provider; the config vocabulary is
+/// `driver`/`llm_provider`/`model`/`reasoning`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ExecutionBundle {
+    pub driver: String,
+    #[serde(default)]
+    pub llm_provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning: String,
+}
+
+impl ExecutionBundle {
+    pub fn new(driver: &str, llm_provider: &str, model: &str, reasoning: &str) -> Self {
+        Self {
+            driver: driver.to_string(),
+            llm_provider: llm_provider.to_string(),
+            model: model.to_string(),
+            reasoning: reasoning.to_string(),
+        }
+    }
+
+    /// The config vocabulary of the identity, for events and the snapshot.
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            (json_field::DRIVER): self.driver,
+            (json_field::LLM_PROVIDER): self.llm_provider,
+            (json_field::MODEL): self.model,
+            (json_field::REASONING): self.reasoning,
+        })
+    }
+}
+
+/// The closed probe-verdict vocabulary (REQ-MS-03). `timeout` and `unknown`
+/// are «не доказано» — a dead `no_credits` is never invented from them.
+/// `not_probeable` is what `mock` is: no process is started for it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    Ok,
+    NoCredits,
+    ModelNotFound,
+    NoKey,
+    Network,
+    Timeout,
+    Unknown,
+    NotProbeable,
+}
+
+impl ProbeVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NoCredits => "no_credits",
+            Self::ModelNotFound => "model_not_found",
+            Self::NoKey => "no_key",
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Unknown => "unknown",
+            Self::NotProbeable => "not_probeable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Self::Ok,
+            Self::NoCredits,
+            Self::ModelNotFound,
+            Self::NoKey,
+            Self::Network,
+            Self::Timeout,
+            Self::Unknown,
+            Self::NotProbeable,
+        ]
+        .into_iter()
+        .find(|v| v.as_str() == s)
+    }
+
+    /// The verdicts that PROVE the bundle dead — only these may be shown as
+    /// «не работает» with a reason (REQ-MS-03/06).
+    pub fn proves_dead(&self) -> bool {
+        matches!(
+            self,
+            Self::NoCredits | Self::ModelNotFound | Self::NoKey | Self::Network
+        )
+    }
+
+    /// `timeout`/`unknown`: not dead, not alive — «не доказано».
+    pub fn not_proven(&self) -> bool {
+        matches!(self, Self::Timeout | Self::Unknown)
+    }
+
+    pub const ALL: [Self; 8] = [
+        Self::Ok,
+        Self::NoCredits,
+        Self::ModelNotFound,
+        Self::NoKey,
+        Self::Network,
+        Self::Timeout,
+        Self::Unknown,
+        Self::NotProbeable,
+    ];
+}
+
+/// The closed refusal reasons of a switch (REQ-MS-05): the platform never
+/// derives one — the human picks it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchReason {
+    Manual,
+    Limits,
+    Error,
+}
+
+impl SwitchReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Limits => "limits",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Manual, Self::Limits, Self::Error]
+            .into_iter()
+            .find(|r| r.as_str() == s)
+    }
+}
+
+/// Freshness of the evidence behind a snapshot status (REQ-MS-05): derived
+/// from the last probe time and the DECLARED window, never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+impl Freshness {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// The closed vocabulary of `RoleExecution.failure_class` (REQ-FG-01/03).
@@ -1096,6 +1274,16 @@ pub mod event_kind {
     /// A human took a ratification out of force (RV6): payload names the
     /// revoking decision and the revoked one. The rules file is not touched.
     pub const PROFILE_REVOKED: &str = "profile.revoked";
+    /// One PROBE of a declared model bundle (REQ-MS-03/05): identity,
+    /// verdict from the closed vocabulary, latency, time and the stored
+    /// evidence (exit code, bounded output fragment). No task is involved —
+    /// a probe is a fact about a BUNDLE, not about a run.
+    pub const MODEL_PROBE: &str = "model.probe";
+    /// One SWITCH attempt of the platform's model bundle (REQ-MS-04/05):
+    /// actor, from/to identities, the probe it rested on, the outcome
+    /// (`applied`/`refused_probe`), the refusing verdict, the human-chosen
+    /// reason (`manual`/`limits`/`error`) and whether the agent NAME changed.
+    pub const MODEL_SWITCHED: &str = "model.switched";
 
     /// The COMPLETE enumerable vocabulary of kinds the platform may persist.
     /// Load-time policy validation (the REWORK delivery table in
@@ -1152,6 +1340,8 @@ pub mod event_kind {
         QA_REWORK_GATE_INCOMPARABLE,
         PROFILE_RATIFIED,
         PROFILE_REVOKED,
+        MODEL_PROBE,
+        MODEL_SWITCHED,
     ];
 }
 
@@ -1242,6 +1432,29 @@ pub mod json_field {
     /// `implementation.reported` payloads; `review.recorded`'s rejection text
     /// is read from here (rework-context.yaml: `rationale_field: summary`).
     pub const SUMMARY: &str = "summary";
+    // Model bundles (task 01a1b71f, REQ-MS-01/05/09): the FOUR identity
+    // fields are spelled driver/llm_provider/model/reasoning — «provider»
+    // alone never names them, because the store's `agent_instances.provider`
+    // is the DRIVER. `reasoning` is the level of thinking, part of the
+    // selection (ratified OQ-6 answer).
+    pub const DRIVER: &str = "driver";
+    pub const LLM_PROVIDER: &str = "llm_provider";
+    pub const MODEL: &str = "model";
+    pub const REASONING: &str = "reasoning";
+    /// Probe/switch event payloads: the bundle id, the verdict from the
+    /// closed vocabulary, the measured latency, the stored evidence and the
+    /// switch outcome vocabulary (`applied`/`refused_probe`).
+    pub const BUNDLE_ID: &str = "bundle_id";
+    pub const BUNDLE: &str = "bundle";
+    pub const LATENCY_MS: &str = "latency_ms";
+    pub const EXIT_CODE: &str = "exit_code";
+    pub const OUTPUT_EXCERPT: &str = "output_excerpt";
+    pub const OUTCOME: &str = "outcome";
+    pub const FROM: &str = "from";
+    pub const TO: &str = "to";
+    pub const PROBE_EVENT: &str = "probe_event";
+    pub const AGENT_CHANGED: &str = "agent_changed";
+    pub const FRESHNESS: &str = "freshness";
 
     /// The COMPLETE enumerable vocabulary of payload field names the platform
     /// itself mints. Load-time policy validation checks user-authored field
@@ -1293,5 +1506,20 @@ pub mod json_field {
         ROLE,
         STATUS,
         SUMMARY,
+        DRIVER,
+        LLM_PROVIDER,
+        MODEL,
+        REASONING,
+        BUNDLE_ID,
+        BUNDLE,
+        LATENCY_MS,
+        EXIT_CODE,
+        OUTPUT_EXCERPT,
+        OUTCOME,
+        FROM,
+        TO,
+        PROBE_EVENT,
+        AGENT_CHANGED,
+        FRESHNESS,
     ];
 }

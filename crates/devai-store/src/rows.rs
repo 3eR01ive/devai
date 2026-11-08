@@ -262,7 +262,9 @@ pub fn agent_from_row(r: &Row) -> StoreResult<AgentInstance> {
         provider: get(r, 2)?,
         model: get(r, 3)?,
         runtime: get(r, 4)?,
-        created_at: parse_ts(get(r, 5)?)?,
+        reasoning: get(r, 5)?,
+        created_at: parse_ts(get(r, 6)?)?,
+        active: get::<i64>(r, 7)? != 0,
     })
 }
 
@@ -299,6 +301,31 @@ pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
         owner_pid: get(r, 15)?,
         owner_host: get(r, 16)?,
         owner_process_start: get(r, 17)?,
+        // The v11 run stamp: NULL columns read as «связка не записана» —
+        // never as an empty identity and never re-derived from the agent
+        // name (REQ-MS-05).
+        bundle: bundle_stamp(
+            get::<Option<String>>(r, 18)?,
+            get::<Option<String>>(r, 19)?,
+            get::<Option<String>>(r, 20)?,
+            get::<Option<String>>(r, 21)?,
+        ),
+    })
+}
+
+/// A stamp exists only when the driver column does: the four columns are
+/// written together by the platform, so a NULL driver is the pre-v11 row.
+fn bundle_stamp(
+    driver: Option<String>,
+    llm_provider: Option<String>,
+    model: Option<String>,
+    reasoning: Option<String>,
+) -> Option<devai_core::types::ExecutionBundle> {
+    driver.map(|driver| devai_core::types::ExecutionBundle {
+        driver,
+        llm_provider: llm_provider.unwrap_or_default(),
+        model: model.unwrap_or_default(),
+        reasoning: reasoning.unwrap_or_default(),
     })
 }
 

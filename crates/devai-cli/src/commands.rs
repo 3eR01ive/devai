@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::outln;
 use crate::{
-    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ProfileCmd, ProjectCmd, QuestionCmd,
-    RoleCmd, TaskCmd,
+    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ModelCmd, ProfileCmd, ProjectCmd,
+    QuestionCmd, RoleCmd, TaskCmd,
 };
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
@@ -97,6 +97,7 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
         Cmd::Question(c) => question(ctx, c, json),
         Cmd::Role(c) => role(ctx, c, json),
         Cmd::Agent(c) => agent(ctx, c, json),
+        Cmd::Model(c) => model(ctx, c, json),
         Cmd::Contract(c) => contract(ctx, c, json),
         Cmd::Exec(c) => exec(ctx, c, json),
         Cmd::Api(c) => api_registry(ctx, c, json),
@@ -720,7 +721,14 @@ fn task_execution(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             agent,
             workspace,
             force_reaudit,
-        } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
+        } => task_run(
+            ctx,
+            &id,
+            agent.as_deref().unwrap_or(""),
+            workspace.as_deref(),
+            force_reaudit,
+            json,
+        )?,
         TaskCmd::Merge {
             id,
             workspace,
@@ -2056,6 +2064,230 @@ fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The console error of the model section: the TYPED code leads, so the
+/// console shows the same machine token the API answer carries
+/// (REQ-MS-07 AC6: «с теми же вердиктами и кодами»). Other commands keep
+/// their historical text-only rendering (`render_api_error`).
+fn model_error(e: devai_api::ApiError) -> anyhow::Error {
+    anyhow::anyhow!("{}: {e}", e.code())
+}
+
+/// The model-bundle section (REQ-MS-07): the console mirror of the window.
+/// Every line is a stored fact or a platform-computed field of the ONE
+/// snapshot; nothing is re-derived here.
+fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
+    match cmd {
+        ModelCmd::List => {
+            let s = ctx.api().model_snapshot().map_err(model_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&s)?);
+                return Ok(());
+            }
+            match &s.active {
+                None => outln!("связка не выбрана — `devai model switch <id>`"),
+                Some(a) => {
+                    let label = a.label.clone().unwrap_or_else(|| "(не объявлена в конфиге)".into());
+                    let id = a.id.clone().unwrap_or_else(|| "—".into());
+                    outln!("действующая связка: {label} [{id}]");
+                    outln!("  агент: {}", a.agent);
+                    outln!("  драйвер: {}", a.driver);
+                    outln!(
+                        "  LLM-провайдер: {}",
+                        if a.llm_provider.is_empty() || a.llm_provider == "local" {
+                            "не задан — выбирает драйвер"
+                        } else {
+                            &a.llm_provider
+                        }
+                    );
+                    outln!(
+                        "  модель: {}",
+                        if a.model.is_empty() {
+                            "не передаётся"
+                        } else {
+                            &a.model
+                        }
+                    );
+                    outln!("  уровень размышления: {}", reasoning_word(&a.reasoning));
+                }
+            }
+            let st = &s.status;
+            let latency = st
+                .latency_ms
+                .map(|l| format!(" {l} мс"))
+                .unwrap_or_default();
+            outln!("статус: {}{latency}", status_word(&st.state));
+            if let Some(reason) = &st.reason {
+                outln!("  причина: {}", model_failure_word(reason));
+            }
+            if let Some(at) = st.evidence_at {
+                outln!(
+                    "  доказательство: {} · {}",
+                    st.evidence.as_deref().unwrap_or("—"),
+                    at.format("%Y-%m-%d %H:%M:%S")
+                );
+            }
+            if st.probe_older {
+                outln!("  проба старее проваленной строки исполнения");
+            }
+            outln!("  свежесть: {}", st.freshness);
+            if let Some(b) = &s.failures {
+                outln!("▲ {}", b.text);
+                match &b.suggestion {
+                    Some(id) => outln!("  предложение: `devai model switch {id}`"),
+                    None => outln!("  живой связки со свежей пробой нет — предложения нет"),
+                }
+            }
+            outln!("объявленные связки:");
+            for b in &s.declared {
+                outln!(
+                    "  {}{}  {} · {} · {} · уровень {} · агент {}",
+                    if b.active { "* " } else { "  " },
+                    b.id,
+                    b.driver,
+                    if b.llm_provider.is_empty() || b.llm_provider == "local" {
+                        "—"
+                    } else {
+                        &b.llm_provider
+                    },
+                    if b.model.is_empty() {
+                        "—"
+                    } else {
+                        &b.model
+                    },
+                    reasoning_word(&b.reasoning),
+                    b.agent
+                );
+            }
+            if !s.running.is_empty() {
+                outln!("идущие прогоны:");
+                for r in &s.running {
+                    outln!(
+                        "  {}  агент {}  с {}",
+                        short_str(&r.execution_id),
+                        r.agent.as_deref().unwrap_or("—"),
+                        r.started_at.format("%Y-%m-%d %H:%M:%S")
+                    );
+                }
+            }
+            outln!("история:");
+            for e in &s.history {
+                let verdict = e
+                    .verdict
+                    .as_deref()
+                    .map(|v| format!(" вердикт={v}"))
+                    .unwrap_or_default();
+                let outcome = e
+                    .outcome
+                    .as_deref()
+                    .map(|o| format!(" {o}"))
+                    .unwrap_or_default();
+                let cause = e
+                    .reason
+                    .as_deref()
+                    .map(|r| format!(" причина={}", model_failure_word(r)))
+                    .unwrap_or_default();
+                outln!(
+                    "  {}  {:<14} {:<10} {}{}{}{}",
+                    e.at.format("%Y-%m-%d %H:%M:%S"),
+                    e.kind,
+                    e.actor,
+                    e.bundle_id.as_deref().unwrap_or("—"),
+                    verdict,
+                    outcome,
+                    if cause.trim().is_empty() {
+                        String::new()
+                    } else {
+                        cause
+                    }
+                );
+                if e.agent_changed {
+                    outln!("     смена имени агента: идущие прогоны остаются на прежнем");
+                }
+            }
+        }
+        ModelCmd::Probe { id } => {
+            let p = ctx.api().model_probe(&id).map_err(model_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&p)?);
+            } else {
+                outln!(
+                    "{}  {}{}  exit={:?}",
+                    p.bundle_id,
+                    p.verdict,
+                    if p.verdict == "ok" {
+                        format!("  {} мс", p.latency_ms)
+                    } else {
+                        String::new()
+                    },
+                    p.exit_code
+                );
+                if !p.output_excerpt.is_empty() {
+                    outln!("  {}", p.output_excerpt.replace('\n', " "));
+                }
+            }
+        }
+        ModelCmd::Switch { id, reason } => {
+            let r = ctx
+                .api()
+                .model_switch(&id, &reason)
+                .map_err(model_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+            } else if r.outcome == "applied" {
+                outln!(
+                    "переключено на {} (проба ok, {} мс, причина {})",
+                    r.bundle_id,
+                    r.latency_ms,
+                    reason
+                );
+            } else {
+                outln!(
+                    "не переключено: проба {} — {} мс; запись и отметка не менялись",
+                    r.verdict,
+                    r.latency_ms
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ONE status word on the console, same vocabulary as the window.
+fn status_word(state: &str) -> &str {
+    match state {
+        "live" => "живая",
+        "not_working" => "не работает",
+        "not_proven" => "не доказано",
+        "not_selected" => "связка не выбрана",
+        _ => "неизвестно",
+    }
+}
+
+/// A reason is named only when the evidence proves it; an unrecognised or
+/// unproven code is shown as «причина не распознана», never guessed.
+fn model_failure_word(code: &str) -> &str {    match code {
+        "no_credits" => "нет кредитов",
+        "model_not_found" => "модель не существует",
+        "no_key" => "нет ключа провайдера",
+        "network" => "сеть недоступна",
+        "provider" => "отказ провайдера",
+        "manual" | "limits" | "error" => code,
+        "причина не классифицирована" => "причина не классифицирована",
+        _ => "причина не распознана",
+    }
+}
+
+/// The reasoning level as the console shows it (REQ-MS-09): an empty level
+/// on a record outside the declared list reads «связка неполна» — never a
+/// driver default.
+fn reasoning_word(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "не задан — связка неполна"
+    } else {
+        value
+    }
 }
 
 fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {

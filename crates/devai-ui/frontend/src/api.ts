@@ -11,7 +11,9 @@ import type {
   HomeRecord,
   HomeRecordsView,
   LivenessView,
+  ModelSnapshot,
   OpDescriptor,
+  ProbeView,
   ProgressView,
   Project,
   Question,
@@ -20,6 +22,7 @@ import type {
   SessionInfo,
   SignatureView,
   StatusView,
+  SwitchResultView,
   Task,
   UiError,
   WaitSnapshot,
@@ -80,6 +83,14 @@ export const api = {
   // Секция ожидания человека (REQ-GATE-01..10): один снимок — строки
   // гейтов, остановленные, справочные заметки и бейдж на нём же.
   inboxView: () => invoke<WaitSnapshot>("inbox_view"),
+
+  // Раздел связок модели (REQ-MS-07): ОДИН read на весь экран и две
+  // записи — проба и переключение. Те же операции, что `devai model …`.
+  modelSnapshot: () => invoke<ModelSnapshot>("model_snapshot"),
+  modelProbe: (bundle_id: string) =>
+    invoke<ProbeView>("model_probe", { bundle_id }),
+  modelSwitch: (bundle_id: string, reason: string) =>
+    invoke<SwitchResultView>("model_switch", { bundle_id, reason }),
 
   // --- homes registry (REQ-HOME-01…09) ---
   // Чтение: home.list / home.projects_all / home.tasks_all (Read-плоскость).

@@ -19,6 +19,8 @@ const used = [
   "question.list",
   "exec.list", "exec.liveness",
   "home.list", "home.projects_all", "home.tasks_all",
+  // Раздел связок модели: один read-снимок и две записи (REQ-MS-07).
+  "model.snapshot", "model.probe", "model.switch",
   // Registry-плоскость: управление реестром домов (не доменные мутации).
   "home.add", "home.set_enabled", "home.activate",
 ];

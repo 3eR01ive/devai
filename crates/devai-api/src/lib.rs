@@ -21,6 +21,7 @@
 mod error;
 mod homes;
 mod inbox;
+mod models;
 mod mutations;
 mod registry;
 mod signature;
@@ -43,6 +44,10 @@ pub use inbox::{
 // them through the API door only (REQ-UI-02: the UI graph must not gain a
 // devai-store dependency to name `devai.db` or `.devai` correctly).
 pub use devai_store::{DB_FILE_NAME, HOME_DIR_NAME};
+pub use models::{
+    ActiveBundleView, BundleStatusView, FailuresBanner, ModelBundleView, ModelEventView,
+    ModelSnapshot, ProbeView, RunningBundleRow, SwitchResultView, bundle_identity_text, stamp_text,
+};
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
     ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
@@ -565,6 +570,13 @@ impl Api {
         std::env::var_os("DEVAI_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| self.store.root().join("config"))
+    }
+
+    /// The config directory as the model-bundle loader sees it. Kept
+    /// `pub(crate)`: a consumer reads bundles through the snapshot, never by
+    /// walking the home itself (REQ-MS-07: the window does not compose).
+    pub(crate) fn model_config_dir(&self) -> PathBuf {
+        self.config_dir()
     }
 
     pub fn task_events(

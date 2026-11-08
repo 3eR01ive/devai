@@ -93,6 +93,7 @@ pub(crate) fn store_code(e: &StoreError) -> ErrorCode {
         StoreError::SchemaVersion { .. } => ErrorCode("schema_version"),
         StoreError::Corrupt(..) => ErrorCode("corrupt"),
         StoreError::Config(..) => ErrorCode("config"),
+        StoreError::ModelBundle(..) => ErrorCode("model_bundle"),
         StoreError::Io(..) => ErrorCode("io"),
         StoreError::Sql(..) => ErrorCode("store"),
     }
@@ -136,6 +137,8 @@ fn runtime_code(e: &RuntimeError) -> ErrorCode {
         RuntimeError::MissingContract(..) => ErrorCode("missing_contract"),
         RuntimeError::Worktree(inner) => worktree_code(inner),
         RuntimeError::ReportShape(..) => ErrorCode("report_shape"),
+        RuntimeError::NoActiveBundle => ErrorCode("no_active_bundle"),
+        RuntimeError::IncompleteBundle => ErrorCode("incomplete_bundle"),
     }
 }
 

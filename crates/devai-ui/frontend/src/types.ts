@@ -311,6 +311,114 @@ export interface RoleExecution {
   owner_pid?: number | null;
   owner_host?: string | null;
   owner_process_start?: number | null;
+  // The v11 run stamp (REQ-MS-05): «what did this run actually use?».
+  // Absent/null = «связка не записана» (a row written before the rung).
+  bundle?: ExecutionBundle | null;
+}
+
+export interface ExecutionBundle {
+  driver: string;
+  llm_provider: string;
+  model: string;
+  reasoning: string;
+}
+
+// --- model-bundle section (model.snapshot / model.probe / model.switch) ---
+// REQ-MS-01/06/07: three INDEPENDENT identity fields (driver, llm_provider,
+// model), ONE status field, the declared allow-list and the stored history.
+export interface ModelBundleView {
+  id: string;
+  label: string;
+  agent: string;
+  driver: string;
+  llm_provider: string;
+  model: string;
+  /** REQ-MS-09: the level of thinking — part of the bundle. */
+  reasoning: string;
+  probe_phrase: string;
+  probe_timeout_ms: number;
+  fresh_secs: number;
+  active: boolean;
+}
+
+export interface ActiveBundleView {
+  id: string | null;
+  label: string | null;
+  agent: string;
+  driver: string;
+  llm_provider: string;
+  model: string;
+  /** REQ-MS-09: empty = an incomplete bundle (a run does not start). */
+  reasoning: string;
+  declared: boolean;
+}
+
+export interface BundleStatusView {
+  // live | not_working | not_proven | unknown | not_selected
+  state: string;
+  latency_ms: number | null;
+  verdict: string | null;
+  reason: string | null;
+  evidence: string | null;
+  evidence_at: string | null;
+  freshness: string;
+  probe_older: boolean;
+}
+
+export interface ModelEventView {
+  at: string;
+  kind: string;
+  actor: string;
+  bundle_id: string | null;
+  verdict: string | null;
+  outcome: string | null;
+  reason: string | null;
+  latency_ms: number | null;
+  from: Record<string, unknown> | null;
+  to: Record<string, unknown> | null;
+  agent_changed: boolean;
+}
+
+export interface RunningBundleRow {
+  execution_id: string;
+  task_id: string;
+  agent: string | null;
+  started_at: string;
+}
+
+export interface FailuresBanner {
+  code: string;
+  text: string;
+  suggestion: string | null;
+}
+
+export interface ModelSnapshot {
+  snapshot_at: string;
+  active: ActiveBundleView | null;
+  status: BundleStatusView;
+  declared: ModelBundleView[];
+  history: ModelEventView[];
+  failures: FailuresBanner | null;
+  running: RunningBundleRow[];
+}
+
+export interface ProbeView {
+  bundle_id: string;
+  verdict: string;
+  latency_ms: number;
+  exit_code: number | null;
+  output_excerpt: string;
+  at: string;
+}
+
+export interface SwitchResultView {
+  outcome: string; // applied | refused_probe
+  bundle_id: string;
+  verdict: string;
+  latency_ms: number;
+  code: string;
+  /** The switch changed the agent NAME: in-flight runs stay on the old one. */
+  agent_changed: boolean;
 }
 
 export interface LivenessView {

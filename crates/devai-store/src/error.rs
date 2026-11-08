@@ -71,6 +71,13 @@ pub enum StoreError {
 
     #[error("config error: {0}")]
     Config(String),
+
+    /// The declared model-bundle allow-list (`models.yaml`) is invalid
+    /// (REQ-MS-02): the message names the file, the record and the offending
+    /// key/value. This is the ONLY door to a bundle — free-form driver /
+    /// model / LLM-provider / base_url input does not exist.
+    #[error("invalid model bundle config: {0}")]
+    ModelBundle(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;

@@ -74,6 +74,20 @@
       "to": 10,
       "script": "migrations/010_decision_payload.sql",
       "apply": "additive_decision_payload_column"
+    },
+    {
+      "id": "011_model_bundles",
+      "from": 10,
+      "to": 11,
+      "script": "migrations/011_model_bundles.sql",
+      "apply": "additive_model_bundle_columns"
+    },
+    {
+      "id": "012_model_reasoning",
+      "from": 11,
+      "to": 12,
+      "script": "migrations/012_model_reasoning.sql",
+      "apply": "additive_model_reasoning_column"
     }
   ]
 }

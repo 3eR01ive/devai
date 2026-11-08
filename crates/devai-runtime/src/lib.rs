@@ -15,6 +15,7 @@ pub mod human_view;
 pub mod humanize;
 pub mod liveness;
 mod prompt;
+pub mod probe;
 pub mod revision;
 pub mod taskname;
 pub mod worktree;

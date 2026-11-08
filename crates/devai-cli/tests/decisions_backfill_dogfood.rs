@@ -188,10 +188,13 @@ fn backfill_runs_on_open_lands_deterministic_rows_and_progress_stays_clean() {
 
     // Any command opens the store — the rung lands here.
     devai(home.path(), &["task", "events", &id]);
+    // v12 (task 01a1b71f): the additive model-bundle rungs add the active
+    // marker, the run stamp, the partial unique index and the reasoning
+    // level; the ladder top moves with them.
     assert_eq!(
         version_of(home.path()),
-        10,
-        "fresh install lands at the ladder top (v10 with the decision payload, rung 010)"
+        12,
+        "fresh install lands at the ladder top (v12 with the model-bundle rungs 011/012)"
     );
 
     // The human view stays exactly as it was (ratified OQ1 variant (б)):
@@ -445,8 +448,8 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     );
     assert_eq!(
         version_of(home.path()),
-        10,
-        "the walked ladder ends at the v10 top"
+        12,
+        "the walked ladder ends at the v12 top"
     );
     println!("──── dogfood evidence: APPROVED_DECISIONS with backfilled rows ────\n{section}");
 }

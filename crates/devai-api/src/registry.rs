@@ -69,7 +69,11 @@ pub struct OpDescriptor {
 /// `profile.ratify` / `profile.revoke` join the table, and `Decision` gains
 /// the `payload` field a ratification's `<project, edition, items>` binding
 /// is read from — a wire-visible shape change for second consumers.
-pub const SURFACE_VERSION: &str = "api-surface@5";
+/// `@6` names the model-bundle increment (task 01a1b71f): the surface
+/// gained `model.snapshot` / `model.probe` / `model.switch` and the run
+/// stamp (`RoleExecution.bundle`) second consumers read — wire-visible, so
+/// the version says so.
+pub const SURFACE_VERSION: &str = "api-surface@6";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -514,6 +518,27 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "List registered agents.",
         },
         OpDescriptor {
+            name: "model.snapshot",
+            class: OpClass::Read,
+            input: "()",
+            output: "ModelSnapshot{snapshot_at, active, status, declared, history, failures, running}",
+            description: "The whole model-bundle section in ONE read: the marked agent record (driver, LLM-provider, model, reasoning level), the SINGLE computed status, the bundles declared in config/models.yaml, the probe/switch history, the refusal banner with a live suggestion, and the runs in flight. No network call; no store access outside this operation. Mirrors `devai model list`.",
+        },
+        OpDescriptor {
+            name: "model.probe",
+            class: OpClass::Mutation,
+            input: "bundle_id",
+            output: "ProbeView{bundle_id, verdict, latency_ms, exit_code, output_excerpt, at}",
+            description: "One real non-interactive driver call of a DECLARED bundle (claude -p / hermes -z) with the bundle's reasoning level and a hard timeout; records exactly one `model.probe` event. Changes no agent record and no marker; `mock` is not_probeable without starting a process. Mirrors `devai model probe`.",
+        },
+        OpDescriptor {
+            name: "model.switch",
+            class: OpClass::Mutation,
+            input: "bundle_id, reason (manual|limits|error)",
+            output: "SwitchResultView{outcome, bundle_id, verdict, latency_ms, code}",
+            description: "ONE platform operation: probe the declared target, and only on `ok` upsert the agent record by name (driver, LLM-provider, model AND reasoning level), move the single active marker, and append `model.switched` — all in one verified transaction (a failure rolls the whole switch back). A dead verdict writes `refused_probe` and changes nothing; unknown id / no_op / not_probeable refuse before any event. Mirrors `devai model switch`.",
+        },
+        OpDescriptor {
             name: "contract.add",
             class: OpClass::Mutation,
             input: "ContractAddReq{name, version, schema}",
@@ -743,18 +768,18 @@ mod tests {
     }
 
     #[test]
-    fn surface_version_v5_ships_the_name_plane_homes_and_profile_ratification() {
+    fn surface_version_v6_ships_the_name_plane_homes_profile_ratification_and_model_bundles() {
         // QA R5 (da/api-contract): the stamp and its increment are
-        // pinned TOGETHER — @5 is by this test defined as "the @4
-        // human-signboard + homes surface PLUS the project-rules
-        // ratification plane": if the constant moves without the new
-        // operations moving with it, or the name/homes planes leave the
-        // table while the stamp claims them, this fails. The literal is
+        // pinned TOGETHER — @6 is by this test defined as "the @5
+        // human-signboard + homes + ratification surface PLUS the
+        // model-bundle plane" (task 01a1b71f): if the constant moves without
+        // the new operations moving with it, or the model-bundle doors leave
+        // the table while the stamp claims them, this fails. The literal is
         // the deliberate second writing of the version: bumping the
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@5");
+        assert_eq!(SURFACE_VERSION, "api-surface@6");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -777,6 +802,21 @@ mod tests {
                 operations().iter().any(|o| o.name == name),
                 "@5 surface must publish {name} (project-rules ratification plane)"
             );
+        }
+        // @6's own increment (task 01a1b71f): the model-bundle doors — one
+        // read and the two writes — are part of what the stamp claims.
+        let ops = operations();
+        let snapshot = ops
+            .iter()
+            .find(|o| o.name == "model.snapshot")
+            .expect("@6 surface must publish model.snapshot (REQ-MS-07)");
+        assert_eq!(snapshot.class, OpClass::Read);
+        for name in ["model.probe", "model.switch"] {
+            let op = ops
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("@6 surface must publish {name} (REQ-MS-03/04)"));
+            assert_eq!(op.class, OpClass::Mutation);
         }
     }
 

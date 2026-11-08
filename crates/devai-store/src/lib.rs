@@ -8,11 +8,13 @@
 pub mod bundle;
 pub mod config;
 mod error;
+pub mod models;
 mod rows;
 pub mod seed;
 
 pub use bundle::{BundleManifest, ImportOutcome};
 pub use error::{StoreError, StoreResult};
+pub use models::{MODEL_CONFIG_FILE, ModelBundle, ModelCatalog, ProbePolicy, load_catalog};
 
 /// The ONE name of the home's store file (arch/no-magic: the homes cycle
 /// spread this literal across api/ui consumers; every join site now reads
@@ -172,7 +174,32 @@ const RUNG_APPLIERS: &[(&str, RungApply)] = &[
         "additive_decision_payload_column",
         additive_decision_payload_column,
     ),
+    (
+        "additive_model_bundle_columns",
+        additive_model_bundle_columns,
+    ),
+    (
+        "additive_model_reasoning_column",
+        additive_model_reasoning_column,
+    ),
 ];
+
+/// The switch request of [`Store::apply_bundle_switch`] — the exact content
+/// the agent record and the `model.switched` event must carry (REQ-MS-04).
+pub struct BundleSwitch {
+    pub agent: String,
+    pub driver: String,
+    pub llm_provider: String,
+    pub model: String,
+    /// REQ-MS-09: the reasoning level of the selection — part of the bundle,
+    /// carried into the agent record by the same transaction.
+    pub reasoning: String,
+    pub actor: String,
+    /// Event payload WITHOUT `from`/`agent_changed` — the store fills those
+    /// in from the row it actually moved.
+    pub payload: serde_json::Value,
+    pub now: Timestamp,
+}
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
 pub struct Store {
@@ -1439,17 +1466,21 @@ impl Store {
     }
 
     pub fn put_agent(&self, a: &AgentInstance) -> StoreResult<()> {
+        // The `active` marker is NOT writable here (REQ-MS-02/04): a plain
+        // `agent add`/upsert never marks or unmarks the bundle in force —
+        // the marker moves only through the switch transaction. A new record
+        // is therefore born unmarked, and an update leaves the marker as is.
         self.conn.execute(
-            "INSERT INTO agent_instances(id,name,provider,model,runtime,created_at) VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(name) DO UPDATE SET provider=?3, model=?4, runtime=?5",
-            params![a.id.to_string(), a.name, a.provider, a.model, a.runtime, rows::ts(&a.created_at)],
+            "INSERT INTO agent_instances(id,name,provider,model,runtime,reasoning,created_at,active) VALUES(?1,?2,?3,?4,?5,?6,?7,0)
+             ON CONFLICT(name) DO UPDATE SET provider=?3, model=?4, runtime=?5, reasoning=?6",
+            params![a.id.to_string(), a.name, a.provider, a.model, a.runtime, a.reasoning, rows::ts(&a.created_at)],
         )?;
         Ok(())
     }
 
     pub fn list_agents(&self) -> StoreResult<Vec<AgentInstance>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,name,provider,model,runtime,created_at FROM agent_instances ORDER BY name",
+            "SELECT id,name,provider,model,runtime,reasoning,created_at,active FROM agent_instances ORDER BY name",
         )?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
@@ -1457,6 +1488,178 @@ impl Store {
             out.push(rows::agent_from_row(r)?);
         }
         Ok(out)
+    }
+
+    /// The ONE marked agent record — «the bundle in force» (REQ-MS-02/04).
+    /// `None` means «связка не выбрана»; the caller never substitutes a
+    /// built-in fallback for it. More than one marked row is impossible by
+    /// the partial unique index (`agent_instances_single_active`), so this is
+    /// a plain lookup, not a conflict resolution.
+    pub fn active_agent(&self) -> StoreResult<Option<AgentInstance>> {
+        rows::unwrap_row(
+            self.conn
+                .query_row(
+                    "SELECT id,name,provider,model,runtime,reasoning,created_at,active FROM agent_instances WHERE active=1",
+                    [],
+                    |r| rows::r2sql(rows::agent_from_row(r)),
+                )
+                .optional(),
+        )
+    }
+
+    /// THE switch (REQ-MS-04): upsert the agent record by NAME (its id and
+    /// `created_at` survive — ASM-8), move the marker onto it, append the
+    /// `model.switched` event and VERIFY before commit. One transaction: a
+    /// failure at any step rolls the whole thing back, so a half-switched
+    /// platform is unrepresentable. Returns the record that was in force
+    /// BEFORE (the event's «from»).
+    ///
+    /// Probe/verdict policy is NOT here: the caller refuses before calling.
+    /// This method only ever performs an approved move.
+    pub fn apply_bundle_switch(&self, s: &BundleSwitch) -> StoreResult<Option<AgentInstance>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let previous = tx
+            .query_row(
+                "SELECT id,name,provider,model,runtime,reasoning,created_at,active FROM agent_instances WHERE active=1",
+                [],
+                |r| rows::r2sql(rows::agent_from_row(r)),
+            )
+            .optional()?;
+        // Upsert by name: id/created_at are preserved (the ON CONFLICT set
+        // deliberately omits both), so the record keeps its identity.
+        // Column order is the STORE's: `provider` holds the DRIVER, `model`
+        // the model, `runtime` the LLM-provider — the opposite of the config
+        // field order (REQ-MS-01: the two vocabularies never swap columns).
+        tx.execute(
+            "INSERT INTO agent_instances(id,name,provider,model,runtime,reasoning,created_at,active) VALUES(?1,?2,?3,?4,?5,?6,?7,0)
+             ON CONFLICT(name) DO UPDATE SET provider=?3, model=?4, runtime=?5, reasoning=?6",
+            params![
+                new_id().to_string(),
+                s.agent,
+                s.driver,
+                s.model,
+                s.llm_provider,
+                s.reasoning,
+                rows::ts(&s.now)
+            ],
+        )?;
+        // Move the marker: clear every other row first (the partial unique
+        // index would reject two marked rows), then mark the target.
+        tx.execute(
+            "UPDATE agent_instances SET active=0 WHERE active=1 AND name<>?1",
+            params![s.agent],
+        )?;
+        tx.execute(
+            "UPDATE agent_instances SET active=1 WHERE name=?1",
+            params![s.agent],
+        )?;
+        // VERIFY inside the transaction: the record now carries the bundle
+        // identity and it is the marked one. A divergence is a corrupt state,
+        // never a silent half-switch.
+        let (name, driver, llm_provider, model, reasoning, active): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = tx.query_row(
+            "SELECT name,provider,runtime,model,reasoning,active FROM agent_instances WHERE name=?1",
+            params![s.agent],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )?;
+        if name != s.agent
+            || driver != s.driver
+            || llm_provider != s.llm_provider
+            || model != s.model
+            || reasoning != s.reasoning
+            || active != 1
+        {
+            return Err(StoreError::Corrupt(format!(
+                "model switch verification failed for agent `{}`: record reads (driver={driver}, llm_provider={llm_provider}, model={model}, reasoning={reasoning}, active={active}), expected ({}, {}, {}, {}, active=1) — rolled back",
+                s.agent, s.driver, s.llm_provider, s.model, s.reasoning
+            )));
+        }
+        let mut payload = s.payload.clone();
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert(
+                json_field::FROM.into(),
+                match &previous {
+                    Some(p) => serde_json::json!({
+                        (json_field::DRIVER): p.provider,
+                        (json_field::LLM_PROVIDER): p.runtime,
+                        (json_field::MODEL): p.model,
+                        (json_field::REASONING): p.reasoning,
+                    }),
+                    None => serde_json::Value::Null,
+                },
+            );
+            map.insert(
+                json_field::AGENT_CHANGED.into(),
+                // No previous marker = there is no NAME to have changed: the
+                // flag reports a transition between two records, not the
+                // first selection (REQ-MS-04 AC4).
+                serde_json::Value::Bool(
+                    previous
+                        .as_ref()
+                        .map(|p| p.name != s.agent)
+                        .unwrap_or(false),
+                ),
+            );
+        }
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,NULL,?2,?3,?4,?5)",
+            params![
+                new_id().to_string(),
+                event_kind::MODEL_SWITCHED,
+                s.actor,
+                payload.to_string(),
+                rows::ts(&s.now)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(previous)
+    }
+
+    /// Home-level history of the bundle surface (REQ-MS-05): every probe and
+    /// every switch attempt, oldest first. These events carry NO task — the
+    /// read is not a task read and is served by one operation for both the
+    /// console and the window.
+    pub fn model_events(&self) -> StoreResult<Vec<WorkflowEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,kind,actor,payload,created_at FROM workflow_events WHERE kind IN (?1,?2) ORDER BY seq",
+        )?;
+        let mut rows = stmt.query(params![event_kind::MODEL_PROBE, event_kind::MODEL_SWITCHED])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::event_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    /// The newest FINISHED execution row of one identity stamp — the second
+    /// evidence input of the status field (REQ-MS-06). RUNNING rows never
+    /// determine status. Ties broken by the larger row id, exactly as the
+    /// snapshot documents.
+    pub fn latest_finished_execution_for_stamp(
+        &self,
+        driver: &str,
+        llm_provider: &str,
+        model: &str,
+        reasoning: &str,
+    ) -> StoreResult<Option<RoleExecution>> {
+        rows::unwrap_row(
+            self.conn
+                .query_row(
+                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning
+                     FROM role_executions
+                     WHERE status <> 'RUNNING' AND driver=?1 AND llm_provider=?2 AND model=?3 AND reasoning=?4
+                     ORDER BY finished_at DESC, id DESC LIMIT 1",
+                    params![driver, llm_provider, model, reasoning],
+                    |r| rows::r2sql(rows::execution_from_row(r)),
+                )
+                .optional(),
+        )
     }
 
     pub fn put_contract(&self, name: &str, version: u32, schema: &str) -> StoreResult<()> {
@@ -1553,8 +1756,8 @@ impl Store {
         // before provenance existed and for manual rows without one.
         let revision = e.workspace_revision.as_ref().map(|r| json_string(r));
         let insert = tx.execute(
-            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9,?10,?11,NULL,?12,?13,?14)",
+            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9,?10,?11,NULL,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 e.id.to_string(),
                 e.task_id.to_string(),
@@ -1573,6 +1776,13 @@ impl Store {
                 e.owner_pid,
                 e.owner_host,
                 e.owner_process_start,
+                // The run STAMP (REQ-MS-05): the identity the platform copied
+                // off the agent record at start. NULL stays NULL — a row
+                // without a stamp reads «связка не записана».
+                e.bundle.as_ref().map(|b| b.driver.clone()),
+                e.bundle.as_ref().map(|b| b.llm_provider.clone()),
+                e.bundle.as_ref().map(|b| b.model.clone()),
+                e.bundle.as_ref().map(|b| b.reasoning.clone()),
             ],
         );
         if let Err(err) = insert {
@@ -1689,7 +1899,7 @@ impl Store {
         // would finish the WRONG execution — over main's widened row (the
         // form-loop columns attempt/parent_execution/failure_class ride in).
         let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start
+            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning
              FROM role_executions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 2",
         )?;
         let mut rows = stmt.query(params![id.to_lowercase()])?;
@@ -1711,11 +1921,11 @@ impl Store {
     pub fn list_executions(&self, task_id: Option<Id>) -> StoreResult<Vec<RoleExecution>> {
         let (sql, args): (&str, Vec<Option<String>>) = match task_id {
             Some(t) => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start FROM role_executions WHERE task_id=?1 ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning FROM role_executions WHERE task_id=?1 ORDER BY started_at",
                 vec![Some(t.to_string())],
             ),
             None => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start FROM role_executions ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning FROM role_executions ORDER BY started_at",
                 vec![],
             ),
         };
@@ -1934,9 +2144,25 @@ impl Store {
         actor: &str,
         payload: serde_json::Value,
     ) -> StoreResult<()> {
+        self.insert_event_with(new_id(), task_id, kind, actor, payload, Utc::now())
+    }
+
+    /// `insert_event` with a CALLER-CHOSEN id and time — the door the model
+    /// surface uses to cite one probe event from the switch event that rests
+    /// on it (REQ-MS-05: «ссылка на пробу»), and to keep the probe's own
+    /// measurement time. The row is append-only like every event.
+    pub fn insert_event_with(
+        &self,
+        id: Id,
+        task_id: Option<Id>,
+        kind: &str,
+        actor: &str,
+        payload: serde_json::Value,
+        at: Timestamp,
+    ) -> StoreResult<()> {
         self.conn.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![new_id().to_string(), task_id.map(|i| i.to_string()), kind, actor, payload.to_string(), rows::ts(&Utc::now())],
+            params![id.to_string(), task_id.map(|i| i.to_string()), kind, actor, payload.to_string(), rows::ts(&at)],
         )?;
         Ok(())
     }
@@ -2109,6 +2335,23 @@ fn additive_decision_payload_column(tx: &Transaction<'_>, step: &SchemaRung) -> 
     if present == 0 {
         return Ok(());
     }
+    apply_script_with_column_skip(tx, step.script)
+}
+
+/// Rung v10→v11 (task 01a1b71f, REQ-MS-02/05): the active-bundle marker on
+/// `agent_instances` and the three run-stamp columns on `role_executions`,
+/// plus the partial unique index that keeps exactly one marker. Additive
+/// only — no row is rewritten; the shared column-presence skip makes a
+/// re-run over an already-shaped home a no-op.
+fn additive_model_bundle_columns(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    apply_script_with_column_skip(tx, step.script)
+}
+
+/// Rung v11→v12 (task 01a1b71f, REQ-MS-09): the reasoning level on the
+/// agent record and on the run stamp. Additive only — one defaulted column
+/// and one nullable column; the shared column-presence skip keeps a re-run
+/// over an already-shaped home a no-op.
+fn additive_model_reasoning_column(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
     apply_script_with_column_skip(tx, step.script)
 }
 
@@ -3805,6 +4048,7 @@ mod single_writer_tests {
             owner_pid: None,
             owner_host: None,
             owner_process_start: None,
+            bundle: None,
         }
     }
 
