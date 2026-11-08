@@ -19,6 +19,13 @@ pub enum ReviewParagraphSource {
     None,
 }
 
+impl ReviewParagraphSource {
+    /// The closed set, compared against the data file by the vocabulary
+    /// parity test (rework R8).
+    pub const ALL: &'static [ReviewParagraphSource] =
+        &[Self::ReviewReport, Self::Summary, Self::None];
+}
+
 /// One parsed reviewer report — the fields the card prints, nothing derived.
 #[derive(Clone, Debug)]
 pub struct ReviewParse {

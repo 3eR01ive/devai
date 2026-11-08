@@ -2390,6 +2390,109 @@ mod tests {
         );
     }
 
+    /// The shared precondition of the two signature acts: a task in APPROVAL
+    /// with a published CURRENT spec. Returns the task id and the spec id.
+    fn approval_with_current_spec(api: &Api, title: &str) -> (String, String) {
+        let t = fresh_task(api, title);
+        let id = t.to_string();
+        api.task_start(&id).unwrap();
+        let published = api.artifact_publish(spec_publish(&t, "s1")).unwrap();
+        api.task_review(&id, Verdict::Approved, None).unwrap();
+        assert_eq!(
+            api.task_get(&id).unwrap().state,
+            TaskState::Approval,
+            "the fixture must sit on the APPROVAL gate"
+        );
+        (id, published.publish.artifact.id.to_string())
+    }
+
+    /// REQ-SIGN-05 AC3 + rework R1: reject writes ONE
+    /// `requirements_rejection` row — verdict, actor, rationale and the
+    /// CURRENT spec ref — beside the transition, and touches no artifact.
+    /// Before this test the reject write path had no coverage at all; only
+    /// the backfill dogfood ever produced such a row.
+    #[test]
+    fn reject_carries_one_decision_row_and_leaves_artifacts_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let (id, spec_id) = approval_with_current_spec(&api, "reject-me");
+        let task = api.task_get(&id).unwrap();
+        let arts_before = api.store.artifacts(task.id).unwrap();
+
+        let outcome = api
+            .task_reject(&id, Some("спеку надо переписать".into()))
+            .unwrap();
+        assert_eq!(outcome.task.state, TaskState::Analysis);
+        assert_eq!(
+            outcome.event_kinds,
+            vec![event_kind::REQUIREMENTS_REJECTED.to_string()]
+        );
+
+        let decisions = api.task_decisions(&id).unwrap();
+        assert_eq!(decisions.len(), 1, "exactly one rejection row");
+        let row = &decisions[0];
+        assert_eq!(row.kind, decision_kind::REQUIREMENTS_REJECTION);
+        assert_eq!(row.verdict, Verdict::Rejected);
+        assert_eq!(row.actor, "api-tester");
+        assert_eq!(row.rationale.as_deref(), Some("спеку надо переписать"));
+        assert_eq!(row.refs, vec![spec_id], "refs cite the CURRENT spec");
+        assert_eq!(row.task_id, task.id);
+
+        // No artifact was staled, superseded or rewritten by the rejection.
+        let arts_after = api.store.artifacts(task.id).unwrap();
+        assert_eq!(arts_before.len(), arts_after.len());
+        for (before, after) in arts_before.iter().zip(arts_after.iter()) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.status, after.status);
+            assert_eq!(before.sha256, after.sha256);
+            assert_eq!(before.seq, after.seq);
+        }
+    }
+
+    /// REQ-SIGN-06 / rework R6: signing twice is refused and writes nothing —
+    /// no second transition event, no second decision row.
+    #[test]
+    fn a_second_approve_is_refused_and_adds_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let (id, _) = approval_with_current_spec(&api, "approve-twice");
+        api.task_approve(&id, Some("первая".into())).unwrap();
+        let decisions = api.task_decisions(&id).unwrap().len();
+        let events = api.task_events(&id, None).unwrap().len();
+
+        let err = api.task_approve(&id, Some("вторая".into())).unwrap_err();
+        assert_eq!(err.code(), ErrorCode("invalid_transition"), "{err}");
+        assert_eq!(
+            api.task_get(&id).unwrap().state,
+            TaskState::Implementation,
+            "the refusal leaves the task where the first signature put it"
+        );
+        assert_eq!(api.task_decisions(&id).unwrap().len(), decisions);
+        assert_eq!(api.task_events(&id, None).unwrap().len(), events);
+    }
+
+    /// The same idempotency for the reject path: the second reject is
+    /// refused (the task left APPROVAL) and no row or event is added.
+    #[test]
+    fn a_second_reject_is_refused_and_adds_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let (id, _) = approval_with_current_spec(&api, "reject-twice");
+        api.task_reject(&id, Some("первый".into())).unwrap();
+        let decisions = api.task_decisions(&id).unwrap().len();
+        let events = api.task_events(&id, None).unwrap().len();
+
+        let err = api.task_reject(&id, Some("второй".into())).unwrap_err();
+        assert_eq!(err.code(), ErrorCode("invalid_transition"), "{err}");
+        assert_eq!(
+            api.task_get(&id).unwrap().state,
+            TaskState::Analysis,
+            "the refusal leaves the task where the first rejection put it"
+        );
+        assert_eq!(api.task_decisions(&id).unwrap().len(), decisions);
+        assert_eq!(api.task_events(&id, None).unwrap().len(), events);
+    }
+
     /// A publish request of the CURRENT spec kind — the shape both publish
     /// paths of the parity test take.
     fn spec_publish(id: &Id, name: &str) -> PublishReq {

@@ -15,14 +15,15 @@ pub fn diff_specs(previous: &ParsedSpec, current: &ParsedSpec) -> SpecDiff {
     if let Some(refused) = refusal_of(previous, current) {
         return refused;
     }
+    let (paragraph, paragraph_note) = diff_paragraph(
+        previous.human_paragraph.as_deref().unwrap_or(""),
+        current.human_paragraph.as_deref().unwrap_or(""),
+    );
     SpecDiff {
-        paragraph: diff_paragraph(
-            previous.human_paragraph.as_deref().unwrap_or(""),
-            current.human_paragraph.as_deref().unwrap_or(""),
-        ),
+        paragraph,
         requirements: diff_requirements(previous, current),
         refusal: None,
-        note: None,
+        note: paragraph_note,
     }
 }
 
@@ -158,13 +159,52 @@ fn line(mark: &str, label: &str, text: &str) -> DiffLine {
     }
 }
 
+/// Hard ceilings of the paragraph comparison (rework R7). The LCS table costs
+/// `(lines_old + 1) × (lines_new + 1)` `usize` cells — at 250 000 cells that
+/// is ≈2 MB of a temporary buffer and ≈2·10^5 comparisons, which a stored
+/// human paragraph never approaches. The bound is what turns "the input is
+/// small" from a comment into a guarantee: above it the comparison DEGRADES
+/// to a linear whole-version diff and says so in `note` (no quadratic work,
+/// no silent truncation).
+pub const MAX_DIFF_LINES: usize = 2_000;
+/// `MAX_DIFF_LINES² = 4·10⁶ > MAX_DIFF_CELLS`, so the cell bound is the
+/// effective one for square inputs; the line bound bounds the linear walk.
+pub const MAX_LCS_CELLS: usize = 250_000;
+
 /// Line diff with unchanged context (small LCS over lines — the paragraph is
-/// prose, line granularity is the human unit).
-fn diff_paragraph(old: &str, new: &str) -> Vec<DiffLine> {
+/// prose, line granularity is the human unit), or the linear whole-version
+/// diff with an honest note when the input is above the bound.
+fn diff_paragraph(old: &str, new: &str) -> (Vec<DiffLine>, Option<String>) {
     let a = lines_of(old);
     let b = lines_of(new);
+    let cells = a.len().checked_mul(b.len());
+    let over_limit = a.len() > MAX_DIFF_LINES
+        || b.len() > MAX_DIFF_LINES
+        || cells.is_none_or(|c| c > MAX_LCS_CELLS);
+    if over_limit {
+        return (
+            whole_versions(&a, &b),
+            Some(over_limit_note(a.len(), b.len())),
+        );
+    }
     let lcs = lcs_table(&a, &b);
-    walk(&a, &b, &lcs)
+    (walk(&a, &b, &lcs), None)
+}
+
+/// The bounded fallback: every old line removed, every new line added — O(n+m),
+/// no table. It never claims a common line it did not compare.
+fn whole_versions(a: &[&str], b: &[&str]) -> Vec<DiffLine> {
+    let mut out: Vec<DiffLine> = a.iter().map(|l| line("-", "абзац", l)).collect();
+    out.extend(b.iter().map(|l| line("+", "абзац", l)));
+    out
+}
+
+fn over_limit_note(old_lines: usize, new_lines: usize) -> String {
+    format!(
+        "абзац слишком велик для построчного сопоставления ({old_lines} строк против \
+         {new_lines}, предел {MAX_LCS_CELLS} сравнений и {MAX_DIFF_LINES} строк на сторону) — \
+         показан целиком как удалённый и добавленный, без поиска общих строк"
+    )
 }
 
 fn lines_of(text: &str) -> Vec<&str> {
@@ -208,4 +248,89 @@ fn walk(a: &[&str], b: &[&str], lcs: &[Vec<usize>]) -> Vec<DiffLine> {
     out.extend(a[i..].iter().map(|l| line("-", "абзац", l)));
     out.extend(b[j..].iter().map(|l| line("+", "абзац", l)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(paragraph: Option<&str>) -> ParsedSpec {
+        ParsedSpec {
+            human_paragraph: paragraph.map(str::to_string),
+            ..ParsedSpec::default()
+        }
+    }
+
+    fn numbered_lines(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("строка {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Under the bound the comparison keeps its common lines (the human
+    /// diff, not two whole versions).
+    #[test]
+    fn small_paragraphs_keep_their_common_context() {
+        let d = diff_specs(
+            &parsed(Some("первая\nобщая\nстарая")),
+            &parsed(Some("первая\nобщая\nновая")),
+        );
+        assert!(d.note.is_none(), "{:?}", d.note);
+        assert!(
+            d.paragraph
+                .iter()
+                .any(|l| l.mark == " " && l.text == "общая")
+        );
+        assert!(
+            d.paragraph
+                .iter()
+                .any(|l| l.mark == "-" && l.text == "старая")
+        );
+        assert!(
+            d.paragraph
+                .iter()
+                .any(|l| l.mark == "+" && l.text == "новая")
+        );
+    }
+
+    /// R7: above the bound the comparison is LINEAR (every old line removed,
+    /// every new line added — no LCS table is built) and the answer says so
+    /// instead of silently degrading.
+    #[test]
+    fn huge_paragraphs_degrade_to_a_linear_diff_with_a_note() {
+        let old = numbered_lines(MAX_DIFF_LINES + 1);
+        let new = format!("{old}\nдобавленная строка");
+        let d = diff_specs(&parsed(Some(&old)), &parsed(Some(&new)));
+
+        assert!(d.refusal.is_none(), "a big paragraph is readable");
+        let note = d.note.as_deref().unwrap_or_default();
+        assert!(note.contains("слишком велик"), "{note}");
+        assert!(
+            note.contains(&MAX_DIFF_LINES.to_string()),
+            "the note names the bound: {note}"
+        );
+        assert_eq!(
+            d.paragraph.len(),
+            (MAX_DIFF_LINES + 1) + (MAX_DIFF_LINES + 2),
+            "every line of both versions, nothing omitted"
+        );
+        assert!(
+            d.paragraph.iter().all(|l| l.mark != " "),
+            "the fallback claims no shared line it never compared"
+        );
+    }
+
+    /// The cell bound is the effective ceiling for square inputs: 1000×1000
+    /// lines already exceeds MAX_LCS_CELLS while still being under
+    /// MAX_DIFF_LINES per side.
+    #[test]
+    fn the_cell_bound_catches_a_square_input_before_the_line_bound() {
+        let side = 1_000;
+        assert!(side <= MAX_DIFF_LINES);
+        assert!(side * side > MAX_LCS_CELLS);
+        let text = numbered_lines(side);
+        let d = diff_specs(&parsed(Some(&text)), &parsed(Some(&text)));
+        assert!(d.note.is_some(), "the cell bound must trigger the fallback");
+    }
 }

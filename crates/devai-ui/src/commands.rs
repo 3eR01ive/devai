@@ -1710,58 +1710,6 @@ mod tests {
         assert!(err.message.contains("parked_question"), "{}", err.message);
     }
 
-    /// REQ-GATE-04 AC1 + ratified OQ-GATE-4: the paragraph and the spec's
-    /// own open_questions come from the artifact JSON; when the body
-    /// predates the paragraph protocol the stored business description
-    /// stands in — with the honest label, never an empty presentation.
-    #[test]
-    fn spec_presentation_reads_the_document_without_rewriting_it() {
-        let now = now_fixture();
-        let task = task_fixture("дело", "бизнес-описание задачи", now);
-        let artifact = spec_artifact_fixture();
-
-        let body = r#"{"version":3,"human_paragraph":"Коротко: что происходит.",
-            "open_questions":["OQ-A: первый?","OQ-B: второй?"]}"#;
-        let p = spec_presentation(&artifact, Ok(body), &task, true);
-        assert_eq!(p.paragraph_source, ParagraphSource::Spec);
-        assert_eq!(
-            p.human_paragraph.as_deref(),
-            Some("Коротко: что происходит.")
-        );
-        assert_eq!(p.open_questions.len(), 2);
-        assert!(p.unavailable_note.is_none());
-        assert!(p.current);
-
-        // Pre-protocol spec (no human_paragraph key) → business_description
-        // fallback with the ratified label (OQ-GATE-4).
-        let old = r#"{"version":2,"open_questions":["OQ-TN: вопрос документа"]}"#;
-        let p = spec_presentation(&artifact, Ok(old), &task, false);
-        assert_eq!(p.paragraph_source, ParagraphSource::BusinessDescription);
-        assert_eq!(p.human_paragraph.as_deref(), Some("бизнес-описание задачи"));
-        assert!(
-            p.unavailable_note
-                .as_deref()
-                .is_some_and(|n| n.contains("спека до протокола"))
-        );
-        assert_eq!(
-            p.open_questions,
-            vec!["OQ-TN: вопрос документа".to_string()]
-        );
-        assert!(!p.current, "OQ-GATE-3 label rides on the same view");
-
-        // Unparsable body / binary artifact (AC2): honest fact + fallback,
-        // raw bytes are never rendered.
-        let not_text = BodyError::NotText { size: 12 };
-        for p in [
-            spec_presentation(&artifact, Ok("не json {{{"), &task, true),
-            spec_presentation(&artifact, Err(&not_text), &task, true),
-        ] {
-            assert_eq!(p.paragraph_source, ParagraphSource::BusinessDescription);
-            assert!(p.unavailable_note.is_some());
-            assert_eq!(p.human_paragraph.as_deref(), Some("бизнес-описание задачи"));
-        }
-    }
-
     /// REQ-SIGN-12 AC1/AC4: the spec parse has ONE home — `devai-api`. The
     /// window neither declares the types nor parses the body; a second
     /// definition in devai-ui fails here (grep test, not a convention).
@@ -1867,9 +1815,14 @@ mod tests {
             !states.contains("signature_labels"),
             "states.ts is a TaskState mirror, not the section's word dictionary"
         );
-        let labels =
-            std::fs::read_to_string(format!("{crate_dir}/frontend/src/signature_labels.ts"))
-                .unwrap();
+        // Rework R8: the words are DATA — `signature/labels.json` in devai-api,
+        // rendered into the section's generated module. The closed tokens are
+        // checked in the DATA file, which is the single source both languages
+        // read.
+        let labels = std::fs::read_to_string(format!(
+            "{crate_dir}/../devai-api/src/signature/labels.json"
+        ))
+        .unwrap();
         for token in [
             "CURRENT",
             "STALE",
@@ -1880,7 +1833,7 @@ mod tests {
         ] {
             assert!(
                 labels.contains(token),
-                "signature_labels.ts misses the closed token `{token}`"
+                "signature/labels.json misses the closed token `{token}`"
             );
         }
     }

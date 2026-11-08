@@ -58,6 +58,12 @@ pub enum ParagraphSource {
     BusinessDescription,
 }
 
+impl ParagraphSource {
+    /// The closed set, so the label parity test (rework R8) compares the
+    /// data file against the type instead of a hand-kept list.
+    pub const ALL: &'static [ParagraphSource] = &[Self::Spec, Self::BusinessDescription];
+}
+
 /// One requirement of the spec body as stored (REQ-SIGN-02): formulation and
 /// criteria are printed verbatim, never translated or rewritten.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -125,7 +131,8 @@ struct SpecFields {
 
 /// Parse the spec artifact body. The JSON is read, never rewritten; the
 /// array shapes are the seeded contract's (`open_questions` is an array of
-/// strings, seed.rs:312). Ratified OQ-GATE-4: absent paragraph → the stored
+/// strings, crates/devai-store/src/seed.rs:312). Ratified OQ-GATE-4: absent
+/// paragraph → the stored
 /// task business description with an honest source + note.
 pub fn parse_spec_body(body: Result<&str, &BodyError>, task: &Task) -> ParsedSpec {
     let fields = match spec_document(body) {

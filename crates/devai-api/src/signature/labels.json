@@ -1,0 +1,47 @@
+{
+  "artifact_status": [
+    { "token": "CURRENT", "word": "действует" },
+    { "token": "STALE", "word": "устарел" },
+    { "token": "SUPERSEDED", "word": "заменён" }
+  ],
+  "review_verdict": [
+    { "token": "approved", "word": "одобрено" },
+    { "token": "needs_revision", "word": "нужны правки" },
+    { "token": "rejected", "word": "отклонён" }
+  ],
+  "paragraph_source": [
+    { "token": "spec", "word": "абзац спеки" },
+    { "token": "business_description", "word": "бизнес-описание задачи" }
+  ],
+  "review_paragraph_source": [
+    { "token": "review_report", "word": "абзац отчёта ревьювера" },
+    { "token": "summary", "word": "summary отчёта (абзаца нет)" },
+    { "token": "none", "word": "абзаца нет" }
+  ],
+  "denial": [
+    {
+      "token": "not_approval",
+      "word": "подпись доступна только в состоянии APPROVAL"
+    },
+    { "token": "no_spec", "word": "спеки нет — утверждать нечего" },
+    {
+      "token": "spec_not_current",
+      "word": "последняя спека не CURRENT — утверждать нельзя"
+    },
+    {
+      "token": "no_requirements_version",
+      "word": "у задачи нет утверждённой версии требований"
+    }
+  ],
+  "signature_kind": [
+    { "token": "approval", "word": "утверждение" },
+    { "token": "rejection", "word": "отклонение" }
+  ],
+  "signature_source": [
+    { "token": "decision", "word": "строка решения" },
+    {
+      "token": "event",
+      "word": "событие (сохранённой строки решения нет)"
+    }
+  ]
+}

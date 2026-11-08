@@ -5,12 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "gen:codes": "node scripts/gen-home-codes.mjs",
-    "build": "node scripts/gen-home-codes.mjs && vite build",
+    "gen:codes": "node scripts/gen-home-codes.mjs && node scripts/gen-signature-labels.mjs",
+    "build": "node scripts/gen-home-codes.mjs && node scripts/gen-signature-labels.mjs && vite build",
     "typecheck": "vue-tsc --noEmit",
     "preview": "vite preview",
     "test": "vitest run && node --import ./tests/support/register-ts.mjs --test tests/*.test.ts",
-    "check": "node scripts/gen-home-codes.mjs && vue-tsc --noEmit && node --import ./tests/support/register-ts.mjs --test tests/*.test.ts"
+    "check": "node scripts/gen-home-codes.mjs && node scripts/gen-signature-labels.mjs && vue-tsc --noEmit && node --import ./tests/support/register-ts.mjs --test tests/*.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

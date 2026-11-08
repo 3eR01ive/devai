@@ -35,10 +35,11 @@ mod review;
 mod selectors;
 mod spec;
 mod types;
+mod vocabulary;
 
 pub use answer::signature_view;
 pub use body::{BodyError, BodyProblem, BodyProblemKind};
-pub use denial::{DENIAL_CODES, approve_denied, reject_denied};
+pub use denial::{approve_denied, denial_codes, reject_denied};
 pub use diff::diff_specs;
 pub use review::{ReviewParagraphSource, parse_review_body};
 pub use selectors::{last_review_artifact, pick_previous_spec};
@@ -235,13 +236,14 @@ mod tests {
         assert_eq!(reject_denied(TaskState::Approval), None);
         assert_eq!(reject_denied(TaskState::Analysis), Some("not_approval"));
 
-        // R7: every code those FOUR return sites can produce lives in the ONE
-        // dictionary the frontend parity test reads.
+        // R8: every code those FOUR return sites can produce is READ FROM the
+        // data dictionary the UI render is generated from.
         let stale = parse_spec_body(Ok(r#"{"human_paragraph":"x"}"#), &task()).view(
             &artifact(1, devai_core::types::ArtifactStatus::Stale),
             false,
         );
         let current = view.clone();
+        let dictionary = denial_codes();
         for code in [
             approve_denied(TaskState::Review, None, 0),
             approve_denied(TaskState::Approval, None, 0),
@@ -253,8 +255,8 @@ mod tests {
         .flatten()
         {
             assert!(
-                DENIAL_CODES.contains(&code),
-                "{code} is not in DENIAL_CODES"
+                dictionary.contains(&code),
+                "{code} is not in the data dictionary"
             );
         }
     }
