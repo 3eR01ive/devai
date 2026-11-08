@@ -17,7 +17,7 @@ use std::process::Command;
 use std::sync::LazyLock;
 
 use devai_core::vocab::CheckState;
-use devai_store::config::{Probe, Profile, unresolved_slot};
+use devai_store::config::{Probe, Profile};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -145,32 +145,46 @@ fn exec_probe(cmd: &str, workspace: &Path, pass_exit: &[i64]) -> ProbeOutcome {
     }
 }
 
-/// REQ-SP-105 (verdict semantics ratified in OQ-SP-7): the unresolved-slot
-/// predicate is MECHANICAL and SYNTACTIC — a probe command that still
-/// contains an open `{{...}}` binding token after composition is never
-/// spawned, and its outcome is BLOCKED regardless of what the command would
-/// have returned. Not a fake-FAIL, not a fake-PASS; an unperformed check
-/// cannot fabricate either. The SAME predicate covers check probes and gate
+/// An open `{{...}}` template token left in a probe command, if any.
+///
+/// The profile grammar no longer substitutes anything into a probe: a rule
+/// carries the exact command it will run. This predicate is the runtime's
+/// own last line of defence — a command still holding a template token is
+/// not a command, and executing it would produce a verdict about the SHELL,
+/// not about the code under audit.
+fn open_template_token(cmd: &str) -> Option<String> {
+    let open = cmd.find("{{")?;
+    let rest = &cmd[open + 2..];
+    let close = rest.find("}}")?;
+    Some(format!("{{{{{}}}}}", &rest[..close]))
+}
+
+/// REQ-SP-105 (verdict semantics ratified in OQ-SP-7): the predicate is
+/// MECHANICAL and SYNTACTIC — a probe command that still contains an open
+/// `{{...}}` template token is never spawned, and its outcome is BLOCKED
+/// regardless of what the command would have returned. Not a fake-FAIL,
+/// not a fake-PASS; an unperformed check cannot fabricate either. The SAME predicate covers check probes and gate
 /// probes: gates are binary (V6), so counting an unbound gate as gate=0
 /// would forge a rejected-gate, and as gate=1 would forge a pass — the
 /// verdict function already turns a BLOCKED gate into INCONCLUSIVE (§2.5),
 /// never into FAIL.
-fn slot_blocked_probe(p: &Probe) -> Option<ProbeOutcome> {
-    unresolved_slot(&p.cmd).map(|tok| ProbeOutcome {
+fn template_blocked_probe(p: &Probe) -> Option<ProbeOutcome> {
+    open_template_token(&p.cmd).map(|tok| ProbeOutcome {
         state: ProbeState::Blocked,
         detail: format!(
-            "probe `{}`: binding slot `{tok}` is unresolved — not executed (BLOCKED: neither fake-FAIL nor fake-PASS, REQ-SP-105)",
+            "probe `{}`: template token `{tok}` is unresolved — not executed (BLOCKED: neither fake-FAIL nor fake-PASS, REQ-SP-105)",
             p.cmd
         ),
         output: String::new(),
     })
 }
 
-/// Run a probe list: slot predicate FIRST (no spawn), then the process.
+/// Run a probe list: template-token predicate FIRST (no spawn), then the
+/// process.
 fn run_probes(probes: &[Probe], workspace: &Path) -> Vec<ProbeOutcome> {
     probes
         .iter()
-        .map(|p| match slot_blocked_probe(p) {
+        .map(|p| match template_blocked_probe(p) {
             Some(b) => b,
             None => exec_probe(&p.cmd, workspace, &p.pass_exit),
         })
@@ -1135,10 +1149,12 @@ scoring:
     }
 
     #[test]
-    fn unresolved_slot_probe_is_blocked_without_spawn() {
+    fn unresolved_template_token_probe_is_blocked_without_spawn() {
         // REQ-SP-105: the predicate is syntactic and fires BEFORE the
         // process — the command never spawns (side effect absent) and the
         // outcome is BLOCKED, not FAIL whatever the command would return.
+        // A rule carries an exact command; a leftover template token means
+        // the rule was never completed, so nothing may be executed.
         // Covers gate probes and check probes identically (R1/RV3-2).
         let ws = tempfile::TempDir::new().unwrap();
         let marker = ws.path().join("spawned");

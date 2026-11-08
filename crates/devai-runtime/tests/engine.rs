@@ -2965,7 +2965,7 @@ fn engine_binds_tasks_to_their_projects_effective_profile() {
         verdict: Verdict::Approved,
         actor: "operator".into(),
         rationale: Some("section ratified".into()),
-        refs: vec!["build-green".into(), "dom/x".into()],
+        refs: vec!["dom/x".into()],
         created_at: Utc::now(),
     };
     store.record_decision(&dec).unwrap();
@@ -2978,10 +2978,9 @@ fn engine_binds_tasks_to_their_projects_effective_profile() {
 base_identity: base@1
 overlay_version: 1
 items:
-  - {{kind: bind, target_id: build-green, ratified_by: {}, slots: {{build_cmd: "true"}}}}
   - {{kind: add, target_id: dom/x, ratified_by: {}, add: {{statement: domain invariant x, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.10}}}}
 "#,
-            alpha.id, dec.id, dec.id
+            alpha.id, dec.id
         ),
     )
     .unwrap();
@@ -2991,10 +2990,9 @@ items:
     let pa = pa.expect("alpha resolves to a profile");
     assert!(wa.is_empty(), "{wa:?}");
     assert_eq!(pa.identity(), "base@1", "the delta layers onto the base");
-    let bg = pa.gates.iter().find(|g| g.id == "build-green").unwrap();
-    assert_eq!(
-        bg.probes[0].cmd, "true",
-        "ratified bind reached the engine's resolution"
+    assert!(
+        pa.gates.is_empty(),
+        "the base carries no gates; an overlay ADDS rules, it never fills them in"
     );
     assert!(
         pa.checks().iter().any(|c| c.id == "dom/x"),
@@ -3009,10 +3007,12 @@ items:
     let pb = pb.expect("beta resolves to a profile");
     assert!(wb.is_empty(), "{wb:?}");
     assert!(
-        pb.gates
-            .iter()
-            .any(|g| g.probes[0].cmd.contains("{{build_cmd}}")),
-        "beta keeps the pure base — alpha's binding must not leak"
+        pb.gates.is_empty(),
+        "beta keeps the pure base — alpha's overlay must not leak"
+    );
+    assert!(
+        (pb.scoring.weights["pr/spec-fidelity"] - 0.06).abs() < 1e-12,
+        "beta's weights stay unscaled — alpha's add must not leak"
     );
     assert!(!pb.checks().iter().any(|c| c.id == "dom/x"));
 }

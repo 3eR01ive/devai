@@ -683,52 +683,7 @@ impl OverlayError {
 
 type OverlayResult<T> = Result<T, OverlayError>;
 
-/// Binding-slot token grammar: a literal `{{name}}` inside `Probe.cmd`.
-/// After composition, any token still present means the slot is UNRESOLVED —
-/// the probe is BLOCKED before spawn (REQ-SP-105), never fake-FAIL/fake-PASS.
-pub fn unresolved_slot(cmd: &str) -> Option<String> {
-    let open = cmd.find("{{")?;
-    let rest = &cmd[open + 2..];
-    let close = rest.find("}}")?;
-    Some(format!("{{{{{}}}}}", &rest[..close]))
-}
-
-/// True when ANY gate/check probe of the profile still carries an open
-/// `{{slot}}` token — the profile is not yet bound to project tooling.
-/// Used by the projectless fallback in `resolve_effective_profile`
-/// (manual operator fix 05.11): bound courts win over the pure base.
-pub fn profile_has_open_slots(p: &Profile) -> bool {
-    p.gates
-        .iter()
-        .flat_map(|g| g.probes.iter())
-        .chain(
-            p.evaluations
-                .iter()
-                .flat_map(|e| e.checks.iter())
-                .flat_map(|c| c.probes.iter()),
-        )
-        .any(|x| unresolved_slot(&x.cmd).is_some())
-}
-
-/// Collect every `{{name}}` token name in a command (deduplicated, sorted).
-fn slot_names(cmd: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut hay = cmd;
-    while let Some(o) = hay.find("{{") {
-        let rest = &hay[o + 2..];
-        let Some(c) = rest.find("}}") else { break };
-        let name = rest[..c].trim().to_string();
-        if !name.is_empty() && !names.contains(&name) {
-            names.push(name);
-        }
-        hay = &rest[c + 2..];
-    }
-    names.sort();
-    names
-}
-
-/// One item of the delta file: `bind` fills the slots of a base target
-/// (check OR gate — REQ-SP-104), `add` contributes a new project check with
+/// One item of the delta file: `add` contributes a new project check with
 /// a declared weight. `ratified_by` is the data-field link to the human
 /// decision that gives the item force (REQ-SP-106, A-5).
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -764,32 +719,25 @@ pub struct OverlayAddPayload {
 /// Item kind of the delta (REQ-SP-104/106). A SERDE ENUM, not a free
 /// string with a runtime dictionary (R3): an invalid `kind` in the delta
 /// file is rejected by the PARSER, before any validation-order logic runs.
-/// `rename_all = "lowercase"` keeps the stored dictionary exactly `bind`
-/// and `add`.
+/// `rename_all = "lowercase"` keeps the stored dictionary exactly `add`;
+/// the overlay can only ADD rules — a retired `bind` value is an unknown
+/// variant and fails at parse time.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OverlayKind {
-    Bind,
     Add,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OverlayItem {
     pub kind: OverlayKind,
-    /// bind: an existing base id (check or gate). add: a NEW id.
+    /// add: a NEW id (never an existing base id).
     pub target_id: String,
     /// id of a decisions row (kind=profile_ratification, verdict=APPROVED)
     /// whose refs cover `target_id`. Non-empty is structural; force is the
     /// cross-check (A-5) — a dangling/foreign/unapproved ref drops the item.
     #[serde(default)]
     pub ratified_by: String,
-    /// bind: slot name -> bound value (replaces `{{name}}` in target probes).
-    #[serde(default)]
-    pub slots: BTreeMap<String, String>,
-    /// bind: the explicitly ratified refinement of the base wording
-    /// (REQ-SP-104 — the only way a bind may restate a target).
-    #[serde(default)]
-    pub refine_statement: Option<String>,
     /// add: the full check payload.
     #[serde(default)]
     pub add: Option<OverlayAddPayload>,
@@ -803,7 +751,8 @@ pub struct ProfileOverlay {
     /// projects.id the overlay is keyed by (stable PK, not display name).
     pub project_id: String,
     /// The base this delta was authored against, `name@version` — kept as a
-    /// divergence signal (ratified OQ-SP-4: never silently re-drops bindings).
+    /// provenance signal: the base is matched by NAME, so a version drift is
+    /// visible without silently discarding the overlay.
     pub base_identity: String,
     pub overlay_version: u32,
     #[serde(default)]
@@ -819,10 +768,9 @@ pub struct Composition {
     /// target_ids dropped by the force cross-check (announced loudly —
     /// REQ-SP-106 "не прошедший item не входит в композицию и оглашается").
     pub dropped: Vec<String>,
-    /// Non-fatal signals (e.g. base-form divergence per ratified OQ-SP-4:
-    /// a bound slot whose token no longer exists in the target — the item
-    /// stays in force, nothing is reset silently; re-ratification is the
-    /// C3 surface's call).
+    /// Non-fatal signals raised while composing (e.g. a weight rescale that
+    /// had nothing to scale). Nothing is reset silently; a warning is the
+    /// loader's announcement surface.
     pub warnings: Vec<String>,
 }
 
@@ -836,8 +784,9 @@ pub fn overlay_path(cfg_dir: &Path, project_id: &str) -> PathBuf {
 
 /// Read and structurally validate the delta (layer (a) of REQ-SP-106)
 /// BEFORE any composition. Structural violations are hard errors naming
-/// the item: unknown kind, bind on a missing target, add colliding with a
-/// base id or another item, weight out of (0,1), empty ratified_by.
+/// the item: add colliding with a base id or another item, weight out of
+/// (0,1), empty ratified_by. The item KIND is the serde enum's business —
+/// an unknown variant never reaches this function.
 pub fn load_overlay(path: &Path) -> StoreResult<ProfileOverlay> {
     let overlay: ProfileOverlay = parse_yaml(path)?;
     Ok(overlay)
@@ -872,17 +821,6 @@ pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> OverlayResu
             ));
         }
         match item.kind {
-            OverlayKind::Bind => {
-                if !base_ids.contains(item.target_id.as_str()) {
-                    return Err(OverlayError::new(
-                        "REQ-SP-104",
-                        format!(
-                            "{who}: bind target `{}` does not exist in the base (checks or gates) — nothing to bind",
-                            item.target_id
-                        ),
-                    ));
-                }
-            }
             OverlayKind::Add => {
                 if base_ids.contains(item.target_id.as_str()) {
                     return Err(OverlayError::new(
@@ -919,117 +857,6 @@ pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> OverlayResu
     Ok(())
 }
 
-/// View of BOTH bind-target sorts (REQ-SP-104: a bind points at a check
-/// id OR a gate id). Gates and checks share the only surface slot binding
-/// rewrites — `probes` — and each owns one restatable wording (gate `desc`,
-/// check `statement`), reachable solely through a ratified
-/// `refine_statement`. One substitution loop over this trait replaces the
-/// two gate/check copies that used to drift apart (R2).
-trait BindTarget {
-    fn id(&self) -> &str;
-    fn target_probes(&self) -> &[Probe];
-    fn probes_mut(&mut self) -> &mut Vec<Probe>;
-    /// The target's wording replaced by a ratified `refine_statement`.
-    fn set_wording(&mut self, wording: &str);
-    /// Names of every `{{slot}}` token currently in the target's form
-    /// (deduplicated) — the OQ-SP-4 divergence read.
-    fn slot_token_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-        for p in self.target_probes() {
-            for n in slot_names(&p.cmd) {
-                if !names.contains(&n) {
-                    names.push(n);
-                }
-            }
-        }
-        names.sort();
-        names
-    }
-}
-
-impl BindTarget for GateDef {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn target_probes(&self) -> &[Probe] {
-        &self.probes
-    }
-    fn probes_mut(&mut self) -> &mut Vec<Probe> {
-        &mut self.probes
-    }
-    fn set_wording(&mut self, wording: &str) {
-        self.desc = wording.to_string();
-    }
-}
-
-impl BindTarget for CheckDef {
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn target_probes(&self) -> &[Probe] {
-        &self.probes
-    }
-    fn probes_mut(&mut self) -> &mut Vec<Probe> {
-        &mut self.probes
-    }
-    fn set_wording(&mut self, wording: &str) {
-        self.statement = wording.to_string();
-    }
-}
-
-/// The ONE slot-substitution step (R2): apply a ratified bind — explicit
-/// wording refinement, then replace every `{{name}}` token in every probe
-/// of the target — identically for gates and checks.
-fn apply_bind(target: &mut dyn BindTarget, item: &OverlayItem) {
-    if let Some(r) = &item.refine_statement {
-        target.set_wording(r);
-    }
-    for p in target.probes_mut() {
-        for (name, value) in &item.slots {
-            p.cmd = p.cmd.replace(&format!("{{{{{name}}}}}"), value);
-        }
-    }
-}
-
-/// The bind-target view of one profile: gates and checks through the
-/// shared `BindTarget` trait (REQ-SP-104 — a bind may name either sort).
-fn bind_targets<'a>(
-    profile: &'a Profile,
-    target_id: &'a str,
-) -> impl Iterator<Item = &'a dyn BindTarget> + 'a {
-    profile
-        .gates
-        .iter()
-        .map(|g| g as &dyn BindTarget)
-        .chain(
-            profile
-                .evaluations
-                .iter()
-                .flat_map(|e| e.checks.iter())
-                .map(|c| c as &dyn BindTarget),
-        )
-        .filter(move |t| t.id() == target_id)
-}
-
-/// The mutable bind-target view (see `bind_targets`).
-fn bind_targets_mut<'a>(
-    profile: &'a mut Profile,
-    target_id: &'a str,
-) -> impl Iterator<Item = &'a mut dyn BindTarget> + 'a {
-    profile
-        .gates
-        .iter_mut()
-        .map(|g| g as &mut dyn BindTarget)
-        .chain(
-            profile
-                .evaluations
-                .iter_mut()
-                .flat_map(|e| e.checks.iter_mut())
-                .map(|c| c as &mut dyn BindTarget),
-        )
-        .filter(move |t| t.id() == target_id)
-}
-
 /// Compose the effective profile: base + the RATIFIED subset of the delta.
 /// `ratified` maps decision id -> refs (only rows with
 /// kind=profile_ratification, verdict=APPROVED reach it — the force
@@ -1041,10 +868,10 @@ fn bind_targets_mut<'a>(
 ///
 /// Weights follow REQ-SP-107 exactly: W = Σ ratified add weights;
 /// W >= 1 rejects the composition naming the items; otherwise base weights
-/// scale by (1−W) and adds carry their declared weight. Bind never touches
-/// weights (REQ-SP-107 AC). Application order is sorted by target id, so
-/// one base@version + overlay@version yields a byte-identical effective
-/// profile (REQ-SP-103 AC) regardless of file order.
+/// scale by (1−W) and adds carry their declared weight. Application order
+/// is sorted by target id, so one base@version + overlay@version yields a byte-identical effective
+/// profile (REQ-SP-103 AC) regardless of file order. The overlay ADDS only:
+/// it contributes new checks, never rewrites a base rule.
 pub fn compose_profile(
     base: &Profile,
     overlay: &ProfileOverlay,
@@ -1054,7 +881,7 @@ pub fn compose_profile(
 
     let mut applied: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
+    let warnings: Vec<String> = Vec::new();
 
     // Deterministic processing order: items sorted by target_id.
     let mut ordered: Vec<&OverlayItem> = overlay.items.iter().collect();
@@ -1075,34 +902,6 @@ pub fn compose_profile(
         .collect();
 
     let mut eff = base.clone();
-
-    // Binds: fill slot tokens of the target — check OR gate (REQ-SP-104),
-    // through ONE substitution path (R2). The target stays the same single
-    // id; no second check/gate appears.
-    for item in in_force.iter().filter(|i| i.kind == OverlayKind::Bind) {
-        // Token form read BEFORE substitution: the ratified OQ-SP-4
-        // divergence signal is a declared slot that is not part of the
-        // target's current form (the base drifted under a ratified
-        // binding). The binding is NOT silently dropped — it is announced.
-        let mut tokens: Vec<String> = bind_targets(&eff, &item.target_id)
-            .flat_map(|t| t.slot_token_names())
-            .collect();
-        tokens.sort();
-        tokens.dedup();
-
-        for t in bind_targets_mut(&mut eff, &item.target_id) {
-            apply_bind(t, item);
-        }
-
-        for name in item.slots.keys() {
-            if !tokens.contains(name) {
-                warnings.push(format!(
-                    "bind `{}`: slot `{{{{{name}}}}}` is absent from the base target's probe form — the base has diverged; the ratified binding is retained and re-ratification is required (OQ-SP-4)",
-                    item.target_id
-                ));
-            }
-        }
-    }
 
     // Adds: new project checks under NEW ids, with their declared weights
     // and any new error types / sections (REQ-SP-104).
@@ -1207,7 +1006,7 @@ pub fn compose_profile(
 
 /// Outcome of resolving the factory layers for one task/project: the
 /// effective profile plus the loader's announcements (dropped non-ratified
-/// items and divergence warnings — REQ-SP-106 "оглашается загрузчиком").
+/// items — REQ-SP-106 "оглашается загрузчиком").
 #[derive(Clone, Debug)]
 pub struct Resolution {
     pub profile: Option<Profile>,
@@ -1237,16 +1036,18 @@ pub fn resolve_effective_profile(
 ) -> StoreResult<Resolution> {
     let profiles = load_profiles(&cfg_dir.join("evaluation"))?;
     let applies = |p: &&Profile| p.applies_to_roles.iter().any(|r| r == "quality-auditor");
-    // manual operator fix (05.11, C1 defect found by dogfood — UI re-audit):
-    // a task WITHOUT a project must be judged on a BOUND auditor profile when
-    // the home carries one. Glob order alone would hand base.yaml (open slots
-    // -> BLOCKED flood past the cap) to exactly the platform's own court the
-    // split was introduced for. A pure open-slots base stays the last resort,
-    // preserving the clean-home semantics of REQ-SP-101.
-    let fallback = profiles
-        .iter()
-        .find(|p| applies(p) && !profile_has_open_slots(p))
-        .or_else(|| profiles.iter().find(|p| applies(p)));
+    // A task WITHOUT a project: the most MATURE auditor court the home carries
+    // wins, version ties resolved by the sorted load order. On a clean home
+    // that is just the factory base (REQ-SP-101); on a home that still carries
+    // an older owned full profile, that profile keeps judging (operator
+    // decision: init must not swap a working checklist for the fresh base
+    // before the home is migrated).
+    let fallback = profiles.iter().filter(applies).fold(None::<&Profile>, |best, p| {
+        match best {
+            Some(b) if b.version >= p.version => Some(b),
+            _ => Some(p),
+        }
+    });
     let Some(pid) = project_id else {
         // No project: judged on the base (a clean home carries exactly it).
         return Ok(Resolution {
@@ -1268,9 +1069,9 @@ pub fn resolve_effective_profile(
                 overlay.project_id
             )));
         }
-        // OQ-SP-4 (ratified): the base is matched by NAME; a version drift
-        // does not reset bindings — composition proceeds and only genuinely
-        // unresolvable slot forms surface as warnings above.
+        // The base is matched by NAME: a version drift in `base_identity`
+        // does not discard the overlay — the items' own force rule (A-5)
+        // still decides what enters composition.
         let base_name = overlay.base_identity.split('@').next().unwrap_or("");
         let base = profiles
             .iter()
@@ -2235,8 +2036,8 @@ mod tests {
     }
 
     /// REQ-SP-101/102 (cycle C1): the factory ships the ABSTRACT BASE only —
-    /// one profile, no project specifics anywhere, binding slots open, and it
-    /// compiles into the auditor exactly like any full Profile.
+    /// one profile, no project specifics anywhere, and it compiles into the
+    /// auditor exactly like any full Profile.
     #[test]
     fn factory_profile_loads_valid_and_compiles_into_auditor() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2251,7 +2052,13 @@ mod tests {
             p.applies_to_roles.iter().any(|r| r == "quality-auditor"),
             "the engine must find the base for the auditor"
         );
-        assert_eq!(p.gates.len(), 3);
+        // Механических гейтов база не несёт: гейт — это команда, а любая команда
+        // есть знание о конкретном проекте (пути, инструменты, имена файлов).
+        // Проверки остаются все, но судятся ролью по абстрактным критериям.
+        assert!(
+            p.gates.is_empty(),
+            "the base carries no mechanical gates"
+        );
         assert!(p.checks().iter().any(|c| c.id == "cl/meaningful-names"));
         assert!(p.checks().iter().any(|c| c.id == "pr/spec-fidelity"));
         // AC REQ-SP-101: no devai specifics at start — no block, no name.
@@ -2266,27 +2073,15 @@ mod tests {
                 "the factory base mentions concrete-stack token `{leak}`"
             );
         }
-        // AC REQ-SP-102: every probe of the base is a pure binding slot —
-        // no concrete command lives outside {{...}} syntax (checks AND gates).
-        for g in &p.gates {
-            for pr in &g.probes {
-                assert!(
-                    unresolved_slot(&pr.cmd).is_some(),
-                    "gate `{}` probe `{}` must be an open slot in the base",
-                    g.id,
-                    pr.cmd
-                );
-            }
-        }
+        // Правило остаётся правилом, только пока не знает ничего о проекте:
+        // ни команд, ни слотов-заглушек, ни путей. Проба («запрос проверки»)
+        // — это всегда конкретика, поэтому в базе их нет вовсе.
         for c in p.checks() {
-            for pr in &c.probes {
-                assert!(
-                    unresolved_slot(&pr.cmd).is_some(),
-                    "check `{}` probe `{}` must be an open slot in the base",
-                    c.id,
-                    pr.cmd
-                );
-            }
+            assert!(
+                c.probes.is_empty(),
+                "check `{}` carries a probe; the base must stay free of commands",
+                c.id
+            );
         }
         // Floors are derived from error_type severity, never declared per check.
         let inj = p

@@ -1,24 +1,24 @@
 # Фабричный БАЗОВЫЙ профиль оценки (REQ-SP-101/102, цикл C1 задачи 01a1ab88).
 # Языконезависимая база: ни путей, ни имён модулей, ни команд конкретного
-# проекта — механические пробы и гейты выражены слотами привязки {{...}}
+# проекта. Механическое исполнение (гейты, пробы) здесь отсутствует по
+# определению — любая команда есть знание о конкретном проекте. Все проверки
+# судятся ролью по абстрактным критериям: verify=rubric и якоря V4
 # (docs/internal/criteria-generic-draft.yaml 0.2-abstract как материал;
-# нормализация draft->Profile — probes/pass_exit вместо probe/map, якоря V4,
-# version u32, applies_to_roles).
+# нормализация draft->Profile: probes/pass_exit, version u32, applies_to_roles).
 #
-# Семантика неразрешённого слота (REQ-SP-105 + ратификация OQ-SP-7) — проба с
-# открытым токеном {{...}} НЕ исполняется и даёт BLOCKED: ни fake-FAIL, ни
-# fake-PASS; гейт с BLOCKED-пробой не gate=0 и не gate=1, вердикт при нём
-# INCONCLUSIVE. Дом без оверлея судится этой чистой базой.
+# Дом без оверлея судится этой чистой базой.
 #
-# Конкретика проекта (привязки слотов к инструментам и доменные проверки)
-# входит в силу только через human-гейт ратификации и живёт в дельте
-# profiles/<projects.id>.overlay.yaml (REQ-SP-106) — НЕ в этом файле и не в
-# evaluation/. Веса effective-профиля пересчитывает композиция по
-# REQ-SP-107; база сама валидна как Profile с sum=1.00 (V7).
+# Конкретика проекта (доменные проверки) входит в силу только через human-гейт
+# ратификации и живёт в дельте profiles/<projects.id>.overlay.yaml
+# (REQ-SP-106) — НЕ в этом файле и не в evaluation/. Оверлей умеет только
+# ДОБАВЛЯТЬ правила под своими id; правила базы он не переписывает. Веса
+# effective-профиля пересчитывает композиция по REQ-SP-107; база сама валидна
+# как Profile с sum=1.00 (V7).
 #
-# Нормализации при переносе из draft 0.2-abstract (структура, не смысл):
+# Нормализация при переносе из draft 0.2-abstract (структура, не смысл):
 #   - da/run-docs и proc/evidence-completeness получили недостающие якоря V4;
-#   - pass_exit проставлен по схеме проб (mechanical [0], hybrid [0,1]).
+#   - pass_exit оставлен по схеме проб там, где правило когда-нибудь станет
+#     механическим (mechanical [0], hybrid [0,1]).
 
 version: 1
 name: base
@@ -129,23 +129,7 @@ error_types:
     desc: Rubric-нарушение или балл выставлены без обязательного evidence.
     severity: minor
 
-gates:
-  - id: build-green
-    desc: >-
-      Все значимые сборки проекта проходят (bind — слот {{build_cmd}}).
-      Правило не перечисляет сборки и не знает инструментов проекта: оно требует,
-      чтобы прошли ВСЕ значимые; частичное покрытие — ложная зелень.
-    probes:
-      - { cmd: "{{build_cmd}}", pass_exit: [0] }
-  - id: tests-green
-    desc: "тестовый набор проекта зелёный (bind — слот {{test_cmd}})"
-    probes:
-      - { cmd: "{{test_cmd}}", pass_exit: [0] }
-  - id: no-secrets
-    desc: "нет секретов-литералов в дереве (bind — сканер {{secret_scan_cmd}}, exit 0 = чисто)"
-    probes:
-      - { cmd: "{{secret_scan_cmd}}", pass_exit: [0] }
-
+gates: []
 evaluations:
   - id: readability
     title: Читаемость и понятность
@@ -175,9 +159,7 @@ evaluations:
       - id: cl/short-units
         statement: Единицы кода читаются целиком в рамках порога оверлея; вложенность управляющего потока ограничена.
         detects: [clarity/oversized-unit, clarity/deep-nesting]
-        verify: hybrid
-        probes:
-          - { cmd: "{{size_nesting_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": кандидатов нет или все с ролевым обоснованием
           "0.7": единичные длинные с обоснованием роли
@@ -188,9 +170,11 @@ evaluations:
       - id: cl/style-consistency
         statement: Дерево проходит штатный инструмент стиля проекта без исключений-без-обоснования.
         detects: [clarity/style-drift]
-        verify: mechanical
-        probes:
-          - { cmd: "{{style_check_cmd}}", pass_exit: [0] }
+        verify: rubric
+        anchors:
+          "1.0": нарушений нет
+          "0.5": единичные нарушения на второстепенных путях
+          "0.0": нарушения систематические
         evidence: required
         reviewer: either
 
@@ -200,9 +184,7 @@ evaluations:
       - id: mt/no-magic
         statement: Литералы с доменным смыслом (лимиты, состояния, пороги) вынесены в именованные сущности с обоснованием; в тестах не считаются.
         detects: [architecture/magic]
-        verify: hybrid
-        probes:
-          - { cmd: "{{magic_candidates_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": кандидатов нет или все обоснованы
           "0.7": до двух незначительных
@@ -225,9 +207,7 @@ evaluations:
       - id: mt/dependency-direction
         statement: Потребители зависят от заявленной границы (контрактного слоя), а не от реализации внутреннего слоя в обход неё.
         detects: [maintainability/dependency-inversion, maintainability/tight-coupling]
-        verify: hybrid
-        probes:
-          - { cmd: "{{boundary_bypass_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": обходов границы нет
           "0.7": остаточные обращения явно ратифицированы как граница этапа
@@ -238,9 +218,7 @@ evaluations:
       - id: mt/dry
         statement: Общий смысл имеет один источник; параллельных копий одной семантики без общего источника нет.
         detects: [maintainability/duplication]
-        verify: hybrid
-        probes:
-          - { cmd: "{{duplication_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": копий нет
           "0.7": две-три локализованные копии с мелким дрейфом
@@ -266,9 +244,7 @@ evaluations:
       - id: rl/error-handling
         statement: Ошибки не теряются; состояние «нет данных» отличимо от «данные повреждены».
         detects: [reliability/error-wash]
-        verify: hybrid
-        probes:
-          - { cmd: "{{silent_failure_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": глотания нет
           "0.7": единичные обоснованные места
@@ -279,9 +255,7 @@ evaluations:
       - id: rl/crash-free
         statement: Аварийный выход library-кода на валидных редких данных отсутствует; исключения из правила несут локальное обоснование недостижимости.
         detects: [reliability/abnormal-exit]
-        verify: hybrid
-        probes:
-          - { cmd: "{{abnormal_exit_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": все места обоснованы
           "0.7": единицы без обоснования, структурно недостижимы
@@ -325,9 +299,7 @@ evaluations:
       - id: sec/injection
         statement: Внешняя строка попадает в исполняемый канал только через параметризацию; константы схемы — единственный не-связанный интерполяции источник.
         detects: [security/injection]
-        verify: hybrid
-        probes:
-          - { cmd: "{{injection_candidates_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": кандидатов нет или все — константы при параметризации
           "0.4": спорная сборка
@@ -337,9 +309,7 @@ evaluations:
       - id: sec/secrets-hygiene
         statement: Секретов-литералов в дереве нет; внешние креды читаются из окружения/файлов вне репозитория.
         detects: [security/secret-exposure]
-        verify: hybrid
-        probes:
-          - { cmd: "{{secret_scan_cmd}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": чисто
           "0.4": закомментированный секрет
@@ -375,9 +345,7 @@ evaluations:
       - id: pf/resource-growth
         statement: Долгоживущие процессы имеют явные ограничители роста (шаги, буферы, соединения) — именованные с обоснованием.
         detects: [performance/unbounded-growth]
-        verify: hybrid
-        probes:
-          - { cmd: "{{growth_guard_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": все циклы ограничены
           "0.7": ограничения есть, обоснование единиц неполное
@@ -388,9 +356,11 @@ evaluations:
       - id: pf/hot-path-measure
         statement: Утверждения о производительности опираются на измерения (bench-тулинг оверлея), не на глаз.
         detects: [performance/algorithmic]
-        verify: mechanical
-        probes:
-          - { cmd: "{{bench_check_cmd}}", pass_exit: [0] }
+        verify: rubric
+        anchors:
+          "1.0": нарушений нет
+          "0.5": единичные нарушения на второстепенных путях
+          "0.0": нарушения систематические
         evidence: optional
         reviewer: either
       - id: pf/parallelism
@@ -411,9 +381,11 @@ evaluations:
       - id: ts/global-state
         statement: Разделяемого изменяемого глобального состояния в исполняемом коде нет.
         detects: [testability/global-state]
-        verify: mechanical
-        probes:
-          - { cmd: "{{global_state_probe}}", pass_exit: [0] }
+        verify: rubric
+        anchors:
+          "1.0": нарушений нет
+          "0.5": единичные нарушения на второстепенных путях
+          "0.0": нарушения систематические
         evidence: required
         reviewer: either
       - id: ts/di-seams
@@ -430,9 +402,7 @@ evaluations:
       - id: ts/coverage-static
         statement: Ключевая логика и взаимодействия модулей накрыты тестами; метрика покрытия — на усмотрение оверлея, при её отсутствии плотность статическая.
         detects: [testability/coverage-gap]
-        verify: hybrid
-        probes:
-          - { cmd: "{{test_density_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": новое и гейты с parity-тестами
           "0.7": плотность высокая, отдельные ветки без тестов
@@ -443,10 +413,11 @@ evaluations:
       - id: ts/test-independence
         statement: Набор зелёный при смене порядка/распараллеливания; тесты не мутируют окружение процесса и не ссылаются на общий порядок.
         detects: [testability/order-dependent]
-        verify: mechanical
-        probes:
-          - { cmd: "{{serial_test_cmd}}", pass_exit: [0] }
-          - { cmd: "{{env_mutation_probe}}", pass_exit: [0] }
+        verify: rubric
+        anchors:
+          "1.0": нарушений нет
+          "0.5": единичные нарушения на второстепенных путях
+          "0.0": нарушения систематические
         evidence: required
         reviewer: either
 
@@ -478,9 +449,7 @@ evaluations:
       - id: da/run-docs
         statement: Инструкции сборки/запуска существуют и точны; ключевые решения и обходные пути задокументированы.
         detects: [documentation/run-docs-stale]
-        verify: hybrid
-        probes:
-          - { cmd: "{{run_docs_probe}}", pass_exit: [0, 1] }
+        verify: rubric
         anchors:
           "1.0": точные инструкции и записанные решения
           "0.7": инструкции есть, решения не записаны

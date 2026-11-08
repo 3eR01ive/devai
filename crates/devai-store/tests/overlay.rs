@@ -1,8 +1,12 @@
 //! Cycle C1 (task 01a1ab88): the project overlay DELTA — representation,
-//! force rule (A-5), composition semantics (bind/add), weight procedure
+//! force rule (A-5), composition semantics (ADD-only), weight procedure
 //! (REQ-SP-107) and per-project resolution (REQ-SP-103). The tests run
 //! against a materialised factory home, so the base under composition is
 //! the SHIPPED base.yaml, not a fixture that could drift from it.
+//!
+//! The overlay can only ADD rules under new ids. It cannot rewrite, fill in
+//! or restate a base rule: the retired `bind` item kind is not part of the
+//! grammar and is rejected by the parser.
 //!
 //! FIXTURE DISCIPLINE (QA R1, evaluator collision): this repo IS judged by
 //! devai itself, whose devai-v11 profile greps `crates/` for network-stack
@@ -12,9 +16,7 @@
 
 use chrono::Utc;
 use devai_core::types::*;
-use devai_store::config::{
-    self, Profile, ProfileOverlay, overlay_path, profile_has_open_slots, unresolved_slot,
-};
+use devai_store::config::{self, Profile, ProfileOverlay, overlay_path};
 use devai_store::{Store, seed};
 use std::fs;
 use tempfile::TempDir;
@@ -70,6 +72,31 @@ fn task(store: &Store, project: Option<&Project>) -> Task {
     t
 }
 
+fn base_profile(cfg: &std::path::Path) -> Profile {
+    config::load_profiles(&cfg.join("evaluation"))
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name.as_deref() == Some("base"))
+        .expect("factory base is present")
+}
+
+/// A ratified ADD item body (mechanical probe, neutral fixture pattern).
+fn add_item(id: &str, decision: &str, weight: f64) -> String {
+    format!(
+        r#"  - kind: add
+    target_id: {id}
+    ratified_by: {decision}
+    add:
+      statement: local-first — nothing may reach out past the declared adapter.
+      detects: [security/injection]
+      verify: mechanical
+      probes:
+        - {{ cmd: "test -z \"$(grep -RnE 'fakenet|othercrate' src)\"", pass_exit: [0] }}
+      weight: {weight}
+"#
+    )
+}
+
 /// REQ-SP-101 AC1/AC4: a clean home receives ONLY the base in evaluation/;
 /// the factory tree does not seed a profiles/ subdirectory at all.
 #[test]
@@ -109,56 +136,35 @@ fn unratified_overlay_judges_on_pure_base_and_is_announced() {
 base_identity: base@1
 overlay_version: 1
 items:
-  - kind: bind
-    target_id: build-green
-    ratified_by: no-such-decision
-    slots:
-      build_cmd: "make build"
-  - kind: add
-    target_id: dom/sovereignty
-    ratified_by: also-no-decision
-    add:
-      statement: local-first — nothing may reach out past the declared adapter.
-      detects: [security/injection]
-      verify: mechanical
-      probes:
-        - {{ cmd: "grep -Rn fakenet src/", pass_exit: [0] }}
-      weight: 0.30
-"#
+{}
+{}"#,
+            add_item("dom/sovereignty", "no-such-decision", 0.30),
+            add_item("dom/portability", "also-no-decision", 0.20),
         ),
     );
     let r = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
     let eff = r.profile.clone().expect("resolves to a profile");
-    let b = config::load_profiles(&cfg.join("evaluation"))
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-    // Pure base: gates keep their open slots, no new checks, weights intact.
+    let b = base_profile(&cfg);
+    // Pure base: same rules, no new checks, weights intact.
     assert_eq!(eff.checks().len(), b.checks().len());
-    assert!(
-        eff.gates
-            .iter()
-            .any(|g| unresolved_slot(&g.probes[0].cmd).is_some())
-    );
+    assert!(eff.gates.is_empty(), "the base carries no gates");
     assert!(!eff.checks().iter().any(|c| c.id == "dom/sovereignty"));
-    assert_eq!(eff.scoring.weights["sec/injection"], 0.04);
+    assert!(!eff.checks().iter().any(|c| c.id == "dom/portability"));
+    assert_eq!(eff.scoring.weights, b.scoring.weights);
     assert_eq!(r.warnings.len(), 2, "both items announced: {r:?}");
     assert!(r.warnings.iter().all(|w| w.contains("NOT in force")));
     let _ = t;
 }
 
-/// REQ-SP-103/104/106/107 with ratification: bind fills gate slots and a
-/// check probe without duplicating the target; add lands under its new id
-/// and the weights follow the deterministic formula; V7 holds on the
-/// effective profile.
+/// REQ-SP-103/104/106/107 with ratification: the ratified ADD lands under
+/// its new id in its (new) section, the weights follow the deterministic
+/// formula, and V7 holds on the effective profile. The base rules are
+/// untouched — an overlay adds, it never rewrites.
 #[test]
-fn ratified_overlay_composes_base_plus_specifics() {
+fn ratified_overlay_composes_base_plus_added_rule() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let dec_bind = ratify(&store, &t, &["build-green"]).to_string();
-    let dec_probe = ratify(&store, &t, &["sec/injection"]).to_string();
     let dec_add = ratify(&store, &t, &["dom/sovereignty"]).to_string();
     let pid = prj.id.to_string();
     write_overlay(
@@ -177,7 +183,7 @@ items:
       detects: [security/injection]
       verify: mechanical
       probes:
-        - {{ cmd: "test -z \"$(grep -RnE 'fakenet|othercrate' crates --exclude-dir=tools)\"", pass_exit: [0] }}
+        - {{ cmd: "test -z \"$(grep -RnE 'fakenet|othercrate' src)\"", pass_exit: [0] }}
       weight: 0.30
       error_types:
         architecture/sovereignty-leak:
@@ -185,38 +191,13 @@ items:
           severity: major
       section: platform-invariants
       section_title: Продуктовые инварианты
-  - kind: bind
-    target_id: build-green
-    ratified_by: {dec_bind}
-    slots:
-      build_cmd: "cargo build --workspace"
-  - kind: bind
-    target_id: sec/injection
-    ratified_by: {dec_probe}
-    slots:
-      injection_candidates_probe: "grep -Rn 'format!' crates/devai-store/src/"
 "#
         ),
     );
     let r = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
     let eff = r.profile.expect("effective profile");
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-
-    // Bind: the gate ran once, slot gone, gate count unchanged (no second gate).
-    assert_eq!(eff.gates.len(), 3);
-    let bg = eff.gates.iter().find(|g| g.id == "build-green").unwrap();
-    assert_eq!(bg.probes[0].cmd, "cargo build --workspace");
-    assert!(unresolved_slot(&bg.probes[0].cmd).is_none());
-    // Bind on a CHECK probe: same id, filled in place.
-    let inj = eff
-        .checks()
-        .into_iter()
-        .find(|c| c.id == "sec/injection")
-        .unwrap();
-    assert_eq!(
-        inj.probes[0].cmd,
-        "grep -Rn 'format!' crates/devai-store/src/"
-    );
+    let base = base_profile(&cfg);
 
     // Add: new check under its new id in its (new) section + error type merged.
     let added = eff
@@ -235,6 +216,16 @@ items:
         eff.error_types
             .contains_key("architecture/sovereignty-leak")
     );
+
+    // The base rules are exactly as shipped: same ids, same wording.
+    for b in base.checks() {
+        let e = eff
+            .checks()
+            .into_iter()
+            .find(|c| c.id == b.id)
+            .unwrap_or_else(|| panic!("base check `{}` disappeared", b.id));
+        assert_eq!(e.statement, b.statement, "an add must not rewrite `{}`", b.id);
+    }
 
     // Weights (REQ-SP-107): W=0.30 -> base scaled by 0.70, add keeps 0.30.
     assert!((eff.scoring.weights["sec/injection"] - 0.04 * 0.7).abs() < 1e-12);
@@ -284,33 +275,14 @@ items:
 }
 
 /// REQ-SP-106 layer (a): structural violations are rejected BEFORE
-/// composition — bind on a missing target, add colliding with a base id,
-/// an item without ratified_by, and a file whose header id mismatches the
-/// projects.id key.
+/// composition — an add colliding with a base id, an item without
+/// ratified_by, and a file whose header id mismatches the projects.id key.
 #[test]
 fn structural_violations_are_rejected_before_composition() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let dec = ratify(&store, &t, &["ghost/check"]).to_string();
-    let pid = prj.id.to_string();
-    write_overlay(
-        &cfg,
-        &prj.id.to_string(),
-        &format!(
-            r#"project_id: "{pid}"
-base_identity: base@1
-overlay_version: 1
-items:
-  - {{kind: bind, target_id: ghost/check, ratified_by: {dec}, slots: {{x: y}}}}
-"#
-        ),
-    );
-    let err = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string()))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("does not exist in the base"), "{err}");
-
+    let dec = ratify(&store, &t, &["sec/injection"]).to_string();
     let pid = prj.id.to_string();
     write_overlay(
         &cfg,
@@ -329,7 +301,6 @@ items:
         .to_string();
     assert!(err.contains("collides with an existing base id"), "{err}");
 
-    let pid = prj.id.to_string();
     write_overlay(
         &cfg,
         &prj.id.to_string(),
@@ -338,7 +309,7 @@ items:
 base_identity: base@1
 overlay_version: 1
 items:
-  - {{kind: bind, target_id: build-green, slots: {{build_cmd: "make"}}}}
+  - {{kind: add, target_id: dom/no-decision, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.1}}}}
 "#
         ),
     );
@@ -351,18 +322,45 @@ items:
     write_overlay(
         &cfg,
         &prj.id.to_string(),
-        &format!(
-            r#"project_id: "some-other-id"
+        r#"project_id: "some-other-id"
 base_identity: base@1
 overlay_version: 1
 items: []
-"#
-        ),
+"#,
     );
     let err = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string()))
         .unwrap_err()
         .to_string();
     assert!(err.contains("does not match the key"), "{err}");
+}
+
+/// The overlay can only ADD: the retired `bind` item kind is an unknown serde
+/// variant now, and the PARSER rejects it before any validation logic runs —
+/// no branch for it survives anywhere in the composition.
+#[test]
+fn bind_kind_is_rejected_at_parse_time() {
+    let (_d, store, cfg) = home();
+    let prj = project(&store, "alpha");
+    let pid = prj.id.to_string();
+    write_overlay(
+        &cfg,
+        &pid,
+        &format!(
+            r#"project_id: "{pid}"
+base_identity: base@1
+overlay_version: 1
+items:
+  - kind: bind
+    target_id: sec/injection
+    ratified_by: whatever
+"#
+        ),
+    );
+    let err = config::resolve_effective_profile(&store, &cfg, Some(&pid))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown variant"), "{err}");
+    assert!(err.contains("bind"), "{err}");
 }
 
 /// REQ-SP-106 AC: the delta is NOT a Profile — the full-Profile loader
@@ -392,30 +390,16 @@ fn composition_is_deterministic_and_keyed_by_project_id() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let d1 = ratify(&store, &t, &["build-green"]).to_string();
-    let d2 = ratify(&store, &t, &["dom/a"]).to_string();
+    let d1 = ratify(&store, &t, &["dom/a"]).to_string();
+    let d2 = ratify(&store, &t, &["dom/b"]).to_string();
+    let (a, b) = (
+        add_item("dom/a", &d1, 0.2),
+        add_item("dom/b", &d2, 0.3),
+    );
     let overlay = |first: bool| {
-        let (a, b) = if first {
-            (
-                format!(
-                    "  - {{kind: bind, target_id: build-green, ratified_by: {d1}, slots: {{build_cmd: make}}}}"
-                ),
-                format!(
-                    "  - {{kind: add, target_id: dom/a, ratified_by: {d2}, add: {{statement: s, detects: [], verify: rubric, anchors: {{\"1.0\": a, \"0.5\": b, \"0.0\": c}}, weight: 0.2}}}}"
-                ),
-            )
-        } else {
-            (
-                format!(
-                    "  - {{kind: add, target_id: dom/a, ratified_by: {d2}, add: {{statement: s, detects: [], verify: rubric, anchors: {{\"1.0\": a, \"0.5\": b, \"0.0\": c}}, weight: 0.2}}}}"
-                ),
-                format!(
-                    "  - {{kind: bind, target_id: build-green, ratified_by: {d1}, slots: {{build_cmd: make}}}}"
-                ),
-            )
-        };
+        let (x, y) = if first { (&a, &b) } else { (&b, &a) };
         format!(
-            "project_id: \"{}\"\nbase_identity: base@1\noverlay_version: 1\nitems:\n{a}\n{b}\n",
+            "project_id: \"{}\"\nbase_identity: base@1\noverlay_version: 1\nitems:\n{x}{y}",
             prj.id
         )
     };
@@ -429,6 +413,7 @@ fn composition_is_deterministic_and_keyed_by_project_id() {
         y(r2.profile.as_ref().unwrap()),
         "byte-identical effective profile for the same composition (REQ-SP-103)"
     );
+    assert!(r1.warnings.is_empty(), "{:?}", r1.warnings);
 
     // Resolution keyed by projects.id survives the name being different:
     // an unknown-to-DB id still composes the overlay (name is display-only).
@@ -548,16 +533,15 @@ scoring:
     let _ = t;
 }
 
-/// OQ-SP-4 (ratified): a base upgrade does not silently reset ratified
-/// bindings. Composition matches the base by NAME across the version drift;
-/// a slot whose token no longer exists in the target form is ANNOUNCED as a
-/// divergence (re-ratification signal) and everything else keeps force.
+/// A `base_identity` whose version drifted keeps its ratified adds in force:
+/// the base is matched by NAME, only the items' own force rule (A-5) decides
+/// what enters composition.
 #[test]
-fn base_version_drift_keeps_bindings_and_announces_divergence() {
+fn base_version_drift_keeps_ratified_adds() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let d1 = ratify(&store, &t, &["build-green"]).to_string();
+    let d1 = ratify(&store, &t, &["dom/a"]).to_string();
     let pid = prj.id.to_string();
     write_overlay(
         &cfg,
@@ -567,19 +551,20 @@ fn base_version_drift_keeps_bindings_and_announces_divergence() {
 base_identity: base@99
 overlay_version: 1
 items:
-  - {{kind: bind, target_id: build-green, ratified_by: {d1}, slots: {{gone_slot: "make", build_cmd: "cargo build"}}}}
-"#
+{}
+"#,
+            add_item("dom/a", &d1, 0.25)
         ),
     );
     let r = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
     let eff = r.profile.unwrap();
-    // base@1 found by name "base" — no silent reset of the human bindings:
-    let bg = eff.gates.iter().find(|g| g.id == "build-green").unwrap();
-    assert_eq!(bg.probes[0].cmd, "cargo build");
-    // The genuinely diverged slot form is announced, the binding stays.
-    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
-    assert!(r.warnings[0].contains("gone_slot"));
-    assert!(r.warnings[0].contains("OQ-SP-4"));
+    assert_eq!(eff.identity(), "base@1");
+    assert!(
+        eff.checks().iter().any(|c| c.id == "dom/a"),
+        "a version drift in base_identity must not discard a ratified add"
+    );
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(r.ratified.get("dom/a").map(|(d, _)| d.as_str()), Some(d1.as_str()));
 }
 
 /// A task WITHOUT a project id judges on the pure base of a clean home
@@ -593,69 +578,9 @@ fn task_without_project_judges_on_the_base() {
     let _ = t;
 }
 
-/// REQ-SP-104 (QA R7): a bind's ratified `refine_statement` is the ONLY
-/// way a bind restates its target's wording — `desc` on a gate,
-/// `statement` on a check — while slots still fill in place and the
-/// target is never duplicated. Bind also never touches weights (the one
-/// REQ-SP-107 AC asserted here).
-#[test]
-fn bind_refine_statement_restates_gate_desc_and_check_statement() {
-    let (_d, store, cfg) = home();
-    let prj = project(&store, "alpha");
-    let t = task(&store, Some(&prj));
-    let d_gate = ratify(&store, &t, &["no-secrets"]).to_string();
-    let d_check = ratify(&store, &t, &["sec/injection"]).to_string();
-    let pid = prj.id.to_string();
-    write_overlay(
-        &cfg,
-        &pid,
-        &format!(
-            r#"project_id: "{pid}"
-base_identity: base@1
-overlay_version: 1
-items:
-  - {{kind: bind, target_id: no-secrets, ratified_by: {d_gate}, refine_statement: "project scanner (ratified wording)", slots: {{secret_scan_cmd: "true"}}}}
-  - {{kind: bind, target_id: sec/injection, ratified_by: {d_check}, refine_statement: "project injection probe (ratified wording)", slots: {{injection_candidates_probe: "true"}}}}
-"#
-        ),
-    );
-    let r = config::resolve_effective_profile(&store, &cfg, Some(&pid)).unwrap();
-    let eff = r.profile.expect("effective profile");
-    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-
-    // Gate: wording restated, slot filled in place, still exactly one gate.
-    let gates: Vec<_> = eff.gates.iter().filter(|g| g.id == "no-secrets").collect();
-    assert_eq!(gates.len(), 1, "bind never duplicates its target");
-    assert_eq!(gates[0].desc, "project scanner (ratified wording)");
-    assert_eq!(gates[0].probes[0].cmd, "true");
-
-    // Check: statement restated, probe filled, still exactly one check.
-    let checks: Vec<_> = eff
-        .checks()
-        .into_iter()
-        .filter(|c| c.id == "sec/injection")
-        .collect();
-    assert_eq!(checks.len(), 1, "bind never duplicates its target");
-    assert_eq!(
-        checks[0].statement,
-        "project injection probe (ratified wording)"
-    );
-    assert_eq!(checks[0].probes[0].cmd, "true");
-
-    // Bind changes no weights (REQ-SP-107 AC4) and the result is valid.
-    let b = config::load_profiles(&cfg.join("evaluation"))
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-    assert_eq!(eff.scoring.weights, b.scoring.weights);
-    eff.validate().expect("effective profile passes V1-V8");
-}
-
-/// R3 (QA): `kind` is a serde ENUM with the dictionary `bind|add` — an
-/// invalid value is rejected by the PARSER, before any validation-order
-/// logic could run (the old String+match let the check depend on call
-/// sequence).
+/// R3 (QA): `kind` is a serde ENUM — an invalid value is rejected by the
+/// PARSER, before any validation-order logic could run (the old String+match
+/// let the check depend on call sequence).
 #[test]
 fn invalid_kind_is_rejected_at_parse_time() {
     let (_d, store, cfg) = home();
@@ -669,7 +594,7 @@ fn invalid_kind_is_rejected_at_parse_time() {
 base_identity: base@1
 overlay_version: 1
 items:
-  - {{kind: delete, target_id: build-green, ratified_by: whatever, slots: {{build_cmd: "make"}}}}
+  - {{kind: delete, target_id: sec/injection, ratified_by: whatever}}
 "#
         ),
     );
@@ -680,14 +605,14 @@ items:
     assert!(err.contains("delete"), "{err}");
 }
 
-/// manual operator fix (05.11, C1 defect found by dogfood — devai-ui re-audit):
-/// a task WITHOUT a project resolves to the BOUND auditor profile present in
-/// the home (quality.yaml), never to the slot-open factory base. The base
-/// stays court only for a clean home that carries nothing else (REQ-SP-101).
+/// A home that still carries an older owned full profile keeps judging its
+/// projectless tasks: the MOST MATURE auditor court wins over the freshly
+/// seeded factory base, and the base stays court only for a clean home
+/// (REQ-SP-101).
 #[test]
-fn projectless_resolution_prefers_bound_profile_over_open_base() {
+fn projectless_resolution_prefers_the_mature_court_over_the_fresh_base() {
     let (_d, store, cfg) = home();
-    // devai-home shape: the pre-split home already carries the BOUND court
+    // devai-home shape: the pre-split home already carries the owned court
     // (init never clobbers existing files, so quality.yaml survives next to
     // the newly seeded base).
     let src = concat!(
@@ -700,27 +625,17 @@ fn projectless_resolution_prefers_bound_profile_over_open_base() {
     assert_eq!(
         profile.name.as_deref(),
         Some("quality"),
-        "projectless tasks must be judged on the bound court, not the slot-open base"
+        "projectless tasks must be judged on the mature court, not the fresh base"
     );
-    assert!(!profile_has_open_slots(&profile));
-    // sanity: the base IS open-slots (otherwise the test above proves nothing)
-    let base = config::load_profiles(&cfg.join("evaluation"))
-        .unwrap()
-        .into_iter()
-        .find(|p| p.name.as_deref() == Some("base"))
-        .expect("factory base is present");
-    assert!(
-        profile_has_open_slots(&base),
-        "factory base must still carry unbound slots — the fallback distinction lives"
-    );
+    assert!(profile.version > 1);
 }
 
 /// REQ-BIND-04 (C5 D1, the court-unchanged guarantee of the binding slice):
 /// binding a task to the devai project moves NO court. The owned-path
-/// resolution without an overlay (config.rs:1294-1317) hands the bound task
-/// the SAME profile the projectless bound-preference fallback hands today —
-/// byte-for-byte. No overlay file exists in this slice (REQ-BIND-05: D1
-/// creates no profiles/), so both addresses land on quality.yaml v13.
+/// resolution without an overlay hands the bound task the SAME profile the
+/// projectless fallback hands today — byte-for-byte. No overlay file exists
+/// in this slice (REQ-BIND-05: D1 creates no profiles/), so both addresses
+/// land on quality.yaml.
 #[test]
 fn bound_task_is_judged_byte_identical_to_the_projectless_fallback() {
     let (_d, store, cfg) = home();
@@ -749,5 +664,4 @@ fn bound_task_is_judged_byte_identical_to_the_projectless_fallback() {
         serde_json::to_vec(&projectless).unwrap(),
         "binding a task must not move its court"
     );
-    assert!(!profile_has_open_slots(&bound));
 }
