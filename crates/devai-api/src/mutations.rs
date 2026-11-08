@@ -744,7 +744,32 @@ impl Api {
         self.task_op(id, WorkflowOp::Review { verdict, summary })
     }
     pub fn task_reject(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
-        self.task_op(id, WorkflowOp::Reject { rationale })
+        // REQ-SIGN-05 AC3 (ASM-13): the rejection is a stored DECISION row,
+        // not only an event — the same act the CLI `task reject` performs.
+        // refs cite the CURRENT spec when one exists; the APPROVAL→ANALYSIS
+        // transition itself is untouched.
+        let task = self.store.resolve_task(id)?;
+        let spec_ref = self
+            .store
+            .artifacts(task.id)?
+            .iter()
+            .find(|x| {
+                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
+            })
+            .map(|x| x.id.to_string());
+        let mutation = self.task_op(id, WorkflowOp::Reject { rationale: rationale.clone() })?;
+        let decision = Decision {
+            id: new_id(),
+            task_id: task.id,
+            kind: decision_kind::REQUIREMENTS_REJECTION.into(),
+            verdict: Verdict::Rejected,
+            actor: self.actor.clone(),
+            rationale,
+            refs: spec_ref.into_iter().collect(),
+            created_at: Utc::now(),
+        };
+        self.store.record_decision(&decision)?;
+        Ok(mutation)
     }
     pub fn task_accept(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
         self.task_op(id, WorkflowOp::Accept { rationale })

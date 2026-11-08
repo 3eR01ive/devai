@@ -5,6 +5,7 @@ Commands:
   list                 
   get                  
   status               Current state + the operations the platform permits next
+  signature            The signable surface of an APPROVAL card: the spec paragraph, requirements, document open questions, reviewer block, previous-version diff, the two signature rights and the newest stored signature fact — the same ONE object the window's signature card renders (with --json: the machine view)
   progress             Pipeline position of the task, allowed operations and a snapshot of running executions — state at a glance without copy-pasting ids (with --json: the same snapshot for machines)
   active               What is running right now, across all tasks of this store: short task id, role@version, elapsed, workflow stage, worktree link — a read-only snapshot, no waiting (with --json: one machine snapshot). Per-task pipeline detail stays with `task progress`
   workspace            What the task's isolated workspace CHANGES against the bound baseline: committed file list with A/M/D markers, the stored range (baseline..tip) and per-run commit stamps. Read-only view over the task's branch — states no_isolation / live / historical / unavailable are verdicts in data, never errors (with --json: the full machine view)

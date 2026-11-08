@@ -175,6 +175,13 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "Readable unified diff of ONE changeset-listed file of the task's rework branch between exactly the baseline and tip task.workspace_changes used (same resolution, so list and diff are consistent by construction). A path outside the changeset is a typed not_found the consumer branches on by code; binary content is a binary fact with the stored size — raw bytes are never rendered. Mirrors `task workspace-diff`.",
         },
         OpDescriptor {
+            name: "task.signature",
+            class: OpClass::Read,
+            input: "id_prefix",
+            output: "SignatureView{task_id,state,snapshot_at,may_approve,may_approve_denied,may_reject,may_reject_denied,spec,review,review_note,previous,previous_note,signature}",
+            description: "The APPROVAL card's signable surface, from stored facts only: the presented REQUIREMENTS_SPEC (CURRENT, else the last one with current=false) with its human paragraph, requirements (id/statement/acceptance_criteria/constraints) and document open_questions; the reviewer block (verdict as stored, human paragraph or its summary, honest note per missing/unreadable branch); the previous spec version with a human field diff; the two independent signature rights may_approve/may_reject with the first denial code; and the newest stored signature fact (decision row preferred over event, spec_seq only from resolvable refs). One read for the whole card — no per-item artifact reads, no writes, no re-derivation. Mirrors `task signature`.",
+        },
+        OpDescriptor {
             name: "task.report",
             class: OpClass::Read,
             input: "id_prefix",

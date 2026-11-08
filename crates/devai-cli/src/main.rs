@@ -129,6 +129,14 @@ enum TaskCmd {
     Status {
         id: String,
     },
+    /// The signable surface of an APPROVAL card: the spec paragraph,
+    /// requirements, document open questions, reviewer block, previous-version
+    /// diff, the two signature rights and the newest stored signature fact —
+    /// the same ONE object the window's signature card renders
+    /// (with --json: the machine view).
+    Signature {
+        id: String,
+    },
     /// Pipeline position of the task, allowed operations and a snapshot of
     /// running executions — state at a glance without copy-pasting ids
     /// (with --json: the same snapshot for machines).

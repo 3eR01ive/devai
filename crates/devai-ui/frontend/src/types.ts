@@ -358,6 +358,79 @@ export interface SpecPresentation {
   unavailable_note: string | null;
 }
 
+// --- signature card (task_signature, REQ-SIGN-07) ---------------------
+// Один ответ на всю секцию подписи: абзац, требования, вопросы документа,
+// блок ревьювера, дифф к прошлой версии, оба права подписи и самый новый
+// сохранённый факт подписи. UI ничего не парсит и не досочиняет.
+export interface RequirementView {
+  id: string;
+  statement: string;
+  acceptance_criteria: string[];
+  constraints: string[];
+}
+
+export interface SpecView {
+  artifact: Artifact;
+  current: boolean;
+  human_paragraph: string | null;
+  paragraph_source: "spec" | "business_description";
+  requirements: RequirementView[];
+  requirements_note: string | null;
+  open_questions: string[];
+  unavailable_note: string | null;
+}
+
+export interface ReviewView {
+  artifact: Artifact;
+  current: boolean;
+  verdict: string | null;
+  human_paragraph: string | null;
+  paragraph_source: "review_report" | "summary" | "none";
+  note: string | null;
+}
+
+export interface DiffLine {
+  mark: "+" | "-" | " ";
+  label: string;
+  text: string;
+}
+
+export interface SpecDiff {
+  paragraph: DiffLine[];
+  requirements: DiffLine[];
+  note: string | null;
+}
+
+export interface PreviousView {
+  artifact: Artifact;
+  diff: SpecDiff;
+}
+
+export interface SignatureFact {
+  kind: "approval" | "rejection";
+  actor: string;
+  at: string;
+  rationale: string | null;
+  spec_seq: number | null;
+  source: "decision" | "event";
+}
+
+export interface SignatureView {
+  task_id: string;
+  state: string;
+  snapshot_at: string;
+  may_approve: boolean;
+  may_approve_denied: string | null;
+  may_reject: boolean;
+  may_reject_denied: string | null;
+  spec: SpecView | null;
+  review: ReviewView | null;
+  review_note: string | null;
+  previous: PreviousView | null;
+  previous_note: string | null;
+  signature: SignatureFact | null;
+}
+
 // Справочная группа ниже списка стоящих (ратифицированное OQ-GATE-1):
 // безответный НЕблокирующий вопрос — заметка на активной задаче, платформа
 // на ней не стоит (workflow.rs:747-748), поэтому это не wait-row. Но строкой

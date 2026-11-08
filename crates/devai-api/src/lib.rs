@@ -23,6 +23,7 @@ mod homes;
 mod inbox;
 mod mutations;
 mod registry;
+mod signature;
 
 /// Machine codes of the homes vocabulary — one dictionary, referenced by
 /// producers here and by the UI bootstrap (R3 quality return).
@@ -51,6 +52,12 @@ pub use mutations::{
     TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult, WorkflowOp,
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
+pub use signature::{
+    DiffLine, ParagraphSource, PreviousView, RequirementView, ReviewParagraphSource, ReviewView,
+    SignatureFact, SignatureView, SpecDiff, SpecPresentation, SpecView, approve_denied,
+    diff_specs, last_review_artifact, parse_review_body, parse_spec_body, pick_previous_spec,
+    reject_denied, signature_view, spec_presentation,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -219,6 +226,15 @@ impl Api {
                 .filter(|q| q.status == QuestionStatus::Open)
                 .collect(),
         })
+    }
+
+    /// The APPROVAL signature read (REQ-SIGN-07): paragraph, requirements,
+    /// document questions, reviewer block, previous-version diff, signature
+    /// rights and the newest stored signature fact — ONE operation, so the
+    /// window makes one call for the whole card instead of a fan-out.
+    pub fn task_signature(&self, id_prefix: &str) -> ApiResult<SignatureView> {
+        let task = self.store.resolve_task(id_prefix)?;
+        signature::signature_view(&self.store, task)
     }
 
     /// Pipeline position + running executions, purely from engine data

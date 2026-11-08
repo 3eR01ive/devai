@@ -241,6 +241,7 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::List => task_list(ctx, json)?,
         TaskCmd::Get { id } => task_get(ctx, &id, json)?,
         TaskCmd::Status { id } => status(ctx, &id, json)?,
+        TaskCmd::Signature { id } => task_signature(ctx, &id, json)?,
         TaskCmd::Progress { id } => progress(ctx, &id, json)?,
         TaskCmd::Active => active_overview(ctx, json)?,
         TaskCmd::Workspace { id } => {
@@ -1354,6 +1355,108 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn task_signature(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    // API task.signature — the ONE read the window's signature card renders
+    // (REQ-SIGN-07/10: the CLI mirror is part of the same delivery).
+    let v = ctx.api().task_signature(id).map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    outln!(
+        "state: {}  may_approve: {}  may_reject: {}",
+        v.state.as_str(),
+        v.may_approve,
+        v.may_reject
+    );
+    if let Some(d) = &v.may_approve_denied {
+        outln!("approve denied: {d}");
+    }
+    if let Some(d) = &v.may_reject_denied {
+        outln!("reject denied: {d}");
+    }
+    match &v.spec {
+        Some(s) => {
+            outln!(
+                "--- spec v{} ({})  current: {}",
+                s.artifact.seq,
+                s.artifact.name,
+                s.current
+            );
+            if let Some(note) = &s.unavailable_note {
+                outln!("  {note}");
+            }
+            outln!(
+                "{}",
+                s.human_paragraph.as_deref().unwrap_or("(абзаца нет)")
+            );
+            for r in &s.requirements {
+                outln!("  [{}] {}", r.id, r.statement);
+                for ac in &r.acceptance_criteria {
+                    outln!("      AC: {ac}");
+                }
+                for c in &r.constraints {
+                    outln!("      · {c}");
+                }
+            }
+            if let Some(note) = &s.requirements_note {
+                outln!("  {note}");
+            }
+            if !s.open_questions.is_empty() {
+                outln!("--- open questions ({})", s.open_questions.len());
+                for (i, q) in s.open_questions.iter().enumerate() {
+                    outln!("  {}. {q}", i + 1);
+                }
+            }
+        }
+        None => outln!("--- spec: утверждать нечего (нет REQUIREMENTS_SPEC)"),
+    }
+    match &v.review {
+        Some(r) => {
+            outln!(
+                "--- review v{}  verdict: {}  current: {}",
+                r.artifact.seq,
+                r.verdict.as_deref().unwrap_or("—"),
+                r.current
+            );
+            if let Some(note) = &r.note {
+                outln!("  {note}");
+            }
+            if let Some(p) = &r.human_paragraph {
+                outln!("{p}");
+            }
+        }
+        None => outln!(
+            "--- review: {}",
+            v.review_note.as_deref().unwrap_or("отчёта ревьювера нет")
+        ),
+    }
+    match &v.previous {
+        Some(p) => {
+            outln!("--- previous: v{}", p.artifact.seq);
+            for l in p.diff.paragraph.iter().chain(p.diff.requirements.iter()) {
+                outln!("{} {}  {}", l.mark, l.label, l.text);
+            }
+        }
+        None => outln!(
+            "--- previous: {}",
+            v.previous_note.as_deref().unwrap_or("прошлой версии нет")
+        ),
+    }
+    match &v.signature {
+        Some(s) => outln!(
+            "--- signature: {} by {} at {} ({})  spec_seq: {:?}",
+            s.kind,
+            s.actor,
+            s.at.to_rfc3339(),
+            s.source,
+            s.spec_seq
+        ),
+        None => outln!("--- signature: ещё не подписывалась"),
+    }
+    Ok(())
 }
 
 fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {

@@ -18,6 +18,7 @@ import type {
   QualityReportView,
   RoleExecution,
   SessionInfo,
+  SignatureView,
   StatusView,
   Task,
   UiError,
@@ -39,6 +40,15 @@ export const api = {
   taskGet: (id_prefix: string) => invoke<Task>("task_get", { id_prefix }),
   taskStatus: (id_prefix: string) =>
     invoke<StatusView>("task_status", { id_prefix }),
+  // Секция подписи спеки на гейте APPROVAL (REQ-SIGN-07): один read на всю
+  // карточку и две мутации — те же акты платформы, что `devai task
+  // approve/reject` (REQ-SIGN-05).
+  taskSignature: (id_prefix: string) =>
+    invoke<SignatureView>("task_signature", { id_prefix }),
+  taskApprove: (id_prefix: string, rationale: string | null) =>
+    invoke<SignatureView>("task_approve", { id_prefix, rationale }),
+  taskReject: (id_prefix: string, rationale: string | null) =>
+    invoke<SignatureView>("task_reject", { id_prefix, rationale }),
   taskProgress: (id_prefix: string) =>
     invoke<ProgressView>("task_progress", { id_prefix }),
   taskDependencies: (id_prefix: string) =>

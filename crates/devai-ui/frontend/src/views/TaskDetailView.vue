@@ -17,6 +17,10 @@ import { activateHome } from "../activation";
 import { foreignHome as foreignHomeOf } from "../homes-view";
 import { fmtElapsed, fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
+import SignatureSection from "../components/SignatureSection.vue";
+import SpecDiffPanel from "../components/SpecDiffPanel.vue";
+import SignatureResultPanel from "../components/SignatureResultPanel.vue";
+import { TaskStateToken } from "../states";
 import {
   freshnessBanner,
   hasEvidence,
@@ -36,6 +40,7 @@ import type {
   ProgressView,
   QualityReportView,
   RoleExecution,
+  SignatureView,
   StatusView,
   UiError,
   WorkflowEvent,
@@ -73,6 +78,11 @@ const wsError = ref<UiError | null>(null);
 const wsDiff = ref<WorkspaceDiffView | null>(null);
 const wsDiffFor = ref<string | null>(null);
 const wsDiffError = ref<UiError | null>(null);
+// Секция подписи (REQ-SIGN-01..07): один read `task.signature` на карточку.
+const signature = ref<SignatureView | null>(null);
+const signatureError = ref<UiError | null>(null);
+const signatureBusy = ref(false);
+const showDiff = ref(false);
 
 async function loadAll() {
   error.value = null;
@@ -108,8 +118,41 @@ async function loadAll() {
     await loadEvents();
     await loadReport();
     await loadWorkspace();
+    await loadSignature();
   } catch (e) {
     error.value = toUiError(e);
+  }
+}
+
+// Один read на всю секцию подписи (REQ-SIGN-07): права, спека, ревьювер,
+// дифф и самый новый факт подписи. UI ничего не собирает сам.
+async function loadSignature() {
+  signatureError.value = null;
+  try {
+    signature.value = await api.taskSignature(props.id);
+  } catch (e) {
+    signature.value = null;
+    signatureError.value = toUiError(e);
+  }
+}
+
+// Подпись/отклонение — те же акты платформы, что `devai task approve/reject`
+// (REQ-SIGN-05): окно только зовёт мутацию и перечитывает карточку.
+async function applySignature(kind: "approve" | "reject", rationale: string) {
+  if (signatureBusy.value) return;
+  signatureBusy.value = true;
+  signatureError.value = null;
+  try {
+    if (kind === "approve") {
+      await api.taskApprove(props.id, rationale);
+    } else {
+      await api.taskReject(props.id, rationale);
+    }
+    await loadAll();
+  } catch (e) {
+    signatureError.value = toUiError(e);
+  } finally {
+    signatureBusy.value = false;
   }
 }
 
@@ -264,6 +307,28 @@ async function activateForeignHome() {
       style="margin: 0 0 10px"
     >заголовок создавшего: {{ status.task.title }}</p>
     <p class="muted" style="white-space: pre-wrap">{{ status.task.business_description }}</p>
+
+    <!-- ЭКРАН ПОДПИСИ (REQ-SIGN-01): первым содержательным блоком на
+         APPROVAL — до формальной структуры панелей. Вне APPROVAL секции и
+         её пустой рамки нет. Данные — одним task.signature. -->
+    <div v-if="signatureError" class="errorbox">
+      <span class="code">{{ signatureError.code }}</span>{{ signatureError.message }}
+    </div>
+    <SignatureSection
+      v-if="status.task.state === TaskStateToken.Approval && signature"
+      :signature="signature"
+      :busy="signatureBusy"
+      @apply="applySignature"
+      @open-diff="showDiff = true"
+    />
+    <SignatureResultPanel
+      v-if="signature && signature.signature"
+      :fact="signature.signature"
+    />
+    <SpecDiffPanel
+      v-if="showDiff && signature && signature.previous"
+      :previous="signature.previous"
+    />
 
     <!-- Пайплайн: порядок отдаёт платформа (PipelineView), UI не хранит свой -->
     <div v-if="progress" class="panel">
@@ -442,7 +507,13 @@ async function activateForeignHome() {
     <div class="panel">
       <h3>Отчёт качества (task.report)</h3>
       <div class="body">
-        <div v-if="reportError" class="errorbox" style="margin-bottom: 0">
+        <!-- Отсутствие данных — честная пустота (REQ-SIGN-08): типизированный
+             not_found от task.report значит «QA ещё не прогонялся», а не
+             красную ошибку с кодом платформы. Прочие коды — остаются ошибкой. -->
+        <p v-if="reportError && reportError.code === 'not_found'" class="muted" style="margin: 0">
+          QA ещё не прогонялся — отчёта качества по задаче нет.
+        </p>
+        <div v-else-if="reportError" class="errorbox" style="margin-bottom: 0">
           <span class="code">{{ reportError.code }}</span>{{ reportError.message }}
         </div>
         <template v-else-if="report">
@@ -558,6 +629,14 @@ async function activateForeignHome() {
             <summary class="muted">rationale</summary>
             <pre class="content">{{ d.rationale }}</pre>
           </details>
+          <!-- Строка подписи без rationale — валидный факт «без обоснования»
+               (REQ-SIGN-06 AC6): видимый маркер вместо спрятанного <details>.
+               Остальные виды решений рендерятся как раньше. -->
+          <p
+            v-else-if="d.kind === 'requirements_approval' || d.kind === 'requirements_rejection'"
+            class="muted"
+            style="margin: 2px 0 0"
+          >без обоснования</p>
         </div>
         <p v-if="!decisions.length" class="muted" style="margin: 0">Решений пока нет.</p>
       </div>

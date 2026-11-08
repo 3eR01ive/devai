@@ -5,16 +5,19 @@
 //! passed through exactly as `devai-api` produced them
 //! (store-is-cache / no read-time rederivation).
 //!
-//! The UI is read-only for DOMAIN data in this iteration (OQ-UI-6
-//! ratified, read as clarified by the homes cycle: "read-only" means no
-//! task/gate mutations — those live in the CLI). The homes REGISTRY plane
+//! The UI is read-only for DOMAIN data except the TWO signature mutations
+//! (REQ-SIGN-05): `task_approve` / `task_reject` are the operator's signature
+//! acts and call the SAME `Api` methods as the CLI — one mutation, one
+//! event/decision, no separate window path. Every other gate action stays in
+//! the CLI (OQ-UI-6 narrowed exactly to these two). The homes REGISTRY plane
 //! is a separate, allowed class of platform operations (REQ-HOME-06):
 //! `home.add`, `home.set_enabled`, `home.activate` write ONLY the
 //! registry file of the control home and never touch any home's domain
 //! rows. The mapping tables pin the split: `COMMAND_OPERATIONS` maps the
-//! data commands to published Read operations, `COMMAND_REGISTRY_OPERATIONS`
-//! maps the management commands to the home-plane Registry operations —
-//! no Mutation-class operation is reachable from either.
+//! data commands to published Read operations plus the two signature
+//! mutations listed in `SIGNATURE_MUTATION_COMMANDS`, and
+//! `COMMAND_REGISTRY_OPERATIONS` maps the management commands to the
+//! home-plane Registry operations — no other Mutation is reachable.
 
 use serde::Serialize;
 use tauri::State;
@@ -23,6 +26,7 @@ use chrono::Utc;
 use devai_api::{ActiveSnapshot, DependenciesView, ProgressView, QualityReportView, StatusView};
 use devai_api::{Api, ApiError, HomeRecord, HomeRecordsView, OpDescriptor};
 use devai_api::{InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts};
+use devai_api::{SignatureView, SpecPresentation, spec_presentation};
 use devai_api::{WorkspaceChangesView, WorkspaceDiffView};
 use devai_core::inbox::{
     InboxWaitPolicy, WHEN_NO_QUESTION, WHEN_PARKED_QUESTION, WaitGroup, WaitStatePolicy,
@@ -120,39 +124,9 @@ pub struct WaitRow {
     pub report_note: Option<String>,
 }
 
-/// The spec body as the gate presents it: the human paragraph and the
-/// document's own open questions, kept apart from platform questions
-/// (REQ-GATE-05 — two different classes under different names).
-#[derive(Serialize, Clone, Debug)]
-pub struct SpecPresentation {
-    pub artifact: Artifact,
-    /// false when there is no CURRENT REQUIREMENTS_SPEC and this is the
-    /// LAST spec artifact shown with an honest label (ratified OQ-GATE-3:
-    /// not a silent hole, not a fake — the approve is impossible).
-    pub current: bool,
-    pub human_paragraph: Option<String>,
-    /// Which text stands in the paragraph slot (ratified OQ-GATE-4).
-    pub paragraph_source: ParagraphSource,
-    /// The REQUIREMENTS_SPEC `open_questions` array — questions of the
-    /// document, NOT registry questions; they have no question id and are
-    /// not answerable via question.answer (REQ-GATE-05 AC2).
-    pub open_questions: Vec<String>,
-    /// Why the paragraph could not come from the spec body (absent field,
-    /// binary artifact, unparsable JSON) — the honest fact, if any.
-    pub unavailable_note: Option<String>,
-}
-
-/// Origin of the paragraph text shown for an APPROVAL row.
-#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum ParagraphSource {
-    /// The spec's own top-level `human_paragraph` (contract @3).
-    Spec,
-    /// Ratified OQ-GATE-4: the spec predates the paragraph protocol (or
-    /// its body is unreadable) — the stored task business description
-    /// stands in, labelled as such. The presentation is never empty.
-    BusinessDescription,
-}
+// The spec/review parse rules are DEVAI-API's (REQ-SIGN-12): the window
+// imports the projections, it never re-declares them. `SpecPresentation`
+// keeps the wait-row shape it always published.
 
 /// One informational row of the reference group (ratified OQ-GATE-1):
 /// an unanswered NON-BLOCKING question — a note on an active task
@@ -300,131 +274,8 @@ fn substitute(template: &str, id: &str, parked: Option<&Question>) -> String {
     }
 }
 
-/// Parse the spec artifact body into the gate presentation. The JSON of
-/// REQUIREMENTS_SPEC is read, never rewritten (REQ-GATE-04 AC1: parsing
-/// on the presentation side does not change data); the array shapes are
-/// the seeded contract's (config seed: `open_questions` is an array of
-/// strings). Ratified OQ-GATE-4: absent paragraph → the stored task
-/// business description with an honest source + note.
-pub fn spec_presentation(
-    artifact: &Artifact,
-    body: Result<&str, &str>,
-    task: &Task,
-    current: bool,
-) -> SpecPresentation {
-    match body {
-        Ok(text) => document_presentation(artifact, task, current, text),
-        Err(reason) => fallback_presentation(
-            artifact,
-            task,
-            current,
-            Vec::new(),
-            format!("{reason}; показываю бизнес-описание задачи"),
-        ),
-    }
-}
-
-/// The readable-body path: the document's own paragraph when it has one,
-/// else the ratified pre-protocol fallback. The document's `open_questions`
-/// survive either way (they are the document's, not the platform's).
-fn document_presentation(
-    artifact: &Artifact,
-    task: &Task,
-    current: bool,
-    text: &str,
-) -> SpecPresentation {
-    let value = match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(value) => value,
-        Err(_) => {
-            return fallback_presentation(
-                artifact,
-                task,
-                current,
-                Vec::new(),
-                "тело артефакта специки не разбирается как JSON; показываю бизнес-описание задачи"
-                    .to_string(),
-            );
-        }
-    };
-    let open_questions = spec_open_questions(&value);
-    match spec_paragraph(&value) {
-        Some(paragraph) => SpecPresentation {
-            artifact: artifact.clone(),
-            current,
-            human_paragraph: Some(paragraph),
-            paragraph_source: ParagraphSource::Spec,
-            open_questions,
-            unavailable_note: None,
-        },
-        // Ratified OQ-GATE-4, verbatim wording of the decision.
-        None => fallback_presentation(
-            artifact,
-            task,
-            current,
-            open_questions,
-            "аналитик абзац не писал — спека до протокола; подставляю бизнес-описание задачи"
-                .to_string(),
-        ),
-    }
-}
-
-/// The ONE constructor of the fail-closed shape (ratified OQ-GATE-4: the
-/// presentation is never empty). The three fail-closed branches — body
-/// unreadable, JSON unparsable, spec predating the paragraph protocol —
-/// differ only in `note`, never in the shape, so the wording cannot drift
-/// as a copy.
-fn fallback_presentation(
-    artifact: &Artifact,
-    task: &Task,
-    current: bool,
-    open_questions: Vec<String>,
-    note: String,
-) -> SpecPresentation {
-    SpecPresentation {
-        artifact: artifact.clone(),
-        current,
-        human_paragraph: non_empty(task.business_description.as_str()).map(str::to_string),
-        paragraph_source: ParagraphSource::BusinessDescription,
-        open_questions,
-        unavailable_note: Some(note),
-    }
-}
-
-/// The document's own top-level `human_paragraph`, trimmed; `None` when
-/// the key is absent, empty or not a string.
-fn spec_paragraph(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("human_paragraph")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-/// The REQUIREMENTS_SPEC `open_questions` array verbatim (strings as-is,
-/// other JSON shapes stringified): questions of the document, never
-/// registry questions (REQ-GATE-05 AC2).
-fn spec_open_questions(value: &serde_json::Value) -> Vec<String> {
-    value
-        .get("open_questions")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| match item {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn non_empty(s: &str) -> Option<&str> {
-    let t = s.trim();
-    if t.is_empty() { None } else { Some(t) }
-}
-
+/// The spec parse lives in `devai_api::signature` (REQ-SIGN-12) — one
+/// module, one rule set, shared by the wait row and the signature card.
 /// Shape-contract ledger of the command plane (ux/contract-stability).
 /// `COMMAND_OPERATIONS` pins WHICH published read backs each command; this
 /// const pins the IPC SHAPE each command publishes, so a breaking revision
@@ -441,11 +292,30 @@ pub struct CommandContract {
 }
 
 #[allow(dead_code)] // consumed by the shape-contract test, not at runtime
-pub const COMMAND_CONTRACTS: &[CommandContract] = &[CommandContract {
-    command: "inbox_view",
-    version: 2,
-    breaking: "v2 (2026-11-06): inbox_view заменил InboxEntry[] на WaitSnapshot (REQ-GATE-01..10) — прежней формы больше нет; frontend/src/types.ts зеркалит v2.",
-}];
+pub const COMMAND_CONTRACTS: &[CommandContract] = &[
+    CommandContract {
+        command: "inbox_view",
+        version: 2,
+        breaking: "v2 (2026-11-06): inbox_view заменил InboxEntry[] на WaitSnapshot (REQ-GATE-01..10) — прежней формы больше нет; frontend/src/types.ts зеркалит v2.",
+    },
+    // The signature card's surface ships at its first recorded shape: no
+    // breaking revision yet, so v1 with an empty note.
+    CommandContract {
+        command: "task_signature",
+        version: 1,
+        breaking: "",
+    },
+    CommandContract {
+        command: "task_approve",
+        version: 1,
+        breaking: "",
+    },
+    CommandContract {
+        command: "task_reject",
+        version: 1,
+        breaking: "",
+    },
+];
 
 /// The (command → registry operation) mapping. Every data command is
 /// backed by a published Read operation; `session_info` is bootstrap state
@@ -467,6 +337,13 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("tasks_list", "task.list"),
     ("task_get", "task.get"),
     ("task_status", "task.status"),
+    // The signable surface of the APPROVAL card: ONE read for the whole
+    // section (REQ-SIGN-07), registered beside task.status.
+    ("task_signature", "task.signature"),
+    // The two signature mutations (REQ-SIGN-05 AC4): the SAME platform acts
+    // as `devai task approve/reject` — the window invents no path of its own.
+    ("task_approve", "task.approve"),
+    ("task_reject", "task.reject"),
     ("task_progress", "task.progress"),
     ("task_dependencies", "task.dependencies"),
     ("task_report", "task.report"),
@@ -490,6 +367,17 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("homes_list", "home.list"),
     ("projects_all", "home.projects_all"),
     ("tasks_all", "home.tasks_all"),
+];
+
+/// The ONE allowlist of signature MUTATIONS reachable from the window
+/// (REQ-SIGN-05 AC4): exactly two pairs, no Read row, no third pair. The
+/// data plane stays read-only; these two are the only exception (the
+/// operator signs in the window) and they call the same API methods the CLI
+/// calls.
+#[allow(dead_code)] // consumed by the plane tests below
+pub const SIGNATURE_MUTATION_COMMANDS: &[(&str, &str)] = &[
+    ("task_approve", "task.approve"),
+    ("task_reject", "task.reject"),
 ];
 
 /// The registry MANAGEMENT mapping (REQ-HOME-05: reading domain records
@@ -778,6 +666,44 @@ pub fn task_get(state: State<AppState>, id_prefix: String) -> Result<Task, UiErr
 #[tauri::command(rename_all = "snake_case")]
 pub fn task_status(state: State<AppState>, id_prefix: String) -> Result<StatusView, UiError> {
     Ok(state.api().task_status(&id_prefix)?)
+}
+
+/// `task.signature` — the one read the APPROVAL signature section renders
+/// (REQ-SIGN-07): spec, requirements, document questions, reviewer block,
+/// previous-version diff, the two rights and the newest signature fact.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_signature(state: State<AppState>, id_prefix: String) -> Result<SignatureView, UiError> {
+    Ok(state.api().task_signature(&id_prefix)?)
+}
+
+/// `task.approve` — the SAME platform act as `devai task approve`
+/// (REQ-SIGN-05): the API writes the decision row; the window only calls it
+/// and never writes the store itself. Author is the session actor the API
+/// handle was opened with (`session.rs`).
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_approve(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+) -> Result<SignatureView, UiError> {
+    let api = state.api();
+    api.task_approve(&id_prefix, rationale)?;
+    // The card is re-read from the store through the SAME read the section
+    // renders — no local state is patched up (REQ-SIGN-04 AC6).
+    Ok(api.task_signature(&id_prefix)?)
+}
+
+/// `task.reject` — same act as `devai task reject`: one event and one
+/// `requirements_rejection` decision row with the operator's rationale.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_reject(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+) -> Result<SignatureView, UiError> {
+    let api = state.api();
+    api.task_reject(&id_prefix, rationale)?;
+    Ok(api.task_signature(&id_prefix)?)
 }
 
 /// PipelineView{order,current,position,position_index,off_spine,terminal}
@@ -1099,25 +1025,58 @@ fn spec_of(task: &Task, facts: &SpecFacts) -> SpecPresentation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use devai_api::ParagraphSource;
     use devai_core::types::ArtifactKind;
 
-    /// REQ-UI-02 AC2: every data command's source is a published registry
-    /// entry of class Read. If a command starts calling something the
-    /// registry does not publish (or any Mutation), this test fails.
+    /// REQ-SIGN-05 AC4 (was REQ-UI-02 AC2): every data command's source is a
+    /// published registry entry. The data plane stays Read-only; the ONLY
+    /// Mutation-class commands reachable from the window are the two
+    /// signature acts in `SIGNATURE_MUTATION_COMMANDS` — (a) every pair
+    /// resolves to a published operation, (b) Read outside the allowlist and
+    /// Mutation inside it, (c) the set of Mutation commands equals the
+    /// allowlist exactly.
     #[test]
-    fn every_command_operation_is_a_registered_read() {
+    fn every_command_operation_is_a_registered_operation() {
         let ops = devai_api::operations();
         let by_name: std::collections::HashMap<&str, &OpDescriptor> =
             ops.iter().map(|o| (o.name, o)).collect();
         assert!(!COMMAND_OPERATIONS.is_empty());
+        let in_allowlist = |cmd: &str| {
+            SIGNATURE_MUTATION_COMMANDS
+                .iter()
+                .any(|(c, _)| *c == cmd)
+        };
         for (cmd, op) in COMMAND_OPERATIONS {
             let d = by_name
                 .get(op)
                 .unwrap_or_else(|| panic!("`{cmd}` calls `{op}`: not a published operation"));
-            assert_eq!(
-                d.class,
-                devai_api::OpClass::Read,
-                "`{cmd}` calls `{op}` — a non-Read operation is forbidden in the data plane (OQ-UI-6)"
+            if in_allowlist(cmd) {
+                assert_eq!(
+                    d.class,
+                    devai_api::OpClass::Mutation,
+                    "`{cmd}` is a listed signature mutation but `{op}` is not a Mutation"
+                );
+            } else {
+                assert_eq!(
+                    d.class,
+                    devai_api::OpClass::Read,
+                    "`{cmd}` calls `{op}` — a non-Read operation is forbidden in the data plane (OQ-UI-6)"
+                );
+            }
+        }
+        // The allowlist is exactly the mutation commands of the table — no
+        // third pair, no Read row smuggled into it, no mutation outside it.
+        let mutation_cmds: Vec<&str> = COMMAND_OPERATIONS
+            .iter()
+            .filter(|(_, op)| by_name.get(op).is_some_and(|d| d.class == devai_api::OpClass::Mutation))
+            .map(|(cmd, _)| *cmd)
+            .collect();
+        let allow: Vec<&str> = SIGNATURE_MUTATION_COMMANDS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(mutation_cmds, allow, "the signature allowlist is exactly two commands");
+        for (cmd, op) in SIGNATURE_MUTATION_COMMANDS {
+            assert!(
+                by_name.get(op).is_some_and(|d| d.class == devai_api::OpClass::Mutation),
+                "`{cmd}` must name a Mutation operation, got `{op}`"
             );
         }
     }
@@ -1502,7 +1461,7 @@ mod tests {
     /// so the workspace panel (and anything after it) cannot drift into
     /// git knowledge or disk-path invention.
     #[test]
-    fn frontend_invokes_are_exactly_mapped_reads() {
+    fn frontend_invokes_are_exactly_mapped_operations() {
         let crate_dir = env!("CARGO_MANIFEST_DIR");
         let api_ts = std::fs::read_to_string(format!("{crate_dir}/frontend/src/api.ts")).unwrap();
         let main_rs = std::fs::read_to_string(format!("{crate_dir}/src/main.rs")).unwrap();
@@ -1546,6 +1505,34 @@ mod tests {
                 "`{name}` is not registered in the invoke_handler of main.rs"
             );
         }
+        // REQ-SIGN-05 AC4: the frontend's Mutation commands are EXACTLY the
+        // two signature acts, and task_signature is a Read.
+        let ops = devai_api::operations();
+        let class_of = |name: &str| {
+            COMMAND_OPERATIONS
+                .iter()
+                .find(|(c, _)| *c == name)
+                .and_then(|(_, op)| ops.iter().find(|o| o.name == *op))
+                .map(|d| d.class)
+        };
+        assert_eq!(
+            class_of("task_signature"),
+            Some(devai_api::OpClass::Read),
+            "task_signature must back the signature card as a Read"
+        );
+        let mut mutations: Vec<&str> = COMMAND_OPERATIONS
+            .iter()
+            .filter(|(cmd, _)| {
+                matches!(class_of(cmd), Some(devai_api::OpClass::Mutation))
+            })
+            .map(|(cmd, _)| *cmd)
+            .collect();
+        mutations.sort_unstable();
+        assert_eq!(
+            mutations,
+            vec!["task_approve", "task_reject"],
+            "the window's only mutations are the two signature acts"
+        );
     }
 
     /// REQ-GATE-02 AC2 + ratified OQ-GATE-2, data-driven (R1): membership is
@@ -1764,6 +1751,130 @@ mod tests {
         }
     }
 
+    /// REQ-SIGN-12 AC1/AC4: the spec parse has ONE home — `devai-api`. The
+    /// window neither declares the types nor parses the body; a second
+    /// definition in devai-ui fails here (grep test, not a convention).
+    #[test]
+    fn the_spec_parse_has_one_home_in_devai_api() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let ui = std::fs::read_to_string(format!("{crate_dir}/src/commands.rs")).unwrap();
+        // Production half only: this very test names the forbidden symbols.
+        let production = ui.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            "struct SpecPresentation",
+            "enum ParagraphSource",
+            "fn spec_presentation",
+            "fn document_presentation",
+            "fn fallback_presentation",
+            "fn spec_paragraph",
+            "fn spec_open_questions",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "devai-ui declares `{forbidden}` — the parse lives in devai-api (REQ-SIGN-12)"
+            );
+        }
+        // The one module that DOES own the rule set.
+        let api = std::fs::read_to_string(format!(
+            "{crate_dir}/../devai-api/src/signature.rs"
+        ))
+        .unwrap();
+        assert!(api.contains("pub fn parse_spec_body"));
+        assert!(api.contains("pub fn spec_presentation"));
+        assert!(api.contains("pub struct SpecPresentation"));
+        // No JSON parsing of the spec body in the window.
+        assert!(
+            !production.contains("serde_json::from_str"),
+            "devai-ui parses the spec JSON itself — the frontend never parses (REQ-SIGN-12 AC2)"
+        );
+    }
+
+    /// REQ-SIGN-02 AC4 / ASM-16: the section's words live in its OWN module;
+    /// the shared StateChip and the TaskState mirror stay untouched and are
+    /// not the section's source of words.
+    #[test]
+    fn signature_labels_are_the_sections_own_and_the_chip_is_untouched() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let section = std::fs::read_to_string(format!(
+            "{crate_dir}/frontend/src/components/SignatureSection.vue"
+        ))
+        .unwrap();
+        assert!(
+            section.contains("signature_labels"),
+            "the section must take its words from signature_labels.ts"
+        );
+        let chip = std::fs::read_to_string(format!(
+            "{crate_dir}/frontend/src/components/StateChip.vue"
+        ))
+        .unwrap();
+        assert!(
+            chip.contains("{{ token }}"),
+            "StateChip prints the stored token as-is (StateChip.vue:20)"
+        );
+        assert!(
+            !chip.contains("signature_labels"),
+            "StateChip must not become the section's dictionary (ASM-16)"
+        );
+        let states = std::fs::read_to_string(format!("{crate_dir}/frontend/src/states.ts")).unwrap();
+        assert!(
+            !states.contains("signature_labels"),
+            "states.ts is a TaskState mirror, not the section's word dictionary"
+        );
+        let labels = std::fs::read_to_string(format!(
+            "{crate_dir}/frontend/src/signature_labels.ts"
+        ))
+        .unwrap();
+        for token in [
+            "CURRENT",
+            "STALE",
+            "SUPERSEDED",
+            "spec_not_current",
+            "no_requirements_version",
+            "review_report",
+        ] {
+            assert!(
+                labels.contains(token),
+                "signature_labels.ts misses the closed token `{token}`"
+            );
+        }
+    }
+
+    /// REQ-SIGN-07: the signature answer's serialized fields exist in the
+    /// mirrored `types.ts` interface (snake_case mirror — serde carries no
+    /// rename_all), so a Rust-side rename fails here.
+    #[test]
+    fn signature_view_shape_parity_with_types_ts() {
+        let now = now_fixture();
+        let view = SignatureView {
+            task_id: "01a1b790-0000-4000-8000-000000000001".into(),
+            state: TaskState::Approval,
+            snapshot_at: now,
+            may_approve: false,
+            may_approve_denied: Some("no_spec".into()),
+            may_reject: true,
+            may_reject_denied: None,
+            spec: None,
+            review: None,
+            review_note: Some("отчёта ревьювера нет".into()),
+            previous: None,
+            previous_note: Some("прошлой версии нет".into()),
+            signature: None,
+        };
+        let value = serde_json::to_value(&view).unwrap();
+        let ts = std::fs::read_to_string(format!(
+            "{}/frontend/src/types.ts",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let block = ts_interface_block(&ts, "SignatureView");
+        for field in value.as_object().unwrap().keys() {
+            assert!(
+                block.contains(&format!("{field}:")),
+                "types.ts `SignatureView` has no field `{field}` the Rust view serializes"
+            );
+        }
+    }
+
     /// One row of the section with the given title — the minimal shape the
     /// grouping and badge tests need.
     fn wait_row_fixture(title: &str, now: chrono::DateTime<chrono::Utc>) -> WaitRow {
@@ -1975,16 +2086,26 @@ mod tests {
     #[test]
     fn breaking_command_contracts_are_versioned_and_mapped() {
         for contract in COMMAND_CONTRACTS {
-            assert!(
-                contract.version >= 2,
-                "{}: a recorded breaking revision starts at v2",
-                contract.command
-            );
-            assert!(
-                !contract.breaking.trim().is_empty(),
-                "{}: a breaking revision must say what changed",
-                contract.command
-            );
+            // v1 = the first recorded shape (no break yet, empty note);
+            // a BREAKING revision starts at v2 and must say what changed.
+            if contract.version >= 2 {
+                assert!(
+                    !contract.breaking.trim().is_empty(),
+                    "{}: a breaking revision must say what changed",
+                    contract.command
+                );
+            } else {
+                assert_eq!(
+                    contract.version, 1,
+                    "{}: versions start at 1",
+                    contract.command
+                );
+                assert!(
+                    contract.breaking.trim().is_empty(),
+                    "{}: a first shape carries no breaking note",
+                    contract.command
+                );
+            }
             assert!(
                 COMMAND_OPERATIONS
                     .iter()
