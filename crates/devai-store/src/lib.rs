@@ -43,7 +43,7 @@ pub fn project_label_from_path(root: &Path) -> Option<String> {
     None
 }
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -168,7 +168,10 @@ const RUNG_APPLIERS: &[(&str, RungApply)] = &[
     ("execution_form_columns", execution_form_columns),
     ("single_writer_repair", single_writer_repair),
     ("additive_human_name_column", additive_human_name_column),
-    ("additive_decision_payload_column", additive_decision_payload_column),
+    (
+        "additive_decision_payload_column",
+        additive_decision_payload_column,
+    ),
 ];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
@@ -1810,29 +1813,27 @@ impl Store {
             .collect())
     }
 
-    /// The same ratification index, WITH the ratifying actor: decision id ->
-    /// (refs, actor). REQ-QH-03/OQ-QH-2 need «чьим решением закреплено» on
-    /// the human form of a report, and the author of the decision is a store
-    /// fact — never something the presentation layer may invent.
+    /// The ONE read-side index of ratification rows: decision id -> typed
+    /// row (payload, actor, verdict, live). `config::ratification_index`
+    /// owns the revocation filter and the visible-on-corruption payload
+    /// decode; this method is the store-side door to it, so a consumer never
+    /// re-implements "which ratification is in force".
+    pub fn ratification_index(&self) -> StoreResult<BTreeMap<String, config::RatificationRow>> {
+        config::ratification_index(&self.profile_ratification_decisions()?)
+    }
+
+    /// The same index as decision id -> (refs, actor), LIVE rows only:
+    /// REQ-QH-03/OQ-QH-2 need «чьим решением закреплено» on the human form
+    /// of a report, and the author of the decision is a store fact — never
+    /// something the presentation layer may invent.
     pub fn ratified_profile_decisions(
         &self,
     ) -> StoreResult<BTreeMap<String, (Vec<String>, String)>> {
-        let rows = self.profile_ratification_decisions()?;
-        let revoked: BTreeSet<String> = rows
-            .iter()
-            .filter(|d| d.verdict != Verdict::Approved)
-            .filter_map(|d| {
-                d.payload
-                    .get("revokes")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .collect();
-        Ok(rows
+        Ok(self
+            .ratification_index()?
             .into_iter()
-            .filter(|d| d.verdict == Verdict::Approved)
-            .filter(|d| !revoked.contains(&d.id.to_string()))
-            .map(|d| (d.id.to_string(), (d.refs, d.actor)))
+            .filter(|(_, row)| row.live)
+            .map(|(id, row)| (id, (row.payload.items, row.actor)))
             .collect())
     }
 

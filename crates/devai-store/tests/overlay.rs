@@ -39,13 +39,7 @@ fn project(store: &Store, name: &str) -> Project {
 /// A human ratification row as the load cross-check sees it: kind
 /// profile_ratification, verdict APPROVED, the EDITION fingerprint of the
 /// rules content and the refs covering the item ids (task 01a1bacf, RV2).
-fn ratify(
-    store: &Store,
-    task: &Task,
-    project_id: &str,
-    edition: &str,
-    refs: &[&str],
-) -> Id {
+fn ratify(store: &Store, task: &Task, project_id: &str, edition: &str, refs: &[&str]) -> Id {
     let id = new_id();
     store
         .record_decision(&Decision {
@@ -230,14 +224,7 @@ items:
       section_title: Продуктовые инварианты
 "#
     );
-    write_ratified(
-        &store,
-        &t,
-        &cfg,
-        &pid,
-        &body,
-        &["dom/sovereignty"],
-    );
+    write_ratified(&store, &t, &cfg, &pid, &body, &["dom/sovereignty"]);
     let r = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
     let eff = r.profile.expect("effective profile");
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);

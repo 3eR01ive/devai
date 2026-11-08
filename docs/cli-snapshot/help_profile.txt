@@ -1,0 +1,15 @@
+Project RULES ratification (task 01a1bacf): a HUMAN act that gives a project's `profiles/<id>.overlay.yaml` edition force. The platform computes the edition fingerprint itself; no engine, role or agent path can create these decisions
+
+Usage: devai profile [OPTIONS] <COMMAND>
+
+Commands:
+  status  Current rules state: the edition fingerprint and every item's force (in force with the decision/actor, or OUT with the reason). Read-only
+  ratify  HUMAN-ONLY: ratify the CURRENT edition of a project's rules file, covering the named items. Records the `profile_ratification` decision (project, edition fingerprint, items, actor, rationale) and writes the pointers into the file
+  revoke  HUMAN-ONLY: revoke an APPROVED ratification (items leave force; the rules file is not touched)
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --home <HOME>    Data directory (default: $DEVAI_HOME or ~/.devai) [env: DEVAI_HOME=]
+      --actor <ACTOR>  Actor identity recorded in events/decisions (default: $DEVAI_USER or $USER) [env: DEVAI_USER=]
+      --json           Machine-readable JSON output where supported
+  -h, --help           Print help

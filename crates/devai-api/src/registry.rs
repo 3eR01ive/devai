@@ -395,14 +395,14 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Mutation,
             input: "ProfileRatifyReq{task, project, items, all, rationale}",
             output: "ProfileRatifyOutcome{task_id, decision, recorded_now, project_id, file, edition, items}",
-            description: "HUMAN-ONLY: records the `profile_ratification`/APPROVED decision covering the named items of the CURRENT rules edition (the fingerprint is computed platform-side, never typed), then writes the ratification pointers into the file. Rationale is mandatory; an unknown item refuses; the same edition + item set reuses the stored decision instead of writing a second one. No engine, role or agent path reaches this operation. Mirrors `profile ratify`.",
+            description: "HUMAN-ONLY: records the `profile_ratification`/APPROVED decision covering the named items of the CURRENT rules edition (the fingerprint is computed platform-side, never typed), then writes the ratification pointers into the file. Rationale is mandatory; an unknown item refuses; the same edition + item set reuses the stored decision instead of writing a second one. Enforced by the API against the CALLING SESSION (a role/engine run is refused typed `human_only`), not by the transport; no role tool grants it. Mirrors `profile ratify`.",
         },
         OpDescriptor {
             name: "profile.revoke",
             class: OpClass::Mutation,
             input: "ProfileRevokeReq{decision, rationale}",
             output: "ProfileRevokeOutcome{decision, revoked, project_id, file, edition, items}",
-            description: "HUMAN-ONLY: takes an APPROVED profile_ratification out of force with a separate decision row citing it. The rules file is not rewritten or deleted; a second revocation of the same row refuses. Mirrors `profile revoke`.",
+            description: "HUMAN-ONLY: takes an APPROVED profile_ratification out of force with a separate decision row citing it. The rules file is not rewritten or deleted; a second revocation of the same row refuses. Same session gate as `profile.ratify` (a role/engine run is refused typed `human_only`). Mirrors `profile revoke`.",
         },
         // ---- artifacts ----
         OpDescriptor {
@@ -796,6 +796,13 @@ mod tests {
             assert!(
                 op.description.starts_with("HUMAN-ONLY"),
                 "{name}: a human-only act must say so in the registry"
+            );
+            // RV4 AC2: the registry names the SESSION gate too — a second
+            // consumer reads here that a role run is refused by the API, not
+            // told off by the transport.
+            assert!(
+                op.description.contains("human_only"),
+                "{name}: the published constraint must name the typed refusal"
             );
         }
         let state = ops

@@ -15,8 +15,8 @@
 
 use std::fs;
 
-use devai_api::{Api, ProfileRatifyReq, ProfileRevokeReq, TaskCreateReq};
-use devai_core::types::{decision_kind, event_kind, Project};
+use devai_api::{Api, ProfileRatifyReq, ProfileRevokeReq, SessionKind, TaskCreateReq};
+use devai_core::types::{Project, decision_kind, event_kind, json_field};
 use devai_store::config;
 use tempfile::TempDir;
 
@@ -163,7 +163,12 @@ fn fresh_rules_file_loads_with_every_item_announced() {
     assert!(r.warnings.iter().all(|w| w.contains("NOT in force")));
 
     // No decision was written by looking: the view is read-only (RV9).
-    assert!(h.api.task_decisions(&h.task.to_string()).unwrap().is_empty());
+    assert!(
+        h.api
+            .task_decisions(&h.task.to_string())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// RV1/RV5: one human call records ONE decision with the computed edition,
@@ -207,7 +212,10 @@ fn human_ratification_records_the_act_and_gives_the_items_force() {
     // `task decisions` shows it with actor/rationale/refs + payload.
     let decisions = h.api.task_decisions(&h.task.to_string()).unwrap();
     assert_eq!(decisions.len(), 1);
-    assert_eq!(decisions[0].payload["items"], serde_json::json!(["dom/one"]));
+    assert_eq!(
+        decisions[0].payload["items"],
+        serde_json::json!(["dom/one"])
+    );
     // RV5: ratifying rules is NOT approving the spec.
     assert!(
         decisions
@@ -258,7 +266,12 @@ fn missing_rationale_and_unknown_items_refuse() {
         .unwrap_err();
     let text = format!("{err}");
     assert!(text.contains("dom/future"), "{text}");
-    assert!(h.api.task_decisions(&h.task.to_string()).unwrap().is_empty());
+    assert!(
+        h.api
+            .task_decisions(&h.task.to_string())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// RV2: editing the rules CONTENT after ratification takes force away and
@@ -286,7 +299,10 @@ fn editing_the_rules_invalidates_force_until_a_new_ratification() {
     let s = h.api.profile_state(&h.project.id.to_string()).unwrap();
     let one = s.items.iter().find(|i| i.target_id == "dom/one").unwrap();
     assert!(!one.in_force);
-    assert_eq!(one.reason.as_deref(), Some("редакция изменена после ратификации"));
+    assert_eq!(
+        one.reason.as_deref(),
+        Some("редакция изменена после ратификации")
+    );
     let r = effective(&h);
     assert!(
         r.warnings
@@ -295,7 +311,13 @@ fn editing_the_rules_invalidates_force_until_a_new_ratification() {
         "{:?}",
         r.warnings
     );
-    assert!(!r.profile.unwrap().checks().iter().any(|c| c.id == "dom/one"));
+    assert!(
+        !r.profile
+            .unwrap()
+            .checks()
+            .iter()
+            .any(|c| c.id == "dom/one")
+    );
 
     // Restore the EXACT ratified content: force is back, no new decision.
     fs::write(&h.rules, &before).unwrap();
@@ -326,7 +348,10 @@ fn pointer_only_edits_do_not_change_the_edition() {
     let edited = without_pointer.replace(&out.decision.id.to_string(), "PENDING");
     fs::write(&h.rules, &edited).unwrap();
     let s = h.api.profile_state(&h.project.id.to_string()).unwrap();
-    assert_eq!(s.edition, out.edition, "the edition must not follow a pointer");
+    assert_eq!(
+        s.edition, out.edition,
+        "the edition must not follow a pointer"
+    );
     // The pointer itself is now unconfirmed, so the item is out of force.
     let one = s.items.iter().find(|i| i.target_id == "dom/one").unwrap();
     assert!(!one.in_force);
@@ -347,13 +372,22 @@ fn a_half_applied_act_converges_on_retry() {
     )
     .unwrap();
     let s = h.api.profile_state(&h.project.id.to_string()).unwrap();
-    assert!(!s.items[0].in_force, "the decision alone gives no force (RV3)");
+    assert!(
+        !s.items[0].in_force,
+        "the decision alone gives no force (RV3)"
+    );
 
     let retry = ratify(&h, &["dom/one"]);
     assert!(!retry.recorded_now);
     assert_eq!(retry.decision.id, out.decision.id);
     let s = h.api.profile_state(&h.project.id.to_string()).unwrap();
-    assert!(s.items.iter().find(|i| i.target_id == "dom/one").unwrap().in_force);
+    assert!(
+        s.items
+            .iter()
+            .find(|i| i.target_id == "dom/one")
+            .unwrap()
+            .in_force
+    );
     assert_eq!(
         h.api.task_decisions(&h.task.to_string()).unwrap().len(),
         1,
@@ -379,7 +413,10 @@ fn revocation_takes_force_away_without_touching_the_file() {
         .expect("revocation");
     assert_eq!(rev.decision.verdict.as_str(), "REJECTED");
     assert_eq!(rev.decision.refs, vec![out.decision.id.to_string()]);
-    assert_eq!(rev.decision.payload["revokes"], serde_json::json!(out.decision.id.to_string()));
+    assert_eq!(
+        rev.decision.payload["revokes"],
+        serde_json::json!(out.decision.id.to_string())
+    );
     assert_eq!(
         fs::read(&h.rules).unwrap(),
         bytes_before,
@@ -412,12 +449,14 @@ fn revocation_takes_force_away_without_touching_the_file() {
     let again = ratify(&h, &["dom/one"]);
     assert!(again.recorded_now);
     assert_ne!(again.decision.id, out.decision.id);
-    assert!(effective(&h)
-        .profile
-        .unwrap()
-        .checks()
-        .iter()
-        .any(|c| c.id == "dom/one"));
+    assert!(
+        effective(&h)
+            .profile
+            .unwrap()
+            .checks()
+            .iter()
+            .any(|c| c.id == "dom/one")
+    );
 }
 
 /// RV7: same item ids in two projects — a ratification of A never gives
@@ -443,10 +482,19 @@ fn ratification_is_bound_to_one_project() {
     assert_eq!(out.project_id, h.project.id.to_string());
 
     let sa = h.api.profile_state(&h.project.id.to_string()).unwrap();
-    assert!(sa.items.iter().find(|i| i.target_id == "dom/one").unwrap().in_force);
+    assert!(
+        sa.items
+            .iter()
+            .find(|i| i.target_id == "dom/one")
+            .unwrap()
+            .in_force
+    );
     let sb = h.api.profile_state(&other.id.to_string()).unwrap();
     let one_b = sb.items.iter().find(|i| i.target_id == "dom/one").unwrap();
-    assert!(!one_b.in_force, "project B must not borrow A's ratification");
+    assert!(
+        !one_b.in_force,
+        "project B must not borrow A's ratification"
+    );
 
     let err = h
         .api
@@ -476,9 +524,270 @@ fn all_items_form_stores_the_explicit_list() {
             rationale: Some("вся редакция".into()),
         })
         .unwrap();
-    assert_eq!(out.items, vec!["dom/one".to_string(), "dom/two".to_string()]);
-    assert_eq!(out.decision.payload["items"], serde_json::json!(["dom/one", "dom/two"]));
+    assert_eq!(
+        out.items,
+        vec!["dom/one".to_string(), "dom/two".to_string()]
+    );
+    assert_eq!(
+        out.decision.payload["items"],
+        serde_json::json!(["dom/one", "dom/two"])
+    );
     let eff = effective(&h).profile.unwrap();
     assert!(eff.checks().iter().any(|c| c.id == "dom/one"));
     assert!(eff.checks().iter().any(|c| c.id == "dom/two"));
+}
+
+/// RV4 AC2: both acts are HUMAN-ONLY. A role/engine session — the door
+/// declares it from the platform-exported run marker — is refused by the API
+/// itself with a typed code and NO store effect; the operator's own session
+/// performs the very same call. A role may still READ the rules state.
+#[test]
+fn a_role_session_cannot_ratify_or_revoke() {
+    let h = home();
+    let role = Api::open_session(h.dir.path(), "role:implementation-agent", SessionKind::Role)
+        .expect("open a role session");
+    let attempt = ProfileRatifyReq {
+        task: h.task.to_string(),
+        project: h.project.id.to_string(),
+        items: vec!["dom/one".into()],
+        all: false,
+        rationale: Some("агент решил ратифицировать правила сам".into()),
+    };
+    let err = role.profile_ratify(attempt.clone()).unwrap_err();
+    assert_eq!(err.code(), devai_api::ErrorCode("human_only"), "{err}");
+    assert!(format!("{err}").contains("HUMAN-ONLY"), "{err}");
+    // Nothing landed: no decision, no event, the item is still out of force.
+    assert!(role.task_decisions(&h.task.to_string()).unwrap().is_empty());
+    assert!(
+        role.task_events(&h.task.to_string(), None)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != event_kind::PROFILE_RATIFIED)
+    );
+    assert!(
+        !role
+            .profile_state(&h.project.id.to_string())
+            .unwrap()
+            .items
+            .iter()
+            .any(|i| i.in_force)
+    );
+
+    // The operator's session performs the same act successfully.
+    let out = h.api.profile_ratify(attempt).expect("human ratification");
+    assert!(out.recorded_now);
+
+    // The revocation door is gated the same way.
+    let err = role
+        .profile_revoke(ProfileRevokeReq {
+            decision: out.decision.id.to_string(),
+            rationale: Some("агент решил отозвать".into()),
+        })
+        .unwrap_err();
+    assert_eq!(err.code(), devai_api::ErrorCode("human_only"), "{err}");
+    assert_eq!(
+        h.api.task_decisions(&h.task.to_string()).unwrap().len(),
+        1,
+        "a refused revocation writes no decision"
+    );
+}
+
+/// RV1 AC5: a project that has no rules file refuses BY NAME — nothing is
+/// ratified for a file that does not exist, and the carrier task stays clean.
+#[test]
+fn a_project_without_a_rules_file_refuses_by_name() {
+    let h = home();
+    let bare = h
+        .api
+        .project_add(devai_api::ProjectAddReq {
+            name: "bare".into(),
+            description: String::new(),
+            repos: vec![],
+        })
+        .unwrap();
+    let err = h
+        .api
+        .profile_ratify(ProfileRatifyReq {
+            task: h.task.to_string(),
+            project: bare.id.to_string(),
+            items: vec!["dom/one".into()],
+            all: false,
+            rationale: Some("правил нет, но попробуем".into()),
+        })
+        .unwrap_err();
+    let text = format!("{err}");
+    assert!(text.contains("no rules file"), "{text}");
+    assert!(
+        text.contains("bare"),
+        "the refusal names the project: {text}"
+    );
+    assert!(
+        h.api
+            .task_decisions(&h.task.to_string())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// RV3 AC1: the pointer half can FAIL. A failed act gives the items no force,
+/// refuses naming the file AND the edition, leaves the rules file byte-
+/// identical, and converges on a repeat WITHOUT a second decision.
+///
+/// The failure is injected at the temp file the atomic write needs (a
+/// directory occupies exactly that name): the target file is never truncated,
+/// so the edition the decision bound survives the failed act. The injection
+/// can only work while the write goes through a sibling temp file — if that
+/// mechanism is removed, this test fails loudly at the injection assert.
+#[test]
+fn a_failed_pointer_write_keeps_items_out_of_force_and_converges() {
+    let h = home();
+    let before = fs::read(&h.rules).unwrap();
+    let tmp = h.rules.with_file_name(format!(
+        ".{}.{}.tmp",
+        h.rules.file_name().unwrap().to_string_lossy(),
+        std::process::id()
+    ));
+    fs::create_dir(&tmp).expect("inject the failure at the atomic write's temp path");
+
+    let err = h
+        .api
+        .profile_ratify(ProfileRatifyReq {
+            task: h.task.to_string(),
+            project: h.project.id.to_string(),
+            items: vec!["dom/one".into()],
+            all: false,
+            rationale: Some("правила проекта принимаются".into()),
+        })
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        devai_api::ErrorCode("profile_rules_unwritable"),
+        "{err}"
+    );
+    let text = format!("{err}");
+    assert!(
+        text.contains("edition"),
+        "the refusal names the edition: {text}"
+    );
+    assert!(
+        text.contains(&h.rules.display().to_string()),
+        "the refusal names the file: {text}"
+    );
+
+    assert_eq!(
+        fs::read(&h.rules).unwrap(),
+        before,
+        "a failed pointer half must not leave a damaged rules file"
+    );
+    let s = h.api.profile_state(&h.project.id.to_string()).unwrap();
+    assert!(!s.items[0].in_force, "the decision alone gives no force");
+    assert_eq!(
+        h.api.task_decisions(&h.task.to_string()).unwrap().len(),
+        1,
+        "the decision half landed once"
+    );
+
+    fs::remove_dir(&tmp).expect("clear the injected failure");
+    let retry = ratify(&h, &["dom/one"]);
+    assert!(
+        !retry.recorded_now,
+        "the retry must reuse the stored decision"
+    );
+    assert_eq!(
+        h.api.task_decisions(&h.task.to_string()).unwrap().len(),
+        1,
+        "finishing the act must not mint a second decision"
+    );
+    let s = h.api.profile_state(&h.project.id.to_string()).unwrap();
+    assert!(
+        s.items[0].in_force,
+        "the finished act puts the item in force"
+    );
+}
+
+/// RV5 AC2: BOTH acts are append-only history — the ratification event and
+/// the revocation event each cite their own decision, and the revocation also
+/// names the act it took out of force.
+#[test]
+fn both_acts_land_in_the_task_history() {
+    let h = home();
+    let out = ratify(&h, &["dom/one"]);
+    let rev = h
+        .api
+        .profile_revoke(ProfileRevokeReq {
+            decision: out.decision.id.to_string(),
+            rationale: Some("правило отозвано оператором".into()),
+        })
+        .expect("revocation");
+    let events = h.api.task_events(&h.task.to_string(), None).unwrap();
+    let ratified = events
+        .iter()
+        .find(|e| e.kind == event_kind::PROFILE_RATIFIED)
+        .unwrap_or_else(|| panic!("the ratification event is stored: {events:?}"));
+    assert_eq!(
+        ratified.payload[json_field::DECISION],
+        serde_json::json!(out.decision.id.to_string())
+    );
+    let revoked = events
+        .iter()
+        .find(|e| e.kind == event_kind::PROFILE_REVOKED)
+        .unwrap_or_else(|| panic!("the revocation event is stored: {events:?}"));
+    assert_eq!(
+        revoked.payload[json_field::DECISION],
+        serde_json::json!(rev.decision.id.to_string())
+    );
+    assert_eq!(
+        revoked.payload[json_field::REVOKES],
+        serde_json::json!(out.decision.id.to_string())
+    );
+}
+
+/// R4/R9 (rl/error-handling, rel/error-context): a stored ratification row
+/// whose payload is valid JSON but NOT a binding is a VISIBLE error naming the
+/// decision — never a silently skipped entry that would read as "not
+/// ratified" and let the next act overwrite history. The state view and the
+/// act both refuse with the store's `corrupt` code.
+#[test]
+fn a_torn_ratification_row_is_a_visible_error() {
+    let h = home();
+    let store = devai_store::Store::open(h.dir.path()).expect("open store");
+    let torn = devai_core::types::Decision {
+        id: devai_core::types::new_id(),
+        task_id: h.task,
+        kind: decision_kind::PROFILE_RATIFICATION.into(),
+        verdict: devai_core::types::Verdict::Approved,
+        actor: "guerrero".into(),
+        rationale: Some("torn act".into()),
+        refs: vec!["dom/one".into()],
+        created_at: chrono::Utc::now(),
+        payload: serde_json::json!({"unexpected": true}),
+    };
+    store.record_decision(&torn).expect("write the torn row");
+
+    let err = h
+        .api
+        .profile_state(&h.project.id.to_string())
+        .expect_err("a torn row must not be skipped");
+    assert_eq!(err.code(), devai_api::ErrorCode("corrupt"), "{err}");
+    assert!(
+        format!("{err}").contains(&torn.id.to_string()),
+        "the refusal names the decision: {err}"
+    );
+
+    let err = h
+        .api
+        .profile_ratify(ProfileRatifyReq {
+            task: h.task.to_string(),
+            project: h.project.id.to_string(),
+            items: vec!["dom/one".into()],
+            all: false,
+            rationale: Some("после повреждения".into()),
+        })
+        .expect_err("the act must not proceed over a torn row");
+    assert_eq!(err.code(), devai_api::ErrorCode("corrupt"), "{err}");
+    assert_eq!(
+        h.api.task_decisions(&h.task.to_string()).unwrap().len(),
+        1,
+        "the torn row stays the only decision: nothing was minted over it"
+    );
 }

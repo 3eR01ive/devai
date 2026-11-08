@@ -931,14 +931,15 @@ pub mod decision_kind {
     pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
     /// Profile overlay ratification (REQ-SP-301 schema, load-side mechanism
     /// already in C1 per REQ-SP-106/A-5): a human decision confirming one
-    /// overlay item (or a section of items) — `refs` carry the item target
-    /// ids it covers, and ONLY rows of this kind with verdict APPROVED give
-    /// a `profiles/<projects.id>.overlay.yaml` item force. The store-side
-    /// read is `Store::ratified_profile_refs`; the human surface (generic
-    /// decide) is cycle C4 (ratified OQ-SP-6) — the kind exists now so the
-    /// load cross-check and the future surface read the same vocabulary.
-    /// A distinct kind (not requirements_approval/rework_merge) keeps the
-    /// decision history distinguishable by purpose (spec v3 RV5 note).
+    /// overlay item (or a section of items) — `payload` carries the project,
+    /// the rules file, the EDITION fingerprint and the covered item ids, and
+    /// ONLY rows of this kind with verdict APPROVED that no later revocation
+    /// cites give a `profiles/<projects.id>.overlay.yaml` item force. The
+    /// read-side index is `config::ratification_index`; the human surface is
+    /// the `profile ratify` / `profile revoke` CLI (task 01a1bacf), which is
+    /// the ONLY writer of this kind. A distinct kind (not
+    /// requirements_approval/rework_merge) keeps the decision history
+    /// distinguishable by purpose (spec v3 RV5 note).
     pub const PROFILE_RATIFICATION: &str = "profile_ratification";
     /// The empty-rework gate (REQ-RG-03): the operator's explicit ratification
     /// that a QA return needed NO new changes — `refs` carry the pair
@@ -1195,6 +1196,10 @@ pub mod json_field {
     pub const RATIFIED_BY: &str = "ratified_by";
     /// The id of the stored DECISION a human gate event cites.
     pub const DECISION: &str = "decision";
+    /// The APPROVED ratification a `profile_ratification` revocation row
+    /// takes out of force (RV6): one vocabulary for the stored payload, the
+    /// force index and the task history event.
+    pub const REVOKES: &str = "revokes";
     pub const QA_RETURN_RATIONALE: &str = "qa_return_rationale";
     // Migration (one-time repair) records.
     pub const BACKFILL: &str = "backfill";
@@ -1269,6 +1274,7 @@ pub mod json_field {
         CURRENT_COMMIT,
         RATIFIED_BY,
         DECISION,
+        REVOKES,
         QA_RETURN_RATIONALE,
         BACKFILL,
         SCRIPT_PATH,
