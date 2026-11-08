@@ -2493,6 +2493,54 @@ mod tests {
         assert_eq!(api.task_events(&id, None).unwrap().len(), events);
     }
 
+    /// Rework R1 (idempotency, both acts): the transition runs BEFORE the
+    /// decision row, so a repeat is refused at the gate and leaves the FIRST
+    /// stored row untouched — same rationale, actor and refs, no added event.
+    #[test]
+    fn a_repeated_signature_act_keeps_the_first_stored_row() {
+        for reject in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let api = api(dir.path());
+            let (id, spec_id) = approval_with_current_spec(&api, "repeat-once");
+            let first_landed = if reject {
+                api.task_reject(&id, Some("первый".into())).is_ok()
+            } else {
+                api.task_approve(&id, Some("первый".into())).is_ok()
+            };
+            assert!(first_landed, "the first act must land");
+            let decisions_before = api.task_decisions(&id).unwrap().len();
+            let events_before = api.task_events(&id, None).unwrap().len();
+
+            let refused = if reject {
+                api.task_reject(&id, Some("второй".into()))
+                    .map(|_| ())
+                    .unwrap_err()
+            } else {
+                api.task_approve(&id, Some("второй".into()))
+                    .map(|_| ())
+                    .unwrap_err()
+            };
+            assert_eq!(refused.code(), ErrorCode("invalid_transition"), "{refused}");
+            assert_eq!(
+                api.task_decisions(&id).unwrap().len(),
+                decisions_before,
+                "a repeat adds no decision row"
+            );
+            assert_eq!(
+                api.task_events(&id, None).unwrap().len(),
+                events_before,
+                "a repeat adds no event"
+            );
+            let row = &api.task_decisions(&id).unwrap()[0];
+            assert_eq!(
+                row.rationale.as_deref(),
+                Some("первый"),
+                "the first act's rationale survives the repeated call"
+            );
+            assert_eq!(row.refs, vec![spec_id], "the first act's refs survive");
+        }
+    }
+
     /// A publish request of the CURRENT spec kind — the shape both publish
     /// paths of the parity test take.
     fn spec_publish(id: &Id, name: &str) -> PublishReq {

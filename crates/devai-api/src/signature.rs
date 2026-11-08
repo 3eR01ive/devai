@@ -487,6 +487,54 @@ mod tests {
         assert!(view.may_approve, "CURRENT spec, requirements seq > 0");
     }
 
+    /// REQ-SIGN-12 AC5 (rework R1 parity): ONE stored body, TWO projections —
+    /// the API card (`signature_view` → `SpecView`) and the window's wait-row
+    /// representation (`SpecPresentation`, the shape `inbox_view` publishes).
+    /// Paragraph, its source, the unavailability note, the document's open
+    /// questions and the formal requirements are compared ITEM BY ITEM on the
+    /// same bytes; the diff lines come from those same parsed fields.
+    #[test]
+    fn the_api_card_and_the_window_row_render_one_parsed_body() {
+        let (_dir, store, task) = store_with_task();
+        let previous_body = r#"{"human_paragraph":"Прошлая версия.","requirements":[{"id":"REQ-1","statement":"Было","acceptance_criteria":["A1"]}],"open_questions":[]}"#;
+        let current_body = r#"{"human_paragraph":"Абзац целиком.\nВторая строка.","requirements":[{"id":"REQ-1","statement":"Стало","acceptance_criteria":["A1","A2"],"constraints":["C1"]}],"open_questions":["OQ-1: вопрос документа?"]}"#;
+        let previous = publish(&store, &task, ArtifactKind::RequirementsSpec, previous_body);
+        let current = publish(&store, &task, ArtifactKind::RequirementsSpec, current_body);
+
+        // The API: the signature card, ONE read.
+        let view = signature_view(&store, task.clone()).unwrap();
+        let api = view.spec.expect("the card carries the spec");
+
+        // The representation: the SAME stored bytes through the wait-row shape.
+        let stored = store.read_artifact_body(&current).unwrap();
+        let text = std::str::from_utf8(&stored).unwrap();
+        let rendered = spec_presentation(&current, Ok(text), &task, true);
+
+        // 1-4: the four shared fields agree item by item.
+        assert_eq!(rendered.human_paragraph, api.human_paragraph);
+        assert_eq!(rendered.paragraph_source, api.paragraph_source);
+        assert_eq!(rendered.unavailable_note, api.unavailable_note);
+        assert_eq!(rendered.open_questions, api.open_questions);
+
+        // 5: the formal structure lives on the API projection exactly as
+        // stored — the wait-row shape does not carry it (REQ-SIGN-12 AC5).
+        assert_eq!(api.requirements.len(), 1);
+        assert_eq!(api.requirements[0].id, "REQ-1");
+        assert_eq!(api.requirements[0].statement, "Стало");
+        assert_eq!(api.requirements[0].acceptance_criteria, vec!["A1", "A2"]);
+
+        // The diff the card shows is the diff of those same parsed fields.
+        let previous_stored = store.read_artifact_body(&previous).unwrap();
+        let previous_text = std::str::from_utf8(&previous_stored).unwrap();
+        let window_diff = diff_specs(
+            &parse_spec_body(Ok(previous_text), &task),
+            &parse_spec_body(Ok(text), &task),
+        );
+        let api_diff = view.previous.expect("a previous version exists").diff;
+        assert_eq!(api_diff.paragraph, window_diff.paragraph);
+        assert_eq!(api_diff.requirements, window_diff.requirements);
+    }
+
     /// Rework R1 (the auditor's probe, reproduced on the shipped answer): a
     /// READABLE pre-protocol previous version has no paragraph of its own.
     /// The card falls back to the business description for its OWN slot, but
