@@ -1819,10 +1819,9 @@ mod tests {
         // (`signature_labels.ts`), not a data table. This test ties that
         // constant's token sets to the CLOSED Rust types: growing an enum
         // fails here until the word lands in the module.
-        let labels = std::fs::read_to_string(format!(
-            "{crate_dir}/frontend/src/signature_labels.ts"
-        ))
-        .unwrap();
+        let labels =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/signature_labels.ts"))
+                .unwrap();
         let tokens_of = |constant: &str| -> std::collections::BTreeSet<String> {
             let head = format!("export const {constant}: Record<string, string> = {{");
             let start = labels
@@ -1848,7 +1847,11 @@ mod tests {
             .collect();
         assert_eq!(tokens_of("ARTIFACT_STATUS_LABELS"), statuses);
 
-        let wire = |v: &serde_json::Value| v.as_str().expect("closed sets are string tokens").to_string();
+        let wire = |v: &serde_json::Value| {
+            v.as_str()
+                .expect("closed sets are string tokens")
+                .to_string()
+        };
         let spec_sources: std::collections::BTreeSet<String> = ParagraphSource::ALL
             .iter()
             .map(|v| serde_token(&wire(&serde_json::to_value(*v).unwrap())))
@@ -1869,9 +1872,26 @@ mod tests {
             .collect();
         assert_eq!(tokens_of("REVIEW_VERDICT_LABELS"), verdicts);
 
-        let denials: std::collections::BTreeSet<String> =
-            devai_api::DENIAL_CODES.iter().map(|c| c.to_string()).collect();
+        let denials: std::collections::BTreeSet<String> = devai_api::DENIAL_CODES
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
         assert_eq!(tokens_of("DENIAL_LABELS"), denials);
+
+        // Rework R3: the signature act and its source are CLOSED sets too —
+        // their words are pinned to the Rust enums, not to the module's own
+        // self-check, so a third act cannot print as a raw token.
+        let kinds: std::collections::BTreeSet<String> = devai_api::SignatureKind::ALL
+            .iter()
+            .map(|v| wire(&serde_json::to_value(*v).unwrap()))
+            .collect();
+        assert_eq!(tokens_of("SIGNATURE_KIND_LABELS"), kinds);
+
+        let sources: std::collections::BTreeSet<String> = devai_api::SignatureSource::ALL
+            .iter()
+            .map(|v| wire(&serde_json::to_value(*v).unwrap()))
+            .collect();
+        assert_eq!(tokens_of("SIGNATURE_SOURCE_LABELS"), sources);
     }
 
     /// REQ-SIGN-07: the signature answer's serialized fields exist in the

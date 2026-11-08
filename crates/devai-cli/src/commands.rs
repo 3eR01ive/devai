@@ -1359,7 +1359,8 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
 
 fn task_signature(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     // API task.signature — the ONE read the window's signature card renders
-    // (REQ-SIGN-07/10: the CLI mirror is part of the same delivery).
+    // (REQ-SIGN-07/10: the CLI mirror is part of the same delivery). Each
+    // block is rendered by its own function, so no step hides another.
     let v = ctx.api().task_signature(id).map_err(render_api_error)?;
     if json {
         outln!("{}", serde_json::to_string_pretty(&v)?);
@@ -1377,77 +1378,85 @@ fn task_signature(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     if let Some(d) = &v.may_reject_denied {
         outln!("reject denied: {d}");
     }
-    match &v.spec {
-        Some(s) => {
-            outln!(
-                "--- spec v{} ({})  current: {}",
-                s.artifact.seq,
-                s.artifact.name,
-                s.current
-            );
-            if let Some(note) = &s.unavailable_note {
-                outln!("  {note}");
-            }
-            outln!("{}", s.human_paragraph.as_deref().unwrap_or("(абзаца нет)"));
-            for r in &s.requirements {
-                outln!("  [{}] {}", r.id, r.statement);
-                for ac in &r.acceptance_criteria {
-                    outln!("      AC: {ac}");
-                }
-                for c in &r.constraints {
-                    outln!("      · {c}");
-                }
-            }
-            if let Some(note) = &s.requirements_note {
-                outln!("  {note}");
-            }
-            if !s.open_questions.is_empty() {
-                outln!("--- open questions ({})", s.open_questions.len());
-                for (i, q) in s.open_questions.iter().enumerate() {
-                    outln!("  {}. {q}", i + 1);
-                }
-            }
-        }
-        None => outln!("--- spec: утверждать нечего (нет REQUIREMENTS_SPEC)"),
+    print_signature_spec(v.spec.as_ref());
+    print_signature_review(v.review.as_ref(), v.review_note.as_deref());
+    print_signature_previous(v.previous.as_ref(), v.previous_note.as_deref());
+    print_signature_fact(v.signature.as_ref());
+    Ok(())
+}
+
+fn print_signature_spec(spec: Option<&devai_api::SpecView>) {
+    let Some(s) = spec else {
+        outln!("--- spec: утверждать нечего (нет REQUIREMENTS_SPEC)");
+        return;
+    };
+    outln!(
+        "--- spec v{} ({})  current: {}",
+        s.artifact.seq,
+        s.artifact.name,
+        s.current
+    );
+    if let Some(note) = &s.unavailable_note {
+        outln!("  {note}");
     }
-    match &v.review {
-        Some(r) => {
-            outln!(
-                "--- review v{}  verdict: {}  current: {}",
-                r.artifact.seq,
-                r.verdict.as_deref().unwrap_or("—"),
-                r.current
-            );
-            if let Some(note) = &r.note {
-                outln!("  {note}");
-            }
-            if let Some(p) = &r.human_paragraph {
-                outln!("{p}");
-            }
+    outln!("{}", s.human_paragraph.as_deref().unwrap_or("(абзаца нет)"));
+    for r in &s.requirements {
+        outln!("  [{}] {}", r.id, r.statement);
+        for ac in &r.acceptance_criteria {
+            outln!("      AC: {ac}");
         }
-        None => outln!(
-            "--- review: {}",
-            v.review_note.as_deref().unwrap_or("отчёта ревьювера нет")
-        ),
-    }
-    match &v.previous {
-        Some(p) => {
-            outln!("--- previous: v{}", p.artifact.seq);
-            // A refused comparison states its reason instead of printing an
-            // empty (and therefore misleading) diff (rework R3/R8).
-            if let Some(note) = &p.diff.note {
-                outln!("  {note}");
-            }
-            for l in p.diff.paragraph.iter().chain(p.diff.requirements.iter()) {
-                outln!("{} {}  {}", l.mark, l.label, l.text);
-            }
+        for c in &r.constraints {
+            outln!("      · {c}");
         }
-        None => outln!(
-            "--- previous: {}",
-            v.previous_note.as_deref().unwrap_or("прошлой версии нет")
-        ),
     }
-    match &v.signature {
+    if let Some(note) = &s.requirements_note {
+        outln!("  {note}");
+    }
+    if !s.open_questions.is_empty() {
+        outln!("--- open questions ({})", s.open_questions.len());
+        for (i, q) in s.open_questions.iter().enumerate() {
+            outln!("  {}. {q}", i + 1);
+        }
+    }
+}
+
+fn print_signature_review(review: Option<&devai_api::ReviewView>, note: Option<&str>) {
+    let Some(r) = review else {
+        outln!("--- review: {}", note.unwrap_or("отчёта ревьювера нет"));
+        return;
+    };
+    outln!(
+        "--- review v{}  verdict: {}  current: {}",
+        r.artifact.seq,
+        r.verdict.as_deref().unwrap_or("—"),
+        r.current
+    );
+    if let Some(note) = &r.note {
+        outln!("  {note}");
+    }
+    if let Some(p) = &r.human_paragraph {
+        outln!("{p}");
+    }
+}
+
+fn print_signature_previous(previous: Option<&devai_api::PreviousView>, note: Option<&str>) {
+    let Some(p) = previous else {
+        outln!("--- previous: {}", note.unwrap_or("прошлой версии нет"));
+        return;
+    };
+    outln!("--- previous: v{}", p.artifact.seq);
+    // A refused comparison states its reason instead of printing an
+    // empty (and therefore misleading) diff (rework R3/R8).
+    if let Some(note) = &p.diff.note {
+        outln!("  {note}");
+    }
+    for l in p.diff.paragraph.iter().chain(p.diff.requirements.iter()) {
+        outln!("{} {}  {}", l.mark, l.label, l.text);
+    }
+}
+
+fn print_signature_fact(fact: Option<&devai_api::SignatureFact>) {
+    match fact {
         Some(s) => outln!(
             "--- signature: {} by {} at {} ({})  spec_seq: {:?}",
             s.kind,
@@ -1458,7 +1467,6 @@ fn task_signature(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         ),
         None => outln!("--- signature: ещё не подписывалась"),
     }
-    Ok(())
 }
 
 fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {

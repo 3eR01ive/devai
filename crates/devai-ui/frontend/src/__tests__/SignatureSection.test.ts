@@ -123,4 +123,24 @@ describe("SignatureSection with a spec", () => {
     expect(text).toContain("approved");
     w.unmount();
   });
+
+  // Rework R4: the render branch of a spec that is NOT CURRENT has its own
+  // component test — the notice must be visible (not only "not decided by
+  // may_approve").
+  it("marks a spec that is not CURRENT, with its own version, and still offers reject", () => {
+    const w = mountWith(
+      signatureView({
+        may_approve: false,
+        may_approve_denied: "spec_not_current",
+        may_reject: true,
+        spec: specView({ current: false }),
+      }),
+    );
+    const text = w.text();
+    expect(text).toContain("не CURRENT");
+    expect(text).toContain("версия 4");
+    expect(text).toContain("Отклонить");
+    expect(text).not.toContain("Утвердить — удерживайте");
+    w.unmount();
+  });
 });

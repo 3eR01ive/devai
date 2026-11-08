@@ -46,8 +46,8 @@ pub use spec::{
     ParagraphSource, RequirementView, SpecPresentation, parse_spec_body, spec_presentation,
 };
 pub use types::{
-    DiffLine, DiffRefusal, PreviousView, ReviewView, SignatureFact, SignatureView, SpecDiff,
-    SpecView,
+    DiffLine, DiffRefusal, PreviousView, ReviewView, SignatureFact, SignatureKind, SignatureSource,
+    SignatureView, SpecDiff, SpecView,
 };
 
 #[cfg(test)]
@@ -55,8 +55,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use devai_core::types::{
-        ArtifactKind, DataCategory, Decision, Task, TaskState, Verdict, decision_kind, event_kind,
-        new_id,
+        ArtifactKind, ArtifactStatus, DataCategory, Decision, Task, TaskState, Verdict,
+        decision_kind, event_kind, new_id,
     };
     use devai_store::{ArtifactDraft, Store};
 
@@ -160,7 +160,7 @@ mod tests {
         let not_text = BodyError::NotText { size: 12 };
         for parsed in [
             parse_spec_body(Err(&not_text), &task),
-            parse_spec_body(Ok("не json {{{"), &task),
+            parse_spec_body(Ok("не json [1, 2"), &task),
         ] {
             assert_eq!(
                 parsed.paragraph_source,
@@ -207,7 +207,14 @@ mod tests {
         );
     }
 
-    /// REQ-SIGN-07 AC1: the denial names the FIRST failed conjunct, in order.
+    /// The spec projection of a one-paragraph body, at a given status.
+    fn spec_view(status: ArtifactStatus, current: bool) -> SpecView {
+        parse_spec_body(Ok(r#"{"human_paragraph":"x"}"#), &task())
+            .view(&artifact(1, status), current)
+    }
+
+    /// REQ-SIGN-07 AC1: the approval denial names the FIRST failed conjunct,
+    /// in the ratified order.
     #[test]
     fn approve_denial_names_the_first_failed_conjunct() {
         assert_eq!(
@@ -218,31 +225,28 @@ mod tests {
             approve_denied(TaskState::Approval, None, 0),
             Some("no_spec")
         );
-        let mut view = parse_spec_body(Ok(r#"{"human_paragraph":"x"}"#), &task()).view(
-            &artifact(1, devai_core::types::ArtifactStatus::Stale),
-            false,
-        );
+        let stale = spec_view(ArtifactStatus::Stale, false);
         assert_eq!(
-            approve_denied(TaskState::Approval, Some(&view), 1),
+            approve_denied(TaskState::Approval, Some(&stale), 1),
             Some("spec_not_current")
         );
-        view.current = true;
+        let current = spec_view(ArtifactStatus::Current, true);
         assert_eq!(
-            approve_denied(TaskState::Approval, Some(&view), 0),
+            approve_denied(TaskState::Approval, Some(&current), 0),
             Some("no_requirements_version")
         );
-        assert_eq!(approve_denied(TaskState::Approval, Some(&view), 1), None);
+        assert_eq!(approve_denied(TaskState::Approval, Some(&current), 1), None);
+    }
+
+    /// REQ-SIGN-07 AC2 and rework R7/R0: the two rights are independent, and
+    /// every code those FOUR return sites can produce lives in the ONE const
+    /// list `DENIAL_CODES` the UI parity test also reads.
+    #[test]
+    fn both_rights_are_independent_and_every_code_is_a_known_one() {
         assert_eq!(reject_denied(TaskState::Approval), None);
         assert_eq!(reject_denied(TaskState::Analysis), Some("not_approval"));
-
-        // Rework R7/R0: every code those FOUR return sites can produce lives
-        // in the ONE const list DENIAL_CODES the UI parity test also reads.
-        let stale = parse_spec_body(Ok(r#"{"human_paragraph":"x"}"#), &task()).view(
-            &artifact(1, devai_core::types::ArtifactStatus::Stale),
-            false,
-        );
-        let current = view.clone();
-        let dictionary = DENIAL_CODES;
+        let stale = spec_view(ArtifactStatus::Stale, false);
+        let current = spec_view(ArtifactStatus::Current, true);
         for code in [
             approve_denied(TaskState::Review, None, 0),
             approve_denied(TaskState::Approval, None, 0),
@@ -254,7 +258,7 @@ mod tests {
         .flatten()
         {
             assert!(
-                dictionary.contains(&code),
+                DENIAL_CODES.contains(&code),
                 "{code} is not in DENIAL_CODES"
             );
         }
@@ -283,30 +287,47 @@ mod tests {
         }
     }
 
-    /// REQ-SIGN-11: the five review branches, each with a visible text.
+    /// REQ-SIGN-11 branch (2): @1 has no human_paragraph — the STORED summary
+    /// becomes the paragraph, labelled as a summary.
     #[test]
-    fn review_branches_are_all_visible() {
-        // (2) @1: no human_paragraph → summary as the paragraph, labelled.
+    fn a_report_without_a_human_paragraph_shows_its_summary() {
         let parsed = parse_review_body(Ok(r#"{"verdict":"approved","summary":"Коротко"}"#));
         assert_eq!(parsed.verdict.as_deref(), Some("approved"));
         assert_eq!(parsed.paragraph_source, ReviewParagraphSource::Summary);
         assert_eq!(parsed.human_paragraph.as_deref(), Some("Коротко"));
         assert!(parsed.note.is_some());
+    }
 
-        // (3) @2: human_paragraph as stored.
+    /// REQ-SIGN-11: an EMPTY paragraph is the same as none; a readable body
+    /// WITHOUT a verdict still shows the stored summary and names the gap.
+    #[test]
+    fn a_blank_paragraph_and_a_missing_verdict_are_named_but_not_faked() {
+        let blank = parse_review_body(Ok(
+            r#"{"verdict":"approved","human_paragraph":"  ","summary":"S"}"#,
+        ));
+        assert_eq!(blank.paragraph_source, ReviewParagraphSource::Summary);
+
+        let no_verdict = parse_review_body(Ok(r#"{"summary":"S"}"#));
+        assert!(no_verdict.verdict.is_none());
+        assert_eq!(no_verdict.paragraph_source, ReviewParagraphSource::Summary);
+        assert_eq!(no_verdict.human_paragraph.as_deref(), Some("S"));
+        assert!(no_verdict.note.is_some());
+    }
+
+    /// REQ-SIGN-11 branch (3): @2 keeps the report's human paragraph as-is.
+    #[test]
+    fn a_report_paragraph_is_printed_as_stored() {
         let parsed = parse_review_body(Ok(
             r#"{"verdict":"needs_revision","human_paragraph":"Абзац"}"#,
         ));
         assert_eq!(parsed.paragraph_source, ReviewParagraphSource::ReviewReport);
         assert_eq!(parsed.human_paragraph.as_deref(), Some("Абзац"));
+    }
 
-        // Empty paragraph = absent → summary branch.
-        let parsed = parse_review_body(Ok(
-            r#"{"verdict":"approved","human_paragraph":"  ","summary":"S"}"#,
-        ));
-        assert_eq!(parsed.paragraph_source, ReviewParagraphSource::Summary);
-
-        // (5) unreadable body: no verdict, a reason, no panic.
+    /// REQ-SIGN-11 branch (5): an unreadable body states its reason, never
+    /// panics and never invents a verdict or a paragraph.
+    #[test]
+    fn an_unreadable_review_body_states_its_reason() {
         for parsed in [
             parse_review_body(Err(&BodyError::NotText { size: 3 })),
             parse_review_body(Ok("не json")),
@@ -318,19 +339,12 @@ mod tests {
             );
             assert!(parsed.verdict.is_none());
         }
-        // A readable body WITHOUT a verdict: the summary branch still shows
-        // the stored summary, the missing verdict is named in a note.
-        let parsed = parse_review_body(Ok(r#"{"summary":"S"}"#));
-        assert!(parsed.verdict.is_none());
-        assert_eq!(parsed.paragraph_source, ReviewParagraphSource::Summary);
-        assert_eq!(parsed.human_paragraph.as_deref(), Some("S"));
-        assert!(parsed.note.is_some());
     }
 
-    /// REQ-SIGN-13: the diff compares PARSED fields — reformatting is not a
-    /// change; a changed statement shows as -/+; an added requirement as +.
+    /// REQ-SIGN-13: the diff compares PARSED fields — reformatting the JSON
+    /// is not a spec change.
     #[test]
-    fn spec_diff_is_human_and_by_parsed_fields() {
+    fn reformatting_a_spec_is_not_a_change() {
         let task = task();
         let old = parse_spec_body(
             Ok(
@@ -349,7 +363,19 @@ mod tests {
             same.requirements.iter().all(|l| l.mark == " "),
             "reformatting must not read as a spec change"
         );
+    }
 
+    /// REQ-SIGN-13: a changed statement shows as -/+ and an added requirement
+    /// as a + line carrying its own id.
+    #[test]
+    fn changed_and_added_requirements_show_as_lines() {
+        let task = task();
+        let old = parse_spec_body(
+            Ok(
+                r#"{"requirements":[{"id":"REQ-1","statement":"Старое","acceptance_criteria":["A"]}]}"#,
+            ),
+            &task,
+        );
         let new = parse_spec_body(
             Ok(r#"{"requirements":[
               {"id":"REQ-1","statement":"Новое","acceptance_criteria":["A"]},
@@ -396,20 +422,18 @@ mod tests {
         assert!(view.signature.is_none());
     }
 
-    /// R11: the assembled answer reads the stored spec (with structure), the
-    /// reviewer block and the stored decision row in one pass.
-    #[test]
-    fn the_answer_reads_the_spec_the_review_and_the_signature_fact() {
-        let (_dir, store, task) = store_with_task();
+    /// The stored inputs of an approvable card: one CURRENT spec with
+    /// structure, one reviewer report and one approval decision row.
+    fn publish_approvable_inputs(store: &Store, task: &Task) {
         publish(
-            &store,
-            &task,
+            store,
+            task,
             ArtifactKind::RequirementsSpec,
             r#"{"human_paragraph":"Абзац спеки.\nВторая строка.","requirements":[{"id":"REQ-1","statement":"Сделать","acceptance_criteria":["AC1"]}],"open_questions":["OQ-1"]}"#,
         );
         publish(
-            &store,
-            &task,
+            store,
+            task,
             ArtifactKind::ReviewReport,
             r#"{"verdict":"approved","human_paragraph":"Одобряю."}"#,
         );
@@ -425,7 +449,14 @@ mod tests {
                 created_at: Utc::now(),
             })
             .unwrap();
+    }
 
+    /// R11: the assembled answer reads the stored spec (with structure) and
+    /// the reviewer block in one pass.
+    #[test]
+    fn the_answer_reads_the_spec_and_the_review() {
+        let (_dir, store, task) = store_with_task();
+        publish_approvable_inputs(&store, &task);
         let view = signature_view(&store, task).unwrap();
         let spec = view.spec.expect("spec is presented");
         assert!(spec.current);
@@ -436,11 +467,20 @@ mod tests {
             .expect("review block is present whenever a report exists");
         assert_eq!(review.verdict.as_deref(), Some("approved"));
         assert_eq!(review.human_paragraph.as_deref(), Some("Одобряю."));
+    }
+
+    /// R11: the same answer surfaces the stored decision row as the signature
+    /// fact, and a CURRENT spec with a requirements version is signable.
+    #[test]
+    fn the_answer_surfaces_the_stored_signature_fact() {
+        let (_dir, store, task) = store_with_task();
+        publish_approvable_inputs(&store, &task);
+        let view = signature_view(&store, task).unwrap();
         let fact = view
             .signature
             .expect("the decision row is the signature fact");
-        assert_eq!(fact.kind, "approval");
-        assert_eq!(fact.source, "decision");
+        assert_eq!(fact.kind, SignatureKind::Approval);
+        assert_eq!(fact.source, SignatureSource::Decision);
         assert_eq!(fact.rationale.as_deref(), Some("принято"));
         assert_eq!(fact.spec_seq, None, "no ref → no guessed version");
         assert!(view.may_approve, "CURRENT spec, requirements seq > 0");
@@ -451,7 +491,7 @@ mod tests {
     #[test]
     fn an_unreadable_previous_version_is_named_not_diffed() {
         let (_dir, store, task) = store_with_task();
-        publish(&store, &task, ArtifactKind::RequirementsSpec, "{broken");
+        publish(&store, &task, ArtifactKind::RequirementsSpec, "[broken");
         publish(
             &store,
             &task,
@@ -471,19 +511,8 @@ mod tests {
         assert!(refusal.current.is_none());
     }
 
-    /// REQ-SIGN-06: the newest act wins; the decision row is preferred over an
-    /// older event, and an event is reported with its own source marker.
-    #[test]
-    fn the_newest_signature_fact_wins_and_the_source_is_named() {
-        let (_dir, store, task) = store_with_task();
-        store
-            .insert_event(
-                Some(task.id),
-                event_kind::REQUIREMENTS_REJECTED,
-                "guerrero",
-                serde_json::json!({"rationale": "рано"}),
-            )
-            .unwrap();
+    /// A stored approval decision row with no rationale and no refs.
+    fn record_approval_row(store: &Store, task: &Task) {
         store
             .record_decision(&Decision {
                 id: new_id(),
@@ -496,29 +525,55 @@ mod tests {
                 created_at: Utc::now(),
             })
             .unwrap();
+    }
+
+    /// REQ-SIGN-06: a later decision row wins over an older event; the fact
+    /// is reported as a decision row and `rationale=null` is a valid stored
+    /// fact, printed as such.
+    #[test]
+    fn the_later_decision_row_wins_over_an_older_event() {
+        let (_dir, store, task) = store_with_task();
+        store
+            .insert_event(
+                Some(task.id),
+                event_kind::REQUIREMENTS_REJECTED,
+                "guerrero",
+                serde_json::json!({"rationale": "рано"}),
+            )
+            .unwrap();
+        record_approval_row(&store, &task);
         let view = signature_view(&store, task).unwrap();
         let fact = view.signature.expect("a fact exists");
-        assert_eq!(fact.kind, "approval");
-        assert_eq!(fact.source, "decision", "the later decision row wins");
+        assert_eq!(fact.kind, SignatureKind::Approval);
+        assert_eq!(
+            fact.source,
+            SignatureSource::Decision,
+            "the later decision row wins"
+        );
         assert_eq!(
             fact.rationale, None,
             "rationale=null is a valid stored fact"
         );
+    }
 
-        // An event with no later row is reported as an event.
-        let (_dir2, store2, task2) = store_with_task();
-        store2
+    /// REQ-SIGN-06 AC4: an event with no later row is reported as an event,
+    /// and its version is never recovered from the payload.
+    #[test]
+    fn an_event_is_reported_with_its_own_source() {
+        let (_dir, store, task) = store_with_task();
+        store
             .insert_event(
-                Some(task2.id),
+                Some(task.id),
                 event_kind::REQUIREMENTS_APPROVED,
                 "guerrero",
                 serde_json::json!({"rationale": "ок"}),
             )
             .unwrap();
-        let view2 = signature_view(&store2, task2).unwrap();
-        let fact2 = view2.signature.expect("the event is a fact");
-        assert_eq!(fact2.source, "event");
-        assert_eq!(fact2.spec_seq, None);
+        let view = signature_view(&store, task).unwrap();
+        let fact = view.signature.expect("the event is a fact");
+        assert_eq!(fact.kind, SignatureKind::Approval);
+        assert_eq!(fact.source, SignatureSource::Event);
+        assert_eq!(fact.spec_seq, None);
     }
 
     /// Rework R4: selection is FAIL-CLOSED over the kind vocabulary. An event
@@ -558,6 +613,29 @@ mod tests {
         assert!(format!("{err2}").contains("brand_new_decision"), "{err2}");
     }
 
+    /// REQ-SIGN-06 / rework R3: the CLI word and the wire token are the SAME
+    /// string for both closed sets — the Display impl cannot drift from serde.
+    #[test]
+    fn the_display_words_are_the_wire_tokens() {
+        let wire = |v: &serde_json::Value| v.as_str().unwrap().to_string();
+        for kind in SignatureKind::ALL {
+            assert_eq!(
+                kind.to_string(),
+                wire(&serde_json::to_value(kind).unwrap()),
+                "SignatureKind::{} prints another word than it serializes",
+                kind
+            );
+        }
+        for source in SignatureSource::ALL {
+            assert_eq!(
+                source.to_string(),
+                wire(&serde_json::to_value(source).unwrap()),
+                "SignatureSource::{} prints another word than it serializes",
+                source
+            );
+        }
+    }
+
     /// Every KNOWN non-signature kind stays a silent skip — the explicit
     /// decision list and `event_kind::ALL` keep today's behaviour.
     #[test]
@@ -584,6 +662,9 @@ mod tests {
             })
             .unwrap();
         let view = signature_view(&store, task).unwrap();
-        assert!(view.signature.is_none(), "not every decision is a signature");
+        assert!(
+            view.signature.is_none(),
+            "not every decision is a signature"
+        );
     }
 }

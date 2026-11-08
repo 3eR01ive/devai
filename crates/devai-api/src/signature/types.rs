@@ -36,20 +36,69 @@ pub struct ReviewView {
     pub note: Option<String>,
 }
 
+/// The two signature acts (REQ-SIGN-06). A CLOSED set, typed: a third act
+/// cannot appear as a bare string, and the UI words are pinned against
+/// [`SignatureKind::ALL`] by the section's parity test (rework R3).
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureKind {
+    Approval,
+    Rejection,
+}
+
+impl SignatureKind {
+    /// Every act the answer can carry — the set the UI dictionary mirrors.
+    pub const ALL: [Self; 2] = [Self::Approval, Self::Rejection];
+}
+
+/// The CLI prints the same word the wire carries. The two spellings are
+/// pinned together by `the_display_words_are_the_wire_tokens`.
+impl std::fmt::Display for SignatureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Approval => "approval",
+            Self::Rejection => "rejection",
+        })
+    }
+}
+
+/// Where the stored act was read from (REQ-SIGN-06 AC4). Closed for the same
+/// reason as [`SignatureKind`].
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureSource {
+    Decision,
+    Event,
+}
+
+impl SignatureSource {
+    /// Every source the answer can carry — the set the UI dictionary mirrors.
+    pub const ALL: [Self; 2] = [Self::Decision, Self::Event];
+}
+
+/// Same rule as [`SignatureKind`]: the printed word is the wire token, and
+/// `the_display_words_are_the_wire_tokens` holds the two together.
+impl std::fmt::Display for SignatureSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Decision => "decision",
+            Self::Event => "event",
+        })
+    }
+}
+
 /// The result of a signature act (REQ-SIGN-06): the newest stored fact among
 /// the decision rows and the events of the act.
 #[derive(Serialize, Clone, Debug)]
 pub struct SignatureFact {
-    /// "approval" | "rejection"
-    pub kind: String,
+    pub kind: SignatureKind,
     pub actor: String,
     pub at: DateTime<Utc>,
     pub rationale: Option<String>,
     /// Only from decision.refs → artifact REQUIREMENTS_SPEC → seq
     /// (REQ-SIGN-06 AC3); an unresolvable ref is `null`, never a guess.
     pub spec_seq: Option<u32>,
-    /// "decision" | "event"
-    pub source: String,
+    pub source: SignatureSource,
 }
 
 /// The human diff of one field line (REQ-SIGN-13).

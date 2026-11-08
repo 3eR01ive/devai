@@ -12,13 +12,13 @@
 //! an unknown kind is visible, never silence.
 
 use devai_core::types::{
-    decision_kind, event_kind, Artifact, ArtifactKind, Decision, WorkflowEvent,
+    Artifact, ArtifactKind, Decision, WorkflowEvent, decision_kind, event_kind,
 };
 use devai_store::Store;
 
 use crate::{ApiError, ApiResult};
 
-use super::types::SignatureFact;
+use super::types::{SignatureFact, SignatureKind, SignatureSource};
 
 /// Decision kinds the platform stores that are NOT signature acts — spelled
 /// out, so a decision kind that is neither listed here nor a signature kind
@@ -70,32 +70,32 @@ pub fn newest_signature_fact(
 
 fn decision_fact(decision: &Decision, arts: &[Artifact]) -> ApiResult<Option<SignatureFact>> {
     let kind = match decision.kind.as_str() {
-        decision_kind::REQUIREMENTS_APPROVAL => "approval",
-        decision_kind::REQUIREMENTS_REJECTION => "rejection",
+        decision_kind::REQUIREMENTS_APPROVAL => SignatureKind::Approval,
+        decision_kind::REQUIREMENTS_REJECTION => SignatureKind::Rejection,
         other if NON_SIGNATURE_DECISION_KINDS.contains(&other) => return Ok(None),
         other => return Err(unknown_kind("решения", other)),
     };
     Ok(Some(SignatureFact {
-        kind: kind.to_string(),
+        kind,
         actor: decision.actor.clone(),
         at: decision.created_at,
         rationale: decision.rationale.clone(),
         spec_seq: seq_of_refs(&decision.refs, arts),
-        source: "decision".to_string(),
+        source: SignatureSource::Decision,
     }))
 }
 
 fn event_fact(event: &WorkflowEvent) -> ApiResult<Option<SignatureFact>> {
     let kind = match event.kind.as_str() {
-        event_kind::REQUIREMENTS_APPROVED => "approval",
-        event_kind::REQUIREMENTS_REJECTED => "rejection",
+        event_kind::REQUIREMENTS_APPROVED => SignatureKind::Approval,
+        event_kind::REQUIREMENTS_REJECTED => SignatureKind::Rejection,
         // Every other PERSISTED kind is a known non-signature event; the list
         // is the domain's own complete vocabulary, so it cannot drift.
         other if event_kind::ALL.contains(&other) => return Ok(None),
         other => return Err(unknown_kind("события", other)),
     };
     Ok(Some(SignatureFact {
-        kind: kind.to_string(),
+        kind,
         actor: event.actor.clone(),
         at: event.created_at,
         rationale: event
@@ -106,7 +106,7 @@ fn event_fact(event: &WorkflowEvent) -> ApiResult<Option<SignatureFact>> {
         // An event cites no artifact: its version is not recovered from the
         // payload (REQ-SIGN-06 AC3).
         spec_seq: None,
-        source: "event".to_string(),
+        source: SignatureSource::Event,
     }))
 }
 

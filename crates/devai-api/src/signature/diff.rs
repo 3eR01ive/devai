@@ -6,6 +6,8 @@
 //! fell back to the business description on both sides and printed a diff of
 //! paragraph/requirements that did not exist.
 
+use std::collections::{HashMap, HashSet};
+
 use super::spec::{ParsedSpec, RequirementView};
 use super::types::{DiffLine, DiffRefusal, SpecDiff};
 
@@ -54,13 +56,30 @@ fn refusal_of(previous: &ParsedSpec, current: &ParsedSpec) -> Option<SpecDiff> {
 }
 
 /// Requirement lines in the CURRENT order, then the removed requirements.
+///
+/// One pass per side (rework R2): the previous requirements are indexed by id
+/// ONCE, so pairing N current with M previous requirements costs O(N + M) —
+/// the old `iter().find()` inside the loop was O(N×M).
 fn diff_requirements(previous: &ParsedSpec, current: &ParsedSpec) -> Vec<DiffLine> {
+    let mut index: HashMap<&str, &RequirementView> =
+        HashMap::with_capacity(previous.requirements.len());
+    for req in &previous.requirements {
+        // First occurrence wins, exactly like the old `find`.
+        index.entry(req.id.as_str()).or_insert(req);
+    }
+    let mut current_ids: HashSet<&str> = HashSet::with_capacity(current.requirements.len());
     let mut out = Vec::new();
     for req in &current.requirements {
-        let old = previous.requirements.iter().find(|p| p.id == req.id);
-        out.extend(requirement_lines(old, req));
+        out.extend(requirement_lines(index.get(req.id.as_str()).copied(), req));
+        current_ids.insert(req.id.as_str());
     }
-    out.extend(removed_requirements(previous, current));
+    out.extend(
+        previous
+            .requirements
+            .iter()
+            .filter(|old| !current_ids.contains(old.id.as_str()))
+            .map(|old| line("-", &label_of(&old.id), &old.statement)),
+    );
     out
 }
 
@@ -121,25 +140,18 @@ fn changed_requirement(old: &RequirementView, req: &RequirementView) -> Vec<Diff
 }
 
 fn removed_values(old: &[String], new: &[String], label: &str) -> Vec<DiffLine> {
+    let kept: HashSet<&str> = new.iter().map(String::as_str).collect();
     old.iter()
-        .filter(|v| !new.contains(v))
+        .filter(|v| !kept.contains(v.as_str()))
         .map(|v| line("-", label, v))
         .collect()
 }
 
 fn added_values(old: &[String], new: &[String], label: &str) -> Vec<DiffLine> {
+    let known: HashSet<&str> = old.iter().map(String::as_str).collect();
     new.iter()
-        .filter(|v| !old.contains(v))
+        .filter(|v| !known.contains(v.as_str()))
         .map(|v| line("+", label, v))
-        .collect()
-}
-
-fn removed_requirements(previous: &ParsedSpec, current: &ParsedSpec) -> Vec<DiffLine> {
-    previous
-        .requirements
-        .iter()
-        .filter(|old| !current.requirements.iter().any(|r| r.id == old.id))
-        .map(|old| line("-", &label_of(&old.id), &old.statement))
         .collect()
 }
 
