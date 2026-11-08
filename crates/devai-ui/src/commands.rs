@@ -25,8 +25,8 @@ use tauri::State;
 use chrono::Utc;
 use devai_api::{ActiveSnapshot, DependenciesView, ProgressView, QualityReportView, StatusView};
 use devai_api::{Api, ApiError, HomeRecord, HomeRecordsView, OpDescriptor};
+use devai_api::{BodyError, SignatureView, SpecPresentation, spec_presentation};
 use devai_api::{InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts};
-use devai_api::{SignatureView, SpecPresentation, spec_presentation};
 use devai_api::{WorkspaceChangesView, WorkspaceDiffView};
 use devai_core::inbox::{
     InboxWaitPolicy, WHEN_NO_QUESTION, WHEN_PARKED_QUESTION, WaitGroup, WaitStatePolicy,
@@ -1012,13 +1012,22 @@ fn spec_of(task: &Task, facts: &SpecFacts) -> SpecPresentation {
         SpecBodyView::Text { text } => {
             spec_presentation(&facts.artifact, Ok(text.as_str()), task, facts.current)
         }
-        SpecBodyView::Binary { size } => {
-            let note = format!("артефакт бинарный (не UTF-8, {size} байт)");
-            spec_presentation(&facts.artifact, Err(note.as_str()), task, facts.current)
-        }
-        SpecBodyView::Error { message } => {
-            spec_presentation(&facts.artifact, Err(message.as_str()), task, facts.current)
-        }
+        // Rework R8: the read refusal is a TYPED value, not a formatted
+        // string — the API words the cause, the window only forwards it.
+        SpecBodyView::Binary { size } => spec_presentation(
+            &facts.artifact,
+            Err(&BodyError::NotText { size: *size }),
+            task,
+            facts.current,
+        ),
+        SpecBodyView::Error { message } => spec_presentation(
+            &facts.artifact,
+            Err(&BodyError::Unreadable {
+                message: message.clone(),
+            }),
+            task,
+            facts.current,
+        ),
     }
 }
 
@@ -1041,11 +1050,7 @@ mod tests {
         let by_name: std::collections::HashMap<&str, &OpDescriptor> =
             ops.iter().map(|o| (o.name, o)).collect();
         assert!(!COMMAND_OPERATIONS.is_empty());
-        let in_allowlist = |cmd: &str| {
-            SIGNATURE_MUTATION_COMMANDS
-                .iter()
-                .any(|(c, _)| *c == cmd)
-        };
+        let in_allowlist = |cmd: &str| SIGNATURE_MUTATION_COMMANDS.iter().any(|(c, _)| *c == cmd);
         for (cmd, op) in COMMAND_OPERATIONS {
             let d = by_name
                 .get(op)
@@ -1068,14 +1073,26 @@ mod tests {
         // third pair, no Read row smuggled into it, no mutation outside it.
         let mutation_cmds: Vec<&str> = COMMAND_OPERATIONS
             .iter()
-            .filter(|(_, op)| by_name.get(op).is_some_and(|d| d.class == devai_api::OpClass::Mutation))
+            .filter(|(_, op)| {
+                by_name
+                    .get(op)
+                    .is_some_and(|d| d.class == devai_api::OpClass::Mutation)
+            })
             .map(|(cmd, _)| *cmd)
             .collect();
-        let allow: Vec<&str> = SIGNATURE_MUTATION_COMMANDS.iter().map(|(c, _)| *c).collect();
-        assert_eq!(mutation_cmds, allow, "the signature allowlist is exactly two commands");
+        let allow: Vec<&str> = SIGNATURE_MUTATION_COMMANDS
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
+        assert_eq!(
+            mutation_cmds, allow,
+            "the signature allowlist is exactly two commands"
+        );
         for (cmd, op) in SIGNATURE_MUTATION_COMMANDS {
             assert!(
-                by_name.get(op).is_some_and(|d| d.class == devai_api::OpClass::Mutation),
+                by_name
+                    .get(op)
+                    .is_some_and(|d| d.class == devai_api::OpClass::Mutation),
                 "`{cmd}` must name a Mutation operation, got `{op}`"
             );
         }
@@ -1522,9 +1539,7 @@ mod tests {
         );
         let mut mutations: Vec<&str> = COMMAND_OPERATIONS
             .iter()
-            .filter(|(cmd, _)| {
-                matches!(class_of(cmd), Some(devai_api::OpClass::Mutation))
-            })
+            .filter(|(cmd, _)| matches!(class_of(cmd), Some(devai_api::OpClass::Mutation)))
             .map(|(cmd, _)| *cmd)
             .collect();
         mutations.sort_unstable();
@@ -1736,14 +1751,10 @@ mod tests {
 
         // Unparsable body / binary artifact (AC2): honest fact + fallback,
         // raw bytes are never rendered.
+        let not_text = BodyError::NotText { size: 12 };
         for p in [
             spec_presentation(&artifact, Ok("не json {{{"), &task, true),
-            spec_presentation(
-                &artifact,
-                Err("артефакт бинарный (не UTF-8, 12 байт)"),
-                &task,
-                true,
-            ),
+            spec_presentation(&artifact, Err(&not_text), &task, true),
         ] {
             assert_eq!(p.paragraph_source, ParagraphSource::BusinessDescription);
             assert!(p.unavailable_note.is_some());
@@ -1774,14 +1785,50 @@ mod tests {
                 "devai-ui declares `{forbidden}` — the parse lives in devai-api (REQ-SIGN-12)"
             );
         }
-        // The one module that DOES own the rule set.
-        let api = std::fs::read_to_string(format!(
-            "{crate_dir}/../devai-api/src/signature.rs"
-        ))
-        .unwrap();
-        assert!(api.contains("pub fn parse_spec_body"));
-        assert!(api.contains("pub fn spec_presentation"));
-        assert!(api.contains("pub struct SpecPresentation"));
+        // The one module that DOES own the rule set (rework R5: the module is
+        // split by responsibility, so the grep spans every file of it) — and
+        // each definition exists EXACTLY once, which is the uniqueness proof
+        // REQ-SIGN-12 AC4 asks for.
+        let module_dir = format!("{crate_dir}/../devai-api/src/signature");
+        let mut api = String::new();
+        for entry in std::fs::read_dir(&module_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                api.push_str(&std::fs::read_to_string(&path).unwrap());
+                api.push('\n');
+            }
+        }
+        api.push_str(
+            &std::fs::read_to_string(format!("{crate_dir}/../devai-api/src/signature.rs")).unwrap(),
+        );
+        // The CURRENT-spec selector lives in `inbox.rs` (the read plane calls
+        // it, never a private copy) — include it in the count below.
+        api.push_str(
+            &std::fs::read_to_string(format!("{crate_dir}/../devai-api/src/inbox.rs")).unwrap(),
+        );
+        for definition in [
+            "pub fn parse_spec_body",
+            "pub fn spec_presentation",
+            "pub struct SpecPresentation",
+        ] {
+            assert_eq!(
+                api.matches(definition).count(),
+                1,
+                "`{definition}` must be defined exactly once in devai-api"
+            );
+        }
+        // One CURRENT-spec selector (rework R6) and no surviving copy of the
+        // parser name the move deleted.
+        assert_eq!(
+            api.matches("fn pick_spec_artifact").count(),
+            1,
+            "the CURRENT-spec selector must exist exactly once"
+        );
+        assert_eq!(
+            api.matches("fn spec_open_questions").count(),
+            0,
+            "the old per-panel question parser is gone, not copied"
+        );
         // No JSON parsing of the spec body in the window.
         assert!(
             !production.contains("serde_json::from_str"),
@@ -1803,10 +1850,9 @@ mod tests {
             section.contains("signature_labels"),
             "the section must take its words from signature_labels.ts"
         );
-        let chip = std::fs::read_to_string(format!(
-            "{crate_dir}/frontend/src/components/StateChip.vue"
-        ))
-        .unwrap();
+        let chip =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/components/StateChip.vue"))
+                .unwrap();
         assert!(
             chip.contains("{{ token }}"),
             "StateChip prints the stored token as-is (StateChip.vue:20)"
@@ -1815,15 +1861,15 @@ mod tests {
             !chip.contains("signature_labels"),
             "StateChip must not become the section's dictionary (ASM-16)"
         );
-        let states = std::fs::read_to_string(format!("{crate_dir}/frontend/src/states.ts")).unwrap();
+        let states =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/states.ts")).unwrap();
         assert!(
             !states.contains("signature_labels"),
             "states.ts is a TaskState mirror, not the section's word dictionary"
         );
-        let labels = std::fs::read_to_string(format!(
-            "{crate_dir}/frontend/src/signature_labels.ts"
-        ))
-        .unwrap();
+        let labels =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/signature_labels.ts"))
+                .unwrap();
         for token in [
             "CURRENT",
             "STALE",

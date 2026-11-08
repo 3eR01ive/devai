@@ -1042,12 +1042,13 @@ pub fn resolve_effective_profile(
     // an older owned full profile, that profile keeps judging (operator
     // decision: init must not swap a working checklist for the fresh base
     // before the home is migrated).
-    let fallback = profiles.iter().filter(applies).fold(None::<&Profile>, |best, p| {
-        match best {
+    let fallback = profiles
+        .iter()
+        .filter(applies)
+        .fold(None::<&Profile>, |best, p| match best {
             Some(b) if b.version >= p.version => Some(b),
             _ => Some(p),
-        }
-    });
+        });
     let Some(pid) = project_id else {
         // No project: judged on the base (a clean home carries exactly it).
         return Ok(Resolution {
@@ -2055,10 +2056,7 @@ mod tests {
         // Механических гейтов база не несёт: гейт — это команда, а любая команда
         // есть знание о конкретном проекте (пути, инструменты, имена файлов).
         // Проверки остаются все, но судятся ролью по абстрактным критериям.
-        assert!(
-            p.gates.is_empty(),
-            "the base carries no mechanical gates"
-        );
+        assert!(p.gates.is_empty(), "the base carries no mechanical gates");
         assert!(p.checks().iter().any(|c| c.id == "cl/meaningful-names"));
         assert!(p.checks().iter().any(|c| c.id == "pr/spec-fidelity"));
         // AC REQ-SP-101: no devai specifics at start — no block, no name.

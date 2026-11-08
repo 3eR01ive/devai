@@ -395,9 +395,21 @@ export interface DiffLine {
   text: string;
 }
 
+export interface BodyProblem {
+  kind: "not_text" | "unreadable" | "not_json";
+  reason: string;
+}
+
+export interface DiffRefusal {
+  previous: BodyProblem | null;
+  current: BodyProblem | null;
+}
+
 export interface SpecDiff {
   paragraph: DiffLine[];
   requirements: DiffLine[];
+  /** Заполнено, когда сравнение отказано: непрочитанная версия — не пустая. */
+  refusal: DiffRefusal | null;
   note: string | null;
 }
 

@@ -33,6 +33,7 @@ use devai_runtime::{Engine, Gate, RunReport, liveness};
 use devai_store::{ArtifactDraft, StoreError, bundle, guess_media_type, seed};
 use uuid::Uuid;
 
+use crate::inbox::pick_spec_artifact;
 use crate::{Api, ApiError, ApiResult};
 
 // ---------------------------------------------------------------------------
@@ -743,21 +744,30 @@ impl Api {
     ) -> ApiResult<MutationResult> {
         self.task_op(id, WorkflowOp::Review { verdict, summary })
     }
+    /// The id of the CURRENT REQUIREMENTS_SPEC, or `None`. ONE selector —
+    /// `inbox::pick_spec_artifact` — shared by the approve and reject refs
+    /// (rework R6: the same lookup block used to be copied at both sites).
+    fn current_spec_ref(&self, task_id: Id) -> ApiResult<Option<String>> {
+        Ok(pick_spec_artifact(&self.store.artifacts(task_id)?)
+            .filter(|(_, current)| *current)
+            .map(|(artifact, _)| artifact.id.to_string()))
+    }
+
     pub fn task_reject(&self, id: &str, rationale: Option<String>) -> ApiResult<MutationResult> {
         // REQ-SIGN-05 AC3 (ASM-13): the rejection is a stored DECISION row,
         // not only an event — the same act the CLI `task reject` performs.
         // refs cite the CURRENT spec when one exists; the APPROVAL→ANALYSIS
         // transition itself is untouched.
         let task = self.store.resolve_task(id)?;
-        let spec_ref = self
-            .store
-            .artifacts(task.id)?
-            .iter()
-            .find(|x| {
-                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
-            })
-            .map(|x| x.id.to_string());
-        let mutation = self.task_op(id, WorkflowOp::Reject { rationale: rationale.clone() })?;
+        // ONE selector for "the CURRENT spec" (rework R6): the lookup used to
+        // be copied here and in task_approve.
+        let spec_ref = self.current_spec_ref(task.id)?;
+        let mutation = self.task_op(
+            id,
+            WorkflowOp::Reject {
+                rationale: rationale.clone(),
+            },
+        )?;
         let decision = Decision {
             id: new_id(),
             task_id: task.id,
@@ -798,15 +808,8 @@ impl Api {
     /// The spec-ref load and the refusal positions mirror the old handler.
     pub fn task_approve(&self, id: &str, rationale: Option<String>) -> ApiResult<ApproveOutcome> {
         let task = self.store.resolve_task(id)?;
-        let spec_ref = self
-            .store
-            .artifacts(task.id)?
-            .iter()
-            .find(|x| {
-                x.kind == ArtifactKind::RequirementsSpec && x.status == ArtifactStatus::Current
-            })
-            .map(|x| x.id.to_string())
-            .unwrap_or_default();
+        // The SAME selector the reject path uses (rework R6).
+        let spec_ref = self.current_spec_ref(task.id)?.unwrap_or_default();
         let mutation = self.task_op(
             id,
             WorkflowOp::Approve {

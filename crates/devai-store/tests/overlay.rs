@@ -224,7 +224,11 @@ items:
             .into_iter()
             .find(|c| c.id == b.id)
             .unwrap_or_else(|| panic!("base check `{}` disappeared", b.id));
-        assert_eq!(e.statement, b.statement, "an add must not rewrite `{}`", b.id);
+        assert_eq!(
+            e.statement, b.statement,
+            "an add must not rewrite `{}`",
+            b.id
+        );
     }
 
     // Weights (REQ-SP-107): W=0.30 -> base scaled by 0.70, add keeps 0.30.
@@ -392,10 +396,7 @@ fn composition_is_deterministic_and_keyed_by_project_id() {
     let t = task(&store, Some(&prj));
     let d1 = ratify(&store, &t, &["dom/a"]).to_string();
     let d2 = ratify(&store, &t, &["dom/b"]).to_string();
-    let (a, b) = (
-        add_item("dom/a", &d1, 0.2),
-        add_item("dom/b", &d2, 0.3),
-    );
+    let (a, b) = (add_item("dom/a", &d1, 0.2), add_item("dom/b", &d2, 0.3));
     let overlay = |first: bool| {
         let (x, y) = if first { (&a, &b) } else { (&b, &a) };
         format!(
@@ -564,7 +565,10 @@ items:
         "a version drift in base_identity must not discard a ratified add"
     );
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-    assert_eq!(r.ratified.get("dom/a").map(|(d, _)| d.as_str()), Some(d1.as_str()));
+    assert_eq!(
+        r.ratified.get("dom/a").map(|(d, _)| d.as_str()),
+        Some(d1.as_str())
+    );
 }
 
 /// A task WITHOUT a project id judges on the pure base of a clean home

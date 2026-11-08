@@ -53,10 +53,11 @@ pub use mutations::{
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 pub use signature::{
-    DiffLine, ParagraphSource, PreviousView, RequirementView, ReviewParagraphSource, ReviewView,
-    SignatureFact, SignatureView, SpecDiff, SpecPresentation, SpecView, approve_denied,
-    diff_specs, last_review_artifact, parse_review_body, parse_spec_body, pick_previous_spec,
-    reject_denied, signature_view, spec_presentation,
+    BodyError, BodyProblem, BodyProblemKind, DENIAL_CODES, DiffLine, DiffRefusal, ParagraphSource,
+    PreviousView, RequirementView, ReviewParagraphSource, ReviewView, SignatureFact, SignatureView,
+    SpecDiff, SpecPresentation, SpecView, approve_denied, diff_specs, last_review_artifact,
+    parse_review_body, parse_spec_body, pick_previous_spec, reject_denied, signature_view,
+    spec_presentation,
 };
 
 use std::collections::HashMap;

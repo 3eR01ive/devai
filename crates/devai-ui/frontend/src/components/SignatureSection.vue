@@ -217,30 +217,32 @@ function release() {
             />
           </div>
         </div>
-
-        <!-- Ревьювер: вердикт сохранённым токеном + абзац -->
-        <div class="reviewer">
-          <h4 class="subhead" style="margin-top: 12px">
-            Отчёт ревьювера
-            <template v-if="review">
-              · версия {{ review.artifact.seq }}
-              <span v-if="!review.current" class="muted">(не CURRENT)</span>
-            </template>
-          </h4>
-          <template v-if="review">
-            <div class="rowflex">
-              <span class="mono">вердикт: {{ verdict?.token }}</span>
-              <span class="muted">{{ verdict?.word }}</span>
-            </div>
-            <p class="muted small" style="margin: 2px 0 4px">
-              {{ reviewText?.sourceNote }}
-              <template v-if="reviewText?.note">· {{ reviewText.note }}</template>
-            </p>
-            <p class="paragraph">{{ reviewText?.text }}</p>
-          </template>
-          <p v-else class="muted">{{ signature.review_note ?? "отчёта ревьювера нет" }}</p>
-        </div>
       </template>
+
+      <!-- Ревьювер: ВНЕ ветки спеки (REQ-SIGN-01 AC4, REQ-SIGN-11) — блок
+           показывается всегда, в том числе при spec=null, где он говорит
+           словами review_note, что отчёта нет. -->
+      <div class="reviewer">
+        <h4 class="subhead" style="margin-top: 12px">
+          Отчёт ревьювера
+          <template v-if="review">
+            · версия {{ review.artifact.seq }}
+            <span v-if="!review.current" class="muted">(не CURRENT)</span>
+          </template>
+        </h4>
+        <template v-if="review">
+          <div class="rowflex">
+            <span class="mono">вердикт: {{ verdict?.token }}</span>
+            <span class="muted">{{ verdict?.word }}</span>
+          </div>
+          <p class="muted small" style="margin: 2px 0 4px">
+            {{ reviewText?.sourceNote }}
+            <template v-if="reviewText?.note">· {{ reviewText.note }}</template>
+          </p>
+          <p class="paragraph">{{ reviewText?.text }}</p>
+        </template>
+        <p v-else class="muted">{{ signature.review_note ?? "отчёта ревьювера нет" }}</p>
+      </div>
 
       <!-- Обоснование: видимое правимое поле, то, что уходит в решение -->
       <label class="rationale">

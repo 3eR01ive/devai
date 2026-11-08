@@ -1388,10 +1388,7 @@ fn task_signature(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
             if let Some(note) = &s.unavailable_note {
                 outln!("  {note}");
             }
-            outln!(
-                "{}",
-                s.human_paragraph.as_deref().unwrap_or("(абзаца нет)")
-            );
+            outln!("{}", s.human_paragraph.as_deref().unwrap_or("(абзаца нет)"));
             for r in &s.requirements {
                 outln!("  [{}] {}", r.id, r.statement);
                 for ac in &r.acceptance_criteria {
@@ -1436,6 +1433,11 @@ fn task_signature(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     match &v.previous {
         Some(p) => {
             outln!("--- previous: v{}", p.artifact.seq);
+            // A refused comparison states its reason instead of printing an
+            // empty (and therefore misleading) diff (rework R3/R8).
+            if let Some(note) = &p.diff.note {
+                outln!("  {note}");
+            }
             for l in p.diff.paragraph.iter().chain(p.diff.requirements.iter()) {
                 outln!("{} {}  {}", l.mark, l.label, l.text);
             }
