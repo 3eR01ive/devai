@@ -266,7 +266,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Mutation,
             input: "id_prefix, rationale",
             output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
-            description: "APPROVAL → ANALYSIS. Mirrors `task reject`.",
+            description: "APPROVAL → ANALYSIS: persists the workflow event AND a requirements_rejection decision row (REJECTED, actor, rationale, refs to the CURRENT REQUIREMENTS_SPEC when one exists; refs empty otherwise). Rights are the state alone — a missing or non-CURRENT spec does not narrow reject. Mirrors `task reject`; the window's `task_reject` calls this same operation.",
         },
         OpDescriptor {
             name: "task.accept",

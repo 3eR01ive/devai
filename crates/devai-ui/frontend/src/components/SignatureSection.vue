@@ -31,12 +31,14 @@ const rationale = ref("");
 const choices = ref<OqChoice[]>([]);
 
 // Вопросы документа приходят строками (контракт @4); «принять как есть» —
-// положение по умолчанию (ASM-6).
+// положение по умолчанию (ASM-6), и R6-приёмка требует, чтобы ВЫБРАННОЕ
+// значение попадало в rationale подписи: умолчания пишутся в поле сразу,
+// а не только после первой правки выбора.
 watch(
   () => props.signature.spec?.open_questions,
   (questions) => {
     choices.value = (questions ?? []).map(() => ({ accept: true, answer: "" }));
-    rationale.value = "";
+    rationale.value = mergeOqLines("", choices.value);
   },
   { immediate: true },
 );

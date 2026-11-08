@@ -493,29 +493,26 @@ mod tests {
     /// the diff must not present that fallback as the previous version's
     /// paragraph — the state is typed, the sentence names the side, and the
     /// requirements of a readable body still diff.
-    #[test]
-    fn a_pre_protocol_previous_version_is_not_diffed_as_its_paragraph() {
-        let (_dir, store, task) = store_with_task();
+    /// Publishes a pre-protocol spec (no `human_paragraph`) and then a
+    /// protocol-era one that carries its own; both state the same REQ-1.
+    fn publish_pre_protocol_then_current(store: &Store, task: &Task) {
         publish(
-            &store,
-            &task,
+            store,
+            task,
             ArtifactKind::RequirementsSpec,
             r#"{"version":2,"requirements":[{"id":"REQ-1","statement":"Написано до протокола"}]}"#,
         );
         publish(
-            &store,
-            &task,
+            store,
+            task,
             ArtifactKind::RequirementsSpec,
             r#"{"human_paragraph":"Абзац текущей версии.","requirements":[{"id":"REQ-1","statement":"Написано до протокола"}]}"#,
         );
-        let view = signature_view(&store, task).unwrap();
-        assert_eq!(
-            view.spec.as_ref().unwrap().paragraph_source,
-            ParagraphSource::Spec,
-            "the CURRENT version carries its own paragraph"
-        );
-        let previous = view.previous.expect("a previous version exists");
-        let diff = &previous.diff;
+    }
+
+    /// The paragraph side of the probe: typed state, no fallback passed off as
+    /// a version's paragraph, and the version that has one IS shown.
+    fn assert_previous_paragraph_is_named(diff: &SpecDiff) {
         assert_eq!(
             diff.paragraph_previous,
             DiffParagraphState::PreProtocol,
@@ -542,6 +539,20 @@ mod tests {
             .as_deref()
             .expect("the missing paragraph is stated");
         assert!(note.contains("у прошлой версии"), "{note}");
+    }
+
+    #[test]
+    fn a_pre_protocol_previous_version_is_not_diffed_as_its_paragraph() {
+        let (_dir, store, task) = store_with_task();
+        publish_pre_protocol_then_current(&store, &task);
+        let view = signature_view(&store, task).unwrap();
+        assert_eq!(
+            view.spec.as_ref().unwrap().paragraph_source,
+            ParagraphSource::Spec,
+            "the CURRENT version carries its own paragraph"
+        );
+        let diff = view.previous.expect("a previous version exists").diff;
+        assert_previous_paragraph_is_named(&diff);
         assert!(
             diff.requirements.iter().all(|l| l.mark == " "),
             "the readable structure still diffs: {:?}",

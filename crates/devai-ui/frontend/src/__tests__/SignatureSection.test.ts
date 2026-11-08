@@ -143,4 +143,26 @@ describe("SignatureSection with a spec", () => {
     expect(text).not.toContain("Утвердить — удерживайте");
     w.unmount();
   });
+
+  // Rework R6 (spec-fidelity): the DEFAULT position of every document
+  // question («принять как есть») is part of what the operator signs, so it
+  // must already sit in the visible rationale field — not appear only after
+  // the first edit.
+  it("writes the default «принято как есть» of every question into the rationale field", () => {
+    const w = mountWith(
+      signatureView({
+        may_approve: true,
+        may_approve_denied: null,
+        spec: specView({ open_questions: ["OQ-1: вопрос", "OQ-2: второй"] }),
+        review: reviewView(),
+        review_note: null,
+      }),
+    );
+    const field = w.find("textarea");
+    expect(field.exists()).toBe(true);
+    const value = (field.element as HTMLTextAreaElement).value;
+    expect(value).toContain("Вопрос 1: принято как есть");
+    expect(value).toContain("Вопрос 2: принято как есть");
+    w.unmount();
+  });
 });

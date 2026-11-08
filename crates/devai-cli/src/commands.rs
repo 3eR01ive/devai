@@ -234,91 +234,124 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
 /// by subcommand plane — intake, reads, lifecycle, requirements revision,
 /// execution, the dependency plane. This is the routing table only; every
 /// statement moved VERBATIM, stdout is unchanged (the cli-snapshot parity
-/// pins that).
+/// pins that). R1 rework: the table names the planes and `task_verbs` names
+/// the verbs, so a new subcommand adds one arm, not a longer body.
 fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
     match cmd {
         cmd @ TaskCmd::New { .. } => task_new(ctx, cmd, json)?,
-        TaskCmd::List => task_list(ctx, json)?,
-        TaskCmd::Get { id } => task_get(ctx, &id, json)?,
-        TaskCmd::Status { id } => status(ctx, &id, json)?,
-        TaskCmd::Signature { id } => task_signature(ctx, &id, json)?,
-        TaskCmd::Progress { id } => progress(ctx, &id, json)?,
-        TaskCmd::Active => active_overview(ctx, json)?,
-        TaskCmd::Workspace { id } => {
-            // API task.workspace_changes — the committed changeset of the
-            // task's isolated branch against the stored bound baseline
-            // (read-only view; REQ-WV-01/03/07). The CLI renders the state
-            // verdicts as data, never as errors.
-            let v = ctx
-                .api()
-                .task_workspace_changes(&id)
-                .map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                render_workspace_changes(&v);
-            }
-        }
-        TaskCmd::WorkspaceDiff { id, path } => {
-            // API task.workspace_diff — one file's diff over exactly the
-            // range the changeset used (REQ-WV-02). A path outside the list
-            // keeps the platform's not_found refusal (code + text).
-            let v = ctx
-                .api()
-                .task_workspace_diff(&id, &path)
-                .map_err(render_api_error)?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&v)?);
-            } else if let Some(diff) = &v.diff {
-                outln!("{}", diff);
-            } else if v.binary {
-                outln!(
-                    "(modified, binary — {} bytes; raw bytes are not rendered)",
-                    v.size_bytes
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "size unknown".into())
-                );
-            } else {
-                outln!("(state {} — no diffable content)", v.state);
-                if let Some(n) = &v.note {
-                    outln!("  {n}");
-                }
-            }
-        }
-        TaskCmd::Report { id } => show_report(ctx, &id, json)?,
-        TaskCmd::Events { id, limit } => task_events(ctx, &id, limit, json)?,
-        TaskCmd::Decisions { id } => task_decisions(ctx, &id, json)?,
         cmd @ TaskCmd::Revise { .. } => task_revise(ctx, cmd)?,
-        // — execution, ratification, merge (one group handler) —
+        cmd @ TaskCmd::Rename { .. } => task_rename_arm(ctx, cmd, json)?,
+        cmd @ (TaskCmd::SetProject { .. } | TaskCmd::BackfillProject { .. }) => {
+            task_binding_plane(ctx, cmd, json)?
+        }
+        cmd @ (TaskCmd::List
+        | TaskCmd::Get { .. }
+        | TaskCmd::Status { .. }
+        | TaskCmd::Signature { .. }
+        | TaskCmd::Progress { .. }
+        | TaskCmd::Active
+        | TaskCmd::Workspace { .. }
+        | TaskCmd::WorkspaceDiff { .. }
+        | TaskCmd::Report { .. }
+        | TaskCmd::Events { .. }
+        | TaskCmd::Decisions { .. }) => task_reads(ctx, cmd, json)?,
+        cmd => task_verbs(ctx, cmd, json)?,
+    }
+    Ok(())
+}
+
+/// The verbs of the remaining planes: role execution and merge, the human
+/// gate verdicts, the lifecycle holds and the dependency plane. Each plane
+/// keeps its own handler — this only picks one.
+fn task_verbs(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
+    match cmd {
         cmd @ (TaskCmd::Run { .. } | TaskCmd::Merge { .. } | TaskCmd::RatifyEmptyRework { .. }) => {
             task_execution(ctx, cmd, json)?
         }
-        // — human gate verdicts (one group handler) —
         cmd @ (TaskCmd::Review { .. }
         | TaskCmd::Approve { .. }
         | TaskCmd::Reject { .. }
         | TaskCmd::Accept { .. }
         | TaskCmd::Return { .. }) => task_verdicts(ctx, cmd)?,
-        // — lifecycle transitions and holds (one group handler) —
         cmd @ (TaskCmd::Start { .. }
         | TaskCmd::Pause { .. }
         | TaskCmd::Resume { .. }
         | TaskCmd::Block { .. }
         | TaskCmd::Cancel { .. }
         | TaskCmd::Fail { .. }) => task_state_ops(ctx, cmd)?,
-        // — the project-binding plane (C5 D1; one group handler) —
-        cmd @ (TaskCmd::SetProject { .. } | TaskCmd::BackfillProject { .. }) => {
-            task_binding_plane(ctx, cmd, json)?
-        }
-        // — the human signboard write (task 01a1ad1d, ratified OQ-TN-1) —
-        cmd @ TaskCmd::Rename { .. } => task_rename_arm(ctx, cmd, json)?,
-        // — the dependency plane (one group handler) —
         cmd @ (TaskCmd::Depend { .. }
         | TaskCmd::Dependencies { .. }
         | TaskCmd::Unlink { .. }
         | TaskCmd::Override { .. }
         | TaskCmd::Epics
         | TaskCmd::Graph) => task_dependency_plane(ctx, cmd, json)?,
+        _ => unreachable!("the router sends only plane verbs to `task_verbs`"),
+    }
+    Ok(())
+}
+
+/// The task READ arms (R1 rework: the two `workspace` bodies used to sit
+/// inline in `task` and every new arm grew the router). Statements are the
+/// same as before, stdout unchanged.
+fn task_reads(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
+    match cmd {
+        TaskCmd::List => task_list(ctx, json)?,
+        TaskCmd::Get { id } => task_get(ctx, &id, json)?,
+        TaskCmd::Status { id } => status(ctx, &id, json)?,
+        TaskCmd::Signature { id } => task_signature(ctx, &id, json)?,
+        TaskCmd::Progress { id } => progress(ctx, &id, json)?,
+        TaskCmd::Active => active_overview(ctx, json)?,
+        TaskCmd::Workspace { id } => task_workspace(ctx, &id, json)?,
+        TaskCmd::WorkspaceDiff { id, path } => task_workspace_diff(ctx, &id, &path, json)?,
+        TaskCmd::Report { id } => show_report(ctx, &id, json)?,
+        TaskCmd::Events { id, limit } => task_events(ctx, &id, limit, json)?,
+        TaskCmd::Decisions { id } => task_decisions(ctx, &id, json)?,
+        _ => unreachable!("the dispatcher routes only read arms to `task_reads`"),
+    }
+    Ok(())
+}
+
+/// `task workspace` — API task.workspace_changes, the committed changeset of
+/// the task's isolated branch against the stored bound baseline (read-only
+/// view; REQ-WV-01/03/07). The CLI renders the state verdicts as data, never
+/// as errors.
+fn task_workspace(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    let v = ctx
+        .api()
+        .task_workspace_changes(id)
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        render_workspace_changes(&v);
+    }
+    Ok(())
+}
+
+/// `task workspace-diff` — API task.workspace_diff: one file's diff over
+/// exactly the range the changeset used (REQ-WV-02). A path outside the list
+/// keeps the platform's not_found refusal (code + text).
+fn task_workspace_diff(ctx: &Ctx, id: &str, path: &str, json: bool) -> Result<()> {
+    let v = ctx
+        .api()
+        .task_workspace_diff(id, path)
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+    } else if let Some(diff) = &v.diff {
+        outln!("{}", diff);
+    } else if v.binary {
+        outln!(
+            "(modified, binary — {} bytes; raw bytes are not rendered)",
+            v.size_bytes
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "size unknown".into())
+        );
+    } else {
+        outln!("(state {} — no diffable content)", v.state);
+        if let Some(n) = &v.note {
+            outln!("  {n}");
+        }
     }
     Ok(())
 }
