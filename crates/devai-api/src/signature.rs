@@ -16,7 +16,8 @@
 //! * [`spec`] — parsing a spec body and its two projections;
 //! * [`review`] — parsing a reviewer report (the five branches);
 //! * [`selectors`] — which report / which previous spec;
-//! * [`diff`] — the human field diff (and its typed refusal);
+//! * [`diff`] — the human field diff (its typed paragraph states and its
+//!   typed refusal);
 //! * [`denial`] — the refusal codes of the two signature rights (one
 //!   dictionary, pinned against the UI labels by a parity test);
 //! * [`fact`] — the newest stored signature act;
@@ -46,8 +47,8 @@ pub use spec::{
     ParagraphSource, RequirementView, SpecPresentation, parse_spec_body, spec_presentation,
 };
 pub use types::{
-    DiffLine, DiffRefusal, PreviousView, ReviewView, SignatureFact, SignatureKind, SignatureSource,
-    SignatureView, SpecDiff, SpecView,
+    DiffLine, DiffParagraphState, DiffRefusal, PreviousView, ReviewView, SignatureFact,
+    SignatureKind, SignatureSource, SignatureView, SpecDiff, SpecView,
 };
 
 #[cfg(test)]
@@ -486,6 +487,68 @@ mod tests {
         assert!(view.may_approve, "CURRENT spec, requirements seq > 0");
     }
 
+    /// Rework R1 (the auditor's probe, reproduced on the shipped answer): a
+    /// READABLE pre-protocol previous version has no paragraph of its own.
+    /// The card falls back to the business description for its OWN slot, but
+    /// the diff must not present that fallback as the previous version's
+    /// paragraph — the state is typed, the sentence names the side, and the
+    /// requirements of a readable body still diff.
+    #[test]
+    fn a_pre_protocol_previous_version_is_not_diffed_as_its_paragraph() {
+        let (_dir, store, task) = store_with_task();
+        publish(
+            &store,
+            &task,
+            ArtifactKind::RequirementsSpec,
+            r#"{"version":2,"requirements":[{"id":"REQ-1","statement":"Написано до протокола"}]}"#,
+        );
+        publish(
+            &store,
+            &task,
+            ArtifactKind::RequirementsSpec,
+            r#"{"human_paragraph":"Абзац текущей версии.","requirements":[{"id":"REQ-1","statement":"Написано до протокола"}]}"#,
+        );
+        let view = signature_view(&store, task).unwrap();
+        assert_eq!(
+            view.spec.as_ref().unwrap().paragraph_source,
+            ParagraphSource::Spec,
+            "the CURRENT version carries its own paragraph"
+        );
+        let previous = view.previous.expect("a previous version exists");
+        let diff = &previous.diff;
+        assert_eq!(
+            diff.paragraph_previous,
+            DiffParagraphState::PreProtocol,
+            "a readable body without human_paragraph is pre-protocol, not empty"
+        );
+        assert_eq!(diff.paragraph_current, DiffParagraphState::Stored);
+        assert!(diff.refusal.is_none(), "a readable body is not a refusal");
+        assert!(
+            diff.paragraph
+                .iter()
+                .all(|l| l.text != "бизнес-описание задачи"),
+            "the business-description fallback is never a version's paragraph: {:?}",
+            diff.paragraph
+        );
+        assert!(
+            diff.paragraph
+                .iter()
+                .any(|l| l.mark == "+" && l.text == "Абзац текущей версии."),
+            "the version that DOES have a paragraph is shown: {:?}",
+            diff.paragraph
+        );
+        let note = diff
+            .paragraph_note
+            .as_deref()
+            .expect("the missing paragraph is stated");
+        assert!(note.contains("у прошлой версии"), "{note}");
+        assert!(
+            diff.requirements.iter().all(|l| l.mark == " "),
+            "the readable structure still diffs: {:?}",
+            diff.requirements
+        );
+    }
+
     /// R3/R8: an UNREADABLE previous body is a visible refusal with the side
     /// named — never a diff of the business-description fallback.
     #[test]
@@ -632,6 +695,14 @@ mod tests {
                 wire(&serde_json::to_value(source).unwrap()),
                 "SignatureSource::{} prints another word than it serializes",
                 source
+            );
+        }
+        for state in DiffParagraphState::ALL {
+            assert_eq!(
+                state.to_string(),
+                wire(&serde_json::to_value(state).unwrap()),
+                "DiffParagraphState::{} prints another word than it serializes",
+                state
             );
         }
     }

@@ -55,6 +55,14 @@ export const SIGNATURE_SOURCE_LABELS: Record<string, string> = {
   event: "событие (сохранённой строки решения нет)",
 };
 
+/// Состояние абзаца в диффе спеки (rework R1): сторона без своего абзаца
+/// называется словом, а не выдаётся за пустой абзац.
+export const DIFF_PARAGRAPH_STATE_LABELS: Record<string, string> = {
+  stored: "свой абзац",
+  pre_protocol: "абзаца нет (спека до протокола)",
+  unreadable: "тело не читается",
+};
+
 export interface Label {
   text: string;
   /** true — слова нет в словаре, токен напечатан как есть с пометкой. */
@@ -85,4 +93,5 @@ export const CLOSED_TOKEN_SETS: Record<string, string[]> = {
   ],
   SIGNATURE_KIND_LABELS: ["approval", "rejection"],
   SIGNATURE_SOURCE_LABELS: ["decision", "event"],
+  DIFF_PARAGRAPH_STATE_LABELS: ["stored", "pre_protocol", "unreadable"],
 };

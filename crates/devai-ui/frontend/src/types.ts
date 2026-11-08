@@ -405,9 +405,18 @@ export interface DiffRefusal {
   current: BodyProblem | null;
 }
 
+/** Что одна сторона диффа несёт в слоте абзаца (rework R1). */
+export type DiffParagraphState = "stored" | "pre_protocol" | "unreadable";
+
 export interface SpecDiff {
   paragraph: DiffLine[];
   requirements: DiffLine[];
+  /** Состояние абзаца прошлой версии: свой абзац / до протокола / тело не читается. */
+  paragraph_previous: DiffParagraphState;
+  /** То же для текущей версии. */
+  paragraph_current: DiffParagraphState;
+  /** Почему своего абзаца нет: сторона названа; бизнес-описание за абзац не выдаётся. */
+  paragraph_note: string | null;
   /** Заполнено, когда сравнение отказано: непрочитанная версия — не пустая. */
   refusal: DiffRefusal | null;
   note: string | null;

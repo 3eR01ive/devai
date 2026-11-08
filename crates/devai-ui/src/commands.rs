@@ -1892,6 +1892,16 @@ mod tests {
             .map(|v| wire(&serde_json::to_value(*v).unwrap()))
             .collect();
         assert_eq!(tokens_of("SIGNATURE_SOURCE_LABELS"), sources);
+
+        // Rework R1: the paragraph slot of a diff side is a CLOSED set too —
+        // a pre-protocol version is named by its own word, never shown as an
+        // empty paragraph.
+        let paragraph_states: std::collections::BTreeSet<String> =
+            devai_api::DiffParagraphState::ALL
+                .iter()
+                .map(|v| wire(&serde_json::to_value(*v).unwrap()))
+                .collect();
+        assert_eq!(tokens_of("DIFF_PARAGRAPH_STATE_LABELS"), paragraph_states);
     }
 
     /// REQ-SIGN-07: the signature answer's serialized fields exist in the

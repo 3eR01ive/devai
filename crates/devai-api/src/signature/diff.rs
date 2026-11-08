@@ -8,30 +8,61 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::spec::{ParsedSpec, RequirementView};
-use super::types::{DiffLine, DiffRefusal, SpecDiff};
+use super::spec::{ParagraphSource, ParsedSpec, RequirementView};
+use super::types::{DiffLine, DiffParagraphState, DiffRefusal, SpecDiff};
 
 /// The field diff of two parsed specs (REQ-SIGN-13) — or the honest refusal
 /// when either side's body was not a readable spec document.
+///
+/// Rework R1: the paragraph is compared ONLY when both sides carry their OWN
+/// stored paragraph. A readable pre-protocol body has no paragraph of its own
+/// — the card's business-description fallback is a labelled stand-in, and
+/// printing it as "the previous version's paragraph" attributed invented text
+/// to that version. The states travel in the answer, the fallback never
+/// becomes a diff line.
 pub fn diff_specs(previous: &ParsedSpec, current: &ParsedSpec) -> SpecDiff {
-    if let Some(refused) = refusal_of(previous, current) {
-        return refused;
+    let paragraph_previous = paragraph_state(previous);
+    let paragraph_current = paragraph_state(current);
+    if let Some((refusal, note)) = refusal_of(previous, current) {
+        return SpecDiff {
+            paragraph: Vec::new(),
+            requirements: Vec::new(),
+            paragraph_previous,
+            paragraph_current,
+            paragraph_note: None,
+            refusal: Some(refusal),
+            note: Some(note),
+        };
     }
-    let (paragraph, paragraph_note) = diff_paragraph(
-        previous.human_paragraph.as_deref().unwrap_or(""),
-        current.human_paragraph.as_deref().unwrap_or(""),
-    );
+    let (paragraph, paragraph_note, note) =
+        diff_paragraph_fields(previous, current, paragraph_previous, paragraph_current);
     SpecDiff {
         paragraph,
         requirements: diff_requirements(previous, current),
+        paragraph_previous,
+        paragraph_current,
+        paragraph_note,
         refusal: None,
-        note: paragraph_note,
+        note,
     }
 }
 
-/// The empty diff carrying the causes: no line is invented on a refused
+/// What this side carries in the paragraph slot. An unreadable body is
+/// checked FIRST: its `human_paragraph` is the fallback too, but the refusal
+/// path already speaks for it.
+fn paragraph_state(parsed: &ParsedSpec) -> DiffParagraphState {
+    if parsed.body_problem.is_some() {
+        DiffParagraphState::Unreadable
+    } else if parsed.paragraph_source == ParagraphSource::BusinessDescription {
+        DiffParagraphState::PreProtocol
+    } else {
+        DiffParagraphState::Stored
+    }
+}
+
+/// The causes of a refused comparison: no line is invented on a refused
 /// comparison, and the sentence names every failing side.
-fn refusal_of(previous: &ParsedSpec, current: &ParsedSpec) -> Option<SpecDiff> {
+fn refusal_of(previous: &ParsedSpec, current: &ParsedSpec) -> Option<(DiffRefusal, String)> {
     let previous_problem = previous.body_problem.as_ref();
     let current_problem = current.body_problem.as_ref();
     if previous_problem.is_none() && current_problem.is_none() {
@@ -44,15 +75,13 @@ fn refusal_of(previous: &ParsedSpec, current: &ParsedSpec) -> Option<SpecDiff> {
     if let Some(problem) = previous_problem {
         sides.push(format!("прошлая версия не читается — {}", problem.reason()));
     }
-    Some(SpecDiff {
-        paragraph: Vec::new(),
-        requirements: Vec::new(),
-        refusal: Some(DiffRefusal {
+    Some((
+        DiffRefusal {
             previous: previous_problem.cloned(),
             current: current_problem.cloned(),
-        }),
-        note: Some(format!("сравнить не удалось: {}", sides.join("; "))),
-    })
+        },
+        format!("сравнить не удалось: {}", sides.join("; ")),
+    ))
 }
 
 /// Requirement lines in the CURRENT order, then the removed requirements.
@@ -182,6 +211,68 @@ pub const MAX_DIFF_LINES: usize = 2_000;
 /// `MAX_DIFF_LINES² = 4·10⁶ > MAX_DIFF_CELLS`, so the cell bound is the
 /// effective one for square inputs; the line bound bounds the linear walk.
 pub const MAX_LCS_CELLS: usize = 250_000;
+
+/// The paragraph lines of the diff, the honest sentence about a side that
+/// carries no paragraph of its own, and the over-limit note.
+///
+/// Rework R1: compared only when BOTH sides carry their own stored paragraph
+/// — a readable pre-protocol body has none, and its business-description
+/// fallback is never printed as that version's text. When only one side has
+/// text, its lines are shown against nothing (`-` removed / `+` appeared) and
+/// the note names the side.
+fn diff_paragraph_fields(
+    previous: &ParsedSpec,
+    current: &ParsedSpec,
+    previous_state: DiffParagraphState,
+    current_state: DiffParagraphState,
+) -> (Vec<DiffLine>, Option<String>, Option<String>) {
+    debug_assert!(
+        previous_state != DiffParagraphState::Unreadable
+            && current_state != DiffParagraphState::Unreadable,
+        "an unreadable side is refused before the paragraph is compared"
+    );
+    let previous_text = previous.human_paragraph.as_deref().unwrap_or("");
+    let current_text = current.human_paragraph.as_deref().unwrap_or("");
+    if previous_state == DiffParagraphState::Stored && current_state == DiffParagraphState::Stored {
+        let (lines, over_limit) = diff_paragraph(previous_text, current_text);
+        return (lines, None, over_limit);
+    }
+    let mut out = Vec::new();
+    if previous_state == DiffParagraphState::Stored {
+        out.extend(paragraph_lines("-", previous_text));
+    }
+    if current_state == DiffParagraphState::Stored {
+        out.extend(paragraph_lines("+", current_text));
+    }
+    let note = missing_paragraph_note(previous_state, current_state);
+    (out, Some(note), None)
+}
+
+/// The sentence for a side without its own paragraph: it names the side and
+/// says plainly that the business-description fallback is not that version's
+/// paragraph.
+fn missing_paragraph_note(
+    previous_state: DiffParagraphState,
+    current_state: DiffParagraphState,
+) -> String {
+    let subject = match (previous_state, current_state) {
+        (DiffParagraphState::Stored, _) => "у текущей версии",
+        (_, DiffParagraphState::Stored) => "у прошлой версии",
+        _ => "ни у прошлой, ни у текущей версии",
+    };
+    format!(
+        "{subject} нет своего абзаца — в теле нет human_paragraph (спека до протокола); \
+         бизнес-описание задачи за абзац версии не выдаётся и не сравнивается"
+    )
+}
+
+/// Every line of one side under one mark.
+fn paragraph_lines(mark: &str, text: &str) -> Vec<DiffLine> {
+    lines_of(text)
+        .into_iter()
+        .map(|l| line(mark, "абзац", l))
+        .collect()
+}
 
 /// Line diff with unchanged context (small LCS over lines — the paragraph is
 /// prose, line granularity is the human unit), or the linear whole-version
@@ -344,5 +435,51 @@ mod tests {
         let text = numbered_lines(side);
         let d = diff_specs(&parsed(Some(&text)), &parsed(Some(&text)));
         assert!(d.note.is_some(), "the cell bound must trigger the fallback");
+    }
+
+    /// Rework R1: a READABLE pre-protocol version has no paragraph of its
+    /// own — the business-description fallback the card shows in its place is
+    /// never diffed as that version's text, and the state is typed.
+    #[test]
+    fn a_pre_protocol_side_is_never_diffed_as_its_paragraph() {
+        let previous = ParsedSpec {
+            human_paragraph: Some("бизнес-описание задачи".into()),
+            paragraph_source: ParagraphSource::BusinessDescription,
+            unavailable_note: Some("спека до протокола".into()),
+            ..ParsedSpec::default()
+        };
+        let current = parsed(Some("новый абзац"));
+        let d = diff_specs(&previous, &current);
+
+        assert_eq!(d.paragraph_previous, DiffParagraphState::PreProtocol);
+        assert_eq!(d.paragraph_current, DiffParagraphState::Stored);
+        assert!(
+            d.paragraph
+                .iter()
+                .all(|l| l.text != "бизнес-описание задачи"),
+            "the fallback must never be printed as a version's paragraph: {:?}",
+            d.paragraph
+        );
+        assert!(
+            d.paragraph
+                .iter()
+                .any(|l| l.mark == "+" && l.text == "новый абзац"),
+            "the side that DOES carry a paragraph is still shown"
+        );
+        let note = d.paragraph_note.expect("the missing side is named");
+        assert!(note.contains("у прошлой версии"), "{note}");
+        assert!(note.contains("не выдаётся"), "{note}");
+        assert!(d.refusal.is_none(), "a readable body is not a refusal");
+        assert!(d.note.is_none(), "the paragraph note is not a refusal note");
+    }
+
+    /// Two stored paragraphs are comparable — and then there is nothing to
+    /// explain about a missing side.
+    #[test]
+    fn two_stored_paragraphs_carry_no_missing_side_note() {
+        let d = diff_specs(&parsed(Some("старое")), &parsed(Some("новое")));
+        assert!(d.paragraph_note.is_none());
+        assert_eq!(d.paragraph_previous, DiffParagraphState::Stored);
+        assert_eq!(d.paragraph_current, DiffParagraphState::Stored);
     }
 }

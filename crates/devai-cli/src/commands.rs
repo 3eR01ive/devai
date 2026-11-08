@@ -1445,9 +1445,20 @@ fn print_signature_previous(previous: Option<&devai_api::PreviousView>, note: Op
         return;
     };
     outln!("--- previous: v{}", p.artifact.seq);
+    // Rework R1: the paragraph slot of each side is stated by its typed
+    // state — a readable pre-protocol version has no paragraph of its own,
+    // and the business-description fallback is never printed as one.
+    outln!(
+        "  абзац: прошлая версия — {}, текущая — {}",
+        p.diff.paragraph_previous,
+        p.diff.paragraph_current
+    );
     // A refused comparison states its reason instead of printing an
     // empty (and therefore misleading) diff (rework R3/R8).
     if let Some(note) = &p.diff.note {
+        outln!("  {note}");
+    }
+    if let Some(note) = &p.diff.paragraph_note {
         outln!("  {note}");
     }
     for l in p.diff.paragraph.iter().chain(p.diff.requirements.iter()) {

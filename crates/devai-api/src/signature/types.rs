@@ -121,12 +121,56 @@ pub struct DiffRefusal {
     pub current: Option<BodyProblem>,
 }
 
+/// What ONE side of the diff actually carries in the paragraph slot (rework
+/// R1). The paragraph fields are compared only when BOTH sides carry their
+/// own stored `human_paragraph`; a version without one is NOT an empty
+/// paragraph — its text is unknown, and the card's business-description
+/// fallback must never be printed as that version's own text.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffParagraphState {
+    /// The version's own stored `human_paragraph` — comparable text.
+    Stored,
+    /// A READABLE body without `human_paragraph` (a spec before the
+    /// paragraph protocol): the fallback is a labelled stand-in, not the
+    /// version's paragraph.
+    PreProtocol,
+    /// The body never became a document.
+    Unreadable,
+}
+
+impl DiffParagraphState {
+    /// Every state the diff can carry — the set the section's dictionary is
+    /// pinned against (the labels parity test reads this).
+    pub const ALL: [Self; 3] = [Self::Stored, Self::PreProtocol, Self::Unreadable];
+}
+
+/// The CLI prints the same word the wire carries; the two spellings are held
+/// together by `the_display_words_are_the_wire_tokens`.
+impl std::fmt::Display for DiffParagraphState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stored => "stored",
+            Self::PreProtocol => "pre_protocol",
+            Self::Unreadable => "unreadable",
+        })
+    }
+}
+
 /// The diff of the spec against its previous version, compared by PARSED
 /// FIELDS (never by raw JSON lines — reformatting is not a spec change).
 #[derive(Serialize, Clone, Debug)]
 pub struct SpecDiff {
     pub paragraph: Vec<DiffLine>,
     pub requirements: Vec<DiffLine>,
+    /// What the previous side carries in the paragraph slot (rework R1).
+    pub paragraph_previous: DiffParagraphState,
+    /// What the current side carries in the paragraph slot.
+    pub paragraph_current: DiffParagraphState,
+    /// Why the paragraph is absent from a side — one sentence naming the
+    /// side(s) and stating that the business-description fallback is not
+    /// shown as a version's paragraph.
+    pub paragraph_note: Option<String>,
     /// Set when the comparison was refused: an unreadable body is never
     /// shown as an empty version (rework R3).
     pub refusal: Option<DiffRefusal>,

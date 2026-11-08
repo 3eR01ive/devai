@@ -75,6 +75,9 @@ function previous(overrides: Partial<PreviousView["diff"]> = {}): PreviousView {
         { mark: "+", label: "абзац", text: "новая строка" },
       ],
       requirements: [{ mark: "+", label: "REQ-2", text: "Новое требование" }],
+      paragraph_previous: "stored",
+      paragraph_current: "stored",
+      paragraph_note: null,
       refusal: null,
       note: null,
       ...overrides,
@@ -94,6 +97,9 @@ describe("SpecDiffPanel", () => {
     expect(w.findAll(".dline.del")).toHaveLength(1);
     expect(w.findAll(".dline.add")).toHaveLength(2);
     expect(w.findAll(".dline.ctx")).toHaveLength(1);
+    // Обе стороны с своим абзацем — объяснять нечего.
+    expect(text).not.toContain("спека до протокола");
+    expect(text).not.toContain("не выдаётся");
     expect(text).not.toContain("{");
     w.unmount();
   });
@@ -112,6 +118,49 @@ describe("SpecDiffPanel", () => {
     expect(text).toContain("сравнить не удалось");
     expect(text).toContain("прошлая версия не читается");
     expect(w.findAll(".dline")).toHaveLength(0);
+    w.unmount();
+  });
+
+  // Rework R1: до-протокольная предыдущая версия своего абзаца не имеет.
+  // Сторона называется своим состоянием словами секции, а подставленное
+  // бизнес-описание не печатается как её абзац.
+  it("names a pre-protocol side instead of printing the fallback as its paragraph", () => {
+    const w = mount(SpecDiffPanel, {
+      props: {
+        previous: previous({
+          paragraph: [{ mark: "+", label: "абзац", text: "Абзац текущей версии." }],
+          requirements: [{ mark: " ", label: "REQ-1", text: "Написано до протокола" }],
+          paragraph_previous: "pre_protocol",
+          paragraph_current: "stored",
+          paragraph_note:
+            "у прошлой версии нет своего абзаца — в теле нет human_paragraph (спека до протокола); " +
+            "бизнес-описание задачи за абзац версии не выдаётся и не сравнивается",
+        }),
+      },
+    });
+    const text = w.text();
+    expect(text).toContain("прошлая версия — абзаца нет (спека до протокола)");
+    expect(text).toContain("текущая — свой абзац");
+    expect(text).toContain("у прошлой версии нет своего абзаца");
+    expect(text).toContain("Абзац текущей версии.");
+    // Структура читаемой версии всё равно диффится.
+    expect(text).toContain("REQ-1");
+    expect(text).toContain("Написано до протокола");
+    // Ни сырого токена, ни подставленного бизнес-описания.
+    expect(text).not.toContain("pre_protocol");
+    w.unmount();
+  });
+
+  // Нераспознанный токен не выдумывается: печатается как есть с пометкой.
+  it("prints an unknown paragraph state with a mark", () => {
+    const w = mount(SpecDiffPanel, {
+      props: {
+        previous: previous({
+          paragraph_previous: "brand_new" as never,
+        }),
+      },
+    });
+    expect(w.text()).toContain("brand_new (слово не задано)");
     w.unmount();
   });
 });
