@@ -407,6 +407,7 @@ fn approved_decisions_reach_every_post_approve_role() {
             rationale: Some("OQ1=X ratified".into()),
             refs: vec![],
             created_at: Utc::now(),
+            payload: serde_json::Value::Null,
         })
         .unwrap();
     engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -1781,6 +1782,7 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
         rationale: Some("правок не потребовалось — пункты уже были удовлетворены".into()),
         refs: vec![prev_id.clone(), cur_id.clone()],
         created_at: Utc::now(),
+        payload: serde_json::Value::Null,
     };
     store.record_decision(&d).unwrap();
     store
@@ -2957,7 +2959,26 @@ fn engine_binds_tasks_to_their_projects_effective_profile() {
     let tb = Task::new("beta task", "d", Some(beta.id), Utc::now());
     store.create_task(&tb).unwrap();
 
-    // Human ratification covering BOTH overlay items of alpha.
+    // Human ratification covering the overlay item of alpha, BOUND to the
+    // edition fingerprint of the rules content (task 01a1bacf, RV2).
+    let overlay_dir = cfg.join("profiles");
+    std::fs::create_dir_all(&overlay_dir).unwrap();
+    let overlay_path = overlay_dir.join(format!("{}.overlay.yaml", alpha.id));
+    std::fs::write(
+        &overlay_path,
+        format!(
+            r#"project_id: "{}"
+base_identity: base@1
+overlay_version: 1
+items:
+  - {{kind: add, target_id: dom/x, ratified_by: "", add: {{statement: domain invariant x, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.10}}}}
+"#,
+            alpha.id
+        ),
+    )
+    .unwrap();
+    let (edition, _) =
+        devai_store::config::overlay_edition_at(&cfg, &alpha.id.to_string()).unwrap();
     let dec = Decision {
         id: new_id(),
         task_id: ta.id,
@@ -2967,21 +2988,20 @@ fn engine_binds_tasks_to_their_projects_effective_profile() {
         rationale: Some("section ratified".into()),
         refs: vec!["dom/x".into()],
         created_at: Utc::now(),
+        payload: serde_json::to_value(ProfileRatification {
+            project_id: alpha.id.to_string(),
+            file: devai_store::config::overlay_rel_path(&alpha.id.to_string()),
+            edition,
+            items: vec!["dom/x".into()],
+            revokes: None,
+        })
+        .unwrap(),
     };
     store.record_decision(&dec).unwrap();
-    let overlay_dir = cfg.join("profiles");
-    std::fs::create_dir_all(&overlay_dir).unwrap();
-    std::fs::write(
-        overlay_dir.join(format!("{}.overlay.yaml", alpha.id)),
-        format!(
-            r#"project_id: "{}"
-base_identity: base@1
-overlay_version: 1
-items:
-  - {{kind: add, target_id: dom/x, ratified_by: {}, add: {{statement: domain invariant x, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.10}}}}
-"#,
-            alpha.id, dec.id
-        ),
+    devai_store::config::set_ratification_pointers(
+        &overlay_path,
+        &dec.id.to_string(),
+        &["dom/x".to_string()],
     )
     .unwrap();
 

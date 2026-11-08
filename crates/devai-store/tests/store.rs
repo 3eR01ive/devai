@@ -320,6 +320,7 @@ fn export_import_roundtrip_restores_everything() {
             rationale: Some("ok".into()),
             refs: vec![spec1.id.to_string()],
             created_at: now(),
+            payload: serde_json::Value::Null,
         })
         .unwrap();
     t = store.get_task(&t.id.to_string()).unwrap();

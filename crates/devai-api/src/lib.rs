@@ -46,10 +46,12 @@ pub use devai_store::{DB_FILE_NAME, HOME_DIR_NAME};
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
     ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
-    MergeResult, MutationResult, OverrideResult, ProjectAddReq, PublishOutcome, PublishReq,
-    PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome, ReviseReq, RunOutcome, RunReq,
-    TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome, TaskProjectSetOutcome,
-    TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult, WorkflowOp,
+    MergeResult, MutationResult, OverrideResult, ProfileRatifyOutcome, ProfileRatifyReq,
+    ProfileRevokeOutcome, ProfileRevokeReq, ProfileState, ProfileStateItem, ProjectAddReq,
+    PublishOutcome, PublishReq, PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome,
+    ReviseReq, RunOutcome, RunReq, TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome,
+    TaskProjectSetOutcome, TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult,
+    WorkflowOp,
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 pub use signature::{
@@ -86,6 +88,21 @@ fn group_by_task<T>(rows: Vec<T>, task_id: impl Fn(&T) -> Id) -> TaskIndex<T> {
     index
 }
 
+/// WHO is calling an operation, as the DOOR declared it (RV4 AC2). A
+/// human-only act must not be reachable from a role/engine run, and the
+/// caller's actor string is not evidence of what it is — the session kind is.
+/// The API, not the door, decides what a non-human session may not do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    /// The operator's own process: an interactive shell, no run marker.
+    Human,
+    /// A role/engine run. The platform exports `DEVAI_EVIDENCE_DIR` to every
+    /// role process it spawns (REQ-WT-05 — the sink is platform-chosen, the
+    /// agent never chooses it), so a CLI invocation inheriting that marker
+    /// is a run of a role, not the operator's hand.
+    Role,
+}
+
 /// One store home behind the typed operation surface. The `Store` handle
 /// is OWNED here and never exposed (REQ-MUT-03): cycle 1 borrowed it from
 /// the CLI (the accepted cycle-1 boundary); cycle 2 inverted the
@@ -96,6 +113,7 @@ pub struct Api {
     store: Store,
     home: PathBuf,
     actor: String,
+    session: SessionKind,
 }
 
 impl Api {
@@ -104,10 +122,18 @@ impl Api {
     /// the registry — it happens before the domain exists — but it is also
     /// no longer a consumer-side `Store::open`. The handle stays inside.
     pub fn open(home: &Path, actor: &str) -> ApiResult<Api> {
+        Self::open_session(home, actor, SessionKind::Human)
+    }
+
+    /// The same entry with the session's provenance made explicit: the CLI
+    /// classifies its own process (see [`SessionKind`]) and the API enforces
+    /// the human-only acts against it.
+    pub fn open_session(home: &Path, actor: &str, session: SessionKind) -> ApiResult<Api> {
         Ok(Api {
             store: Store::open(home)?,
             home: home.to_path_buf(),
             actor: actor.to_string(),
+            session,
         })
     }
 
@@ -124,6 +150,9 @@ impl Api {
             store: Store::open_read_only(home)?,
             home: home.to_path_buf(),
             actor: actor.to_string(),
+            // An observation handle is the human UI's read plane; it writes
+            // nothing, so the human-only gate never sees it.
+            session: SessionKind::Human,
         })
     }
 

@@ -17,13 +17,13 @@ use uuid::Uuid;
 
 use crate::outln;
 use crate::{
-    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd,
-    TaskCmd,
+    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ProfileCmd, ProjectCmd, QuestionCmd,
+    RoleCmd, TaskCmd,
 };
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
-    MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq,
-    TaskProjectSetReq, TaskRenameReq,
+    MergeRecordReq, MutationResult, ProfileRatifyReq, ProfileRevokeReq, ProjectAddReq, PublishReq,
+    ReviseReq, RunReq, TaskCreateReq, TaskProjectSetReq, TaskRenameReq,
 };
 
 pub struct Ctx {
@@ -46,7 +46,19 @@ impl Ctx {
         // and OWNS the store handle — the bootstrap entry stays outside the
         // operation registry (RATIFIED OQ-10) but is no longer consumer-
         // side store access. Every command dispatches through `Ctx::api`.
-        let api = Api::open(&dir, &actor).context("open local store")?;
+        //
+        // RV4 AC2: the CLI is also the one place that can tell a human shell
+        // from a role run. The adapters export the run's artifact sink
+        // (`DEVAI_EVIDENCE_DIR`, REQ-WT-05) to every role process they spawn
+        // and the agent never chooses it, so a `devai` invocation inheriting
+        // that marker IS a role run; the API then refuses the human-only acts
+        // against the declared session instead of trusting the actor string.
+        let session = if std::env::var_os("DEVAI_EVIDENCE_DIR").is_some() {
+            devai_api::SessionKind::Role
+        } else {
+            devai_api::SessionKind::Human
+        };
+        let api = Api::open_session(&dir, &actor, session).context("open local store")?;
         Ok(Ctx { api })
     }
 
@@ -79,6 +91,7 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
         // registry.
         Cmd::Init { config } => init(ctx, config.as_deref(), json),
         Cmd::Project(c) => project(ctx, c, json),
+        Cmd::Profile(c) => profile(ctx, c, json),
         Cmd::Task(c) => task(ctx, c, json),
         Cmd::Artifact(c) => artifact(ctx, c, json),
         Cmd::Question(c) => question(ctx, c, json),
@@ -220,6 +233,139 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
             None => bail!("project `{id}` not found"),
         },
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// profile rules ratification (task 01a1bacf)
+// ---------------------------------------------------------------------------
+
+/// The HUMAN door to the project overlay. `status` is a read; `ratify` and
+/// `revoke` are human-only operations of the API registry (no engine, role
+/// or agent path reaches them). Presentation only: the fingerprint, the
+/// force rule and the decision row all come from the API.
+fn profile(ctx: &Ctx, cmd: ProfileCmd, json: bool) -> Result<()> {
+    match cmd {
+        ProfileCmd::Status { project } => profile_status(ctx, &project, json),
+        ProfileCmd::Ratify {
+            task,
+            project,
+            items,
+            all,
+            rationale,
+        } => profile_ratify(
+            ctx,
+            ProfileRatifyReq {
+                task,
+                project,
+                items,
+                all,
+                rationale,
+            },
+            json,
+        ),
+        ProfileCmd::Revoke {
+            decision,
+            rationale,
+        } => profile_revoke(
+            ctx,
+            ProfileRevokeReq {
+                decision,
+                rationale,
+            },
+            json,
+        ),
+    }
+}
+
+/// `profile status`: the edition fingerprint and every item's force. One line
+/// per item, and the OUT line always carries the reason, so a narrowed profile
+/// is never silent (RV9).
+fn profile_status(ctx: &Ctx, project: &str, json: bool) -> Result<()> {
+    let s = ctx.api().profile_state(project).map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&s)?);
+        return Ok(());
+    }
+    outln!("project: {} ({})", s.project_name, s.project_id);
+    outln!("rules:   {}", s.file);
+    outln!("edition: {}", s.edition);
+    outln!(
+        "items:   {} (in force: {})",
+        s.items.len(),
+        s.items.iter().filter(|i| i.in_force).count()
+    );
+    for i in &s.items {
+        match (&i.in_force, &i.decision, &i.actor) {
+            (true, Some(d), Some(a)) => {
+                outln!("  IN FORCE  {}  by {}  decision {}", i.target_id, a, d)
+            }
+            _ => outln!(
+                "  OUT       {}  {}",
+                i.target_id,
+                i.reason.as_deref().unwrap_or("нератифицирован")
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// `profile ratify`: the human act. The line says whether the decision was
+/// RECORDED now or reused, so an operator can tell a fresh act from a repeat.
+fn profile_ratify(ctx: &Ctx, req: ProfileRatifyReq, json: bool) -> Result<()> {
+    let r = ctx.api().profile_ratify(req).map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    outln!(
+        "ratified: decision {} ({})",
+        r.decision.id,
+        if r.recorded_now {
+            "recorded"
+        } else {
+            "already recorded — reused"
+        }
+    );
+    outln!("project: {}  file: {}", r.project_id, r.file);
+    outln!("edition: {}", r.edition);
+    outln!("items:   {}", r.items.join(", "));
+    outln!(
+        "actor:   {}  rationale: {}",
+        r.decision.actor,
+        r.decision.rationale.as_deref().unwrap_or("")
+    );
+    outln!(
+        "next:    profile status {} — the items are now in force",
+        r.project_id
+    );
+    Ok(())
+}
+
+/// `profile revoke`: the separate human act that takes a ratification out of
+/// force. The closing line also states that the rules file was NOT rewritten —
+/// that is the promise of RV6, not an implementation detail.
+fn profile_revoke(ctx: &Ctx, req: ProfileRevokeReq, json: bool) -> Result<()> {
+    let r = ctx.api().profile_revoke(req).map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    outln!(
+        "revoked: decision {} takes {} out of force",
+        r.decision.id,
+        r.revoked.id
+    );
+    outln!(
+        "project: {}  file: {}  edition: {}",
+        r.project_id,
+        r.file,
+        r.edition
+    );
+    outln!(
+        "items:   {} — now OUT of force; the rules file was not touched",
+        r.items.join(", ")
+    );
     Ok(())
 }
 
@@ -550,6 +696,15 @@ fn task_decisions(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
             );
             if !d.refs.is_empty() {
                 outln!("    refs: {}", d.refs.join(", "));
+            }
+            // RV5 (task 01a1bacf): a ratification shows the EDITION it bound
+            // and, for a revocation, the decision it took out of force — the
+            // payload is the decision's own fact, not a re-derivation.
+            if let Some(edition) = d.payload.get("edition").and_then(|v| v.as_str()) {
+                outln!("    edition: {edition}");
+            }
+            if let Some(revokes) = d.payload.get("revokes").and_then(|v| v.as_str()) {
+                outln!("    revokes: {revokes}");
             }
         }
     }

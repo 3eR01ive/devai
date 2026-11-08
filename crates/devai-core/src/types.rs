@@ -822,6 +822,36 @@ pub struct Decision {
     pub rationale: Option<String>,
     pub refs: Vec<String>,
     pub created_at: Timestamp,
+    /// Kind-specific structured data stored WITH the decision row (schema
+    /// v10). `profile_ratification` keeps its `<project, file, edition,
+    /// items>` binding here so `task decisions` and every consumer read the
+    /// ratified EDITION from the row itself instead of re-deriving it from
+    /// the rules file at read time (no-read-time-rederivation). `Null` for
+    /// kinds that carry no payload — the historic row shape.
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+/// The `payload` of a `profile_ratification` decision (task 01a1bacf,
+/// RV1/RV2/RV6): WHAT was ratified — one project, one file edition
+/// fingerprint, the covered item ids — and, for a revocation row, which
+/// APPROVED ratification it took out of force.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProfileRatification {
+    /// `projects.id` the ratification belongs to (never inferred from the
+    /// carrier task — ASM-2).
+    pub project_id: String,
+    /// The rules file, relative to the config directory
+    /// (`profiles/<project_id>.overlay.yaml`).
+    pub file: String,
+    /// Fingerprint of the ratified EDITION: `sha256:<hex>` over the rule
+    /// content with the ratification pointers stripped (ASM-1).
+    pub edition: String,
+    /// The covered overlay item ids (full list, no shorthand).
+    pub items: Vec<String>,
+    /// Set on a REVOCATION row: the APPROVED decision it takes out of force.
+    #[serde(default)]
+    pub revokes: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -901,14 +931,15 @@ pub mod decision_kind {
     pub const REQUIREMENTS_APPROVAL: &str = "requirements_approval";
     /// Profile overlay ratification (REQ-SP-301 schema, load-side mechanism
     /// already in C1 per REQ-SP-106/A-5): a human decision confirming one
-    /// overlay item (or a section of items) — `refs` carry the item target
-    /// ids it covers, and ONLY rows of this kind with verdict APPROVED give
-    /// a `profiles/<projects.id>.overlay.yaml` item force. The store-side
-    /// read is `Store::ratified_profile_refs`; the human surface (generic
-    /// decide) is cycle C4 (ratified OQ-SP-6) — the kind exists now so the
-    /// load cross-check and the future surface read the same vocabulary.
-    /// A distinct kind (not requirements_approval/rework_merge) keeps the
-    /// decision history distinguishable by purpose (spec v3 RV5 note).
+    /// overlay item (or a section of items) — `payload` carries the project,
+    /// the rules file, the EDITION fingerprint and the covered item ids, and
+    /// ONLY rows of this kind with verdict APPROVED that no later revocation
+    /// cites give a `profiles/<projects.id>.overlay.yaml` item force. The
+    /// read-side index is `config::ratification_index`; the human surface is
+    /// the `profile ratify` / `profile revoke` CLI (task 01a1bacf), which is
+    /// the ONLY writer of this kind. A distinct kind (not
+    /// requirements_approval/rework_merge) keeps the decision history
+    /// distinguishable by purpose (spec v3 RV5 note).
     pub const PROFILE_RATIFICATION: &str = "profile_ratification";
     /// The empty-rework gate (REQ-RG-03): the operator's explicit ratification
     /// that a QA return needed NO new changes — `refs` carry the pair
@@ -1056,6 +1087,15 @@ pub mod event_kind {
     /// distinguishable outcome — this event, and NEVER a verdict claim: the
     /// transition proceeds without a "gate passed" verdict in its payload.
     pub const QA_REWORK_GATE_INCOMPARABLE: &str = "qa.rework_gate_incomparable";
+    /// A human ratified a PROJECT RULES EDITION (task 01a1bacf, RV5): one
+    /// append-only fact per ratification act, payload carrying the decision
+    /// id, the project, the file, the edition fingerprint and the covered
+    /// item ids. Distinct from `requirements.approved` by kind AND payload:
+    /// ratifying project rules never approves a task's spec.
+    pub const PROFILE_RATIFIED: &str = "profile.ratified";
+    /// A human took a ratification out of force (RV6): payload names the
+    /// revoking decision and the revoked one. The rules file is not touched.
+    pub const PROFILE_REVOKED: &str = "profile.revoked";
 
     /// The COMPLETE enumerable vocabulary of kinds the platform may persist.
     /// Load-time policy validation (the REWORK delivery table in
@@ -1110,6 +1150,8 @@ pub mod event_kind {
         WORKTREE_COMMITTED,
         QA_REWORK_GATE_TRIPPED,
         QA_REWORK_GATE_INCOMPARABLE,
+        PROFILE_RATIFIED,
+        PROFILE_REVOKED,
     ];
 }
 
@@ -1152,6 +1194,12 @@ pub mod json_field {
     pub const PREV_COMMIT: &str = "prev_commit";
     pub const CURRENT_COMMIT: &str = "current_commit";
     pub const RATIFIED_BY: &str = "ratified_by";
+    /// The id of the stored DECISION a human gate event cites.
+    pub const DECISION: &str = "decision";
+    /// The APPROVED ratification a `profile_ratification` revocation row
+    /// takes out of force (RV6): one vocabulary for the stored payload, the
+    /// force index and the task history event.
+    pub const REVOKES: &str = "revokes";
     pub const QA_RETURN_RATIONALE: &str = "qa_return_rationale";
     // Migration (one-time repair) records.
     pub const BACKFILL: &str = "backfill";
@@ -1225,6 +1273,8 @@ pub mod json_field {
         PREV_COMMIT,
         CURRENT_COMMIT,
         RATIFIED_BY,
+        DECISION,
+        REVOKES,
         QA_RETURN_RATIONALE,
         BACKFILL,
         SCRIPT_PATH,

@@ -178,6 +178,7 @@ fn signature_prints_every_populated_block_and_never_the_fallback_paragraph() {
                 rationale: Some("подписываю".into()),
                 refs: vec![],
                 created_at: Utc::now(),
+                payload: serde_json::Value::Null,
             })
             .unwrap();
     }

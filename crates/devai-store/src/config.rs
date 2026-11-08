@@ -24,9 +24,11 @@ use std::path::{Path, PathBuf};
 
 use devai_core::inbox::InboxWaitPolicy;
 use devai_core::types::{
-    ContractRef, RoleDefinition, Timestamp, Verdict, event_kind, json_field, new_id,
+    ContractRef, Decision, ProfileRatification, RoleDefinition, Timestamp, Verdict, decision_kind,
+    event_kind, json_field, new_id,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{Store, StoreError, StoreResult};
 
@@ -734,8 +736,11 @@ pub struct OverlayItem {
     /// add: a NEW id (never an existing base id).
     pub target_id: String,
     /// id of a decisions row (kind=profile_ratification, verdict=APPROVED)
-    /// whose refs cover `target_id`. Non-empty is structural; force is the
-    /// cross-check (A-5) — a dangling/foreign/unapproved ref drops the item.
+    /// whose refs cover `target_id`. An EMPTY value is the normal state of a
+    /// fresh rules file (RV8): the file loads and the item is announced as
+    /// out of force. Force is the cross-check (A-5) — a dangling, foreign,
+    /// revoked or edition-stale ref drops the item with a named reason
+    /// (`item_forces`, RV2).
     #[serde(default)]
     pub ratified_by: String,
     /// add: the full check payload.
@@ -777,19 +782,421 @@ pub struct Composition {
 /// The conventional delta path for one project (single file per projects.id
 /// — REQ-SP-106 AC "два оверлея на один id невозможны (один путь)").
 pub fn overlay_path(cfg_dir: &Path, project_id: &str) -> PathBuf {
-    cfg_dir
-        .join("profiles")
-        .join(format!("{project_id}.overlay.yaml"))
+    cfg_dir.join(overlay_rel_path(project_id))
 }
 
-/// Read and structurally validate the delta (layer (a) of REQ-SP-106)
-/// BEFORE any composition. Structural violations are hard errors naming
-/// the item: add colliding with a base id or another item, weight out of
-/// (0,1), empty ratified_by. The item KIND is the serde enum's business —
-/// an unknown variant never reaches this function.
+/// The same path as it is RECORDED in a ratification decision: relative to
+/// the config directory, so a home moved to another root keeps a readable
+/// provenance without a machine-specific absolute path.
+pub fn overlay_rel_path(project_id: &str) -> String {
+    format!("profiles/{project_id}.overlay.yaml")
+}
+
+/// The EDITION fingerprint of the rules content (ASM-1, RV2): the parsed
+/// document in canonical form — items sorted by target_id, every
+/// ratification pointer stripped — hashed with SHA-256 as `sha256:<hex>`.
+///
+/// Why canonical form and not raw bytes: `ratify` itself WRITES the
+/// pointers into the file (RV3), so a byte-level digest would invalidate
+/// the very act that produced it. Any edit to the RULE content — item
+/// text, weight, an added/removed item, the header — changes this
+/// fingerprint; rewriting only `ratified_by` (or reordering items, which
+/// composition already ignores) does not. That is exactly the force rule
+/// RV2 states.
+pub fn overlay_edition(overlay: &ProfileOverlay) -> String {
+    let mut doc = serde_json::to_value(overlay).unwrap_or(serde_json::Value::Null);
+    if let Some(items) = doc.get_mut("items").and_then(|v| v.as_array_mut()) {
+        for item in items.iter_mut() {
+            if let Some(map) = item.as_object_mut() {
+                map.remove("ratified_by");
+            }
+        }
+        items.sort_by(|a, b| {
+            let key = |v: &serde_json::Value| {
+                v.get("target_id")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            key(a).cmp(&key(b))
+        });
+    }
+    let bytes = serde_json::to_vec(&doc).unwrap_or_default();
+    format!("sha256:{}", crate::hex_encode(&Sha256::digest(&bytes)))
+}
+
+/// The edition fingerprint of the CURRENT rules file of one project. The
+/// command computes it itself (RV1: the human never types a hash), and the
+/// human state view prints the same value, so the two can be compared.
+pub fn overlay_edition_at(
+    cfg_dir: &Path,
+    project_id: &str,
+) -> StoreResult<(String, ProfileOverlay)> {
+    let path = overlay_path(cfg_dir, project_id);
+    let overlay = load_overlay(&path).map_err(|e| match e {
+        StoreError::Config(m) => cfg_err(format!("{}: {m}", path.display())),
+        other => other,
+    })?;
+    Ok((overlay_edition(&overlay), overlay))
+}
+
+/// One stored `profile_ratification` row as the force rule sees it (ASM-3):
+/// the typed edition binding, who ratified, the row's verdict and whether the
+/// row still gives force.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RatificationRow {
+    pub payload: ProfileRatification,
+    pub actor: String,
+    pub verdict: Verdict,
+    /// An APPROVED row cited by a later revocation row gives no force.
+    pub live: bool,
+}
+
+/// THE index of stored ratification rows: decision id -> row, with the
+/// revocation filter applied exactly ONCE. Composition, the human state view
+/// and the reuse key of the ratify act all read this map, so "which
+/// ratification is in force" cannot drift between readers.
+///
+/// A row whose payload does not decode is a VISIBLE corruption: skipping it
+/// would make a torn act read as "never ratified" and let the next act
+/// silently supersede history. Invalid JSON fails earlier still, at
+/// `rows::decision_from_row`.
+pub fn ratification_index(rows: &[Decision]) -> StoreResult<BTreeMap<String, RatificationRow>> {
+    let ratifications = || {
+        rows.iter()
+            .filter(|d| d.kind == decision_kind::PROFILE_RATIFICATION)
+    };
+    let revoked: HashSet<String> = ratifications()
+        .filter(|d| d.verdict != Verdict::Approved)
+        .filter_map(|d| {
+            d.payload
+                .get(json_field::REVOKES)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut index = BTreeMap::new();
+    for row in ratifications() {
+        let payload: ProfileRatification =
+            serde_json::from_value(row.payload.clone()).map_err(|e| {
+                crate::error::StoreError::Corrupt(format!(
+                    "decision {} ({}) carries no ratification binding (project/edition/items): {e}",
+                    row.id, row.kind
+                ))
+            })?;
+        let live = row.verdict == Verdict::Approved && !revoked.contains(&row.id.to_string());
+        index.insert(
+            row.id.to_string(),
+            RatificationRow {
+                payload,
+                actor: row.actor.clone(),
+                verdict: row.verdict,
+                live,
+            },
+        );
+    }
+    Ok(index)
+}
+
+/// Force state of ONE overlay item, as the loader sees it. `force` is the
+/// live decision that keeps the item in force; `reason` says WHY an item is
+/// out — the RV8 vocabulary (empty pointer, unknown decision, wrong kind or
+/// verdict, another project, a changed edition, a coverage gap, a
+/// revocation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemForce {
+    pub force: Option<(String, String)>,
+    pub reason: Option<String>,
+}
+
+impl ItemForce {
+    /// An item that gives no force, carrying the reason a human reads.
+    fn out(reason: impl Into<String>) -> ItemForce {
+        ItemForce {
+            force: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Resolve every item of the overlay against the CURRENT edition and the
+/// stored ratification index. ONE function feeds composition, the human
+/// state view and the loader announcements, so a verdict on an item is
+/// stated once and never re-derived differently by another reader.
+pub fn item_forces(
+    overlay: &ProfileOverlay,
+    edition: &str,
+    ratifications: &BTreeMap<String, RatificationRow>,
+) -> BTreeMap<String, ItemForce> {
+    let mut out = BTreeMap::new();
+    for item in &overlay.items {
+        let state = force_of(item, &overlay.project_id, edition, ratifications);
+        out.insert(item.target_id.clone(), state);
+    }
+    out
+}
+
+fn force_of(
+    item: &OverlayItem,
+    project_id: &str,
+    edition: &str,
+    ratifications: &BTreeMap<String, RatificationRow>,
+) -> ItemForce {
+    if item.ratified_by.trim().is_empty() {
+        return ItemForce::out("нератифицирован: указатель на решение не задан");
+    }
+    let Some(row) = ratifications.get(&item.ratified_by) else {
+        return ItemForce::out(format!(
+            "нератифицирован: указатель `{}` не называет решение-ратификацию профиля",
+            item.ratified_by
+        ));
+    };
+    if row.verdict != Verdict::Approved {
+        return ItemForce::out(format!(
+            "нератифицирован: решение `{}` не является APPROVED-ратификацией профиля",
+            item.ratified_by
+        ));
+    }
+    if !row.live {
+        return ItemForce::out("ратификация отозвана");
+    }
+    if let Some(state) = binding_outage(&row.payload, project_id, edition, item) {
+        return state;
+    }
+    ItemForce {
+        force: Some((item.ratified_by.clone(), row.actor.clone())),
+        reason: None,
+    }
+}
+
+/// The RV2/RV7 binding check of ONE live ratification: `Some(out-of-force
+/// state)` when the binding does not cover THIS item, `None` when it does.
+/// The three reasons are the vocabulary the loader announcement, the human
+/// state view and the CLI print, so they are spelled exactly ONCE.
+fn binding_outage(
+    payload: &ProfileRatification,
+    project_id: &str,
+    edition: &str,
+    item: &OverlayItem,
+) -> Option<ItemForce> {
+    if payload.project_id != project_id {
+        return Some(ItemForce::out(format!(
+            "нератифицирован: решение `{}` ратифицирует правила другого проекта",
+            item.ratified_by
+        )));
+    }
+    if payload.edition != edition {
+        return Some(ItemForce::out("редакция изменена после ратификации"));
+    }
+    if !payload.items.iter().any(|i| i == &item.target_id) {
+        return Some(ItemForce::out("решение не покрывает этот пункт"));
+    }
+    None
+}
+
+/// Read the delta (layer (a) of REQ-SP-106). Structural validation of the
+/// items runs at composition (`validate_overlay`): an add colliding with a
+/// base id or a sibling, or a weight out of (0,1), is a hard error naming
+/// the item. An EMPTY `ratified_by` is deliberately NOT a load error (RV8):
+/// a fresh rules file loads, and composition drops + announces the item.
 pub fn load_overlay(path: &Path) -> StoreResult<ProfileOverlay> {
     let overlay: ProfileOverlay = parse_yaml(path)?;
     Ok(overlay)
+}
+
+/// Write the ratification POINTERS into the rules file (RV3): every covered
+/// item gets `ratified_by: <decision id>`. This is the second half of the
+/// human act; the fingerprint is computed over the document WITHOUT these
+/// pointers, so writing them does not create a new edition.
+///
+/// Block-style item lists are edited line-by-line, so a human's comments and
+/// formatting survive the act; a flow-style file (one `{...}` mapping per
+/// item) falls back to a canonical re-serialisation of the parsed document.
+pub fn set_ratification_pointers(
+    path: &Path,
+    decision_id: &str,
+    target_ids: &[String],
+) -> StoreResult<()> {
+    let text =
+        fs::read_to_string(path).map_err(|e| cfg_err(format!("read {}: {e}", path.display())))?;
+    let updated = rewrite_pointers(&text, decision_id, target_ids)
+        .or_else(|| rewrite_pointers_structured(&text, decision_id, target_ids));
+    let Some(updated) = updated else {
+        return Err(cfg_err(format!(
+            "{}: cannot place the ratification pointer for every covered item — the file does not parse as an overlay or an item is missing",
+            path.display()
+        )));
+    };
+    write_atomically(path, &updated)
+        .map_err(|e| cfg_err(format!("write {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Replace the file through a SIBLING temp file + rename (RV3 AC1). A plain
+/// `fs::write` truncates first, so a failure mid-write leaves a half rules
+/// file — and the act's promise is that a failed pointer half gives items no
+/// force, not that it eats the neighbouring rules. `rename` is atomic within
+/// a directory: the reader sees the previous edition or the new one, never a
+/// prefix of either. A failed rename removes the temp file so the next
+/// attempt is not wedged by a leftover.
+fn write_atomically(path: &Path, body: &str) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "overlay".into());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Line-preserving pointer edit for block-style item lists. `None` when an
+/// item start or a covered target cannot be located (the caller then falls
+/// back to the structured rewrite).
+fn rewrite_pointers(text: &str, decision_id: &str, targets: &[String]) -> Option<String> {
+    let wanted: HashSet<&str> = targets.iter().map(String::as_str).collect();
+    let mut done: HashSet<String> = HashSet::new();
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut i = 0;
+    while i < lines.len() {
+        if !is_item_start(lines[i]) {
+            out.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+        let end = item_block_end(&lines, i);
+        out.push_str(&rewrite_item_block(
+            &lines[i..end],
+            decision_id,
+            &wanted,
+            &mut done,
+        ));
+        i = end;
+    }
+    if wanted.iter().all(|t| done.contains(*t)) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// A block-style item opens with `- kind:`; the dash may be indented, so the
+/// test runs on the trimmed line (the indent is read again by the block end).
+fn is_item_start(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix('-')
+        .map(|rest| rest.trim_start().starts_with("kind:"))
+        .unwrap_or(false)
+}
+
+/// The exclusive end of the item block that starts at `start`: the first
+/// following line indented no deeper than the dash. Blank lines do not end a
+/// block (a human may separate the item's fields), so a stray blank line
+/// never splits an item in two.
+fn item_block_end(lines: &[&str], start: usize) -> usize {
+    let dash_indent = lines[start].len() - lines[start].trim_start().len();
+    let mut j = start + 1;
+    while j < lines.len() {
+        let l = lines[j];
+        let lt = l.trim_start();
+        if lt.trim().is_empty() {
+            j += 1;
+            continue;
+        }
+        if l.len() - lt.len() <= dash_indent {
+            break;
+        }
+        j += 1;
+    }
+    j
+}
+
+fn rewrite_item_block(
+    block: &[&str],
+    decision_id: &str,
+    wanted: &HashSet<&str>,
+    done: &mut HashSet<String>,
+) -> String {
+    let Some((ti, pointer)) = item_field_lines(block) else {
+        return block.concat();
+    };
+    let raw = field_value(block[ti]);
+    let hit = wanted.contains(raw.as_str());
+    if hit {
+        done.insert(raw);
+    }
+    let pointer_line = format!("{}ratified_by: {decision_id}\n", indent_of(block[ti]));
+    let mut out = String::new();
+    for (k, l) in block.iter().enumerate() {
+        if k == ti {
+            out.push_str(l);
+            // No `ratified_by` field yet: the pointer is inserted right after
+            // `target_id`, where a human would have written it.
+            if hit && pointer.is_none() {
+                if !l.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&pointer_line);
+            }
+        } else if Some(k) == pointer && hit {
+            out.push_str(&pointer_line);
+        } else {
+            out.push_str(l);
+        }
+    }
+    out
+}
+
+/// The leading whitespace of a YAML line — the indent a written pointer
+/// inherits so it stays inside its item block.
+fn indent_of(line: &str) -> String {
+    line.chars().take_while(|c| c.is_whitespace()).collect()
+}
+
+/// The `target_id` line and the `ratified_by` line of one item block, if the
+/// block has the former. `None` means "not an addressable item" — the caller
+/// copies the block verbatim instead of inventing a pointer position.
+fn item_field_lines(block: &[&str]) -> Option<(usize, Option<usize>)> {
+    let mut target: Option<usize> = None;
+    let mut pointer: Option<usize> = None;
+    for (k, l) in block.iter().enumerate() {
+        let t = l.trim_start();
+        if t.starts_with("target_id:") {
+            target = Some(k);
+        } else if t.starts_with("ratified_by:") {
+            pointer = Some(k);
+        }
+    }
+    target.map(|ti| (ti, pointer))
+}
+
+/// The scalar value of a `key: value` line, with optional quotes stripped.
+fn field_value(line: &str) -> String {
+    line.split_once(':')
+        .map(|(_, v)| v.trim().trim_matches(|c| c == '"' || c == '\''))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Canonical rewrite fallback: parse, set the pointers, re-serialise. Used
+/// for flow-style item lists that a line edit cannot address.
+fn rewrite_pointers_structured(
+    text: &str,
+    decision_id: &str,
+    targets: &[String],
+) -> Option<String> {
+    let mut overlay: ProfileOverlay = serde_yaml::from_str(text).ok()?;
+    if overlay.items.is_empty() {
+        return None;
+    }
+    for item in overlay.items.iter_mut() {
+        if targets.iter().any(|t| t == &item.target_id) {
+            item.ratified_by = decision_id.to_string();
+        }
+    }
+    serde_yaml::to_string(&overlay).ok()
 }
 
 fn base_target_ids(base: &Profile) -> HashSet<&str> {
@@ -812,14 +1219,10 @@ pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> OverlayResu
     let mut seen: HashSet<&str> = HashSet::new();
     for item in &overlay.items {
         let who = format!("overlay item `{}`", item.target_id);
-        if item.ratified_by.trim().is_empty() {
-            return Err(OverlayError::new(
-                "REQ-SP-106",
-                format!(
-                    "{who}: `ratified_by` is empty — an item without a human decision reference has no force path (A-5/REQ-SP-106)"
-                ),
-            ));
-        }
+        // RV8: an EMPTY `ratified_by` is a NORMAL state of a fresh rules
+        // file, not a structural load failure — the item is dropped and
+        // announced by composition. Structural faults of the item itself
+        // (id collision, weight out of range, duplicate) still refuse.
         match item.kind {
             OverlayKind::Add => {
                 if base_ids.contains(item.target_id.as_str()) {
@@ -858,13 +1261,13 @@ pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> OverlayResu
 }
 
 /// Compose the effective profile: base + the RATIFIED subset of the delta.
-/// `ratified` maps decision id -> refs (only rows with
-/// kind=profile_ratification, verdict=APPROVED reach it — the force
-/// cross-check, layer (b)). Items whose `ratified_by` does not resolve to
-/// such a row whose refs cover the item are DROPPED and announced, so a
-/// manual edit without a valid decision reference never enters force —
-/// already in C1-without-C3, where the table has no such rows and every
-/// overlay resolves to the pure base (A-5).
+/// `ratifications` are the STORED `profile_ratification` decision rows
+/// (APPROVED ones and their revocations). An item enters force only when
+/// its `ratified_by` resolves to a LIVE APPROVED ratification that (a)
+/// belongs to THIS project, (b) records the CURRENT edition fingerprint of
+/// the rules file, and (c) covers the item id (task 01a1bacf, RV2/RV7/RV8).
+/// Every other item is DROPPED and announced with its own reason — a
+/// manual edit without a valid decision reference never enters force.
 ///
 /// Weights follow REQ-SP-107 exactly: W = Σ ratified add weights;
 /// W >= 1 rejects the composition naming the items; otherwise base weights
@@ -875,13 +1278,15 @@ pub fn validate_overlay(overlay: &ProfileOverlay, base: &Profile) -> OverlayResu
 pub fn compose_profile(
     base: &Profile,
     overlay: &ProfileOverlay,
-    ratified: &BTreeMap<String, Vec<String>>,
+    ratifications: &BTreeMap<String, RatificationRow>,
 ) -> OverlayResult<Composition> {
     validate_overlay(overlay, base)?;
+    let edition = overlay_edition(overlay);
+    let forces = item_forces(overlay, &edition, ratifications);
 
     let mut applied: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
-    let warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     // Deterministic processing order: items sorted by target_id.
     let mut ordered: Vec<&OverlayItem> = overlay.items.iter().collect();
@@ -889,13 +1294,21 @@ pub fn compose_profile(
     let in_force: Vec<&OverlayItem> = ordered
         .into_iter()
         .filter(|item| {
-            let force = ratified
-                .get(&item.ratified_by)
-                .is_some_and(|refs| refs.iter().any(|r| r == &item.target_id));
+            let force = forces
+                .get(&item.target_id)
+                .is_some_and(|f| f.force.is_some());
             if force {
                 applied.push(item.target_id.clone());
             } else {
                 dropped.push(item.target_id.clone());
+                let reason = forces
+                    .get(&item.target_id)
+                    .and_then(|f| f.reason.clone())
+                    .unwrap_or_else(|| "нератифицирован".to_string());
+                warnings.push(format!(
+                    "overlay item `{}` NOT in force: {reason} — project judged without it (A-5)",
+                    item.target_id
+                ));
             }
             force
         })
@@ -1090,33 +1503,20 @@ pub fn resolve_effective_profile(
                     cfg_dir.join("evaluation").display()
                 ))
             })?;
-        let decisions = store.ratified_profile_decisions()?;
-        let ratified: BTreeMap<String, Vec<String>> = decisions
-            .iter()
-            .map(|(id, (refs, _actor))| (id.clone(), refs.clone()))
-            .collect();
-        let comp = compose_profile(base, &overlay, &ratified)
+        let rows = store.ratification_index()?;
+        let comp = compose_profile(base, &overlay, &rows)
             .map_err(|e| cfg_err(format!("{}: {e}", path.display())))?;
-        let mut warnings: Vec<String> = comp
-            .dropped
-            .iter()
-            .map(|id| {
-                format!(
-                    "overlay item `{id}` has no valid profile_ratification/APPROVED decision covering it — NOT in force, project judged without it (A-5)"
-                )
-            })
-            .chain(comp.warnings)
-            .collect();
+        let mut warnings = comp.warnings.clone();
         warnings.sort();
         // The anchor map of the human form (OQ-QH-2): only items that ACTUALLY
         // entered force, each with the decision that gave it force.
+        let forces = item_forces(&overlay, &overlay_edition(&overlay), &rows);
         let ratified_in_force: BTreeMap<String, (String, String)> = comp
             .applied
             .iter()
             .filter_map(|target| {
-                let item = overlay.items.iter().find(|i| &i.target_id == target)?;
-                let (_, actor) = decisions.get(&item.ratified_by)?;
-                Some((target.clone(), (item.ratified_by.clone(), actor.clone())))
+                let (decision, actor) = forces.get(target)?.force.clone()?;
+                Some((target.clone(), (decision, actor)))
             })
             .collect();
         Ok(Resolution {

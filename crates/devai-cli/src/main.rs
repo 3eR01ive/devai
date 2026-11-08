@@ -43,6 +43,12 @@ enum Cmd {
     },
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Project RULES ratification (task 01a1bacf): a HUMAN act that gives a
+    /// project's `profiles/<id>.overlay.yaml` edition force. The platform
+    /// computes the edition fingerprint itself; no engine, role or agent
+    /// path can create these decisions.
+    #[command(subcommand)]
+    Profile(ProfileCmd),
     #[command(subcommand)]
     Task(TaskCmd),
     #[command(subcommand)]
@@ -90,6 +96,48 @@ enum ProjectCmd {
     Get {
         /// Project id or name
         id: String,
+    },
+}
+
+/// Project rules ratification — the HUMAN door to the project overlay
+/// (task 01a1bacf). Every verb names the project explicitly; the edition
+/// fingerprint is computed by the platform, never typed by the operator.
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// Current rules state: the edition fingerprint and every item's force
+    /// (in force with the decision/actor, or OUT with the reason). Read-only.
+    Status {
+        /// Project id or name
+        project: String,
+    },
+    /// HUMAN-ONLY: ratify the CURRENT edition of a project's rules file,
+    /// covering the named items. Records the `profile_ratification` decision
+    /// (project, edition fingerprint, items, actor, rationale) and writes the
+    /// pointers into the file.
+    Ratify {
+        /// Carrier task of the decision (id or unique prefix)
+        #[arg(long)]
+        task: String,
+        /// Project id or name the rules belong to
+        #[arg(long)]
+        project: String,
+        /// Covered item ids (comma-separated); repeatable
+        #[arg(long, value_delimiter = ',')]
+        items: Vec<String>,
+        /// Cover EVERY item of the current edition (the decision still stores
+        /// the full explicit list)
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        rationale: Option<String>,
+    },
+    /// HUMAN-ONLY: revoke an APPROVED ratification (items leave force; the
+    /// rules file is not touched).
+    Revoke {
+        /// Ratification decision (id or unique prefix)
+        decision: String,
+        #[arg(long)]
+        rationale: Option<String>,
     },
 }
 

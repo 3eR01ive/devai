@@ -37,8 +37,9 @@ fn project(store: &Store, name: &str) -> Project {
 }
 
 /// A human ratification row as the load cross-check sees it: kind
-/// profile_ratification, verdict APPROVED, refs covering the item ids.
-fn ratify(store: &Store, task: &Task, refs: &[&str]) -> Id {
+/// profile_ratification, verdict APPROVED, the EDITION fingerprint of the
+/// rules content and the refs covering the item ids (task 01a1bacf, RV2).
+fn ratify(store: &Store, task: &Task, project_id: &str, edition: &str, refs: &[&str]) -> Id {
     let id = new_id();
     store
         .record_decision(&Decision {
@@ -50,15 +51,49 @@ fn ratify(store: &Store, task: &Task, refs: &[&str]) -> Id {
             rationale: Some("ratified item".into()),
             refs: refs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
+            payload: serde_json::to_value(ProfileRatification {
+                project_id: project_id.into(),
+                file: config::overlay_rel_path(project_id),
+                edition: edition.into(),
+                items: refs.iter().map(|s| s.to_string()).collect(),
+                revokes: None,
+            })
+            .unwrap(),
         })
         .unwrap();
     id
+}
+
+/// The edition fingerprint of a rules body BEFORE any decision id is known:
+/// the pointers are stripped from the digest, so the value does not depend
+/// on the `ratified_by` placeholder the test writes first (ASM-1).
+fn edition_of(body: &str) -> String {
+    let overlay: ProfileOverlay = serde_yaml::from_str(body).unwrap();
+    config::overlay_edition(&overlay)
 }
 
 fn write_overlay(cfg: &std::path::Path, project_id: &str, body: &str) {
     let p = overlay_path(cfg, project_id);
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(&p, body).unwrap();
+}
+
+/// Write the rules body with `PENDING` pointers, record ONE ratification
+/// bound to its edition, then rewrite the body with the decision id — the
+/// exact sequence the human command performs (task 01a1bacf, RV1/RV3).
+fn write_ratified(
+    store: &Store,
+    task: &Task,
+    cfg: &std::path::Path,
+    project_id: &str,
+    body_tpl: &str,
+    refs: &[&str],
+) -> String {
+    write_overlay(cfg, project_id, body_tpl);
+    let edition = edition_of(body_tpl);
+    let id = ratify(store, task, project_id, &edition, refs).to_string();
+    write_overlay(cfg, project_id, &body_tpl.replace("PENDING", &id));
+    id
 }
 
 fn task(store: &Store, project: Option<&Project>) -> Task {
@@ -165,19 +200,15 @@ fn ratified_overlay_composes_base_plus_added_rule() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let dec_add = ratify(&store, &t, &["dom/sovereignty"]).to_string();
     let pid = prj.id.to_string();
-    write_overlay(
-        &cfg,
-        &prj.id.to_string(),
-        &format!(
-            r#"project_id: "{pid}"
+    let body = format!(
+        r#"project_id: "{pid}"
 base_identity: base@1
 overlay_version: 3
 items:
   - kind: add
     target_id: dom/sovereignty
-    ratified_by: {dec_add}
+    ratified_by: PENDING
     add:
       statement: local-first — nothing may reach out past the declared adapter.
       detects: [security/injection]
@@ -192,8 +223,8 @@ items:
       section: platform-invariants
       section_title: Продуктовые инварианты
 "#
-        ),
     );
+    write_ratified(&store, &t, &cfg, &pid, &body, &["dom/sovereignty"]);
     let r = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
     let eff = r.profile.expect("effective profile");
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -255,22 +286,21 @@ fn add_weights_at_or_over_one_reject_the_publication() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let d1 = ratify(&store, &t, &["dom/one"]).to_string();
-    let d2 = ratify(&store, &t, &["dom/two"]).to_string();
     let pid = prj.id.to_string();
-    write_overlay(
-        &cfg,
-        &prj.id.to_string(),
-        &format!(
-            r#"project_id: "{pid}"
+    let body = format!(
+        r#"project_id: "{pid}"
 base_identity: base@1
 overlay_version: 1
 items:
-  - {{kind: add, target_id: dom/one, ratified_by: {d1}, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.6}}}}
-  - {{kind: add, target_id: dom/two, ratified_by: {d2}, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.4}}}}
+  - {{kind: add, target_id: dom/one, ratified_by: D1, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.6}}}}
+  - {{kind: add, target_id: dom/two, ratified_by: D2, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.4}}}}
 "#
-        ),
     );
+    write_overlay(&cfg, &pid, &body);
+    let ed = edition_of(&body);
+    let d1 = ratify(&store, &t, &pid, &ed, &["dom/one"]).to_string();
+    let d2 = ratify(&store, &t, &pid, &ed, &["dom/two"]).to_string();
+    write_overlay(&cfg, &pid, &body.replace("D1", &d1).replace("D2", &d2));
     let err = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string()))
         .unwrap_err()
         .to_string();
@@ -278,15 +308,15 @@ items:
     assert!(err.contains("dom/one") && err.contains("dom/two"), "{err}");
 }
 
-/// REQ-SP-106 layer (a): structural violations are rejected BEFORE
-/// composition — an add colliding with a base id, an item without
-/// ratified_by, and a file whose header id mismatches the projects.id key.
+/// REQ-SP-106 layer (a) + RV8: structural violations are rejected BEFORE
+/// composition (base-id collision, header mismatch), while an EMPTY
+/// ratification pointer is the NORMAL state of a fresh rules file: it
+/// loads, the item is announced as out of force, and the project is judged
+/// on the base (task 01a1bacf).
 #[test]
 fn structural_violations_are_rejected_before_composition() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
-    let t = task(&store, Some(&prj));
-    let dec = ratify(&store, &t, &["sec/injection"]).to_string();
     let pid = prj.id.to_string();
     write_overlay(
         &cfg,
@@ -296,7 +326,7 @@ fn structural_violations_are_rejected_before_composition() {
 base_identity: base@1
 overlay_version: 1
 items:
-  - {{kind: add, target_id: sec/injection, ratified_by: {dec}, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.1}}}}
+  - {{kind: add, target_id: sec/injection, ratified_by: some-decision, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.1}}}}
 "#
         ),
     );
@@ -317,10 +347,21 @@ items:
 "#
         ),
     );
-    let err = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string()))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("ratified_by"), "{err}");
+    let r = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string()))
+        .expect("an empty pointer is not a load failure (RV8)");
+    assert!(
+        r.profile
+            .expect("the base still judges the project")
+            .checks()
+            .iter()
+            .all(|c| c.id != "dom/no-decision")
+    );
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("dom/no-decision") && r.warnings[0].contains("NOT in force"),
+        "{}",
+        r.warnings[0]
+    );
 
     // Header id must equal the projects.id the file is keyed by.
     write_overlay(
@@ -394,17 +435,18 @@ fn composition_is_deterministic_and_keyed_by_project_id() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let d1 = ratify(&store, &t, &["dom/a"]).to_string();
-    let d2 = ratify(&store, &t, &["dom/b"]).to_string();
-    let (a, b) = (add_item("dom/a", &d1, 0.2), add_item("dom/b", &d2, 0.3));
-    let overlay = |first: bool| {
+    let pid = prj.id.to_string();
+    let (a, b) = (add_item("dom/a", "D1", 0.2), add_item("dom/b", "D2", 0.3));
+    let tpl = |first: bool| {
         let (x, y) = if first { (&a, &b) } else { (&b, &a) };
-        format!(
-            "project_id: \"{}\"\nbase_identity: base@1\noverlay_version: 1\nitems:\n{x}{y}",
-            prj.id
-        )
+        format!("project_id: \"{pid}\"\nbase_identity: base@1\noverlay_version: 1\nitems:\n{x}{y}")
     };
-    write_overlay(&cfg, &prj.id.to_string(), &overlay(true));
+    write_overlay(&cfg, &pid, &tpl(true));
+    let ed = edition_of(&tpl(true));
+    let d1 = ratify(&store, &t, &pid, &ed, &["dom/a"]).to_string();
+    let d2 = ratify(&store, &t, &pid, &ed, &["dom/b"]).to_string();
+    let overlay = |first: bool| tpl(first).replace("D1", &d1).replace("D2", &d2);
+    write_overlay(&cfg, &pid, &overlay(true));
     let r1 = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
     write_overlay(&cfg, &prj.id.to_string(), &overlay(false));
     let r2 = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
@@ -416,17 +458,40 @@ fn composition_is_deterministic_and_keyed_by_project_id() {
     );
     assert!(r1.warnings.is_empty(), "{:?}", r1.warnings);
 
-    // Resolution keyed by projects.id survives the name being different:
-    // an unknown-to-DB id still composes the overlay (name is display-only).
+    // Resolution is keyed by projects.id, and a ratification is bound to ITS
+    // project (RV7): an overlay under another id carrying alpha's decisions has
+    // no force — an identical item id does not borrow another project's act.
     let ghost_id = new_id().to_string();
+    let ghost_body = overlay(true).replace(&prj.id.to_string(), &ghost_id);
+    write_overlay(&cfg, &ghost_id, &ghost_body);
+    let r3 = config::resolve_effective_profile(&store, &cfg, Some(&ghost_id)).unwrap();
+    let eff3 = r3.profile.as_ref().unwrap();
+    assert!(
+        !eff3.checks().iter().any(|c| c.id == "dom/a"),
+        "another project's ratification must not judge this one (RV7)"
+    );
+    assert_eq!(r3.warnings.len(), 2, "{:?}", r3.warnings);
+    assert!(
+        r3.warnings.iter().all(|w| w.contains("другого проекта")),
+        "{:?}",
+        r3.warnings
+    );
+
+    // Ratified for THIS id, the same edition composes byte-identically:
+    // projects.name is display-only, the id is the resolution key.
+    let ghost_tpl = tpl(true).replace(&prj.id.to_string(), &ghost_id);
+    let ghost_ed = edition_of(&ghost_tpl);
+    let g1 = ratify(&store, &t, &ghost_id, &ghost_ed, &["dom/a"]).to_string();
+    let g2 = ratify(&store, &t, &ghost_id, &ghost_ed, &["dom/b"]).to_string();
     write_overlay(
         &cfg,
         &ghost_id,
-        &overlay(true).replace(&prj.id.to_string(), &ghost_id),
+        &ghost_tpl.replace("D1", &g1).replace("D2", &g2),
     );
-    let r3 = config::resolve_effective_profile(&store, &cfg, Some(&ghost_id)).unwrap();
+    let r4 = config::resolve_effective_profile(&store, &cfg, Some(&ghost_id)).unwrap();
+    assert!(r4.warnings.is_empty(), "{:?}", r4.warnings);
     assert_eq!(
-        y(r3.profile.as_ref().unwrap()),
+        y(r4.profile.as_ref().unwrap()),
         y(r1.profile.as_ref().unwrap()),
         "projects.name is display-only; the resolution key is the id"
     );
@@ -441,20 +506,16 @@ fn projects_do_not_borrow_each_others_checks() {
     let a = project(&store, "alpha");
     let b = project(&store, "beta");
     let t = task(&store, Some(&a));
-    let d = ratify(&store, &t, &["dom/a-only"]).to_string();
     let apid = a.id.to_string();
-    write_overlay(
-        &cfg,
-        &a.id.to_string(),
-        &format!(
-            r#"project_id: "{apid}"
+    let body = format!(
+        r#"project_id: "{apid}"
 base_identity: base@1
 overlay_version: 1
 items:
-  - {{kind: add, target_id: dom/a-only, ratified_by: {d}, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.2}}}}
+  - {{kind: add, target_id: dom/a-only, ratified_by: PENDING, add: {{statement: s, detects: [], verify: rubric, anchors: {{"1.0": a, "0.5": b, "0.0": c}}, weight: 0.2}}}}
 "#
-        ),
     );
+    write_ratified(&store, &t, &cfg, &apid, &body, &["dom/a-only"]);
     let eff_b = config::resolve_effective_profile(&store, &cfg, Some(&b.id.to_string()))
         .unwrap()
         .profile
@@ -542,21 +603,17 @@ fn base_version_drift_keeps_ratified_adds() {
     let (_d, store, cfg) = home();
     let prj = project(&store, "alpha");
     let t = task(&store, Some(&prj));
-    let d1 = ratify(&store, &t, &["dom/a"]).to_string();
     let pid = prj.id.to_string();
-    write_overlay(
-        &cfg,
-        &prj.id.to_string(),
-        &format!(
-            r#"project_id: "{pid}"
+    let body = format!(
+        r#"project_id: "{pid}"
 base_identity: base@99
 overlay_version: 1
 items:
 {}
 "#,
-            add_item("dom/a", &d1, 0.25)
-        ),
+        add_item("dom/a", "PENDING", 0.25)
     );
+    let d1 = write_ratified(&store, &t, &cfg, &pid, &body, &["dom/a"]);
     let r = config::resolve_effective_profile(&store, &cfg, Some(&prj.id.to_string())).unwrap();
     let eff = r.profile.unwrap();
     assert_eq!(eff.identity(), "base@1");
