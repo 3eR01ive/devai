@@ -244,6 +244,11 @@ CREATE TABLE decisions(
   actor      TEXT NOT NULL,
   rationale  TEXT NULL,
   refs       TEXT NOT NULL DEFAULT '[]',
+  -- v10 (migrations/010_decision_payload.sql, task 01a1bacf): the
+  -- kind-specific structured binding of the row — a `profile_ratification`
+  -- carries `<project_id, file, edition, items>` here, NULL for the kinds
+  -- that predate it.
+  payload    TEXT NULL,
   created_at TEXT NOT NULL
 );
 -- The decisions read/disclosure indexes (v4; the same two the v3→v4 rung

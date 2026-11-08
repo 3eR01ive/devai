@@ -43,7 +43,7 @@ pub fn project_label_from_path(root: &Path) -> Option<String> {
     None
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -168,6 +168,7 @@ const RUNG_APPLIERS: &[(&str, RungApply)] = &[
     ("execution_form_columns", execution_form_columns),
     ("single_writer_repair", single_writer_repair),
     ("additive_human_name_column", additive_human_name_column),
+    ("additive_decision_payload_column", additive_decision_payload_column),
 ];
 
 /// Handle to the local store. `root` contains `devai.db` and `blobs/`.
@@ -1729,16 +1730,21 @@ impl Store {
     // ------------------------------------------------------------------
 
     pub fn record_decision(&self, d: &Decision) -> StoreResult<()> {
+        let payload = if d.payload.is_null() {
+            None
+        } else {
+            Some(d.payload.to_string())
+        };
         self.conn.execute(
-            "INSERT INTO decisions(id,task_id,kind,verdict,actor,rationale,refs,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![d.id.to_string(), d.task_id.to_string(), d.kind, d.verdict.as_str(), d.actor, d.rationale, json_string(&d.refs), rows::ts(&d.created_at)],
+            "INSERT INTO decisions(id,task_id,kind,verdict,actor,rationale,refs,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![d.id.to_string(), d.task_id.to_string(), d.kind, d.verdict.as_str(), d.actor, d.rationale, json_string(&d.refs), payload, rows::ts(&d.created_at)],
         )?;
         Ok(())
     }
 
     pub fn list_decisions(&self, task_id: Id) -> StoreResult<Vec<Decision>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,kind,verdict,actor,rationale,refs,created_at FROM decisions WHERE task_id=?1 ORDER BY created_at",
+            "SELECT id,task_id,kind,verdict,actor,rationale,refs,created_at,payload FROM decisions WHERE task_id=?1 ORDER BY created_at",
         )?;
         let mut rows = stmt.query(params![task_id.to_string()])?;
         let mut out = Vec::new();
@@ -1748,14 +1754,54 @@ impl Store {
         Ok(out)
     }
 
+    /// One decision row by full id or unique prefix — the same loud
+    /// resolver rule as `resolve_task` (multiple prefix matches are an
+    /// error, never a guess). The revocation door (`profile revoke`) needs
+    /// to name the decision it takes out of force.
+    pub fn get_decision(&self, id: &str) -> StoreResult<Decision> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,kind,verdict,actor,rationale,refs,created_at,payload FROM decisions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 2",
+        )?;
+        let mut rows = stmt.query(params![id.to_lowercase()])?;
+        let mut found: Vec<Decision> = Vec::new();
+        while let Some(r) = rows.next()? {
+            found.push(rows::decision_from_row(r)?);
+        }
+        match found.len() {
+            0 => Err(StoreError::NotFound(
+                "decision".into(),
+                format!("decision `{id}` does not exist"),
+            )),
+            1 => Ok(found.pop().unwrap()),
+            _ => Err(StoreError::Ambiguous(format!(
+                "decision id prefix `{id}` matches multiple decisions"
+            ))),
+        }
+    }
+
+    /// Every `profile_ratification` decision row — APPROVED ratifications
+    /// AND their revocations — in stored chronology. The ratification's
+    /// structured binding (project, file, edition, covered items, revokes)
+    /// lives in `Decision::payload`, so the force cross-check reads the
+    /// ratified EDITION from the row instead of re-deriving it (task
+    /// 01a1bacf, RV2/RV6).
+    pub fn profile_ratification_decisions(&self) -> StoreResult<Vec<Decision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,kind,verdict,actor,rationale,refs,created_at,payload FROM decisions WHERE kind=?1 ORDER BY created_at",
+        )?;
+        let mut rows = stmt.query(params![decision_kind::PROFILE_RATIFICATION])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::decision_from_row(r)?);
+        }
+        Ok(out)
+    }
+
     /// The ratification index for profile overlays (REQ-SP-106 layer (b)):
-    /// every decisions row of kind `profile_ratification` with verdict
-    /// APPROVED, as decision-id -> refs. The delta loader cross-checks each
-    /// item's `ratified_by` against this map — only rows that EXIST, are of
-    /// that kind and APPROVED, and whose refs cover the item, give it force
-    /// (A-5: a manual edit without a valid decision reference never enters
-    /// force, and this works already in C1-without-C3, where the table holds
-    /// no such rows). Rejected/other-kind rows are absent by construction.
+    /// every LIVE decisions row of kind `profile_ratification` with verdict
+    /// APPROVED — a row taken out of force by a later revocation is absent —
+    /// as decision-id -> refs. The delta loader cross-checks each item's
+    /// `ratified_by` against this map AND against the recorded edition.
     pub fn ratified_profile_refs(&self) -> StoreResult<BTreeMap<String, Vec<String>>> {
         Ok(self
             .ratified_profile_decisions()?
@@ -1771,19 +1817,23 @@ impl Store {
     pub fn ratified_profile_decisions(
         &self,
     ) -> StoreResult<BTreeMap<String, (Vec<String>, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,kind,verdict,actor,rationale,refs,created_at FROM decisions WHERE kind=?1 AND verdict=?2 ORDER BY created_at",
-        )?;
-        let mut rows = stmt.query(params![
-            decision_kind::PROFILE_RATIFICATION,
-            Verdict::Approved.as_str()
-        ])?;
-        let mut map = BTreeMap::new();
-        while let Some(r) = rows.next()? {
-            let d = rows::decision_from_row(r)?;
-            map.insert(d.id.to_string(), (d.refs, d.actor));
-        }
-        Ok(map)
+        let rows = self.profile_ratification_decisions()?;
+        let revoked: BTreeSet<String> = rows
+            .iter()
+            .filter(|d| d.verdict != Verdict::Approved)
+            .filter_map(|d| {
+                d.payload
+                    .get("revokes")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        Ok(rows
+            .into_iter()
+            .filter(|d| d.verdict == Verdict::Approved)
+            .filter(|d| !revoked.contains(&d.id.to_string()))
+            .map(|d| (d.id.to_string(), (d.refs, d.actor)))
+            .collect())
     }
 
     pub fn create_question(&self, q: &Question) -> StoreResult<()> {
@@ -2034,6 +2084,30 @@ fn added_column_of(code: &str) -> Option<(String, String)> {
 /// Rung v8→v9 (task 01a1ad1d, REQ-TN-01): one additive nullable column on
 /// `tasks`; pure SQL plus the shared presence check for idempotence.
 fn additive_human_name_column(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    apply_script_with_column_skip(tx, step.script)
+}
+
+/// Rung v9→v10 (task 01a1bacf, RV1/RV2/RV5): `decisions.payload` — the
+/// kind-specific structured binding of a decision row (the profile
+/// ratification's `<project, file, edition, items>`). Same additive-column
+/// discipline as `009`: a re-run against a home that already carries the
+/// column is a no-op, no row is rewritten.
+///
+/// Shape detection before any mutation, exactly like `decisions_backfill`:
+/// a database predating the `decisions` table itself (the shipped v1
+/// fixture shape) has no decision rows to bind, and `ALTER TABLE` on an
+/// absent table would abort the whole `open()` for a legacy home that is
+/// otherwise migratable forward. The rung is inert there — the same
+/// absence the pre-v10 ladder already tolerated.
+fn additive_decision_payload_column(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    let present: i64 = tx.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='decisions'",
+        [],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        return Ok(());
+    }
     apply_script_with_column_skip(tx, step.script)
 }
 
@@ -3363,6 +3437,7 @@ mod decisions_backfill_tests {
                     rationale: Some("already a stored decision".into()),
                     refs: vec!["spec-id".into()],
                     created_at: Utc::now(),
+                    payload: serde_json::Value::Null,
                 })
                 .unwrap();
             // Pretend this database never saw v4: open() must run rung 004.

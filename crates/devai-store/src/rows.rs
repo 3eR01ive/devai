@@ -312,6 +312,12 @@ pub fn decision_from_row(r: &Row) -> StoreResult<Decision> {
         rationale: get(r, 5)?,
         refs: arr(get(r, 6)?)?,
         created_at: parse_ts(get(r, 7)?)?,
+        payload: match get::<Option<String>>(r, 8)? {
+            Some(text) => serde_json::from_str(&text).map_err(|e| {
+                crate::error::StoreError::Corrupt(format!("decision payload is not JSON: {e}"))
+            })?,
+            None => serde_json::Value::Null,
+        },
     })
 }
 

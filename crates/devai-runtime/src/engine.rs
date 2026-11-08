@@ -697,6 +697,7 @@ impl<'a> Engine<'a> {
                             rationale: Some(format!("workspace is fresh for quality-report v{}; explicit --force-reaudit", report.seq)),
                             refs: vec![report.id.to_string()],
                             created_at: Utc::now(),
+                            payload: serde_json::Value::Null,
                         })?;
                         self.store.insert_event(
                             Some(task.id),
@@ -1726,6 +1727,7 @@ mod decisions_render_tests {
             rationale: rationale.map(|s| s.to_string()),
             refs: vec![],
             created_at: Utc::now(),
+            payload: serde_json::Value::Null,
         }
     }
 

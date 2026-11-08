@@ -17,13 +17,13 @@ use uuid::Uuid;
 
 use crate::outln;
 use crate::{
-    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ProjectCmd, QuestionCmd, RoleCmd,
-    TaskCmd,
+    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ProfileCmd, ProjectCmd, QuestionCmd,
+    RoleCmd, TaskCmd,
 };
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
-    MergeRecordReq, MutationResult, ProjectAddReq, PublishReq, ReviseReq, RunReq, TaskCreateReq,
-    TaskProjectSetReq, TaskRenameReq,
+    MergeRecordReq, MutationResult, ProfileRatifyReq, ProfileRevokeReq, ProjectAddReq, PublishReq,
+    ReviseReq, RunReq, TaskCreateReq, TaskProjectSetReq, TaskRenameReq,
 };
 
 pub struct Ctx {
@@ -79,6 +79,7 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
         // registry.
         Cmd::Init { config } => init(ctx, config.as_deref(), json),
         Cmd::Project(c) => project(ctx, c, json),
+        Cmd::Profile(c) => profile(ctx, c, json),
         Cmd::Task(c) => task(ctx, c, json),
         Cmd::Artifact(c) => artifact(ctx, c, json),
         Cmd::Question(c) => question(ctx, c, json),
@@ -219,6 +220,109 @@ fn project(ctx: &Ctx, cmd: ProjectCmd, json: bool) -> Result<()> {
             }
             None => bail!("project `{id}` not found"),
         },
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// profile rules ratification (task 01a1bacf)
+// ---------------------------------------------------------------------------
+
+/// The HUMAN door to the project overlay. `status` is a read; `ratify` and
+/// `revoke` are human-only operations of the API registry (no engine, role
+/// or agent path reaches them). Presentation only: the fingerprint, the
+/// force rule and the decision row all come from the API.
+fn profile(ctx: &Ctx, cmd: ProfileCmd, json: bool) -> Result<()> {
+    match cmd {
+        ProfileCmd::Status { project } => {
+            let s = ctx.api().profile_state(&project).map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&s)?);
+            } else {
+                outln!("project: {} ({})", s.project_name, s.project_id);
+                outln!("rules:   {}", s.file);
+                outln!("edition: {}", s.edition);
+                outln!(
+                    "items:   {} (in force: {})",
+                    s.items.len(),
+                    s.items.iter().filter(|i| i.in_force).count()
+                );
+                for i in &s.items {
+                    match (&i.in_force, &i.decision, &i.actor) {
+                        (true, Some(d), Some(a)) => outln!(
+                            "  IN FORCE  {}  by {}  decision {}",
+                            i.target_id,
+                            a,
+                            d
+                        ),
+                        _ => outln!(
+                            "  OUT       {}  {}",
+                            i.target_id,
+                            i.reason.as_deref().unwrap_or("нератифицирован")
+                        ),
+                    }
+                }
+            }
+        }
+        ProfileCmd::Ratify {
+            task,
+            project,
+            items,
+            all,
+            rationale,
+        } => {
+            let r = ctx
+                .api()
+                .profile_ratify(ProfileRatifyReq {
+                    task,
+                    project,
+                    items,
+                    all,
+                    rationale,
+                })
+                .map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                outln!(
+                    "ratified: decision {} ({})",
+                    r.decision.id,
+                    if r.recorded_now {
+                        "recorded"
+                    } else {
+                        "already recorded — reused"
+                    }
+                );
+                outln!("project: {}  file: {}", r.project_id, r.file);
+                outln!("edition: {}", r.edition);
+                outln!("items:   {}", r.items.join(", "));
+                outln!("actor:   {}  rationale: {}", r.decision.actor, r.decision.rationale.as_deref().unwrap_or(""));
+                outln!("next:    profile status {} — the items are now in force", r.project_id);
+            }
+        }
+        ProfileCmd::Revoke {
+            decision,
+            rationale,
+        } => {
+            let r = ctx
+                .api()
+                .profile_revoke(ProfileRevokeReq {
+                    decision,
+                    rationale,
+                })
+                .map_err(render_api_error)?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                outln!(
+                    "revoked: decision {} takes {} out of force",
+                    r.decision.id,
+                    r.revoked.id
+                );
+                outln!("project: {}  file: {}  edition: {}", r.project_id, r.file, r.edition);
+                outln!("items:   {} — now OUT of force; the rules file was not touched", r.items.join(", "));
+            }
+        }
     }
     Ok(())
 }
@@ -550,6 +654,15 @@ fn task_decisions(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
             );
             if !d.refs.is_empty() {
                 outln!("    refs: {}", d.refs.join(", "));
+            }
+            // RV5 (task 01a1bacf): a ratification shows the EDITION it bound
+            // and, for a revocation, the decision it took out of force — the
+            // payload is the decision's own fact, not a re-derivation.
+            if let Some(edition) = d.payload.get("edition").and_then(|v| v.as_str()) {
+                outln!("    edition: {edition}");
+            }
+            if let Some(revokes) = d.payload.get("revokes").and_then(|v| v.as_str()) {
+                outln!("    revokes: {revokes}");
             }
         }
     }

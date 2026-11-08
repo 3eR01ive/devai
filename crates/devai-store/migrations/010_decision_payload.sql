@@ -1,0 +1,13 @@
+-- v9 -> v10: the DECISION PAYLOAD (task 01a1bacf, RV1/RV2/RV5/RV6).
+--
+-- A decision row used to carry only `refs` (a flat string list) and
+-- `rationale`. The human ratification of PROJECT RULES has to bind its act
+-- to a concrete EDITION of the rules file — `<project_id, file, edition
+-- fingerprint, covered item ids>` — and the row itself must carry it, or
+-- every reader would re-derive the binding from the file at read time
+-- (the no-read-time-rederivation doctrine). `payload` is that kind-specific
+-- structured data as JSON; it is NULL for every historic kind (the rows
+-- written before this rung keep NULL and read exactly as they did).
+--
+-- ADDITIVE ONLY: one nullable column, no row is rewritten, no index moves.
+ALTER TABLE decisions ADD COLUMN payload TEXT NULL;

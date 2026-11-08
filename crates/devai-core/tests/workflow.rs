@@ -215,6 +215,7 @@ fn ratification(prev: &Id, current: &Id) -> Decision {
         rationale: Some("no fixes were required".into()),
         refs: vec![prev.to_string(), current.to_string()],
         created_at: now(),
+        payload: serde_json::Value::Null,
     }
 }
 
@@ -900,6 +901,7 @@ fn decision(task: &Task, kind: &str, verdict: Verdict, refs: Vec<String>) -> Dec
         rationale: Some("human act".into()),
         refs,
         created_at: now(),
+        payload: serde_json::Value::Null,
     }
 }
 

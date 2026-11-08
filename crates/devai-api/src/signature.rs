@@ -448,6 +448,7 @@ mod tests {
                 rationale: Some("принято".into()),
                 refs: vec![],
                 created_at: Utc::now(),
+                payload: serde_json::Value::Null,
             })
             .unwrap();
     }
@@ -645,6 +646,7 @@ mod tests {
                 rationale: None,
                 refs: vec![],
                 created_at: Utc::now(),
+                payload: serde_json::Value::Null,
             })
             .unwrap();
     }
@@ -728,6 +730,7 @@ mod tests {
                 rationale: None,
                 refs: vec![],
                 created_at: Utc::now(),
+                payload: serde_json::Value::Null,
             })
             .unwrap();
         let err2 = signature_view(&store2, task2).unwrap_err();
@@ -789,6 +792,7 @@ mod tests {
                 rationale: Some("вернуть".into()),
                 refs: vec![],
                 created_at: Utc::now(),
+                payload: serde_json::Value::Null,
             })
             .unwrap();
         let view = signature_view(&store, task).unwrap();

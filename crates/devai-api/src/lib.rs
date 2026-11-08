@@ -46,10 +46,12 @@ pub use devai_store::{DB_FILE_NAME, HOME_DIR_NAME};
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
     ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
-    MergeResult, MutationResult, OverrideResult, ProjectAddReq, PublishOutcome, PublishReq,
-    PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome, ReviseReq, RunOutcome, RunReq,
-    TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome, TaskProjectSetOutcome,
-    TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult, WorkflowOp,
+    MergeResult, MutationResult, OverrideResult, ProfileRatifyOutcome, ProfileRatifyReq,
+    ProfileRevokeOutcome, ProfileRevokeReq, ProfileState, ProfileStateItem, ProjectAddReq,
+    PublishOutcome, PublishReq, PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome, ReviseReq,
+    RunOutcome, RunReq, TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome,
+    TaskProjectSetOutcome, TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult,
+    WorkflowOp,
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 pub use signature::{

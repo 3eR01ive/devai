@@ -64,8 +64,12 @@ pub struct OpDescriptor {
 /// token (`registry`) and the `home.*` plane (list/projects_all/tasks_all
 /// plus the add/set_enabled/activate management doors) — additive for
 /// tolerant readers, but wire-visible, so the version says so (a
-/// vocabulary change never travels without the stamp).
-pub const SURFACE_VERSION: &str = "api-surface@4";
+/// vocabulary change never travels without the stamp). `@5` names the
+/// project-rules ratification increment (task 01a1bacf): `profile.state` /
+/// `profile.ratify` / `profile.revoke` join the table, and `Decision` gains
+/// the `payload` field a ratification's `<project, edition, items>` binding
+/// is read from — a wire-visible shape change for second consumers.
+pub const SURFACE_VERSION: &str = "api-surface@5";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -377,6 +381,28 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "MergeRecordReq{id, branch, workspace, head_before, head_after, rationale}",
             output: "MergeResult{task_id, branch, workspace, head_before, head_after}",
             description: "HUMAN-ONLY (OQ-13): the persistence half of the single merge path — records the `rework_merge` decision and `rework.merged` event for a merge of the platform rework/<task-id> branch into the checked-out baseline. The repository act itself stays in the human-invoked command (REQ-WT-07 keeps the git invocation behind the CLI subcommand so no engine path reaches it); this operation never touches task state. Mirrors the recording inside `task merge`.",
+        },
+        // ---- project rules ratification (task 01a1bacf, RV1/RV4/RV6/RV9) ----
+        OpDescriptor {
+            name: "profile.state",
+            class: OpClass::Read,
+            input: "project_id_or_name",
+            output: "ProfileState{project_id, project_name, file, edition, items}",
+            description: "READ-ONLY state of a project's rules file: the current EDITION fingerprint and every item's force state (in force with the decision + actor, or out with the RV8 reason). Computes nothing the loader would compute differently: same fingerprint, same force rule. Mirrors `profile status`; needs no role run.",
+        },
+        OpDescriptor {
+            name: "profile.ratify",
+            class: OpClass::Mutation,
+            input: "ProfileRatifyReq{task, project, items, all, rationale}",
+            output: "ProfileRatifyOutcome{task_id, decision, recorded_now, project_id, file, edition, items}",
+            description: "HUMAN-ONLY: records the `profile_ratification`/APPROVED decision covering the named items of the CURRENT rules edition (the fingerprint is computed platform-side, never typed), then writes the ratification pointers into the file. Rationale is mandatory; an unknown item refuses; the same edition + item set reuses the stored decision instead of writing a second one. No engine, role or agent path reaches this operation. Mirrors `profile ratify`.",
+        },
+        OpDescriptor {
+            name: "profile.revoke",
+            class: OpClass::Mutation,
+            input: "ProfileRevokeReq{decision, rationale}",
+            output: "ProfileRevokeOutcome{decision, revoked, project_id, file, edition, items}",
+            description: "HUMAN-ONLY: takes an APPROVED profile_ratification out of force with a separate decision row citing it. The rules file is not rewritten or deleted; a second revocation of the same row refuses. Mirrors `profile revoke`.",
         },
         // ---- artifacts ----
         OpDescriptor {
@@ -717,18 +743,18 @@ mod tests {
     }
 
     #[test]
-    fn surface_version_v4_ships_the_name_plane_and_homes() {
+    fn surface_version_v5_ships_the_name_plane_homes_and_profile_ratification() {
         // QA R5 (da/api-contract): the stamp and its increment are
-        // pinned TOGETHER — @4 is by this test defined as "the
-        // human-signboard surface PLUS the homes-registry plane": if the
-        // constant moves without the rename door/shape moving with it, or
-        // the name plane or the home plane leaves the table while the
-        // stamp claims it, this fails. The literal is the deliberate
-        // second writing of the version: bumping the constant is an
-        // author's decision documented at the declaration (see the bump
-        // mechanics comment there), and this test forces that decision to
-        // be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@4");
+        // pinned TOGETHER — @5 is by this test defined as "the @4
+        // human-signboard + homes surface PLUS the project-rules
+        // ratification plane": if the constant moves without the new
+        // operations moving with it, or the name/homes planes leave the
+        // table while the stamp claims them, this fails. The literal is
+        // the deliberate second writing of the version: bumping the
+        // constant is an author's decision documented at the declaration
+        // (see the bump mechanics comment there), and this test forces
+        // that decision to be taken consciously, twice, in one change.
+        assert_eq!(SURFACE_VERSION, "api-surface@5");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -744,6 +770,45 @@ mod tests {
             .find(|o| o.name == "home.list")
             .expect("@4 surface must publish home.list (the homes registry plane)");
         assert_eq!(homes.class, OpClass::Read);
+        // @5's own increment: the profile-rules ratification doors are
+        // part of what the stamp claims.
+        for name in ["profile.state", "profile.ratify", "profile.revoke"] {
+            assert!(
+                operations().iter().any(|o| o.name == name),
+                "@5 surface must publish {name} (project-rules ratification plane)"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_ratification_operations_are_human_only_and_published() {
+        // RV4: the act is marked HUMAN-ONLY in the published registry (the
+        // enforcement is the actor rights of the human session, the registry
+        // is where a second consumer SEES the constraint), and the state
+        // view is a plain read.
+        let ops = operations();
+        for name in ["profile.ratify", "profile.revoke"] {
+            let op = ops
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("{name} must be published"));
+            assert_eq!(op.class, OpClass::Mutation);
+            assert!(
+                op.description.starts_with("HUMAN-ONLY"),
+                "{name}: a human-only act must say so in the registry"
+            );
+        }
+        let state = ops
+            .iter()
+            .find(|o| o.name == "profile.state")
+            .expect("the rules state view is published");
+        assert_eq!(state.class, OpClass::Read);
+        // RV5: the ratification is a DISTINCT decision kind from the spec
+        // approval — the vocabulary itself keeps them apart.
+        assert_ne!(
+            devai_core::types::decision_kind::PROFILE_RATIFICATION,
+            devai_core::types::decision_kind::REQUIREMENTS_APPROVAL
+        );
     }
 
     #[test]
@@ -793,6 +858,8 @@ mod tests {
             "task.override",
             "task.ratify_empty_rework",
             "task.merge",
+            "profile.ratify",
+            "profile.revoke",
             "artifact.publish",
             "artifact.publish_row",
             "artifact.advance",

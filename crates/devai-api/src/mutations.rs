@@ -777,6 +777,7 @@ impl Api {
             rationale,
             refs: spec_ref.into_iter().collect(),
             created_at: Utc::now(),
+            payload: serde_json::Value::Null,
         };
         self.store.record_decision(&decision)?;
         Ok(mutation)
@@ -829,6 +830,7 @@ impl Api {
                 vec![spec_ref]
             },
             created_at: Utc::now(),
+            payload: serde_json::Value::Null,
         };
         self.store.record_decision(&decision)?;
         Ok(ApproveOutcome { mutation, decision })
@@ -1415,6 +1417,7 @@ impl Api {
             rationale,
             refs: blockers.to_vec(),
             created_at: Utc::now(),
+            payload: serde_json::Value::Null,
         })?;
         self.store.insert_event(
             Some(task.id),
@@ -1440,6 +1443,7 @@ impl Api {
             rationale: req.rationale.clone(),
             refs: vec![req.branch.clone(), req.head_after.clone()],
             created_at: Utc::now(),
+            payload: serde_json::Value::Null,
         })?;
         self.store.insert_event(
             Some(task.id),
@@ -1594,6 +1598,7 @@ impl Api {
                     rationale,
                     refs: vec![prev_report.to_string(), current_id.to_string()],
                     created_at: Utc::now(),
+                    payload: serde_json::Value::Null,
                 };
                 self.store.record_decision(&d)?;
                 Ok((d, true))
@@ -2048,6 +2053,412 @@ impl Api {
                 freshness,
             },
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// profile rules ratification (task 01a1bacf, RV1..RV9)
+// ---------------------------------------------------------------------------
+
+/// `profile.ratify` — the HUMAN act that gives a project's rules edition
+/// force. `items` is the explicit covered list; `all` covers every item of
+/// the current edition (the decision still stores the full explicit list).
+/// `rationale` is mandatory: a ratification is a stated human ground, never
+/// a bare button.
+#[derive(Debug, Clone)]
+pub struct ProfileRatifyReq {
+    pub task: String,
+    pub project: String,
+    pub items: Vec<String>,
+    pub all: bool,
+    pub rationale: Option<String>,
+}
+
+/// `profile.revoke` — the HUMAN act that takes an APPROVED ratification out
+/// of force. The rules file is not touched (RV6).
+#[derive(Debug, Clone)]
+pub struct ProfileRevokeReq {
+    pub decision: String,
+    pub rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileRatifyOutcome {
+    pub task_id: String,
+    pub decision: Decision,
+    /// false when the SAME edition + item set already carried a live
+    /// approval — the command then reports that decision instead of
+    /// recording a second one (RV1 AC6).
+    pub recorded_now: bool,
+    pub project_id: String,
+    pub file: String,
+    pub edition: String,
+    pub items: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileRevokeOutcome {
+    pub decision: Decision,
+    pub revoked: Decision,
+    pub project_id: String,
+    pub file: String,
+    pub edition: String,
+    pub items: Vec<String>,
+}
+
+/// State of ONE item of a project's rules file (RV9).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileStateItem {
+    pub target_id: String,
+    pub in_force: bool,
+    pub decision: Option<String>,
+    pub actor: Option<String>,
+    /// WHY an item is out of force, in the RV8 vocabulary.
+    pub reason: Option<String>,
+}
+
+/// The read-only view of a project's rules state (RV9): the current edition
+/// fingerprint and every item's force state. Nothing is written; the
+/// fingerprint is computed the same way the ratification computes it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileState {
+    pub project_id: String,
+    pub project_name: String,
+    pub file: String,
+    pub edition: String,
+    pub items: Vec<ProfileStateItem>,
+}
+
+impl Api {
+    /// Resolve the project and its rules file, refusing loudly when either
+    /// does not exist (RV1 AC5 / RV7 AC2): the refusal names the project
+    /// and the expected file.
+    fn profile_rules_target(&self, project: &str) -> ApiResult<(Project, PathBuf)> {
+        let p = self.store.get_project(project)?.ok_or_else(|| {
+            ApiError::refused(
+                "bad_request",
+                format!(
+                    "project `{project}` is not registered — a profile ratification names an EXISTING project"
+                ),
+            )
+        })?;
+        let path = devai_store::config::overlay_path(&self.config_dir(), &p.id.to_string());
+        if !path.is_file() {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "project `{}` has no rules file at {} — nothing to ratify (the file is the project rules overlay)",
+                    p.name,
+                    path.display()
+                ),
+            ));
+        }
+        Ok((p, path))
+    }
+
+    fn load_profile_overlay(
+        &self,
+        project: &Project,
+        path: &Path,
+    ) -> ApiResult<(String, devai_store::config::ProfileOverlay)> {
+        let (edition, overlay) =
+            devai_store::config::overlay_edition_at(&self.config_dir(), &project.id.to_string())?;
+        if overlay.project_id != project.id.to_string() {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "{}: header project_id `{}` does not belong to project `{}` ({}) — the file must be the project's own rules overlay",
+                    path.display(),
+                    overlay.project_id,
+                    project.name,
+                    project.id
+                ),
+            ));
+        }
+        Ok((edition, overlay))
+    }
+
+    pub fn profile_state(&self, project: &str) -> ApiResult<ProfileState> {
+        let (p, path) = self.profile_rules_target(project)?;
+        let (edition, overlay) = self.load_profile_overlay(&p, &path)?;
+        let rows = self.store.profile_ratification_decisions()?;
+        let forces = devai_store::config::item_forces(&overlay, &edition, &rows);
+        let mut items: Vec<ProfileStateItem> = overlay
+            .items
+            .iter()
+            .map(|item| {
+                let state = forces.get(&item.target_id).cloned().unwrap_or(
+                    devai_store::config::ItemForce {
+                        force: None,
+                        reason: Some("нератифицирован".into()),
+                    },
+                );
+                ProfileStateItem {
+                    target_id: item.target_id.clone(),
+                    in_force: state.force.is_some(),
+                    decision: state.force.as_ref().map(|(d, _)| d.clone()),
+                    actor: state.force.as_ref().map(|(_, a)| a.clone()),
+                    reason: state.reason,
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| a.target_id.cmp(&b.target_id));
+        Ok(ProfileState {
+            project_id: p.id.to_string(),
+            project_name: p.name,
+            file: devai_store::config::overlay_rel_path(&p.id.to_string()),
+            edition,
+            items,
+        })
+    }
+
+    pub fn profile_ratify(&self, req: ProfileRatifyReq) -> ApiResult<ProfileRatifyOutcome> {
+        let rationale = req
+            .rationale
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ApiError::refused(
+                    "bad_request",
+                    "`--rationale` is required — a ratification records WHY the edition is ratified",
+                )
+            })?
+            .to_string();
+        let task = self.store.resolve_task(&req.task)?;
+        let (p, path) = self.profile_rules_target(&req.project)?;
+        let (edition, overlay) = self.load_profile_overlay(&p, &path)?;
+        let mut items: Vec<String> = if req.all {
+            overlay.items.iter().map(|i| i.target_id.clone()).collect()
+        } else {
+            if req.items.is_empty() {
+                return Err(ApiError::refused(
+                    "bad_request",
+                    "no items named — pass `--items id[,id...]` or `--all` so the decision states WHAT it covers",
+                ));
+            }
+            for id in &req.items {
+                if !overlay.items.iter().any(|i| &i.target_id == id) {
+                    return Err(ApiError::refused(
+                        "bad_request",
+                        format!(
+                            "item `{id}` is not in the current edition of project `{}` — a ratification cannot cover an unknown or future item",
+                            p.name
+                        ),
+                    ));
+                }
+            }
+            req.items.clone()
+        };
+        items.sort();
+        items.dedup();
+        if items.is_empty() {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!("project `{}` has no rules items — nothing to ratify", p.name),
+            ));
+        }
+
+        let project_id = p.id.to_string();
+        let file = devai_store::config::overlay_rel_path(&project_id);
+        let existing = self.profile_ratification_for(&project_id, &edition, &items)?;
+        let (decision, recorded_now) = match existing {
+            Some(d) => (d, false),
+            None => {
+                let d = Decision {
+                    id: new_id(),
+                    task_id: task.id,
+                    kind: decision_kind::PROFILE_RATIFICATION.into(),
+                    verdict: Verdict::Approved,
+                    actor: self.actor.clone(),
+                    rationale: Some(rationale.clone()),
+                    refs: items.clone(),
+                    created_at: Utc::now(),
+                    payload: serde_json::to_value(ProfileRatification {
+                        project_id: project_id.clone(),
+                        file: file.clone(),
+                        edition: edition.clone(),
+                        items: items.clone(),
+                        revokes: None,
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+                };
+                self.store.record_decision(&d)?;
+                (d, true)
+            }
+        };
+
+        // The pointer half (RV3). A failure here leaves the decision row in
+        // place and refuses naming file + edition; a repeated call finds the
+        // same decision, rewrites the pointers and creates no second row.
+        if let Err(e) = devai_store::config::set_ratification_pointers(
+            &path,
+            &decision.id.to_string(),
+            &items,
+        ) {
+            return Err(ApiError::refused(
+                "profile_rules_unwritable",
+                format!(
+                    "ratification decision {} was recorded, but the pointers did not land in {} (edition {edition}): {e}. The items stay OUT of force; re-run the same command to finish the act",
+                    decision.id,
+                    path.display()
+                ),
+            ));
+        }
+        self.record_profile_event(event_kind::PROFILE_RATIFIED, task.id, &decision, &file)?;
+        Ok(ProfileRatifyOutcome {
+            task_id: task.id.to_string(),
+            decision,
+            recorded_now,
+            project_id,
+            file,
+            edition,
+            items,
+        })
+    }
+
+    /// The LIVE approval for exactly (project, edition, item set), if any —
+    /// the idempotence key of RV1 AC6.
+    fn profile_ratification_for(
+        &self,
+        project_id: &str,
+        edition: &str,
+        items: &[String],
+    ) -> ApiResult<Option<Decision>> {
+        let rows = self.store.profile_ratification_decisions()?;
+        let live = devai_store::config::live_ratifications(&rows);
+        Ok(rows
+            .into_iter()
+            .filter(|d| live.contains_key(&d.id.to_string()))
+            .find(|d| {
+                let Some((payload, _)) = live.get(&d.id.to_string()) else {
+                    return false;
+                };
+                payload.project_id == project_id
+                    && payload.edition == edition
+                    && payload.items == items
+            }))
+    }
+
+    pub fn profile_revoke(&self, req: ProfileRevokeReq) -> ApiResult<ProfileRevokeOutcome> {
+        let rationale = req
+            .rationale
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ApiError::refused(
+                    "bad_request",
+                    "`--rationale` is required — a revocation records WHY the ratification is taken out of force",
+                )
+            })?
+            .to_string();
+        let revoked = self.store.get_decision(&req.decision)?;
+        if revoked.kind != decision_kind::PROFILE_RATIFICATION
+            || revoked.verdict != Verdict::Approved
+        {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "decision {} is not an APPROVED profile_ratification — only a live ratification can be revoked",
+                    revoked.id
+                ),
+            ));
+        }
+        let payload: ProfileRatification = serde_json::from_value(revoked.payload.clone())
+            .map_err(|e| {
+                ApiError::refused(
+                    "bad_request",
+                    format!(
+                        "decision {} carries no edition binding ({e}) — it cannot be revoked as a rules ratification",
+                        revoked.id
+                    ),
+                )
+            })?;
+        let revoked_id = revoked.id.to_string();
+        let already = self
+            .store
+            .profile_ratification_decisions()?
+            .into_iter()
+            .any(|d| {
+                d.verdict != Verdict::Approved
+                    && d.payload.get("revokes").and_then(|v| v.as_str())
+                        == Some(revoked_id.as_str())
+            });
+        if already {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!("ratification {} is already revoked — no second revocation row is written", revoked.id),
+            ));
+        }
+        let revocation = Decision {
+            id: new_id(),
+            task_id: revoked.task_id,
+            kind: decision_kind::PROFILE_RATIFICATION.into(),
+            verdict: Verdict::Rejected,
+            actor: self.actor.clone(),
+            rationale: Some(rationale),
+            refs: vec![revoked_id],
+            created_at: Utc::now(),
+            payload: serde_json::to_value(ProfileRatification {
+                project_id: payload.project_id.clone(),
+                file: payload.file.clone(),
+                edition: payload.edition.clone(),
+                items: payload.items.clone(),
+                revokes: Some(revoked.id.to_string()),
+            })
+            .unwrap_or(serde_json::Value::Null),
+        };
+        self.store.record_decision(&revocation)?;
+        self.record_profile_event(
+            event_kind::PROFILE_REVOKED,
+            revoked.task_id,
+            &revocation,
+            &payload.file,
+        )?;
+        Ok(ProfileRevokeOutcome {
+            decision: revocation,
+            revoked,
+            project_id: payload.project_id,
+            file: payload.file,
+            edition: payload.edition,
+            items: payload.items,
+        })
+    }
+
+    /// Append the human act to the task history (RV5). Append-only: one
+    /// event per decision row; a repeated call for a decision that already
+    /// has its event writes nothing.
+    fn record_profile_event(
+        &self,
+        kind: &str,
+        task_id: Id,
+        decision: &Decision,
+        file: &str,
+    ) -> ApiResult<()> {
+        let already = self.store.events(task_id, None)?.iter().any(|e| {
+            e.kind == kind
+                && e.payload.get(json_field::DECISION).and_then(|v| v.as_str())
+                    == Some(decision.id.to_string().as_str())
+        });
+        if already {
+            return Ok(());
+        }
+        self.store.insert_event(
+            Some(task_id),
+            kind,
+            &self.actor,
+            serde_json::json!({
+                "decision": decision.id.to_string(),
+                "project_id": decision.payload.get("project_id"),
+                "file": file,
+                "edition": decision.payload.get("edition"),
+                "items": &decision.refs,
+                "rationale": decision.rationale,
+                "revokes": decision.payload.get("revokes"),
+            }),
+        )?;
+        Ok(())
     }
 }
 
