@@ -88,6 +88,13 @@
       "to": 12,
       "script": "migrations/012_model_reasoning.sql",
       "apply": "additive_model_reasoning_column"
+    },
+    {
+      "id": "013_model_bundle_indexes",
+      "from": 12,
+      "to": 13,
+      "script": "migrations/013_model_bundle_indexes.sql",
+      "apply": "script"
     }
   ]
 }

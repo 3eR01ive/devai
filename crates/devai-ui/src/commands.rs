@@ -909,7 +909,10 @@ pub fn model_snapshot(state: State<AppState>) -> Result<devai_api::ModelSnapshot
 /// read-only handle refuses with «attempt to write a readonly database»);
 /// it goes through the same write path the CLI uses.
 #[tauri::command(rename_all = "snake_case")]
-pub fn model_probe(state: State<AppState>, bundle_id: String) -> Result<devai_api::ProbeView, UiError> {
+pub fn model_probe(
+    state: State<AppState>,
+    bundle_id: String,
+) -> Result<devai_api::ProbeView, UiError> {
     let (home, actor) = {
         let s = state.session();
         (s.home.clone(), s.actor.clone())

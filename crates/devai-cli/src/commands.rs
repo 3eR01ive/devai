@@ -2088,7 +2088,10 @@ fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
             match &s.active {
                 None => outln!("связка не выбрана — `devai model switch <id>`"),
                 Some(a) => {
-                    let label = a.label.clone().unwrap_or_else(|| "(не объявлена в конфиге)".into());
+                    let label = a
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| "(не объявлена в конфиге)".into());
                     let id = a.id.clone().unwrap_or_else(|| "—".into());
                     outln!("действующая связка: {label} [{id}]");
                     outln!("  агент: {}", a.agent);
@@ -2117,9 +2120,9 @@ fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
                 .latency_ms
                 .map(|l| format!(" {l} мс"))
                 .unwrap_or_default();
-            outln!("статус: {}{latency}", status_word(&st.state));
-            if let Some(reason) = &st.reason {
-                outln!("  причина: {}", model_failure_word(reason));
+            outln!("статус: {}{latency}", st.state_text);
+            if let Some(reason) = &st.reason_text {
+                outln!("  причина: {reason}");
             }
             if let Some(at) = st.evidence_at {
                 outln!(
@@ -2131,7 +2134,7 @@ fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
             if st.probe_older {
                 outln!("  проба старее проваленной строки исполнения");
             }
-            outln!("  свежесть: {}", st.freshness);
+            outln!("  свежесть: {}", st.freshness_text);
             if let Some(b) = &s.failures {
                 outln!("▲ {}", b.text);
                 match &b.suggestion {
@@ -2151,11 +2154,7 @@ fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
                     } else {
                         &b.llm_provider
                     },
-                    if b.model.is_empty() {
-                        "—"
-                    } else {
-                        &b.model
-                    },
+                    if b.model.is_empty() { "—" } else { &b.model },
                     reasoning_word(&b.reasoning),
                     b.agent
                 );
@@ -2229,10 +2228,7 @@ fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
             }
         }
         ModelCmd::Switch { id, reason } => {
-            let r = ctx
-                .api()
-                .model_switch(&id, &reason)
-                .map_err(model_error)?;
+            let r = ctx.api().model_switch(&id, &reason).map_err(model_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&r)?);
             } else if r.outcome == "applied" {
@@ -2254,29 +2250,10 @@ fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// ONE status word on the console, same vocabulary as the window.
-fn status_word(state: &str) -> &str {
-    match state {
-        "live" => "живая",
-        "not_working" => "не работает",
-        "not_proven" => "не доказано",
-        "not_selected" => "связка не выбрана",
-        _ => "неизвестно",
-    }
-}
-
-/// A reason is named only when the evidence proves it; an unrecognised or
-/// unproven code is shown as «причина не распознана», never guessed.
-fn model_failure_word(code: &str) -> &str {    match code {
-        "no_credits" => "нет кредитов",
-        "model_not_found" => "модель не существует",
-        "no_key" => "нет ключа провайдера",
-        "network" => "сеть недоступна",
-        "provider" => "отказ провайдера",
-        "manual" | "limits" | "error" => code,
-        "причина не классифицирована" => "причина не классифицирована",
-        _ => "причина не распознана",
-    }
+/// A reason is named only when the evidence proves it; the words come from
+/// the ONE dictionary in core (R3) — never a local copy.
+fn model_failure_word(code: &str) -> &str {
+    devai_core::types::failure_word(code)
 }
 
 /// The reasoning level as the console shows it (REQ-MS-09): an empty level

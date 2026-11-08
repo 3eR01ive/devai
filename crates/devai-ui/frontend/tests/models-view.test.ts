@@ -17,13 +17,10 @@ import {
   type Harness,
 } from "./support/component-harness.ts";
 import {
-  freshnessWord,
   holdCompletes,
   modelWord,
   providerWord,
-  reasonWord,
   reasoningWord,
-  statusWord,
 } from "../src/model_view.ts";
 
 let harness: Harness;
@@ -61,12 +58,15 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
   },
   status: {
     state: "live",
+    state_text: "живая",
     latency_ms: 820,
     verdict: "ok",
     reason: null,
+    reason_text: null,
     evidence: "probe",
     evidence_at: "2026-11-08T19:59:00Z",
     freshness: "fresh",
+    freshness_text: "свежая проба",
     probe_older: false,
   },
   declared: [
@@ -103,17 +103,7 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-test("словарь статуса и причин — закрытый, без выдуманных причин", () => {
-  assert.equal(statusWord("live"), "живая");
-  assert.equal(statusWord("not_working"), "не работает");
-  assert.equal(statusWord("not_proven"), "не доказано");
-  assert.equal(statusWord("not_selected"), "связка не выбрана");
-  assert.equal(statusWord("что-то"), "неизвестно");
-  assert.equal(reasonWord("no_credits"), "нет кредитов");
-  assert.equal(reasonWord("model_not_found"), "модель не существует");
-  assert.equal(reasonWord("provider"), "отказ провайдера");
-  assert.equal(reasonWord("самопридуманное"), "причина не распознана");
-  assert.equal(reasonWord(null), "причина не распознана");
+test("подписи связки — словами, подстановки нет; удержание имеет порог", () => {
   // Пустые поля — словами, подстановки нет.
   assert.equal(providerWord(""), "не задан — выбирает драйвер");
   assert.equal(providerWord("local"), "не задан — выбирает драйвер");
@@ -121,7 +111,6 @@ test("словарь статуса и причин — закрытый, без
   // Пустой уровень — неполная связка, а не «драйвер решит» (REQ-MS-09).
   assert.equal(reasoningWord(""), "не задан — связка неполна");
   assert.equal(reasoningWord("high"), "high");
-  assert.equal(freshnessWord("unknown"), "доказательств нет");
   assert.equal(holdCompletes(699), false);
   assert.equal(holdCompletes(700), true);
 });
@@ -157,12 +146,15 @@ test("ModelsView: «не работает» горит баннером и пр�
       return snapshot({
         status: {
           state: "not_working",
+          state_text: "не работает",
           latency_ms: null,
           verdict: "no_credits",
           reason: "no_credits",
+          reason_text: "нет кредитов",
           evidence: "probe",
           evidence_at: "2026-11-08T19:59:00Z",
           freshness: "fresh",
+          freshness_text: "свежая проба",
           probe_older: false,
         },
         failures: {

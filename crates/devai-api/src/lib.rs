@@ -119,7 +119,18 @@ pub struct Api {
     home: PathBuf,
     actor: String,
     session: SessionKind,
+    /// The probe SEAM (R8 quality return): the real driver call in
+    /// production, a controlled runner in tests — so the probe/switch path is
+    /// testable without launching an external process.
+    probe_runner: ProbeRunner,
 }
+
+/// One probe call as the surface invokes it. The default is
+/// [`devai_runtime::probe::probe`]; a test substitutes a runner that returns
+/// a chosen outcome through the same request type.
+pub type ProbeRunner = std::sync::Arc<
+    dyn Fn(&devai_runtime::probe::ProbeRequest) -> devai_runtime::probe::ProbeOutcome + Send + Sync,
+>;
 
 impl Api {
     /// Bootstrap entry (the ratified OQ-10 exception, encapsulated per the
@@ -139,7 +150,15 @@ impl Api {
             home: home.to_path_buf(),
             actor: actor.to_string(),
             session,
+            probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
         })
+    }
+
+    /// Substitute the probe runner (tests / diagnostics). The default is the
+    /// real driver call; nothing else about the surface changes.
+    pub fn with_probe_runner(mut self, runner: ProbeRunner) -> Self {
+        self.probe_runner = runner;
+        self
     }
 
     /// Observation entry (REQ-HOME-09): the same handle shape as
@@ -158,6 +177,7 @@ impl Api {
             // An observation handle is the human UI's read plane; it writes
             // nothing, so the human-only gate never sees it.
             session: SessionKind::Human,
+            probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
         })
     }
 

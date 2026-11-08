@@ -23,13 +23,14 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use devai_core::types::{ProbeVerdict, Timestamp};
+use serde::Deserialize;
 
 /// The bounded evidence fragment kept with every probe (REQ-MS-05: no
 /// unlimited output in history).
 pub const OUTPUT_EXCERPT_LIMIT: usize = 600;
 
-/// The factory probe phrase, used when a bundle declares none.
-pub const DEFAULT_PROBE_PHRASE: &str = "ping";
+/// The factory probe phrase — one source with the loader's default (R6).
+pub use devai_core::types::DEFAULT_PROBE_PHRASE;
 
 /// One probe request: the identity to call plus its declared policy.
 #[derive(Clone, Debug)]
@@ -52,7 +53,7 @@ impl ProbeRequest {
             model: model.to_string(),
             reasoning: reasoning.to_string(),
             phrase: DEFAULT_PROBE_PHRASE.to_string(),
-            timeout_ms: 20_000,
+            timeout_ms: devai_core::types::DEFAULT_PROBE_TIMEOUT_MS,
         }
     }
 
@@ -274,46 +275,44 @@ fn bounded(text: &str) -> String {
     }
 }
 
-/// One row of the OBSERVED refusal samples: a marker found in the provider's
-/// output and the verdict it stands for. Order is the matching order and is
-/// meaningful — balance/credit wording wins over a bare status code, because
-/// a 402 body often also names the model.
-///
-/// These are observations of 2026-11-07, NOT a contract (spec unknown #1):
-/// anything the table does not recognise stays `unknown`.
-pub const SAMPLE_TABLE: &[(&str, ProbeVerdict)] = &[
-    ("insufficient balance", ProbeVerdict::NoCredits),
-    ("insufficient_quota", ProbeVerdict::NoCredits),
-    ("insufficient quota", ProbeVerdict::NoCredits),
-    ("no credits", ProbeVerdict::NoCredits),
-    ("402", ProbeVerdict::NoCredits),
-    ("model not exist", ProbeVerdict::ModelNotFound),
-    ("model_not_found", ProbeVerdict::ModelNotFound),
-    ("unsupported model", ProbeVerdict::ModelNotFound),
-    ("model does not exist", ProbeVerdict::ModelNotFound),
-    ("404", ProbeVerdict::ModelNotFound),
-    ("invalid api key", ProbeVerdict::NoKey),
-    ("no api key", ProbeVerdict::NoKey),
-    ("incorrect api key", ProbeVerdict::NoKey),
-    ("unauthorized", ProbeVerdict::NoKey),
-    ("401", ProbeVerdict::NoKey),
-    ("connection refused", ProbeVerdict::Network),
-    ("connection reset", ProbeVerdict::Network),
-    ("network is unreachable", ProbeVerdict::Network),
-    ("temporary failure in name resolution", ProbeVerdict::Network),
-    ("failed to connect", ProbeVerdict::Network),
-    ("dns", ProbeVerdict::Network),
-    ("timed out", ProbeVerdict::Timeout),
-    ("timeout", ProbeVerdict::Timeout),
-];
+/// One row of the observed-refusal DATA (`data/probe_samples.yaml`): a marker
+/// found in the provider's output and the verdict token it stands for.
+#[derive(Deserialize)]
+struct SampleRow {
+    marker: String,
+    verdict: String,
+}
+
+#[derive(Deserialize)]
+struct SampleFile {
+    #[serde(default)]
+    samples: Vec<SampleRow>,
+}
+
+/// The observed refusal samples, loaded from the DECLARATIVE data file baked
+/// into the binary (R7 quality return: an observation catalogue is data, not
+/// a typed const table; adding a sample is a YAML row, not a code edit). A
+/// malformed/absent list degrades to «nothing recognised» — `unknown`, which
+/// is the honest fail-closed answer, never a panic and never a dead verdict.
+fn samples() -> Vec<(String, ProbeVerdict)> {
+    let doc: SampleFile = serde_yaml::from_str(include_str!("../data/probe_samples.yaml"))
+        .unwrap_or(SampleFile {
+            samples: Vec::new(),
+        });
+    doc.samples
+        .into_iter()
+        .filter_map(|r| ProbeVerdict::parse(&r.verdict).map(|v| (r.marker, v)))
+        .collect()
+}
 
 /// Classify a non-zero, non-timed-out exit by the stored evidence. Unknown
-/// when the sample table does not speak — «не доказано», never «мёртвая».
+/// when the observation data does not speak — «не доказано», never «мёртвая».
+/// Order is the data file's order: the first marker wins.
 pub fn classify(output: &str) -> ProbeVerdict {
     let haystack = output.to_ascii_lowercase();
-    for (marker, verdict) in SAMPLE_TABLE {
-        if haystack.contains(marker) {
-            return *verdict;
+    for (marker, verdict) in samples() {
+        if haystack.contains(&marker) {
+            return verdict;
         }
     }
     ProbeVerdict::Unknown
@@ -369,11 +368,7 @@ mod tests {
         // THE deadline mechanics `probe` runs (`run_argv`), not a copy of
         // them (REQ-MS-03 AC1).
         let started = Instant::now();
-        let argv = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "sleep 30".to_string(),
-        ];
+        let argv = vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
         let run = run_argv(&argv, 200);
         assert!(run.timed_out, "the child must be killed at the deadline");
         assert_eq!(run.exit_code, None, "a killed child has no exit code");
@@ -386,10 +381,7 @@ mod tests {
     #[test]
     fn a_clean_exit_is_ok_and_provider_evidence_is_classified() {
         // Exit 0 → ok, whatever the output says.
-        let ok = run_argv(
-            &["sh".into(), "-c".into(), "echo ping".into()],
-            5_000,
-        );
+        let ok = run_argv(&["sh".into(), "-c".into(), "echo ping".into()], 5_000);
         assert_eq!(ok.exit_code, Some(0));
         assert!(!ok.timed_out);
         // A non-zero exit is classified ONLY from the stored evidence: the
@@ -423,8 +415,7 @@ mod tests {
         let pos = claude.iter().position(|a| a == "--effort").unwrap();
         assert_eq!(claude[pos + 1], "high");
 
-        let hermes =
-            argv_of(&ProbeRequest::new("hermes", "deepseek", "m", "medium")).unwrap();
+        let hermes = argv_of(&ProbeRequest::new("hermes", "deepseek", "m", "medium")).unwrap();
         let pos = hermes.iter().position(|a| a == "--provider").unwrap();
         assert_eq!(hermes[pos + 1], "deepseek");
         // REQ-MS-09: and hermes' own `--reasoning`.

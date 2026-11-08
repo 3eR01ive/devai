@@ -356,12 +356,18 @@ export interface ActiveBundleView {
 export interface BundleStatusView {
   // live | not_working | not_proven | unknown | not_selected
   state: string;
+  /** The ONE operator word of `state`, served by the platform dictionary. */
+  state_text: string;
   latency_ms: number | null;
   verdict: string | null;
   reason: string | null;
+  /** The operator word of `reason`, from the same platform dictionary. */
+  reason_text: string | null;
   evidence: string | null;
   evidence_at: string | null;
   freshness: string;
+  /** The operator word of `freshness` (names WHICH evidence is fresh). */
+  freshness_text: string;
   probe_older: boolean;
 }
 
@@ -373,6 +379,8 @@ export interface ModelEventView {
   verdict: string | null;
   outcome: string | null;
   reason: string | null;
+  /** The operator word of `reason`, from the platform dictionary. */
+  reason_text: string | null;
   latency_ms: number | null;
   from: Record<string, unknown> | null;
   to: Record<string, unknown> | null;
@@ -405,6 +413,8 @@ export interface ModelSnapshot {
 export interface ProbeView {
   bundle_id: string;
   verdict: string;
+  /** The operator word of `verdict`, from the platform dictionary. */
+  verdict_text: string;
   latency_ms: number;
   exit_code: number | null;
   output_excerpt: string;

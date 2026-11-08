@@ -94,10 +94,7 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         "workflow/task-name.yaml",
         include_str!("../../../config/workflow/task-name.yaml"),
     ),
-    (
-        "models.yaml",
-        include_str!("../../../config/models.yaml"),
-    ),
+    ("models.yaml", include_str!("../../../config/models.yaml")),
 ];
 
 fn cfg_err(msg: impl Into<String>) -> StoreError {

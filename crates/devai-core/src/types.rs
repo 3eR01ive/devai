@@ -904,6 +904,77 @@ impl Freshness {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The ONE operator-word dictionary of the model-bundle surface (R3 quality
+// return). The API snapshot, the console mirror and the window all read
+// these functions; no consumer keeps its own copy of the mapping. Wire tokens
+// stay frozen (they are stored history), only the words are chosen here.
+// ---------------------------------------------------------------------------
+
+/// The factory probe policy (ASM-4): the home's `models.yaml` carries the
+/// real policy; these are ONLY the defaults the loader and `ProbeRequest`
+/// fall back to. One source for all three defaults (R6 quality return).
+pub const DEFAULT_PROBE_PHRASE: &str = "ping";
+pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 20_000;
+pub const DEFAULT_PROBE_FRESH_SECS: u64 = 900;
+
+/// One status word for a snapshot `state` (REQ-MS-06: exactly one word on
+/// screen). An unknown token is never dressed as live or dead.
+pub fn status_word(state: &str) -> &'static str {
+    match state {
+        "live" => "живая",
+        "not_working" => "не работает",
+        "not_proven" => "не доказано",
+        "not_selected" => "связка не выбрана",
+        _ => "неизвестно",
+    }
+}
+
+/// One failure/reason word. `manual|limits|error` and the honest
+/// «причина не классифицирована» are pass-through (the operator picked that
+/// token); anything unrecognised reads «причина не распознана» — never a
+/// guessed cause.
+pub fn failure_word(code: &str) -> &str {
+    match code {
+        "no_credits" => "нет кредитов",
+        "model_not_found" => "модель не существует",
+        "no_key" => "нет ключа провайдера",
+        "network" => "сеть недоступна",
+        "provider" => "отказ провайдера",
+        "manual" | "limits" | "error" | "причина не классифицирована" => {
+            code
+        }
+        _ => "причина не распознана",
+    }
+}
+
+/// One word for a probe verdict: `ok` is not a failure, timeout/unknown are
+/// «не доказано», mock is «не пробуется».
+pub fn verdict_word(verdict: &str) -> &str {
+    match verdict {
+        "ok" => "успешна",
+        "timeout" => "таймаут — не доказано",
+        "unknown" => "не доказано",
+        "not_probeable" => "не пробуется",
+        other => failure_word(other),
+    }
+}
+
+/// Freshness as the operator reads it. The word names WHICH evidence is
+/// fresh — a run row must never be called «свежая проба» (R8 quality
+/// return: the execution branch was mislabelled on screen).
+pub fn freshness_word(freshness: &str, evidence: Option<&str>) -> &'static str {
+    match (freshness, evidence) {
+        ("fresh", Some("probe")) => "свежая проба",
+        ("fresh", Some("execution")) => "свежий прогон",
+        ("fresh", _) => "свежие доказательства",
+        ("stale", Some("probe")) => "проба устарела",
+        ("stale", Some("execution")) => "прогон устарел",
+        ("stale", _) => "доказательства устарели",
+        _ => "доказательств нет",
+    }
+}
+
 /// The closed vocabulary of `RoleExecution.failure_class` (REQ-FG-01/03).
 /// Producers write these strings; consumers read them back — never a raw
 /// literal at a call site.
@@ -1455,6 +1526,10 @@ pub mod json_field {
     pub const PROBE_EVENT: &str = "probe_event";
     pub const AGENT_CHANGED: &str = "agent_changed";
     pub const FRESHNESS: &str = "freshness";
+    /// The STEP of a `failed` switch (REQ-MS-05: «шаг отказа»): the
+    /// transaction that rolled back names the step it died on. Written only
+    /// on the `failed` outcome — an applied/refused switch carries no step.
+    pub const FAILURE_STEP: &str = "failure_step";
 
     /// The COMPLETE enumerable vocabulary of payload field names the platform
     /// itself mints. Load-time policy validation checks user-authored field
@@ -1521,5 +1596,60 @@ pub mod json_field {
         PROBE_EVENT,
         AGENT_CHANGED,
         FRESHNESS,
+        FAILURE_STEP,
     ];
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    /// R3 quality return: ONE dictionary backs the API, the console and the
+    /// window. The stored tokens never drift; unknown input is never guessed.
+    #[test]
+    fn the_failure_words_are_one_closed_dictionary() {
+        assert_eq!(failure_word("no_credits"), "нет кредитов");
+        assert_eq!(failure_word("model_not_found"), "модель не существует");
+        assert_eq!(failure_word("no_key"), "нет ключа провайдера");
+        assert_eq!(failure_word("network"), "сеть недоступна");
+        assert_eq!(failure_word("provider"), "отказ провайдера");
+        // The human-chosen reason tokens are pass-through, not re-worded.
+        assert_eq!(failure_word("manual"), "manual");
+        assert_eq!(failure_word("limits"), "limits");
+        assert_eq!(failure_word("error"), "error");
+        assert_eq!(
+            failure_word("причина не классифицирована"),
+            "причина не классифицирована"
+        );
+        // Not proven = not named.
+        assert_eq!(failure_word("самопридуманное"), "причина не распознана");
+    }
+
+    #[test]
+    fn every_state_and_freshness_has_one_word() {
+        for (token, word) in [
+            ("live", "живая"),
+            ("not_working", "не работает"),
+            ("not_proven", "не доказано"),
+            ("not_selected", "связка не выбрана"),
+            ("whatever", "неизвестно"),
+        ] {
+            assert_eq!(status_word(token), word);
+        }
+        // The word names WHICH evidence is fresh — a run is not a probe.
+        assert_eq!(freshness_word("fresh", Some("probe")), "свежая проба");
+        assert_eq!(freshness_word("fresh", Some("execution")), "свежий прогон");
+        assert_eq!(freshness_word("stale", Some("probe")), "проба устарела");
+        assert_eq!(freshness_word("stale", Some("execution")), "прогон устарел");
+        assert_eq!(freshness_word("unknown", None), "доказательств нет");
+    }
+
+    /// The factory probe policy is ONE source: the loader and the probe
+    /// request both read these consts (R6 quality return).
+    #[test]
+    fn the_probe_defaults_are_the_documented_policy() {
+        assert_eq!(DEFAULT_PROBE_PHRASE, "ping");
+        assert_eq!(DEFAULT_PROBE_TIMEOUT_MS, 20_000);
+        assert_eq!(DEFAULT_PROBE_FRESH_SECS, 900);
+    }
 }

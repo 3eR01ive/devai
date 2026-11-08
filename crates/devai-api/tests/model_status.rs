@@ -56,7 +56,10 @@ impl Fixture {
         let store = Store::open(home.path()).unwrap();
         let task = Task::new("status fixture", "status evidence", None, Utc::now());
         store.create_task(&task).unwrap();
-        Fixture { home, task: task.id }
+        Fixture {
+            home,
+            task: task.id,
+        }
     }
 
     fn store(&self) -> Store {
@@ -178,7 +181,11 @@ fn a_later_failed_run_beats_an_ok_probe_and_the_answer_says_the_probe_is_older()
     f.mark_active();
     let t0 = Utc::now() - Duration::seconds(400);
     f.probe("hermes-live", "ok", 42, t0);
-    f.finish_run(ExecutionStatus::Failed, Some(failure_class::PROVIDER), t0 + Duration::seconds(100));
+    f.finish_run(
+        ExecutionStatus::Failed,
+        Some(failure_class::PROVIDER),
+        t0 + Duration::seconds(100),
+    );
 
     let snap = f.api().model_snapshot().unwrap();
     assert_eq!(snap.status.state, "not_working", "the later evidence wins");
@@ -186,10 +193,17 @@ fn a_later_failed_run_beats_an_ok_probe_and_the_answer_says_the_probe_is_older()
     assert_eq!(snap.status.reason.as_deref(), Some(failure_class::PROVIDER));
     assert!(snap.status.probe_older, "the OK probe must be marked older");
     assert!(snap.status.latency_ms.is_none());
+    // R8 quality return: the winning evidence is a RUN, so the freshness word
+    // must say «свежий прогон» — never «свежая проба».
+    assert_eq!(snap.status.freshness, "fresh");
+    assert_eq!(snap.status.freshness_text, "свежий прогон");
     // The banner is part of the SAME snapshot and applies nothing.
     let banner = snap.failures.expect("not_working carries the banner");
     assert_eq!(banner.code, failure_class::PROVIDER);
-    assert_eq!(banner.suggestion, None, "no fresh successful probe = no offer");
+    assert_eq!(
+        banner.suggestion, None,
+        "no fresh successful probe = no offer"
+    );
 }
 
 #[test]
@@ -246,7 +260,12 @@ fn a_failed_row_without_a_class_is_never_given_an_invented_reason() {
 fn a_dead_probe_verdict_is_not_working_but_timeout_is_not_proven() {
     let f = Fixture::new();
     f.mark_active();
-    f.probe("hermes-live", "no_credits", 0, Utc::now() - Duration::seconds(10));
+    f.probe(
+        "hermes-live",
+        "no_credits",
+        0,
+        Utc::now() - Duration::seconds(10),
+    );
     let snap = f.api().model_snapshot().unwrap();
     assert_eq!(snap.status.state, "not_working");
     assert_eq!(snap.status.reason.as_deref(), Some("no_credits"));
@@ -257,10 +276,7 @@ fn a_dead_probe_verdict_is_not_working_but_timeout_is_not_proven() {
     f.probe("hermes-live", "timeout", 0, Utc::now());
     let snap = f.api().model_snapshot().unwrap();
     assert_eq!(snap.status.state, "not_proven");
-    assert!(snap
-        .status
-        .reason
-        .is_none());
+    assert!(snap.status.reason.is_none());
     assert!(snap.failures.is_none(), "«не доказано» does not glow");
 }
 
@@ -316,6 +332,13 @@ fn running_and_unstamped_rows_never_decide_the_status() {
         "no stamped evidence = «неизвестно», not «живая» and not «не работает»"
     );
     assert_eq!(snap.status.freshness, "unknown");
+    assert_eq!(snap.status.freshness_text, "доказательств нет");
+    assert!(!snap.running.is_empty(), "the RUNNING row is listed");
+    assert_eq!(
+        snap.running.len(),
+        1,
+        "only the RUNNING row: the finished legacy row is not in flight"
+    );
     assert!(snap.status.evidence.is_none());
     assert!(snap.failures.is_none());
 }
@@ -341,7 +364,12 @@ fn the_banner_offers_only_a_bundle_with_the_latest_fresh_ok_probe() {
         Utc::now() - Duration::seconds(5),
     );
     // Live, but stale (older than the declared 900 s window): NOT an offer.
-    f.probe("claude-live", "ok", 10, Utc::now() - Duration::seconds(2_000));
+    f.probe(
+        "claude-live",
+        "ok",
+        10,
+        Utc::now() - Duration::seconds(2_000),
+    );
     let snap = f.api().model_snapshot().unwrap();
     assert_eq!(snap.status.state, "not_working");
     assert_eq!(

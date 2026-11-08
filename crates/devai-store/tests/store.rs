@@ -1074,7 +1074,10 @@ fn the_partial_index_refuses_a_second_marked_agent_record() {
     raw.execute("UPDATE agent_instances SET active=1 WHERE name='first'", [])
         .unwrap();
     let err = raw
-        .execute("UPDATE agent_instances SET active=1 WHERE name='second'", [])
+        .execute(
+            "UPDATE agent_instances SET active=1 WHERE name='second'",
+            [],
+        )
         .unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("unique"),
@@ -1082,4 +1085,46 @@ fn the_partial_index_refuses_a_second_marked_agent_record() {
     );
     // The read stays single-valued: the FIRST marked record.
     assert_eq!(store.active_agent().unwrap().unwrap().name, "first");
+}
+
+/// R4 quality return: the snapshot's «идущие прогоны» is an ADDRESSED read —
+/// only RUNNING rows come back, never the whole execution history.
+#[test]
+fn running_executions_reads_only_running_rows() {
+    let (_d, store) = open();
+    let t1 = draft(&store);
+    let t2 = draft(&store);
+    let row = |task: Id, status: ExecutionStatus| RoleExecution {
+        id: new_id(),
+        task_id: task,
+        role_slug: "implementation-agent".into(),
+        role_version: 1,
+        agent_name: Some("hermes".into()),
+        status,
+        inputs: vec![],
+        summary: None,
+        error: None,
+        started_at: now(),
+        finished_at: None,
+        workspace_revision: None,
+        attempt: 1,
+        parent_execution: None,
+        failure_class: None,
+        owner_pid: None,
+        owner_host: None,
+        owner_process_start: None,
+        bundle: None,
+    };
+    let live = row(t1.id, ExecutionStatus::Running);
+    let done = row(t2.id, ExecutionStatus::Running);
+    store.start_execution(&live).unwrap();
+    store.start_execution(&done).unwrap();
+    store
+        .finish_execution_classified(&done, ExecutionStatus::Completed, None, None, None, now())
+        .unwrap();
+
+    let running = store.running_executions().unwrap();
+    assert_eq!(running.len(), 1, "only the RUNNING row is listed");
+    assert_eq!(running[0].id, live.id);
+    assert_eq!(running[0].status.as_str(), "RUNNING");
 }

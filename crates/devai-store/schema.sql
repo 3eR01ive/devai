@@ -250,6 +250,11 @@ CREATE INDEX exec_task ON role_executions(task_id);
 CREATE UNIQUE INDEX role_executions_single_writer
   ON role_executions(task_id)
   WHERE status = 'RUNNING';
+-- Addressed reads of the model-bundle surface (rung 013): the RUNNING list
+-- and the newest finished row of one identity stamp.
+CREATE INDEX role_executions_status ON role_executions(status);
+CREATE INDEX role_executions_stamp
+  ON role_executions(driver, llm_provider, model, reasoning, finished_at);
 
 -- Evaluation profile history: every (name, version) ever seeded, with the
 -- raw YAML body, so a recorded profile identity in an old execution stays

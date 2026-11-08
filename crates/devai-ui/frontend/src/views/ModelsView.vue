@@ -11,14 +11,12 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import {
+  HOLD_TIMER_GRACE_MS,
   HOLD_TO_SWITCH_MS,
   holdCompletes,
   modelWord,
   providerWord,
-  reasonWord,
   reasoningWord,
-  statusWord,
-  freshnessWord,
 } from "../model_view";
 import { fmtTime } from "../settings";
 import type { ModelSnapshot, SwitchResultView, UiError } from "../types";
@@ -54,7 +52,7 @@ async function probe(id: string) {
       [id]:
         p.verdict === "ok"
           ? `проба ok · ${p.latency_ms} мс`
-          : `проба ${p.verdict} (${reasonWord(p.verdict)})`,
+          : `проба ${p.verdict} (${p.verdict_text})`,
     };
     await load();
   } catch (e) {
@@ -92,7 +90,7 @@ function startHold(id: string) {
     if (completes) {
       void applySwitch(id);
     }
-  }, HOLD_TO_SWITCH_MS);
+  }, HOLD_TO_SWITCH_MS + HOLD_TIMER_GRACE_MS);
 }
 
 function cancelHold() {
@@ -141,9 +139,9 @@ onUnmounted(cancelHold);
           <b>{{ snap.active ? (snap.active.label ?? "(не объявлена в конфиге)") : "связка не выбрана" }}</b>
           <span v-if="snap.active" class="mono muted">{{ snap.active.id ?? "—" }}</span>
           <div class="spacer" />
-          <b data-testid="model-status">{{ statusWord(status?.state ?? "unknown") }}</b>
+          <b data-testid="model-status">{{ status?.state_text ?? "неизвестно" }}</b>
           <span v-if="status?.latency_ms != null" class="mono muted">{{ status.latency_ms }} мс</span>
-          <span class="mono muted">{{ freshnessWord(status?.freshness ?? "unknown") }}</span>
+          <span class="mono muted">{{ status?.freshness_text ?? "доказательств нет" }}</span>
         </div>
         <div v-if="snap.active" class="muted">
           агент <span class="mono">{{ snap.active.agent }}</span> ·
@@ -153,7 +151,7 @@ onUnmounted(cancelHold);
           уровень размышления <span class="mono">{{ reasoningWord(snap.active.reasoning) }}</span>
         </div>
         <div v-if="status?.reason" class="muted">
-          причина: {{ reasonWord(status.reason) }}
+          причина: {{ status.reason_text ?? "причина не распознана" }}
           <span v-if="status.probe_older"> · проба старее проваленной строки исполнения</span>
         </div>
         <div v-if="status?.evidence_at" class="muted">
@@ -227,7 +225,7 @@ onUnmounted(cancelHold);
           {{ e.bundle_id ?? "—" }}
           <template v-if="e.verdict"> · вердикт <span class="mono">{{ e.verdict }}</span></template>
           <template v-if="e.outcome"> · <span class="mono">{{ e.outcome }}</span></template>
-          <template v-if="e.reason"> · причина {{ reasonWord(e.reason) }}</template>
+          <template v-if="e.reason"> · причина {{ e.reason_text ?? "причина не распознана" }}</template>
           <template v-if="e.agent_changed"> · смена имени агента</template>
         </div>
       </div>

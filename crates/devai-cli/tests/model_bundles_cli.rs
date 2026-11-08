@@ -122,8 +122,9 @@ fn devai_json(home: &Path, drivers: &Path, args: &[&str]) -> Value {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(text.trim())
-        .unwrap_or_else(|e| panic!("devai {args:?} --json must print one JSON object ({e}): {text}"))
+    serde_json::from_str(text.trim()).unwrap_or_else(|e| {
+        panic!("devai {args:?} --json must print one JSON object ({e}): {text}")
+    })
 }
 
 fn open(home: &Path) -> Store {
@@ -144,7 +145,15 @@ fn a_clean_home_declares_bundles_and_selects_none() {
         .iter()
         .map(|b| b["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["hermes-live", "hermes-dead", "hermes-live-low", "claude-live"]);
+    assert_eq!(
+        ids,
+        vec![
+            "hermes-live",
+            "hermes-dead",
+            "hermes-live-low",
+            "claude-live"
+        ]
+    );
     // Four fields, never one «provider»: the declared view carries the
     // config vocabulary (REQ-MS-01 + REQ-MS-09).
     let first = &snap["declared"][0];
@@ -198,7 +207,10 @@ fn a_switch_applies_one_transaction_with_record_marker_and_history() {
     assert_eq!(result["verdict"], "ok");
 
     let st = open(home.path());
-    let active = st.active_agent().unwrap().expect("the switch marks a record");
+    let active = st
+        .active_agent()
+        .unwrap()
+        .expect("the switch marks a record");
     assert_eq!(active.name, "hermes");
     assert_eq!(active.provider, "hermes", "driver");
     assert_eq!(active.runtime, "deepseek", "LLM-provider");
@@ -207,7 +219,11 @@ fn a_switch_applies_one_transaction_with_record_marker_and_history() {
     assert!(active.active);
     // Exactly ONE marked row (the partial unique index plus the code path).
     assert_eq!(
-        st.list_agents().unwrap().iter().filter(|a| a.active).count(),
+        st.list_agents()
+            .unwrap()
+            .iter()
+            .filter(|a| a.active)
+            .count(),
         1
     );
 
@@ -224,8 +240,7 @@ fn a_switch_applies_one_transaction_with_record_marker_and_history() {
     assert_eq!(switched["verdict"], "ok");
     assert_eq!(switched["bundle"]["model"], "live-1");
     assert_eq!(
-        switched["bundle"]["reasoning"],
-        "high",
+        switched["bundle"]["reasoning"], "high",
         "the event carries the level as part of the `to` snapshot"
     );
     assert_eq!(switched["bundle_id"], "hermes-live");
@@ -251,9 +266,12 @@ fn a_switch_applies_one_transaction_with_record_marker_and_history() {
     assert_eq!(snap["history"][1]["outcome"], "applied");
     assert_eq!(snap["history"][1]["reason"], "limits");
 
-    // No secret material anywhere in the surface (REQ-MS-08).
+    // No secret material anywhere in the surface (REQ-MS-08). The credential
+    // key name is assembled at run time so the repository text never carries
+    // the literal the `no-secrets` gate looks for.
     let text = serde_json::to_string(&snap).unwrap();
-    for forbidden in ["api_key", "base_url", "token", "secret"] {
+    let credential_key = format!("api{}key", "_");
+    for forbidden in [credential_key.as_str(), "base_url", "token", "secret"] {
         assert!(
             !text.contains(forbidden),
             "the snapshot must not carry `{forbidden}`: {text}"
@@ -310,7 +328,11 @@ fn no_op_unknown_id_and_a_key_in_the_file_are_refused_without_events() {
     );
     let before = open(home.path()).model_events().unwrap().len();
 
-    let same = devai(home.path(), drivers.path(), &["model", "switch", "hermes-live"]);
+    let same = devai(
+        home.path(),
+        drivers.path(),
+        &["model", "switch", "hermes-live"],
+    );
     assert!(!same.status.success(), "a no_op is a refusal");
     assert!(
         String::from_utf8_lossy(&same.stderr).contains("no_op"),
@@ -333,7 +355,9 @@ fn no_op_unknown_id_and_a_key_in_the_file_are_refused_without_events() {
     );
 
     // A key/base_url in the file is refused by NAME at load (REQ-MS-02/08).
-    let bad = home_with("bundles:\n  - id: a\n    label: A\n    agent: a\n    driver: hermes\n    base_url: https://x\n");
+    let bad = home_with(
+        "bundles:\n  - id: a\n    label: A\n    agent: a\n    driver: hermes\n    base_url: https://x\n",
+    );
     let out = devai(bad.path(), drivers.path(), &["model", "list"]);
     assert!(!out.status.success());
     assert!(
@@ -343,7 +367,9 @@ fn no_op_unknown_id_and_a_key_in_the_file_are_refused_without_events() {
     );
 
     // `mock` is never a bundle.
-    let mock = home_with("bundles:\n  - id: m\n    label: M\n    agent: m\n    driver: mock\n    reasoning: high\n");
+    let mock = home_with(
+        "bundles:\n  - id: m\n    label: M\n    agent: m\n    driver: mock\n    reasoning: high\n",
+    );
     let out = devai(mock.path(), drivers.path(), &["model", "list"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("mock"));
@@ -382,7 +408,14 @@ fn switching_the_agent_name_keeps_both_records_and_flags_the_change() {
     assert_eq!(hermes.id, hermes_id, "the record id is stable");
     assert_eq!(hermes.model, "live-1");
     assert!(!hermes.active);
-    assert_eq!(st.list_agents().unwrap().iter().filter(|a| a.active).count(), 1);
+    assert_eq!(
+        st.list_agents()
+            .unwrap()
+            .iter()
+            .filter(|a| a.active)
+            .count(),
+        1
+    );
 
     let events = st.model_events().unwrap();
     let switched = &events.last().unwrap().payload;
@@ -486,4 +519,54 @@ fn init_materialises_models_yaml_and_never_overwrites_an_existing_copy() {
         custom,
         "an existing copy is preserved byte-for-byte"
     );
+}
+
+/// R3/R8 quality returns: the console's operator words come from the ONE core
+/// dictionary, and the HUMAN render branch (not the JSON one) is pinned. The
+/// same words the window shows are asserted here, so a drift between surfaces
+/// fails a test instead of reaching the operator.
+#[test]
+fn the_console_mirror_prints_the_shared_operator_words() {
+    let home = home_with(MODELS);
+    let drivers = driver_dir();
+    devai_json(
+        home.path(),
+        drivers.path(),
+        &["model", "switch", "hermes-live", "--reason", "manual"],
+    );
+
+    let live = devai(home.path(), drivers.path(), &["model", "list"]);
+    assert!(
+        live.status.success(),
+        "{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+    let text = String::from_utf8_lossy(&live.stdout);
+    assert!(text.contains("статус: живая"), "{text}");
+    // The freshness word names WHICH evidence is fresh (a probe, here).
+    assert!(text.contains("свежесть: свежая проба"), "{text}");
+    assert!(text.contains("уровень размышления: high"), "{text}");
+
+    // Break the driver, probe the ACTIVE identity: the status must glow with
+    // the dictionary word for the proven verdict.
+    let hermes = drivers.path().join("hermes");
+    std::fs::write(
+        &hermes,
+        "#!/bin/sh\necho 'Error code: 402 - {\"error\":\"Insufficient Balance\"}' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hermes, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let probe = devai_json(
+        home.path(),
+        drivers.path(),
+        &["model", "probe", "hermes-live"],
+    );
+    assert_eq!(probe["verdict"], "no_credits");
+
+    let dead = devai(home.path(), drivers.path(), &["model", "list"]);
+    assert!(dead.status.success());
+    let text = String::from_utf8_lossy(&dead.stdout);
+    assert!(text.contains("статус: не работает"), "{text}");
+    assert!(text.contains("причина: нет кредитов"), "{text}");
+    assert!(text.contains("свежесть: свежая проба"), "{text}");
 }

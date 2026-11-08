@@ -1938,6 +1938,22 @@ impl Store {
         Ok(out)
     }
 
+    /// The RUNNING rows only — the snapshot's «идущие прогоны» list (R4
+    /// quality return). Addressed by the `role_executions_status` index
+    /// instead of reading the whole execution history and filtering in
+    /// memory; the single-writer index allows at most one per task anyway.
+    pub fn running_executions(&self) -> StoreResult<Vec<RoleExecution>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning FROM role_executions WHERE status='RUNNING' ORDER BY started_at",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(rows::execution_from_row(r)?);
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------
     // decisions & questions
     // ------------------------------------------------------------------
