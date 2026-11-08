@@ -1815,27 +1815,63 @@ mod tests {
             !states.contains("signature_labels"),
             "states.ts is a TaskState mirror, not the section's word dictionary"
         );
-        // Rework R8: the words are DATA — `signature/labels.json` in devai-api,
-        // rendered into the section's generated module. The closed tokens are
-        // checked in the DATA file, which is the single source both languages
-        // read.
+        // Rework R0: the words are ONE constant of the section's own module
+        // (`signature_labels.ts`), not a data table. This test ties that
+        // constant's token sets to the CLOSED Rust types: growing an enum
+        // fails here until the word lands in the module.
         let labels = std::fs::read_to_string(format!(
-            "{crate_dir}/../devai-api/src/signature/labels.json"
+            "{crate_dir}/frontend/src/signature_labels.ts"
         ))
         .unwrap();
-        for token in [
-            "CURRENT",
-            "STALE",
-            "SUPERSEDED",
-            "spec_not_current",
-            "no_requirements_version",
-            "review_report",
-        ] {
-            assert!(
-                labels.contains(token),
-                "signature/labels.json misses the closed token `{token}`"
-            );
-        }
+        let tokens_of = |constant: &str| -> std::collections::BTreeSet<String> {
+            let head = format!("export const {constant}: Record<string, string> = {{");
+            let start = labels
+                .find(&head)
+                .unwrap_or_else(|| panic!("no dictionary `{constant}` in signature_labels.ts"));
+            let body = &labels[start + head.len()..];
+            let end = body.find("};").expect("the dictionary block is not closed");
+            body[..end]
+                .lines()
+                .filter_map(|line| {
+                    let (key, rest) = line.trim().split_once(':')?;
+                    let word = rest.trim().trim_end_matches(',').trim().trim_matches('"');
+                    assert!(!word.is_empty(), "{constant}: нет слова для `{key}`");
+                    Some(key.trim().to_string())
+                })
+                .collect()
+        };
+        let serde_token = |value: &str| value.to_string();
+
+        let statuses: std::collections::BTreeSet<String> = devai_core::types::ArtifactStatus::ALL
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        assert_eq!(tokens_of("ARTIFACT_STATUS_LABELS"), statuses);
+
+        let wire = |v: &serde_json::Value| v.as_str().expect("closed sets are string tokens").to_string();
+        let spec_sources: std::collections::BTreeSet<String> = ParagraphSource::ALL
+            .iter()
+            .map(|v| serde_token(&wire(&serde_json::to_value(*v).unwrap())))
+            .collect();
+        assert_eq!(tokens_of("PARAGRAPH_SOURCE_LABELS"), spec_sources);
+
+        let review_sources: std::collections::BTreeSet<String> =
+            devai_api::ReviewParagraphSource::ALL
+                .iter()
+                .map(|v| serde_token(&wire(&serde_json::to_value(*v).unwrap())))
+                .collect();
+        assert_eq!(tokens_of("REVIEW_PARAGRAPH_SOURCE_LABELS"), review_sources);
+
+        let verdicts: std::collections::BTreeSet<String> = devai_core::types::Verdict::ALL
+            .iter()
+            .map(|v| v.as_str().to_ascii_lowercase())
+            .filter(|v| v != "returned")
+            .collect();
+        assert_eq!(tokens_of("REVIEW_VERDICT_LABELS"), verdicts);
+
+        let denials: std::collections::BTreeSet<String> =
+            devai_api::DENIAL_CODES.iter().map(|c| c.to_string()).collect();
+        assert_eq!(tokens_of("DENIAL_LABELS"), denials);
     }
 
     /// REQ-SIGN-07: the signature answer's serialized fields exist in the

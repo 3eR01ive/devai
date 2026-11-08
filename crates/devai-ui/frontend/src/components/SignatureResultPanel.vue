@@ -1,13 +1,18 @@
 <script setup lang="ts">
 // Результат подписи (REQ-SIGN-06): самый новый сохранённый факт — кто, когда,
 // каким обоснованием, к какой версии спеки. Источник — task.signature
-// (решение или событие); rationale=null — валидный факт «без обоснования»,
-// поле не скрывается. Панель не сворачивается и не исчезает.
+// (решение или событие); rationale=null И пустая строка — один валидный факт
+// «без обоснования» (R2 rework: Some("") достижим через CLI), поле не
+// скрывается. Панель не сворачивается и не исчезает.
+import { computed } from "vue";
 import type { SignatureFact } from "../types";
 import { fmtTime } from "../settings";
+import { signatureRationale } from "../signature_view";
 import { SIGNATURE_KIND_LABELS, SIGNATURE_SOURCE_LABELS, labelFor } from "../signature_labels";
 
-defineProps<{ fact: SignatureFact }>();
+const props = defineProps<{ fact: SignatureFact }>();
+
+const rationale = computed(() => signatureRationale(props.fact.rationale));
 </script>
 
 <template>
@@ -26,7 +31,7 @@ defineProps<{ fact: SignatureFact }>();
         <template v-else>версия в записи не сохранена</template>
       </p>
       <p class="muted" style="margin: 0 0 2px">обоснование:</p>
-      <p v-if="fact.rationale !== null" class="rationale">{{ fact.rationale }}</p>
+      <p v-if="rationale !== null" class="rationale">{{ rationale }}</p>
       <p v-else class="rationale muted">без обоснования</p>
     </div>
   </div>

@@ -1,97 +1,55 @@
-// Rework R5/R8: the signature section's words used to be hand-written TS maps
-// beside `CLOSED_TOKEN_SETS`, and the refusal codes a Rust const table. Now
-// there is ONE data file — `crates/devai-api/src/signature/labels.json` — and
-// every closed set is wired to it mechanically:
+// Rework R7: the refusal codes of the signature rights are spelled ONCE, in
+// Rust (`crates/devai-api/src/signature/denial.rs` → DENIAL_CODES), and the
+// section's word map `DENIAL_LABELS` must cover EXACTLY that set. A code
+// added on one side only fails this test: the two halves cannot drift.
 //
-//   * Rust tests (`crates/devai-api/src/signature/vocabulary.rs`) compare the
-//     data's token sets with the closed enums and pin the ratified denial
-//     codes;
-//   * this test compares the checked-in TS render with a fresh render of the
-//     data, per set — a token added to the data but not rendered, or a render
-//     edited by hand, fails here;
-//   * `DENIAL_LABELS` is checked against the data's `denial` set explicitly,
-//     because that is the set the refusal rules return.
+// This is a parity check over the real source, not a copy: it parses the
+// Rust constants and the DENIAL_CODES array, then compares the key set.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
-import {
-  ARTIFACT_STATUS_LABELS,
-  DENIAL_LABELS,
-  PARAGRAPH_SOURCE_LABELS,
-  REVIEW_PARAGRAPH_SOURCE_LABELS,
-  REVIEW_VERDICT_LABELS,
-  SIGNATURE_KIND_LABELS,
-  SIGNATURE_SOURCE_LABELS,
-} from "../src/signature_labels.ts";
-import {
-  LABELS_JSON,
-  OUT_FILE,
-  SETS,
-  parseLabels,
-  renderModule,
-} from "../scripts/gen-signature-labels.mjs";
+import { DENIAL_LABELS } from "../src/signature_labels.ts";
 
-const data = parseLabels(readFileSync(LABELS_JSON, "utf8"));
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DENIAL_RS = resolve(HERE, "../../../devai-api/src/signature/denial.rs");
 
-const rendered: Record<string, Record<string, string>> = {
-  ARTIFACT_STATUS_LABELS,
-  REVIEW_VERDICT_LABELS,
-  PARAGRAPH_SOURCE_LABELS,
-  REVIEW_PARAGRAPH_SOURCE_LABELS,
-  DENIAL_LABELS,
-  SIGNATURE_KIND_LABELS,
-  SIGNATURE_SOURCE_LABELS,
-};
-
-test("the checked-in TS render is a current render of labels.json", () => {
-  assert.equal(
-    readFileSync(OUT_FILE, "utf8"),
-    renderModule(data),
-    "src/generated/signature-labels.ts is stale — run `node scripts/gen-signature-labels.mjs`",
-  );
-});
-
-test("every data set reaches the UI with exactly its tokens and words", () => {
-  for (const [set, constant] of Object.entries(SETS)) {
-    const pairs = data[set] as { token: string; word: string }[];
-    const render = rendered[constant as string];
-    assert.ok(render, `no render for set ${set} (${constant})`);
-    assert.deepEqual(
-      Object.keys(render).sort(),
-      pairs.map((p) => p.token).sort(),
-      `${constant} and labels.json «${set}» disagree — regenerate the module`,
-    );
-    for (const pair of pairs) {
-      assert.equal(render[pair.token], pair.word, `${constant}:${pair.token} word differs`);
-      assert.ok(pair.word.trim(), `${constant}:${pair.token} has a blank word`);
-    }
+/** `pub const NAME: &str = "value";` pairs of the denial module. */
+function stringConstants(source) {
+  const consts = new Map();
+  for (const m of source.matchAll(/pub const ([A-Z][A-Z0-9_]*): &str = "([^"]+)";/g)) {
+    consts.set(m[1], m[2]);
   }
-});
+  return consts;
+}
 
-test("no UI dictionary exists that the data does not produce", () => {
-  assert.deepEqual(
-    Object.keys(rendered).sort(),
-    Object.values(SETS).sort(),
-    "a TS dictionary is rendered that labels.json does not define",
-  );
-});
+/** The codes named by `DENIAL_CODES`, resolved to their string values. */
+function denialCodes(source) {
+  const consts = stringConstants(source);
+  const list = source.match(/pub const DENIAL_CODES: &\[&str\] = &\[([\s\S]*?)\];/);
+  assert.ok(list, "denial.rs must declare the DENIAL_CODES array");
+  return list[1]
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean)
+    .map((name) => {
+      const value = consts.get(name);
+      assert.ok(value, `DENIAL_CODES names ${name}, which has no string constant`);
+      return value;
+    });
+}
 
-test("the denial words come from the same data the refusal rules read", () => {
+test("every Rust denial code has a word, and no word exists without a code", () => {
+  const codes = denialCodes(readFileSync(DENIAL_RS, "utf8"));
+  assert.ok(codes.length > 0, "the denial dictionary must not be empty");
   assert.deepEqual(
     Object.keys(DENIAL_LABELS).sort(),
-    data.denial.map((p: { token: string }) => p.token).sort(),
-    "DENIAL_LABELS and labels.json «denial» disagree — the rules return data tokens",
+    [...codes].sort(),
+    "DENIAL_LABELS and the Rust DENIAL_CODES disagree — add the code on BOTH sides",
   );
-});
-
-test("a set the data grows without a TS render fails loudly", () => {
-  assert.throws(
-    () => parseLabels(JSON.stringify({ ...data, unexpected_set: [{ token: "x", word: "y" }] })),
-    /sets with no TS render/,
-  );
-  assert.throws(
-    () => parseLabels(JSON.stringify({ ...data, denial: [] })),
-    /no non-empty `denial` set/,
-  );
+  for (const code of codes) {
+    assert.ok(DENIAL_LABELS[code]?.trim(), `нет слова для кода отказа ${code}`);
+  }
 });

@@ -20,8 +20,8 @@ pub enum ReviewParagraphSource {
 }
 
 impl ReviewParagraphSource {
-    /// The closed set, compared against the data file by the vocabulary
-    /// parity test (rework R8).
+    /// The closed set, compared against the section's word module by the
+    /// label parity test in devai-ui/commands.rs.
     pub const ALL: &'static [ReviewParagraphSource] =
         &[Self::ReviewReport, Self::Summary, Self::None];
 }

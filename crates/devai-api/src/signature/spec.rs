@@ -59,8 +59,9 @@ pub enum ParagraphSource {
 }
 
 impl ParagraphSource {
-    /// The closed set, so the label parity test (rework R8) compares the
-    /// data file against the type instead of a hand-kept list.
+    /// The closed set, so the label parity test (devai-ui/commands.rs)
+    /// compares the section's word module (`signature_labels.ts`) against the
+    /// type instead of a hand-kept list.
     pub const ALL: &'static [ParagraphSource] = &[Self::Spec, Self::BusinessDescription];
 }
 

@@ -64,6 +64,16 @@ export function specParagraph(spec: SpecView): { text: string; sourceNote: strin
   };
 }
 
+/// Обоснование сохранённого факта для печати (REQ-SIGN-06 AC2): null И
+/// пустая строка — один и тот же факт «без обоснования». `Some("")` достижим
+/// через CLI (`task approve --rationale ""`), поэтому панель не должна
+/// печатать пустой абзац под меткой обоснования; непустая строка печатается
+/// как сохранена.
+export function signatureRationale(rationale: string | null): string | null {
+  if (rationale === null || rationale.trim() === "") return null;
+  return rationale;
+}
+
 /// Счёт раскрывающихся критериев требования: «3 AC · 1 ограничение».
 export function criteriaSummary(ac: number, constraints: number): string {
   const parts: string[] = [];

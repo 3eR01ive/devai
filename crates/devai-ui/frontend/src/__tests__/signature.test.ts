@@ -26,6 +26,7 @@ import {
   rationaleValid,
   reviewParagraph,
   reviewVerdict,
+  signatureRationale,
   specParagraph,
 } from "../signature_view";
 import type { ReviewView, SpecView } from "../types";
@@ -64,6 +65,18 @@ describe("hold-to-confirm", () => {
     expect(holdCompletes(HOLD_MS - 1)).toBe(false);
     expect(holdCompletes(0)).toBe(false);
     expect(holdCompletes(HOLD_MS)).toBe(true);
+  });
+});
+
+describe("signature rationale of the stored fact", () => {
+  it("treats null and blank as «без обоснования», keeps a real text verbatim", () => {
+    expect(signatureRationale(null)).toBeNull();
+    expect(signatureRationale("")).toBeNull();
+    expect(signatureRationale("   \n ")).toBeNull();
+    expect(signatureRationale("принято как есть")).toBe("принято как есть");
+    expect(signatureRationale("  строка с отступом\nвторая")).toBe(
+      "  строка с отступом\nвторая",
+    );
   });
 });
 

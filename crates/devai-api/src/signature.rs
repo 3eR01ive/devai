@@ -35,11 +35,10 @@ mod review;
 mod selectors;
 mod spec;
 mod types;
-mod vocabulary;
 
 pub use answer::signature_view;
 pub use body::{BodyError, BodyProblem, BodyProblemKind};
-pub use denial::{approve_denied, denial_codes, reject_denied};
+pub use denial::{DENIAL_CODES, approve_denied, reject_denied};
 pub use diff::diff_specs;
 pub use review::{ReviewParagraphSource, parse_review_body};
 pub use selectors::{last_review_artifact, pick_previous_spec};
@@ -236,14 +235,14 @@ mod tests {
         assert_eq!(reject_denied(TaskState::Approval), None);
         assert_eq!(reject_denied(TaskState::Analysis), Some("not_approval"));
 
-        // R8: every code those FOUR return sites can produce is READ FROM the
-        // data dictionary the UI render is generated from.
+        // Rework R7/R0: every code those FOUR return sites can produce lives
+        // in the ONE const list DENIAL_CODES the UI parity test also reads.
         let stale = parse_spec_body(Ok(r#"{"human_paragraph":"x"}"#), &task()).view(
             &artifact(1, devai_core::types::ArtifactStatus::Stale),
             false,
         );
         let current = view.clone();
-        let dictionary = denial_codes();
+        let dictionary = DENIAL_CODES;
         for code in [
             approve_denied(TaskState::Review, None, 0),
             approve_denied(TaskState::Approval, None, 0),
@@ -256,7 +255,7 @@ mod tests {
         {
             assert!(
                 dictionary.contains(&code),
-                "{code} is not in the data dictionary"
+                "{code} is not in DENIAL_CODES"
             );
         }
     }
@@ -520,5 +519,71 @@ mod tests {
         let fact2 = view2.signature.expect("the event is a fact");
         assert_eq!(fact2.source, "event");
         assert_eq!(fact2.spec_seq, None);
+    }
+
+    /// Rework R4: selection is FAIL-CLOSED over the kind vocabulary. An event
+    /// or decision kind the platform does not know must not be skipped in
+    /// silence — the read refuses and names the kind, so a future signature
+    /// kind becomes visible instead of vanishing from the operator's card.
+    #[test]
+    fn an_unknown_kind_stops_the_fact_selection_loudly() {
+        let (_dir, store, task) = store_with_task();
+        store
+            .insert_event(
+                Some(task.id),
+                "signature.brand_new",
+                "platform",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let err = signature_view(&store, task).unwrap_err();
+        assert_eq!(err.code().0, "signature_unknown_kind");
+        assert!(format!("{err}").contains("signature.brand_new"), "{err}");
+
+        let (_dir2, store2, task2) = store_with_task();
+        store2
+            .record_decision(&Decision {
+                id: new_id(),
+                task_id: task2.id,
+                kind: "brand_new_decision".into(),
+                verdict: Verdict::Approved,
+                actor: "platform".into(),
+                rationale: None,
+                refs: vec![],
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let err2 = signature_view(&store2, task2).unwrap_err();
+        assert_eq!(err2.code().0, "signature_unknown_kind");
+        assert!(format!("{err2}").contains("brand_new_decision"), "{err2}");
+    }
+
+    /// Every KNOWN non-signature kind stays a silent skip — the explicit
+    /// decision list and `event_kind::ALL` keep today's behaviour.
+    #[test]
+    fn known_non_signature_kinds_are_skipped_without_an_error() {
+        let (_dir, store, task) = store_with_task();
+        store
+            .insert_event(
+                Some(task.id),
+                event_kind::STATE_CHANGED,
+                "engine",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        store
+            .record_decision(&Decision {
+                id: new_id(),
+                task_id: task.id,
+                kind: decision_kind::QUALITY_RETURN.into(),
+                verdict: Verdict::Returned,
+                actor: "guerrero".into(),
+                rationale: Some("вернуть".into()),
+                refs: vec![],
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let view = signature_view(&store, task).unwrap();
+        assert!(view.signature.is_none(), "not every decision is a signature");
     }
 }
