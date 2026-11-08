@@ -18,6 +18,9 @@ import SignatureReviewer from "./signature/SignatureReviewer.vue";
 import SignatureActions from "./signature/SignatureActions.vue";
 
 const props = defineProps<{
+  /** Ошибка подписи — показывается РЯДОМ С КНОПКАМИ (R: оператор смотрел на кнопки
+   *  внизу и не видел красную строку вверху карточки — «нажимаю, ничего не происходит»). */
+  error?: { code: string; message: string } | null;
   signature: SignatureView;
   busy: boolean;
 }>();
@@ -88,6 +91,9 @@ function onAnswer(index: number, answer: string) {
 
       <SignatureReviewer :review="props.signature.review" :note="props.signature.review_note" />
 
+      <div v-if="props.error" class="sig-error">
+        <span class="code">{{ props.error.code }}</span> {{ props.error.message }}
+      </div>
       <SignatureActions
         :may-approve="props.signature.may_approve"
         :may-reject="props.signature.may_reject"
@@ -109,6 +115,19 @@ function onAnswer(index: number, answer: string) {
 </template>
 
 <style scoped>
+.sig-error {
+  margin: 8px 0;
+  padding: 6px 10px;
+  border-left: 3px solid #d33;
+  background: #fdecec;
+  color: #7a1010;
+  white-space: pre-wrap;
+}
+.sig-error .code {
+  font-family: var(--mono, monospace);
+  margin-right: 8px;
+  font-weight: 600;
+}
 .no-spec {
   margin: 0 0 10px;
 }

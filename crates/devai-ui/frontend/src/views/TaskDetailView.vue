@@ -318,6 +318,7 @@ async function activateForeignHome() {
       v-if="status.task.state === TaskStateToken.Approval && signature"
       :signature="signature"
       :busy="signatureBusy"
+      :error="signatureError"
       @apply="applySignature"
       @open-diff="showDiff = true"
     />

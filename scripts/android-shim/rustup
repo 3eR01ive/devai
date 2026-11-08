@@ -1,0 +1,4 @@
+#!/bin/sh
+# Собираем только arm64: не даём `tauri android` докачивать остальные Android-таргеты.
+if [ "$1" = "target" ] && [ "$2" = "add" ]; then exit 0; fi
+exec "$HOME/Android/rustup-bin/rustup" "$@"

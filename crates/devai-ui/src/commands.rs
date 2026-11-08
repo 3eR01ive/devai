@@ -48,6 +48,15 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Хендл ДЛЯ ЗАПИСИ. Окно держит дом в режиме наблюдения (read-only) —
+    /// так работает вся читающая поверхность; мутация же обязана идти тем же
+    /// путём, что CLI: `Api::open` на том же доме и том же акторе. Без этого
+    /// `task_approve` падал «attempt to write a readonly database» — и кнопка
+    /// подписи выглядела мёртвой (08.11, живой гейт).
+    fn write_api(&self, path: &str, actor: &str) -> Result<Api, UiError> {
+        Ok(Api::open(std::path::Path::new(path), actor)?)
+    }
+
     fn api(&self) -> std::sync::MutexGuard<'_, Api> {
         // Poisoned only if a command panicked mid-call; the reads leave no
         // mutation, so the handle is still sound.
@@ -686,8 +695,13 @@ pub fn task_approve(
     id_prefix: String,
     rationale: Option<String>,
 ) -> Result<SignatureView, UiError> {
+    let (home, actor) = {
+        let info = state.session();
+        (info.home.clone(), info.actor.clone())
+    };
+    let write = state.write_api(&home, &actor)?;
+    write.task_approve(&id_prefix, rationale)?;
     let api = state.api();
-    api.task_approve(&id_prefix, rationale)?;
     // The card is re-read from the store through the SAME read the section
     // renders — no local state is patched up (REQ-SIGN-04 AC6).
     Ok(api.task_signature(&id_prefix)?)
@@ -701,8 +715,13 @@ pub fn task_reject(
     id_prefix: String,
     rationale: Option<String>,
 ) -> Result<SignatureView, UiError> {
+    let (home, actor) = {
+        let info = state.session();
+        (info.home.clone(), info.actor.clone())
+    };
+    let write = state.write_api(&home, &actor)?;
+    write.task_reject(&id_prefix, rationale)?;
     let api = state.api();
-    api.task_reject(&id_prefix, rationale)?;
     Ok(api.task_signature(&id_prefix)?)
 }
 
@@ -1258,7 +1277,7 @@ mod tests {
     fn sources_never_import_the_store() {
         let needle: String = ["devai", "store"].join("_");
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        for file in ["main.rs", "session.rs", "commands.rs"] {
+        for file in ["lib.rs", "main.rs", "session.rs", "commands.rs"] {
             let src = std::fs::read_to_string(format!("{dir}/{file}")).unwrap();
             assert!(
                 !src.contains(needle.as_str()),
@@ -1481,7 +1500,9 @@ mod tests {
     fn frontend_invokes_are_exactly_mapped_operations() {
         let crate_dir = env!("CARGO_MANIFEST_DIR");
         let api_ts = std::fs::read_to_string(format!("{crate_dir}/frontend/src/api.ts")).unwrap();
-        let main_rs = std::fs::read_to_string(format!("{crate_dir}/src/main.rs")).unwrap();
+        // handlers moved into the lib target (Android needs a lib with mobile_entry_point):
+        // the invoke_handler registration lives in src/lib.rs now.
+        let main_rs = std::fs::read_to_string(format!("{crate_dir}/src/lib.rs")).unwrap();
 
         // Extract every invoke("<name>") / invoke<X>("<name>") token:
         // real calls are the ONLY occurrences of `invoke<` in api.ts

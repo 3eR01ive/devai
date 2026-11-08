@@ -449,6 +449,17 @@ impl Session {
     /// migrating bootstrap `Api::open` is used for exactly one case: a home
     /// that carries no store on disk yet and must be created once (the
     /// first launch of a home, REQ-HOME-02).
+    /// Дом платформы внутри каталога данных приложения (Android): ни $HOME,
+    /// ни $DEVAI_HOME у процесса нет, поэтому путь приходит снаружи, а
+    /// контрольный дом совпадает с домом запуска — реестр домов живёт рядом
+    /// с данными приложения (одно приложение = один дом на устройстве).
+    pub fn open_in_app_dir(home: PathBuf) -> Result<Session, BootstrapError> {
+        let lookup = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let actor = resolve_actor(&lookup);
+        let _ = std::fs::create_dir_all(&home);
+        Self::open_resolved(home.clone(), actor, home, true)
+    }
+
     pub(crate) fn open_resolved(
         launch: PathBuf,
         actor: String,

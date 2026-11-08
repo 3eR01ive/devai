@@ -9,14 +9,36 @@ set -eu
 
 PROFILE="debug"
 CARGO_FLAGS=""
+ANDROID=0
 for arg in "$@"; do
     case "$arg" in
         --release) PROFILE="release"; CARGO_FLAGS="--release" ;;
+        --android) ANDROID=1 ;;
         -h|--help)
-            echo "usage: ./build.sh [--release]  # binaries land in ./bin/"; exit 0 ;;
+            echo "usage: ./build.sh [--release] [--android]"; 
+            echo "  --android  собрать APK (arm64) и положить его в ./bin/devai-ui.apk";
+            echo "             нужны JDK 21, Android SDK/NDK — пути задаёт scripts/android-env.sh";
+            exit 0 ;;
         *) echo "build.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+
+# Android: сборка APK. Окружение (SDK, NDK, JDK 21, отдельный rustup) — в scripts/android-env.sh,
+# рецепт тот же, что в cashcrash: init проекта при первом запуске, затем arm64 APK.
+if [ "$ANDROID" = 1 ]; then
+    . ./scripts/android-env.sh
+    command -v cargo-tauri >/dev/null 2>&1 || { echo "build.sh: нет cargo-tauri (cargo install tauri-cli)" >&2; exit 1; }
+    [ -d crates/devai-ui/gen/android ] || ( cd crates/devai-ui && cargo tauri android init --ci )
+    # Подпись: без ключа Gradle отдаёт *-unsigned.apk, который телефон не поставит.
+    bash scripts/android-signing.sh
+    ( cd crates/devai-ui && cargo tauri android build --apk --target aarch64 )
+    apk_src="crates/devai-ui/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+    [ -f "$apk_src" ] || { echo "build.sh: APK не найден: $apk_src" >&2; exit 1; }
+    mkdir -p bin
+    cp "$apk_src" "bin/.devai-ui.apk.$$" && mv -f "bin/.devai-ui.apk.$$" bin/devai-ui.apk
+    echo "bin/devai-ui.apk <- $apk_src"
+    exit 0
+fi
 
 # 1) Фронт: зависимости и сборка ассетов ДО cargo — Tauri встраивает dist в бинарь
 # на этапе компиляции, поэтому устаревший node_modules или пустой dist даёт либо

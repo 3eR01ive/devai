@@ -64,7 +64,9 @@ const { holding, progress, start, release } = useHoldToConfirm(
         @contextmenu.prevent
       >
         <span class="fill" :style="{ width: `${holding === 'approve' ? progress * 100 : 0}%` }" />
-        <span class="label">Утвердить — удерживайте {{ HOLD_MS }} мс</span>
+        <span class="label">
+          {{ props.busy ? "подписываю…" : `Утвердить — удерживайте ${HOLD_MS} мс` }}
+        </span>
       </button>
       <span v-else class="muted">
         «Утвердить» недоступно: {{ props.approvalDenied ?? "may_approve=false" }}

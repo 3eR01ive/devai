@@ -10,6 +10,13 @@ description = "devai-ui: Tauri desktop consumer of the platform API — read-onl
 # direct deps below are the whole surface the crate can reach. devai-core
 # supplies the domain vocabulary types (Task/TaskState tokens) for the
 # inbox filter; it performs no IO (core's own doctrine).
+[lib]
+# Мобильной сборке Tauri нужен статический/динамический lib-таргет с
+# `mobile_entry_point`; десктоп использует тот же код как rlib из main.rs.
+name = "devai_ui"
+crate-type = ["staticlib", "cdylib", "rlib"]
+path = "src/lib.rs"
+
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
@@ -19,7 +26,7 @@ serde_json.workspace = true
 dirs.workspace = true
 devai-core.workspace = true
 devai-api.workspace = true
-tauri = "2"
+tauri = { version = "2", features = [] }
 # R1 (operator, rework of the homes cycle): the native folder picker for
 # adding a home (REQ-HOME-03 «диалог выбора пути»). Connected by the stock
 # plugin pattern: crate dep here, init in main.rs, `dialog:allow-open` in
@@ -34,5 +41,5 @@ serde_json.workspace = true
 tempfile = "3"
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 serde_json.workspace = true
