@@ -339,6 +339,19 @@ pub struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
+    /// The leading convergence block of the quality report (REQ-CV-16): the
+    /// SAME slice object the reads publish, computed once here from the
+    /// task's stored carriers and executions. No extra body read is made on
+    /// behalf of the block — it quotes the slice.
+    fn convergence_block(&self, task: &Task) -> RuntimeResult<String> {
+        let arts = self.store.artifacts(task.id)?;
+        let execs = self.store.list_executions(Some(task.id))?;
+        let read = |a: &Artifact| self.store.read_artifact_body(a);
+        let bodies = crate::convergence::BodyCache::from_reader(&read);
+        let view = crate::convergence::compute(&arts, &execs, &bodies);
+        Ok(crate::convergence::quality_report_block(&view))
+    }
+
     /// Engine bound to a store; the profile comes from `$DEVAI_CONFIG`
     /// (a config tree rooted at an explicit `devai init --config` dir) or
     /// `<home>/config`, and probes run in the current working directory.
@@ -1387,13 +1400,14 @@ impl<'a> Engine<'a> {
                                 "assessment reply is not valid JSON, cannot assemble: {e}"
                             ))
                         })?;
-                    let assembled = evaluation::assemble(
+                    let assembled = evaluation::assemble_with_convergence(
                         profile,
                         run,
                         &assessment,
                         &execution.id.to_string(),
                         &revision,
                         &ratified_anchors,
+                        Some(&self.convergence_block(task)?),
                     );
                     let text = serde_json::to_string_pretty(&assembled.json).map_err(|e| {
                         AdapterError::Platform(format!("cannot serialize assembled report: {e}"))

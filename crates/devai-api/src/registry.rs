@@ -54,11 +54,15 @@ pub struct OpDescriptor {
 /// plane (`Task.human_name`, `TaskDependency.task_display`/
 /// `depends_on_display`) — a consumer typed against `@2` reads those
 /// fields as unknown-absent, so the stamp must move with them.
-/// `@4` names the convergence increment (task 01a1b5be, REQ-CV-09): the
+/// `@4` named the convergence increment (task 01a1b5be, REQ-CV-09): the
 /// surface gained the `task.convergence` read and `InboxTaskFacts.convergence`
 /// — a consumer typed against `@3` reads the fact as unknown-absent, so the
 /// stamp moves with the new operation and the widened inbox shape.
-pub const SURFACE_VERSION: &str = "api-surface@4";
+/// `@5` returns the surface to the ratified shape of REQ-CV-14: the separate
+/// `task.convergence` operation is GONE (no new operations), and the slice
+/// rides on the two reads that already existed — `task.progress` and
+/// `inbox.snapshot` gain the `convergence` field in their output shape.
+pub const SURFACE_VERSION: &str = "api-surface@5";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -143,8 +147,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.progress",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions}",
-            description: "Pipeline position, re-entry note and the snapshot of RUNNING executions, drawn purely from engine data. Mirrors `task progress`.",
+            output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions, convergence}",
+            description: "Pipeline position, re-entry note, the snapshot of RUNNING executions and the convergence slice of the task (per repeatable stage the rounds read out of stored carriers, their computed modes and honest gaps; null on terminal tasks). Drawn purely from engine data. Mirrors `task progress`.",
         },
         OpDescriptor {
             name: "task.active",
@@ -166,13 +170,6 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "id_prefix, path",
             output: "WorkspaceDiffView{task, path, state, branch, baseline, tip, binary, size_bytes, diff, note}",
             description: "Readable unified diff of ONE changeset-listed file of the task's rework branch between exactly the baseline and tip task.workspace_changes used (same resolution, so list and diff are consistent by construction). A path outside the changeset is a typed not_found the consumer branches on by code; binary content is a binary fact with the stored size — raw bytes are never rendered. Mirrors `task workspace-diff`.",
-        },
-        OpDescriptor {
-            name: "task.convergence",
-            class: OpClass::Read,
-            input: "id_prefix",
-            output: "ConvergenceView{task, snapshot_at, gap_milli, reason, stages: Vec<StageConvergence{stage, series: Vec<ConvergencePoint>, counters, stage_total_seconds}>}",
-            description: "The convergence slice of the task: per repeatable stage (spec_review, then quality) the rounds read out of stored carrier artifacts — score/theta/threshold from the report body, requirements/OQ volume and verdict from the review round's bound spec, round and accumulated time from the execution rows. Modes (CONVERGING/PLATEAU/DIVERGING/STUCK) and their honest reasons are DATA computed from the series, never a model verdict; nothing is written and no score is re-derived. Mirrors `task convergence`.",
         },
         OpDescriptor {
             name: "task.report",
@@ -420,7 +417,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Read,
             input: "()",
             output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, convergence}>}",
-            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the convergence fact of the gate's stage (APPROVAL → spec_review, QA → quality; null in every other state). One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
+            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
         },
         // ---- questions ----
         OpDescriptor {
@@ -673,7 +670,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@4");
+        assert_eq!(SURFACE_VERSION, "api-surface@5");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -687,16 +684,23 @@ mod tests {
     }
 
     #[test]
-    fn surface_version_v4_ships_the_convergence_slice() {
-        // Task 01a1b5be (REQ-CV-09): the increment and its stamp move
-        // together — the read operation joins the table and the inbox
-        // shape gains the fact a consumer of @3 does not know.
-        let conv = operations()
+    fn surface_version_v5_rides_the_slice_on_existing_reads() {
+        // Task 01a1b5be (REQ-CV-14): the increment and its stamp move
+        // together, but NO operation joins the table — the slice is carried
+        // by the two reads that already existed.
+        assert!(
+            !operations().iter().any(|o| o.name == "task.convergence"),
+            "REQ-CV-14: the convergence slice must not become its own operation"
+        );
+        let progress = operations()
             .into_iter()
-            .find(|o| o.name == "task.convergence")
-            .expect("@4 surface must publish task.convergence");
-        assert_eq!(conv.class, OpClass::Read);
-        assert!(conv.output.contains("ConvergenceView"));
+            .find(|o| o.name == "task.progress")
+            .expect("task.progress stays published");
+        assert!(
+            progress.output.contains("convergence"),
+            "the progress shape carries the slice: {}",
+            progress.output
+        );
         let inbox = operations()
             .into_iter()
             .find(|o| o.name == "inbox.snapshot")

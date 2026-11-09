@@ -27,8 +27,7 @@ import {
 import { TaskStateToken } from "../states";
 import WaitTaskHeader from "../components/WaitTaskHeader.vue";
 import ConvergenceChart from "../components/ConvergenceChart.vue";
-import type { ChartPoint } from "../convergence_view";
-import type { ConvergenceFact } from "../types";
+import { stageForRow } from "../convergence_view";
 
 // Сколько символов машинного JSON показывать, когда у quality-отчёта нет
 // человеческой части: одна строка-факт, не дамп.
@@ -56,21 +55,8 @@ function applyInterval(ms: number) {
   setWaitInterval(ms);
 }
 
-// Факт гейта → серия графика. Значения (балл, порог, объём, режимы)
-// приходят посчитанными; строка «Ожидания» не несёт profile — линию на
-// границе сегмента она не рвёт (это делает страница задачи).
-function chartOf(fact: ConvergenceFact): ChartPoint[] {
-  return fact.series.map((t) => ({
-    round: t.round,
-    measured: t.measured,
-    score_milli: t.score_milli,
-    theta_milli: t.theta_milli,
-    requirements_count: t.requirements_count,
-    oq_count: t.oq_count,
-    modes: t.modes,
-    profile: null,
-  }));
-}
+// Срез строки → стадия графика (REQ-CV-13) — правило в convergence_view.ts,
+// чтобы его можно было утверждать тестом без сети и без формы гейта.
 
 onMounted(() => {
   unsubscribe = subscribeWait();
@@ -124,17 +110,15 @@ onUnmounted(() => unsubscribe?.());
             </span>
           </p>
 
-          <!-- Мини-график сходимости стадии гейта (REQ-CV-10): null —
-               строки вне двух подписываемых гейтов, графика и плейсхолдера
-               у них нет вовсе. -->
+          <!-- Мини-график сходимости стадии строки (REQ-CV-12/13): срез
+               приходит в фактах снимка; null — только у терминальной
+               задачи, у остальных стадия выбирается по состоянию. -->
           <div v-if="row.convergence" class="conv-mini">
             <ConvergenceChart
-              :stage="row.convergence.stage"
-              :series="chartOf(row.convergence)"
+              :stage="stageForRow(row.convergence, row.task.state).stage"
+              :series="stageForRow(row.convergence, row.task.state).series"
               :gap-milli="row.convergence.gap_milli"
-              :modes="row.convergence.modes"
-              :mode-note="row.convergence.mode_note"
-              :missing="row.convergence.missing"
+              break-on-profile
             />
           </div>
 

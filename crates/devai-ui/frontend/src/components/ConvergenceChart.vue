@@ -1,22 +1,24 @@
 <script setup lang="ts">
-// Мини-график сходимости стадии (REQ-CV-10): инлайн-SVG без зависимостей,
+// Мини-график сходимости стадии (REQ-CV-13): инлайн-SVG без зависимостей,
 // без интерактива и без сглаживания. Компонент РИСУЕТ готовые значения:
-// балл/порог/объём/режимы/причины приходят посчитанными платформой
-// (task.convergence для страницы задачи, факт inbox.snapshot для строки
+// балл, порог, объём и режим приходят посчитанными платформой
+// (`task.progress` для страницы задачи, `inbox.snapshot` для строки
 // «Ожидания») — здесь нет ни пересчёта балла, ни вывода режима.
 //
-// Ось X — круг, ось Y — метрика: score_milli/1000 у quality, требования
-// (сплошная) и открытые вопросы (пунктир) у spec_review. Линия порога —
-// только quality и только по СОХРАНЁННОМУ theta каждого круга; theta нет —
-// линии нет (0.80 не подставляется). Неизмеренный круг и граница
-// profile-сегмента — разрыв линии, не ноль.
+// Ось X — круг, ось Y — метрика: score_milli/1000 у quality, ДВЕ счётные
+// линии (требования и открытые вопросы) на общей оси «штуки» у
+// spec_review. Линия порога — только quality и только по СОХРАНЁННОМУ
+// theta каждого круга; theta нет — линии нет и есть подпись «порог
+// неизвестен». Неизмеренный круг, null-счётчик и граница профиля рвут
+// линию, а не рисуются нулём.
 import { computed } from "vue";
 import type { ChartPoint } from "../convergence_view";
 import {
-  lastRoundLabel,
+  basisLabel,
+  gapsText,
   missingLabel,
-  modeLabel,
-  oqLine,
+  scoreText,
+  volumeLabel,
   plot,
 } from "../convergence_view";
 
@@ -25,45 +27,54 @@ const props = withDefaults(
     stage: string;
     series: ChartPoint[];
     gapMilli: number;
-    modes: string[];
-    modeNote: string | null;
-    missing: string[];
-    /** Страница задачи рвёт линию на границе профиля; строка «Ожидания» — нет
-     *  (её серия по контракту не несёт profile). */
+    /** Страница задачи рвёт линию на границе профиля; строка «Ожидания»
+     *  получает тот же объект, поэтому тоже рвёт — флаг оставлен для
+     *  явности двух поверхностей. */
     breakOnProfile?: boolean;
   }>(),
-  { breakOnProfile: false },
+  { breakOnProfile: true },
 );
 
 const isQuality = computed(() => props.stage === "quality");
 const drawing = computed(() => plot(props.series, props.stage, props.breakOnProfile));
+const last = computed(() => props.series[props.series.length - 1] ?? null);
 
 const polyline = (idx: number[]): string =>
   idx
     .map((i) => `${drawing.value.points[i].x.toFixed(1)},${drawing.value.points[i].y.toFixed(1)}`)
     .join(" ");
 
-const dotClass = (modes: string[]): string => {
-  if (modes.includes("DIVERGING")) return "dot diverging";
-  if (modes.includes("STUCK")) return "dot stuck";
-  if (modes.includes("PLATEAU")) return "dot plateau";
-  if (modes.includes("CONVERGING")) return "dot converging";
+const dotClass = (mode: string): string => {
+  if (mode === "DIVERGING") return "dot diverging";
+  if (mode === "STUCK") return "dot stuck";
+  if (mode === "PLATEAU") return "dot plateau";
+  if (mode === "CONVERGING") return "dot converging";
   return "dot plain";
 };
 
-const oqPoints = computed(() => {
-  const top = Math.max(1, ...props.series.map((p) => p.requirements_count ?? 0));
-  return oqLine(props.series, top)
-    .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
-    .join(" ");
-});
+const lastProfile = computed(() => last.value?.profile ?? null);
+const headline = computed(() =>
+  last.value ? basisLabel(last.value.mode, last.value.mode_basis) : "",
+);
+const thetaUnknown = computed(
+  () => isQuality.value && last.value !== null && last.value.theta_milli === null,
+);
+const specVolume = computed(() =>
+  isQuality.value ? "" : volumeLabel(last.value?.volume_direction ?? null),
+);
 
-const lastProfile = computed(() => {
-  const last = props.series[props.series.length - 1];
-  return last?.profile ?? null;
+/** Подпись последнего круга: готовое значение, без арифметики. */
+const lastValue = computed(() => {
+  if (!last.value) return "";
+  if (isQuality.value) {
+    return `S=${scoreText(last.value.score_milli)} · пунктов ниже 1.0: ${
+      last.value.low_count ?? "—"
+    }`;
+  }
+  return `требований ${last.value.requirements_count ?? "—"} · открытых вопросов ${
+    last.value.oq_count ?? "—"
+  }`;
 });
-
-const headline = computed(() => lastRoundLabel(props.modes, props.modeNote));
 </script>
 
 <template>
@@ -101,21 +112,32 @@ const headline = computed(() => lastRoundLabel(props.modes, props.modeNote));
           :y2="t.y2"
           class="threshold"
         />
-        <!-- Требования (сплошная) и открытые вопросы (пунктир) стадии spec. -->
+        <!-- quality: одна линия балла; spec: требования (сплошная) + OQ (пунктир). -->
         <polyline
-          v-for="(seg, i) in drawing.segments"
+          v-for="(seg, i) in drawing.scoreSegments"
           :key="`s${i}`"
           :points="polyline(seg)"
           class="line"
         />
-        <polyline v-if="!isQuality && oqPoints" :points="oqPoints" class="line oq" />
+        <polyline
+          v-for="(seg, i) in drawing.reqSegments"
+          :key="`r${i}`"
+          :points="polyline(seg)"
+          class="line req"
+        />
+        <polyline
+          v-for="(seg, i) in drawing.oqSegments"
+          :key="`o${i}`"
+          :points="polyline(seg)"
+          class="line oq"
+        />
         <circle
           v-for="p in drawing.points.filter((x) => x.measured)"
           :key="`p${p.round}`"
           :cx="p.x"
           :cy="p.y"
           r="3"
-          :class="dotClass(p.modes)"
+          :class="dotClass(p.mode)"
         />
         <!-- Неизмеренный круг: пустая метка на оси, не ноль. -->
         <g v-for="p in drawing.points.filter((x) => !x.measured)" :key="`m${p.round}`">
@@ -126,17 +148,18 @@ const headline = computed(() => lastRoundLabel(props.modes, props.modeNote));
         </g>
       </svg>
 
-      <!-- Подпись последнего круга: все режимы по порядку платформы, иначе — причина. -->
+      <!-- Бейдж последнего круга: mode + mode_basis (REQ-CV-13). -->
       <p class="conv-last">
         <span class="mono">круг {{ drawing.points[drawing.points.length - 1].round }}</span>
-        <span v-if="headline" :class="modes.length ? 'mode' : 'muted'">{{ headline }}</span>
-        <span v-if="series.length === 1" class="muted">· данных мало — один круг</span>
+        <span class="mode" :class="last?.mode === 'UNKNOWN' ? 'unknown' : ''">{{ headline }}</span>
       </p>
-      <p v-if="missing.length" class="muted mono conv-gaps">
-        пробелы: {{ missing.map(missingLabel).join(" · ") }}
+      <p class="muted mono conv-value">{{ lastValue }}<template v-if="specVolume"> · {{ specVolume }}</template></p>
+      <p v-if="thetaUnknown" class="muted mono conv-gaps">порог неизвестен</p>
+      <p v-if="last?.missing.length" class="muted mono conv-gaps">
+        пробелы: {{ gapsText(last.missing) }}
       </p>
-      <p v-if="modes.length" class="muted conv-gaps">
-        режимы последнего круга: {{ modes.map(modeLabel).join(" + ") }}
+      <p v-if="series.length === 1" class="muted conv-gaps">
+        данных мало — один круг, режим не определён
       </p>
     </template>
   </div>
@@ -174,6 +197,10 @@ const headline = computed(() => lastRoundLabel(props.modes, props.modeNote));
   fill: none;
   stroke: var(--slate);
   stroke-width: 1.5;
+}
+.line.req {
+  stroke: var(--orange);
+  opacity: 0.85;
 }
 .line.oq {
   stroke-dasharray: 3 3;
@@ -215,6 +242,14 @@ const headline = computed(() => lastRoundLabel(props.modes, props.modeNote));
   font-weight: 700;
   color: var(--orange);
   font-size: 12px;
+}
+.conv-last .mode.unknown {
+  color: var(--slate);
+  font-weight: 600;
+}
+.conv-value {
+  margin: 2px 0 0;
+  font-size: 11px;
 }
 .conv-gaps {
   margin: 2px 0 0;

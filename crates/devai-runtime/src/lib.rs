@@ -8,6 +8,7 @@
 
 mod adapters;
 pub mod context;
+pub mod convergence;
 mod engine;
 pub mod evaluation;
 pub mod gate;

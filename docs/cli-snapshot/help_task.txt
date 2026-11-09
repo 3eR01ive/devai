@@ -10,7 +10,6 @@ Commands:
   workspace            What the task's isolated workspace CHANGES against the bound baseline: committed file list with A/M/D markers, the stored range (baseline..tip) and per-run commit stamps. Read-only view over the task's branch — states no_isolation / live / historical / unavailable are verdicts in data, never errors (with --json: the full machine view)
   workspace-diff       Readable unified diff of ONE changeset-listed file of the task's rework branch against the stored baseline — the same range the `task workspace` list used (with --json: the machine view)
   report               Show the CURRENT quality report — the rendering a human signs at the QA gate (with --json: the full machine report)
-  convergence          The convergence curve of the task: per repeatable stage (spec_review, quality) the rounds read out of stored artifacts and executions, the computed mode of each round and the honest reasons where a round has none. A COMPUTED read — nothing is written and no score is re-derived (with --json: the full machine view)
   start                DRAFT → ANALYSIS: start the workflow
   run                  Run the assigned roles through all autonomous stages until the next human gate (APPROVAL / final acceptance), hold, or terminal state
   revise               Publish/replace a REQUIREMENTS_SPEC and move to REVIEW

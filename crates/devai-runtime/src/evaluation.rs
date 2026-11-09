@@ -398,6 +398,32 @@ pub fn assemble(
     revision: &devai_core::types::WorkspaceRevision,
     ratified: &std::collections::BTreeMap<String, Ratified>,
 ) -> Assembled {
+    assemble_with_convergence(
+        profile,
+        run,
+        assessment,
+        assessment_execution,
+        revision,
+        ratified,
+        None,
+    )
+}
+
+/// The assembler with the leading convergence block (REQ-CV-16): the block
+/// is built from the SAME slice object the reads publish and passed in here,
+/// so this function never rereads the task history. It changes `report_text`
+/// only — the verdict, the recommendation and every stored field are the
+/// same computation as without it.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_with_convergence(
+    profile: &Profile,
+    run: &EvalRun,
+    assessment: &Value,
+    assessment_execution: &str,
+    revision: &devai_core::types::WorkspaceRevision,
+    ratified: &std::collections::BTreeMap<String, Ratified>,
+    convergence_block: Option<&str>,
+) -> Assembled {
     let scores: HashMap<String, f64> = assessment
         .get("scores")
         .and_then(|s| s.as_object())
@@ -715,6 +741,7 @@ pub fn assemble(
         &run.gates,
         &pending,
         blocked_weight,
+        convergence_block,
     );
     // REQ-QH-01/02/03: the human FORM is assembled ONCE, here, from the same
     // decided values the verdict was computed from (scores, weights, floors,
@@ -784,16 +811,24 @@ fn render(
     gates: &[GateOutcome],
     pending: &[String],
     blocked_weight: f64,
+    convergence_block: Option<&str>,
 ) -> String {
     let head = match verdict {
         "PASS" => "ПРОШЁЛ",
         "FAIL" => "НЕ ПРОШЁЛ",
         _ => "ВЕРДИКТ НЕ ГОТОВ",
     };
-    let mut lines = vec![format!(
+    let mut lines = Vec::new();
+    // REQ-CV-16: the report opens with the convergence block; every section
+    // below keeps its former order and wording.
+    if let Some(block) = convergence_block {
+        lines.extend(block.lines().map(|l| l.to_string()));
+        lines.push(String::new());
+    }
+    lines.push(format!(
         "ВЕРДИКТ: {head} (S={score:.3}/1.00, порог {}, {basis})",
         profile.scoring.theta
-    )];
+    ));
     if let Some(g) = gates.iter().find(|g| g.state != ProbeState::Pass) {
         lines.push(format!("ШЛЮЗ: {} — {}", g.id, state_name(g.state)));
     }
@@ -964,6 +999,40 @@ scoring:
             out.report_text
         );
         assert!(out.report_text.starts_with("ВЕРДИКТ: ВЕРДИКТ НЕ ГОТОВ"));
+    }
+
+    #[test]
+    fn convergence_block_leads_the_report_and_leaves_the_verdict_alone() {
+        // REQ-CV-16: the block is the FIRST section; the verdict, the
+        // recommendation and the whole former body are untouched.
+        let p = tiny_profile("true", "true");
+        let run = run_ok(&p);
+        let a = assessment(&[("rub/b", 1.0)], &[], &[]);
+        let plain = assemble(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+        );
+        let block = "СХОДИМОСТЬ: DIVERGING — правило diverging\n  круг 1: 0.943, ниже 1.0: 2";
+        let with_block = assemble_with_convergence(
+            &p,
+            &run,
+            &a,
+            "exec-1",
+            &fixture_revision(),
+            &Default::default(),
+            Some(block),
+        );
+        assert!(with_block.report_text.starts_with("СХОДИМОСТЬ: DIVERGING"));
+        assert!(
+            with_block.report_text.ends_with(&plain.report_text),
+            "the former sections keep their order and wording"
+        );
+        assert_eq!(plain.evaluation_verdict, with_block.evaluation_verdict);
+        assert_eq!(plain.recommendation, with_block.recommendation);
     }
 
     #[test]

@@ -18,15 +18,15 @@
 //! per the human-ratified cycle-2 answer to Q2: the prohibition on direct
 //! store access in consumers is total.
 
-pub mod convergence;
 mod error;
 mod inbox;
 mod mutations;
 mod registry;
 
-pub use convergence::{
-    ConvergenceCounters, ConvergenceFact, ConvergencePoint, ConvergenceTick, ConvergenceView,
-    GAP_MILLI, STAGE_QUALITY, STAGE_SPEC_REVIEW, StageConvergence, stage_for_state,
+pub use devai_runtime::convergence;
+pub use devai_runtime::convergence::{
+    ConvergenceCounters, ConvergencePoint, ConvergenceView, GAP_MILLI, STAGE_QUALITY,
+    STAGE_SPEC_REVIEW, StageConvergence,
 };
 pub use error::{ApiError, ApiResult, ErrorCode};
 pub use inbox::{
@@ -168,28 +168,31 @@ impl Api {
     }
 
     /// Pipeline position + running executions, purely from engine data
-    /// (the progress renderer owns no state-machine knowledge).
+    /// (the progress renderer owns no state-machine knowledge). The answer
+    /// also carries the convergence slice of the task (REQ-CV-12): one
+    /// computed object, so a consumer never asks for it separately.
     pub fn task_progress(&self, id_prefix: &str) -> ApiResult<ProgressView> {
         let t = self.store.resolve_task(id_prefix)?;
         let now = Utc::now();
         let order = workflow::pipeline_order();
         let position = workflow::pipeline_position(&t);
         let pos_idx = position.and_then(|p| order.iter().position(|s| *s == p));
-        let running: Vec<RunningExecutionView> = self
-            .store
-            .list_executions(Some(t.id))?
-            .into_iter()
+        let executions = self.store.list_executions(Some(t.id))?;
+        let running: Vec<RunningExecutionView> = executions
+            .iter()
             .filter(|e| e.status == ExecutionStatus::Running)
             .map(|e| RunningExecutionView {
                 id: e.id.to_string(),
                 role: format!("{}@{}", e.role_slug, e.role_version),
-                role_slug: e.role_slug,
+                role_slug: e.role_slug.clone(),
                 role_version: e.role_version,
-                agent_name: e.agent_name,
+                agent_name: e.agent_name.clone(),
                 started_at: e.started_at,
                 elapsed_seconds: (now - e.started_at).num_seconds().max(0),
             })
             .collect();
+        let artifacts = self.store.artifacts(t.id)?;
+        let convergence = self.task_convergence(&t, &artifacts, &executions);
         Ok(ProgressView {
             task: t.clone(),
             snapshot_at: now,
@@ -206,6 +209,7 @@ impl Api {
                 .map(|s| s.to_string())
                 .collect(),
             running_executions: running,
+            convergence,
         })
     }
 
@@ -343,19 +347,26 @@ impl Api {
         })
     }
 
-    /// The convergence slice of one task (task 01a1b5be, REQ-CV-09): per
-/// repeatable stage, the rounds read out of stored carriers — a computed
-/// read, nothing written (REQ-CV-01). The task page draws every stage it
-/// answers; the human-wait row draws the one stage of its gate.
-pub fn task_convergence(&self, id_prefix: &str) -> ApiResult<ConvergenceView> {
-    let t = self.store.resolve_task(id_prefix)?;
-    let arts = self.store.artifacts(t.id)?;
-    let execs = self.store.list_executions(Some(t.id))?;
-    let read = |a: &Artifact| self.store.read_artifact_body(a);
-    Ok(convergence::compute(t.id, &arts, &execs, &read))
-}
+    /// The convergence slice of a task (REQ-CV-12), computed from data the
+    /// store already holds. NOT a registry operation of its own: the slice
+    /// rides on `task.progress` and on `inbox.snapshot`, the two reads that
+    /// existed before (REQ-CV-14: no new operations). A TERMINAL task
+    /// answers `None` — the slice does not read the bodies of finished work.
+    fn task_convergence(
+        &self,
+        task: &Task,
+        arts: &[Artifact],
+        execs: &[RoleExecution],
+    ) -> Option<ConvergenceView> {
+        if task.state.is_terminal() {
+            return None;
+        }
+        let read = |a: &Artifact| self.store.read_artifact_body(a);
+        let bodies = convergence::BodyCache::from_reader(&read);
+        Some(convergence::compute(arts, execs, &bodies))
+    }
 
-/// The human-wait section in ONE batch read (REQ-GATE-01..10): the
+    /// The human-wait section in ONE batch read (REQ-GATE-01..10): the
     /// declarative demand table of this home plus every task's stored
     /// questions and gate presentation. One store snapshot per data type
     /// (tasks / questions / artifacts) instead of a per-task fan-out — the
@@ -390,10 +401,22 @@ pub fn task_convergence(&self, id_prefix: &str) -> ApiResult<ConvergenceView> {
         // fact of a gate row needs the rows its carriers name, and a
         // per-row query would put the fan-out back (REQ-CV-09 AC5).
         let mut executions = group_by_task(self.store.list_executions(None)?, |e| e.task_id);
+        // ONE body cache for the whole snapshot (REQ-CV-12 AC7/AC8): a spec
+        // bound to N reviews of five tasks is read once, not once per row.
+        let read = |a: &Artifact| self.store.read_artifact_body(a);
+        let bodies = convergence::BodyCache::from_reader(&read);
 
         let facts = tasks
             .into_iter()
-            .map(|task| self.task_facts(task, &mut questions, &mut artifacts, &mut executions))
+            .map(|task| {
+                self.task_facts(
+                    task,
+                    &mut questions,
+                    &mut artifacts,
+                    &mut executions,
+                    &bodies,
+                )
+            })
             .collect::<ApiResult<Vec<_>>>()?;
 
         Ok(InboxSnapshotView {
@@ -411,12 +434,23 @@ pub fn task_convergence(&self, id_prefix: &str) -> ApiResult<ConvergenceView> {
         questions: &mut TaskIndex<Question>,
         artifacts: &mut TaskIndex<Artifact>,
         executions: &mut TaskIndex<RoleExecution>,
+        bodies: &convergence::BodyCache<'_>,
     ) -> ApiResult<InboxTaskFacts> {
         let owned_questions = questions.remove(&task.id).unwrap_or_default();
         let owned_artifacts = artifacts.remove(&task.id).unwrap_or_default();
         let owned_executions = executions.remove(&task.id).unwrap_or_default();
         let (spec, report, report_note) = self.gate_presentation(&task, &owned_artifacts)?;
-        let convergence = self.convergence_fact(&task, &owned_artifacts, &owned_executions);
+        // The SAME object the progress read answers (REQ-CV-12 AC1/AC5):
+        // one computation, one slice, `null` only on terminal tasks.
+        let convergence = if task.state.is_terminal() {
+            None
+        } else {
+            Some(convergence::compute(
+                &owned_artifacts,
+                &owned_executions,
+                bodies,
+            ))
+        };
         Ok(InboxTaskFacts {
             task,
             questions: owned_questions,
@@ -425,30 +459,6 @@ pub fn task_convergence(&self, id_prefix: &str) -> ApiResult<ConvergenceView> {
             report_note,
             convergence,
         })
-    }
-
-    /// The gate row's convergence fact (REQ-CV-09): only the two signable
-    /// gates carry one — APPROVAL reads the spec_review stage, QA the
-    /// quality stage. Computed in the same batch from the already-grouped
-    /// rows; a stage with no carrier still answers an EMPTY fact of its
-    /// stage (rounds 0), so the row can say «кругов пока нет» instead of
-    /// pretending convergence is not applicable here.
-    fn convergence_fact(
-        &self,
-        task: &Task,
-        arts: &[Artifact],
-        execs: &[RoleExecution],
-    ) -> Option<ConvergenceFact> {
-        let stage = stage_for_state(task.state)?;
-        let read = |a: &Artifact| self.store.read_artifact_body(a);
-        let view = convergence::compute(task.id, arts, execs, &read);
-        Some(
-            view.stages
-                .iter()
-                .find(|s| s.stage == stage)
-                .map(ConvergenceFact::of_stage)
-                .unwrap_or_else(|| ConvergenceFact::empty(stage)),
-        )
     }
 
     /// The gate presentation for the stored state that presents one:
@@ -964,6 +974,8 @@ pub struct ProgressView {
     pub pipeline: PipelineView,
     pub allowed_operations: Vec<String>,
     pub running_executions: Vec<RunningExecutionView>,
+    /// The convergence slice (REQ-CV-12); `null` on terminal tasks only.
+    pub convergence: Option<ConvergenceView>,
 }
 
 #[derive(Serialize, Clone, Debug)]

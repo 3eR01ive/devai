@@ -45,7 +45,6 @@ fn main() {
             commands::task_progress,
             commands::task_dependencies,
             commands::task_report,
-            commands::task_convergence,
             commands::task_events,
             commands::task_decisions,
             commands::task_active,

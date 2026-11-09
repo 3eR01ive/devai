@@ -160,14 +160,6 @@ enum TaskCmd {
     Report {
         id: String,
     },
-    /// The convergence curve of the task: per repeatable stage (spec_review,
-    /// quality) the rounds read out of stored artifacts and executions, the
-    /// computed mode of each round and the honest reasons where a round has
-    /// none. A COMPUTED read — nothing is written and no score is re-derived
-    /// (with --json: the full machine view).
-    Convergence {
-        id: String,
-    },
     /// DRAFT → ANALYSIS: start the workflow
     Start {
         id: String,

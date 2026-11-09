@@ -36,7 +36,7 @@ use devai_core::inbox::InboxWaitPolicy;
 use devai_core::types::{Artifact, ArtifactKind, ArtifactStatus, Question, Task};
 use serde::Serialize;
 
-use crate::{ApiResult, ConvergenceFact, QualityReportView};
+use crate::{ApiResult, ConvergenceView, QualityReportView};
 
 /// The whole section input in one snapshot: policy + per-task facts.
 #[derive(Serialize, Clone, Debug)]
@@ -64,11 +64,10 @@ pub struct InboxTaskFacts {
     pub report: Option<QualityReportView>,
     /// Honest platform text when a QA row has no signable report.
     pub report_note: Option<String>,
-    /// The gate's convergence fact (REQ-CV-09): present exactly in the two
-    /// signable gate states (APPROVAL → spec_review, QA → quality); `None`
-    /// for WAITING_FOR_INPUT / PAUSED / BLOCKED / FAILED and every other
-    /// state — those rows draw no chart and no placeholder.
-    pub convergence: Option<ConvergenceFact>,
+    /// The task's convergence slice (REQ-CV-12): the SAME object the task
+    /// progress read answers, byte for byte, and `null` on terminal tasks
+    /// only. The row picks the stage to draw (its gate's, else the last).
+    pub convergence: Option<ConvergenceView>,
 }
 
 /// The spec artifact the APPROVAL gate presents, plus its body. `current`

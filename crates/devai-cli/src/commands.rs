@@ -282,7 +282,6 @@ fn task(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             }
         }
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
-        TaskCmd::Convergence { id } => show_convergence(ctx, &id, json)?,
         TaskCmd::Events { id, limit } => task_events(ctx, &id, limit, json)?,
         TaskCmd::Decisions { id } => task_decisions(ctx, &id, json)?,
         cmd @ TaskCmd::Revise { .. } => task_revise(ctx, cmd)?,
@@ -1440,95 +1439,6 @@ fn show_report(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&v.report).unwrap_or_default()
         ),
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// convergence (task 01a1b5be, REQ-CV-09)
-// ---------------------------------------------------------------------------
-
-/// The convergence curve, rendered from the typed read: one line per round
-/// with the value the platform measured, the mode it computed and — where a
-/// mode is absent — its honest reason. The renderer computes NOTHING: scores,
-/// deltas, modes and totals arrive decided (store-is-cache).
-fn show_convergence(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
-    let v = ctx.api().task_convergence(id).map_err(render_api_error)?;
-    if json {
-        outln!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-    outln!(
-        "convergence of {}  gap {} milli  snapshot {}",
-        short_str(&v.task),
-        v.gap_milli,
-        v.snapshot_at.to_rfc3339()
-    );
-    if let Some(reason) = v.reason {
-        outln!("{reason}: у задачи нет ни одного круга");
-        return Ok(());
-    }
-    for stage in &v.stages {
-        outln!("---");
-        outln!(
-            "{}: кругов {} · без времени {} · время стадии {} с{}",
-            stage.stage,
-            stage.series.len(),
-            stage.counters.rounds_without_time,
-            stage.stage_total_seconds,
-            if stage.stage == "spec_review" {
-                format!(
-                    " · версий спеки без ревью {}",
-                    stage.counters.spec_versions_without_review
-                )
-            } else {
-                String::new()
-            }
-        );
-        for p in &stage.series {
-            let modes = if p.modes.is_empty() {
-                p.mode_note.unwrap_or("-").to_string()
-            } else {
-                p.modes.join("+")
-            };
-            let value = if stage.stage == "quality" {
-                match p.score_milli {
-                    Some(s) => format!(
-                        "S {}.{:03}{}",
-                        s / 1000,
-                        s % 1000,
-                        p.delta_score_milli
-                            .map(|d| format!(" ({d:+} milli)"))
-                            .unwrap_or_default()
-                    ),
-                    None => "S —".to_string(),
-                }
-            } else {
-                format!(
-                    "требований {}{} · OQ {}{} · {}",
-                    p.requirements_count
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "—".into()),
-                    p.delta_requirements
-                        .map(|d| format!(" ({d:+})"))
-                        .unwrap_or_default(),
-                    p.oq_count
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "—".into()),
-                    p.delta_oq.map(|d| format!(" ({d:+})")).unwrap_or_default(),
-                    p.verdict.as_deref().unwrap_or("вердикта нет"),
-                )
-            };
-            outln!("  круг {:>2}  {:>8}  {:<28} {}", p.round, modes, value, {
-                match p.time_seconds {
-                    Some(t) => format!("{t} с"),
-                    None => "время неизвестно".to_string(),
-                }
-            });
-            if !p.missing.is_empty() {
-                outln!("            пробелы: {}", p.missing.join(", "));
-            }
-        }
     }
     Ok(())
 }

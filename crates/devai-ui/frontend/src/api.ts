@@ -6,7 +6,6 @@ import type {
   ActiveSnapshot,
   Artifact,
   ArtifactContent,
-  ConvergenceView,
   Decision,
   DependenciesView,
   LivenessView,
@@ -44,8 +43,6 @@ export const api = {
     invoke<DependenciesView>("task_dependencies", { id_prefix }),
   taskReport: (id_prefix: string) =>
     invoke<QualityReportView>("task_report", { id_prefix }),
-  taskConvergence: (id_prefix: string) =>
-    invoke<ConvergenceView>("task_convergence", { id_prefix }),
   taskEvents: (id_prefix: string, limit: number | null) =>
     invoke<WorkflowEvent[]>("task_events", { id_prefix, limit }),
   taskDecisions: (id_prefix: string) =>
