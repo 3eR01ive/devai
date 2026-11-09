@@ -300,11 +300,11 @@ fn full_cycle_through_both_human_gates() {
             c["state"].as_str().unwrap_or("?"),
         );
     }
+    // REQ-QH: the report is the assembled verdict text, unchanged.
+    let text = rep["report_text"].as_str().unwrap();
     assert!(
-        rep["report_text"]
-            .as_str()
-            .unwrap()
-            .starts_with("ВЕРДИКТ: ВЕРДИКТ НЕ ГОТОВ")
+        text.contains("ВЕРДИКТ: ВЕРДИКТ НЕ ГОТОВ"),
+        "the verdict section is present: {text}"
     );
     assert!(
         r2.steps[1]

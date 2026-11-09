@@ -281,6 +281,26 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: model_probe_rpc,
     },
     RpcCommand {
+        name: "model_bundle_handle",
+        handler: model_bundle_handle_rpc,
+    },
+    RpcCommand {
+        name: "model_bundle_check",
+        handler: model_bundle_check_rpc,
+    },
+    RpcCommand {
+        name: "model_bundle_create",
+        handler: model_bundle_create_rpc,
+    },
+    RpcCommand {
+        name: "model_bundle_update",
+        handler: model_bundle_update_rpc,
+    },
+    RpcCommand {
+        name: "model_bundle_delete",
+        handler: model_bundle_delete_rpc,
+    },
+    RpcCommand {
         name: "model_switch",
         handler: model_switch_rpc,
     },
@@ -720,6 +740,75 @@ fn model_switch_rpc(
         param_str(params, "reason")?,
         Some(actor_for(app, device)),
     )?)
+}
+
+// Связки моделей (задача 01a1be5c): телефон получает ТУ ЖЕ поверхность, что
+// окно — создание/правка/удаление связок доступны с телефона, а решение
+// помечается устройством через actor_for.
+fn model_bundle_handle_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::model_bundle_handle(
+        state(app),
+        param_str(params, "label")?,
+    )?)
+}
+
+fn model_bundle_check_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::model_bundle_check(
+        state(app),
+        bundle_form_input(params)?,
+    )?)
+}
+
+fn model_bundle_create_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::model_bundle_create(
+        state(app),
+        bundle_form_input(params)?,
+    )?)
+}
+
+fn model_bundle_update_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::model_bundle_update(
+        state(app),
+        bundle_form_input(params)?,
+    )?)
+}
+
+fn model_bundle_delete_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::model_bundle_delete(
+        state(app),
+        param_str(params, "bundle_id")?,
+        param_str(params, "file_revision")?,
+    )?)
+}
+
+/// Форма связки из тела запроса телефона: те же поля, что у окна.
+fn bundle_form_input(params: &serde_json::Value) -> Result<devai_api::BundleFormInput, UiError> {
+    serde_json::from_value(params.get("input").cloned().unwrap_or(serde_json::Value::Null)).map_err(
+        |e| UiError {
+            code: "invalid_input".into(),
+            message: format!("форма связки не разобрана: {e}"),
+        },
+    )
 }
 
 fn lan_status_rpc(

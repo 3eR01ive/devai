@@ -65,7 +65,11 @@ const { holding, progress, start, release } = useHoldToConfirm(
       >
         <span class="fill" :style="{ width: `${holding === 'approve' ? progress * 100 : 0}%` }" />
         <span class="label">
-          {{ props.busy ? "подписываю…" : `Утвердить — удерживайте ${HOLD_MS} мс` }}
+          {{ props.busy
+            ? "подписываю…"
+            : !canSign
+              ? "сначала обоснование"
+              : `Утвердить — удерживайте ${HOLD_MS} мс` }}
         </span>
       </button>
       <span v-else class="muted">
@@ -124,6 +128,13 @@ const { holding, progress, start, release } = useHoldToConfirm(
 }
 .hold .label {
   position: relative;
+}
+/* Выключенная кнопка обязана ВЫГЛЯДЕТЬ выключенной: иначе «не реагирует»
+   читается как поломка, хотя это невыполненное условие (пустое обоснование). */
+.hold:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(0.4);
 }
 .hint {
   margin: 4px 0 0;

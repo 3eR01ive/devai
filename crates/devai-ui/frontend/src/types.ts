@@ -141,6 +141,8 @@ export interface ProgressView {
   pipeline: PipelineView;
   allowed_operations: string[];
   running_executions: RunningExecutionView[];
+  /** Срез сходимости (REQ-CV-12); null только у терминальных задач. */
+  convergence: ConvergenceView | null;
 }
 
 export interface ActiveRow {
@@ -527,6 +529,88 @@ export interface WaitRow {
   spec: SpecPresentation | null;
   report: QualityReportView | null;
   report_note: string | null;
+  /**
+   * Срез сходимости ЗАДАЧИ (REQ-CV-12): тот же объект, что отдаёт чтение
+   * хода задачи; null у терминальных задач и у строк вне секции ожидания.
+   * Строка выбирает стадию для графика сама (гейт → его стадия, иное —
+   * последняя).
+   */
+  convergence: ConvergenceView | null;
+}
+
+// --- сходимость стадии (REQ-CV-05/09/12) ---
+// mode, rule, reason, token, volume_direction — машинные токены платформы;
+// человеческие фразы для них — фиксированный словарь UI
+// (convergence_view.ts), не свободный текст.
+export interface MissingEntry {
+  field: string;
+  token: string;
+}
+
+export interface ModeBasis {
+  rule: string;
+  reason: string | null;
+  rounds: number[];
+  check_id: string | null;
+}
+
+/** Пробел данных — объяснение токена платформы (закрытый словарь). */
+export interface ReadError {
+  code: string;
+  message: string;
+}
+
+/** Одна точка — одна форма для обеих стадий, все ключи всегда на месте. */
+export interface ConvergencePoint {
+  round: number;
+  artifact_id: string;
+  created_at: string;
+  stage: string;
+  status: string;
+  measured: boolean;
+  comparable: boolean;
+  missing: MissingEntry[];
+  score_milli: number | null;
+  theta_milli: number | null;
+  low_count: number | null;
+  unscored_count: number | null;
+  invalid_count: number | null;
+  pending_count: number | null;
+  closed_count: number | null;
+  delta_score_milli: number | null;
+  verdict: string | null;
+  requirements_count: number | null;
+  oq_count: number | null;
+  delta_requirements: number | null;
+  delta_oq: number | null;
+  volume_direction: string | null;
+  time_seconds: number | null;
+  profile: string | null;
+  mode: string;
+  mode_basis: ModeBasis;
+  /** Сбой чтения из стора (REQ-CV-05 + QA R2); null — фолта не было. */
+  read_error: ReadError | null;
+}
+
+export interface ConvergenceCounters {
+  rounds_total: number;
+  rounds_unmeasured: number;
+  rounds_without_time: number;
+  spec_versions_without_review: number;
+}
+
+export interface StageConvergence {
+  stage: string;
+  series: ConvergencePoint[];
+  counters: ConvergenceCounters;
+  stage_total_seconds: number | null;
+  stage_current_seconds: number | null;
+  missing: MissingEntry[];
+}
+
+export interface ConvergenceView {
+  gap_milli: number;
+  stages: StageConvergence[];
 }
 
 // Предъявление APPROVAL-строки (REQ-GATE-04/05): тело REQUIREMENTS_SPEC,

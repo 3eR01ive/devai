@@ -26,6 +26,8 @@ import {
 } from "../inbox";
 import { TaskStateToken } from "../states";
 import WaitTaskHeader from "../components/WaitTaskHeader.vue";
+import ConvergenceChart from "../components/ConvergenceChart.vue";
+import { stageForRow } from "../convergence_view";
 
 // Сколько символов машинного JSON показывать, когда у quality-отчёта нет
 // человеческой части: одна строка-факт, не дамп.
@@ -52,6 +54,9 @@ function applyInterval(ms: number) {
   setPollMs(ms);
   setWaitInterval(ms);
 }
+
+// Срез строки → стадия графика (REQ-CV-13) — правило в convergence_view.ts,
+// чтобы его можно было утверждать тестом без сети и без формы гейта.
 
 onMounted(() => {
   unsubscribe = subscribeWait();
@@ -104,6 +109,18 @@ onUnmounted(() => unsubscribe?.());
               {{ isExpanded(row.task.id) ? "свернуть" : "показать" }}
             </span>
           </p>
+
+          <!-- Мини-график сходимости стадии строки (REQ-CV-12/13): срез
+               приходит в фактах снимка; null — только у терминальной
+               задачи, у остальных стадия выбирается по состоянию. -->
+          <div v-if="row.convergence" class="conv-mini">
+            <ConvergenceChart
+              :stage="stageForRow(row.convergence, row.task.state).stage"
+              :series="stageForRow(row.convergence, row.task.state).series"
+              :gap-milli="row.convergence.gap_milli"
+              break-on-profile
+            />
+          </div>
 
           <template v-if="isExpanded(row.task.id)">
             <!-- APPROVAL: предъявление спеки — абзац и её открытые вопросы
@@ -200,6 +217,14 @@ onUnmounted(() => unsubscribe?.());
               <span class="muted">{{ row.demand }}</span>
               <span class="muted mono">{{ row.cli_hint }}</span>
             </WaitTaskHeader>
+            <div v-if="row.convergence" class="conv-mini">
+              <ConvergenceChart
+                :stage="stageForRow(row.convergence, row.task.state).stage"
+                :series="stageForRow(row.convergence, row.task.state).series"
+                :gap-milli="row.convergence.gap_milli"
+                break-on-profile
+              />
+            </div>
           </div>
         </div>
       </template>

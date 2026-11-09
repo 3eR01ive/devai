@@ -108,6 +108,7 @@ export function row(task: Task, overrides: Partial<WaitRow> = {}): WaitRow {
     spec: null,
     report: null,
     report_note: null,
+    convergence: null,
     ...overrides,
   };
 }

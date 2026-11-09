@@ -83,7 +83,14 @@ pub struct OpDescriptor {
 /// that answers «what id will the save write?», so the window's copy of the
 /// rule could be deleted rather than kept in sync. Wire-visible addition
 /// (one Read operation), so the stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@8";
+
+/// `@9` names the convergence increment (task 01a1b5be, REQ-CV-14): NO operation
+/// joins or leaves the table — the slice rides on the two reads that already
+/// existed, `task.progress` and `inbox.snapshot`, whose output shapes gain the
+/// `convergence` field (null on terminal tasks and on rows outside the wait
+/// section); a consumer typed against `@8` reads it as unknown-absent, so the
+/// stamp moves with the widened shapes.
+pub const SURFACE_VERSION: &str = "api-surface@9";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -168,8 +175,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.progress",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions}",
-            description: "Pipeline position, re-entry note and the snapshot of RUNNING executions, drawn purely from engine data. Mirrors `task progress`.",
+            output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions, convergence}",
+            description: "Pipeline position, re-entry note, the snapshot of RUNNING executions and the convergence slice of the task (per repeatable stage the rounds read out of stored carriers, their computed modes and honest gaps; null on terminal tasks). Drawn purely from engine data. Mirrors `task progress`.",
         },
         OpDescriptor {
             name: "task.active",
@@ -466,8 +473,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "inbox.snapshot",
             class: OpClass::Read,
             input: "()",
-            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note}>}",
-            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA). One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
+            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, convergence}>}",
+            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks and on rows outside the wait section. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
         },
         // ---- questions ----
         OpDescriptor {
@@ -824,7 +831,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@8");
+        assert_eq!(SURFACE_VERSION, "api-surface@9");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -921,6 +928,35 @@ mod tests {
         assert_ne!(
             devai_core::types::decision_kind::PROFILE_RATIFICATION,
             devai_core::types::decision_kind::REQUIREMENTS_APPROVAL
+        );
+    }
+
+    #[test]
+    fn surface_version_v7_rides_the_slice_on_existing_reads() {
+        // Task 01a1b5be (REQ-CV-14): the increment and its stamp move
+        // together, but NO operation joins the table — the slice is carried
+        // by the two reads that already existed.
+        assert!(
+            !operations().iter().any(|o| o.name == "task.convergence"),
+            "REQ-CV-14: the convergence slice must not become its own operation"
+        );
+        let progress = operations()
+            .into_iter()
+            .find(|o| o.name == "task.progress")
+            .expect("task.progress stays published");
+        assert!(
+            progress.output.contains("convergence"),
+            "the progress shape carries the slice: {}",
+            progress.output
+        );
+        let inbox = operations()
+            .into_iter()
+            .find(|o| o.name == "inbox.snapshot")
+            .expect("inbox.snapshot stays published");
+        assert!(
+            inbox.output.contains("convergence"),
+            "the inbox fact rides in the published shape: {}",
+            inbox.output
         );
     }
 

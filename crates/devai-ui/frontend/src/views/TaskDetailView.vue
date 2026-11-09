@@ -21,6 +21,7 @@ import SignatureSection from "../components/SignatureSection.vue";
 import SpecDiffPanel from "../components/SpecDiffPanel.vue";
 import SignatureResultPanel from "../components/SignatureResultPanel.vue";
 import { TaskStateToken } from "../states";
+import ConvergenceChart from "../components/ConvergenceChart.vue";
 import {
   freshnessBanner,
   hasEvidence,
@@ -34,6 +35,7 @@ import type {
   ActiveRow,
   Artifact,
   ArtifactContent,
+  ConvergenceView,
   Decision,
   DependenciesView,
   LivenessView,
@@ -83,6 +85,9 @@ const signature = ref<SignatureView | null>(null);
 const signatureError = ref<UiError | null>(null);
 const signatureBusy = ref(false);
 const showDiff = ref(false);
+// Сходимость стадий (REQ-CV-12): срез приходит ПОЛЕМ чтения хода задачи —
+// отдельной операции нет. UI не считает ни балл, ни режим: рисует готовое.
+const convergence = computed<ConvergenceView | null>(() => progress.value?.convergence ?? null);
 
 async function loadAll() {
   error.value = null;
@@ -347,6 +352,44 @@ async function activateForeignHome() {
         <p v-if="progress.pipeline.off_spine || progress.pipeline.position === null" class="muted" style="margin: 8px 0 0">
           вне линейки стадий; текущее состояние — <b class="mono">{{ progress.pipeline.current }}</b>
           <template v-if="progress.pipeline.terminal"> (терминальное)</template>
+        </p>
+      </div>
+    </div>
+
+    <!-- Сходимость стадий (REQ-CV-12/13): по графику на каждую стадию с
+         кругами, порядок и значения — от платформы (spec_review → quality).
+         Срез пришёл полем progress; без кругов — честная строка без осей. -->
+    <div class="panel">
+      <h3>Сходимость стадий</h3>
+      <div class="body">
+        <template v-if="convergence">
+          <p v-if="!convergence.stages.length" class="muted" style="margin: 0">
+            кругов пока нет — у задачи не опубликовано ни отчёта ревью, ни QA-отчёта
+          </p>
+          <template v-else>
+            <p class="muted" style="margin: 0 0 8px">
+              шаг прироста: <span class="mono">{{ convergence.gap_milli }}</span> тысячных
+            </p>
+            <div v-for="s in convergence.stages" :key="s.stage" class="conv-stage">
+              <ConvergenceChart
+                :stage="s.stage"
+                :series="s.series"
+                :gap-milli="convergence.gap_milli"
+                break-on-profile
+              />
+              <p class="muted mono" style="margin: 2px 0 0; font-size: 11px">
+                время стадии
+                {{ s.stage_total_seconds === null ? "неизвестно" : `${s.stage_total_seconds} с` }} ·
+                кругов {{ s.counters.rounds_total }} · не измерено
+                {{ s.counters.rounds_unmeasured }} · без времени
+                {{ s.counters.rounds_without_time }}<template v-if="s.stage === 'spec_review'">
+                  · версий спеки без ревью {{ s.counters.spec_versions_without_review }}</template>
+              </p>
+            </div>
+          </template>
+        </template>
+        <p v-else class="muted" style="margin: 0">
+          у завершённой задачи ряд не отдаётся
         </p>
       </div>
     </div>
