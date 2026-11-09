@@ -36,7 +36,8 @@ export const VOLUME_LABELS: Record<string, string> = {
   flat: "объём не меняется",
 };
 
-/** Токены пробелов данных (REQ-CV-05) — закрытый словарь из 13. */
+/** Токены пробелов данных (REQ-CV-05) — закрытый словарь + `read_error`
+ *  (QA R2: сбой чтения стора назван отдельно от битого тела). */
 export const MISSING_LABELS: Record<string, string> = {
   quality_report: "тело отчёта не даёт балл и проверки",
   quality_theta: "порог не сохранён",
@@ -51,6 +52,7 @@ export const MISSING_LABELS: Record<string, string> = {
   current_unmeasured: "круг не измерен",
   predecessor_unmeasured: "предыдущий круг не измерен",
   segment_boundary: "сменился профиль оценки",
+  read_error: "сбой чтения из стора",
 };
 
 export function modeLabel(token: string): string {
@@ -163,8 +165,13 @@ function segments(
 /**
  * Раскладка серии по осям. quality — балл score_milli/1000 и порог;
  * spec_review — ДВЕ счётные линии (требования и открытые вопросы) на
- * общей оси «штуки». Разрывы: неизмеренный круг, null-счётчик, граница
- * профиля.
+ * общей оси «штуки».
+ *
+ * Разрывы: неизмеренный круг и null-счётчик рвут линию всегда. Граница
+ * профиля рвёт ТОЛЬКО quality: профиль — свойство quality-точки
+ * (REQ-CV-10), у spec его нет и быть не может, поэтому `profile === null`
+ * на каждом spec-круге НЕ является разрывом (иначе две счётные линии
+ * вырождаются в точки — QA R3).
  */
 export function plot(series: ChartPoint[], stage: string, breakOnProfile: boolean): Plot {
   const isQuality = stage === "quality";
@@ -192,10 +199,10 @@ export function plot(series: ChartPoint[], stage: string, breakOnProfile: boolea
     : [];
   const reqSegments = isQuality
     ? []
-    : segments(series, (p) => p.requirements_count, breakOnProfile);
+    : segments(series, (p) => p.requirements_count, false);
   const oqSegments = isQuality
     ? []
-    : segments(series, (p) => p.oq_count, breakOnProfile);
+    : segments(series, (p) => p.oq_count, false);
 
   const threshold: Plot["threshold"] = [];
   if (isQuality) {

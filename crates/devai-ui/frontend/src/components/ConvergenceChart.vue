@@ -59,6 +59,10 @@ const headline = computed(() =>
 const thetaUnknown = computed(
   () => isQuality.value && last.value !== null && last.value.theta_milli === null,
 );
+const readErrorText = computed(() => {
+  const err = last.value?.read_error ?? null;
+  return err ? `сбой чтения: ${err.code} — ${err.message}` : "";
+});
 const specVolume = computed(() =>
   isQuality.value ? "" : volumeLabel(last.value?.volume_direction ?? null),
 );
@@ -175,6 +179,7 @@ const lastValue = computed(() => {
         не измерено {{ counters.unmeasured }}<template v-if="isQuality"> · ждут {{ counters.waiting }} · дефект {{ counters.defect }}</template>
       </p>
       <p v-if="thetaUnknown" class="muted mono conv-gaps">порог неизвестен</p>
+      <p v-if="readErrorText" class="muted mono conv-gaps">{{ readErrorText }}</p>
       <p v-if="last?.missing.length" class="muted mono conv-gaps">
         пробелы: {{ gapsText(last.missing) }}
       </p>

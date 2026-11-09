@@ -35,6 +35,7 @@ const point = (over: Partial<ConvergencePoint> & { round: number }): Convergence
   profile: "devai@1",
   mode: "UNKNOWN",
   mode_basis: { rule: "unknown", reason: "insufficient_data", rounds: [], check_id: null },
+  read_error: null,
   ...over,
 });
 
@@ -125,17 +126,38 @@ describe("plot", () => {
     expect(p.threshold[0].y1).toBeGreaterThan(70); // низ графика, не 0.80
   });
 
-  it("draws BOTH spec counters on one scale and breaks only the null one", () => {
+  it("draws BOTH spec counters on one scale with no profile to break on", () => {
+    // Real spec points ALWAYS carry profile=null (REQ-CV-10: a profile is a
+    // quality fact). The two count lines must therefore build across the
+    // whole series; only a null counter breaks one of them (QA R3).
     const series = [
-      point({ round: 1, requirements_count: 14, oq_count: 5, score_milli: null }),
-      point({ round: 2, requirements_count: 14, oq_count: null, score_milli: null }),
-      point({ round: 3, requirements_count: 14, oq_count: 0, score_milli: null }),
+      point({ round: 1, requirements_count: 14, oq_count: 5, score_milli: null, profile: null }),
+      point({ round: 2, requirements_count: 14, oq_count: null, score_milli: null, profile: null }),
+      point({ round: 3, requirements_count: 22, oq_count: 0, score_milli: null, profile: null }),
     ];
     const p = plot(series, "spec_review", true);
     expect(p.reqSegments).toEqual([[0, 1, 2]]);
     // null (ключа нет) рвёт линию, явный 0 рисуется нулём
     expect(p.oqSegments).toEqual([[0], [2]]);
-    expect(p.top).toBe(14);
+    expect(p.top).toBe(22);
+  });
+
+  it("keeps the profile break for quality and drops it for spec", () => {
+    const series = [
+      point({ round: 1, profile: "devai@12" }),
+      point({ round: 2, profile: "devai@13" }),
+    ];
+    expect(plot(series, "quality", true).scoreSegments).toEqual([[0], [1]]);
+
+    const spec = series.map((p) => ({
+      ...p,
+      score_milli: null,
+      requirements_count: 14,
+      oq_count: 5,
+      profile: null,
+    }));
+    expect(plot(spec, "spec_review", true).reqSegments).toEqual([[0, 1]]);
+    expect(plot(spec, "spec_review", true).oqSegments).toEqual([[0, 1]]);
   });
 });
 
@@ -274,6 +296,27 @@ describe("ConvergenceChart", () => {
     expect(badge.classes()).toContain("unknown");
     expect(badge.text()).toContain("режим не определён");
     expect(badge.text()).toContain("кругов мало");
+    w.unmount();
+  });
+
+  it("prints a store read failure with its code and message", () => {
+    const w = mountChart({
+      stage: "quality",
+      series: [
+        point({
+          round: 1,
+          measured: false,
+          score_milli: null,
+          low_count: null,
+          unscored_count: null,
+          invalid_count: null,
+          pending_count: null,
+          read_error: { code: "io", message: "disk gone" },
+        }),
+      ],
+      gapMilli: 10,
+    });
+    expect(w.text()).toContain("сбой чтения: io — disk gone");
     w.unmount();
   });
 

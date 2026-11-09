@@ -74,3 +74,25 @@ pub enum StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+impl StoreError {
+    /// Stable machine token for the error category (QA R2). ONE source for
+    /// every consumer: the API branches on it, and the convergence read
+    /// keeps it beside the point instead of collapsing the failure into a
+    /// generic "unreadable body".
+    pub fn code(&self) -> &'static str {
+        match self {
+            StoreError::NotFound(..) => "not_found",
+            StoreError::Ambiguous(..) => "ambiguous",
+            StoreError::Conflict { .. } => "conflict",
+            StoreError::SingleWriterBusy { .. } => "single_writer_busy",
+            StoreError::SingleCurrentCollision { .. } => "single_current_collision",
+            StoreError::InvalidDependency(..) => "invalid_dependency",
+            StoreError::SchemaVersion { .. } => "schema_version",
+            StoreError::Corrupt(..) => "corrupt",
+            StoreError::Config(..) => "config",
+            StoreError::Io(..) => "io",
+            StoreError::Sql(..) => "store",
+        }
+    }
+}

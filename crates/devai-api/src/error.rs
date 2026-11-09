@@ -83,19 +83,9 @@ impl ApiError {
 }
 
 fn store_code(e: &StoreError) -> ErrorCode {
-    match e {
-        StoreError::NotFound(..) => ErrorCode("not_found"),
-        StoreError::Ambiguous(..) => ErrorCode("ambiguous"),
-        StoreError::Conflict { .. } => ErrorCode("conflict"),
-        StoreError::SingleWriterBusy { .. } => ErrorCode("single_writer_busy"),
-        StoreError::SingleCurrentCollision { .. } => ErrorCode("single_current_collision"),
-        StoreError::InvalidDependency(..) => ErrorCode("invalid_dependency"),
-        StoreError::SchemaVersion { .. } => ErrorCode("schema_version"),
-        StoreError::Corrupt(..) => ErrorCode("corrupt"),
-        StoreError::Config(..) => ErrorCode("config"),
-        StoreError::Io(..) => ErrorCode("io"),
-        StoreError::Sql(..) => ErrorCode("store"),
-    }
+    // The token lives on the error itself (QA R2): the convergence read
+    // brands the SAME code, so the two surfaces cannot drift.
+    ErrorCode(e.code())
 }
 
 fn core_code(e: &CoreError) -> ErrorCode {

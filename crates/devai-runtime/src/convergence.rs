@@ -16,6 +16,13 @@
 //! memoised per artifact id for one call (REQ-CV-12 AC7/AC8): a spec bound
 //! to N review rounds is read once, and a snapshot that asks for five tasks
 //! reads each artifact once, not once per row.
+//!
+//! QA R2 (rel/error-context): a STORE read failure is NOT a corrupt body.
+//! The seam keeps the typed `StoreError` code and message on the point
+//! (`read_error`) and marks its applicable fields with the `read_error`
+//! token; bytes that were read but are not a JSON object stay
+//! `Body::Unreadable` and keep the report/body tokens. Swallowing both as
+//! `Err(_)` would erase the only evidence of a real storage failure.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -63,7 +70,9 @@ pub mod volume {
     pub const FLAT: &str = "flat";
 }
 
-/// The closed `missing[]` vocabulary: exactly thirteen tokens (REQ-CV-05 AC3).
+/// The closed `missing[]` vocabulary (REQ-CV-05 AC3). QA R2 ratified ONE
+/// addition, `read_error`: a store read failure must not be named with the
+/// corrupt-body token, so the vocabulary is 13 + `read_error`.
 pub mod token {
     pub const QUALITY_REPORT: &str = "quality_report";
     pub const QUALITY_THETA: &str = "quality_theta";
@@ -78,6 +87,9 @@ pub mod token {
     pub const CURRENT_UNMEASURED: &str = "current_unmeasured";
     pub const PREDECESSOR_UNMEASURED: &str = "predecessor_unmeasured";
     pub const SEGMENT_BOUNDARY: &str = "segment_boundary";
+    /// QA R2: the store could not PRODUCE the body — distinct from a body
+    /// that was produced but is corrupt (`quality_report` / `spec_body`).
+    pub const READ_ERROR: &str = "read_error";
 }
 
 /// Every token of the closed vocabulary, in one place for the tests that
@@ -96,6 +108,7 @@ pub const MISSING_TOKENS: &[&str] = &[
     token::CURRENT_UNMEASURED,
     token::PREDECESSOR_UNMEASURED,
     token::SEGMENT_BOUNDARY,
+    token::READ_ERROR,
 ];
 
 /// Quality fields that can be null with a token, in the printed order.
@@ -130,6 +143,15 @@ pub struct MissingEntry {
     pub token: &'static str,
 }
 
+/// A store read failure kept on the point (QA R2): the typed machine code
+/// and the store's own message, so a real storage fault never looks like a
+/// corrupt report body.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReadError {
+    pub code: &'static str,
+    pub message: String,
+}
+
 /// The basis of a point's mode (REQ-CV-09): the fired rule, an honest
 /// reason only for UNKNOWN, the rounds the rule read, and the check id
 /// only for STUCK.
@@ -161,9 +183,10 @@ impl ModeBasis {
     }
 }
 
-/// One round of a stage — ONE shape for both stages, 26 keys always present
-/// (REQ-CV-05). Fields that do not apply to the stage are null and carry no
-/// `missing[]` record.
+/// One round of a stage — ONE shape for both stages, every key always
+/// present (REQ-CV-05). Fields that do not apply to the stage are null and
+/// carry no `missing[]` record. QA R2 adds `read_error`: null unless the
+/// store itself failed to produce this round's body.
 #[derive(Serialize, Clone, Debug)]
 pub struct ConvergencePoint {
     pub round: u32,
@@ -192,6 +215,7 @@ pub struct ConvergencePoint {
     pub profile: Option<String>,
     pub mode: &'static str,
     pub mode_basis: ModeBasis,
+    pub read_error: Option<ReadError>,
 }
 
 /// Stage counters (REQ-CV-12): all four are counts over the series, never a
@@ -230,23 +254,29 @@ impl ConvergenceView {
     pub fn stage(&self, name: &str) -> Option<&StageConvergence> {
         self.stages.iter().find(|s| s.stage == name)
     }
-
-    /// The stage a wait row draws (REQ-CV-13): the gate's own stage when it
-    /// has one, otherwise the LAST stage of the slice.
-    pub fn stage_for_gate(&self, gate_stage: Option<&str>) -> Option<&StageConvergence> {
-        gate_stage
-            .and_then(|name| self.stage(name))
-            .or_else(|| self.stages.last())
-    }
 }
 
-/// One body outcome: absent blob, unreadable/not-an-object body, or a
-/// usable JSON object. All three are distinct outcomes; none becomes `{}`.
+/// One body outcome: absent blob, body bytes that are not a JSON object,
+/// a store read FAILURE (keeps its code/message), or a usable JSON object.
+/// All four are distinct; none becomes `{}`.
 #[derive(Clone, Debug)]
 pub enum Body {
     Absent,
     Unreadable,
+    Failed(ReadError),
     Json(serde_json::Map<String, serde_json::Value>),
+}
+
+/// Parse bytes that WERE produced: only a JSON object is usable; anything
+/// else is a corrupt body, never a read failure (QA R2 keeps them apart).
+fn classify_bytes(bytes: Vec<u8>) -> Body {
+    match std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    {
+        Some(serde_json::Value::Object(map)) => Body::Json(map),
+        _ => Body::Unreadable,
+    }
 }
 
 /// The body reader seam with one-read-per-artifact-id memoisation. The API
@@ -260,18 +290,15 @@ pub struct BodyCache<'a> {
 
 impl<'a> BodyCache<'a> {
     pub fn from_reader(read: &'a dyn Fn(&Artifact) -> Result<Vec<u8>, StoreError>) -> Self {
-        let classify = |bytes: Vec<u8>| match std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        {
-            Some(serde_json::Value::Object(map)) => Body::Json(map),
-            _ => Body::Unreadable,
-        };
         BodyCache {
             source: Box::new(move |a: &Artifact| match read(a) {
-                Ok(bytes) => classify(bytes),
+                Ok(bytes) => classify_bytes(bytes),
                 Err(StoreError::NotFound(..)) => Body::Absent,
-                Err(_) => Body::Unreadable,
+                // QA R2: keep the typed category AND the store's message.
+                Err(e) => Body::Failed(ReadError {
+                    code: e.code(),
+                    message: e.to_string(),
+                }),
             }),
             cache: RefCell::new(HashMap::new()),
             reads: Cell::new(0),
@@ -351,6 +378,8 @@ struct Draft {
     volume: Option<&'static str>,
     mode: &'static str,
     basis: ModeBasis,
+    /// QA R2: the store fault behind an unmeasured round, if any.
+    read_error: Option<ReadError>,
 }
 
 impl Draft {
@@ -383,6 +412,7 @@ impl Draft {
             volume: None,
             mode: mode::UNKNOWN,
             basis: ModeBasis::unknown(reason::INSUFFICIENT_DATA),
+            read_error: None,
         }
     }
 
@@ -435,119 +465,40 @@ fn profile_of(map: &serde_json::Map<String, serde_json::Value>) -> Option<String
     Some(format!("{project}@{version}"))
 }
 
-fn quality_draft(
-    round: u32,
-    a: Artifact,
-    bodies: &BodyCache<'_>,
-    execs: &HashMap<String, RoleExecution>,
-) -> Draft {
-    let mut d = Draft::new(round, a);
+/// The token an unreadable quality body carries: a store failure is named
+/// `read_error`, a produced-but-corrupt body keeps `quality_report`.
+fn quality_gap_token(body: &Body) -> &'static str {
+    match body {
+        Body::Failed(_) => token::READ_ERROR,
+        _ => token::QUALITY_REPORT,
+    }
+}
+
+/// The token an unreadable spec body carries (REQ-CV-04).
+fn spec_gap_token(body: &Body) -> &'static str {
+    match body {
+        Body::Failed(_) => token::READ_ERROR,
+        _ => token::SPEC_BODY,
+    }
+}
+
+fn set_time(d: &mut Draft, execs: &HashMap<String, RoleExecution>) {
     d.time_seconds = exec_time(&d.artifact, execs);
     if d.time_seconds.is_none() {
         d.token("time_seconds", token::TIME);
     }
+}
 
-    let map = match bodies.body(&d.artifact) {
-        Body::Absent | Body::Unreadable => {
-            // No usable report: the five metric counters share ONE reason
-            // record each (REQ-CV-03 AC5), the threshold and profile have
-            // their own.
-            for field in [
-                "score_milli",
-                "low_count",
-                "unscored_count",
-                "invalid_count",
-                "pending_count",
-            ] {
-                d.token(field, token::QUALITY_REPORT);
-            }
-            d.token("theta_milli", token::QUALITY_THETA);
-            d.token("profile", token::PROFILE);
-            mark_quality_unmeasured(&mut d);
-            return d;
-        }
-        Body::Json(map) => map,
-    };
-
-    d.profile = profile_of(&map);
-    if d.profile.is_none() {
-        d.token("profile", token::PROFILE);
+fn quality_counters_missing(d: &mut Draft, tok: &'static str) {
+    for field in [
+        "score_milli",
+        "low_count",
+        "unscored_count",
+        "invalid_count",
+        "pending_count",
+    ] {
+        d.token(field, tok);
     }
-
-    let evaluation = map.get("evaluation").and_then(|v| v.as_object());
-    let score = evaluation
-        .and_then(|e| e.get("score"))
-        .and_then(|v| v.as_f64());
-    let checks = evaluation
-        .and_then(|e| e.get("checks"))
-        .and_then(|v| v.as_array());
-    if let Some(theta) = evaluation
-        .and_then(|e| e.get("theta"))
-        .and_then(|v| v.as_f64())
-    {
-        d.theta_milli = Some(milli(theta));
-    } else {
-        d.token("theta_milli", token::QUALITY_THETA);
-    }
-
-    if let Some(checks) = checks {
-        d.checks_readable = true;
-        for c in checks {
-            let Some(obj) = c.as_object() else { continue };
-            let Some(id) = obj.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let raw = obj.get("score");
-            let numeric = raw.and_then(|v| v.as_f64());
-            let state = obj.get("state").and_then(|v| v.as_str());
-            d.checks_seen.insert(id.to_string());
-            d.scores.insert(id.to_string(), numeric);
-            if state == Some("PENDING_HUMAN") {
-                // REQ-CV-03: the signature is a separate counter, never a
-                // score of the round.
-                d.pending += 1;
-                d.unclean.insert(id.to_string());
-                continue;
-            }
-            match (raw, numeric) {
-                (None, _) => {
-                    // A block with no score at all — REQ-CV-03 AC1.
-                    d.unscored += 1;
-                    d.unclean.insert(id.to_string());
-                }
-                (Some(_), Some(x)) => {
-                    if x < 1.0 {
-                        d.low.insert(id.to_string());
-                        d.unclean.insert(id.to_string());
-                    }
-                }
-                (Some(_), None) => {
-                    // A present but non-numeric score is a defect, not a
-                    // missing measurement — REQ-CV-03 AC1 («0.7»).
-                    d.invalid += 1;
-                    d.unclean.insert(id.to_string());
-                }
-            }
-        }
-    }
-
-    d.measured = score.is_some() && checks.is_some();
-    if !d.measured {
-        for field in [
-            "score_milli",
-            "low_count",
-            "unscored_count",
-            "invalid_count",
-            "pending_count",
-        ] {
-            d.token(field, token::QUALITY_REPORT);
-        }
-        mark_quality_unmeasured(&mut d);
-        return d;
-    }
-
-    d.score_milli = score.map(milli);
-    d
 }
 
 fn mark_quality_unmeasured(d: &mut Draft) {
@@ -561,6 +512,202 @@ fn mark_quality_unmeasured(d: &mut Draft) {
     d.token("delta_score_milli", token::CURRENT_UNMEASURED);
 }
 
+fn quality_draft(
+    round: u32,
+    a: Artifact,
+    bodies: &BodyCache<'_>,
+    execs: &HashMap<String, RoleExecution>,
+) -> Draft {
+    let mut d = Draft::new(round, a);
+    set_time(&mut d, execs);
+    match bodies.body(&d.artifact) {
+        Body::Json(map) => fill_quality_body(&mut d, &map),
+        gap => fill_quality_gap(&mut d, gap),
+    }
+    d
+}
+
+/// A quality body that could not be used at all: the metric counters share
+/// ONE reason record each, the threshold and profile have their own
+/// (REQ-CV-03 AC5). A store failure additionally keeps its code/message.
+fn fill_quality_gap(d: &mut Draft, body: Body) {
+    let tok = quality_gap_token(&body);
+    if let Body::Failed(err) = body {
+        d.read_error = Some(err);
+    }
+    quality_counters_missing(d, tok);
+    d.token("theta_milli", token::QUALITY_THETA);
+    d.token("profile", token::PROFILE);
+    mark_quality_unmeasured(d);
+}
+
+fn fill_quality_body(d: &mut Draft, map: &serde_json::Map<String, serde_json::Value>) {
+    d.profile = profile_of(map);
+    if d.profile.is_none() {
+        d.token("profile", token::PROFILE);
+    }
+    let evaluation = map.get("evaluation").and_then(|v| v.as_object());
+    fill_theta(d, evaluation);
+    let score = evaluation
+        .and_then(|e| e.get("score"))
+        .and_then(|v| v.as_f64());
+    let checks = evaluation
+        .and_then(|e| e.get("checks"))
+        .and_then(|v| v.as_array());
+    if let Some(checks) = checks {
+        d.checks_readable = true;
+        scan_checks(d, checks);
+    }
+    // Measured means BOTH a numeric score and a readable check array; the
+    // counters of a body without them are a gap, not zeroes (REQ-CV-03).
+    d.measured = score.is_some() && checks.is_some();
+    if d.measured {
+        d.score_milli = score.map(milli);
+    } else {
+        quality_counters_missing(d, token::QUALITY_REPORT);
+        mark_quality_unmeasured(d);
+    }
+}
+
+fn fill_theta(d: &mut Draft, evaluation: Option<&serde_json::Map<String, serde_json::Value>>) {
+    match evaluation
+        .and_then(|e| e.get("theta"))
+        .and_then(|v| v.as_f64())
+    {
+        Some(theta) => d.theta_milli = Some(milli(theta)),
+        None => d.token("theta_milli", token::QUALITY_THETA),
+    }
+}
+
+fn scan_checks(d: &mut Draft, checks: &[serde_json::Value]) {
+    for c in checks {
+        let Some(obj) = c.as_object() else { continue };
+        let Some(id) = obj.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        record_check(d, id, obj.get("score"), obj.get("state"));
+    }
+}
+
+/// One check block: identity is always recorded (STUCK reads it without a
+/// score); the counters tell a clean item (exactly 1.0) from the defects.
+fn record_check(
+    d: &mut Draft,
+    id: &str,
+    raw: Option<&serde_json::Value>,
+    state: Option<&serde_json::Value>,
+) {
+    let numeric = raw.and_then(|v| v.as_f64());
+    d.checks_seen.insert(id.to_string());
+    d.scores.insert(id.to_string(), numeric);
+    if state.and_then(|v| v.as_str()) == Some("PENDING_HUMAN") {
+        // REQ-CV-03: the signature is a separate counter, never a score.
+        d.pending += 1;
+        d.unclean.insert(id.to_string());
+        return;
+    }
+    match (raw, numeric) {
+        (None, _) => {
+            d.unscored += 1;
+            d.unclean.insert(id.to_string());
+        }
+        (Some(_), Some(x)) if x < 1.0 => {
+            d.low.insert(id.to_string());
+            d.unclean.insert(id.to_string());
+        }
+        // A present but non-numeric score is a defect, not a missing
+        // measurement — REQ-CV-03 AC1 («0.7»).
+        (Some(_), None) => {
+            d.invalid += 1;
+            d.unclean.insert(id.to_string());
+        }
+        _ => {}
+    }
+}
+
+/// The single spec version a review execution names as its input
+/// (REQ-CV-04): exactly one resolvable REQUIREMENTS_SPEC, else no binding.
+fn bound_spec(
+    a: &Artifact,
+    execs: &HashMap<String, RoleExecution>,
+    by_id: &HashMap<String, Artifact>,
+) -> Option<Artifact> {
+    let exec = execs.get(&a.execution_id.as_ref()?.to_string())?;
+    let mut found: Vec<&Artifact> = exec
+        .inputs
+        .iter()
+        .filter_map(|i| by_id.get(i))
+        .filter(|s| s.kind == ArtifactKind::RequirementsSpec)
+        .collect();
+    found.dedup_by_key(|s| s.id);
+    (found.len() == 1).then(|| found[0].clone())
+}
+
+fn count_gap(d: &mut Draft, tok: &'static str) {
+    d.token("requirements_count", tok);
+    d.token("oq_count", tok);
+}
+
+/// The two counts come from the BOUND spec body, independent of whether the
+/// review body itself is readable (REQ-CV-04 AC7).
+fn fill_spec_counts(
+    d: &mut Draft,
+    bodies: &BodyCache<'_>,
+    execs: &HashMap<String, RoleExecution>,
+    by_id: &HashMap<String, Artifact>,
+) {
+    match bound_spec(&d.artifact, execs, by_id).map(|s| bodies.body(&s)) {
+        None => count_gap(d, token::SPEC_BINDING),
+        Some(Body::Json(map)) => read_counts(d, &map),
+        Some(gap) => {
+            let tok = spec_gap_token(&gap);
+            if let Body::Failed(err) = gap {
+                d.read_error = Some(err);
+            }
+            count_gap(d, tok);
+        }
+    }
+}
+
+fn read_counts(d: &mut Draft, map: &serde_json::Map<String, serde_json::Value>) {
+    if let Some(reqs) = map.get("requirements").and_then(|v| v.as_array()) {
+        d.requirements = Some(reqs.len());
+    } else {
+        d.token("requirements_count", token::SPEC_COUNTS);
+    }
+    if let Some(oq) = map.get("open_questions").and_then(|v| v.as_array()) {
+        d.oq = Some(oq.len());
+    } else {
+        d.token("oq_count", token::SPEC_COUNTS);
+    }
+}
+
+/// The verdict comes from the REVIEW body alone; an unreadable review makes
+/// the point unmeasured but keeps the counts above (REQ-CV-04 AC7).
+fn fill_review_verdict(d: &mut Draft, bodies: &BodyCache<'_>) {
+    match bodies.body(&d.artifact) {
+        Body::Json(map) => {
+            d.measured = true;
+            d.verdict = read_verdict(&map);
+            if d.verdict.is_none() {
+                d.token("verdict", token::REVIEW_VERDICT);
+            }
+        }
+        Body::Failed(err) => {
+            d.read_error = Some(err);
+            d.token("verdict", token::READ_ERROR);
+        }
+        Body::Absent | Body::Unreadable => d.token("verdict", token::REVIEW_VERDICT),
+    }
+}
+
+fn read_verdict(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    map.get("verdict")
+        .and_then(|v| v.as_str())
+        .filter(|v| matches!(*v, "APPROVED" | "NEEDS_REVISION" | "REJECTED"))
+        .map(|v| v.to_string())
+}
+
 fn spec_draft(
     round: u32,
     a: Artifact,
@@ -569,74 +716,9 @@ fn spec_draft(
     by_id: &HashMap<String, Artifact>,
 ) -> Draft {
     let mut d = Draft::new(round, a);
-    d.time_seconds = exec_time(&d.artifact, execs);
-    if d.time_seconds.is_none() {
-        d.token("time_seconds", token::TIME);
-    }
-
-    // The spec version is bound by the stored execution row — exactly one
-    // resolvable REQUIREMENTS_SPEC among its inputs (REQ-CV-04). Binding
-    // and counters are independent of the review body's readability.
-    let spec = d
-        .artifact
-        .execution_id
-        .as_ref()
-        .and_then(|id| execs.get(&id.to_string()))
-        .and_then(|e| {
-            let mut found: Vec<&Artifact> = e
-                .inputs
-                .iter()
-                .filter_map(|i| by_id.get(i))
-                .filter(|s| s.kind == ArtifactKind::RequirementsSpec)
-                .collect();
-            found.dedup_by_key(|s| s.id);
-            (found.len() == 1).then(|| found[0].clone())
-        });
-
-    match spec.map(|s| bodies.body(&s)) {
-        None => {
-            for field in ["requirements_count", "oq_count"] {
-                d.token(field, token::SPEC_BINDING);
-            }
-        }
-        Some(Body::Absent) | Some(Body::Unreadable) => {
-            for field in ["requirements_count", "oq_count"] {
-                d.token(field, token::SPEC_BODY);
-            }
-        }
-        Some(Body::Json(smap)) => {
-            if let Some(reqs) = smap.get("requirements").and_then(|v| v.as_array()) {
-                d.requirements = Some(reqs.len());
-            } else {
-                d.token("requirements_count", token::SPEC_COUNTS);
-            }
-            if let Some(oq) = smap.get("open_questions").and_then(|v| v.as_array()) {
-                d.oq = Some(oq.len());
-            } else {
-                d.token("oq_count", token::SPEC_COUNTS);
-            }
-        }
-    }
-
-    match bodies.body(&d.artifact) {
-        Body::Json(map) => {
-            d.measured = true;
-            d.verdict = map
-                .get("verdict")
-                .and_then(|v| v.as_str())
-                .filter(|v| matches!(*v, "APPROVED" | "NEEDS_REVISION" | "REJECTED"))
-                .map(|v| v.to_string());
-            if d.verdict.is_none() {
-                d.token("verdict", token::REVIEW_VERDICT);
-            }
-        }
-        Body::Absent | Body::Unreadable => {
-            // The ONE cause of measured=false on a spec point: the review
-            // body could not be read (REQ-CV-04 AC7). The counters above
-            // stay numbers when binding and spec body were readable.
-            d.token("verdict", token::REVIEW_VERDICT);
-        }
-    }
+    set_time(&mut d, execs);
+    fill_spec_counts(&mut d, bodies, execs, by_id);
+    fill_review_verdict(&mut d, bodies);
     d
 }
 
@@ -691,49 +773,58 @@ fn count_closed(prev: &Draft, cur: &Draft) -> usize {
 
 fn finish_spec(out: &mut [Draft]) {
     for i in 0..out.len() {
-        if !out[i].measured {
-            for field in ["delta_requirements", "delta_oq", "volume_direction"] {
-                out[i].token(field, token::CURRENT_UNMEASURED);
-            }
-            continue;
-        }
-        let Some(j) = i.checked_sub(1) else {
-            for field in ["delta_requirements", "delta_oq", "volume_direction"] {
-                out[i].token(field, token::PREDECESSOR_UNMEASURED);
-            }
-            continue;
-        };
-        if !out[j].measured {
-            for field in ["delta_requirements", "delta_oq", "volume_direction"] {
-                out[i].token(field, token::PREDECESSOR_UNMEASURED);
-            }
-            continue;
-        }
-        out[i].comparable = true;
-        // A counter absent from either round is NOT zero: the delta and the
-        // direction stay null with `counts_unavailable` (REQ-CV-06 AC6).
-        out[i].delta_req = out[i]
-            .requirements
-            .zip(out[j].requirements)
-            .map(|(c, p)| c as i64 - p as i64);
-        out[i].delta_oq = out[i].oq.zip(out[j].oq).map(|(c, p)| c as i64 - p as i64);
-        if out[i].delta_req.is_none() {
-            out[i].token("delta_requirements", token::COUNTS_UNAVAILABLE);
-        }
-        if out[i].delta_oq.is_none() {
-            out[i].token("delta_oq", token::COUNTS_UNAVAILABLE);
-        }
-        out[i].volume = match (out[i].delta_req, out[i].delta_oq) {
-            (Some(dr), Some(dq)) if dr > 0 || dq > 0 => Some(volume::GROWING),
-            (Some(dr), Some(dq)) if dr <= 0 && dq <= 0 && (dr < 0 || dq < 0) => {
-                Some(volume::SHRINKING)
-            }
-            (Some(0), Some(0)) => Some(volume::FLAT),
-            _ => {
-                out[i].token("volume_direction", token::COUNTS_UNAVAILABLE);
-                None
-            }
-        };
+        finish_spec_round(out, i);
+    }
+}
+
+fn spec_round_missing(d: &mut Draft, tok: &'static str) {
+    for field in ["delta_requirements", "delta_oq", "volume_direction"] {
+        d.token(field, tok);
+    }
+}
+
+fn finish_spec_round(out: &mut [Draft], i: usize) {
+    if !out[i].measured {
+        spec_round_missing(&mut out[i], token::CURRENT_UNMEASURED);
+        return;
+    }
+    let Some(j) = i.checked_sub(1) else {
+        spec_round_missing(&mut out[i], token::PREDECESSOR_UNMEASURED);
+        return;
+    };
+    if !out[j].measured {
+        spec_round_missing(&mut out[i], token::PREDECESSOR_UNMEASURED);
+        return;
+    }
+    out[i].comparable = true;
+    let (head, tail) = out.split_at_mut(i);
+    let cur = &mut tail[0];
+    let prev = &head[j];
+    // A counter absent from either round is NOT zero: the delta and the
+    // direction stay null with `counts_unavailable` (REQ-CV-06 AC6).
+    cur.delta_req = cur
+        .requirements
+        .zip(prev.requirements)
+        .map(|(c, p)| c as i64 - p as i64);
+    cur.delta_oq = cur.oq.zip(prev.oq).map(|(c, p)| c as i64 - p as i64);
+    if cur.delta_req.is_none() {
+        cur.token("delta_requirements", token::COUNTS_UNAVAILABLE);
+    }
+    if cur.delta_oq.is_none() {
+        cur.token("delta_oq", token::COUNTS_UNAVAILABLE);
+    }
+    cur.volume = volume_of(cur.delta_req, cur.delta_oq);
+    if cur.volume.is_none() {
+        cur.token("volume_direction", token::COUNTS_UNAVAILABLE);
+    }
+}
+
+fn volume_of(delta_req: Option<i64>, delta_oq: Option<i64>) -> Option<&'static str> {
+    match (delta_req, delta_oq) {
+        (Some(dr), Some(dq)) if dr > 0 || dq > 0 => Some(volume::GROWING),
+        (Some(dr), Some(dq)) if dr <= 0 && dq <= 0 && (dr < 0 || dq < 0) => Some(volume::SHRINKING),
+        (Some(0), Some(0)) => Some(volume::FLAT),
+        _ => None,
     }
 }
 
@@ -766,59 +857,70 @@ fn stuck_at(out: &[Draft], i: usize) -> Option<(String, Vec<u32>)> {
         .map(|id| ((*id).clone(), vec![a.round, b.round, c.round]))
 }
 
-fn quality_modes(out: &mut [Draft]) {
-    // STUCK is older than every other rule and independent of whether the
-    // score was measured (REQ-CV-09 AC2). A chain of three marks ALL THREE
-    // members (REQ-CV-07 AC2: «все три STUCK, средний круг не даёт
-    // insufficient_data»); an unscored round with a readable list does NOT
-    // fall out of the series. The earliest chain owns a shared point
-    // (deterministic by ascending index).
-    let mut stuck_basis: Vec<Option<ModeBasis>> = vec![None; out.len()];
+/// STUCK is older than every other rule and independent of whether the
+/// score was measured (REQ-CV-09 AC2). A chain of three marks ALL THREE
+/// members (REQ-CV-07 AC2); an unscored round with a readable list does NOT
+/// fall out of the series. The earliest chain owns a shared point
+/// (deterministic by ascending index).
+fn stuck_bases(out: &[Draft]) -> Vec<Option<ModeBasis>> {
+    let mut bases: Vec<Option<ModeBasis>> = vec![None; out.len()];
     for i in 0..out.len() {
-        if let Some((check_id, rounds)) = stuck_at(out, i) {
-            let basis = ModeBasis {
-                rule: rule::STUCK,
-                reason: None,
-                rounds,
-                check_id: Some(check_id),
-            };
-            let from = i.saturating_sub(2);
-            for slot in &mut stuck_basis[from..=i] {
-                if slot.is_none() {
-                    *slot = Some(basis.clone());
-                }
+        let Some((check_id, rounds)) = stuck_at(out, i) else {
+            continue;
+        };
+        let basis = ModeBasis {
+            rule: rule::STUCK,
+            reason: None,
+            rounds,
+            check_id: Some(check_id),
+        };
+        for slot in &mut bases[i.saturating_sub(2)..=i] {
+            if slot.is_none() {
+                *slot = Some(basis.clone());
             }
         }
     }
+    bases
+}
+
+fn quality_modes(out: &mut [Draft]) {
+    let stuck = stuck_bases(out);
     for i in 0..out.len() {
-        if let Some(basis) = &stuck_basis[i] {
-            out[i].mode = mode::STUCK;
-            out[i].basis = basis.clone();
-            continue;
-        }
-        if !out[i].measured || !out[i].comparable {
-            out[i].mode = mode::UNKNOWN;
-            out[i].basis = ModeBasis::unknown(reason::INSUFFICIENT_DATA);
-            continue;
-        }
-        let delta = out[i]
-            .delta_score
-            .expect("comparable quality round has a delta");
-        // REQ-CV-07 / ratified 08.11: +10 or more converges with NO closed
-        // item required; a negative step diverges; anything in [0, gap) is a
-        // plateau FROM THE FIRST such round (no two-round warm-up).
-        let rounds = vec![out[i - 1].round, out[i].round];
-        if delta >= GAP_MILLI {
-            out[i].mode = mode::CONVERGING;
-            out[i].basis = ModeBasis::fired(rule::CONVERGING, rounds);
-        } else if delta < 0 {
-            out[i].mode = mode::DIVERGING;
-            out[i].basis = ModeBasis::fired(rule::DIVERGING, rounds);
-        } else {
-            out[i].mode = mode::PLATEAU;
-            out[i].basis = ModeBasis::fired(rule::PLATEAU, rounds);
-        }
+        grade_quality(out, i, &stuck[i]);
     }
+}
+
+fn grade_quality(out: &mut [Draft], i: usize, stuck: &Option<ModeBasis>) {
+    if let Some(basis) = stuck {
+        out[i].mode = mode::STUCK;
+        out[i].basis = basis.clone();
+        return;
+    }
+    if !out[i].measured || !out[i].comparable {
+        out[i].mode = mode::UNKNOWN;
+        out[i].basis = ModeBasis::unknown(reason::INSUFFICIENT_DATA);
+        return;
+    }
+    let Some(delta) = out[i].delta_score else {
+        // Comparable without a delta cannot happen; fail closed rather than
+        // panic on live data.
+        out[i].mode = mode::UNKNOWN;
+        out[i].basis = ModeBasis::unknown(reason::INSUFFICIENT_DATA);
+        return;
+    };
+    let rounds = vec![out[i - 1].round, out[i].round];
+    // REQ-CV-07 / ratified 08.11: +10 or more converges with NO closed item
+    // required; a negative step diverges; anything in [0, gap) is a plateau
+    // FROM THE FIRST such round (no two-round warm-up).
+    let (fired_mode, fired_rule) = if delta >= GAP_MILLI {
+        (mode::CONVERGING, rule::CONVERGING)
+    } else if delta < 0 {
+        (mode::DIVERGING, rule::DIVERGING)
+    } else {
+        (mode::PLATEAU, rule::PLATEAU)
+    };
+    out[i].mode = fired_mode;
+    out[i].basis = ModeBasis::fired(fired_rule, rounds);
 }
 
 fn spec_modes(out: &mut [Draft]) {
@@ -855,51 +957,86 @@ fn spec_modes(out: &mut [Draft]) {
     }
 }
 
-/// Build the 26-field point: every key always present, `missing[]` carrying
-/// exactly one record for each APPLICABLE null field (REQ-CV-05).
-fn into_point(d: Draft, stage: &'static str) -> ConvergencePoint {
-    let fields: Vec<&'static str> = if stage == STAGE_QUALITY {
+#[derive(Default)]
+struct QualityCounts {
+    low: Option<usize>,
+    unscored: Option<usize>,
+    invalid: Option<usize>,
+    pending: Option<usize>,
+}
+
+fn quality_counts(d: &Draft, stage: &'static str) -> QualityCounts {
+    if stage == STAGE_QUALITY && d.measured {
+        QualityCounts {
+            low: Some(d.low.len()),
+            unscored: Some(d.unscored),
+            invalid: Some(d.invalid),
+            pending: Some(d.pending),
+        }
+    } else {
+        QualityCounts::default()
+    }
+}
+
+/// Applicability table: a field is null-with-a-token only when its stage
+/// can carry it. Inapplicable fields stay null WITHOUT a record (REQ-CV-05).
+fn is_null(d: &Draft, stage: &'static str, field: &str) -> bool {
+    match field {
+        "score_milli" => d.score_milli.is_none(),
+        "theta_milli" => d.theta_milli.is_none(),
+        "low_count" | "unscored_count" | "invalid_count" | "pending_count" => {
+            stage == STAGE_QUALITY && !d.measured
+        }
+        "closed_count" => d.closed.is_none(),
+        "delta_score_milli" => d.delta_score.is_none(),
+        "profile" => d.profile.is_none(),
+        "verdict" => d.verdict.is_none(),
+        "requirements_count" => d.requirements.is_none(),
+        "oq_count" => d.oq.is_none(),
+        "delta_requirements" => d.delta_req.is_none(),
+        "delta_oq" => d.delta_oq.is_none(),
+        "volume_direction" => d.volume.is_none(),
+        "time_seconds" => d.time_seconds.is_none(),
+        // invariant: every entry of QUALITY_FIELDS/SPEC_FIELDS/COMMON_FIELDS
+        // is matched below; a new table entry without an arm must fail loudly
+        // here instead of silently mis-tokenising a null field.
+        other => unreachable!("field {other} is not in the applicability table"),
+    }
+}
+
+fn token_of(d: &Draft, field: &'static str) -> &'static str {
+    d.tokens.get(field).copied().unwrap_or_else(|| {
+        // invariant: every null field writes its token where it became null;
+        // the fallback only degrades a future table edit to a named gap in
+        // release builds instead of panicking on live data.
+        debug_assert!(false, "null field {field} has no token");
+        token::QUALITY_REPORT
+    })
+}
+
+fn missing_entries(d: &Draft, stage: &'static str) -> Vec<MissingEntry> {
+    let fields = if stage == STAGE_QUALITY {
         QUALITY_FIELDS
-            .iter()
-            .chain(COMMON_FIELDS.iter())
-            .copied()
-            .collect()
     } else {
         SPEC_FIELDS
-            .iter()
-            .chain(COMMON_FIELDS.iter())
-            .copied()
-            .collect()
     };
-    let mut missing = Vec::new();
-    for field in fields {
-        let is_null = match field {
-            "score_milli" => d.score_milli.is_none(),
-            "theta_milli" => d.theta_milli.is_none(),
-            "low_count" => stage == STAGE_QUALITY && !d.measured,
-            "unscored_count" => stage == STAGE_QUALITY && !d.measured,
-            "invalid_count" => stage == STAGE_QUALITY && !d.measured,
-            "pending_count" => stage == STAGE_QUALITY && !d.measured,
-            "closed_count" => d.closed.is_none(),
-            "delta_score_milli" => d.delta_score.is_none(),
-            "profile" => d.profile.is_none(),
-            "verdict" => d.verdict.is_none(),
-            "requirements_count" => d.requirements.is_none(),
-            "oq_count" => d.oq.is_none(),
-            "delta_requirements" => d.delta_req.is_none(),
-            "delta_oq" => d.delta_oq.is_none(),
-            "volume_direction" => d.volume.is_none(),
-            "time_seconds" => d.time_seconds.is_none(),
-            other => unreachable!("field {other} is not in the applicability table"),
-        };
-        if is_null {
-            let token = d.tokens.get(field).copied().unwrap_or_else(|| {
-                debug_assert!(false, "null field {field} has no token");
-                token::QUALITY_REPORT
-            });
-            missing.push(MissingEntry { field, token });
-        }
-    }
+    fields
+        .iter()
+        .chain(COMMON_FIELDS.iter())
+        .copied()
+        .filter(|field| is_null(d, stage, field))
+        .map(|field| MissingEntry {
+            field,
+            token: token_of(d, field),
+        })
+        .collect()
+}
+
+/// Build the point: every key always present, `missing[]` carrying exactly
+/// one record for each APPLICABLE null field (REQ-CV-05).
+fn into_point(d: Draft, stage: &'static str) -> ConvergencePoint {
+    let missing = missing_entries(&d, stage);
+    let counts = quality_counts(&d, stage);
     ConvergencePoint {
         round: d.round,
         artifact_id: d.artifact.id.to_string(),
@@ -911,26 +1048,10 @@ fn into_point(d: Draft, stage: &'static str) -> ConvergencePoint {
         missing,
         score_milli: d.score_milli,
         theta_milli: d.theta_milli,
-        low_count: if stage == STAGE_QUALITY && d.measured {
-            Some(d.low.len())
-        } else {
-            None
-        },
-        unscored_count: if stage == STAGE_QUALITY && d.measured {
-            Some(d.unscored)
-        } else {
-            None
-        },
-        invalid_count: if stage == STAGE_QUALITY && d.measured {
-            Some(d.invalid)
-        } else {
-            None
-        },
-        pending_count: if stage == STAGE_QUALITY && d.measured {
-            Some(d.pending)
-        } else {
-            None
-        },
+        low_count: counts.low,
+        unscored_count: counts.unscored,
+        invalid_count: counts.invalid,
+        pending_count: counts.pending,
         closed_count: d.closed,
         delta_score_milli: d.delta_score,
         verdict: d.verdict,
@@ -943,21 +1064,22 @@ fn into_point(d: Draft, stage: &'static str) -> ConvergencePoint {
         profile: d.profile,
         mode: d.mode,
         mode_basis: d.basis,
+        read_error: d.read_error,
     }
 }
 
-fn stage(
-    name: &'static str,
-    drafts: Vec<Draft>,
-    spec_versions_without_review: usize,
-) -> StageConvergence {
-    let series: Vec<ConvergencePoint> = drafts.into_iter().map(|d| into_point(d, name)).collect();
+struct StageTimes {
+    total: Option<i64>,
+    current: Option<i64>,
+}
+
+fn counters_of(series: &[ConvergencePoint], specs_without_review: usize) -> ConvergenceCounters {
     let mut counters = ConvergenceCounters {
         rounds_total: series.len(),
-        spec_versions_without_review,
+        spec_versions_without_review: specs_without_review,
         ..Default::default()
     };
-    for p in &series {
+    for p in series {
         if !p.measured {
             counters.rounds_unmeasured += 1;
         }
@@ -965,50 +1087,40 @@ fn stage(
             counters.rounds_without_time += 1;
         }
     }
-    // REQ-CV-11: the total counts every known round time; the CURRENT time
-    // is the profile segment the stage stands in — the last contiguous
-    // segment with one known profile for quality, the whole series for spec
-    // (a spec point has no profile). An unknown total is null + stage_time,
-    // never 0.
-    let total: i64 = series.iter().filter_map(|p| p.time_seconds).sum();
-    let stage_total_seconds = if series.is_empty() || counters.rounds_without_time == series.len() {
-        None
-    } else {
-        Some(total)
-    };
-    let segment_start = if name == STAGE_QUALITY {
-        match series.last().and_then(|p| p.profile.clone()) {
-            Some(tail) => {
-                let mut start = series.len().saturating_sub(1);
-                while start > 0 && series[start - 1].profile.as_deref() == Some(tail.as_str()) {
-                    start -= 1;
-                }
-                start
-            }
-            // An unknown last profile proves no segment: there is no
-            // "current" span to add up.
-            None => series.len(),
-        }
-    } else {
-        0
-    };
-    let current_known: Vec<i64> = series[segment_start..]
-        .iter()
-        .filter_map(|p| p.time_seconds)
-        .collect();
-    let stage_current_seconds = if current_known.is_empty() {
-        None
-    } else {
-        Some(current_known.iter().sum())
-    };
-    StageConvergence {
-        stage: name,
-        counters,
-        missing: stage_missing(stage_total_seconds, stage_current_seconds.is_some()),
-        stage_total_seconds,
-        stage_current_seconds,
-        series,
+    counters
+}
+
+/// REQ-CV-11: the CURRENT time is the profile segment the stage stands in —
+/// the last contiguous segment with one known profile for quality, the whole
+/// series for spec (a spec point has no profile). An unknown segment has no
+/// "current" span to add up.
+fn segment_start(name: &'static str, series: &[ConvergencePoint]) -> usize {
+    if name != STAGE_QUALITY {
+        return 0;
     }
+    let Some(tail) = series.last().and_then(|p| p.profile.as_deref()) else {
+        return series.len();
+    };
+    let mut start = series.len().saturating_sub(1);
+    while start > 0 && series[start - 1].profile.as_deref() == Some(tail) {
+        start -= 1;
+    }
+    start
+}
+
+fn stage_times(name: &'static str, series: &[ConvergencePoint]) -> StageTimes {
+    // An unknown total is null, never 0 — even when every round lacks time.
+    let known = series.iter().filter(|p| p.time_seconds.is_some()).count();
+    let total = (known > 0).then(|| series.iter().filter_map(|p| p.time_seconds).sum());
+    let start = segment_start(name, series);
+    let current: Option<i64> = {
+        let seconds: Vec<i64> = series[start..]
+            .iter()
+            .filter_map(|p| p.time_seconds)
+            .collect();
+        (!seconds.is_empty()).then(|| seconds.iter().sum())
+    };
+    StageTimes { total, current }
 }
 
 /// One `missing[]` record per applicable null stage field (REQ-CV-12).
@@ -1029,6 +1141,93 @@ fn stage_missing(total: Option<i64>, current_known: bool) -> Vec<MissingEntry> {
     missing
 }
 
+fn stage(
+    name: &'static str,
+    drafts: Vec<Draft>,
+    spec_versions_without_review: usize,
+) -> StageConvergence {
+    let series: Vec<ConvergencePoint> = drafts.into_iter().map(|d| into_point(d, name)).collect();
+    let counters = counters_of(&series, spec_versions_without_review);
+    let times = stage_times(name, &series);
+    StageConvergence {
+        stage: name,
+        series,
+        counters,
+        stage_total_seconds: times.total,
+        stage_current_seconds: times.current,
+        missing: stage_missing(times.total, times.current.is_some()),
+    }
+}
+
+fn index_execs(executions: &[RoleExecution]) -> HashMap<String, RoleExecution> {
+    executions
+        .iter()
+        .cloned()
+        .map(|e| (e.id.to_string(), e))
+        .collect()
+}
+
+fn index_artifacts(artifacts: &[Artifact]) -> HashMap<String, Artifact> {
+    artifacts
+        .iter()
+        .cloned()
+        .map(|a| (a.id.to_string(), a))
+        .collect()
+}
+
+/// Versions without a review are a COUNTER, not rounds (REQ-CV-12 AC2):
+/// count spec rows no review execution names as its single spec input.
+fn specs_without_review(
+    artifacts: &[Artifact],
+    review_rows: &[Artifact],
+    execs: &HashMap<String, RoleExecution>,
+    by_id: &HashMap<String, Artifact>,
+) -> usize {
+    let mut reviewed: HashSet<Id> = HashSet::new();
+    for a in review_rows {
+        if let Some(spec) = bound_spec(a, execs, by_id) {
+            reviewed.insert(spec.id);
+        }
+    }
+    let total = artifacts
+        .iter()
+        .filter(|a| a.kind == ArtifactKind::RequirementsSpec)
+        .count();
+    total.saturating_sub(reviewed.len())
+}
+
+fn spec_stage(
+    rows: Vec<Artifact>,
+    bodies: &BodyCache<'_>,
+    execs: &HashMap<String, RoleExecution>,
+    by_id: &HashMap<String, Artifact>,
+    specs_without_review: usize,
+) -> StageConvergence {
+    let mut drafts: Vec<Draft> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| spec_draft(i as u32 + 1, a, bodies, execs, by_id))
+        .collect();
+    finish_spec(&mut drafts);
+    spec_modes(&mut drafts);
+    stage(STAGE_SPEC_REVIEW, drafts, specs_without_review)
+}
+
+fn quality_stage(
+    rows: Vec<Artifact>,
+    bodies: &BodyCache<'_>,
+    execs: &HashMap<String, RoleExecution>,
+) -> StageConvergence {
+    let mut drafts: Vec<Draft> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| quality_draft(i as u32 + 1, a, bodies, execs))
+        .collect();
+    finish_quality(&mut drafts);
+    quality_modes(&mut drafts);
+    stage(STAGE_QUALITY, drafts, 0)
+}
+
 /// The whole slice of one task. Read-only by construction: the only store
 /// capability it asks for is the memoised body reader.
 pub fn compute(
@@ -1036,70 +1235,24 @@ pub fn compute(
     executions: &[RoleExecution],
     bodies: &BodyCache<'_>,
 ) -> ConvergenceView {
-    let execs: HashMap<String, RoleExecution> = executions
-        .iter()
-        .cloned()
-        .map(|e| (e.id.to_string(), e))
-        .collect();
-    let by_id: HashMap<String, Artifact> = artifacts
-        .iter()
-        .cloned()
-        .map(|a| (a.id.to_string(), a))
-        .collect();
-
+    let execs = index_execs(executions);
+    let by_id = index_artifacts(artifacts);
     let q_rows = carriers(artifacts, ArtifactKind::QualityReport);
     let s_rows = carriers(artifacts, ArtifactKind::ReviewReport);
-
-    // Versions without a review are a COUNTER, not rounds (REQ-CV-12 AC2):
-    // count spec rows no review execution names as its single spec input.
-    let mut reviewed_specs: HashSet<Id> = HashSet::new();
-    for a in &s_rows {
-        let Some(exec) = a
-            .execution_id
-            .as_ref()
-            .and_then(|id| execs.get(&id.to_string()))
-        else {
-            continue;
-        };
-        let mut found: Vec<&Artifact> = exec
-            .inputs
-            .iter()
-            .filter_map(|i| by_id.get(i))
-            .filter(|s| s.kind == ArtifactKind::RequirementsSpec)
-            .collect();
-        found.dedup_by_key(|s| s.id);
-        if found.len() == 1 {
-            reviewed_specs.insert(found[0].id);
-        }
-    }
-    let spec_total = artifacts
-        .iter()
-        .filter(|a| a.kind == ArtifactKind::RequirementsSpec)
-        .count();
-    let specs_without_review = spec_total.saturating_sub(reviewed_specs.len());
+    let specs_without_review = specs_without_review(artifacts, &s_rows, &execs, &by_id);
 
     let mut stages = Vec::new();
-
     if !s_rows.is_empty() {
-        let mut drafts: Vec<Draft> = s_rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, a)| spec_draft(i as u32 + 1, a, bodies, &execs, &by_id))
-            .collect();
-        finish_spec(&mut drafts);
-        spec_modes(&mut drafts);
-        stages.push(stage(STAGE_SPEC_REVIEW, drafts, specs_without_review));
+        stages.push(spec_stage(
+            s_rows,
+            bodies,
+            &execs,
+            &by_id,
+            specs_without_review,
+        ));
     }
-
     if !q_rows.is_empty() {
-        let mut drafts: Vec<Draft> = q_rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, a)| quality_draft(i as u32 + 1, a, bodies, &execs))
-            .collect();
-        finish_quality(&mut drafts);
-        quality_modes(&mut drafts);
-        stages.push(stage(STAGE_QUALITY, drafts, 0));
+        stages.push(quality_stage(q_rows, bodies, &execs));
     }
 
     ConvergenceView {

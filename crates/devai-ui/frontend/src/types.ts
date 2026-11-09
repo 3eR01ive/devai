@@ -355,7 +355,13 @@ export interface ModeBasis {
   check_id: string | null;
 }
 
-/** Одна точка — одна форма для обеих стадий, 26 ключей всегда на месте. */
+/** Пробел данных — объяснение токена платформы (закрытый словарь). */
+export interface ReadError {
+  code: string;
+  message: string;
+}
+
+/** Одна точка — одна форма для обеих стадий, все ключи всегда на месте. */
 export interface ConvergencePoint {
   round: number;
   artifact_id: string;
@@ -383,6 +389,8 @@ export interface ConvergencePoint {
   profile: string | null;
   mode: string;
   mode_basis: ModeBasis;
+  /** Сбой чтения из стора (REQ-CV-05 + QA R2); null — фолта не было. */
+  read_error: ReadError | null;
 }
 
 export interface ConvergenceCounters {

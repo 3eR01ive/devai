@@ -1921,6 +1921,7 @@ mod tests {
                 rounds: vec![],
                 check_id: None,
             },
+            read_error: None,
         };
         let view = ConvergenceView {
             gap_milli: 10,

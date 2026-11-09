@@ -12,6 +12,7 @@ use devai_runtime::convergence::{
     Body, BodyCache, ConvergencePoint, ConvergenceView, GAP_MILLI, MISSING_TOKENS, MissingEntry,
     STAGE_QUALITY, STAGE_SPEC_REVIEW, compute, mode, reason, rule, token, volume,
 };
+use devai_store::StoreError;
 use serde_json::{Map, Value, json};
 
 fn ts(secs: i64) -> DateTime<Utc> {
@@ -758,6 +759,32 @@ fn a_null_verdict_is_not_approved_and_keeps_the_point_measured() {
 }
 
 #[test]
+fn an_unknown_verdict_is_null_but_the_point_stays_measured() {
+    let view = spec_fixture(&[("WEIRD", 14, 5)]);
+    let p = point(stage(&view, STAGE_SPEC_REVIEW), 0);
+    assert!(p.measured, "a readable review body is measured");
+    assert_eq!(p.verdict, None, "only the three tokens are verdicts");
+    assert_one_token(p, "verdict", token::REVIEW_VERDICT);
+}
+
+#[test]
+fn an_absent_review_body_is_not_a_measured_round() {
+    let spec = artifact(ArtifactKind::RequirementsSpec, 1, -1, None);
+    let exec_id = new_id();
+    let review = artifact(ArtifactKind::ReviewReport, 1, 0, Some(exec_id));
+    let exec = execution(exec_id, &[spec.id], 0, Some(5));
+    let mut bodies = HashMap::new();
+    bodies.insert(spec.id, spec_body(14, 5));
+    // The review artifact exists but its blob does not.
+    let cache = BodyCache::from_bodies(bodies);
+    let view = compute(&[spec, review], &[exec], &cache);
+    let p = point(stage(&view, STAGE_SPEC_REVIEW), 0);
+    assert!(!p.measured);
+    assert_one_token(p, "verdict", token::REVIEW_VERDICT);
+    assert_eq!(p.requirements_count, Some(14), "counts survive the gap");
+}
+
+#[test]
 fn an_unreadable_review_body_keeps_the_counters_from_the_bound_spec() {
     let spec = artifact(ArtifactKind::RequirementsSpec, 1, -1, None);
     let exec_id = new_id();
@@ -1047,6 +1074,74 @@ fn stage_current_time_is_the_last_profile_segment_not_the_whole_series() {
 }
 
 #[test]
+fn a_profile_change_in_the_middle_breaks_both_neighbours_and_keeps_the_last_segment() {
+    // 12, 12, 13, 13: the boundary sits between rounds 2 and 3; the last
+    // segment (13) is the current one. A boundary on the far side does not
+    // retroactively merge the segments.
+    let mut bodies = HashMap::new();
+    let mut artifacts = Vec::new();
+    for (i, version) in [12u64, 12, 13, 13].iter().enumerate() {
+        let e = new_id();
+        let a = artifact(ArtifactKind::QualityReport, i as u32 + 1, i as i64, Some(e));
+        bodies.insert(
+            a.id,
+            quality_body(
+                Some(0.9),
+                &[("a", Some(0.9))],
+                Some(0.8),
+                Some(("home", *version)),
+            ),
+        );
+        artifacts.push((a, e));
+    }
+    let execs: Vec<_> = artifacts
+        .iter()
+        .map(|(_, e)| execution(*e, &[], 0, Some(10)))
+        .collect();
+    let cache = BodyCache::from_bodies(bodies);
+    let rows: Vec<Artifact> = artifacts.iter().map(|(a, _)| a.clone()).collect();
+    let view = compute(&rows, &execs, &cache);
+    let s = stage(&view, STAGE_QUALITY);
+    assert!(
+        !s.series[0].comparable,
+        "the first round has no predecessor"
+    );
+    assert!(s.series[1].comparable, "12 -> 12 is one segment");
+    assert!(!s.series[2].comparable, "12 -> 13 is a boundary");
+    assert_one_token(&s.series[2], "delta_score_milli", token::SEGMENT_BOUNDARY);
+    assert!(s.series[3].comparable, "13 -> 13 is one segment");
+    assert_eq!(s.stage_total_seconds, Some(40), "four rounds of 10 s");
+    assert_eq!(s.stage_current_seconds, Some(20), "two rounds of home@13");
+}
+
+#[test]
+fn an_unknown_last_profile_has_no_current_segment_even_with_known_times() {
+    let mut bodies = HashMap::new();
+    let mut artifacts = Vec::new();
+    for (i, profile) in [Some(("home", 12u64)), None].iter().enumerate() {
+        let e = new_id();
+        let a = artifact(ArtifactKind::QualityReport, i as u32 + 1, i as i64, Some(e));
+        bodies.insert(a.id, quality_body(Some(0.9), &[], Some(0.8), *profile));
+        artifacts.push((a, e));
+    }
+    let execs: Vec<_> = artifacts
+        .iter()
+        .map(|(_, e)| execution(*e, &[], 0, Some(7)))
+        .collect();
+    let cache = BodyCache::from_bodies(bodies);
+    let rows: Vec<Artifact> = artifacts.iter().map(|(a, _)| a.clone()).collect();
+    let view = compute(&rows, &execs, &cache);
+    let s = stage(&view, STAGE_QUALITY);
+    assert_eq!(s.stage_total_seconds, Some(14), "the total is known");
+    assert_eq!(s.stage_current_seconds, None, "no segment is provable");
+    assert!(
+        s.missing
+            .iter()
+            .any(|m| m.field == "stage_current_seconds" && m.token == token::STAGE_TIME)
+    );
+}
+
+#[test]
 fn spec_versions_without_review_are_a_counter_not_rounds() {
     let spec1 = artifact(ArtifactKind::RequirementsSpec, 1, -3, None);
     let spec2 = artifact(ArtifactKind::RequirementsSpec, 2, -2, None);
@@ -1133,12 +1228,73 @@ fn two_reads_of_unchanged_data_are_byte_identical() {
     assert_eq!(first, second);
 }
 
+#[test]
+fn a_store_read_failure_is_named_apart_from_a_corrupt_body() {
+    // QA R2: a store fault keeps its code and message on the point and
+    // carries `read_error`; bytes that were produced but are not JSON keep
+    // the report token and carry NO read error.
+    let failed = artifact(ArtifactKind::QualityReport, 1, 0, None);
+    let corrupt = artifact(ArtifactKind::QualityReport, 2, 1, None);
+    let failed_id = failed.id;
+    let read = move |a: &Artifact| {
+        if a.id == failed_id {
+            Err(StoreError::Corrupt(
+                "blob 0 is stored but unreadable: EIO".into(),
+            ))
+        } else {
+            Ok(b"not a json object".to_vec())
+        }
+    };
+    let cache = BodyCache::from_reader(&read);
+    let view = compute(&[failed, corrupt], &[], &cache);
+    let s = stage(&view, STAGE_QUALITY);
+
+    let err = s.series[0]
+        .read_error
+        .as_ref()
+        .expect("the store failure is kept on the point");
+    assert_eq!(err.code, "corrupt");
+    assert!(err.message.contains("unreadable"));
+    assert!(!s.series[0].measured);
+    assert_one_token(&s.series[0], "score_milli", token::READ_ERROR);
+
+    assert!(s.series[1].read_error.is_none(), "corrupt is not a fault");
+    assert_one_token(&s.series[1], "score_milli", token::QUALITY_REPORT);
+}
+
+#[test]
+fn a_failed_spec_read_carries_the_store_code_and_keeps_the_review_measured() {
+    let spec = artifact(ArtifactKind::RequirementsSpec, 1, -1, None);
+    let exec_id = new_id();
+    let review = artifact(ArtifactKind::ReviewReport, 1, 0, Some(exec_id));
+    let exec = execution(exec_id, &[spec.id], 0, Some(5));
+    let spec_id = spec.id;
+    let read = move |a: &Artifact| {
+        if a.id == spec_id {
+            Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "disk gone",
+            )))
+        } else {
+            Ok(br#"{"verdict":"NEEDS_REVISION"}"#.to_vec())
+        }
+    };
+    let cache = BodyCache::from_reader(&read);
+    let view = compute(&[spec, review], &[exec], &cache);
+    let p = point(stage(&view, STAGE_SPEC_REVIEW), 0);
+    let err = p.read_error.as_ref().expect("spec read failure kept");
+    assert_eq!(err.code, "io");
+    assert!(err.message.contains("disk gone"));
+    assert_one_token(p, "requirements_count", token::READ_ERROR);
+    assert!(p.measured, "the review body itself was readable");
+}
+
 // ---------------------------------------------------------------------------
 // REQ-CV-05: the shape and the closed vocabularies
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_point_carries_26_keys_and_a_closed_missing_vocabulary() {
+fn every_point_carries_27_keys_and_a_closed_missing_vocabulary() {
     let view = quality_series(&[
         (0.943, vec![("a", Some(0.5))]),
         (0.997, vec![("b", Some(0.9))]),
@@ -1146,7 +1302,8 @@ fn every_point_carries_26_keys_and_a_closed_missing_vocabulary() {
     let v = serde_json::to_value(&view).unwrap();
     for p in v["stages"][0]["series"].as_array().unwrap() {
         let obj = p.as_object().unwrap();
-        assert_eq!(obj.len(), 26, "the point shape is 26 keys");
+        // 26 REQ-CV-05 keys + QA R2 `read_error` (the store code/message).
+        assert_eq!(obj.len(), 27, "the point shape is 27 keys");
         for entry in p["missing"].as_array().unwrap() {
             let t = entry["token"].as_str().unwrap();
             assert!(MISSING_TOKENS.contains(&t), "closed vocabulary: {t}");
