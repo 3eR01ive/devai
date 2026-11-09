@@ -65,8 +65,9 @@ pub struct InboxTaskFacts {
     /// Honest platform text when a QA row has no signable report.
     pub report_note: Option<String>,
     /// The task's convergence slice (REQ-CV-12): the SAME object the task
-    /// progress read answers, byte for byte, and `null` on terminal tasks
-    /// only. The row picks the stage to draw (its gate's, else the last).
+    /// progress read answers, byte for byte, and `null` for terminal tasks
+    /// and for rows outside the wait section. The row picks the stage to
+    /// draw (its gate's, else the last).
     pub convergence: Option<ConvergenceView>,
 }
 

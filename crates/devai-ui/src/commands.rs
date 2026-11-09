@@ -1902,6 +1902,8 @@ mod tests {
             theta_milli: Some(950),
             low_count: Some(2),
             unscored_count: Some(0),
+            invalid_count: Some(0),
+            pending_count: Some(0),
             closed_count: None,
             delta_score_milli: None,
             verdict: None,
@@ -1932,6 +1934,7 @@ mod tests {
                     spec_versions_without_review: 0,
                 },
                 stage_total_seconds: Some(60),
+                stage_current_seconds: Some(60),
                 missing: vec![],
             }],
         };

@@ -54,15 +54,21 @@ pub struct OpDescriptor {
 /// plane (`Task.human_name`, `TaskDependency.task_display`/
 /// `depends_on_display`) — a consumer typed against `@2` reads those
 /// fields as unknown-absent, so the stamp must move with them.
-/// `@4` named the convergence increment (task 01a1b5be, REQ-CV-09): the
-/// surface gained the `task.convergence` read and `InboxTaskFacts.convergence`
-/// — a consumer typed against `@3` reads the fact as unknown-absent, so the
-/// stamp moves with the new operation and the widened inbox shape.
-/// `@5` returns the surface to the ratified shape of REQ-CV-14: the separate
-/// `task.convergence` operation is GONE (no new operations), and the slice
-/// rides on the two reads that already existed — `task.progress` and
-/// `inbox.snapshot` gain the `convergence` field in their output shape.
-pub const SURFACE_VERSION: &str = "api-surface@5";
+/// `@4` names the homes-registry increment built ON TOP of `@3`: the
+/// operation vocabulary grew a class token (`registry`) and the `home.*`
+/// plane — additive for tolerant readers, wire-visible for the stamp.
+/// `@5` names the project-rules ratification increment: `profile.state` /
+/// `profile.ratify` / `profile.revoke` join the table and `Decision` gains
+/// `payload` — a wire-visible shape change. `@6` names the model-bundle
+/// increment: `model.snapshot` / `model.probe` / `model.switch` and the run
+/// stamp (`RoleExecution.bundle`) join the surface. `@7` names the
+/// convergence increment (task 01a1b5be, REQ-CV-14): NO operation joins or
+/// leaves the table — the slice rides on the two reads that already
+/// existed, `task.progress` and `inbox.snapshot`, whose output shapes gain
+/// the `convergence` field (null on terminal tasks and on rows outside the
+/// wait section); a consumer typed against `@6` reads it as unknown-absent,
+/// so the stamp moves with the widened shapes.
+pub const SURFACE_VERSION: &str = "api-surface@7";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -417,7 +423,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Read,
             input: "()",
             output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, convergence}>}",
-            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
+            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks and on rows outside the wait section. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
         },
         // ---- questions ----
         OpDescriptor {
@@ -670,7 +676,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@5");
+        assert_eq!(SURFACE_VERSION, "api-surface@7");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -684,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_version_v5_rides_the_slice_on_existing_reads() {
+    fn surface_version_v7_rides_the_slice_on_existing_reads() {
         // Task 01a1b5be (REQ-CV-14): the increment and its stamp move
         // together, but NO operation joins the table — the slice is carried
         // by the two reads that already existed.

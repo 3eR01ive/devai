@@ -1,6 +1,6 @@
 //! Behaviour pins of the convergence slice (task 01a1b5be,
-//! REQ-CV-01..16): the arithmetic, the closed vocabularies and the report
-//! block, all against injected bodies — no store, no clock, no model.
+//! REQ-CV-01..16): the arithmetic, the closed vocabularies and the round
+//! structure, all against injected bodies — no store, no clock, no model.
 
 use std::collections::HashMap;
 
@@ -209,6 +209,8 @@ fn a_recorded_zero_is_a_measurement_and_null_is_not() {
         assert_one_token(p, "score_milli", token::QUALITY_REPORT);
         assert_one_token(p, "low_count", token::QUALITY_REPORT);
         assert_one_token(p, "unscored_count", token::QUALITY_REPORT);
+        assert_one_token(p, "invalid_count", token::QUALITY_REPORT);
+        assert_one_token(p, "pending_count", token::QUALITY_REPORT);
     }
 }
 
@@ -219,22 +221,42 @@ fn an_empty_checks_array_is_measured_with_zero_low_items() {
     assert!(p.measured);
     assert_eq!(p.low_count, Some(0));
     assert_eq!(p.unscored_count, Some(0));
+    assert_eq!(p.invalid_count, Some(0));
+    assert_eq!(p.pending_count, Some(0));
 }
 
 #[test]
-fn low_and_unscored_counts_come_from_the_checks_array_only() {
-    let view = quality_series(&[(
-        0.7,
-        vec![
-            ("pass", Some(1.0)),
-            ("far", Some(0.5)),
-            ("zero", Some(0.0)),
-            ("pending", None),
-        ],
-    )]);
+fn low_unscored_invalid_and_pending_come_from_the_checks_array_only() {
+    // REQ-CV-03 AC1: 1.0 (pass), 0.0 and 0.8 (low), a block with no score
+    // (unscored), "0.7" (invalid), nothing pending → low=2, unscored=1,
+    // invalid=1, pending=0.
+    let a = artifact(ArtifactKind::QualityReport, 1, 0, None);
+    let mut bodies = HashMap::new();
+    bodies.insert(
+        a.id,
+        object(json!({
+            "evaluation": {
+                "score": 0.7,
+                "theta": 0.8,
+                "checks": [
+                    {"id": "pass", "state": "SCORED", "score": 1.0},
+                    {"id": "zero", "state": "MECHANICAL_FAIL", "score": 0.0},
+                    {"id": "eight", "state": "SCORED", "score": 0.8},
+                    {"id": "block", "state": "BLOCKED"},
+                    {"id": "bad", "state": "SCORED", "score": "0.7"},
+                    {"id": "human", "state": "PENDING_HUMAN"},
+                ]
+            },
+            "profile": {"project": "home", "version": 12},
+        })),
+    );
+    let cache = BodyCache::from_bodies(bodies);
+    let view = compute(&[a], &[], &cache);
     let p = point(stage(&view, STAGE_QUALITY), 0);
-    assert_eq!(p.low_count, Some(2), "0.5 and 0.0 are below 1.0");
-    assert_eq!(p.unscored_count, Some(1));
+    assert_eq!(p.low_count, Some(2), "0.0 and 0.8 are below 1.0");
+    assert_eq!(p.unscored_count, Some(1), "the block has no score");
+    assert_eq!(p.invalid_count, Some(1), "\"0.7\" is not a number");
+    assert_eq!(p.pending_count, Some(1), "the human signature is pending");
 }
 
 #[test]
@@ -420,7 +442,9 @@ fn an_unknown_profile_breaks_the_segment_too() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn converging_needs_the_gap_and_one_closed_item() {
+fn converging_needs_only_the_gap_and_not_a_closed_item() {
+    // REQ-CV-07 / ratified 08.11: +10 or more converges whether or not an
+    // item closed.
     let view = quality_series(&[
         (0.94, vec![("a", Some(0.6))]),
         (0.98, vec![("a", Some(1.0))]),
@@ -435,13 +459,13 @@ fn converging_needs_the_gap_and_one_closed_item() {
     assert_eq!(s.series[1].mode_basis.rule, rule::CONVERGING);
     assert_eq!(s.series[1].mode_basis.rounds, vec![1, 2]);
 
-    // +9 milli with a closed item is NOT converging.
+    // +9 milli is below the gap and therefore a plateau, not convergence.
     let view = quality_series(&[
         (0.9, vec![("a", Some(0.6))]),
         (0.909, vec![("a", Some(1.0))]),
     ]);
     let s = stage(&view, STAGE_QUALITY);
-    assert_ne!(s.series[1].mode, mode::CONVERGING);
+    assert_eq!(s.series[1].mode, mode::PLATEAU);
 }
 
 #[test]
@@ -454,15 +478,16 @@ fn the_gap_boundary_is_exact_in_thousandths() {
 }
 
 #[test]
-fn progress_without_a_closed_item_is_unknown_not_converging() {
+fn progress_without_a_closed_item_still_converges() {
+    // REQ-CV-07 / ratified 08.11: closure is a counter, never a gate.
     let view = quality_series(&[
         (0.9, vec![("a", Some(1.0))]),
         (0.95, vec![("a", Some(1.0))]),
     ]);
     let p = point(stage(&view, STAGE_QUALITY), 1);
     assert_eq!(p.closed_count, Some(0));
-    assert_eq!(p.mode, mode::UNKNOWN);
-    assert_eq!(p.mode_basis.reason, Some(reason::NO_PREDICATE));
+    assert_eq!(p.mode, mode::CONVERGING);
+    assert_eq!(p.mode_basis.rule, rule::CONVERGING);
 }
 
 #[test]
@@ -474,22 +499,24 @@ fn diverging_and_plateau_follow_the_measured_curve() {
         (1.0, vec![("d", Some(0.9))]),
     ]);
     let s = stage(&view, STAGE_QUALITY);
+    assert_eq!(s.series[1].mode, mode::CONVERGING);
     assert_eq!(s.series[2].mode, mode::DIVERGING);
     assert_eq!(s.series[2].mode_basis.rounds, vec![2, 3]);
     assert_eq!(s.series[3].mode, mode::PLATEAU);
-    assert_eq!(s.series[3].mode_basis.rounds, vec![2, 3, 4]);
+    assert_eq!(s.series[3].mode_basis.rounds, vec![3, 4]);
 }
 
 #[test]
-fn a_single_flat_step_is_not_plateau() {
+fn a_single_flat_step_is_a_plateau_from_the_first_round() {
+    // REQ-CV-07 / ratified 08.11: no two-round warm-up.
     let view = quality_series(&[
         (0.94, vec![("a", Some(0.9))]),
         (0.94, vec![("b", Some(0.9))]),
     ]);
     let s = stage(&view, STAGE_QUALITY);
     assert_eq!(s.series[1].delta_score_milli, Some(0));
-    assert_eq!(s.series[1].mode, mode::UNKNOWN);
-    assert_eq!(s.series[1].mode_basis.reason, Some(reason::NO_PREDICATE));
+    assert_eq!(s.series[1].mode, mode::PLATEAU);
+    assert_eq!(s.series[1].mode_basis.rounds, vec![1, 2]);
 }
 
 #[test]
@@ -538,7 +565,54 @@ fn a_check_absent_from_the_middle_round_breaks_the_stuck_chain() {
 }
 
 #[test]
-fn an_unmeasured_round_breaks_the_stuck_chain() {
+fn an_unmeasured_round_with_a_readable_check_list_does_not_break_stuck() {
+    // REQ-CV-09 AC2: a round without evaluation.score is still a STUCK
+    // member when its checklist is readable; the middle round does NOT get
+    // insufficient_data.
+    let mut bodies = HashMap::new();
+    let a1 = artifact(ArtifactKind::QualityReport, 1, 0, None);
+    let a2 = artifact(ArtifactKind::QualityReport, 2, 1, None);
+    let a3 = artifact(ArtifactKind::QualityReport, 3, 2, None);
+    bodies.insert(
+        a1.id,
+        object(json!({
+            "evaluation": {"score": 1.0, "theta": 0.8,
+                "checks": [{"id": "same", "state": "SCORED", "score": 1.0}]},
+            "profile": {"project": "home", "version": 12},
+        })),
+    );
+    bodies.insert(
+        a2.id,
+        object(json!({
+            "evaluation": {"theta": 0.8,
+                "checks": [{"id": "same", "state": "SCORED", "score": 1.0}]},
+            "profile": {"project": "home", "version": 12},
+        })),
+    );
+    bodies.insert(
+        a3.id,
+        object(json!({
+            "evaluation": {"score": 1.0, "theta": 0.8,
+                "checks": [{"id": "same", "state": "SCORED", "score": 1.0}]},
+            "profile": {"project": "home", "version": 12},
+        })),
+    );
+    let cache = BodyCache::from_bodies(bodies);
+    let view = compute(&[a1, a2, a3], &[], &cache);
+    let s = stage(&view, STAGE_QUALITY);
+    assert!(!s.series[1].measured);
+    for p in &s.series {
+        assert_eq!(p.mode, mode::STUCK, "round {} is stuck", p.round);
+        assert_eq!(p.mode_basis.reason, None, "STUCK has no reason");
+        assert_eq!(p.mode_basis.check_id.as_deref(), Some("same"));
+        assert_eq!(p.mode_basis.rounds, vec![1, 2, 3]);
+    }
+}
+
+#[test]
+fn an_unmeasured_round_without_a_check_list_breaks_the_stuck_chain() {
+    // REQ-CV-07: a round whose body has no readable evaluation.checks is
+    // not a member of the chain, even if its id list would have matched.
     let mut bodies = HashMap::new();
     let a1 = artifact(ArtifactKind::QualityReport, 1, 0, None);
     let a2 = artifact(ArtifactKind::QualityReport, 2, 1, None);
@@ -557,7 +631,11 @@ fn an_unmeasured_round_breaks_the_stuck_chain() {
     let cache = BodyCache::from_bodies(bodies);
     let view = compute(&[a1, a2, a3], &[], &cache);
     let s = stage(&view, STAGE_QUALITY);
-    assert_eq!(s.series[2].mode, mode::UNKNOWN);
+    assert_ne!(s.series[2].mode, mode::STUCK);
+    assert_eq!(
+        s.series[2].mode_basis.reason,
+        Some(reason::INSUFFICIENT_DATA)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -635,24 +713,22 @@ fn shrinking_converges_and_approved_growth_has_no_predicate() {
 }
 
 #[test]
-fn spec_plateau_needs_two_flat_steps_and_a_verdict_is_not_required() {
+fn spec_plateau_starts_at_the_first_flat_round_and_needs_no_verdict() {
+    // REQ-CV-08 / ratified 08.11: flat is a plateau from the FIRST flat
+    // round, whatever the verdict (APPROVED included).
     let view = spec_fixture(&[("NEEDS_REVISION", 14, 5), ("NEEDS_REVISION", 14, 5)]);
     let s = stage(&view, STAGE_SPEC_REVIEW);
     assert_eq!(s.series[1].volume_direction, Some(volume::FLAT));
+    assert_eq!(s.series[1].mode, mode::PLATEAU);
+    assert_eq!(s.series[1].mode_basis.rounds, vec![1, 2]);
+
+    let view = spec_fixture(&[("APPROVED", 14, 5), ("APPROVED", 14, 5)]);
+    let s = stage(&view, STAGE_SPEC_REVIEW);
     assert_eq!(
         s.series[1].mode,
-        mode::UNKNOWN,
-        "one flat step is not plateau"
+        mode::PLATEAU,
+        "an approved flat spec is still a plateau"
     );
-
-    let view = spec_fixture(&[
-        ("NEEDS_REVISION", 14, 5),
-        ("NEEDS_REVISION", 14, 5),
-        ("NEEDS_REVISION", 14, 5),
-    ]);
-    let s = stage(&view, STAGE_SPEC_REVIEW);
-    assert_eq!(s.series[2].mode, mode::PLATEAU);
-    assert_eq!(s.series[2].mode_basis.rounds, vec![1, 2, 3]);
 }
 
 #[test]
@@ -675,8 +751,10 @@ fn a_null_verdict_is_not_approved_and_keeps_the_point_measured() {
     assert!(p.measured);
     assert_eq!(p.verdict, None);
     assert_one_token(p, "verdict", token::REVIEW_VERDICT);
-    assert_eq!(p.mode, mode::UNKNOWN);
-    assert_eq!(p.mode_basis.reason, Some(reason::NO_PREDICATE));
+    // A null verdict is not APPROVED; with flat volume the round is a
+    // PLATEAU (REQ-CV-08), not an unfired predicate.
+    assert_eq!(p.volume_direction, Some(volume::FLAT));
+    assert_eq!(p.mode, mode::PLATEAU);
 }
 
 #[test]
@@ -813,6 +891,73 @@ fn rounds_are_ordered_by_seq_then_created_at_then_id() {
 }
 
 #[test]
+fn stale_and_superseded_reports_are_still_rounds() {
+    // REQ-CV-02 AC1: the round count is the number of reports of the kind,
+    // status included — a superseded carrier is history, not a hole.
+    let mut bodies = HashMap::new();
+    let mut artifacts = Vec::new();
+    for (i, status) in [
+        ArtifactStatus::Current,
+        ArtifactStatus::Stale,
+        ArtifactStatus::Superseded,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut a = artifact(ArtifactKind::QualityReport, i as u32 + 1, i as i64, None);
+        a.status = *status;
+        bodies.insert(
+            a.id,
+            quality_body(Some(0.9), &[], Some(0.8), Some(("home", 12))),
+        );
+        artifacts.push(a);
+    }
+    let cache = BodyCache::from_bodies(bodies);
+    let view = compute(&artifacts, &[], &cache);
+    let s = stage(&view, STAGE_QUALITY);
+    assert_eq!(s.series.len(), 3, "all three carriers are rounds");
+    assert_eq!(s.counters.rounds_total, 3);
+    assert_eq!(
+        s.series
+            .iter()
+            .map(|p| p.status.as_str())
+            .collect::<Vec<_>>(),
+        vec!["CURRENT", "STALE", "SUPERSEDED"]
+    );
+}
+
+#[test]
+fn profile_boundary_breaks_stuck_series() {
+    // REQ-CV-10 AC1: 12,13,13 is not a stuck series; 13,13,13 is.
+    let build = |profiles: [u64; 3]| {
+        let mut bodies = HashMap::new();
+        let mut artifacts = Vec::new();
+        for (i, version) in profiles.iter().enumerate() {
+            let a = artifact(ArtifactKind::QualityReport, i as u32 + 1, i as i64, None);
+            bodies.insert(
+                a.id,
+                quality_body(
+                    Some(0.9),
+                    &[("same", Some(0.9))],
+                    Some(0.8),
+                    Some(("home", *version)),
+                ),
+            );
+            artifacts.push(a);
+        }
+        let cache = BodyCache::from_bodies(bodies);
+        compute(&artifacts, &[], &cache)
+    };
+    let crossing = build([12, 13, 13]);
+    let s = stage(&crossing, STAGE_QUALITY);
+    assert_ne!(s.series[2].mode, mode::STUCK);
+    assert_one_token(&s.series[1], "delta_score_milli", token::SEGMENT_BOUNDARY);
+    let same = build([13, 13, 13]);
+    let s = stage(&same, STAGE_QUALITY);
+    assert_eq!(s.series[2].mode, mode::STUCK);
+}
+
+#[test]
 fn time_is_finished_minus_started_and_an_absent_time_is_not_zero() {
     let mut bodies = HashMap::new();
     let e1 = new_id();
@@ -834,6 +979,11 @@ fn time_is_finished_minus_started_and_an_absent_time_is_not_zero() {
     assert_eq!(s.series[1].time_seconds, None);
     assert_one_token(&s.series[1], "time_seconds", token::TIME);
     assert_eq!(s.stage_total_seconds, Some(100));
+    assert_eq!(
+        s.stage_current_seconds,
+        Some(100),
+        "both rounds are home@12"
+    );
     assert_eq!(s.counters.rounds_without_time, 1);
 }
 
@@ -842,14 +992,58 @@ fn a_stage_without_any_known_time_says_stage_time() {
     let view = quality_series(&[(0.9, vec![])]);
     let s = stage(&view, STAGE_QUALITY);
     assert_eq!(s.stage_total_seconds, None);
+    assert_eq!(s.stage_current_seconds, None);
     assert_eq!(
         s.missing,
-        vec![MissingEntry {
-            field: "stage_total_seconds",
-            token: token::STAGE_TIME,
-        }]
+        vec![
+            MissingEntry {
+                field: "stage_total_seconds",
+                token: token::STAGE_TIME,
+            },
+            MissingEntry {
+                field: "stage_current_seconds",
+                token: token::STAGE_TIME,
+            },
+        ]
     );
     assert_eq!(s.counters.rounds_without_time, 1);
+}
+
+#[test]
+fn stage_current_time_is_the_last_profile_segment_not_the_whole_series() {
+    // REQ-CV-11 AC1: 100 s + 50 s = 150 s total; the current segment is the
+    // last profile (home@13), so its own sum is 50 s.
+    let mut bodies = HashMap::new();
+    let mut artifacts = Vec::new();
+    for (i, (secs, version)) in [(100i64, 12u64), (50, 13)].iter().enumerate() {
+        let e = new_id();
+        let a = artifact(ArtifactKind::QualityReport, i as u32 + 1, i as i64, Some(e));
+        bodies.insert(
+            a.id,
+            quality_body(Some(0.9), &[], Some(0.8), Some(("home", *version))),
+        );
+        artifacts.push((a, e, *secs));
+    }
+    let execs: Vec<_> = artifacts
+        .iter()
+        .map(|(_, e, secs)| execution(*e, &[], 0, Some(*secs)))
+        .collect();
+    let cache = BodyCache::from_bodies(bodies);
+    let view = compute(
+        &artifacts
+            .iter()
+            .map(|(a, _, _)| a.clone())
+            .collect::<Vec<_>>(),
+        &execs,
+        &cache,
+    );
+    let s = stage(&view, STAGE_QUALITY);
+    assert_eq!(s.stage_total_seconds, Some(150), "100 + 50");
+    assert_eq!(
+        s.stage_current_seconds,
+        Some(50),
+        "the current segment is home@13 (round 2 only)"
+    );
 }
 
 #[test]
@@ -944,7 +1138,7 @@ fn two_reads_of_unchanged_data_are_byte_identical() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_point_carries_24_keys_and_a_closed_missing_vocabulary() {
+fn every_point_carries_26_keys_and_a_closed_missing_vocabulary() {
     let view = quality_series(&[
         (0.943, vec![("a", Some(0.5))]),
         (0.997, vec![("b", Some(0.9))]),
@@ -952,7 +1146,7 @@ fn every_point_carries_24_keys_and_a_closed_missing_vocabulary() {
     let v = serde_json::to_value(&view).unwrap();
     for p in v["stages"][0]["series"].as_array().unwrap() {
         let obj = p.as_object().unwrap();
-        assert_eq!(obj.len(), 24, "the point shape is 24 keys");
+        assert_eq!(obj.len(), 26, "the point shape is 26 keys");
         for entry in p["missing"].as_array().unwrap() {
             let t = entry["token"].as_str().unwrap();
             assert!(MISSING_TOKENS.contains(&t), "closed vocabulary: {t}");
@@ -1017,33 +1211,4 @@ fn no_carriers_means_no_stages_not_an_error() {
     let view = compute(&[], &[], &cache);
     assert!(view.stages.is_empty());
     assert_eq!(view.gap_milli, GAP_MILLI);
-}
-
-// ---------------------------------------------------------------------------
-// REQ-CV-16: the leading block of the quality report
-// ---------------------------------------------------------------------------
-
-#[test]
-fn the_report_block_prints_the_last_mode_the_basis_and_the_series() {
-    let view = quality_series(&[
-        (0.943, vec![("a", Some(0.5))]),
-        (0.997, vec![("a", Some(1.0))]),
-        (0.991, vec![("b", Some(0.9))]),
-        (1.0, vec![("c", Some(1.0))]),
-    ]);
-    let block = devai_runtime::convergence::quality_report_block(&view);
-    assert!(block.starts_with("СХОДИМОСТЬ: PLATEAU"), "{block}");
-    assert!(block.contains("круг 1: 0.943, ниже 1.0: 1"), "{block}");
-    assert!(block.contains("круг 4: 1.000, ниже 1.0: 0"), "{block}");
-    assert!(!block.contains("ВЕРДИКТ"));
-}
-
-#[test]
-fn the_report_block_is_honest_without_rounds() {
-    let cache = BodyCache::from_bodies(HashMap::new());
-    let view = compute(&[], &[], &cache);
-    assert_eq!(
-        devai_runtime::convergence::quality_report_block(&view),
-        "СХОДИМОСТЬ: кругов пока нет"
-    );
 }

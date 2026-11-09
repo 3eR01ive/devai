@@ -300,17 +300,11 @@ fn full_cycle_through_both_human_gates() {
             c["state"].as_str().unwrap_or("?"),
         );
     }
-    // REQ-CV-16: the report OPENS with the convergence block; the verdict
-    // section follows it unchanged (no quality carrier yet -> "кругов пока
-    // нет", the block is still first).
+    // REQ-QH: the report is the assembled verdict text, unchanged.
     let text = rep["report_text"].as_str().unwrap();
     assert!(
-        text.starts_with("СХОДИМОСТЬ:"),
-        "the report must open with the convergence block: {text}"
-    );
-    assert!(
         text.contains("ВЕРДИКТ: ВЕРДИКТ НЕ ГОТОВ"),
-        "the verdict section follows the block unchanged: {text}"
+        "the verdict section is present: {text}"
     );
     assert!(
         r2.steps[1]

@@ -63,6 +63,23 @@ const specVolume = computed(() =>
   isQuality.value ? "" : volumeLabel(last.value?.volume_direction ?? null),
 );
 
+/**
+ * Счётчики стадии (REQ-CV-13): «не измерено» — круги без точки,
+ * «ждут» — проверки, ждущие подписи человека, «дефект» — нечисловые
+ * баллы. Это суммы готовых полей платформы, без пересчёта балла.
+ */
+const counters = computed(() => {
+  let unmeasured = 0;
+  let waiting = 0;
+  let defect = 0;
+  for (const p of props.series) {
+    if (!p.measured) unmeasured += 1;
+    waiting += p.pending_count ?? 0;
+    defect += p.invalid_count ?? 0;
+  }
+  return { unmeasured, waiting, defect };
+});
+
 /** Подпись последнего круга: готовое значение, без арифметики. */
 const lastValue = computed(() => {
   if (!last.value) return "";
@@ -154,6 +171,9 @@ const lastValue = computed(() => {
         <span class="mode" :class="last?.mode === 'UNKNOWN' ? 'unknown' : ''">{{ headline }}</span>
       </p>
       <p class="muted mono conv-value">{{ lastValue }}<template v-if="specVolume"> · {{ specVolume }}</template></p>
+      <p class="muted mono conv-counters">
+        не измерено {{ counters.unmeasured }}<template v-if="isQuality"> · ждут {{ counters.waiting }} · дефект {{ counters.defect }}</template>
+      </p>
       <p v-if="thetaUnknown" class="muted mono conv-gaps">порог неизвестен</p>
       <p v-if="last?.missing.length" class="muted mono conv-gaps">
         пробелы: {{ gapsText(last.missing) }}
@@ -249,6 +269,10 @@ const lastValue = computed(() => {
 }
 .conv-value {
   margin: 2px 0 0;
+  font-size: 11px;
+}
+.conv-counters {
+  margin: 0;
   font-size: 11px;
 }
 .conv-gaps {

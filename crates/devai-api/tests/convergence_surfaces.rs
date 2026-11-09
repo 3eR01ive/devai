@@ -134,7 +134,9 @@ fn a_terminal_task_answers_null_on_both_surfaces() {
 #[test]
 fn both_stages_are_present_whatever_the_task_state() {
     let home = Home::new();
-    let task = home.task(TaskState::Rework, "two stages");
+    // QA is a wait row, so the snapshot builds the slice there; the stage
+    // order is a property of the data, not of the stored state.
+    let task = home.task(TaskState::Qa, "two stages");
     home.quality(&task, 0.9, json!([{"id": "a", "score": 0.9}]));
     let spec = home.publish(
         &task,
@@ -179,6 +181,77 @@ fn both_stages_are_present_whatever_the_task_state() {
     assert!(names.contains(&STAGE_SPEC_REVIEW));
     assert!(names.contains(&STAGE_QUALITY));
     assert_eq!(names[0], STAGE_SPEC_REVIEW, "fixed stage order");
+}
+
+#[test]
+fn a_wait_row_gets_the_slice_and_an_idle_row_answers_null() {
+    // REQ-CV-12: the snapshot builds the slice ONLY for rows the wait
+    // section shows; a task in a state the table puts in `none` answers
+    // null and its bodies are never read.
+    let home = Home::new();
+    let waiting = home.task(TaskState::Qa, "waiting");
+    home.quality(&waiting, 0.9, json!([]));
+    let idle = home.task(TaskState::Implementation, "idle");
+    home.quality(&idle, 0.9, json!([]));
+
+    let snapshot = home.api().inbox_snapshot().unwrap();
+    let waiting_row = snapshot
+        .tasks
+        .iter()
+        .find(|f| f.task.id == waiting.id)
+        .unwrap();
+    assert!(waiting_row.convergence.is_some(), "QA is a wait row");
+    let idle_row = snapshot
+        .tasks
+        .iter()
+        .find(|f| f.task.id == idle.id)
+        .unwrap();
+    assert!(
+        idle_row.convergence.is_none(),
+        "IMPLEMENTATION is not a wait row"
+    );
+}
+
+#[test]
+fn snapshot_cost_is_measured_on_twenty_tasks() {
+    // REQ-CV-16 AC2: the latency is measured on a fixture and PRINTED as a
+    // number (the ceiling is not ratified — open question 1). Twenty wait
+    // rows, three quality rounds each; the snapshot builds every slice in
+    // ONE pass.
+    let home = Home::new();
+    for i in 0..20 {
+        let task = home.task(TaskState::Qa, &format!("curve-{i}"));
+        for round in 0..3 {
+            home.quality(
+                &task,
+                0.9 + round as f64 * 0.02,
+                json!([{"id": "a", "score": 0.9}]),
+            );
+        }
+    }
+    let api = home.api();
+    let started = std::time::Instant::now();
+    let snapshot = api.inbox_snapshot().unwrap();
+    let elapsed = started.elapsed();
+    println!(
+        "convergence snapshot: {} tasks, {} rows with a slice, {} ms",
+        snapshot.tasks.len(),
+        snapshot
+            .tasks
+            .iter()
+            .filter(|f| f.convergence.is_some())
+            .count(),
+        elapsed.as_millis()
+    );
+    assert_eq!(snapshot.tasks.len(), 20);
+    assert!(
+        snapshot.tasks.iter().all(|f| f.convergence.is_some()),
+        "every QA row is a wait row"
+    );
+    assert!(
+        elapsed.as_millis() < 2_000,
+        "the slice must not turn a 20-task snapshot into a batch job: {elapsed:?}"
+    );
 }
 
 #[test]

@@ -21,6 +21,8 @@ const point = (over: Partial<ConvergencePoint> & { round: number }): Convergence
   theta_milli: 950,
   low_count: 0,
   unscored_count: 0,
+  invalid_count: 0,
+  pending_count: 0,
   closed_count: 0,
   delta_score_milli: null,
   verdict: null,
@@ -151,6 +153,7 @@ describe("stageForRow", () => {
           spec_versions_without_review: 0,
         },
         stage_total_seconds: null,
+        stage_current_seconds: null,
         missing: [],
       },
       {
@@ -163,6 +166,7 @@ describe("stageForRow", () => {
           spec_versions_without_review: 0,
         },
         stage_total_seconds: null,
+        stage_current_seconds: null,
         missing: [],
       },
     ],
@@ -270,6 +274,30 @@ describe("ConvergenceChart", () => {
     expect(badge.classes()).toContain("unknown");
     expect(badge.text()).toContain("режим не определён");
     expect(badge.text()).toContain("кругов мало");
+    w.unmount();
+  });
+
+  it("prints the stage counters: unmeasured rounds, waiting signatures, defects", () => {
+    const w = mountChart({
+      stage: "quality",
+      series: [
+        point({
+          round: 1,
+          measured: false,
+          score_milli: null,
+          low_count: null,
+          unscored_count: null,
+          invalid_count: null,
+          pending_count: null,
+        }),
+        point({ round: 2, invalid_count: 2, pending_count: 1 }),
+      ],
+      gapMilli: 10,
+    });
+    const counters = w.find(".conv-counters").text();
+    expect(counters).toContain("не измерено 1");
+    expect(counters).toContain("ждут 1");
+    expect(counters).toContain("дефект 2");
     w.unmount();
   });
 });

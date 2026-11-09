@@ -217,6 +217,14 @@ onUnmounted(() => unsubscribe?.());
               <span class="muted">{{ row.demand }}</span>
               <span class="muted mono">{{ row.cli_hint }}</span>
             </WaitTaskHeader>
+            <div v-if="row.convergence" class="conv-mini">
+              <ConvergenceChart
+                :stage="stageForRow(row.convergence, row.task.state).stage"
+                :series="stageForRow(row.convergence, row.task.state).series"
+                :gap-milli="row.convergence.gap_milli"
+                break-on-profile
+              />
+            </div>
           </div>
         </div>
       </template>

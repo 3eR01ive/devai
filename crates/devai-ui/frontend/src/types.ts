@@ -332,8 +332,9 @@ export interface WaitRow {
   report_note: string | null;
   /**
    * Срез сходимости ЗАДАЧИ (REQ-CV-12): тот же объект, что отдаёт чтение
-   * хода задачи, null только у терминальных задач. Строка выбирает стадию
-   * для графика сама (гейт → его стадия, иное — последняя).
+   * хода задачи; null у терминальных задач и у строк вне секции ожидания.
+   * Строка выбирает стадию для графика сама (гейт → его стадия, иное —
+   * последняя).
    */
   convergence: ConvergenceView | null;
 }
@@ -354,7 +355,7 @@ export interface ModeBasis {
   check_id: string | null;
 }
 
-/** Одна точка — одна форма для обеих стадий, 24 ключа всегда на месте. */
+/** Одна точка — одна форма для обеих стадий, 26 ключей всегда на месте. */
 export interface ConvergencePoint {
   round: number;
   artifact_id: string;
@@ -368,6 +369,8 @@ export interface ConvergencePoint {
   theta_milli: number | null;
   low_count: number | null;
   unscored_count: number | null;
+  invalid_count: number | null;
+  pending_count: number | null;
   closed_count: number | null;
   delta_score_milli: number | null;
   verdict: string | null;
@@ -394,6 +397,7 @@ export interface StageConvergence {
   series: ConvergencePoint[];
   counters: ConvergenceCounters;
   stage_total_seconds: number | null;
+  stage_current_seconds: number | null;
   missing: MissingEntry[];
 }
 

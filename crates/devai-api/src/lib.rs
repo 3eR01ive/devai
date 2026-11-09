@@ -47,6 +47,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use devai_core::inbox::WaitGroup;
 use devai_core::types::*;
 use devai_core::workflow;
 use devai_runtime::liveness;
@@ -411,6 +412,7 @@ impl Api {
             .map(|task| {
                 self.task_facts(
                     task,
+                    &policy,
                     &mut questions,
                     &mut artifacts,
                     &mut executions,
@@ -431,6 +433,7 @@ impl Api {
     fn task_facts(
         &self,
         task: Task,
+        policy: &devai_core::inbox::InboxWaitPolicy,
         questions: &mut TaskIndex<Question>,
         artifacts: &mut TaskIndex<Artifact>,
         executions: &mut TaskIndex<RoleExecution>,
@@ -440,16 +443,22 @@ impl Api {
         let owned_artifacts = artifacts.remove(&task.id).unwrap_or_default();
         let owned_executions = executions.remove(&task.id).unwrap_or_default();
         let (spec, report, report_note) = self.gate_presentation(&task, &owned_artifacts)?;
-        // The SAME object the progress read answers (REQ-CV-12 AC1/AC5):
-        // one computation, one slice, `null` only on terminal tasks.
-        let convergence = if task.state.is_terminal() {
-            None
-        } else {
+        // The SAME object the progress read answers (REQ-CV-12 AC1/AC5),
+        // built ONLY for a row the wait section actually shows: a state the
+        // declarative table puts in neither group (and every terminal task)
+        // answers null and its bodies are never read (REQ-CV-16 AC3).
+        let wait_row = policy
+            .state(task.state)
+            .map(|s| s.group != WaitGroup::NotWait)
+            .unwrap_or(false);
+        let convergence = if wait_row && !task.state.is_terminal() {
             Some(convergence::compute(
                 &owned_artifacts,
                 &owned_executions,
                 bodies,
             ))
+        } else {
+            None
         };
         Ok(InboxTaskFacts {
             task,
@@ -974,7 +983,8 @@ pub struct ProgressView {
     pub pipeline: PipelineView,
     pub allowed_operations: Vec<String>,
     pub running_executions: Vec<RunningExecutionView>,
-    /// The convergence slice (REQ-CV-12); `null` on terminal tasks only.
+    /// The convergence slice (REQ-CV-12); `null` on terminal tasks and on
+    /// rows outside the wait section.
     pub convergence: Option<ConvergenceView>,
 }
 
