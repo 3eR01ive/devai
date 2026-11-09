@@ -101,6 +101,13 @@ function stateWord(token: string): string {
   font-size: 11px;
   min-width: 90px;
 }
+/* Телефон и планшет: колонка метки в диффе не мельче 12px (REQ-RESP-08 AC3). */
+@media (max-width: 1199px) {
+  .label {
+    font-size: 12px;
+    min-width: 0;
+  }
+}
 .notice {
   border-left: 3px solid var(--orange);
   padding: 4px 8px;

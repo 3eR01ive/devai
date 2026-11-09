@@ -377,7 +377,7 @@ async function activateForeignHome() {
                 :gap-milli="convergence.gap_milli"
                 break-on-profile
               />
-              <p class="muted mono" style="margin: 2px 0 0; font-size: 11px">
+              <p class="muted mono stage-caption">
                 время стадии
                 {{ s.stage_total_seconds === null ? "неизвестно" : `${s.stage_total_seconds} с` }} ·
                 кругов {{ s.counters.rounds_total }} · не измерено
@@ -716,6 +716,17 @@ async function activateForeignHome() {
 </template>
 
 <style scoped>
+/* Подпись «время стадии…» — служебная: на десктопе 11px, на телефоне и
+   планшете не мельче 12px (REQ-RESP-08 AC3). */
+.stage-caption {
+  margin: 2px 0 0;
+  font-size: 11px;
+}
+@media (max-width: 1199px) {
+  .stage-caption {
+    font-size: 12px;
+  }
+}
 .chip-stage {
   padding: 2px 8px;
   border: 1px solid var(--slate);

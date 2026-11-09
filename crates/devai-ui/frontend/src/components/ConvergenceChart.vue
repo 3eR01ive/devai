@@ -284,4 +284,17 @@ const lastValue = computed(() => {
   margin: 2px 0 0;
   font-size: 11px;
 }
+/* Телефон и планшет: подписи графика — служебные, но не мельче 12px
+   (REQ-RESP-08 AC3). Ось живёт в viewBox шириной 320 и масштабируется к
+   ~312px, поэтому кегль оси поднят до 13 — на экране остаётся >= 12. */
+@media (max-width: 1199px) {
+  .axis-label {
+    font-size: 13px;
+  }
+  .conv-value,
+  .conv-counters,
+  .conv-gaps {
+    font-size: 12px;
+  }
+}
 </style>

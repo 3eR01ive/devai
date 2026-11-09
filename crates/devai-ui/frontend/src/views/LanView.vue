@@ -175,6 +175,12 @@ onUnmounted(() => {
   border-radius: 999px;
   padding: 1px 9px;
 }
+/* Телефон и планшет: служебная подпись не мельче 12px (REQ-RESP-08 AC3). */
+@media (max-width: 1199px) {
+  .lan-state {
+    font-size: 12px;
+  }
+}
 .lan-state.off {
   color: var(--slate);
 }

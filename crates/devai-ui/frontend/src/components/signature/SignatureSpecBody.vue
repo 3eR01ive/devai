@@ -91,6 +91,13 @@ const paragraph = computed(() => specParagraph(props.spec));
   font-size: 11px;
   margin-right: 8px;
 }
+/* Телефон и планшет: идентификатор — служебная подпись, не мельче 12px
+   (REQ-RESP-08 AC3). */
+@media (max-width: 1199px) {
+  .req-id {
+    font-size: 12px;
+  }
+}
 .req-statement {
   flex: 1;
 }

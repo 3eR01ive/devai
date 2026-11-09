@@ -360,6 +360,11 @@ pre.content {
   table.data td {
     overflow-wrap: anywhere;
   }
+  /* Планшет тоже трогают пальцем и читают на ходу: служебные подписи не
+     мельче 12px (REQ-RESP-08 AC3). Десктоп >=1200px это правило не видит. */
+  table.data th {
+    font-size: 12px;
+  }
 }
 
 @media (max-width: 767px) {
@@ -410,23 +415,39 @@ pre.content {
     line-height: 1.15;
     overflow-wrap: anywhere;
   }
+  /* Статус остаётся рядом с брендом: факты те же (активный дом, реестр,
+     актор, снимок), но служебные подписи короткие — строка занимает две-три
+     строки, а не шесть (REQ-RESP-04 AC3). */
   .statusbar {
     grid-column: 2;
     grid-row: 1;
     margin-left: 0;
     min-width: 0;
     font-size: 12px;
-    line-height: 1.3;
+    line-height: 1.25;
     text-align: left;
     overflow-wrap: anywhere;
   }
-  /* Все факты состояния остаются видимыми, но в одну компактную строку. */
+  .statusbar .st-label {
+    display: none;
+  }
+  /* Все факты состояния остаются видимыми, но в одну компактную строку;
+     подписи — короткие имена полей, значения не сокращаются. */
   .statusbar .st-home,
   .statusbar .st-registry {
     display: inline;
   }
+  .statusbar .st-home::before {
+    content: "home ";
+  }
   .statusbar .st-registry::before {
-    content: " · ";
+    content: " · реестр ";
+  }
+  /* Пути — длинные токены без пробелов: разрешаем перенос внутри значения,
+     иначе строка рвётся по границам токенов и тратит две-три лишние строки
+     (REQ-RESP-04 AC3). Значения не сокращаются. */
+  .statusbar b {
+    word-break: break-all;
   }
 
   /* Нижняя полоса вкладок не перекрывает содержимое: у страницы есть

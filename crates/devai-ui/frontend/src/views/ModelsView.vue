@@ -594,4 +594,11 @@ button.hold {
   flex-direction: column;
   gap: 2px;
 }
+/* Телефон — одна колонка (REQ-RESP-01): auto-fill на 600px давал две по
+   272px, то есть форме связки — десктопную раскладку на телефоне. */
+@media (max-width: 767px) {
+  .formgrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 </style>
