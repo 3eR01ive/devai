@@ -9,6 +9,7 @@
 import { onScopeDispose, ref, type Ref } from "vue";
 
 import { HOLD_MS, holdCompletes } from "../../signature_view";
+import { holdMoveCancels, holdPoint, type HoldPoint } from "../../hold_gesture";
 
 export type HoldKind = "approve" | "reject";
 
@@ -18,6 +19,8 @@ export interface HoldToConfirm {
   /** Прогресс удержания 0..1 — только для заливки кнопки. */
   progress: Ref<number>;
   start(kind: HoldKind, event: PointerEvent): void;
+  /** Смахивание пальцем отменяет удержание и сбрасывает прогресс. */
+  move(event: PointerEvent): void;
   release(): void;
 }
 
@@ -33,12 +36,14 @@ export function useHoldToConfirm(
   const progress = ref(0);
   let raf = 0;
   let startedAt = 0;
+  let origin: HoldPoint | null = null;
 
   function stop() {
     if (raf) cancelAnimationFrame(raf);
     raf = 0;
     holding.value = null;
     progress.value = 0;
+    origin = null;
   }
 
   function start(kind: HoldKind, event: PointerEvent) {
@@ -46,6 +51,7 @@ export function useHoldToConfirm(
     stop();
     (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
     holding.value = kind;
+    origin = holdPoint(event);
     startedAt = performance.now();
     const tick = () => {
       const elapsed = performance.now() - startedAt;
@@ -60,6 +66,13 @@ export function useHoldToConfirm(
     raf = requestAnimationFrame(tick);
   }
 
+  // Смахивание пальцем: сдвиг больше порога отменяет удержание, даже если
+  // палец остаётся в границах кнопки (REQ-RESP-06).
+  function move(event: PointerEvent) {
+    if (!holding.value || !origin) return;
+    if (holdMoveCancels(origin, holdPoint(event))) stop();
+  }
+
   // Отпускание раньше порога: мутации нет.
   function release() {
     stop();
@@ -68,5 +81,5 @@ export function useHoldToConfirm(
   // Уход со страницы посреди удержания не оставляет ни кадра, ни состояния.
   onScopeDispose(stop);
 
-  return { holding, progress, start, release };
+  return { holding, progress, start, move, release };
 }

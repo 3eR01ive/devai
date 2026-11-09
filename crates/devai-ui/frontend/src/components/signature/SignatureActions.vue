@@ -26,7 +26,7 @@ const rationaleOk = computed(() => rationaleValid(props.rationale));
 const choicesOk = computed(() => choicesValid(props.choices));
 const canSign = computed(() => rationaleOk.value && choicesOk.value && !props.busy);
 
-const { holding, progress, start, release } = useHoldToConfirm(
+const { holding, progress, start, move, release } = useHoldToConfirm(
   () => canSign.value,
   (kind) => emit("apply", kind, props.rationale),
 );
@@ -58,6 +58,7 @@ const { holding, progress, start, release } = useHoldToConfirm(
         :class="{ holding: holding === 'approve' }"
         :disabled="!canSign"
         @pointerdown.prevent="start('approve', $event)"
+        @pointermove="move($event)"
         @pointerup="release"
         @pointercancel="release"
         @pointerleave="release"
@@ -82,6 +83,7 @@ const { holding, progress, start, release } = useHoldToConfirm(
         :class="{ holding: holding === 'reject' }"
         :disabled="!canSign"
         @pointerdown.prevent="start('reject', $event)"
+        @pointermove="move($event)"
         @pointerup="release"
         @pointercancel="release"
         @pointerleave="release"
@@ -119,6 +121,10 @@ const { holding, progress, start, release } = useHoldToConfirm(
   position: relative;
   overflow: hidden;
   min-width: 240px;
+  /* Палец: браузер не должен превращать удержание в скролл/выделение. */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 .hold .fill {
   position: absolute;

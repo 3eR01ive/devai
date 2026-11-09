@@ -98,6 +98,12 @@ nav.modes a .badge {
   color: var(--cream);
   font-weight: 600;
 }
+/* Две строки десктопа: дом, затем реестр/актор/снимок. На телефоне
+   обе части остаются видимыми и складываются в одну компактную строку
+   (REQ-RESP-04) — ни одно значение не выпадает. */
+.statusbar .st-home {
+  display: block;
+}
 
 main.content {
   flex: 1;
@@ -294,4 +300,283 @@ pre.content {
 .qr-evidence summary {
   cursor: pointer;
   font-size: 12px;
+}
+
+/* ==========================================================================
+   Адаптивная раскладка (REQ-RESP-01..11).
+
+   Эталон десктопа — правила ВЫШЕ этого блока: они не меняются. Телефонная
+   раскладка живёт только в медиа-запросе <= 767px: одна колонка, таблицы
+   превращаются в карточки (все те же поля, подписи из data-label), цели
+   нажатия не меньше 44x44, шапка компактная и всегда видимая.
+   Планшет 768..1199 сохраняет таблицы, но не даёт длинным токенам
+   вытолкнуть ширину страницы.
+   ========================================================================== */
+
+@media (min-width: 768px) and (max-width: 1199px) {
+  main.content {
+    padding: 16px;
+  }
+  header.topbar {
+    flex-wrap: wrap;
+    gap: 8px 14px;
+  }
+  .statusbar {
+    font-size: 12px;
+  }
+  /* Планшет тоже трогают пальцем: цели не меньше 44x44. Это не десктоп:
+     ширина >= 1200px правила ниже не видит. */
+  button {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px 14px;
+  }
+  select,
+  input:not([type="radio"]):not([type="checkbox"]),
+  textarea {
+    min-height: 44px;
+    max-width: 100%;
+  }
+  nav.modes a,
+  .rowflex a,
+  table.data a,
+  .panel > h3 a,
+  .title-link {
+    display: inline-flex;
+    align-items: center;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  details > summary,
+  .panel-toggle {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    cursor: pointer;
+  }
+  /* Планшет сохраняет табличную раскладку, но длинные пути/идентификаторы
+     переносятся — горизонтального скролла нет (REQ-RESP-03). */
+  table.data th,
+  table.data td {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 767px) {
+  body {
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  /* Шапка: бренд + компактное состояние одной строкой сверху; вкладки —
+     закреплённой полосой снизу, в две строки по четыре. Так вкладки
+     доступны с любой прокрутки, активная вкладка и состояние видны всегда
+     (REQ-RESP-04), и шапка не съедает пол-экрана. */
+  header.topbar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    gap: 0 10px;
+    padding: 6px 12px 8px;
+  }
+  .brand {
+    grid-column: 1;
+    grid-row: 1;
+    padding-top: 2px;
+    font-size: 15px;
+  }
+  nav.modes {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px));
+    background: var(--coal-lo);
+    border-top: 1px solid var(--panel-border);
+  }
+  nav.modes a {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 6px 4px;
+    font-size: 13px;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+  }
+  .statusbar {
+    grid-column: 2;
+    grid-row: 1;
+    margin-left: 0;
+    min-width: 0;
+    font-size: 12px;
+    line-height: 1.3;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  /* Все факты состояния остаются видимыми, но в одну компактную строку. */
+  .statusbar .st-home,
+  .statusbar .st-registry {
+    display: inline;
+  }
+  .statusbar .st-registry::before {
+    content: " · ";
+  }
+
+  /* Нижняя полоса вкладок не перекрывает содержимое: у страницы есть
+     собственный отступ под неё. */
+  main.content {
+    padding: 12px 12px calc(118px + env(safe-area-inset-bottom, 0px));
+  }
+  .panel > h3 {
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+  .panel > .body {
+    padding: 10px 12px;
+  }
+  .rowflex {
+    gap: 8px;
+  }
+  .rowflex .spacer {
+    display: none;
+  }
+  .muted.mono,
+  .mono {
+    font-size: 12px;
+  }
+
+  /* Цели нажатия — палец (REQ-RESP-05): не меньше 44x44 и с зазором. */
+  button {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px 14px;
+  }
+  select,
+  input:not([type="radio"]):not([type="checkbox"]),
+  textarea {
+    min-height: 44px;
+    max-width: 100%;
+    padding: 8px 10px;
+    font: inherit;
+  }
+  textarea {
+    min-height: 88px;
+  }
+  nav.modes a,
+  .rowflex a,
+  table.data a,
+  .panel > h3 a,
+  .title-link {
+    display: inline-flex;
+    align-items: center;
+    min-width: 44px;
+    min-height: 44px;
+  }
+  details > summary,
+  .panel-toggle {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    cursor: pointer;
+  }
+
+  /* Ничего не прячется: длинные цитаты, пути и код переносятся, а не
+     обрезаются (REQ-RESP-03, REQ-RESP-08). */
+  p,
+  li,
+  td,
+  th,
+  .mono {
+    overflow-wrap: anywhere;
+  }
+  pre.content {
+    overflow-x: hidden;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: none;
+  }
+
+  /* Таблица -> список карточек. Колонки не скрываются: каждая ячейка
+     остаётся на месте, её заголовок печатается из data-label. Ячейки с
+     data-mobile="title|head" образуют первую строку карточки — имя,
+     состояние и ключевая метрика (REQ-RESP-02). */
+  table.data {
+    display: block;
+    width: 100%;
+  }
+  table.data thead {
+    display: none;
+  }
+  table.data tbody {
+    display: block;
+  }
+  table.data tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 12px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    background: rgba(17, 24, 32, 0.35);
+  }
+  table.data tr:last-child {
+    margin-bottom: 0;
+  }
+  table.data tr.active {
+    border-color: var(--orange);
+  }
+  table.data td {
+    display: block;
+    order: 2;
+    flex: 1 1 100%;
+    width: 100%;
+    padding: 2px 0;
+    border: none;
+    vertical-align: top;
+  }
+  table.data td::before {
+    content: attr(data-label);
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    line-height: 1.3;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--slate);
+  }
+  table.data td[data-mobile="title"] {
+    order: 1;
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    font-size: 16px;
+    font-weight: 600;
+  }
+  table.data td[data-mobile="title"]::before,
+  table.data td[data-mobile="head"]::before {
+    display: none;
+  }
+  table.data td[data-mobile="head"] {
+    order: 1;
+    flex: 0 0 auto;
+    width: auto;
+    margin-top: 4px;
+  }
+}
+
+/* Узкий телефон: четыре вкладки в ряд больше не помещаются словами без
+   переноса — разрешаем три колонки, цель остаётся 44x44. */
+@media (max-width: 359px) {
+  nav.modes {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }

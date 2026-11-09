@@ -102,7 +102,6 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::model_bundle_create,
         commands::model_bundle_update,
         commands::model_bundle_delete,
-
     ]
 }
 

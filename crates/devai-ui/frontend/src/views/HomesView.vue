@@ -178,9 +178,9 @@ async function activate(h: HomeRecord) {
           <th></th>
         </tr>
       </thead>
-      <tbody>
+        <tbody>
         <tr v-for="h in homes" :key="h.path">
-          <td>
+          <td data-label="Проект" data-mobile="title">
             <b>{{ h.project }}</b>
             <div
               v-if="projectLabelNote(h)"
@@ -190,16 +190,16 @@ async function activate(h: HomeRecord) {
               {{ projectLabelNote(h) }}
             </div>
           </td>
-          <td class="mono muted">{{ h.path }}</td>
-          <td class="mono muted">{{ fmtTime(h.added_at) }}</td>
-          <td>
+          <td class="mono muted" data-label="Путь">{{ h.path }}</td>
+          <td class="mono muted" data-label="Добавлен" data-mobile="head">{{ fmtTime(h.added_at) }}</td>
+          <td data-label="Состояние" data-mobile="head">
             <StateChip
               v-if="homeState(h) !== 'INCLUDED'"
               :token="homeState(h)"
             />
             <span v-else class="muted">включён</span>
           </td>
-          <td class="mono muted">
+          <td class="mono muted" data-label="Схема">
             {{ schemaLabel(h.schema_version) }}
             <div v-if="h.version_note" class="muted" style="font-size: 12px">
               {{ h.version_note }}
@@ -209,7 +209,7 @@ async function activate(h: HomeRecord) {
               >{{ homeIssueText(homeIssue(h)) }}
             </div>
           </td>
-          <td style="text-align: right; white-space: nowrap">
+          <td style="text-align: right; white-space: nowrap" data-label="Действия">
             <button v-if="!h.active" :disabled="!canActivate(h)" @click="activate(h)">
               Активировать
             </button>
@@ -221,7 +221,7 @@ async function activate(h: HomeRecord) {
             </button>
           </td>
         </tr>
-      </tbody>
+        </tbody>
     </table>
   </section>
 </template>

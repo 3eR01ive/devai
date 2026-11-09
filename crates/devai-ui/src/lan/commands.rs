@@ -803,12 +803,16 @@ fn model_bundle_delete_rpc(
 
 /// Форма связки из тела запроса телефона: те же поля, что у окна.
 fn bundle_form_input(params: &serde_json::Value) -> Result<devai_api::BundleFormInput, UiError> {
-    serde_json::from_value(params.get("input").cloned().unwrap_or(serde_json::Value::Null)).map_err(
-        |e| UiError {
-            code: "invalid_input".into(),
-            message: format!("форма связки не разобрана: {e}"),
-        },
+    serde_json::from_value(
+        params
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
     )
+    .map_err(|e| UiError {
+        code: "invalid_input".into(),
+        message: format!("форма связки не разобрана: {e}"),
+    })
 }
 
 fn lan_status_rpc(

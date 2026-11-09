@@ -55,14 +55,14 @@ onMounted(load);
       </thead>
       <tbody>
         <tr v-for="o in ops" :key="o.name">
-          <td>
+          <td data-label="Операция" data-mobile="title">
             <span class="mono">{{ o.name }}</span>
             <span v-if="used.includes(o.name)" title="вызывается devai-ui" style="color: var(--orange); font-weight: 700"> ●</span>
           </td>
-          <td><StateChip :token="o.class.toUpperCase()" /></td>
-          <td class="mono muted">{{ o.input }}</td>
-          <td class="mono muted">{{ o.output }}</td>
-          <td class="muted">{{ o.description }}</td>
+          <td data-label="Класс" data-mobile="head"><StateChip :token="o.class.toUpperCase()" /></td>
+          <td class="mono muted" data-label="Вход">{{ o.input }}</td>
+          <td class="mono muted" data-label="Выход">{{ o.output }}</td>
+          <td class="muted" data-label="Семантика">{{ o.description }}</td>
         </tr>
       </tbody>
     </table>
