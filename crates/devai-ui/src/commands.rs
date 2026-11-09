@@ -474,8 +474,11 @@ pub const MODEL_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("model_bundle_delete", "model.bundle_delete"),
 ];
 
-/// The WHOLE mutation allowlist of the window: the two human signature acts
-/// plus the model-bundle writes — nothing else.
+/// The WHOLE mutation allowlist of the window: every Mutation-class command
+/// the window may reach. The rows are data rather than prose on purpose: the
+/// plane test below derives the exact set of mutating commands from the
+/// command table and fails when the two drift apart, so a new mutation is a
+/// row here and nowhere else.
 #[allow(dead_code)] // consumed by the plane tests below
 pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_approve", "task.approve"),
@@ -1379,12 +1382,12 @@ mod tests {
 
     /// REQ-SIGN-05 AC4 / REQ-MS-07: every data command's source is a
     /// published registry entry. The data plane stays Read-only; the ONLY
-    /// Mutation-class commands reachable from the window are the four pairs
-    /// of `WINDOW_MUTATION_COMMANDS` (two signature acts + probe/switch) —
-    /// (a) every pair resolves to a published operation, (b) Read outside
-    /// the allowlist and Mutation inside it, (c) the set of Mutation
-    /// commands equals the allowlist exactly, so ANY other mutating command
-    /// fails this test.
+    /// Mutation-class commands reachable from the window are the pairs of
+    /// `WINDOW_MUTATION_COMMANDS` — which pairs those are is read from the
+    /// list, never restated here — (a) every pair resolves to a published
+    /// operation, (b) Read outside the allowlist and Mutation inside it,
+    /// (c) the set of Mutation commands equals the allowlist exactly, so ANY
+    /// other mutating command fails this test.
     #[test]
     fn every_command_operation_is_a_registered_operation() {
         let ops = devai_api::operations();

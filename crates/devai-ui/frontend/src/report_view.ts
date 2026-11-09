@@ -190,9 +190,11 @@ export function hasEvidence(it: HumanFormItem): boolean {
 
 // ---------------------------------------------------------------------------
 // Importance filter (REQ-QG-04 AC4/AC5/AC6). The filter is a pure VIEW over
-// the stored groups: it hides rows of the other saved groups and never
-// regroups, re-counts or rewrites anything — «всё» restores the stored view
-// untouched. The choice is not sent anywhere and writes nothing.
+// the stored groups: it hides the rows of the groups that were not chosen and
+// counts the rows it does show, so each chip carries a number — those counts
+// describe the view and are never folded back into the stored form. Grouping,
+// order, verdict and wording stay the saved ones, and «всё» restores that
+// view untouched. The choice is not sent anywhere and writes nothing.
 // ---------------------------------------------------------------------------
 
 /** The filter's «all» token — the stored view as published. */
