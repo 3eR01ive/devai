@@ -23,6 +23,7 @@ mod homes;
 mod inbox;
 mod models;
 mod mutations;
+mod quality_gate;
 mod registry;
 mod signature;
 
@@ -63,6 +64,11 @@ pub use mutations::{
     ReviseReq, RunOutcome, RunReq, TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome,
     TaskProjectSetOutcome, TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult,
     WorkflowOp,
+};
+pub use quality_gate::{
+    AUDIT_RUNNING, AUDIT_RUNNING_LABEL, DENIAL_CODES as QUALITY_GATE_DENIAL_CODES,
+    NO_CURRENT_REPORT, OPEN_BLOCKERS, QualityGateDenial, QualityGateView, audit_running,
+    is_audit_role, is_live_audit, quality_gate,
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 pub use signature::{
@@ -276,6 +282,17 @@ impl Api {
             .collect();
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
+        // REQ-QG-08: the QA gate's public availability travels WITH the status
+        // read — the window does not derive it. The dependency/decision/
+        // execution loads happen only at the gate; other states have no gate.
+        let quality_gate = if t.state == TaskState::Qa {
+            let deps = self.store.task_dependencies(t.id)?;
+            let decisions = self.store.list_decisions(t.id)?;
+            let executions = self.store.list_executions(Some(t.id))?;
+            quality_gate::quality_gate(&t, &artifacts, &deps, &decisions, &executions)
+        } else {
+            None
+        };
         Ok(StatusView {
             task: t,
             allowed_operations: ops,
@@ -287,6 +304,7 @@ impl Api {
                 .into_iter()
                 .filter(|q| q.status == QuestionStatus::Open)
                 .collect(),
+            quality_gate,
         })
     }
 
@@ -410,6 +428,12 @@ impl Api {
         let live =
             liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
         let terminal = t.state.is_terminal();
+        // A live quality audit at the QA gate is a PROCESS, not a human wait
+        // (REQ-QG-09 AC3): the active row carries the platform's words. The
+        // SAME predicate the gate uses decides «live» (rework R1/R4), so an
+        // orphaned row is never labelled as a running audit.
+        let note = (t.state == TaskState::Qa && quality_gate::is_live_audit(e))
+            .then(|| quality_gate::AUDIT_RUNNING_LABEL.to_string());
         ActiveRow {
             id: e.id.to_string(),
             task_id: e.task_id.to_string(),
@@ -432,6 +456,7 @@ impl Api {
                     .display()
                     .to_string()
             }),
+            note,
         }
     }
 
@@ -574,6 +599,9 @@ impl Api {
         let owned_artifacts = artifacts.remove(&task.id).unwrap_or_default();
         let owned_executions = executions.remove(&task.id).unwrap_or_default();
         let (spec, report, report_note) = self.gate_presentation(&task, &owned_artifacts)?;
+        // REQ-QG-09: a live audit is a fact of the SAME execution snapshot the
+        // convergence slice already reads (no extra store call).
+        let audit_running = quality_gate::audit_running(&owned_executions);
         // The SAME object the progress read answers (REQ-CV-12 AC1/AC5),
         // built ONLY for a row the wait section actually shows: a state the
         // declarative table puts in neither group (and every terminal task)
@@ -597,6 +625,7 @@ impl Api {
             spec,
             report,
             report_note,
+            audit_running,
             convergence,
         })
     }
@@ -1091,6 +1120,9 @@ pub struct StatusView {
     pub allowed_operations: Vec<String>,
     pub current_artifacts: Vec<Artifact>,
     pub open_questions: Vec<Question>,
+    /// REQ-QG-08/09: the QA gate's per-action availability and platform
+    /// refusal; `None` outside QA (the actions do not exist there).
+    pub quality_gate: Option<QualityGateView>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1145,6 +1177,9 @@ pub struct ActiveRow {
     pub owner_liveness: String,
     pub branch: Option<String>,
     pub worktree: Option<String>,
+    /// REQ-QG-09 AC3: the platform's word for what the live run IS. A running
+    /// quality audit is «идёт аудит», never «ждёт вашего решения».
+    pub note: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]

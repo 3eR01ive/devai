@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import TaskDetailView from "../views/TaskDetailView.vue";
 import { task } from "./fixtures";
+import { HOLD_MS } from "../signature_view";
 
 const mocks = vi.hoisted(() => ({
   taskStatus: vi.fn(),
@@ -25,6 +26,8 @@ const mocks = vi.hoisted(() => ({
   artifactContent: vi.fn(),
   taskApprove: vi.fn(),
   taskReject: vi.fn(),
+  taskAccept: vi.fn(),
+  taskReturn: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
@@ -51,6 +54,7 @@ function wire(taskReport: () => Promise<unknown>) {
     allowed_operations: [],
     current_artifacts: [],
     open_questions: [],
+    quality_gate: null,
   });
   mocks.taskProgress.mockResolvedValue({
     task: theTask(),
@@ -133,4 +137,90 @@ describe("TaskDetailView · панель «Отчёт качества»", () =>
     expect(panel.text()).not.toContain("QA ещё не прогонялся");
     w.unmount();
   });
+
+  it("accepts from the window through the same operation, with the visible rationale", async () => {
+    wire(() => Promise.resolve(qaReport()));
+    const qa = task("t1", "QA", "гейт качества");
+    mocks.taskStatus.mockResolvedValue({
+      task: qa,
+      allowed_operations: ["accept", "return"],
+      current_artifacts: [],
+      open_questions: [],
+      quality_gate: {
+        audit_running: false,
+        current_report: "art-1",
+        open_blockers: [],
+        may_accept: true,
+        accept_denied: null,
+        may_return: true,
+        return_denied: null,
+      },
+    });
+    mocks.taskAccept.mockResolvedValue({
+      task: { ...qa, state: "ACCEPTED" },
+      allowed_operations: [],
+      current_artifacts: [],
+      open_questions: [],
+      quality_gate: null,
+    });
+
+    let frames: FrameRequestCallback[] = [];
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {
+      frames = [];
+    });
+
+    const w = await mountView();
+    await w.find("textarea").setValue("принято человеком");
+    await w.find("button.hold.approve").trigger("pointerdown");
+    now = HOLD_MS + 10;
+    const pending = frames;
+    frames = [];
+    for (const frame of pending) frame(0);
+    await flushPromises();
+
+    expect(mocks.taskAccept).toHaveBeenCalledTimes(1);
+    expect(mocks.taskAccept).toHaveBeenCalledWith("t1", "принято человеком");
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    w.unmount();
+  });
 });
+
+function qaReport() {
+  return {
+    task: "t1",
+    artifact: "01a1b2aa-1111-700a-aaaa-111111111111",
+    seq: 1,
+    contract: "quality-report@5",
+    created_at: "2026-11-09T10:00:00Z",
+    execution: null,
+    status: "CURRENT",
+    report: {
+      human_view: {
+        version: 1,
+        lang: "ru",
+        headline: {
+          verdict: "ПРОШЁЛ",
+          machine_verdict: "PASS",
+          score: 1,
+          theta: 0.9,
+          numbers: "S=1.000/1.00, порог 0.900",
+          basis: "замечаний нет",
+          counts: { blocks: 0, nuances: 0, anchors: 0, unchecked: 0 },
+        },
+        groups: [],
+        blocked_weight: 0,
+        max_blocked_weight: 0,
+      },
+    },
+    report_text: null,
+    source: "human_form",
+    freshness: null,
+  };
+}

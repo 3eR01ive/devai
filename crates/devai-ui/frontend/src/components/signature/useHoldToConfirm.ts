@@ -10,7 +10,10 @@ import { onScopeDispose, ref, type Ref } from "vue";
 
 import { HOLD_MS, holdCompletes } from "../../signature_view";
 
-export type HoldKind = "approve" | "reject";
+// The four human gate acts share ONE hold machine: the spec signature's
+// approve/reject and the QA gate's accept/return (REQ-QG-02 AC5 — the same
+// threshold and the same disabled look as the signature).
+export type HoldKind = "approve" | "reject" | "accept" | "return";
 
 export interface HoldToConfirm {
   /** Какая кнопка удерживается сейчас (null — никакая). */

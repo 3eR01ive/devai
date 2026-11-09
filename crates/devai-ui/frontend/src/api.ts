@@ -134,6 +134,12 @@ export const api = {
     invoke<SignatureView>("task_approve", { id_prefix, rationale }),
   taskReject: (id_prefix: string, rationale: string | null) =>
     invoke<SignatureView>("task_reject", { id_prefix, rationale }),
+  // Гейт качества (REQ-QG-01): те же операции, что `devai task accept|return`;
+  // ответ — ПЕРЕЧИТАННЫЙ статус с публичным `quality_gate`, локального патча нет.
+  taskAccept: (id_prefix: string, rationale: string | null) =>
+    invoke<StatusView>("task_accept", { id_prefix, rationale }),
+  taskReturn: (id_prefix: string, rationale: string | null) =>
+    invoke<StatusView>("task_return", { id_prefix, rationale }),
   taskProgress: (id_prefix: string) =>
     invoke<ProgressView>("task_progress", { id_prefix }),
   taskDependencies: (id_prefix: string) =>

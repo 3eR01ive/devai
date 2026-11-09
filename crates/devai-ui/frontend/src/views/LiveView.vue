@@ -64,7 +64,10 @@ onUnmounted(() => {
       <tbody>
         <tr v-for="r in snap.rows" :key="r.id">
           <td><RouterLink class="title-link" :to="`/task/${r.task_id}`">{{ shortId(r.task_id) }}</RouterLink></td>
-          <td class="mono">{{ r.role }}</td>
+          <td class="mono">
+            {{ r.role }}
+            <div v-if="r.note" class="chip-att">{{ r.note }}</div>
+          </td>
           <td>{{ r.agent_name ?? "—" }}</td>
           <td><StateChip :token="r.state" /></td>
           <td class="mono muted">{{ fmtElapsed(r.elapsed_seconds) }}</td>
@@ -86,3 +89,11 @@ onUnmounted(() => {
     </table>
   </section>
 </template>
+
+<style scoped>
+.chip-att {
+  color: var(--orange);
+  font-weight: 700;
+  font-size: 12px;
+}
+</style>

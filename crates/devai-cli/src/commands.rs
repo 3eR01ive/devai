@@ -1683,6 +1683,9 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     let ops: Vec<String> = v.allowed_operations;
     let current: Vec<Artifact> = v.current_artifacts;
     let open_q: Vec<Question> = v.open_questions;
+    // REQ-QG-08: the gate's public availability is part of the status read —
+    // a second console consumer reads the same fact the window sees.
+    let quality_gate = v.quality_gate;
     if json {
         outln!(
             "{}",
@@ -1691,6 +1694,7 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
                 "allowed_operations": ops,
                 "current_artifacts": current,
                 "open_questions": open_q,
+                "quality_gate": quality_gate,
             })
         );
     } else {

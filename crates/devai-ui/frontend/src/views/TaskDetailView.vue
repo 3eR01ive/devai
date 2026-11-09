@@ -22,15 +22,8 @@ import SpecDiffPanel from "../components/SpecDiffPanel.vue";
 import SignatureResultPanel from "../components/SignatureResultPanel.vue";
 import { TaskStateToken } from "../states";
 import ConvergenceChart from "../components/ConvergenceChart.vue";
-import {
-  freshnessBanner,
-  hasEvidence,
-  isNameOnlyGroup,
-  presentReport,
-  showsPassedNote,
-  visibleGroups,
-  type ReportBody,
-} from "../report_view";
+import QualityGatePanel from "../components/quality/QualityGatePanel.vue";
+import type { GateAct } from "../quality_gate_view";
 import type {
   ActiveRow,
   Artifact,
@@ -69,6 +62,15 @@ const activeRows = ref<ActiveRow[]>([]);
 const liveness = ref<Record<string, LivenessView>>({});
 const report = ref<QualityReportView | null>(null);
 const reportError = ref<UiError | null>(null);
+// Действия гейта качества (REQ-QG-03 AC4/AC5): отказ — РЯДОМ С КНОПКАМИ,
+// а не вверху карточки; обоснование и черновик после отказа сохраняются,
+// пока панель не перечитана.
+const qualityBusy = ref(false);
+const qualityError = ref<UiError | null>(null);
+// После УСПЕШНОГО акта черновик/обоснование очищаются (REQ-QG-05 AC3):
+// панель пересоздаётся ключом; после отказа ключ не двигается — введённое
+// остаётся на месте (REQ-QG-03 AC5).
+const qualityEpoch = ref(0);
 const error = ref<UiError | null>(null);
 const content = ref<ArtifactContent | null>(null);
 const contentFor = ref<string | null>(null);
@@ -208,21 +210,38 @@ async function loadReport() {
 }
 
 // Человеческая форма отчёта — сохранённый при публикации `human_view`
-// (REQ-QH-01): рендерим его поля как есть, порядок групп, баллы и важность
-// не пересчитываются в UI. Какую ветку показать (форма / повреждённая форма /
-// плоский текст / пусто) решает `report_view.ts` — по source API и с
-// проверкой формы, чтобы структурно битый blob не ронял панель (rework R2;
-// ветки покрыты tests/report_view.test.ts, R3).
-const reportBody = computed<ReportBody | null>(() =>
-  report.value ? presentReport(report.value) : null,
-);
+// (REQ-QH-01): представление и действия живут в `QualityGatePanel`; здесь
+// только загрузка и один путь мутации.
 
-// Баннер свежести (REQ-QH-05, rework R5): шапка — маркер платформы как есть,
-// строка факта — статус отчёта, фаза задачи и исполнение. Ветка живёт в
-// `report_view.ts` и покрыта тестом, шаблон только раскладывает готовое.
-const reportBanner = computed(() =>
-  freshnessBanner(report.value?.freshness, report.value?.status ?? ""),
-);
+// Гейт качества: те же два акта, что `devai task accept|return` (REQ-QG-01).
+// Доступность приходит полем `status.quality_gate` — окно её не вычисляет.
+async function applyQuality(kind: GateAct, rationale: string) {
+  if (qualityBusy.value) return;
+  qualityBusy.value = true;
+  qualityError.value = null;
+  try {
+    const next =
+      kind === "accept"
+        ? await api.taskAccept(props.id, rationale)
+        : await api.taskReturn(props.id, rationale);
+    status.value = next;
+    qualityEpoch.value += 1;
+    await loadAll();
+  } catch (e) {
+    qualityError.value = toUiError(e);
+  } finally {
+    qualityBusy.value = false;
+  }
+}
+
+// Обоснование решения читается РЯДОМ С СОБЫТИЕМ в истории (REQ-QG-07 AC2),
+// а не только в раскрытом payload: accept/return кладут rationale в событие,
+// телефонный актор уже назван устройством.
+function eventRationale(ev: WorkflowEvent): string | null {
+  const p = ev.payload as Record<string, unknown> | null | undefined;
+  const value = p?.rationale ?? p?.qa_return_rationale;
+  return typeof value === "string" && value.trim() ? value : null;
+}
 
 async function openContent(a: Artifact) {
   contentFor.value = a.id;
@@ -432,6 +451,7 @@ async function activateForeignHome() {
           <div v-for="r in activeRows" :key="r.id" class="rowflex" style="margin-bottom: 6px">
             <StateChip :token="r.state" />
             <span class="mono">{{ r.role }}</span>
+            <span v-if="r.note" class="chip-att">{{ r.note }}</span>
             <span v-if="r.branch" class="mono muted">branch {{ r.branch }}</span>
             <span v-if="r.worktree" class="mono muted">{{ r.worktree }}</span>
           </div>
@@ -551,83 +571,19 @@ async function activateForeignHome() {
     <div class="panel">
       <h3>Отчёт качества (task.report)</h3>
       <div class="body">
-        <!-- Отсутствие данных — честная пустота (REQ-SIGN-08): типизированный
-             not_found от task.report значит «QA ещё не прогонялся», а не
-             красную ошибку с кодом платформы. Прочие коды — остаются ошибкой. -->
-        <p v-if="reportError && reportError.code === 'not_found'" class="muted" style="margin: 0">
-          QA ещё не прогонялся — отчёта качества по задаче нет.
-        </p>
-        <div v-else-if="reportError" class="errorbox" style="margin-bottom: 0">
-          <span class="code">{{ reportError.code }}</span>{{ reportError.message }}
-        </div>
-        <template v-else-if="report">
-          <div v-if="reportBanner.stale" class="stale-banner">
-            <strong>{{ reportBanner.head }}</strong>
-            <span class="mono muted">{{ reportBanner.detail }}</span>
-          </div>
-          <div class="rowflex" style="margin-bottom: 6px">
-            <span class="mono muted">artifact {{ shortId(report.artifact) }} · seq {{ report.seq }} · {{ report.contract }}</span>
-            <span class="mono muted">создан {{ fmtTime(report.created_at) }}</span>
-            <!-- Что именно отрендерено (rework R4): форма, плоский текст
-                 или маркер повреждения — не угадывается по тексту. -->
-            <span class="mono muted">источник: {{ report.source }}</span>
-            <StateChip :token="report.status" />
-          </div>
-          <!-- Человеческая форма (REQ-QH-03/04): группы читаются из
-               сохранённого human_view как есть — UI ничего не группирует и не
-               пересчитывает; код и доказательства живут в свёртке пункта.
-               Ветку выбирает report_view.ts (rework R2/R3): битая форма даёт
-               честный маркер, а не падение панели. -->
-          <template v-if="reportBody && reportBody.kind === 'form'">
-            <div class="qr-headline">
-              <span class="mono">ВЕРДИКТ: {{ reportBody.form.headline.verdict }} ({{ reportBody.form.headline.machine_verdict }})</span>
-              <span class="muted mono">{{ reportBody.form.headline.numbers }}</span>
-            </div>
-            <p class="muted" style="margin: 2px 0 8px">{{ reportBody.form.headline.basis }}</p>
-            <p class="mono muted" style="margin: 0 0 10px">
-              бьёт по вердикту: {{ reportBody.form.headline.counts.blocks }} ·
-              нюансы: {{ reportBody.form.headline.counts.nuances }} ·
-              якоря: {{ reportBody.form.headline.counts.anchors }} ·
-              не проверено: {{ reportBody.form.headline.counts.unchecked }}<template
-                v-if="showsPassedNote(reportBody.form)"
-              > · пройдено без замечаний: {{ reportBody.form.headline.counts.passed }}</template>
-            </p>
-            <div v-for="g in visibleGroups(reportBody.form)" :key="g.key" class="qr-group">
-              <h4 class="qr-group-title">{{ g.title }} ({{ g.items.length }})</h4>
-              <p v-if="g.lead" class="muted" style="margin: 0 0 4px">{{ g.lead }}</p>
-              <ul class="qr-items">
-                <li v-for="it in g.items" :key="it.id">
-                  <template v-if="isNameOnlyGroup(g)">
-                    <span class="mono">{{ it.line }}</span>
-                  </template>
-                  <template v-else>
-                    <div class="qr-item-line">
-                      <span class="mono">{{ it.line }}</span>
-                    </div>
-                    <div class="qr-summary">{{ it.summary }}</div>
-                    <div v-if="it.reason" class="muted qr-reason">причина: {{ it.reason }}</div>
-                    <details v-if="hasEvidence(it)" class="qr-evidence">
-                      <summary class="muted">доказательства ({{ (it.evidence ?? []).length }})</summary>
-                      <pre class="content">{{ (it.evidence ?? []).join("\n\n") }}</pre>
-                    </details>
-                  </template>
-                </li>
-              </ul>
-            </div>
-          </template>
-          <template v-else-if="reportBody && reportBody.kind === 'damaged'">
-            <div class="errorbox" style="margin-bottom: 8px">{{ reportBody.marker }}</div>
-            <pre v-if="reportBody.text" class="content">{{ reportBody.text }}</pre>
-          </template>
-          <pre
-            v-else-if="reportBody && (reportBody.kind === 'flat' || reportBody.kind === 'absent')"
-            class="content"
-          >{{ reportBody.text }}</pre>
-          <details>
-            <summary class="muted">machine-тело отчёта</summary>
-            <pre class="content">{{ JSON.stringify(report.report, null, 2) }}</pre>
-          </details>
-        </template>
+        <!-- Отчёт + интерактивность + действия гейта (REQ-QG-01..09):
+             сохранённые группы/счётчики, раскрытие пунктов, фильтр,
+             черновик возврата и удержание кнопок. Ветки представления и
+             правила черновика — отдельными чистыми модулями. -->
+        <QualityGatePanel
+          :key="qualityEpoch"
+          :report="report"
+          :report-error="reportError"
+          :gate="status.quality_gate"
+          :busy="qualityBusy"
+          :error="qualityError"
+          @apply="applyQuality"
+        />
       </div>
     </div>
 
@@ -694,11 +650,17 @@ async function activateForeignHome() {
           <button @click="loadEvents">применить</button>
         </div>
         <table class="data">
+          <thead>
+            <tr><th>Событие</th><th>Актор</th><th>Время</th><th>Обоснование</th><th></th></tr>
+          </thead>
           <tbody>
             <tr v-for="ev in events" :key="ev.id">
               <td class="mono">{{ ev.kind }}</td>
               <td class="muted">{{ ev.actor }}</td>
               <td class="mono muted">{{ fmtTime(ev.created_at) }}</td>
+              <!-- REQ-QG-07 AC2: обоснование решения видно РЯДОМ С событием,
+                   не только в раскрытом payload. -->
+              <td class="muted event-rationale">{{ eventRationale(ev) ?? "—" }}</td>
               <td>
                 <details v-if="ev.payload && JSON.stringify(ev.payload) !== '{}'">
                   <summary class="muted mono">payload</summary>
@@ -740,5 +702,9 @@ async function activateForeignHome() {
   color: var(--orange);
   font-weight: 700;
   font-size: 12px;
+}
+.event-rationale {
+  white-space: pre-wrap;
+  max-width: 420px;
 }
 </style>
