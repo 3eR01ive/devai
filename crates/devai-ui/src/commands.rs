@@ -411,6 +411,15 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("model_snapshot", "model.snapshot"),
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
+    // The bundle-authoring surface (task 01a1be5c, REQ-MC-01..09): one draft
+    // probe and three writes, all on the same file the console reads. The
+    // handle read is the ONE source of the id the form shows (ASM-9) — the
+    // window does not mirror the derivation.
+    ("model_bundle_handle", "model.bundle_handle"),
+    ("model_bundle_check", "model.bundle_check"),
+    ("model_bundle_create", "model.bundle_create"),
+    ("model_bundle_update", "model.bundle_update"),
+    ("model_bundle_delete", "model.bundle_delete"),
     // Merged multi-home reads (REQ-HOME-04/05): live attributed views over
     // the enabled homes of the registry, published as home-plane Reads.
     ("homes_list", "home.list"),
@@ -429,24 +438,32 @@ pub const SIGNATURE_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_reject", "task.reject"),
 ];
 
-/// The model-bundle mutations the section may reach (REQ-MS-07): the window
-/// gets EXACTLY three model commands — one read (`model.snapshot`) and these
-/// two writes (probe, switch). No other mutation is reachable, and the
-/// allowlist test below fails on any fifth pair.
+/// The model-bundle mutations the section may reach (REQ-MS-07, REQ-MC-01..05):
+/// the window gets the model commands — one read (`model.snapshot`), the
+/// probe/switch pair and the four authoring doors. No other mutation is
+/// reachable, and the allowlist test below fails on an unlisted pair.
 #[allow(dead_code)] // consumed by the plane tests below
 pub const MODEL_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
+    ("model_bundle_check", "model.bundle_check"),
+    ("model_bundle_create", "model.bundle_create"),
+    ("model_bundle_update", "model.bundle_update"),
+    ("model_bundle_delete", "model.bundle_delete"),
 ];
 
 /// The WHOLE mutation allowlist of the window: the two human signature acts
-/// plus the two model-bundle writes — nothing else.
+/// plus the model-bundle writes — nothing else.
 #[allow(dead_code)] // consumed by the plane tests below
 pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_approve", "task.approve"),
     ("task_reject", "task.reject"),
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
+    ("model_bundle_check", "model.bundle_check"),
+    ("model_bundle_create", "model.bundle_create"),
+    ("model_bundle_update", "model.bundle_update"),
+    ("model_bundle_delete", "model.bundle_delete"),
 ];
 
 /// The registry MANAGEMENT mapping (REQ-HOME-05: reading domain records
@@ -1014,6 +1031,80 @@ pub fn model_switch_as(
     with_actor_write(&state, actor, |api| api.model_switch(&bundle_id, &reason))
 }
 
+/// The form's derived handle (ASM-9): the ONE source of «what id will the
+/// save write?». A pure read — no file read, no event, no write — answered
+/// by the same store rule `model.bundle_create` uses, so the window never
+/// mirrors the derivation.
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_bundle_handle(
+    state: State<AppState>,
+    label: String,
+) -> Result<devai_api::BundleHandleView, UiError> {
+    Ok(state.api().model_bundle_handle(&label))
+}
+
+/// The form's «Проверить» (REQ-MC-02): ONE real probe of the current form
+/// values, one `model.probe` event, no file change. The save probes again.
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_bundle_check(
+    state: State<AppState>,
+    input: devai_api::BundleFormInput,
+) -> Result<devai_api::ProbeView, UiError> {
+    let (home, actor) = {
+        let s = state.session();
+        (s.home.clone(), s.actor.clone())
+    };
+    let api = state.write_api(&home, &actor)?;
+    Ok(api.model_bundle_check(&input)?)
+}
+
+/// Create one declared bundle from the form (REQ-MC-01): validated, probed,
+/// then written to `config/models.yaml` atomically. The SAME API call the
+/// console would use, on the write handle (the home is observed read-only).
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_bundle_create(
+    state: State<AppState>,
+    input: devai_api::BundleFormInput,
+) -> Result<devai_api::BundleMutationView, UiError> {
+    let (home, actor) = {
+        let s = state.session();
+        (s.home.clone(), s.actor.clone())
+    };
+    let api = state.write_api(&home, &actor)?;
+    Ok(api.model_bundle_create(&input)?)
+}
+
+/// Edit one declared bundle (REQ-MC-03): the same probe-before-write path;
+/// editing the record in force applies the new identity to the marker.
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_bundle_update(
+    state: State<AppState>,
+    input: devai_api::BundleFormInput,
+) -> Result<devai_api::BundleMutationView, UiError> {
+    let (home, actor) = {
+        let s = state.session();
+        (s.home.clone(), s.actor.clone())
+    };
+    let api = state.write_api(&home, &actor)?;
+    Ok(api.model_bundle_update(&input)?)
+}
+
+/// Delete one declared bundle (REQ-MC-05): the file only, agent records
+/// untouched; the bundle in force refuses with «сначала переключитесь».
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_bundle_delete(
+    state: State<AppState>,
+    bundle_id: String,
+    file_revision: String,
+) -> Result<devai_api::BundleMutationView, UiError> {
+    let (home, actor) = {
+        let s = state.session();
+        (s.home.clone(), s.actor.clone())
+    };
+    let api = state.write_api(&home, &actor)?;
+    Ok(api.model_bundle_delete(&bundle_id, &file_revision)?)
+}
+
 /// The human-wait section (REQ-GATE-01..10), published as one command at
 /// the address the navigation already owns (#/inbox): every point where
 /// the platform stands on the operator — APPROVAL / WAITING_FOR_INPUT /
@@ -1250,7 +1341,7 @@ mod tests {
         let allow: Vec<&str> = WINDOW_MUTATION_COMMANDS.iter().map(|(c, _)| *c).collect();
         assert_eq!(
             mutation_cmds, allow,
-            "the window's mutation allowlist is exactly the four listed commands"
+            "the window's mutation allowlist is exactly the listed commands"
         );
         for (cmd, op) in WINDOW_MUTATION_COMMANDS {
             assert!(
@@ -1633,6 +1724,34 @@ mod tests {
             .collect()
     }
 
+    /// R4/R5: the form's field list is ONE chain — the file writer and the
+    /// loader derive it from the record struct (pinned in devai-store), the
+    /// wire form and the window's TS interface are pinned HERE to the same
+    /// names. A domain field added on one side alone fails this test.
+    #[test]
+    fn bundle_form_fields_are_the_same_on_the_wire_and_in_the_window() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let types_ts =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/types.ts")).unwrap();
+        let wire = serde_json::to_value(devai_api::BundleFormInput::default()).unwrap();
+
+        let mut ts_fields = ts_interface_fields(&types_ts, "BundleFormInput");
+        let mut wire_fields: Vec<String> = wire.as_object().unwrap().keys().cloned().collect();
+        ts_fields.sort();
+        wire_fields.sort();
+        assert_eq!(
+            ts_fields, wire_fields,
+            "the window's form interface and the wire form must carry the same fields"
+        );
+
+        let mut ts_probe = ts_interface_fields(&types_ts, "ProbePolicyInput");
+        let mut wire_probe: Vec<String> =
+            wire["probe"].as_object().unwrap().keys().cloned().collect();
+        ts_probe.sort();
+        wire_probe.sort();
+        assert_eq!(ts_probe, wire_probe, "the probe policy's fields must match");
+    }
+
     /// REQ-WV-04 AC1 + AC4 (mechanical half, the window-content criterion
     /// itself is T7's harness): the frontend's data door is closed over
     /// this table — EVERY `invoke("<name>")` in api.ts must
@@ -1712,12 +1831,23 @@ mod tests {
             .map(|(cmd, _)| *cmd)
             .collect();
         mutations.sort_unstable();
-        // REQ-MS-07: the allowlist grew by exactly the two model writes —
-        // probe and switch — and NOTHING else may appear here.
+        // REQ-MS-07 + REQ-MC-01..05: the allowlist is the two signature acts
+        // plus the model surface (probe, switch and the three authoring
+        // writes + the draft check) — and NOTHING else may appear here.
+        let mut expected = vec![
+            "model_bundle_check",
+            "model_bundle_create",
+            "model_bundle_delete",
+            "model_bundle_update",
+            "model_probe",
+            "model_switch",
+            "task_approve",
+            "task_reject",
+        ];
+        expected.sort_unstable();
         assert_eq!(
-            mutations,
-            vec!["model_probe", "model_switch", "task_approve", "task_reject"],
-            "the window's only mutations are the two signature acts plus probe/switch"
+            mutations, expected,
+            "the window's only mutations are the signature acts plus the model surface"
         );
     }
 

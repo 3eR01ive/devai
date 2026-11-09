@@ -941,6 +941,50 @@ pub mod switch_outcome {
     pub const ALL: [&str; 3] = [APPLIED, REFUSED_PROBE, FAILED];
 }
 
+/// The closed wire vocabulary of a bundle MUTATION outcome (task 01a1be5c,
+/// REQ-MC-07): `created` / `updated` / `deleted` are the applied results,
+/// `refused` an attempt the platform declined (probe, duplicate, active
+/// bundle) and `failed` a write that died and was rolled back. Stored
+/// history keeps these tokens; the surface renders words from
+/// [`bundle_outcome_word`] / [`bundle_reason_word`], never a local copy.
+pub mod bundle_outcome {
+    pub const CREATED: &str = "created";
+    pub const UPDATED: &str = "updated";
+    pub const DELETED: &str = "deleted";
+    pub const REFUSED: &str = "refused";
+    pub const FAILED: &str = "failed";
+    pub const ALL: [&str; 5] = [CREATED, UPDATED, DELETED, REFUSED, FAILED];
+}
+
+/// One word for a bundle-mutation outcome. An unknown token is never
+/// dressed as a success.
+pub fn bundle_outcome_word(outcome: &str) -> &'static str {
+    match outcome {
+        bundle_outcome::CREATED => "создана",
+        bundle_outcome::UPDATED => "изменена",
+        bundle_outcome::DELETED => "удалена",
+        bundle_outcome::REFUSED => "отказано",
+        bundle_outcome::FAILED => "сбой записи",
+        _ => "неизвестно",
+    }
+}
+
+/// One word for the REASON a bundle mutation was refused (REQ-MC-04/05/07).
+/// The tokens are the stored history; the sentences are the operator words
+/// the section prints. A probe refusal keeps the verdict's own word through
+/// [`verdict_word`].
+pub fn bundle_reason_word(code: &str) -> &str {
+    match code {
+        "duplicate_id" => "идентификатор занят другой связкой",
+        "duplicate_identity" => "такая связка уже объявлена",
+        "active_bundle" => "связка действующая — сначала переключитесь",
+        "probe_refused" => "проба не прошла",
+        "stale_form" => "файл изменён другим окном — форма устарела",
+        "write_failed" => "запись файла не удалась",
+        other => failure_word(other),
+    }
+}
+
 /// Which stored evidence won the status rule (REQ-MS-06): a probe fact or a
 /// finished execution row. One source for the snapshot, the console and the
 /// freshness word.
@@ -1416,6 +1460,20 @@ pub mod event_kind {
     /// (`applied`/`refused_probe`), the refusing verdict, the human-chosen
     /// reason (`manual`/`limits`/`error`) and whether the agent NAME changed.
     pub const MODEL_SWITCHED: &str = "model.switched";
+    /// One CREATE attempt of a declared model bundle from the window
+    /// (task 01a1be5c, REQ-MC-01/02/07): the identity written, the probe it
+    /// rested on, the outcome (`created`/`refused`/`failed`) and the stored
+    /// file revision. A refusal is an attempt too — the history never hides
+    /// the tries that wrote nothing.
+    pub const MODEL_BUNDLE_CREATED: &str = "model.bundle_created";
+    /// One EDIT attempt of a declared model bundle (REQ-MC-03/07): `from` is
+    /// the identity before, `bundle` the identity after, plus the probe and
+    /// the outcome. An edit that was the marked record in force carries the
+    /// agent-name change flag (the record keeps the marker).
+    pub const MODEL_BUNDLE_UPDATED: &str = "model.bundle_updated";
+    /// One DELETE attempt of a declared model bundle (REQ-MC-05/07): the
+    /// identity removed (or the refusal — an active bundle is never removed).
+    pub const MODEL_BUNDLE_DELETED: &str = "model.bundle_deleted";
 
     /// The COMPLETE enumerable vocabulary of kinds the platform may persist.
     /// Load-time policy validation (the REWORK delivery table in
@@ -1474,6 +1532,9 @@ pub mod event_kind {
         PROFILE_REVOKED,
         MODEL_PROBE,
         MODEL_SWITCHED,
+        MODEL_BUNDLE_CREATED,
+        MODEL_BUNDLE_UPDATED,
+        MODEL_BUNDLE_DELETED,
     ];
 }
 
@@ -1586,7 +1647,15 @@ pub mod json_field {
     pub const TO: &str = "to";
     pub const PROBE_EVENT: &str = "probe_event";
     pub const AGENT_CHANGED: &str = "agent_changed";
+    /// The agent record NAME of a bundle identity snapshot (task 01a1be5c,
+    /// REQ-MC-03/07): an edit may move it, so the history names it beside
+    /// the four driver/model fields.
+    pub const AGENT: &str = "agent";
     pub const FRESHNESS: &str = "freshness";
+    /// The declared `models.yaml` revision a bundle mutation was based on
+    /// (task 01a1be5c, REQ-MC-06 AC6): the history names the file edition
+    /// the action wrote, so «who changed the file» stays answerable.
+    pub const REVISION: &str = "revision";
     /// The STEP of a `failed` switch (REQ-MS-05: «шаг отказа»): the
     /// transaction that rolled back names the step it died on. Written only
     /// on the `failed` outcome — an applied/refused switch carries no step.
@@ -1656,7 +1725,9 @@ pub mod json_field {
         TO,
         PROBE_EVENT,
         AGENT_CHANGED,
+        AGENT,
         FRESHNESS,
+        REVISION,
         FAILURE_STEP,
     ];
 }

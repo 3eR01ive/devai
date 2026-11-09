@@ -73,7 +73,17 @@ pub struct OpDescriptor {
 /// gained `model.snapshot` / `model.probe` / `model.switch` and the run
 /// stamp (`RoleExecution.bundle`) second consumers read — wire-visible, so
 /// the version says so.
-pub const SURFACE_VERSION: &str = "api-surface@6";
+/// `@7` names the bundle-authoring increment (task 01a1be5c): the owner's
+/// form gained `model.bundle_check` / `model.bundle_create` /
+/// `model.bundle_update` / `model.bundle_delete`, `ModelSnapshot` gained
+/// `file_revision` + `form`, and `ModelEventView` gained `outcome_text` —
+/// wire-visible additions, so the stamp says so.
+/// `@8` names the single-source follow-up of the same task: the form no
+/// longer derives a handle itself — `model.bundle_handle` is the ONE read
+/// that answers «what id will the save write?», so the window's copy of the
+/// rule could be deleted rather than kept in sync. Wire-visible addition
+/// (one Read operation), so the stamp says so.
+pub const SURFACE_VERSION: &str = "api-surface@8";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -539,6 +549,41 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "ONE platform operation: probe the declared target, and only on `ok` upsert the agent record by name (driver, LLM-provider, model AND reasoning level), move the single active marker, and append `model.switched` — all in one verified transaction (a failure rolls the whole switch back). A dead verdict writes `refused_probe` and changes nothing; unknown id / no_op / not_probeable refuse before any event. Mirrors `devai model switch`.",
         },
         OpDescriptor {
+            name: "model.bundle_handle",
+            class: OpClass::Read,
+            input: "label",
+            output: "BundleHandleView{id}",
+            description: "The handle a NEW bundle will carry, derived from the label by the store's ONE rule (ASM-9). A pure read: no file read, no event, no write. The window prints this value verbatim instead of mirroring the rule, so the id shown in the form is by construction the id a save writes.",
+        },
+        OpDescriptor {
+            name: "model.bundle_check",
+            class: OpClass::Mutation,
+            input: "BundleFormInput{label, agent, driver, llm_provider, model, reasoning, probe{phrase, timeout_ms, fresh_secs}, editing, id?}",
+            output: "ProbeView{bundle_id, verdict, latency_ms, exit_code, output_excerpt, at}",
+            description: "The form's «Проверить»: ONE real probe of the CURRENT form values, one `model.probe` event, and NOTHING written to config/models.yaml. A create draft does not need a declared record; an edit draft is addressed by its id. The save probes again — a passed check never authorizes a save (REQ-MC-02).",
+        },
+        OpDescriptor {
+            name: "model.bundle_create",
+            class: OpClass::Mutation,
+            input: "BundleFormInput + file_revision",
+            output: "BundleMutationView{outcome, bundle_id, label, verdict, latency_ms, agent_changed, revision}",
+            description: "Create a declared bundle from the window (REQ-MC-01): validate the fields (model and reasoning level required, `mock` refused, no provider for a self-providing driver, positive probe policy), derive the handle from the name once (ASM-9), refuse a taken handle or a duplicate identity NAMING both records, PROBE the exact values and only on `ok` write config/models.yaml atomically (comments preserved). The bundle does not become active. Every attempt is a `model.bundle_created` fact.",
+        },
+        OpDescriptor {
+            name: "model.bundle_update",
+            class: OpClass::Mutation,
+            input: "BundleFormInput{id, editing:true, ...} + file_revision",
+            output: "BundleMutationView{outcome, bundle_id, label, verdict, latency_ms, agent_changed, revision}",
+            description: "Edit a declared bundle (REQ-MC-03): the same probe-before-write path; the handle never changes. Editing the record IN FORCE applies the new identity to the marked agent record after the successful probe (marker stays; a name change marks the new record and leaves the old one unmarked). A stale `file_revision` refuses without touching the file. Every attempt is a `model.bundle_updated` fact.",
+        },
+        OpDescriptor {
+            name: "model.bundle_delete",
+            class: OpClass::Mutation,
+            input: "bundle_id, file_revision",
+            output: "BundleMutationView{outcome, bundle_id, label, revision}",
+            description: "Delete one DECLARED bundle from config/models.yaml (REQ-MC-05): atomic and comment-preserving; agent records are untouched and runs in flight are not stopped. The bundle in force refuses with «сначала переключитесь». Every attempt is a `model.bundle_deleted` fact.",
+        },
+        OpDescriptor {
             name: "contract.add",
             class: OpClass::Mutation,
             input: "ContractAddReq{name, version, schema}",
@@ -768,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_version_v6_ships_the_name_plane_homes_profile_ratification_and_model_bundles() {
+    fn surface_version_v8_ships_the_name_plane_homes_profile_ratification_and_model_bundles() {
         // QA R5 (da/api-contract): the stamp and its increment are
         // pinned TOGETHER — @6 is by this test defined as "the @5
         // human-signboard + homes + ratification surface PLUS the
@@ -779,7 +824,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@6");
+        assert_eq!(SURFACE_VERSION, "api-surface@8");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -818,6 +863,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("@6 surface must publish {name} (REQ-MS-03/04)"));
             assert_eq!(op.class, OpClass::Mutation);
         }
+        // @7's own increment (task 01a1be5c): the bundle-authoring doors are
+        // part of what the stamp claims.
+        for name in [
+            "model.bundle_check",
+            "model.bundle_create",
+            "model.bundle_update",
+            "model.bundle_delete",
+        ] {
+            let op = ops
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("@7 surface must publish {name} (REQ-MC-01..05)"));
+            assert_eq!(op.class, OpClass::Mutation);
+        }
+        // @8's own increment: the form's handle read is part of what the
+        // stamp claims (the window no longer derives it).
+        let handle = ops
+            .iter()
+            .find(|o| o.name == "model.bundle_handle")
+            .expect("@8 surface must publish model.bundle_handle (ASM-9)");
+        assert_eq!(handle.class, OpClass::Read);
     }
 
     #[test]

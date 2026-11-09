@@ -22,3 +22,8 @@ export const HOLD_TIMER_GRACE_MS = 5;
 export function holdCompletes(elapsedMs: number): boolean {
   return elapsedMs >= HOLD_TO_SWITCH_MS;
 }
+
+/** Удержание удаления (REQ-MC-05 AC7): та же механика, отдельный порог не
+ * нужен — но и здесь обработчика click нет, поэтому одиночный и двойной
+ * клик ничего не удаляют. */
+export const HOLD_TO_DELETE_MS = HOLD_TO_SWITCH_MS;

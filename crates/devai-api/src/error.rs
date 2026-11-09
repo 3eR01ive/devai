@@ -114,6 +114,7 @@ pub(crate) fn store_code(e: &StoreError) -> ErrorCode {
         StoreError::Corrupt(..) => ErrorCode("corrupt"),
         StoreError::Config(..) => ErrorCode("config"),
         StoreError::ModelBundle(..) => ErrorCode("model_bundle"),
+        StoreError::Stale { .. } => ErrorCode("stale_form"),
         StoreError::Io(..) => ErrorCode("io"),
         StoreError::Sql(..) => ErrorCode("store"),
     }

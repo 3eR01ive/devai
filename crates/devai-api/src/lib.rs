@@ -45,8 +45,9 @@ pub use inbox::{
 // devai-store dependency to name `devai.db` or `.devai` correctly).
 pub use devai_store::{DB_FILE_NAME, HOME_DIR_NAME};
 pub use models::{
-    ActiveBundleView, BundleStatusView, FailuresBanner, ModelBundleView, ModelEventView,
-    ModelSnapshot, ProbeView, RunningBundleRow, SwitchResultView, bundle_identity_text, stamp_text,
+    ActiveBundleView, BundleFormInput, BundleFormView, BundleHandleView, BundleMutationView,
+    BundleStatusView, FailuresBanner, ModelBundleView, ModelEventView, ModelSnapshot, ProbeView,
+    RunningBundleRow, SwitchResultView, bundle_identity_text, stamp_text,
 };
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,

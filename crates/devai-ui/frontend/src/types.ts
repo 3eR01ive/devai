@@ -393,6 +393,8 @@ export interface ModelEventView {
   bundle_id: string | null;
   verdict: string | null;
   outcome: string | null;
+  /** The operator word of `outcome` for a bundle mutation (served). */
+  outcome_text?: string | null;
   reason: string | null;
   /** The operator word of `reason`, from the platform dictionary. */
   reason_text: string | null;
@@ -423,6 +425,57 @@ export interface ModelSnapshot {
   history: ModelEventView[];
   failures: FailuresBanner | null;
   running: RunningBundleRow[];
+  /** The declared file edition the form must carry back on save. */
+  file_revision: string;
+  /** The closed vocabulary the form may offer (drivers, factory probe). */
+  form: BundleFormView;
+}
+
+export interface BundleFormView {
+  drivers: string[];
+  self_provider_driver: string;
+  default_phrase: string;
+  default_timeout_ms: number;
+  default_fresh_secs: number;
+}
+
+/** The probe policy — the SAME nested shape the declaration carries, so the
+ * form and the file share one field catalogue (no flat `probe_*` copies). */
+export interface ProbePolicyInput {
+  phrase: string;
+  timeout_ms: number;
+  fresh_secs: number;
+}
+
+/** The handle a NEW bundle will carry, as the SERVER derives it (ASM-9).
+ * The window prints `id` verbatim and never derives it itself. */
+export interface BundleHandleView {
+  id: string;
+}
+
+/** The form payload — the declaration's own field names, nothing else. */
+export interface BundleFormInput {
+  id: string;
+  label: string;
+  agent: string;
+  driver: string;
+  llm_provider: string;
+  model: string;
+  reasoning: string;
+  probe: ProbePolicyInput;
+  editing: boolean;
+  file_revision: string;
+}
+
+export interface BundleMutationView {
+  outcome: string; // created | updated | deleted
+  outcome_text: string;
+  bundle_id: string;
+  label: string;
+  verdict: string | null;
+  latency_ms: number | null;
+  agent_changed: boolean;
+  revision: string;
 }
 
 export interface ProbeView {

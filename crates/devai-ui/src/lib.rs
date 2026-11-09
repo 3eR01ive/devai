@@ -97,6 +97,12 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         lan::commands::lan_disable,
         lan::commands::lan_new_invite,
         lan::commands::lan_disconnect,
+        commands::model_bundle_handle,
+        commands::model_bundle_check,
+        commands::model_bundle_create,
+        commands::model_bundle_update,
+        commands::model_bundle_delete,
+
     ]
 }
 

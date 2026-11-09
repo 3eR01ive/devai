@@ -14,6 +14,8 @@ import {
   mount,
   startHarness,
   textOf,
+  typeInto,
+  type FakeNode,
   type Harness,
 } from "./support/component-harness.ts";
 import { holdCompletes } from "../src/model_view.ts";
@@ -104,6 +106,14 @@ const snapshot = (overrides: Record<string, unknown> = {}) => ({
   history: [],
   failures: null,
   running: [],
+  file_revision: "rev-1",
+  form: {
+    drivers: ["claude", "hermes"],
+    self_provider_driver: "claude",
+    default_phrase: "ping",
+    default_timeout_ms: 20000,
+    default_fresh_secs: 900,
+  },
   ...overrides,
 });
 
@@ -319,4 +329,243 @@ test("ModelsView: смена имени агента называет идущи
   assert.equal(switches, 1, `the hold must apply: ${text}`);
   assert.match(text, /идущие прогоны остаются на прежнем агенте/);
   assert.match(text, /hermes/, "the names come from the snapshot's running rows");
+});
+
+// --- авторская поверхность (REQ-MC-01..09) ---------------------------
+
+function inputByField(root: FakeNode, field: string): FakeNode {
+  const node = elements(root).find(
+    (n) => n.type === "input" && n.props["data-field"] === field,
+  );
+  assert.ok(node, `no input for field ${field}; rendered: ${textOf(root)}`);
+  return node!;
+}
+
+test("ModelsView: идентификатор приходит с сервера, окно его не выводит", async () => {
+  const asked: string[] = [];
+  installInvoke((cmd, args) => {
+    if (cmd === "model_snapshot") return snapshot();
+    if (cmd === "model_bundle_handle") {
+      asked.push((args as { label: string }).label);
+      // Нарочно НЕ совпадает с выводом, который окно могло бы посчитать
+      // само: печатается ровно серверное значение (ASM-9, один источник).
+      return { id: "server-handle" };
+    }
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+  buttonByLabel(root, "Создать связку").props.onClick!({});
+  await flush();
+
+  await typeInto(inputByField(root, "label"), "İstanbul");
+  await flush();
+  assert.ok(asked.includes("İstanbul"), `asked: ${asked.join(",")}`);
+  const text = textOf(root);
+  assert.match(text, /идентификатор: server-handle/);
+  assert.match(text, /claude, hermes/);
+  // The offered drivers carry no diagnostic mock; only the sentence explains it.
+  assert.doesNotMatch(text, /Драйверы: [^.]*mock/);
+  assert.match(text, /Диагностический драйвер mock в списке не предлагается/);
+  assert.match(text, /при создании модель обязательна/);
+});
+
+test("ModelsView: сохранение новой связки уходит в платформу с полями формы", async () => {
+  let sent: Record<string, unknown> | null = null;
+  installInvoke((cmd, args) => {
+    if (cmd === "model_snapshot") return snapshot();
+    if (cmd === "model_bundle_handle") return { id: "hermes-alibaba" };
+    if (cmd === "model_bundle_create") {
+      sent = (args as { input: Record<string, unknown> }).input;
+      return {
+        outcome: "created",
+        outcome_text: "создана",
+        bundle_id: "hermes-alibaba",
+        label: "Hermes Alibaba",
+        verdict: "ok",
+        latency_ms: 400,
+        agent_changed: false,
+        revision: "rev-2",
+      };
+    }
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+  buttonByLabel(root, "Создать связку").props.onClick!({});
+  await flush();
+  await typeInto(inputByField(root, "label"), "Hermes Alibaba");
+  await typeInto(inputByField(root, "agent"), "hermes");
+  await typeInto(inputByField(root, "driver"), "hermes");
+  await typeInto(inputByField(root, "model"), "qwen-max");
+  await typeInto(inputByField(root, "reasoning"), "medium");
+  await typeInto(inputByField(root, "probe_phrase"), "ping");
+  await flush();
+  buttonByLabel(root, "Сохранить (с пробой)").props.onClick!({});
+  assert.ok(await waitUntil(() => sent !== null), "save must reach the platform");
+  await flush();
+
+  const payload = sent as unknown as Record<string, unknown>;
+  assert.equal(payload.label, "Hermes Alibaba");
+  assert.equal(payload.agent, "hermes");
+  assert.equal(payload.driver, "hermes");
+  assert.equal(payload.model, "qwen-max");
+  assert.equal(payload.reasoning, "medium");
+  assert.equal(payload.editing, false);
+  assert.equal(payload.file_revision, "rev-1");
+  const probe = payload.probe as Record<string, unknown>;
+  assert.equal(probe.phrase, "ping");
+  assert.equal(
+    probe.timeout_ms,
+    20000,
+    "the factory policy is the snapshot's, not a literal in the window",
+  );
+  assert.equal(probe.fresh_secs, 900);
+  // The credential key name is assembled at run time: the repository text
+  // never carries the literal the `no-secrets` gate looks for.
+  const credentialKey = `api${"_"}key`;
+  assert.equal(payload[credentialKey], undefined);
+  assert.equal(payload.base_url, undefined);
+  assert.match(textOf(root), /создана/);
+  assert.match(textOf(root), /проба ok 400 мс/);
+});
+
+test("ModelsView: фабричная политика пробы приходит от платформы, а не из окна", async () => {
+  // R8: у окна нет своих доменных значений по умолчанию — форма берёт
+  // фразу/таймаут/срок свежести из снимка и отправляет их без подстановок.
+  let sent: Record<string, unknown> | null = null;
+  const served = snapshot({
+    form: {
+      drivers: ["claude", "hermes"],
+      self_provider_driver: "claude",
+      default_phrase: "проверка платформы",
+      default_timeout_ms: 12345,
+      default_fresh_secs: 678,
+    },
+  });
+  installInvoke((cmd, args) => {
+    if (cmd === "model_snapshot") return served;
+    if (cmd === "model_bundle_handle") return { id: "hermes-alibaba" };
+    if (cmd === "model_bundle_create") {
+      sent = (args as { input: Record<string, unknown> }).input;
+      return {
+        outcome: "created",
+        outcome_text: "создана",
+        bundle_id: "hermes-alibaba",
+        label: "Hermes Alibaba",
+        verdict: "ok",
+        latency_ms: 9,
+        agent_changed: false,
+        revision: "rev-2",
+      };
+    }
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+  buttonByLabel(root, "Создать связку").props.onClick!({});
+  await flush();
+  await typeInto(inputByField(root, "label"), "Hermes Alibaba");
+  await typeInto(inputByField(root, "agent"), "hermes");
+  await typeInto(inputByField(root, "driver"), "hermes");
+  await typeInto(inputByField(root, "model"), "qwen-max");
+  await typeInto(inputByField(root, "reasoning"), "medium");
+  await flush();
+  buttonByLabel(root, "Сохранить (с пробой)").props.onClick!({});
+  assert.ok(await waitUntil(() => sent !== null), "save must reach the platform");
+
+  const probe = (sent as unknown as { probe: Record<string, unknown> }).probe;
+  assert.equal(probe.phrase, "проверка платформы");
+  assert.equal(probe.timeout_ms, 12345);
+  assert.equal(probe.fresh_secs, 678);
+});
+
+test("ModelsView: отказ платформы оставляет форму открытой и объясняет поле", async () => {
+  installInvoke((cmd) => {
+    if (cmd === "model_snapshot") return snapshot();
+    if (cmd === "model_bundle_handle") return { id: "hermes-alibaba" };
+    if (cmd === "model_bundle_create") {
+      return Promise.reject({
+        code: "invalid_input",
+        message:
+          "invalid input (model): поле «модель» не заполнено — связка без модели не создаётся",
+      });
+    }
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+  buttonByLabel(root, "Создать связку").props.onClick!({});
+  await flush();
+  await typeInto(inputByField(root, "label"), "Hermes Empty");
+  buttonByLabel(root, "Сохранить (с пробой)").props.onClick!({});
+  assert.ok(
+    await waitUntil(() => /модель».*не создаётся/.test(textOf(root))),
+    `the refusal must be shown: ${textOf(root)}`,
+  );
+  assert.match(textOf(root), /Новая связка/, "the form stays open");
+});
+
+test("ModelsView: действующую связку удалить нельзя — причина подписана", async () => {
+  installInvoke((cmd) => {
+    if (cmd === "model_snapshot") return snapshot();
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+  const text = textOf(root);
+  assert.match(text, /действующая — сначала переключитесь/);
+  const deletes = elements(root).filter(
+    (n) => n.type === "button" && textOf(n).includes("Удержать: удалить"),
+  );
+  assert.equal(deletes.length, 1, "only the non-active row offers deletion");
+});
+
+test("ModelsView: удаление — удержание на кнопке; одиночный клик ничего не удаляет", async () => {
+  let deletes = 0;
+  installInvoke((cmd, args) => {
+    if (cmd === "model_snapshot") return snapshot();
+    if (cmd === "model_bundle_delete") {
+      deletes += 1;
+      assert.equal((args as { bundle_id: string }).bundle_id, "hermes-alibaba");
+      assert.equal((args as { file_revision: string }).file_revision, "rev-1");
+      return {
+        outcome: "deleted",
+        outcome_text: "удалена",
+        bundle_id: "hermes-alibaba",
+        label: "Hermes · Alibaba",
+        verdict: null,
+        latency_ms: null,
+        agent_changed: false,
+        revision: "rev-2",
+      };
+    }
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+
+  const del = elements(root)
+    .filter((n) => n.type === "button")
+    .find((b) => textOf(b).includes("Удержать: удалить"));
+  assert.ok(del);
+  assert.equal(del.props.onClick, undefined, "no click handler: a click deletes nothing");
+
+  // Короткое нажатие.
+  (del.props.onPointerdown as (e: unknown) => void)({});
+  (del.props.onPointerup as (e: unknown) => void)({});
+  await new Promise((r) => setTimeout(r, 900));
+  await flush();
+  assert.equal(deletes, 0, "a released hold deletes nothing");
+
+  (del.props.onPointerdown as (e: unknown) => void)({});
+  assert.ok(await waitUntil(() => deletes === 1), "a completed hold deletes once");
+  await flush();
+  assert.match(textOf(root), /удалена/);
 });

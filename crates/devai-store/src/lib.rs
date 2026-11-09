@@ -14,7 +14,11 @@ pub mod seed;
 
 pub use bundle::{BundleManifest, ImportOutcome};
 pub use error::{StoreError, StoreResult};
-pub use models::{MODEL_CONFIG_FILE, ModelBundle, ModelCatalog, ProbePolicy, load_catalog};
+pub use models::{
+    CatalogEdit, MODEL_CONFIG_FILE, ModelBundle, ModelCatalog, PROBEABLE_DRIVERS, ProbePolicy,
+    SELF_PROVIDER_DRIVER, bundle_id_from_label, bundle_keys, catalog_edition, catalog_revision,
+    load_catalog, probe_keys, restore_catalog_text, write_catalog, write_catalog_with_previous,
+};
 
 /// The ONE name of the home's store file (arch/no-magic: the homes cycle
 /// spread this literal across api/ui consumers; every join site now reads
@@ -1519,6 +1523,29 @@ impl Store {
         Ok(previous)
     }
 
+    /// Apply a new IDENTITY to the record of an edited bundle that is in
+    /// force (task 01a1be5c, REQ-MC-03 AC3/AC4) AND append the edit's own
+    /// fact in ONE transaction (REQ-MC-06 AC5): the record, the marker and
+    /// the `kind` history row land together or not at all — there is no
+    /// window in which the record moved without its history row. The marker
+    /// stays on the record; a changed agent NAME creates/updates the new
+    /// record and marks it, leaving the old one intact and unmarked (runs in
+    /// flight keep their own stamped identity).
+    pub fn apply_bundle_identity_with_fact(
+        &self,
+        s: &BundleSwitch,
+        kind: &str,
+    ) -> StoreResult<Option<AgentInstance>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let previous = Self::marked_agent(&tx)?;
+        Self::upsert_switch_record(&tx, s)?;
+        Self::move_marker(&tx, &s.agent)?;
+        Self::verify_switch_record(&tx, s)?;
+        Self::append_event(&tx, kind, &s.actor, &s.payload, s.now)?;
+        tx.commit()?;
+        Ok(previous)
+    }
+
     /// The ONE marked agent record, read on an open connection/transaction
     /// (`active_agent` serves the same predicate without one).
     fn marked_agent(conn: &Connection) -> StoreResult<Option<AgentInstance>> {
@@ -1638,28 +1665,42 @@ impl Store {
         s: &BundleSwitch,
         payload: &serde_json::Value,
     ) -> StoreResult<()> {
+        Self::append_event(tx, event_kind::MODEL_SWITCHED, &s.actor, payload, s.now)
+    }
+
+    /// Append ONE home-level fact inside the caller's transaction: the kind
+    /// is the caller's (the switch and the bundle edit write different
+    /// facts, both in the same transaction as the move they describe).
+    fn append_event(
+        tx: &Transaction<'_>,
+        kind: &str,
+        actor: &str,
+        payload: &serde_json::Value,
+        at: Timestamp,
+    ) -> StoreResult<()> {
         tx.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,NULL,?2,?3,?4,?5)",
-            params![
-                new_id().to_string(),
-                event_kind::MODEL_SWITCHED,
-                s.actor,
-                payload.to_string(),
-                rows::ts(&s.now)
-            ],
+            params![new_id().to_string(), kind, actor, payload.to_string(), rows::ts(&at)],
         )?;
         Ok(())
     }
 
-    /// Home-level history of the bundle surface (REQ-MS-05): every probe and
-    /// every switch attempt, oldest first. These events carry NO task — the
-    /// read is not a task read and is served by one operation for both the
-    /// console and the window.
+    /// Home-level history of the bundle surface (REQ-MS-05, REQ-MC-07):
+    /// every probe, every switch attempt and every bundle create/edit/delete
+    /// attempt, oldest first. These events carry NO task — the read is not a
+    /// task read and is served by one operation for both the console and the
+    /// window.
     pub fn model_events(&self) -> StoreResult<Vec<WorkflowEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,kind,actor,payload,created_at FROM workflow_events WHERE kind IN (?1,?2) ORDER BY seq",
+            "SELECT id,task_id,kind,actor,payload,created_at FROM workflow_events WHERE kind IN (?1,?2,?3,?4,?5) ORDER BY seq",
         )?;
-        let mut rows = stmt.query(params![event_kind::MODEL_PROBE, event_kind::MODEL_SWITCHED])?;
+        let mut rows = stmt.query(params![
+            event_kind::MODEL_PROBE,
+            event_kind::MODEL_SWITCHED,
+            event_kind::MODEL_BUNDLE_CREATED,
+            event_kind::MODEL_BUNDLE_UPDATED,
+            event_kind::MODEL_BUNDLE_DELETED
+        ])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(rows::event_from_row(r)?);
