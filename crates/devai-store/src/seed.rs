@@ -92,7 +92,9 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
                 provider: provider.into(),
                 model: model.into(),
                 runtime: "builtin".into(),
+                reasoning: String::new(),
                 created_at: now,
+                active: false,
             })?;
         }
     }

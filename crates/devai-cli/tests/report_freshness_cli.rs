@@ -85,6 +85,7 @@ fn start_running_audit(store: &Store, task_id: devai_core::types::Id) -> String 
         owner_pid: None,
         owner_host: None,
         owner_process_start: None,
+        bundle: None,
     };
     store.start_execution(&exec).unwrap();
     devai_core::types::short_id(&exec.id)

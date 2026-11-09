@@ -1748,7 +1748,9 @@ impl Api {
             provider: req.provider,
             model: req.model,
             runtime: req.runtime,
+            reasoning: String::new(),
             created_at: Utc::now(),
+            active: false,
         };
         self.store.put_agent(&a)?;
         Ok(a)
@@ -1806,6 +1808,23 @@ impl Api {
     ) -> ApiResult<RoleExecution> {
         let revision = Engine::new(&self.store).current_revision()?;
         let (owner_pid, owner_host, owner_process_start) = liveness::current_owner().into_columns();
+        // REQ-MS-05: the run stamp is taken from the agent RECORD at start —
+        // the manual path reads the same row the engine does, so a manual row
+        // answers «what did this run use?» exactly like an engine row. No
+        // record → no stamp («связка не записана»), never a guessed identity.
+        let stamp = self
+            .store
+            .list_agents()?
+            .into_iter()
+            .find(|a| Some(&a.name) == req.agent.as_ref())
+            .map(|a| {
+                devai_core::types::ExecutionBundle::new(
+                    &a.provider,
+                    &a.runtime,
+                    &a.model,
+                    &a.reasoning,
+                )
+            });
         Ok(RoleExecution {
             id: new_id(),
             task_id,
@@ -1826,6 +1845,7 @@ impl Api {
             owner_pid,
             owner_host,
             owner_process_start,
+            bundle: stamp,
         })
     }
 
@@ -3357,6 +3377,7 @@ scoring:
             owner_pid: None,
             owner_host: None,
             owner_process_start: None,
+            bundle: None,
         }
     }
 

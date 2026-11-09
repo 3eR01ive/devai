@@ -14,6 +14,7 @@ pub mod gate;
 pub mod human_view;
 pub mod humanize;
 pub mod liveness;
+pub mod probe;
 mod prompt;
 pub mod revision;
 pub mod taskname;

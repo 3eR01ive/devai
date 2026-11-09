@@ -240,6 +240,7 @@ fn live_owner_task_run_refusal_is_labeled_live_not_orphan() {
                 owner_pid: Some(std::process::id() as i64),
                 owner_host: devai_runtime::current_host(),
                 owner_process_start: None,
+                bundle: None,
             })
             .unwrap();
     }

@@ -57,6 +57,7 @@ onUnmounted(() => {
           Ожидание<template v-if="waitBadge > 0">&nbsp;·&nbsp;<b class="badge">{{ waitBadge }}</b></template>
         </RouterLink>
         <RouterLink to="/homes">Дома</RouterLink>
+        <RouterLink to="/models">Связка модели</RouterLink>
         <RouterLink to="/ops">Операции API</RouterLink>
       </nav>
       <div class="statusbar" v-if="session">

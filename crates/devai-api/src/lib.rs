@@ -21,6 +21,7 @@
 mod error;
 mod homes;
 mod inbox;
+mod models;
 mod mutations;
 mod registry;
 mod signature;
@@ -43,6 +44,10 @@ pub use inbox::{
 // them through the API door only (REQ-UI-02: the UI graph must not gain a
 // devai-store dependency to name `devai.db` or `.devai` correctly).
 pub use devai_store::{DB_FILE_NAME, HOME_DIR_NAME};
+pub use models::{
+    ActiveBundleView, BundleStatusView, FailuresBanner, ModelBundleView, ModelEventView,
+    ModelSnapshot, ProbeView, RunningBundleRow, SwitchResultView, bundle_identity_text, stamp_text,
+};
 pub use mutations::{
     AdvanceOutcome, AdvanceReq, AgentAddReq, AnsweredOutcome, ApproveOutcome, AskReq,
     ContractAddReq, ContractRegistration, DependReq, ExecStartReq, ExecStarted, MergeRecordReq,
@@ -114,7 +119,18 @@ pub struct Api {
     home: PathBuf,
     actor: String,
     session: SessionKind,
+    /// The probe SEAM (R8 quality return): the real driver call in
+    /// production, a controlled runner in tests — so the probe/switch path is
+    /// testable without launching an external process.
+    probe_runner: ProbeRunner,
 }
+
+/// One probe call as the surface invokes it. The default is
+/// [`devai_runtime::probe::probe`]; a test substitutes a runner that returns
+/// a chosen outcome through the same request type.
+pub type ProbeRunner = std::sync::Arc<
+    dyn Fn(&devai_runtime::probe::ProbeRequest) -> devai_runtime::probe::ProbeOutcome + Send + Sync,
+>;
 
 impl Api {
     /// Bootstrap entry (the ratified OQ-10 exception, encapsulated per the
@@ -134,7 +150,15 @@ impl Api {
             home: home.to_path_buf(),
             actor: actor.to_string(),
             session,
+            probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
         })
+    }
+
+    /// Substitute the probe runner (tests / diagnostics). The default is the
+    /// real driver call; nothing else about the surface changes.
+    pub fn with_probe_runner(mut self, runner: ProbeRunner) -> Self {
+        self.probe_runner = runner;
+        self
     }
 
     /// Observation entry (REQ-HOME-09): the same handle shape as
@@ -153,6 +177,7 @@ impl Api {
             // An observation handle is the human UI's read plane; it writes
             // nothing, so the human-only gate never sees it.
             session: SessionKind::Human,
+            probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
         })
     }
 
@@ -565,6 +590,13 @@ impl Api {
         std::env::var_os("DEVAI_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| self.store.root().join("config"))
+    }
+
+    /// The config directory as the model-bundle loader sees it. Kept
+    /// `pub(crate)`: a consumer reads bundles through the snapshot, never by
+    /// walking the home itself (REQ-MS-07: the window does not compose).
+    pub(crate) fn model_config_dir(&self) -> PathBuf {
+        self.config_dir()
     }
 
     pub fn task_events(

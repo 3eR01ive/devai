@@ -260,6 +260,7 @@ fn export_import_roundtrip_restores_everything() {
         owner_pid: Some(4242),
         owner_host: Some("fixture-host".into()),
         owner_process_start: Some(1_730_000_000),
+        bundle: None,
     };
     store.start_execution(&e).unwrap();
     let q = Question {
@@ -738,6 +739,7 @@ fn execution_id_prefix_resolution_fails_loudly_on_ambiguity() {
         owner_pid: None,
         owner_host: None,
         owner_process_start: None,
+        bundle: None,
     };
     let a = exec("01a1a5db-3ba0-7a5b-8176-3f38ad4c1ea8", ta.id);
     let b = exec("01a1a5db-3ba1-7a5b-8176-3f38ad4c1ea9", tb.id);
@@ -1046,4 +1048,83 @@ fn read_plane_hands_finished_signboards_on_edges_and_graph() {
     assert_eq!(bare.display_sign(), "bare title");
     // Legacy REVIEW keeps the title as its signboard (OQ-TN-2, no forced rename).
     assert_eq!(c.display_sign(), "test task");
+}
+
+/// REQ-MS-02 AC5 (task 01a1b71f): the «one marked record» rule is held by the
+/// DATABASE, not only by the switch code — the partial unique index refuses a
+/// second `active=1` row written by any path.
+#[test]
+fn the_partial_index_refuses_a_second_marked_agent_record() {
+    let (d, store) = open();
+    for name in ["first", "second"] {
+        store
+            .put_agent(&AgentInstance {
+                id: new_id(),
+                name: name.into(),
+                provider: "hermes".into(),
+                model: String::new(),
+                runtime: String::new(),
+                reasoning: String::new(),
+                created_at: now(),
+                active: false,
+            })
+            .unwrap();
+    }
+    let raw = rusqlite::Connection::open(d.path().join("devai.db")).unwrap();
+    raw.execute("UPDATE agent_instances SET active=1 WHERE name='first'", [])
+        .unwrap();
+    let err = raw
+        .execute(
+            "UPDATE agent_instances SET active=1 WHERE name='second'",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "the second marker must violate the partial unique index: {err}"
+    );
+    // The read stays single-valued: the FIRST marked record.
+    assert_eq!(store.active_agent().unwrap().unwrap().name, "first");
+}
+
+/// R4 quality return: the snapshot's «идущие прогоны» is an ADDRESSED read —
+/// only RUNNING rows come back, never the whole execution history.
+#[test]
+fn running_executions_reads_only_running_rows() {
+    let (_d, store) = open();
+    let t1 = draft(&store);
+    let t2 = draft(&store);
+    let row = |task: Id, status: ExecutionStatus| RoleExecution {
+        id: new_id(),
+        task_id: task,
+        role_slug: "implementation-agent".into(),
+        role_version: 1,
+        agent_name: Some("hermes".into()),
+        status,
+        inputs: vec![],
+        summary: None,
+        error: None,
+        started_at: now(),
+        finished_at: None,
+        workspace_revision: None,
+        attempt: 1,
+        parent_execution: None,
+        failure_class: None,
+        owner_pid: None,
+        owner_host: None,
+        owner_process_start: None,
+        bundle: None,
+    };
+    let live = row(t1.id, ExecutionStatus::Running);
+    let done = row(t2.id, ExecutionStatus::Running);
+    store.start_execution(&live).unwrap();
+    store.start_execution(&done).unwrap();
+    store
+        .finish_execution_classified(&done, ExecutionStatus::Completed, None, None, None, now())
+        .unwrap();
+
+    let running = store.running_executions().unwrap();
+    assert_eq!(running.len(), 1, "only the RUNNING row is listed");
+    assert_eq!(running[0].id, live.id);
+    assert_eq!(running[0].status.as_str(), "RUNNING");
 }

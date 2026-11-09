@@ -422,6 +422,7 @@ mod tests {
             owner_pid: None,
             owner_host: None,
             owner_process_start: None,
+            bundle: None,
         }
     }
 

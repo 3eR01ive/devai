@@ -128,6 +128,23 @@ pub enum RuntimeError {
     /// block 4).
     #[error("report shape: {0}")]
     ReportShape(String),
+    /// REQ-MS-04: a run with no EXPLICIT agent asked for the platform's
+    /// active model bundle, and no agent record is marked. The built-in
+    /// `mock` fallback is never substituted here — a silent switch to a
+    /// dead/diagnostic driver is exactly the incident the bundle surface
+    /// exists to end (ASM-9).
+    #[error(
+        "no active model bundle — the platform has no marked agent record; pick one: `devai model switch <id>` (or name the agent explicitly with `--agent`)"
+    )]
+    NoActiveBundle,
+    /// the ratified OQ-6 answer: the marked bundle carries no
+    /// reasoning level. The level is PART of the selection, so such a bundle
+    /// is incomplete and a run on it does NOT start — the platform never
+    /// silently inherits the driver's own default.
+    #[error(
+        "active model bundle is incomplete — its agent record names no reasoning level; the level is chosen together with the LLM-provider and the model: `devai model switch <id>`"
+    )]
+    IncompleteBundle,
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -628,7 +645,9 @@ impl<'a> Engine<'a> {
 
     /// Advance the task through every autonomous stage until a human gate,
     /// hold or terminal state. `agent_name` selects the `AgentInstance`
-    /// (builtin fallbacks: `mock`, `claude`).
+    /// (builtin fallbacks: `mock`, `claude`); an EMPTY name means «no
+    /// explicit agent» — the agent of the active model bundle runs, or the
+    /// run refuses typed (REQ-MS-04).
     pub fn advance(
         &self,
         task_ref: &str,
@@ -1048,6 +1067,17 @@ impl<'a> Engine<'a> {
             owner_pid,
             owner_host,
             owner_process_start,
+            // The run STAMP (REQ-MS-05): taken off the resolved agent record
+            // AT START — the attempt loop clones this template, so every
+            // attempt of the stage carries one stamp. `llm_provider` is the
+            // record's `runtime` field (the store's driver column is
+            // `provider`), empty/`local` meaning «the driver chooses».
+            bundle: Some(devai_core::types::ExecutionBundle::new(
+                &agent.provider,
+                agent.runtime.as_str(),
+                &agent.model,
+                &agent.reasoning,
+            )),
         };
         // REQ-SW-01/02: a second RUNNING row for this task cannot commit —
         // the partial unique index rejects it and `start_execution` answers
@@ -1216,6 +1246,7 @@ impl<'a> Engine<'a> {
             // data plumbing — the engine stays provider-agnostic, the
             // driver decides how to read the value (R3 constraint).
             provider_override: agent.runtime.clone(),
+            reasoning: agent.reasoning.clone(),
             inputs: inputs.clone(),
             contract_schema: contract_schema.clone(),
             // REQ-WT-02 AC1: a writing role is NEVER handed the main
@@ -1683,6 +1714,21 @@ impl<'a> Engine<'a> {
     }
 
     fn resolve_agent(&self, name: &str) -> RuntimeResult<AgentInstance> {
+        // REQ-MS-04 AC5: a run WITHOUT an explicit agent takes the agent of
+        // the bundle in force — never the `mock` literal. No marked record is
+        // a typed refusal before any driver starts, not a silent fallback.
+        if name.trim().is_empty() {
+            let active = self
+                .store
+                .active_agent()?
+                .ok_or(RuntimeError::NoActiveBundle)?;
+            // the ratified OQ-6 answer: the level is part of the bundle; without it the
+            // bundle is incomplete and the run does NOT start.
+            if active.reasoning.trim().is_empty() {
+                return Err(RuntimeError::IncompleteBundle);
+            }
+            return Ok(active);
+        }
         if let Some(a) = self
             .store
             .list_agents()?
@@ -1705,7 +1751,12 @@ impl<'a> Engine<'a> {
                 provider: name.to_string(),
                 model: String::new(),
                 runtime: "builtin".into(),
+                // An EXPLICIT diagnostic name (mock/claude) is not the chosen
+                // bundle: it carries no level and runs as-is (ASM-9). The
+                // active-bundle path above refuses an empty level.
+                reasoning: String::new(),
                 created_at: Utc::now(),
+                active: false,
             });
         }
         Err(devai_store::StoreError::NotFound("agent".into(), name.to_string()).into())

@@ -59,6 +59,10 @@ enum Cmd {
     Role(RoleCmd),
     #[command(subcommand)]
     Agent(AgentCmd),
+    /// The model-bundle surface (task 01a1b71f): what is in force, the
+    /// declared bundles, a real probe, and the ONE-step switch.
+    #[command(subcommand)]
+    Model(ModelCmd),
     #[command(subcommand)]
     Contract(ContractCmd),
     #[command(subcommand)]
@@ -225,9 +229,11 @@ enum TaskCmd {
     Run {
         id: String,
         /// Agent name from `devai agent list` (builtin: mock, claude;
-        /// other providers — e.g. hermes — via `devai agent add --provider hermes`)
-        #[arg(long, default_value = "mock")]
-        agent: String,
+        /// other providers — e.g. hermes — via `devai agent add --provider hermes`).
+        /// OMITTED: the agent of the ACTIVE model bundle runs; with no marked
+        /// bundle the run refuses typed instead of falling back to `mock`.
+        #[arg(long)]
+        agent: Option<String>,
         /// Workspace where QA gates and mechanical probes execute (default: cwd).
         #[arg(long)]
         workspace: Option<std::path::PathBuf>,
@@ -536,6 +542,32 @@ enum AgentCmd {
         runtime: String,
     },
     List,
+}
+
+/// The model-bundle CLI mirror of the UI section (REQ-MS-07): the SAME three
+/// operations, the SAME verdict vocabulary — the console never invents a
+/// second reading of the same data.
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// The section in one read: the bundle in force, ONE status word with the
+    /// probe's latency and time, every declared bundle, the history, the
+    /// refusal banner and the runs in flight.
+    List,
+    /// Probe ONE declared bundle with a real call and show the typed verdict.
+    Probe {
+        /// Bundle id from `devai model list`
+        id: String,
+    },
+    /// Switch the platform to ONE declared bundle: probe first, apply only on
+    /// `ok`, atomically, with history. Refusals are typed.
+    Switch {
+        /// Bundle id from `devai model list`
+        id: String,
+        /// Why the switch is made (manual|limits|error); the platform never
+        /// derives it.
+        #[arg(long, default_value = "manual")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]

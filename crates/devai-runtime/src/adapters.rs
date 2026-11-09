@@ -24,7 +24,7 @@ pub struct ExecRequest {
     pub role: RoleDefinition,
     pub provider: String,
     pub model: String,
-    /// LLM-provider override SOURCE for drivers that spell one (ratified
+    /// The LLM-provider override SOURCE for drivers that spell one (ratified
     /// OQ-4): the engine fills it from `AgentInstance.runtime`, because
     /// `provider` already carries the DRIVER name (`hermes`, not the LLM
     /// behind it) and `model` carries the model. Empty — or the neutral
@@ -33,6 +33,12 @@ pub struct ExecRequest {
     /// the keys live (R3: keys stay out of the store; OQ-5: the platform
     /// never forces `--ignore-user-config`).
     pub provider_override: String,
+    /// the ratified OQ-6 answer: the REASONING LEVEL of the
+    /// selection, filled from `AgentInstance.reasoning`. Part of the bundle,
+    /// so it is passed to the driver verbatim (`--reasoning` for hermes,
+    /// `--effort` for claude) — never silently replaced by a driver default.
+    /// Empty is a caller bug for a bundle run; the engine refuses earlier.
+    pub reasoning: String,
     /// Input artifacts as `(label, content)` pairs, ordered by dependency.
     pub inputs: Vec<(String, String)>,
     /// JSON Schema text of the role's output contract, when defined.
@@ -303,6 +309,12 @@ impl AgentRuntime {
         if !req.model.is_empty() {
             cmd.arg("--model").arg(&req.model);
         }
+        // the ratified OQ-6 answer: the reasoning level is part of the bundle; claude spells
+        // it `--effort`. An empty level is refused by the engine before a
+        // bundle run starts, so this is never a "use the default" signal.
+        if !req.reasoning.is_empty() {
+            cmd.arg("--effort").arg(&req.reasoning);
+        }
 
         let out = cmd.output()?;
         if !out.status.success() {
@@ -507,6 +519,11 @@ impl AgentRuntime {
             argv.push("--provider".into());
             argv.push(req.provider_override.clone());
         }
+        // the ratified OQ-6 answer: the level rides hermes' own flag (part of the selection).
+        if !req.reasoning.is_empty() {
+            argv.push("--reasoning".into());
+            argv.push(req.reasoning.clone());
+        }
         if let Some(path) = hermes_usage_path(req) {
             argv.push("--usage-file".into());
             argv.push(path.display().to_string());
@@ -609,7 +626,9 @@ const RUNTIME_NO_PROVIDER: &str = "local";
 /// REAL override. Empty means absence; the neutral `devai agent add`
 /// default (`RUNTIME_NO_PROVIDER`) means absence too. A named provider
 /// (`--runtime anthropic|openrouter|...`) is passed through verbatim.
-fn has_provider_override(s: &str) -> bool {
+/// `pub(crate)` because the model-bundle probe launches the SAME driver and
+/// must not spell a second, drifting copy of the emptiness rule (REQ-MS-03).
+pub(crate) fn has_provider_override(s: &str) -> bool {
     !s.is_empty() && s != RUNTIME_NO_PROVIDER
 }
 
@@ -1211,6 +1230,7 @@ mod tests {
             provider: provider.into(),
             model: "".into(),
             provider_override: "".into(),
+            reasoning: "high".into(),
             inputs: vec![],
             contract_schema: None,
             workspace: None,
@@ -1718,6 +1738,12 @@ mod tests {
             "/evidence/task/exec/usage.json",
             "R5: inside the PLATFORM evidence dir, never the tree"
         );
+        // the ratified OQ-6 answer: the level rides hermes' own flag.
+        assert_eq!(
+            argv[pos("--reasoning") + 1],
+            "high",
+            "the level is part of the selection, passed verbatim"
+        );
     }
 
     #[test]
@@ -1726,9 +1752,12 @@ mod tests {
         // Read-only shape (ratified OQ-1): evidence=None => no --usage-file.
         r.evidence = None;
         r.role.tools = vec![];
+        // the ratified OQ-6 answer: an EMPTY level (the explicit diagnostic path) emits no
+        // flag — the active-bundle path never gets here with an empty level.
+        r.reasoning = String::new();
         let argv = AgentRuntime::hermes_argv(&r).unwrap();
         assert_eq!(argv.len(), 2, "-z + prompt only; empty tools => no -t (R2)");
-        for flag in ["-t", "-m", "--provider", "--usage-file"] {
+        for flag in ["-t", "-m", "--provider", "--reasoning", "--usage-file"] {
             assert!(
                 !argv.iter().any(|a| a == flag),
                 "absent sources emit no flag (R2/R3/R5): {flag}"

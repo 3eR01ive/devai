@@ -371,6 +371,12 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // `inbox.snapshot` carries the demand table, the questions and the gate
     // presentations in a single call, so the IPC cost per row is O(1).
     ("inbox_view", "inbox.snapshot"),
+    // The home-plane Reads plus the model-bundle section: ONE snapshot read
+    // and TWO writes (probe/switch) — the only additions to the window's
+    // mutation allowlist besides the two signature acts (REQ-MS-07).
+    ("model_snapshot", "model.snapshot"),
+    ("model_probe", "model.probe"),
+    ("model_switch", "model.switch"),
     // Merged multi-home reads (REQ-HOME-04/05): live attributed views over
     // the enabled homes of the registry, published as home-plane Reads.
     ("homes_list", "home.list"),
@@ -387,6 +393,26 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
 pub const SIGNATURE_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_approve", "task.approve"),
     ("task_reject", "task.reject"),
+];
+
+/// The model-bundle mutations the section may reach (REQ-MS-07): the window
+/// gets EXACTLY three model commands — one read (`model.snapshot`) and these
+/// two writes (probe, switch). No other mutation is reachable, and the
+/// allowlist test below fails on any fifth pair.
+#[allow(dead_code)] // consumed by the plane tests below
+pub const MODEL_MUTATION_COMMANDS: &[(&str, &str)] = &[
+    ("model_probe", "model.probe"),
+    ("model_switch", "model.switch"),
+];
+
+/// The WHOLE mutation allowlist of the window: the two human signature acts
+/// plus the two model-bundle writes — nothing else.
+#[allow(dead_code)] // consumed by the plane tests below
+pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
+    ("task_approve", "task.approve"),
+    ("task_reject", "task.reject"),
+    ("model_probe", "model.probe"),
+    ("model_switch", "model.switch"),
 ];
 
 /// The registry MANAGEMENT mapping (REQ-HOME-05: reading domain records
@@ -867,6 +893,53 @@ pub fn execution_liveness(
     Ok(state.api().exec_liveness(&exec_id)?)
 }
 
+/// The model-bundle section (REQ-MS-07): ONE read for the whole screen — the
+/// bundle in force, its single status field, the declared bundles, the
+/// history, the refusal banner and the runs in flight. The window never
+/// composes this from several operations and never reaches the store.
+#[tauri::command]
+pub fn model_snapshot(state: State<AppState>) -> Result<devai_api::ModelSnapshot, UiError> {
+    Ok(state.api().model_snapshot()?)
+}
+
+/// Probe one DECLARED bundle (REQ-MS-03): the same operation the console
+/// calls, so the verdict vocabulary cannot drift between surfaces. A probe
+/// WRITES its `model.probe` event, so it must not ride the window's
+/// read-only observation handle (the `task_approve` precedent, 08.11: the
+/// read-only handle refuses with «attempt to write a readonly database»);
+/// it goes through the same write path the CLI uses.
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_probe(
+    state: State<AppState>,
+    bundle_id: String,
+) -> Result<devai_api::ProbeView, UiError> {
+    let (home, actor) = {
+        let s = state.session();
+        (s.home.clone(), s.actor.clone())
+    };
+    let api = state.write_api(&home, &actor)?;
+    Ok(api.model_probe(&bundle_id)?)
+}
+
+/// Switch to one DECLARED bundle (REQ-MS-04) — the operator's act, probed
+/// first, applied atomically, recorded in history. It runs on the WRITE
+/// handle for the same reason the signature acts do: the window observes the
+/// home read-only, a mutation goes through the same `Api::open` path the CLI
+/// uses.
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_switch(
+    state: State<AppState>,
+    bundle_id: String,
+    reason: String,
+) -> Result<devai_api::SwitchResultView, UiError> {
+    let (home, actor) = {
+        let s = state.session();
+        (s.home.clone(), s.actor.clone())
+    };
+    let api = state.write_api(&home, &actor)?;
+    Ok(api.model_switch(&bundle_id, &reason)?)
+}
+
 /// The human-wait section (REQ-GATE-01..10), published as one command at
 /// the address the navigation already owns (#/inbox): every point where
 /// the platform stands on the operator — APPROVAL / WAITING_FOR_INPUT /
@@ -1056,20 +1129,21 @@ mod tests {
     use devai_api::ParagraphSource;
     use devai_core::types::ArtifactKind;
 
-    /// REQ-SIGN-05 AC4 (was REQ-UI-02 AC2): every data command's source is a
+    /// REQ-SIGN-05 AC4 / REQ-MS-07: every data command's source is a
     /// published registry entry. The data plane stays Read-only; the ONLY
-    /// Mutation-class commands reachable from the window are the two
-    /// signature acts in `SIGNATURE_MUTATION_COMMANDS` — (a) every pair
-    /// resolves to a published operation, (b) Read outside the allowlist and
-    /// Mutation inside it, (c) the set of Mutation commands equals the
-    /// allowlist exactly.
+    /// Mutation-class commands reachable from the window are the four pairs
+    /// of `WINDOW_MUTATION_COMMANDS` (two signature acts + probe/switch) —
+    /// (a) every pair resolves to a published operation, (b) Read outside
+    /// the allowlist and Mutation inside it, (c) the set of Mutation
+    /// commands equals the allowlist exactly, so ANY other mutating command
+    /// fails this test.
     #[test]
     fn every_command_operation_is_a_registered_operation() {
         let ops = devai_api::operations();
         let by_name: std::collections::HashMap<&str, &OpDescriptor> =
             ops.iter().map(|o| (o.name, o)).collect();
         assert!(!COMMAND_OPERATIONS.is_empty());
-        let in_allowlist = |cmd: &str| SIGNATURE_MUTATION_COMMANDS.iter().any(|(c, _)| *c == cmd);
+        let in_allowlist = |cmd: &str| WINDOW_MUTATION_COMMANDS.iter().any(|(c, _)| *c == cmd);
         for (cmd, op) in COMMAND_OPERATIONS {
             let d = by_name
                 .get(op)
@@ -1078,7 +1152,7 @@ mod tests {
                 assert_eq!(
                     d.class,
                     devai_api::OpClass::Mutation,
-                    "`{cmd}` is a listed signature mutation but `{op}` is not a Mutation"
+                    "`{cmd}` is a listed window mutation but `{op}` is not a Mutation"
                 );
             } else {
                 assert_eq!(
@@ -1099,15 +1173,12 @@ mod tests {
             })
             .map(|(cmd, _)| *cmd)
             .collect();
-        let allow: Vec<&str> = SIGNATURE_MUTATION_COMMANDS
-            .iter()
-            .map(|(c, _)| *c)
-            .collect();
+        let allow: Vec<&str> = WINDOW_MUTATION_COMMANDS.iter().map(|(c, _)| *c).collect();
         assert_eq!(
             mutation_cmds, allow,
-            "the signature allowlist is exactly two commands"
+            "the window's mutation allowlist is exactly the four listed commands"
         );
-        for (cmd, op) in SIGNATURE_MUTATION_COMMANDS {
+        for (cmd, op) in WINDOW_MUTATION_COMMANDS {
             assert!(
                 by_name
                     .get(op)
@@ -1564,10 +1635,12 @@ mod tests {
             .map(|(cmd, _)| *cmd)
             .collect();
         mutations.sort_unstable();
+        // REQ-MS-07: the allowlist grew by exactly the two model writes —
+        // probe and switch — and NOTHING else may appear here.
         assert_eq!(
             mutations,
-            vec!["task_approve", "task_reject"],
-            "the window's only mutations are the two signature acts"
+            vec!["model_probe", "model_switch", "task_approve", "task_reject"],
+            "the window's only mutations are the two signature acts plus probe/switch"
         );
     }
 

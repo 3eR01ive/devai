@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use chrono::Utc;
 use devai_core::types::*;
 use devai_core::workflow;
-use devai_runtime::{Engine, Gate};
+use devai_runtime::{Engine, Gate, RuntimeError};
 use devai_store::{ArtifactDraft, Store, seed};
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -501,7 +501,9 @@ fn failed_adapter_leaves_workflow_untouched() {
             provider: "telepathy".into(),
             model: "".into(),
             runtime: "test".into(),
+            reasoning: "high".into(),
             created_at: Utc::now(),
+            active: false,
         })
         .unwrap();
     let engine = mk_engine(&store);
@@ -552,7 +554,9 @@ fn form_agent(store: &Store, name: &str) {
             provider: name.into(),
             model: "".into(),
             runtime: "test".into(),
+            reasoning: "high".into(),
             created_at: Utc::now(),
+            active: false,
         })
         .unwrap();
 }
@@ -1915,7 +1919,7 @@ fn rework_with_new_commit_still_reaches_qa() {
 use devai_runtime::evaluation::{
     CheckOutcome, EvaluationBlock, GateOutcome, ProbeState, ProfileIdentity, QualityReportDoc,
 };
-use devai_runtime::{REWORK_CONTEXT_LABEL, RuntimeError, build_user_prompt, rework_context};
+use devai_runtime::{REWORK_CONTEXT_LABEL, build_user_prompt, rework_context};
 use devai_store::config::{ReworkPolicy, factory_rework_policies, load_rework_policies};
 
 /// The table exactly as the platform ships it — the same bytes the engine
@@ -3095,4 +3099,134 @@ fn analyst_run_stamps_the_human_name_on_the_task() {
         .find(|e| e.kind == event_kind::REQUIREMENTS_PUBLISHED)
         .expect("publication event");
     assert_eq!(ev.payload[json_field::HUMAN_NAME].as_str(), Some(name));
+}
+
+/// REQ-MS-04 AC5 (task 01a1b71f): a run with NO explicit agent asks for the
+/// platform's ACTIVE model bundle. With no marked record, the platform
+/// refuses typed BEFORE any driver starts — the old `mock` literal fallback
+/// is exactly the silent dead-driver passage the bundle surface exists to
+/// end (ASM-9). No execution row is created by the refusal.
+#[test]
+fn a_run_without_an_explicit_agent_refuses_when_no_bundle_is_marked() {
+    let (_d, store) = store();
+    let t = Task::new(
+        "no bundle marked",
+        "a run without --agent must not fall back to mock",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    let engine = mk_engine(&store);
+
+    let err = engine
+        .advance(&t.id.to_string(), "", "tester")
+        .expect_err("no marked bundle = a typed refusal");
+    assert!(
+        matches!(err, RuntimeError::NoActiveBundle),
+        "expected NoActiveBundle, got: {err}"
+    );
+    assert!(
+        store.list_executions(Some(t.id)).unwrap().is_empty(),
+        "the refusal happens before any execution row or driver launch"
+    );
+}
+
+/// REQ-MS-04 AC5 / REQ-MS-05: with a marked record, the SAME empty agent
+/// argument runs the marked bundle — and every execution row carries the
+/// bundle STAMP copied off the record at start (all attempts of a stage
+/// share it; the caller never supplies it).
+#[test]
+fn a_run_without_an_explicit_agent_uses_the_marked_bundle_and_stamps_rows() {
+    use devai_store::BundleSwitch;
+
+    let (_d, store) = store();
+    let t = Task::new(
+        "marked bundle runs",
+        "the run takes the agent of the active bundle",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    // The seeded `mock` record becomes the ONE bundle in force, through the
+    // same store door the switch uses (no test-only back door).
+    store
+        .apply_bundle_switch(&BundleSwitch {
+            agent: "mock".into(),
+            driver: "mock".into(),
+            llm_provider: String::new(),
+            model: String::new(),
+            reasoning: "high".into(),
+            actor: "tester".into(),
+            payload: serde_json::json!({"outcome": "applied"}),
+            now: Utc::now(),
+        })
+        .unwrap();
+
+    let engine = mk_engine(&store);
+    let report = engine.advance(&t.id.to_string(), "", "tester").unwrap();
+    assert!(
+        matches!(report.gate, Gate::WaitingApproval),
+        "the marked mock bundle drives the run to the human gate: {:?}",
+        report.gate
+    );
+
+    let execs = store.list_executions(Some(t.id)).unwrap();
+    assert!(!execs.is_empty());
+    for e in &execs {
+        let b = e
+            .bundle
+            .as_ref()
+            .expect("every new execution row carries the bundle stamp");
+        assert_eq!(b.driver, "mock");
+        assert_eq!(b.llm_provider, "", "the seeded mock names no LLM-provider");
+        assert_eq!(b.model, "");
+        assert_eq!(
+            b.reasoning, "high",
+            "the ratified OQ-6 answer: the level is stamped"
+        );
+    }
+}
+
+/// the ratified OQ-6 answer: the marked bundle carries no
+/// reasoning level → the bundle is INCOMPLETE and the run does NOT start.
+/// No execution row and no driver call are made.
+#[test]
+fn a_marked_bundle_without_a_reasoning_level_refuses_the_run() {
+    use devai_store::BundleSwitch;
+
+    let (_d, store) = store();
+    let t = Task::new(
+        "incomplete bundle",
+        "a bundle without a reasoning level must not run",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    // A legacy record forced to be the marked one WITHOUT a level: exactly
+    // the shape a pre-v12 home or a manual row could produce.
+    store
+        .apply_bundle_switch(&BundleSwitch {
+            agent: "mock".into(),
+            driver: "mock".into(),
+            llm_provider: String::new(),
+            model: String::new(),
+            reasoning: String::new(),
+            actor: "tester".into(),
+            payload: serde_json::json!({"outcome": "applied"}),
+            now: Utc::now(),
+        })
+        .unwrap();
+
+    let engine = mk_engine(&store);
+    let err = engine
+        .advance(&t.id.to_string(), "", "tester")
+        .expect_err("an incomplete bundle refuses the run");
+    assert!(
+        matches!(err, RuntimeError::IncompleteBundle),
+        "expected IncompleteBundle, got: {err}"
+    );
+    assert!(
+        store.list_executions(Some(t.id)).unwrap().is_empty(),
+        "the refusal happens before any execution row or driver launch"
+    );
 }

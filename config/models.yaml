@@ -1,0 +1,47 @@
+# Declared MODEL BUNDLES of this home (task 01a1b71f, REQ-MS-01/02).
+#
+# This file is the ONLY allow-list the switch accepts: probe/switch name a
+# bundle by `id`, and no free-form driver/model/LLM-provider/base_url input
+# exists anywhere. Keys live in the environment and in the driver's own
+# config — they are NOT declared here, NOT stored and NOT shown.
+#
+# Fields:
+#   id           handle the probe/switch accept (unique)
+#   label        human name in the section
+#   agent        the agent record NAME this bundle is materialised under
+#   driver       claude | hermes   (mock has no network leg and is refused)
+#   llm_provider the LLM behind the driver; empty = the driver chooses.
+#                Must be empty for `claude` (it picks its own).
+#   model        model name; empty = not passed
+#   reasoning    REQUIRED level of thinking (low|medium|high|…): part of the
+#                bundle, chosen WITH the LLM-provider and the model. A bundle
+#                without it never loads and a run on it does not start.
+#   probe        phrase / timeout_ms / fresh_secs — the probe policy
+#
+# Identity = (agent, driver, llm_provider, model, reasoning): a repeated id or
+# a repeated identity fails the whole load naming both records. Edit a value
+# and re-run `devai init` (the file is created once, never overwritten).
+#
+# The two factory bundles name no model on purpose: the home operator
+# declares exactly the pairs their environment can reach.
+bundles:
+  - id: hermes-default
+    label: Hermes
+    agent: hermes
+    driver: hermes
+    llm_provider: ""
+    model: ""
+    reasoning: high
+    probe:
+      phrase: ping
+      timeout_ms: 20000
+      fresh_secs: 900
+  - id: claude-default
+    label: Claude
+    agent: claude
+    driver: claude
+    reasoning: high
+    probe:
+      phrase: ping
+      timeout_ms: 20000
+      fresh_secs: 900

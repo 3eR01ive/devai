@@ -496,8 +496,8 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
 
     for e in &executions {
         tx.execute(
-            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            "INSERT OR IGNORE INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             rusqlite::params![
                 e.id.to_string(), e.task_id.to_string(), e.role_slug, e.role_version, e.agent_name,
                 e.status.as_str(), json_string(&e.inputs), e.summary, e.error,
@@ -511,6 +511,13 @@ pub fn import(store: &Store, dir: &Path) -> StoreResult<ImportOutcome> {
                 // owner it was opened with — or NULL for a pre-v7 export,
                 // which reads as «owner unknown», never as «dead».
                 e.owner_pid, e.owner_host, e.owner_process_start,
+                // The v11 run stamp travels for the same reason: an imported
+                // history keeps «what ran on what», and a pre-v11 export
+                // stays unstamped instead of gaining a guessed identity.
+                e.bundle.as_ref().map(|b| b.driver.clone()),
+                e.bundle.as_ref().map(|b| b.llm_provider.clone()),
+                e.bundle.as_ref().map(|b| b.model.clone()),
+                e.bundle.as_ref().map(|b| b.reasoning.clone()),
             ],
         )?;
     }

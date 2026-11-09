@@ -471,6 +471,7 @@ fn task_active_lifecycle_through_the_real_binary() {
                 owner_pid: None,
                 owner_host: None,
                 owner_process_start: None,
+                bundle: None,
             })
             .unwrap();
     }

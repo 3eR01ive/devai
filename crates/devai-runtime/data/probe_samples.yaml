@@ -1,0 +1,58 @@
+# Observed provider-refusal samples (task 01a1b71f, REQ-MS-03).
+#
+# These are OBSERVATIONS of 2026-11-07, not a contract: the probe classifies
+# only what this data recognises, and anything else stays `unknown`
+# («не доказано») — never an invented «нет кредитов».
+#
+# Shape: `marker` is matched as a lowercase substring of the stored evidence;
+# `verdict` is a token of the closed ProbeVerdict vocabulary. ORDER MATTERS:
+# the first match wins, so balance/credit wording sits above a bare status
+# code (a 402 body often also names the model). Adding a new observation is a
+# row here, not a code edit.
+samples:
+  - marker: insufficient balance
+    verdict: no_credits
+  - marker: insufficient_quota
+    verdict: no_credits
+  - marker: insufficient quota
+    verdict: no_credits
+  - marker: no credits
+    verdict: no_credits
+  - marker: "402"
+    verdict: no_credits
+  - marker: model not exist
+    verdict: model_not_found
+  - marker: model_not_found
+    verdict: model_not_found
+  - marker: unsupported model
+    verdict: model_not_found
+  - marker: model does not exist
+    verdict: model_not_found
+  - marker: "404"
+    verdict: model_not_found
+  - marker: invalid api key
+    verdict: no_key
+  - marker: no api key
+    verdict: no_key
+  - marker: incorrect api key
+    verdict: no_key
+  - marker: unauthorized
+    verdict: no_key
+  - marker: "401"
+    verdict: no_key
+  - marker: connection refused
+    verdict: network
+  - marker: connection reset
+    verdict: network
+  - marker: network is unreachable
+    verdict: network
+  - marker: temporary failure in name resolution
+    verdict: network
+  - marker: failed to connect
+    verdict: network
+  - marker: dns
+    verdict: network
+  - marker: timed out
+    verdict: timeout
+  - marker: timeout
+    verdict: timeout

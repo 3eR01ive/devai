@@ -603,10 +603,26 @@ impl RoleDefinition {
 pub struct AgentInstance {
     pub id: Id,
     pub name: String,
+    /// The DRIVER (`mock`/`claude`/`hermes`) — this store column is NOT the
+    /// LLM-provider; the config vocabulary is `driver`/`llm_provider`/`model`
+    /// (REQ-MS-01). The LLM-provider rides `runtime` below.
     pub provider: String,
     pub model: String,
+    /// The LLM-provider for drivers that spell one (empty/`local` = not
+    /// set, the driver chooses). Named `runtime` for storage-compat; the
+    /// read paths that speak the config vocabulary call it `llm_provider`.
     pub runtime: String,
+    /// The REASONING LEVEL of the selected model (the ratified OQ-6 answer):
+    /// part of the bundle, chosen together with the LLM-provider
+    /// and the model. Empty = the bundle is INCOMPLETE and a run on it does
+    /// not start — it is never silently delegated to the driver's default.
+    #[serde(default)]
+    pub reasoning: String,
     pub created_at: Timestamp,
+    /// REQ-MS-02/04: this record is the ONE marked bundle in force (a
+    /// partial unique index keeps it unique). `false` = not in force.
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -720,10 +736,304 @@ pub struct RoleExecution {
     /// enough, because a recycled pid would fake liveness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_process_start: Option<i64>,
+    /// The model-bundle STAMP of this run (REQ-MS-05): driver, LLM-provider
+    /// and model captured by the PLATFORM from the agent record at start —
+    /// never supplied by the caller, never rewritten afterwards (a later
+    /// `model.switch` changes the agent record, not this row). `None` on rows
+    /// written before the v11 rung: they read as «связка не записана», never
+    /// as an empty identity and never re-derived from `agent_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<ExecutionBundle>,
 }
 
 fn default_attempt() -> u32 {
     1
+}
+
+/// The executed model bundle as STORED on one execution row (REQ-MS-01/05):
+/// four independent fields — the DRIVER (`mock`/`claude`/`hermes`), the
+/// LLM-provider behind it (empty = the driver chooses), the model (empty =
+/// not passed) and the REASONING LEVEL (the ratified OQ-6 answer: part of the selection,
+/// never defaulted). «Just provider» is never a name for these: the
+/// store column `agent_instances.provider` holds the DRIVER, its `runtime`
+/// column holds the LLM-provider; the config vocabulary is
+/// `driver`/`llm_provider`/`model`/`reasoning`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ExecutionBundle {
+    pub driver: String,
+    #[serde(default)]
+    pub llm_provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning: String,
+}
+
+impl ExecutionBundle {
+    pub fn new(driver: &str, llm_provider: &str, model: &str, reasoning: &str) -> Self {
+        Self {
+            driver: driver.to_string(),
+            llm_provider: llm_provider.to_string(),
+            model: model.to_string(),
+            reasoning: reasoning.to_string(),
+        }
+    }
+
+    /// The config vocabulary of the identity, for events and the snapshot.
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            (json_field::DRIVER): self.driver,
+            (json_field::LLM_PROVIDER): self.llm_provider,
+            (json_field::MODEL): self.model,
+            (json_field::REASONING): self.reasoning,
+        })
+    }
+}
+
+/// The closed probe-verdict vocabulary (REQ-MS-03). `timeout` and `unknown`
+/// are «не доказано» — a dead `no_credits` is never invented from them.
+/// `not_probeable` is what `mock` is: no process is started for it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    Ok,
+    NoCredits,
+    ModelNotFound,
+    NoKey,
+    Network,
+    Timeout,
+    Unknown,
+    NotProbeable,
+}
+
+impl ProbeVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NoCredits => "no_credits",
+            Self::ModelNotFound => "model_not_found",
+            Self::NoKey => "no_key",
+            Self::Network => "network",
+            Self::Timeout => "timeout",
+            Self::Unknown => "unknown",
+            Self::NotProbeable => "not_probeable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Self::Ok,
+            Self::NoCredits,
+            Self::ModelNotFound,
+            Self::NoKey,
+            Self::Network,
+            Self::Timeout,
+            Self::Unknown,
+            Self::NotProbeable,
+        ]
+        .into_iter()
+        .find(|v| v.as_str() == s)
+    }
+
+    /// The verdicts that PROVE the bundle dead — only these may be shown as
+    /// «не работает» with a reason (REQ-MS-03/06).
+    pub fn proves_dead(&self) -> bool {
+        matches!(
+            self,
+            Self::NoCredits | Self::ModelNotFound | Self::NoKey | Self::Network
+        )
+    }
+
+    /// `timeout`/`unknown`: not dead, not alive — «не доказано».
+    pub fn not_proven(&self) -> bool {
+        matches!(self, Self::Timeout | Self::Unknown)
+    }
+
+    pub const ALL: [Self; 8] = [
+        Self::Ok,
+        Self::NoCredits,
+        Self::ModelNotFound,
+        Self::NoKey,
+        Self::Network,
+        Self::Timeout,
+        Self::Unknown,
+        Self::NotProbeable,
+    ];
+}
+
+/// The closed refusal reasons of a switch (REQ-MS-05): the platform never
+/// derives one — the human picks it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchReason {
+    Manual,
+    Limits,
+    Error,
+}
+
+impl SwitchReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Limits => "limits",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Manual, Self::Limits, Self::Error]
+            .into_iter()
+            .find(|r| r.as_str() == s)
+    }
+}
+
+/// Freshness of the evidence behind a snapshot status (REQ-MS-05): derived
+/// from the last probe time and the DECLARED window, never stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+impl Freshness {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The ONE operator-word dictionary of the model-bundle surface (R3 quality
+// return). The API snapshot, the console mirror and the window all read
+// these functions; no consumer keeps its own copy of the mapping. Wire tokens
+// stay frozen (they are stored history), only the words are chosen here.
+// ---------------------------------------------------------------------------
+
+/// The factory probe policy (ASM-4): the home's `models.yaml` carries the
+/// real policy; these are ONLY the defaults the loader and `ProbeRequest`
+/// fall back to. One source for all three defaults (R6 quality return).
+pub const DEFAULT_PROBE_PHRASE: &str = "ping";
+pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 20_000;
+pub const DEFAULT_PROBE_FRESH_SECS: u64 = 900;
+
+/// The closed wire vocabulary of the snapshot's ONE status field (REQ-MS-06).
+/// Producers (the API snapshot) and consumers (console, window) name these
+/// tokens through here, so a new state is added in ONE place — the parity
+/// test below fails if a token has no operator word.
+pub mod status_state {
+    pub const LIVE: &str = "live";
+    pub const NOT_WORKING: &str = "not_working";
+    pub const NOT_PROVEN: &str = "not_proven";
+    pub const NOT_SELECTED: &str = "not_selected";
+    pub const UNKNOWN: &str = "unknown";
+    pub const ALL: [&str; 5] = [LIVE, NOT_WORKING, NOT_PROVEN, NOT_SELECTED, UNKNOWN];
+}
+
+/// The closed wire vocabulary of a switch's OUTCOME (REQ-MS-05): `applied`,
+/// `refused_probe`, `failed`. Stored history keeps these tokens; the API,
+/// the console and the tests compare through this module, never a literal.
+pub mod switch_outcome {
+    pub const APPLIED: &str = "applied";
+    pub const REFUSED_PROBE: &str = "refused_probe";
+    pub const FAILED: &str = "failed";
+    pub const ALL: [&str; 3] = [APPLIED, REFUSED_PROBE, FAILED];
+}
+
+/// Which stored evidence won the status rule (REQ-MS-06): a probe fact or a
+/// finished execution row. One source for the snapshot, the console and the
+/// freshness word.
+pub mod evidence_kind {
+    pub const PROBE: &str = "probe";
+    pub const EXECUTION: &str = "execution";
+}
+
+/// One status word for a snapshot `state` (REQ-MS-06: exactly one word on
+/// screen). An unknown token is never dressed as live or dead.
+pub fn status_word(state: &str) -> &'static str {
+    match state {
+        status_state::LIVE => "живая",
+        status_state::NOT_WORKING => "не работает",
+        status_state::NOT_PROVEN => "не доказано",
+        status_state::NOT_SELECTED => "связка не выбрана",
+        _ => "неизвестно",
+    }
+}
+
+/// The LLM-provider as humans read it (REQ-MS-01 AC2): empty AND the neutral
+/// `local` default both mean «the driver chooses». ONE source — the API, the
+/// console and the window print this word, never a local copy.
+pub fn llm_provider_word(value: &str) -> &str {
+    if value.trim().is_empty() || value == "local" {
+        "не задан — выбирает драйвер"
+    } else {
+        value
+    }
+}
+
+/// An empty model reads «не передаётся» — no substitution (REQ-MS-01 AC2).
+pub fn model_word(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "не передаётся"
+    } else {
+        value
+    }
+}
+
+/// An empty reasoning level reads «связка неполна»: the level is part of the
+/// bundle (the ratified OQ-6 answer), so there is no driver default to show.
+pub fn reasoning_word(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "не задан — связка неполна"
+    } else {
+        value
+    }
+}
+
+/// One failure/reason word. `manual|limits|error` and the honest
+/// «причина не классифицирована» are pass-through (the operator picked that
+/// token); anything unrecognised reads «причина не распознана» — never a
+/// guessed cause.
+pub fn failure_word(code: &str) -> &str {
+    match code {
+        "no_credits" => "нет кредитов",
+        "model_not_found" => "модель не существует",
+        "no_key" => "нет ключа провайдера",
+        "network" => "сеть недоступна",
+        "provider" => "отказ провайдера",
+        "manual" | "limits" | "error" | "причина не классифицирована" => {
+            code
+        }
+        _ => "причина не распознана",
+    }
+}
+
+/// One word for a probe verdict: `ok` is not a failure, timeout/unknown are
+/// «не доказано», mock is «не пробуется».
+pub fn verdict_word(verdict: &str) -> &str {
+    match verdict {
+        "ok" => "успешна",
+        "timeout" => "таймаут — не доказано",
+        "unknown" => "не доказано",
+        "not_probeable" => "не пробуется",
+        other => failure_word(other),
+    }
+}
+
+/// Freshness as the operator reads it. The word names WHICH evidence is
+/// fresh — a run row must never be called «свежая проба» (R8 quality
+/// return: the execution branch was mislabelled on screen).
+pub fn freshness_word(freshness: &str, evidence: Option<&str>) -> &'static str {
+    match (freshness, evidence) {
+        ("fresh", Some(evidence_kind::PROBE)) => "свежая проба",
+        ("fresh", Some(evidence_kind::EXECUTION)) => "свежий прогон",
+        ("fresh", _) => "свежие доказательства",
+        ("stale", Some(evidence_kind::PROBE)) => "проба устарела",
+        ("stale", Some(evidence_kind::EXECUTION)) => "прогон устарел",
+        ("stale", _) => "доказательства устарели",
+        _ => "доказательств нет",
+    }
 }
 
 /// The closed vocabulary of `RoleExecution.failure_class` (REQ-FG-01/03).
@@ -1096,6 +1406,16 @@ pub mod event_kind {
     /// A human took a ratification out of force (RV6): payload names the
     /// revoking decision and the revoked one. The rules file is not touched.
     pub const PROFILE_REVOKED: &str = "profile.revoked";
+    /// One PROBE of a declared model bundle (REQ-MS-03/05): identity,
+    /// verdict from the closed vocabulary, latency, time and the stored
+    /// evidence (exit code, bounded output fragment). No task is involved —
+    /// a probe is a fact about a BUNDLE, not about a run.
+    pub const MODEL_PROBE: &str = "model.probe";
+    /// One SWITCH attempt of the platform's model bundle (REQ-MS-04/05):
+    /// actor, from/to identities, the probe it rested on, the outcome
+    /// (`applied`/`refused_probe`), the refusing verdict, the human-chosen
+    /// reason (`manual`/`limits`/`error`) and whether the agent NAME changed.
+    pub const MODEL_SWITCHED: &str = "model.switched";
 
     /// The COMPLETE enumerable vocabulary of kinds the platform may persist.
     /// Load-time policy validation (the REWORK delivery table in
@@ -1152,6 +1472,8 @@ pub mod event_kind {
         QA_REWORK_GATE_INCOMPARABLE,
         PROFILE_RATIFIED,
         PROFILE_REVOKED,
+        MODEL_PROBE,
+        MODEL_SWITCHED,
     ];
 }
 
@@ -1242,6 +1564,33 @@ pub mod json_field {
     /// `implementation.reported` payloads; `review.recorded`'s rejection text
     /// is read from here (rework-context.yaml: `rationale_field: summary`).
     pub const SUMMARY: &str = "summary";
+    // Model bundles (task 01a1b71f, REQ-MS-01/05/09): the FOUR identity
+    // fields are spelled driver/llm_provider/model/reasoning — «provider»
+    // alone never names them, because the store's `agent_instances.provider`
+    // is the DRIVER. `reasoning` is the level of thinking, part of the
+    // selection (ratified OQ-6 answer).
+    pub const DRIVER: &str = "driver";
+    pub const LLM_PROVIDER: &str = "llm_provider";
+    pub const MODEL: &str = "model";
+    pub const REASONING: &str = "reasoning";
+    /// Probe/switch event payloads: the bundle id, the verdict from the
+    /// closed vocabulary, the measured latency, the stored evidence and the
+    /// switch outcome vocabulary (`applied`/`refused_probe`).
+    pub const BUNDLE_ID: &str = "bundle_id";
+    pub const BUNDLE: &str = "bundle";
+    pub const LATENCY_MS: &str = "latency_ms";
+    pub const EXIT_CODE: &str = "exit_code";
+    pub const OUTPUT_EXCERPT: &str = "output_excerpt";
+    pub const OUTCOME: &str = "outcome";
+    pub const FROM: &str = "from";
+    pub const TO: &str = "to";
+    pub const PROBE_EVENT: &str = "probe_event";
+    pub const AGENT_CHANGED: &str = "agent_changed";
+    pub const FRESHNESS: &str = "freshness";
+    /// The STEP of a `failed` switch (REQ-MS-05: «шаг отказа»): the
+    /// transaction that rolled back names the step it died on. Written only
+    /// on the `failed` outcome — an applied/refused switch carries no step.
+    pub const FAILURE_STEP: &str = "failure_step";
 
     /// The COMPLETE enumerable vocabulary of payload field names the platform
     /// itself mints. Load-time policy validation checks user-authored field
@@ -1293,5 +1642,142 @@ pub mod json_field {
         ROLE,
         STATUS,
         SUMMARY,
+        DRIVER,
+        LLM_PROVIDER,
+        MODEL,
+        REASONING,
+        BUNDLE_ID,
+        BUNDLE,
+        LATENCY_MS,
+        EXIT_CODE,
+        OUTPUT_EXCERPT,
+        OUTCOME,
+        FROM,
+        TO,
+        PROBE_EVENT,
+        AGENT_CHANGED,
+        FRESHNESS,
+        FAILURE_STEP,
     ];
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    /// R3 quality return: ONE dictionary backs the API, the console and the
+    /// window. The stored tokens never drift; unknown input is never guessed.
+    #[test]
+    fn the_failure_words_are_one_closed_dictionary() {
+        assert_eq!(failure_word("no_credits"), "нет кредитов");
+        assert_eq!(failure_word("model_not_found"), "модель не существует");
+        assert_eq!(failure_word("no_key"), "нет ключа провайдера");
+        assert_eq!(failure_word("network"), "сеть недоступна");
+        assert_eq!(failure_word("provider"), "отказ провайдера");
+        // The human-chosen reason tokens are pass-through, not re-worded.
+        assert_eq!(failure_word("manual"), "manual");
+        assert_eq!(failure_word("limits"), "limits");
+        assert_eq!(failure_word("error"), "error");
+        assert_eq!(
+            failure_word("причина не классифицирована"),
+            "причина не классифицирована"
+        );
+        // Not proven = not named.
+        assert_eq!(failure_word("самопридуманное"), "причина не распознана");
+    }
+
+    #[test]
+    fn every_state_and_freshness_has_one_word() {
+        for (token, word) in [
+            (status_state::LIVE, "живая"),
+            (status_state::NOT_WORKING, "не работает"),
+            (status_state::NOT_PROVEN, "не доказано"),
+            (status_state::NOT_SELECTED, "связка не выбрана"),
+            (status_state::UNKNOWN, "неизвестно"),
+            ("whatever", "неизвестно"),
+        ] {
+            assert_eq!(status_word(token), word);
+        }
+        // The word names WHICH evidence is fresh — a run is not a probe.
+        assert_eq!(
+            freshness_word("fresh", Some(evidence_kind::PROBE)),
+            "свежая проба"
+        );
+        assert_eq!(
+            freshness_word("fresh", Some(evidence_kind::EXECUTION)),
+            "свежий прогон"
+        );
+        assert_eq!(
+            freshness_word("stale", Some(evidence_kind::PROBE)),
+            "проба устарела"
+        );
+        assert_eq!(
+            freshness_word("stale", Some(evidence_kind::EXECUTION)),
+            "прогон устарел"
+        );
+        assert_eq!(freshness_word("unknown", None), "доказательств нет");
+    }
+
+    /// R2 quality return: the dictionaries are the ONLY source of the wire
+    /// tokens. Adding a status without a word (or a word without a token)
+    /// breaks this parity test instead of drifting surface by surface.
+    #[test]
+    fn the_status_dictionary_is_covered_by_the_word_function() {
+        for state in status_state::ALL
+            .iter()
+            .filter(|s| **s != status_state::UNKNOWN)
+        {
+            let word = status_word(state);
+            assert!(!word.is_empty(), "status `{state}` has no operator word");
+            assert_ne!(
+                word,
+                status_word("token-outside-the-dictionary"),
+                "status `{state}` falls through to the unknown word (only `unknown` may)"
+            );
+        }
+        // The unknown token IS the honest fallback word — nothing else is.
+        assert_eq!(
+            status_word(status_state::UNKNOWN),
+            status_word("token-outside-the-dictionary")
+        );
+        // Distinct tokens must not collapse into one word on screen.
+        let mut words: Vec<&str> = status_state::ALL.iter().map(|s| status_word(s)).collect();
+        words.sort_unstable();
+        words.dedup();
+        assert_eq!(words.len(), status_state::ALL.len());
+    }
+
+    /// The switch outcomes are a closed set: the API writes only these, the
+    /// console compares through them.
+    #[test]
+    fn the_switch_outcome_vocabulary_is_closed() {
+        assert_eq!(switch_outcome::ALL, ["applied", "refused_probe", "failed"]);
+        let mut seen = switch_outcome::ALL.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), switch_outcome::ALL.len());
+    }
+
+    /// One source of the empty-field words (R5 quality return): the API and
+    /// the console both print these, so the words are pinned here once.
+    #[test]
+    fn the_empty_bundle_fields_read_as_words_not_defaults() {
+        for empty in ["", "   ", "local"] {
+            assert_eq!(llm_provider_word(empty), "не задан — выбирает драйвер");
+        }
+        assert_eq!(llm_provider_word("deepseek"), "deepseek");
+        assert_eq!(model_word(""), "не передаётся");
+        assert_eq!(model_word("m-1"), "m-1");
+        assert_eq!(reasoning_word(""), "не задан — связка неполна");
+        assert_eq!(reasoning_word("high"), "high");
+    }
+
+    /// The factory probe policy is ONE source: the loader and the probe
+    /// request both read these consts (R6 quality return).
+    #[test]
+    fn the_probe_defaults_are_the_documented_policy() {
+        assert_eq!(DEFAULT_PROBE_PHRASE, "ping");
+        assert_eq!(DEFAULT_PROBE_TIMEOUT_MS, 20_000);
+        assert_eq!(DEFAULT_PROBE_FRESH_SECS, 900);
+    }
 }

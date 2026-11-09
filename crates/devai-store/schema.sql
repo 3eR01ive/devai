@@ -45,6 +45,16 @@
 -- the 'single-writer migration' marker and one fact event per group) so
 -- the index DDL lands without aborting the ladder.
 
+-- v11 makes the model bundle a stored FACT (task 01a1b71f, REQ-MS-02/05):
+-- `agent_instances.active` marks the ONE agent record in force (pinned by
+-- the partial unique index below; no marker = «связка не выбрана», and the
+-- built-in fallback is never substituted), and `role_executions` carries
+-- the run STAMP — driver, LLM-provider and model copied off the agent
+-- record at start, never accepted from a caller, never rewritten. Rows
+-- written before v11 keep NULL and read as «связка не записана». Existing
+-- v10 databases gain the same shape additively via
+-- migrations/011_model_bundles.sql.
+
 CREATE TABLE projects(
   id           TEXT PRIMARY KEY,
   name         TEXT NOT NULL UNIQUE,
@@ -175,8 +185,19 @@ CREATE TABLE agent_instances(
   provider   TEXT NOT NULL DEFAULT '',
   model      TEXT NOT NULL DEFAULT '',
   runtime    TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL
+  -- v12 (the ratified OQ-6 answer): the reasoning level of the selection — part of the
+  -- bundle, not a driver default. '' on a row that is not a declared bundle.
+  reasoning  TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  -- v11: exactly ONE marked agent record is «the bundle in force». The
+  -- partial unique index below refuses a second marked row on every write
+  -- path (the artifacts_single_current / role_executions_single_writer
+  -- discipline). 0 = not in force.
+  active     INTEGER NOT NULL DEFAULT 0
 );
+CREATE UNIQUE INDEX agent_instances_single_active
+  ON agent_instances(active)
+  WHERE active = 1;
 
 CREATE TABLE role_executions(
   id                TEXT PRIMARY KEY,
@@ -209,7 +230,14 @@ CREATE TABLE role_executions(
   -- owner», a triage signal, never «dead».
   owner_pid          INTEGER NULL,
   owner_host         TEXT NULL,
-  owner_process_start INTEGER NULL
+  owner_process_start INTEGER NULL,
+  -- v11 run stamp (REQ-MS-05): driver, LLM-provider and model copied off the
+  -- agent record by the platform at start. NULL = written before v11 →
+  -- «связка не записана» (never an empty identity, never re-derived).
+  driver             TEXT NULL,
+  llm_provider       TEXT NULL,
+  model              TEXT NULL,
+  reasoning          TEXT NULL
 );
 CREATE INDEX exec_task ON role_executions(task_id);
 -- The single-writer invariant pinned at the database level (REQ-SW-01,
@@ -222,6 +250,11 @@ CREATE INDEX exec_task ON role_executions(task_id);
 CREATE UNIQUE INDEX role_executions_single_writer
   ON role_executions(task_id)
   WHERE status = 'RUNNING';
+-- Addressed reads of the model-bundle surface (rung 013): the RUNNING list
+-- and the newest finished row of one identity stamp.
+CREATE INDEX role_executions_status ON role_executions(status);
+CREATE INDEX role_executions_stamp
+  ON role_executions(driver, llm_provider, model, reasoning, finished_at);
 
 -- Evaluation profile history: every (name, version) ever seeded, with the
 -- raw YAML body, so a recorded profile identity in an old execution stays

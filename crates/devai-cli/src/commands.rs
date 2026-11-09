@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::outln;
 use crate::{
-    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ProfileCmd, ProjectCmd, QuestionCmd,
-    RoleCmd, TaskCmd,
+    AgentCmd, ApiCmd, ArtifactCmd, Cmd, ContractCmd, ExecCmd, ModelCmd, ProfileCmd, ProjectCmd,
+    QuestionCmd, RoleCmd, TaskCmd,
 };
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
@@ -97,6 +97,7 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
         Cmd::Question(c) => question(ctx, c, json),
         Cmd::Role(c) => role(ctx, c, json),
         Cmd::Agent(c) => agent(ctx, c, json),
+        Cmd::Model(c) => model(ctx, c, json),
         Cmd::Contract(c) => contract(ctx, c, json),
         Cmd::Exec(c) => exec(ctx, c, json),
         Cmd::Api(c) => api_registry(ctx, c, json),
@@ -720,7 +721,14 @@ fn task_execution(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             agent,
             workspace,
             force_reaudit,
-        } => task_run(ctx, &id, &agent, workspace.as_deref(), force_reaudit, json)?,
+        } => task_run(
+            ctx,
+            &id,
+            agent.as_deref().unwrap_or(""),
+            workspace.as_deref(),
+            force_reaudit,
+            json,
+        )?,
         TaskCmd::Merge {
             id,
             workspace,
@@ -2056,6 +2064,225 @@ fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The console error of the model section: the OPERATION and the TYPED code
+/// lead, so the console shows the same machine token the API answer carries
+/// (REQ-MS-07 AC6: «с теми же вердиктами и кодами») and the failing step is
+/// never lost on the way out (R7).
+fn model_error(op: &'static str, e: devai_api::ApiError) -> anyhow::Error {
+    anyhow::anyhow!("model.{op}: {}: {e}", e.code())
+}
+
+/// The model-bundle section (REQ-MS-07): the console mirror of the window.
+/// Every line is a stored fact or a platform-computed field of the ONE
+/// snapshot; nothing is re-derived here. Each part is its own renderer
+/// (R1 quality return: one responsibility per step).
+fn model(ctx: &Ctx, cmd: ModelCmd, json: bool) -> Result<()> {
+    match cmd {
+        ModelCmd::List => model_list(ctx, json),
+        ModelCmd::Probe { id } => model_probe(ctx, &id, json),
+        ModelCmd::Switch { id, reason } => model_switch(ctx, &id, &reason, json),
+    }
+}
+
+fn model_list(ctx: &Ctx, json: bool) -> Result<()> {
+    let s = ctx
+        .api()
+        .model_snapshot()
+        .map_err(|e| model_error("list", e))?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&s)?);
+        return Ok(());
+    }
+    print_active(&s.active);
+    print_status(&s.status);
+    print_banner(s.failures.as_ref());
+    print_declared(&s.declared);
+    print_running(&s.running);
+    print_history(&s.history);
+    Ok(())
+}
+
+/// The record in force; a record outside the declared list says so instead of
+/// borrowing a label.
+fn print_active(active: &Option<devai_api::ActiveBundleView>) {
+    match active {
+        None => outln!("связка не выбрана — `devai model switch <id>`"),
+        Some(a) => {
+            let label = a
+                .label
+                .clone()
+                .unwrap_or_else(|| "(не объявлена в конфиге)".into());
+            let id = a.id.clone().unwrap_or_else(|| "—".into());
+            outln!("действующая связка: {label} [{id}]");
+            outln!("  агент: {}", a.agent);
+            outln!("  драйвер: {}", a.driver);
+            outln!("  LLM-провайдер: {}", a.llm_provider_text);
+            outln!("  модель: {}", a.model_text);
+            outln!("  уровень размышления: {}", a.reasoning_text);
+        }
+    }
+}
+
+/// The ONE status field, with latency, reason, evidence and freshness — all
+/// words the platform computed.
+fn print_status(st: &devai_api::BundleStatusView) {
+    let latency = st
+        .latency_ms
+        .map(|l| format!(" {l} мс"))
+        .unwrap_or_default();
+    outln!("статус: {}{latency}", st.state_text);
+    if let Some(reason) = &st.reason_text {
+        outln!("  причина: {reason}");
+    }
+    if let Some(at) = st.evidence_at {
+        outln!(
+            "  доказательство: {} · {}",
+            st.evidence.as_deref().unwrap_or("—"),
+            at.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+    if st.probe_older {
+        outln!("  проба старее проваленной строки исполнения");
+    }
+    outln!("  свежесть: {}", st.freshness_text);
+}
+
+/// The refusal banner and its offer; it never applies anything.
+fn print_banner(banner: Option<&devai_api::FailuresBanner>) {
+    let Some(b) = banner else { return };
+    outln!("▲ {}", b.text);
+    match &b.suggestion {
+        Some(id) => outln!("  предложение: `devai model switch {id}`"),
+        None => outln!("  живой связки со свежей пробой нет — предложения нет"),
+    }
+}
+
+/// The declared list — all rows, no paging and no «+N ещё».
+fn print_declared(declared: &[devai_api::ModelBundleView]) {
+    outln!("объявленные связки:");
+    for b in declared {
+        outln!(
+            "  {}{}  {} · {} · {} · уровень {} · агент {}",
+            if b.active { "* " } else { "  " },
+            b.id,
+            b.driver,
+            b.llm_provider_text,
+            b.model_text,
+            b.reasoning_text,
+            b.agent
+        );
+    }
+}
+
+/// The runs in flight: they never decide status, they name the blast radius.
+fn print_running(running: &[devai_api::RunningBundleRow]) {
+    if running.is_empty() {
+        return;
+    }
+    outln!("идущие прогоны:");
+    for r in running {
+        outln!(
+            "  {}  агент {}  с {}",
+            short_str(&r.execution_id),
+            r.agent.as_deref().unwrap_or("—"),
+            r.started_at.format("%Y-%m-%d %H:%M:%S")
+        );
+    }
+}
+
+/// The append-only history: each row is a stored fact, the words are the
+/// platform's.
+fn print_history(history: &[devai_api::ModelEventView]) {
+    outln!("история:");
+    for e in history {
+        let verdict = e
+            .verdict
+            .as_deref()
+            .map(|v| format!(" вердикт={v}"))
+            .unwrap_or_default();
+        let outcome = e
+            .outcome
+            .as_deref()
+            .map(|o| format!(" {o}"))
+            .unwrap_or_default();
+        let cause = e
+            .reason
+            .as_deref()
+            .map(|r| format!(" причина={}", model_failure_word(r)))
+            .unwrap_or_default();
+        outln!(
+            "  {}  {:<14} {:<10} {}{}{}{}",
+            e.at.format("%Y-%m-%d %H:%M:%S"),
+            e.kind,
+            e.actor,
+            e.bundle_id.as_deref().unwrap_or("—"),
+            verdict,
+            outcome,
+            cause
+        );
+        if e.agent_changed {
+            outln!("     смена имени агента: идущие прогоны остаются на прежнем");
+        }
+    }
+}
+
+fn model_probe(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
+    let p = ctx
+        .api()
+        .model_probe(id)
+        .map_err(|e| model_error("probe", e))?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&p)?);
+        return Ok(());
+    }
+    let latency = if p.verdict == devai_core::types::ProbeVerdict::Ok.as_str() {
+        format!("  {} мс", p.latency_ms)
+    } else {
+        String::new()
+    };
+    outln!(
+        "{}  {}{}  exit={:?}",
+        p.bundle_id,
+        p.verdict,
+        latency,
+        p.exit_code
+    );
+    if !p.output_excerpt.is_empty() {
+        outln!("  {}", p.output_excerpt.replace('\n', " "));
+    }
+    Ok(())
+}
+
+fn model_switch(ctx: &Ctx, id: &str, reason: &str, json: bool) -> Result<()> {
+    let r = ctx
+        .api()
+        .model_switch(id, reason)
+        .map_err(|e| model_error("switch", e))?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&r)?);
+    } else if r.outcome == devai_core::types::switch_outcome::APPLIED {
+        outln!(
+            "переключено на {} (проба ok, {} мс, причина {})",
+            r.bundle_id,
+            r.latency_ms,
+            reason
+        );
+    } else {
+        outln!(
+            "не переключено: проба {} — {} мс; запись и отметка не менялись",
+            r.verdict,
+            r.latency_ms
+        );
+    }
+    Ok(())
+}
+
+/// A reason is named only when the evidence proves it; the words come from
+/// the ONE dictionary in core (R3) — never a local copy.
+fn model_failure_word(code: &str) -> &str {
+    devai_core::types::failure_word(code)
 }
 
 fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
