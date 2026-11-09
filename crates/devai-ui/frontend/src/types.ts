@@ -2,6 +2,9 @@
 // Имена полей snake_case: структуры devai-core/devai-api не используют
 // rename_all, enum-токены сериализуются SCREAMING_SNAKE_CASE. UI берёт
 // готовые токены состояний как данные и никогда их не перефразирует.
+import type { LanState } from "./lanState";
+
+export type { LanState };
 
 export interface SessionInfo {
   home: string;
@@ -706,14 +709,39 @@ export interface LanDevice {
 
 // Фактическое состояние доступа. `state` — не намерение, а факт:
 // off | awaiting (сервер поднят, телефон ещё не подключён) | connected.
+// Токены объявлены один раз в ./lanState (LAN_STATES) и сверяются
+// cargo-тестом с Rust-перечислением.
 export interface LanStatus {
-  state: "off" | "awaiting" | "connected";
+  state: LanState;
   address: string | null;
+  /// Действующее (не использованное) приглашение существует.
+  invite_active: boolean;
   url: string | null;
   token: string | null;
   qr_svg: string | null;
+  /// QR не построился — это НЕ то же самое, что «код уже использован».
+  qr_error: string | null;
   reason_code: string | null;
   reason: string | null;
+  /// Не удалось сохранить флаг «был включён»: следующего запуска это
+  /// коснётся, и окно обязано сказать об этом.
+  persist_error: string | null;
   devices: LanDevice[];
   started_at: string | null;
+}
+
+// --- HTTP/JSON-поверхность телефона (task 01a1be98, quality return R9) ---
+// Зеркало конверта POST /rpc: {command, params} → {ok, data | error}.
+// Паритет с Rust-константами RPC_ENVELOPE_FIELDS закреплён cargo-тестом
+// `the_rpc_envelope_is_registered_and_mirrored`.
+
+export interface RpcRequest {
+  command: string;
+  params: Record<string, unknown>;
+}
+
+export interface RpcResponse<T> {
+  ok: boolean;
+  data?: T;
+  error?: UiError;
 }

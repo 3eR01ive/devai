@@ -19,6 +19,8 @@ import type {
   LivenessView,
   ModelSnapshot,
   OpDescriptor,
+  RpcRequest,
+  RpcResponse,
   ProbeView,
   ProgressView,
   Project,
@@ -51,12 +53,13 @@ const useRpc = isBrowserPage && !hasTauriBridge;
 /// POST /rpc: сервер уже знает сессию по HttpOnly-cookie, поэтому токена в
 /// JS нет вовсе (он живёт в адресе ровно один раз — при сканировании).
 async function rpc<T>(command: string, params?: Record<string, unknown>): Promise<T> {
+  const request: RpcRequest = { command, params: params ?? {} };
   let response: Response;
   try {
     response = await fetch("./rpc", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ command, params: params ?? {} }),
+      body: JSON.stringify(request),
     });
   } catch {
     // Оборванная связь — это либо «отключить» на машине, либо смена сети
@@ -72,7 +75,7 @@ async function rpc<T>(command: string, params?: Record<string, unknown>): Promis
       message: "доступ с телефона закрыт — откройте страницу по новому коду",
     };
   }
-  const body = (await response.json()) as { ok: boolean; data?: T; error?: UiError };
+  const body = (await response.json()) as RpcResponse<T>;
   if (!body.ok || body.error) {
     throw body.error ?? { code: "ipc", message: "пустой ответ машины" };
   }

@@ -89,12 +89,14 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::model_probe,
         commands::model_switch,
         // LAN access from the phone (task 01a1be98): the same window-facing
-        // state machine the HTTP surface reads.
-        commands::lan_status,
-        commands::lan_enable,
-        commands::lan_disable,
-        commands::lan_new_invite,
-        commands::lan_disconnect,
+        // state machine the HTTP surface reads. The controls live with the
+        // phone plane (`lan::commands`), which owns their registration and
+        // their dispatch in ONE catalogue.
+        lan::commands::lan_status,
+        lan::commands::lan_enable,
+        lan::commands::lan_disable,
+        lan::commands::lan_new_invite,
+        lan::commands::lan_disconnect,
     ]
 }
 
@@ -108,11 +110,16 @@ pub fn run() {
     // Ratified Q4: the access OUTLIVES the window. While it is on, closing
     // the window only hides it and the process keeps serving; a second
     // launch hands «show» to the running instance instead of starting a
-    // second server (see lan::InstanceGuard).
-    #[cfg(all(unix, not(mobile)))]
-    let instance = match lan::InstanceGuard::acquire(control_home.join("ui-instance.sock")) {
-        Some(guard) => guard,
-        None => return,
+    // second server (see lan::instance). R2: «another instance runs» and
+    // «the handoff socket could not be created» are different answers — the
+    // first exits quietly, the second is visible and the window still opens.
+    let instance = match lan::instance::acquire(control_home.join("ui-instance.sock")) {
+        lan::InstanceAcquire::Acquired(guard) => Some(guard),
+        lan::InstanceAcquire::AlreadyRunning => return,
+        lan::InstanceAcquire::Unavailable(message) => {
+            eprintln!("devai-ui: одиночный экземпляр недоступен: {message}");
+            None
+        }
     };
 
     let lan_for_close = lan.clone();
@@ -144,8 +151,9 @@ pub fn run() {
                 lan: lan.clone(),
             });
             let handle = app.handle().clone();
-            #[cfg(all(unix, not(mobile)))]
-            instance.spawn(handle.clone());
+            if let Some(guard) = instance {
+                guard.spawn(handle.clone());
+            }
             // Ratified Q1 «должен»: an access that was on at the last
             // shutdown comes back on this launch. The token is never
             // persisted — a fresh invitation is issued each time.
