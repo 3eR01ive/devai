@@ -66,9 +66,9 @@ pub use mutations::{
     WorkflowOp,
 };
 pub use quality_gate::{
-    AUDIT_ROLES, AUDIT_RUNNING, AUDIT_RUNNING_LABEL, DENIAL_CODES as QUALITY_GATE_DENIAL_CODES,
+    AUDIT_RUNNING, AUDIT_RUNNING_LABEL, DENIAL_CODES as QUALITY_GATE_DENIAL_CODES,
     NO_CURRENT_REPORT, OPEN_BLOCKERS, QualityGateDenial, QualityGateView, audit_running,
-    quality_gate,
+    is_audit_role, is_live_audit, quality_gate,
 };
 pub use registry::{OpClass, OpDescriptor, RegistryPublication, SURFACE_VERSION, operations};
 pub use signature::{
@@ -429,10 +429,11 @@ impl Api {
             liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
         let terminal = t.state.is_terminal();
         // A live quality audit at the QA gate is a PROCESS, not a human wait
-        // (REQ-QG-09 AC3): the active row carries the platform's words.
-        let note = (t.state == TaskState::Qa
-            && quality_gate::AUDIT_ROLES.contains(&e.role_slug.as_str()))
-        .then(|| quality_gate::AUDIT_RUNNING_LABEL.to_string());
+        // (REQ-QG-09 AC3): the active row carries the platform's words. The
+        // SAME predicate the gate uses decides «live» (rework R1/R4), so an
+        // orphaned row is never labelled as a running audit.
+        let note = (t.state == TaskState::Qa && quality_gate::is_live_audit(e))
+            .then(|| quality_gate::AUDIT_RUNNING_LABEL.to_string());
         ActiveRow {
             id: e.id.to_string(),
             task_id: e.task_id.to_string(),

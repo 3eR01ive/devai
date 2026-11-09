@@ -5,7 +5,11 @@
 //! The conditions mirror `workflow::accept` / `workflow::return_to_rework`
 //! (phase, current quality report, open blocking dependencies) and add the
 //! one presentation fact REQ-QG-09 made explicit: a RUNNING audit is not a
-//! human wait — while the auditor works, neither action is offered.
+//! human wait — while the auditor works, neither action is offered. «Works»
+//! means the owner of the RUNNING row is not provably dead: a reboot or a
+//! killed runner leaves an orphan nobody can close from the window, and
+//! calling that an audit forever would take the gate away from the operator
+//! (rework R1).
 //!
 //! Nothing here writes and nothing is cached: the read is a pure function of
 //! rows the caller already loaded from the store.
@@ -15,6 +19,7 @@ use devai_core::types::{
     TaskDependency, TaskState,
 };
 use devai_core::workflow;
+use devai_runtime::liveness::{self, Liveness};
 use serde::Serialize;
 
 /// A quality audit is running: the gate is not waiting for a human yet.
@@ -27,9 +32,14 @@ pub const OPEN_BLOCKERS: &str = "open_blockers";
 /// Every code the read may return — one dictionary, pinned by a test.
 pub const DENIAL_CODES: &[&str] = &[AUDIT_RUNNING, NO_CURRENT_REPORT, OPEN_BLOCKERS];
 
-/// The roles whose RUNNING execution means «идёт аудит» (the same two the
-/// workflow lets work in QA).
-pub const AUDIT_ROLES: &[&str] = &["quality-auditor", "quality-aggregator"];
+/// The roles that may run ONLY in QA are the audit roles (REQ-QG-09). The
+/// roster is DERIVED from the core's one role/stage table, never restated:
+/// a role the core confines to QA is an audit role by that very fact, so a
+/// third QA role cannot silently lose its «идёт аудит» mark (rework R4).
+pub fn is_audit_role(slug: &str) -> bool {
+    let allowed = workflow::role_allowed_states(slug);
+    allowed.len() == 1 && allowed[0] == TaskState::Qa
+}
 
 /// The label the active-executions view prints for a live audit (REQ-QG-09
 /// AC3: «идёт аудит» is not «ждёт вашего решения»).
@@ -68,11 +78,23 @@ pub struct QualityGateView {
     pub return_denied: Option<QualityGateDenial>,
 }
 
+/// Is this row the audit the gate must wait for? Status alone is not enough
+/// (rework R1): a reboot or a killed runner leaves a RUNNING row nobody owns,
+/// and the liveness doctrine resolves such an orphan only by a human
+/// `exec fail|cancel` — so the gate must not wait for it forever. A provably
+/// DEAD owner is «not running». `Unknown` (no owner recorded, another host,
+/// no `/proc`) still counts as running: an unanswerable question is never
+/// promoted to death, and closing a live audit's gate early would be worse.
+pub fn is_live_audit(e: &RoleExecution) -> bool {
+    e.status == ExecutionStatus::Running
+        && is_audit_role(&e.role_slug)
+        && liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start)
+            != Liveness::Dead
+}
+
 /// Whether a quality audit is live right now.
 pub fn audit_running(executions: &[RoleExecution]) -> bool {
-    executions.iter().any(|e| {
-        e.status == ExecutionStatus::Running && AUDIT_ROLES.contains(&e.role_slug.as_str())
-    })
+    executions.iter().any(is_live_audit)
 }
 
 /// The public gate read: `Some` in QA, `None` anywhere else.
@@ -215,6 +237,23 @@ mod tests {
         }
     }
 
+    fn blocking_dep(task: &Task, blocker_id: devai_core::types::Id) -> TaskDependency {
+        TaskDependency {
+            id: new_id(),
+            task_id: task.id,
+            task_state: TaskState::Qa,
+            task_title: "gate".into(),
+            depends_on_id: blocker_id,
+            depends_on_state: TaskState::Implementation,
+            depends_on_title: "blocker".into(),
+            task_display: "gate".into(),
+            depends_on_display: "blocker".into(),
+            kind: devai_core::types::DependencyKind::Blocks,
+            actor: "user".into(),
+            created_at: Utc::now(),
+        }
+    }
+
     /// The gate exists only at QA; elsewhere neither act is offered.
     #[test]
     fn outside_qa_there_is_no_gate() {
@@ -279,6 +318,47 @@ mod tests {
         assert!(g.accept_denied.unwrap().text.contains(AUDIT_RUNNING_LABEL));
     }
 
+    /// Rework R1: a RUNNING row whose owner is provably dead is an ORPHAN, not
+    /// an audit. The gate must behave exactly as if no run existed — otherwise
+    /// a reboot locks the task out of the window for good (the only resolution
+    /// of an orphan is a human `exec fail|cancel`).
+    #[test]
+    fn an_orphaned_audit_row_does_not_block_the_gate() {
+        let Some(host) = liveness::current_host() else {
+            return; // no `/proc`: nothing is provably dead, nothing to assert
+        };
+        let mut orphan = execution(ExecutionStatus::Running);
+        orphan.owner_pid = Some(i64::MAX);
+        orphan.owner_host = Some(host);
+        let g = quality_gate(
+            &qa_task(),
+            &[report(ArtifactStatus::Current)],
+            &[],
+            &[],
+            &[orphan],
+        )
+        .unwrap();
+        assert!(!g.audit_running, "a dead owner is not a live audit");
+        assert!(g.may_accept && g.may_return);
+        assert_eq!(g.accept_denied, None);
+    }
+
+    /// Rework R4: the audit roster is the core's QA-only rule, not a second
+    /// list. The two QA roles answer «audit»; a role that may run elsewhere
+    /// does not, so the mark can never drift from the table it mirrors.
+    #[test]
+    fn the_audit_roster_is_the_core_rule() {
+        assert!(is_audit_role("quality-auditor"));
+        assert!(is_audit_role("quality-aggregator"));
+        for slug in [
+            "implementation-agent",
+            "requirements-analyst",
+            "unknown-role",
+        ] {
+            assert!(!is_audit_role(slug), "`{slug}` may run outside QA");
+        }
+    }
+
     /// Open blockers hold the acceptance and are enumerated; return is
     /// untouched. The override decision is the only release (the same rule the
     /// operation applies).
@@ -286,20 +366,7 @@ mod tests {
     fn open_blockers_deny_acceptance_with_the_ids() {
         let task = qa_task();
         let blocker_id = new_id();
-        let dep = TaskDependency {
-            id: new_id(),
-            task_id: task.id,
-            task_state: TaskState::Qa,
-            task_title: "gate".into(),
-            depends_on_id: blocker_id,
-            depends_on_state: TaskState::Implementation,
-            depends_on_title: "blocker".into(),
-            task_display: "gate".into(),
-            depends_on_display: "blocker".into(),
-            kind: devai_core::types::DependencyKind::Blocks,
-            actor: "user".into(),
-            created_at: Utc::now(),
-        };
+        let dep = blocking_dep(&task, blocker_id);
         let arts = [report(ArtifactStatus::Current)];
         let g = quality_gate(&task, &arts, &[dep.clone()], &[], &[]).unwrap();
         assert!(!g.may_accept && g.may_return);

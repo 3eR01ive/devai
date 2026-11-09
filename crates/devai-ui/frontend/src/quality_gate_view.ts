@@ -10,14 +10,15 @@
 //   * acceptance never requires the draft, only a non-empty rationale.
 //
 // Nothing here writes, sends or re-groups the report: it is a form helper.
+//
+// Two operator rules are NOT restated here (rework R3): the stored-site
+// wording and the non-empty rationale live once in `form_rules.ts`, consumed
+// by the panel, the signature card and this module — so the surfaces can
+// never disagree.
 import type { QualityGateView } from "./types";
+import { rationaleValid, siteText } from "./form_rules.ts";
 
-/** The non-empty rationale rule (the same one the signature card enforces:
- * `rationale.trim().length > 0`). Declared here so the pure draft module has
- * no runtime dependency chain and stays drivable by `node --test`. */
-function nonEmptyRationale(text: string): boolean {
-  return text.trim().length > 0;
-}
+export { siteText };
 
 /** One editable point of the return draft. */
 export interface ReturnDraftItem {
@@ -33,11 +34,6 @@ export interface ReturnDraftItem {
 }
 
 export type GateAct = "accept" | "return";
-
-/** Site wording: an absent site is named in words, never silently dropped. */
-export function siteText(site: string): string {
-  return site.trim() ? site : "сайт не указан";
-}
 
 /** The draft row of one stored item: requirement = summary, byte for byte. */
 export function draftItemOf(item: { id: string; summary: string; site: string }): ReturnDraftItem {
@@ -120,7 +116,7 @@ export function acceptRationale(rationale: string): string {
  * plus a non-empty rationale (REQ-QG-02 AC4). Nothing else.
  */
 export function canAccept(gate: QualityGateView | null, rationale: string): boolean {
-  return !!gate?.may_accept && nonEmptyRationale(rationale);
+  return !!gate?.may_accept && rationaleValid(rationale);
 }
 
 /**
@@ -143,7 +139,7 @@ export function canReturn(
  */
 export function rationaleHint(act: GateAct, rationale: string, draft: ReturnDraftItem[]): string {
   if (act === "accept") {
-    return nonEmptyRationale(rationale) ? "" : "без непустого обоснования приёмка недоступна";
+    return rationaleValid(rationale) ? "" : "без непустого обоснования приёмка недоступна";
   }
   return composeReturnRationale(rationale, draft).trim() !== ""
     ? ""

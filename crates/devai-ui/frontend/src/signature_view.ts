@@ -101,10 +101,9 @@ export function oqRationaleLines(choices: OqChoice[]): string[] {
 }
 
 /// Подпись доступна, только когда обоснование непустое (REQ-SIGN-04 AC4):
-/// пустая строка и строка из пробелов не подписывают и не отклоняют.
-export function rationaleValid(rationale: string): boolean {
-  return rationale.trim().length > 0;
-}
+/// пустая строка и строка из пробелов не подписывают и не отклоняют. Само
+/// правило живёт один раз — в `form_rules.ts`, вместе с гейтом качества.
+export { rationaleValid } from "./form_rules.ts";
 
 /// Каждому «своему ответу» нужен непустой текст, иначе подпись недоступна.
 export function choicesValid(choices: OqChoice[]): boolean {

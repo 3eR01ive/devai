@@ -228,7 +228,7 @@ export function groupsForFilter(form: HumanForm, selected: string): HumanFormGro
   return chosen ? [chosen] : visibleGroups(form);
 }
 
-/** The site line of one expanded item: an absent site is named in words. */
-export function siteText(it: HumanFormItem): string {
-  return it.site.trim() ? it.site : "сайт не указан";
-}
+/** The site line of one expanded item: an absent site is named in words.
+ * ONE definition, shared with the return draft and the signature card
+ * (rework R3). */
+export { siteText } from "./form_rules.ts";

@@ -569,16 +569,18 @@ fn task_reject_rpc(
 
 /// The QA gate's acceptance from the phone: the SAME operation the window and
 /// the CLI call; the actor marker names the device, the person stays the author
-/// (REQ-QG-07 AC3).
+/// (REQ-QG-07 AC3). The request is decoded once (rework R5) so the phone's
+/// parameter contract is exercised by a test without a Tauri app.
 fn task_accept_rpc(
     app: &tauri::AppHandle,
     device: &DeviceClaim,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, UiError> {
+    let req = QaActRequest::of(params)?;
     to_json(crate::commands::task_accept_as(
         state(app),
-        param_str(params, "id_prefix")?,
-        param_opt_str(params, "rationale"),
+        req.id_prefix,
+        req.rationale,
         Some(actor_for(app, device)),
     )?)
 }
@@ -589,12 +591,30 @@ fn task_return_rpc(
     device: &DeviceClaim,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, UiError> {
+    let req = QaActRequest::of(params)?;
     to_json(crate::commands::task_return_as(
         state(app),
-        param_str(params, "id_prefix")?,
-        param_opt_str(params, "rationale"),
+        req.id_prefix,
+        req.rationale,
         Some(actor_for(app, device)),
     )?)
+}
+
+/// The request shape both QA acts share: the task reference and the operator's
+/// rationale (REQ-QG-07). The platform — not the window — decides whether the
+/// act is legal, so no other condition is decoded here.
+struct QaActRequest {
+    id_prefix: String,
+    rationale: Option<String>,
+}
+
+impl QaActRequest {
+    fn of(params: &serde_json::Value) -> Result<Self, UiError> {
+        Ok(Self {
+            id_prefix: param_str(params, "id_prefix")?,
+            rationale: param_opt_str(params, "rationale"),
+        })
+    }
 }
 
 fn task_progress_rpc(
@@ -951,6 +971,33 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), routed.len(), "a command name is listed twice");
+    }
+
+    /// Rework R5: the phone's QA acts decode the SAME `id_prefix` + `rationale`
+    /// the window sends and mark the device. The write itself is the window's
+    /// own command (shared line), and the store-level act with this actor
+    /// marker is pinned by `devai-api`'s quality_gate_api test — devai-ui must
+    /// not gain the store dependency (REQ-UI-02).
+    #[test]
+    fn the_phone_qa_acts_take_the_reason_and_mark_the_device() {
+        let params = serde_json::json!({"id_prefix": "01a1", "rationale": "вернуть п.1"});
+        let req = QaActRequest::of(&params).unwrap();
+        assert_eq!(req.id_prefix, "01a1");
+        assert_eq!(req.rationale.as_deref(), Some("вернуть п.1"));
+
+        let no_reason = QaActRequest::of(&serde_json::json!({"id_prefix": "01a1"})).unwrap();
+        assert!(no_reason.rationale.is_none(), "the rationale is optional");
+
+        let device = DeviceClaim {
+            name: "Pixel".into(),
+            addr: "192.168.1.42".into(),
+        };
+        assert_eq!(
+            actor_marker("guerrero", &device),
+            "guerrero · телефон: Pixel (192.168.1.42)",
+            "the phone path names the device; the person stays the author"
+        );
+        assert!(QaActRequest::of(&serde_json::json!({})).is_err());
     }
 
     /// R9: the phone surface is registered, not implied. Every control names
