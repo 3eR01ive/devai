@@ -19,8 +19,9 @@
 //! there and then the window opens the machine's page (top level — the session
 //! cookie is SameSite, so an iframe would never receive it).
 //!
-//! Desktop has no pairing state at all: both commands answer `idle`, nothing
-//! navigates, and the window keeps its own flow (REQ-QRAPP-08).
+//! Desktop has no pairing SESSION: nothing is constructed, nothing navigates,
+//! and both commands answer `idle`, so the window keeps its own flow
+//! (REQ-QRAPP-08).
 
 // The pairing handshake is reached by the mobile window only; it stays
 // compiled on every target so its decisions are unit-tested by the same test
@@ -29,10 +30,11 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-use crate::lan::pair::{self, PairLink, PairRefusal};
+use crate::lan::pair::{self, PairLink, PairRefusal, PairStore, PairStoreError, Remembered};
 
 /// The address a refusal belongs on while a home works. A dead NEW invitation
 /// must never cost the working session (ratified Q3, quality return R2): every
@@ -129,6 +131,10 @@ pub fn refusal_task(
 pub enum Resumed {
     /// No home was ever remembered.
     Nothing,
+    /// The remembered record exists but cannot be read: the phone forgot the
+    /// home and says so (quality return R2 — a broken record is not «never
+    /// paired»).
+    Broken(PairStoreError),
     /// The remembered home is not reachable from this network any more.
     Gone(PairRefusal),
     /// Re-open this home with the session the phone already has.
@@ -138,8 +144,13 @@ pub enum Resumed {
 /// Re-open the remembered home — WITHOUT a question: on a top-level page load
 /// the machine itself decides whether the session still lives (a dead one
 /// answers «доступ закрыт»), and only the network comparison is local.
-pub fn resume(remembered: Option<SocketAddr>, local: &[Ipv4Addr]) -> Resumed {
-    let Some(addr) = remembered else {
+pub fn resume(remembered: Remembered, local: &[Ipv4Addr]) -> Resumed {
+    let record = match remembered {
+        Remembered::Absent => return Resumed::Nothing,
+        Remembered::Broken(error) => return Resumed::Broken(error),
+        Remembered::Record(record) => record,
+    };
+    let Some(addr) = record.home else {
         return Resumed::Nothing;
     };
     if !pair::same_network_addr(addr, local) {
@@ -206,157 +217,147 @@ pub fn log_refusal(refusal: PairRefusal) {
 // the window's half: it holds the pending link and answers the two commands
 // ---------------------------------------------------------------------------
 
-#[cfg(mobile)]
-mod mobile {
-    use std::sync::Mutex;
+/// The window's two side effects, behind a trait: the phone's half owns the
+/// webview, a test owns a recorder — so every branch of the wiring (scan,
+/// boot, report, switch, refusal, resume) runs without a device (quality
+/// return R7). Neither method returns a secret-bearing string: `open` answers
+/// only whether the window took the address, because the address carries the
+/// one-time code and must never reach a log.
+pub trait Screen: Send + Sync {
+    /// Carry the ONE window to this page.
+    fn open(&self, url: &str) -> bool;
+    /// Drop the previous home's cookies and its session key (REQ-QRAPP-04 AC3).
+    fn forget_session(&self) -> bool;
+}
 
-    use tauri::{AppHandle, Manager};
-    use tauri_plugin_deep_link::DeepLinkExt;
+/// The log code of a window that refused a navigation (no address, no code:
+/// the address carries the one-time token).
+const NAVIGATE_FAILED: &str = "pair_navigate_failed";
+/// The log code of a webview that could not drop the previous home's cookies.
+const SESSION_NOT_CLEARED: &str = "pair_session_not_cleared";
 
-    use super::*;
-    use crate::lan::net;
-    use crate::lan::pair::{PairStore, PairStoreError};
+/// Everything the pairing knows right now. One lock, so the boot, the scan and
+/// the answer cannot interleave halfway.
+#[derive(Default)]
+struct Inner {
+    /// The home the window is showing (or was told to show).
+    current: Option<SocketAddr>,
+    /// A link the window has to act on, taken by exactly one boot.
+    pending: Option<String>,
+    /// The last raw link this process already handled: `get_current` keeps
+    /// returning the launching intent, and handling it twice would loop
+    /// between the app page and the machine page.
+    handled: Option<String>,
+    /// The digest of that link, so the mark outlives the process (R4).
+    digest: Option<String>,
+    /// The invitation a boot handed to the page; an answer is accepted only
+    /// for this one.
+    asking: Option<PairLink>,
+}
 
-    /// Everything the pairing knows right now. One lock, so the boot, the
-    /// scan and the answer cannot interleave halfway.
-    #[derive(Default)]
-    struct Inner {
-        /// The home the window is showing (or was told to show).
-        current: Option<SocketAddr>,
-        /// A link the window has to act on, taken by exactly one boot.
-        pending: Option<String>,
-        /// The last raw link this process already handled: `get_current`
-        /// keeps returning the launching intent, and handling it twice would
-        /// loop between the app page and the machine page.
-        handled: Option<String>,
-        /// The invitation a boot handed to the page; an answer is accepted
-        /// only for this one.
-        asking: Option<PairLink>,
-    }
+/// The pairing of the phone's window: what was scanned, what is open, what the
+/// machine answered. No Tauri type appears here — the window is [`Screen`].
+pub struct PairSession {
+    store: PairStore,
+    inner: Mutex<Inner>,
+    base: Option<String>,
+    screen: Arc<dyn Screen>,
+}
 
-    pub struct PairSession {
-        store: PairStore,
-        inner: Mutex<Inner>,
-        base: Option<String>,
-    }
-
-    impl PairSession {
-        pub fn new(store: PairStore, base: Option<String>) -> PairSession {
-            PairSession {
-                store,
-                inner: Mutex::new(Inner::default()),
-                base,
-            }
-        }
-
-        fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
-            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            f(&mut inner)
-        }
-
-        fn current(&self) -> Option<SocketAddr> {
-            self.with(|inner| inner.current)
-        }
-
-        fn base(&self) -> Option<&str> {
-            self.base.as_deref()
-        }
-
-        /// The next boot takes the new link; any older question is dropped.
-        fn hold(&self, raw: &str) {
-            self.with(|inner| {
-                inner.pending = Some(raw.to_string());
-                inner.handled = Some(raw.to_string());
-                inner.asking = None;
-            });
-        }
-
-        fn take_pending(&self) -> Option<String> {
-            self.with(|inner| {
-                inner.asking = None;
-                inner.pending.take()
-            })
-        }
-
-        /// `true` when this raw link is new to the process.
-        fn first_time(&self, raw: &str) -> bool {
-            self.with(|inner| {
-                if inner.handled.as_deref() == Some(raw) {
-                    return false;
-                }
-                inner.handled = Some(raw.to_string());
-                true
-            })
+impl PairSession {
+    pub fn new(store: PairStore, base: Option<String>, screen: Arc<dyn Screen>) -> PairSession {
+        PairSession {
+            store,
+            inner: Mutex::new(Inner::default()),
+            base,
+            screen,
         }
     }
 
-    /// Called once from `run()` on a mobile target.
-    pub fn start(app: &AppHandle, store_path: PathBuf) {
-        // The bundled page address is known NOW and stays valid even when the
-        // paired machine is gone: the refusal screen has to exist somewhere.
-        let base = app
-            .get_webview_window("main")
-            .and_then(|window| window.url().ok())
-            .map(|url| url.to_string());
-        app.manage(PairSession::new(PairStore::new(store_path), base));
-
-        // A link that arrives while the app runs (Android singleTask keeps one
-        // activity, so the second scan lands in the SAME window — REQ-QRAPP-02
-        // AC4, REQ-QRAPP-04 AC1).
-        let handle = app.clone();
-        app.deep_link().on_open_url(move |event| {
-            for url in event.urls() {
-                accept_scan(&handle, url.as_str());
-            }
-        });
+    fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut inner)
     }
 
-    /// Remember the scanned link and bring the app's OWN page up: the page has
+    fn current(&self) -> Option<SocketAddr> {
+        self.with(|inner| inner.current)
+    }
+
+    pub fn base(&self) -> Option<&str> {
+        self.base.as_deref()
+    }
+
+    /// A scanned link is taken and the app's OWN page comes up: the page has
     /// the IPC bridge (a machine page does not), asks the boot question and
     /// carries the decision out. The progress screen is the app's own route, so
     /// no unrelated home flashes while the machine is asked.
-    fn accept_scan(app: &AppHandle, raw: &str) {
-        let session = app.state::<PairSession>();
-        session.hold(raw);
-        let (Some(window), Some(base)) = (app.get_webview_window("main"), session.base()) else {
-            return;
-        };
-        if let Ok(url) = tauri::Url::parse(&pair::connect_url(base)) {
-            let _ = window.navigate(url);
+    pub fn accept_scan(&self, raw: &str) -> PairTask {
+        self.with(|inner| {
+            inner.pending = Some(raw.to_string());
+            inner.handled = Some(raw.to_string());
+            inner.digest = Some(pair::link_digest(raw));
+            inner.asking = None;
+        });
+        match self.base() {
+            Some(base) => self.go(pair::connect_url(base)),
+            None => PairTask::Idle,
         }
     }
 
-    /// The page's first question: what to do now.
-    pub fn boot(app: &AppHandle) -> PairTask {
-        let session = app.state::<PairSession>();
-        session.with(|inner| inner.asking = None);
-        if let Some(raw) = session.take_pending() {
-            return start_link(app, &raw);
+    /// The page's first question: what to do now. `launched` is the intent that
+    /// started the process (the plugin reads it while the page loads).
+    pub fn boot(&self, launched: Option<&str>, local: &[Ipv4Addr]) -> PairTask {
+        self.with(|inner| inner.asking = None);
+        if let Some(raw) = self.with(|inner| inner.pending.take()) {
+            return self.start_link(&raw, local);
         }
-        match launched_link(app) {
-            Some(raw) if session.first_time(&raw) => start_link(app, &raw),
-            _ => resume_home(app),
+        match launched {
+            Some(raw) if self.first_time(raw) => self.start_link(raw, local),
+            _ => self.resume_home(local),
         }
     }
 
-    /// The intent that launched the process. The plugin learns it while the
-    /// page loads, which is exactly when the page asks — no sleep and no
-    /// second thread.
-    fn launched_link(app: &AppHandle) -> Option<String> {
-        let urls = app.deep_link().get_current().ok().flatten()?;
-        urls.into_iter().next().map(|url| url.to_string())
+    /// `true` when this link was never handled by THIS PHONE — neither by this
+    /// process nor by an earlier one. Android re-reads the launching intent on
+    /// every `load(webView)`, so an in-memory marker alone replayed a spent
+    /// invitation after a restart (quality return R4); the digest of the link
+    /// is kept on disk instead, and the link itself — and its code — never is.
+    fn first_time(&self, raw: &str) -> bool {
+        let digest = pair::link_digest(raw);
+        let seen_here = self.with(|inner| {
+            if inner.handled.as_deref() == Some(raw) {
+                return true;
+            }
+            inner.handled = Some(raw.to_string());
+            inner.digest = Some(digest.clone());
+            false
+        });
+        if seen_here {
+            return false;
+        }
+        match self.store.load() {
+            Remembered::Record(record) if record.handled.as_deref() == Some(digest.as_str()) => {
+                return false;
+            }
+            // A record nobody can read is a fact to say out loud before the
+            // mark overwrites it.
+            Remembered::Broken(error) => eprintln!("devai-ui: отметка о приглашении: {error}"),
+            _ => {}
+        }
+        if let Err(error) = self.store.mark_handled(&digest) {
+            eprintln!("devai-ui: отметка о приглашении: {error}");
+        }
+        true
     }
 
-    fn start_link(app: &AppHandle, raw: &str) -> PairTask {
-        let session = app.state::<PairSession>();
-        let local = net::local_ipv4s();
-        match plan_link(raw, &local) {
+    pub fn start_link(&self, raw: &str, local: &[Ipv4Addr]) -> PairTask {
+        match plan_link(raw, local) {
             Ok(link) => {
-                session.with(|inner| inner.asking = Some(link.clone()));
+                self.with(|inner| inner.asking = Some(link.clone()));
                 ask_task(&link)
             }
             Err(refusal) => {
-                let task = refusal_task(refusal, session.current(), session.base());
+                let task = refusal_task(refusal, self.current(), self.base());
                 if matches!(task, PairTask::Idle) {
                     // A refusal with no screen: the code still reaches the
                     // journal (the token never does).
@@ -369,59 +370,62 @@ mod mobile {
 
     /// The page reported what the machine answered. Only the asked invitation
     /// counts; the code is spent by the page load that follows, never here.
-    pub fn report(app: &AppHandle, addr: &str, status: Option<u16>) -> PairTask {
-        let session = app.state::<PairSession>();
-        let asking = session.with(|inner| inner.asking.take());
-        let local = net::local_ipv4s();
+    pub fn report(&self, addr: &str, status: Option<u16>, local: &[Ipv4Addr]) -> PairTask {
+        let asking = self.with(|inner| inner.asking.take());
         match answer(
             asking.as_ref(),
             addr,
             status,
-            &local,
-            session.current(),
-            session.base(),
+            local,
+            self.current(),
+            self.base(),
         ) {
             PairOutcome::Ignored => PairTask::Idle,
-            PairOutcome::Open { addr, url } => opened(app, &session, addr, url),
-            PairOutcome::Refuse { url, refusal } => refuse(app, url, refusal),
+            PairOutcome::Open { addr, url } => self.opened(addr, url),
+            PairOutcome::Refuse { url, refusal } => self.refuse(url, refusal),
         }
     }
 
     /// A different home forgets the previous one — its address and its session
-    /// key (REQ-QRAPP-04 AC3) — and is remembered as the address only
-    /// (REQ-QRAPP-07 AC3). A failure to remember is VISIBLE (R1).
-    fn opened(app: &AppHandle, session: &PairSession, addr: SocketAddr, url: String) -> PairTask {
-        let previous = session.current().or_else(|| session.store.load());
-        if previous.is_some_and(|previous| previous != addr) {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.clear_all_browsing_data();
-            }
+    /// key (REQ-QRAPP-04 AC3) — and is remembered as an address plus the digest
+    /// of the handled link (REQ-QRAPP-07 AC3). A failure to remember is VISIBLE
+    /// (R1): the opened page carries the notice.
+    fn opened(&self, addr: SocketAddr, url: String) -> PairTask {
+        let previous = self.current().or_else(|| match self.store.load() {
+            Remembered::Record(record) => record.home,
+            _ => None,
+        });
+        if previous.is_some_and(|previous| previous != addr) && !self.screen.forget_session() {
+            eprintln!("devai-ui: [{SESSION_NOT_CLEARED}] окно не сбросило прежний сеанс");
         }
-        session.with(|inner| inner.current = Some(addr));
-        match session.store.save(addr) {
-            Ok(()) => go(app, url),
+        self.with(|inner| inner.current = Some(addr));
+        let digest = self.with(|inner| inner.digest.clone());
+        match self.store.save(addr, digest.as_deref()) {
+            Ok(()) => self.go(url),
             Err(error) => {
                 eprintln!("devai-ui: сохранение дома пары: {error}");
-                go(app, pair::with_notice(&url, PairStoreError::CODE))
+                self.go(pair::with_notice(&url, PairStoreError::NOT_REMEMBERED))
             }
         }
     }
 
     /// Open the page in THIS window, through the window's own API (the same
     /// navigation a browser does, but owned by the shell — no second load and
-    /// no double-spent invitation).
-    fn go(app: &AppHandle, url: String) -> PairTask {
-        if let (Some(window), Ok(target)) =
-            (app.get_webview_window("main"), tauri::Url::parse(&url))
-        {
-            let _ = window.navigate(target);
+    /// no double-spent invitation). A window that refused says so by code; the
+    /// address is not echoed (it carries the one-time code), and the task is
+    /// `Idle` because nothing was opened.
+    fn go(&self, url: String) -> PairTask {
+        if self.screen.open(&url) {
+            PairTask::go(url)
+        } else {
+            eprintln!("devai-ui: [{NAVIGATE_FAILED}] окно не открыло адрес приглашения");
+            PairTask::Idle
         }
-        PairTask::go(url)
     }
 
-    fn refuse(app: &AppHandle, url: Option<String>, refusal: PairRefusal) -> PairTask {
+    fn refuse(&self, url: Option<String>, refusal: PairRefusal) -> PairTask {
         match url {
-            Some(url) => go(app, url),
+            Some(url) => self.go(url),
             None => {
                 log_refusal(refusal);
                 PairTask::Idle
@@ -429,18 +433,121 @@ mod mobile {
         }
     }
 
-    fn resume_home(app: &AppHandle) -> PairTask {
-        let session = app.state::<PairSession>();
-        match resume(session.store.load(), &net::local_ipv4s()) {
+    /// No link this boot: re-open the remembered home, or say why it is not
+    /// there. A record that cannot be read is forgotten and named (R2) instead
+    /// of looking exactly like a phone that never paired.
+    fn resume_home(&self, local: &[Ipv4Addr]) -> PairTask {
+        match resume(self.store.load(), local) {
             Resumed::Nothing => PairTask::Idle,
+            Resumed::Broken(error) => {
+                eprintln!("devai-ui: [{0}] запись пары: {error}", error.code());
+                if let Err(forget) = self.store.forget() {
+                    eprintln!("devai-ui: забыть испорченную запись: {forget}");
+                }
+                match self.base() {
+                    Some(base) => self.go(pair::with_notice(base, PairStoreError::RECORD_BROKEN)),
+                    None => PairTask::Idle,
+                }
+            }
             Resumed::Gone(refusal) => {
-                refuse(app, refusal_target(refusal, None, session.base()), refusal)
+                self.refuse(refusal_target(refusal, None, self.base()), refusal)
             }
             Resumed::Home { addr, url } => {
-                session.with(|inner| inner.current = Some(addr));
-                go(app, url)
+                self.with(|inner| inner.current = Some(addr));
+                self.go(url)
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl PairSession {
+    /// The remembered record as the tests read it: a test that expects a home
+    /// or a digest and finds an unreadable file must fail, not pass silently.
+    fn store_load_for_tests(&self) -> pair::StoredPairingRead {
+        match self.store.load() {
+            Remembered::Record(record) => record,
+            other => panic!("the remembered record must be readable: {other:?}"),
+        }
+    }
+}
+
+#[cfg(mobile)]
+mod mobile {
+    use tauri::{AppHandle, Manager};
+    use tauri_plugin_deep_link::DeepLinkExt;
+
+    use super::*;
+    use crate::lan::net;
+    use crate::lan::pair::PairStore;
+
+    /// The real window: the ONE webview the app shows.
+    struct PhoneWindow {
+        app: AppHandle,
+    }
+
+    impl Screen for PhoneWindow {
+        fn open(&self, url: &str) -> bool {
+            let (Some(window), Ok(target)) =
+                (self.app.get_webview_window("main"), tauri::Url::parse(url))
+            else {
+                return false;
+            };
+            window.navigate(target).is_ok()
+        }
+
+        fn forget_session(&self) -> bool {
+            self.app
+                .get_webview_window("main")
+                .is_some_and(|window| window.clear_all_browsing_data().is_ok())
+        }
+    }
+
+    /// Called once from `run()` on a mobile target.
+    pub fn start(app: &AppHandle, store_path: PathBuf) {
+        // The bundled page address is known NOW and stays valid even when the
+        // paired machine is gone: the refusal screen has to exist somewhere.
+        let base = app
+            .get_webview_window("main")
+            .and_then(|window| window.url().ok())
+            .map(|url| url.to_string());
+        app.manage(PairSession::new(
+            PairStore::new(store_path),
+            base,
+            Arc::new(PhoneWindow { app: app.clone() }),
+        ));
+
+        // A link that arrives while the app runs (Android singleTask keeps one
+        // activity, so the second scan lands in the SAME window — REQ-QRAPP-02
+        // AC4, REQ-QRAPP-04 AC1).
+        let handle = app.clone();
+        app.deep_link().on_open_url(move |event| {
+            let session = handle.state::<PairSession>();
+            for url in event.urls() {
+                let _ = session.accept_scan(url.as_str());
+            }
+        });
+    }
+
+    /// The page's first question. The launching intent is read HERE — the
+    /// plugin learns it while the page loads, which is exactly when the page
+    /// asks — and handed to the session, so the decision itself stays testable.
+    pub fn boot(app: &AppHandle) -> PairTask {
+        let launched = launched_link(app);
+        app.state::<PairSession>()
+            .boot(launched.as_deref(), &net::local_ipv4s())
+    }
+
+    pub fn report(app: &AppHandle, addr: &str, status: Option<u16>) -> PairTask {
+        app.state::<PairSession>()
+            .report(addr, status, &net::local_ipv4s())
+    }
+
+    /// The intent that launched the process. No sleep and no second thread: the
+    /// plugin has it by the time the page asks.
+    fn launched_link(app: &AppHandle) -> Option<String> {
+        let urls = app.deep_link().get_current().ok().flatten()?;
+        urls.into_iter().next().map(|url| url.to_string())
     }
 }
 
@@ -673,22 +780,38 @@ mod tests {
         ));
     }
 
+    fn remembered(addr: SocketAddr, handled: Option<&str>) -> Remembered {
+        Remembered::Record(pair::StoredPairingRead {
+            home: Some(addr),
+            handled: handled.map(str::to_string),
+        })
+    }
+
     /// Ratified Q4: a launch without a link re-opens the remembered home, and
     /// only the network is checked locally — whether the session still lives
     /// is answered by the machine's own page (a dead one says «доступ закрыт»).
     #[test]
     fn a_launch_without_a_link_returns_to_the_remembered_home() {
-        assert_eq!(resume(None, &local()), Resumed::Nothing);
+        assert_eq!(resume(Remembered::Absent, &local()), Resumed::Nothing);
         assert_eq!(
-            resume(Some(home()), &local()),
+            resume(remembered(home(), None), &local()),
             Resumed::Home {
                 addr: home(),
                 url: "http://192.168.1.20:4567/".into(),
             }
         );
         assert_eq!(
-            resume(Some(home()), &[ip("10.0.0.9")]),
+            resume(remembered(home(), None), &[ip("10.0.0.9")]),
             Resumed::Gone(PairRefusal::WrongNetwork)
+        );
+        // A record with no home in it (a scan whose home write never ran) is
+        // «нечего открывать», not a home.
+        assert_eq!(
+            resume(
+                Remembered::Record(pair::StoredPairingRead::default()),
+                &local()
+            ),
+            Resumed::Nothing
         );
         // A home that has gone missing from the phone's network is said in
         // words on the bundled page, not silently skipped.
@@ -700,6 +823,20 @@ mod tests {
         assert_eq!(
             task,
             PairTask::go("http://tauri.localhost/#/pair?reason=wrong_network")
+        );
+    }
+
+    /// R2: a record that cannot be read is its OWN outcome — the caller says
+    /// so and forgets it; it never looks like a phone that never paired.
+    #[test]
+    fn a_broken_record_is_named_instead_of_looking_absent() {
+        let error = PairStoreError::Parse {
+            path: "/data/phone-pairing.json".into(),
+            reason: "expected value at line 1".into(),
+        };
+        assert_eq!(
+            resume(Remembered::Broken(error.clone()), &local()),
+            Resumed::Broken(error)
         );
     }
 
@@ -774,5 +911,303 @@ mod tests {
             );
         }
         assert!(serde_json::to_value(PairTask::Idle).unwrap()["kind"] == "idle");
+    }
+
+    // -----------------------------------------------------------------------
+    // the wiring itself (quality return R7): every branch below runs without a
+    // device — the window is a recorder, the store is a temp file
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A [`Screen`] that records what the window was told to do. It can also
+    /// refuse the address, which is the branch a real webview takes when the
+    /// navigation fails.
+    #[derive(Default)]
+    struct Recorder {
+        opened: Mutex<Vec<String>>,
+        forgotten: Mutex<usize>,
+        refuse: AtomicBool,
+    }
+
+    impl Recorder {
+        fn opened(&self) -> Vec<String> {
+            self.opened.lock().unwrap().clone()
+        }
+
+        fn last(&self) -> String {
+            self.opened()
+                .pop()
+                .expect("the window was told to open something")
+        }
+
+        fn forgotten(&self) -> usize {
+            *self.forgotten.lock().unwrap()
+        }
+    }
+
+    impl Screen for Recorder {
+        fn open(&self, url: &str) -> bool {
+            if self.refuse.load(Ordering::SeqCst) {
+                return false;
+            }
+            self.opened.lock().unwrap().push(url.to_string());
+            true
+        }
+
+        fn forget_session(&self) -> bool {
+            *self.forgotten.lock().unwrap() += 1;
+            true
+        }
+    }
+
+    /// One phone: a temp store, the bundled page as its base, a recorder as the
+    /// window.
+    fn phone(dir: &tempfile::TempDir) -> (PairSession, Arc<Recorder>) {
+        let recorder = Arc::new(Recorder::default());
+        let session = PairSession::new(
+            PairStore::new(dir.path().join("phone-pairing.json")),
+            Some("http://tauri.localhost/".into()),
+            recorder.clone(),
+        );
+        (session, recorder)
+    }
+
+    /// A scanned link: the progress screen comes up (the person sees the scan
+    /// was taken), and the next boot asks the machine WITHOUT spending the code.
+    #[test]
+    fn a_scan_shows_the_progress_screen_and_then_asks_the_machine() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        let raw = pair::app_link(home(), "abc");
+
+        let task = session.accept_scan(&raw);
+        assert_eq!(
+            task,
+            PairTask::go("http://tauri.localhost/#/pair?step=connect")
+        );
+        assert_eq!(window.last(), "http://tauri.localhost/#/pair?step=connect");
+
+        let PairTask::Probe {
+            url, addr: asked, ..
+        } = session.boot(None, &local())
+        else {
+            panic!("a scanned invitation must be asked about");
+        };
+        assert_eq!(asked, "192.168.1.20:4567");
+        assert_eq!(url, "http://192.168.1.20:4567/pair?token=abc");
+    }
+
+    /// A live invitation opens the machine's page in the SAME window and the
+    /// home is remembered — address only, plus the link's fingerprint.
+    #[test]
+    fn a_live_answer_opens_the_machine_page_and_remembers_the_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        let raw = pair::app_link(home(), "abc");
+        session.accept_scan(&raw);
+        let PairTask::Probe { addr: asked, .. } = session.boot(None, &local()) else {
+            panic!("probe expected");
+        };
+        let task = session.report(&asked, Some(pair::STATUS_INVITE), &local());
+        assert_eq!(task, PairTask::go("http://192.168.1.20:4567/?token=abc"));
+        assert_eq!(window.last(), "http://192.168.1.20:4567/?token=abc");
+        // The home is remembered; the code is not.
+        let remembered = session.store_load_for_tests();
+        assert_eq!(remembered.home, Some(home()));
+        assert_eq!(remembered.handled, Some(pair::link_digest(&raw)));
+        // The first home needs no cookie wipe: there was nothing before it.
+        assert_eq!(window.forgotten(), 0);
+    }
+
+    /// A question answered twice — or answered by a page nobody asked — changes
+    /// nothing: the window does not jump to a home the person no longer
+    /// pointed at.
+    #[test]
+    fn an_answer_to_a_question_nobody_asked_changes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        assert_eq!(
+            session.report("192.168.1.20:4567", Some(200), &local()),
+            PairTask::Idle
+        );
+        assert!(window.opened().is_empty(), "nothing was opened");
+        // The same invitation reported twice: only the first answer counts.
+        session.accept_scan(&pair::app_link(home(), "abc"));
+        let _ = session.boot(None, &local());
+        let _ = session.report("192.168.1.20:4567", Some(200), &local());
+        let opened = window.opened().len();
+        assert_eq!(
+            session.report("192.168.1.20:4567", Some(200), &local()),
+            PairTask::Idle
+        );
+        assert_eq!(
+            window.opened().len(),
+            opened,
+            "the second answer opened nothing"
+        );
+    }
+
+    /// A dead NEW invitation never trades the working home for itself: the
+    /// refusal is shown ON the open home, with the way back.
+    #[test]
+    fn a_dead_new_invitation_is_shown_on_the_open_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        // Pair with the first machine.
+        session.accept_scan(&pair::app_link(home(), "one"));
+        let PairTask::Probe { addr: asked, .. } = session.boot(None, &local()) else {
+            panic!("probe expected");
+        };
+        let _ = session.report(&asked, Some(pair::STATUS_INVITE), &local());
+
+        // A second machine in the same network refuses its invitation.
+        let second = addr("192.168.1.30:4567");
+        session.accept_scan(&pair::app_link(second, "two"));
+        let PairTask::Probe { addr: asked, .. } = session.boot(None, &local()) else {
+            panic!("the second invitation must be asked about");
+        };
+        assert_eq!(asked, "192.168.1.30:4567");
+        let task = session.report(&asked, Some(pair::STATUS_REFUSED), &local());
+        assert_eq!(
+            task,
+            PairTask::go("http://192.168.1.20:4567/#/pair?reason=invite_expired&return=1")
+        );
+        assert_eq!(
+            window.last(),
+            "http://192.168.1.20:4567/#/pair?reason=invite_expired&return=1",
+            "the working home keeps the screen"
+        );
+    }
+
+    /// A new invitation switches the open home: the previous session is wiped,
+    /// the new home is remembered, and no page of the old home is shown.
+    #[test]
+    fn a_new_invitation_switches_the_home_and_forgets_the_old_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        let first = addr("192.168.1.20:4567");
+        let second = addr("192.168.1.30:4567");
+        session.accept_scan(&pair::app_link(first, "one"));
+        let PairTask::Probe { .. } = session.boot(None, &local()) else {
+            panic!("probe expected");
+        };
+        let _ = session.report("192.168.1.20:4567", Some(pair::STATUS_INVITE), &local());
+
+        session.accept_scan(&pair::app_link(second, "two"));
+        let PairTask::Probe { addr: asked, .. } = session.boot(None, &local()) else {
+            panic!("the second invitation must be asked about");
+        };
+        let task = session.report(&asked, Some(pair::STATUS_INVITE), &local());
+        assert_eq!(task, PairTask::go("http://192.168.1.30:4567/?token=two"));
+        assert_eq!(window.forgotten(), 1, "the old session key is dropped");
+        assert_eq!(session.store_load_for_tests().home, Some(second));
+        assert!(
+            !window
+                .opened()
+                .iter()
+                .skip(2)
+                .any(|url| url.contains("192.168.1.20:4567")),
+            "no page of the previous home is opened after the switch"
+        );
+    }
+
+    /// R4: Android re-reads the launching intent after a restart. The SAME
+    /// link is handled once; the next process resumes the remembered home
+    /// instead of asking about a spent invitation again.
+    #[test]
+    fn a_replayed_launching_intent_is_handled_only_once_per_phone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let raw = pair::app_link(home(), "abc");
+        {
+            let (session, _window) = phone(&dir);
+            assert!(
+                matches!(session.boot(Some(&raw), &local()), PairTask::Probe { .. }),
+                "the first launch handles the link"
+            );
+            let _ = session.report("192.168.1.20:4567", Some(pair::STATUS_INVITE), &local());
+        }
+        // A new process over the same store file: the intent is replayed.
+        let (restarted, window) = phone(&dir);
+        let task = restarted.boot(Some(&raw), &local());
+        assert_eq!(
+            task,
+            PairTask::go("http://192.168.1.20:4567/"),
+            "the replayed intent must not be handled again"
+        );
+        assert_eq!(window.last(), "http://192.168.1.20:4567/");
+    }
+
+    /// R2: a record that cannot be read is said on the bundled page and
+    /// forgotten — the person reads it instead of a silent fresh start.
+    #[test]
+    fn a_broken_record_is_named_on_the_bundled_page() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("phone-pairing.json"), "{ not json").unwrap();
+        let (session, window) = phone(&dir);
+        let task = session.boot(None, &local());
+        assert_eq!(
+            task,
+            PairTask::go("http://tauri.localhost/?notice=pair_record_broken")
+        );
+        assert_eq!(
+            window.last(),
+            "http://tauri.localhost/?notice=pair_record_broken"
+        );
+        assert!(
+            !dir.path().join("phone-pairing.json").exists(),
+            "the record nobody can read is forgotten"
+        );
+    }
+
+    /// A window that refuses the address is not reported as opened — the fact
+    /// reaches the journal by code, never by echoing the address (it carries
+    /// the one-time code).
+    #[test]
+    fn a_window_that_refuses_the_address_is_not_reported_as_opened() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        session.accept_scan(&pair::app_link(home(), "abc"));
+        let _ = session.boot(None, &local());
+        window.refuse.store(true, Ordering::SeqCst);
+        let task = session.report("192.168.1.20:4567", Some(pair::STATUS_INVITE), &local());
+        assert_eq!(task, PairTask::Idle, "nothing was opened");
+        assert_eq!(
+            session.store_load_for_tests().home,
+            Some(home()),
+            "the home is still remembered even when the window refused"
+        );
+    }
+
+    /// A scan with no window page to show it on still takes the link; nothing
+    /// is navigated, and the boot asks the machine.
+    #[test]
+    fn a_scan_without_a_base_page_still_takes_the_link() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let window = Arc::new(Recorder::default());
+        let session = PairSession::new(
+            PairStore::new(dir.path().join("phone-pairing.json")),
+            None,
+            window.clone(),
+        );
+        assert_eq!(
+            session.accept_scan(&pair::app_link(home(), "abc")),
+            PairTask::Idle
+        );
+        assert!(window.opened().is_empty());
+        assert!(matches!(
+            session.boot(None, &local()),
+            PairTask::Probe { .. }
+        ));
+    }
+
+    /// A launch with nothing scanned and nothing remembered has nothing to do
+    /// (the desktop answer, from the phone's own state machine).
+    #[test]
+    fn a_launch_with_nothing_to_do_answers_idle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        assert_eq!(session.boot(None, &local()), PairTask::Idle);
+        assert!(window.opened().is_empty());
     }
 }

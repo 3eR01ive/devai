@@ -14,7 +14,10 @@ use std::sync::Arc;
 use crate::commands::UiError;
 use crate::lan::commands::dispatch_rpc;
 use crate::lan::pair::{PairRefusal, STATE_CLOSED, STATE_INVALID, STATE_INVITE, STATE_PAIRED};
-use crate::lan::state::{DeviceClaim, LanAccess, PageAuth, PairState};
+use crate::lan::state::{
+    CODE_LAN_OFF, CODE_TOKEN_INVALID, CODE_TOKEN_REQUIRED, DeviceClaim, LanAccess, PageAuth,
+    PairState,
+};
 
 const SESSION_COOKIE: &str = "devai_lan";
 
@@ -152,7 +155,7 @@ async fn pair_probe(
         ),
         PairState::Off => (
             axum::http::StatusCode::FORBIDDEN,
-            serde_json::json!({ "state": STATE_CLOSED, "code": "lan_off" }),
+            serde_json::json!({ "state": STATE_CLOSED, "code": CODE_LAN_OFF }),
         ),
     };
     json_readable_across_origins(status, body)
@@ -171,7 +174,7 @@ async fn page(
     let cookie = cookie_value(&headers, SESSION_COOKIE);
     match ctx.lan.page_load(token, cookie.as_deref(), &device) {
         PageAuth::Deny { code, message } => {
-            if code == "lan_off" {
+            if code == CODE_LAN_OFF {
                 refusal_page(axum::http::StatusCode::FORBIDDEN, code, &message)
             } else {
                 refusal_page(axum::http::StatusCode::UNAUTHORIZED, code, &message)
@@ -340,9 +343,9 @@ fn refusal_page(
     message: &str,
 ) -> axum::response::Response {
     let refusal = match code {
-        "lan_token_invalid" => Some(PairRefusal::InviteExpired),
-        "lan_token_required" => Some(PairRefusal::AccessClosed),
-        "lan_off" => Some(PairRefusal::AccessClosed),
+        CODE_TOKEN_INVALID => Some(PairRefusal::InviteExpired),
+        CODE_TOKEN_REQUIRED => Some(PairRefusal::AccessClosed),
+        CODE_LAN_OFF => Some(PairRefusal::AccessClosed),
         _ => None,
     };
     let body = match refusal {
@@ -730,6 +733,34 @@ mod tests {
         let (status, _, body) = call(&router, "GET", &format!("/?token={invite}"), None, "");
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(body.contains("приглашение просрочено"), "{body}");
+    }
+
+    /// R3: a reload of an already-paired phone with a FRESH invitation spends
+    /// that code. Otherwise the desktop shows «приглашение использовано» while
+    /// the very same code still pairs another device.
+    #[test]
+    fn a_page_load_with_a_live_cookie_still_spends_the_presented_code() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let invite = lan.status().token.expect("a fresh invitation");
+        let (_, cookie) = pair(&router, &invite);
+        let fresh = lan.new_invite().expect("access is on");
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            &format!("/?token={fresh}"),
+            Some(&cookie),
+            "",
+        );
+        assert_eq!(status, StatusCode::OK, "the cookie admits the device");
+        assert!(
+            !lan.status().invite_active,
+            "the successful entry spent the code"
+        );
+        // The same code is dead for anybody else.
+        let (status, _, body) = call(&router, "GET", &format!("/pair?token={fresh}"), None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("lan_token_invalid"), "{body}");
     }
 
     /// R2: the question the app page asks the candidate machine is readable
