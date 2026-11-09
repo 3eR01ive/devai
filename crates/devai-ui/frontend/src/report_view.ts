@@ -187,3 +187,48 @@ export function isNameOnlyGroup(group: HumanFormGroup): boolean {
 export function hasEvidence(it: HumanFormItem): boolean {
   return (it.evidence?.length ?? 0) > 0;
 }
+
+// ---------------------------------------------------------------------------
+// Importance filter (REQ-QG-04 AC4/AC5/AC6). The filter is a pure VIEW over
+// the stored groups: it hides rows of the other saved groups and never
+// regroups, re-counts or rewrites anything — «всё» restores the stored view
+// untouched. The choice is not sent anywhere and writes nothing.
+// ---------------------------------------------------------------------------
+
+/** The filter's «all» token — the stored view as published. */
+export const ALL_GROUPS = "all";
+
+/** One filter choice: «всё» plus every saved, non-empty group by its title. */
+export interface GroupFilterOption {
+  key: string;
+  title: string;
+  count: number;
+}
+
+export function filterOptions(form: HumanForm): GroupFilterOption[] {
+  const visible = visibleGroups(form);
+  return [
+    {
+      key: ALL_GROUPS,
+      title: "всё",
+      count: visible.reduce((n, g) => n + g.items.length, 0),
+    },
+    ...visible.map((g) => ({ key: g.key, title: g.title, count: g.items.length })),
+  ];
+}
+
+/**
+ * The groups the panel prints under the chosen filter: the selected saved
+ * group alone, or every visible group for «всё» / an unknown key. Order is
+ * the stored order; nothing is recomputed.
+ */
+export function groupsForFilter(form: HumanForm, selected: string): HumanFormGroup[] {
+  if (!selected || selected === ALL_GROUPS) return visibleGroups(form);
+  const chosen = visibleGroups(form).find((g) => g.key === selected);
+  return chosen ? [chosen] : visibleGroups(form);
+}
+
+/** The site line of one expanded item: an absent site is named in words. */
+export function siteText(it: HumanFormItem): string {
+  return it.site.trim() ? it.site : "сайт не указан";
+}

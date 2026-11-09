@@ -217,6 +217,14 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_reject_rpc,
     },
     RpcCommand {
+        name: "task_accept",
+        handler: task_accept_rpc,
+    },
+    RpcCommand {
+        name: "task_return",
+        handler: task_return_rpc,
+    },
+    RpcCommand {
         name: "task_progress",
         handler: task_progress_rpc,
     },
@@ -559,6 +567,36 @@ fn task_reject_rpc(
     )?)
 }
 
+/// The QA gate's acceptance from the phone: the SAME operation the window and
+/// the CLI call; the actor marker names the device, the person stays the author
+/// (REQ-QG-07 AC3).
+fn task_accept_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::task_accept_as(
+        state(app),
+        param_str(params, "id_prefix")?,
+        param_opt_str(params, "rationale"),
+        Some(actor_for(app, device)),
+    )?)
+}
+
+/// The QA gate's return from the phone: same operation, same one-event record.
+fn task_return_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::task_return_as(
+        state(app),
+        param_str(params, "id_prefix")?,
+        param_opt_str(params, "rationale"),
+        Some(actor_for(app, device)),
+    )?)
+}
+
 fn task_progress_rpc(
     app: &tauri::AppHandle,
     _device: &DeviceClaim,
@@ -803,12 +841,16 @@ fn model_bundle_delete_rpc(
 
 /// Форма связки из тела запроса телефона: те же поля, что у окна.
 fn bundle_form_input(params: &serde_json::Value) -> Result<devai_api::BundleFormInput, UiError> {
-    serde_json::from_value(params.get("input").cloned().unwrap_or(serde_json::Value::Null)).map_err(
-        |e| UiError {
-            code: "invalid_input".into(),
-            message: format!("форма связки не разобрана: {e}"),
-        },
+    serde_json::from_value(
+        params
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
     )
+    .map_err(|e| UiError {
+        code: "invalid_input".into(),
+        message: format!("форма связки не разобрана: {e}"),
+    })
 }
 
 fn lan_status_rpc(

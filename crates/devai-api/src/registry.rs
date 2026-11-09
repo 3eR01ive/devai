@@ -83,14 +83,17 @@ pub struct OpDescriptor {
 /// that answers «what id will the save write?», so the window's copy of the
 /// rule could be deleted rather than kept in sync. Wire-visible addition
 /// (one Read operation), so the stamp says so.
+/// `@9` named the convergence increment (task 01a1b5be, REQ-CV-14): NO
+/// operation joined or left the table — the slice rode on `task.progress` and
+/// `inbox.snapshot`, whose output shapes gained `convergence`.
 
-/// `@9` names the convergence increment (task 01a1b5be, REQ-CV-14): NO operation
-/// joins or leaves the table — the slice rides on the two reads that already
-/// existed, `task.progress` and `inbox.snapshot`, whose output shapes gain the
-/// `convergence` field (null on terminal tasks and on rows outside the wait
-/// section); a consumer typed against `@8` reads it as unknown-absent, so the
-/// stamp moves with the widened shapes.
-pub const SURFACE_VERSION: &str = "api-surface@9";
+/// `@10` names the quality-gate increment (task 01a1bfa0, REQ-QG-01..09): NO
+/// operation joins or leaves the table — the gate's availability rides on
+/// `task.status` (`quality_gate`), a live audit is named on `task.active`
+/// rows (`note`), and `inbox.snapshot` facts gain `audit_running` so a running
+/// audit is not presented as a human wait. Wire-visible additions, so the
+/// stamp says so.
+pub const SURFACE_VERSION: &str = "api-surface@10";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -168,8 +171,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.status",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "StatusView{task, allowed_operations, current_artifacts, open_questions}",
-            description: "Current state plus the operations the platform permits next, the CURRENT artifacts and open questions. Mirrors `task status`.",
+            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate}",
+            description: "Current state plus the operations the platform permits next, the CURRENT artifacts, open questions and — at the QA gate — each action's public availability and platform refusal. Mirrors `task status`.",
         },
         OpDescriptor {
             name: "task.progress",
@@ -182,8 +185,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.active",
             class: OpClass::Read,
             input: "()",
-            output: "ActiveSnapshot{snapshot_at, rows}",
-            description: "Cross-task read-only snapshot of every RUNNING execution with liveness triage (alive/dead/unknown) and worktree link only where the platform recorded worktree.prepared. Mirrors `task active`.",
+            output: "ActiveSnapshot{snapshot_at, rows: Vec<ActiveRow{…, note}>}",
+            description: "Cross-task read-only snapshot of every RUNNING execution with liveness triage (alive/dead/unknown), worktree link only where the platform recorded worktree.prepared, and the platform's note for a live quality audit («идёт аудит»). Mirrors `task active`.",
         },
         OpDescriptor {
             name: "task.workspace_changes",
@@ -473,7 +476,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "inbox.snapshot",
             class: OpClass::Read,
             input: "()",
-            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, convergence}>}",
+            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, audit_running, convergence}>}",
             description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks and on rows outside the wait section. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
         },
         // ---- questions ----
@@ -831,7 +834,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@9");
+        assert_eq!(SURFACE_VERSION, "api-surface@10");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

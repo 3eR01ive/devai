@@ -114,6 +114,26 @@ export interface StatusView {
   allowed_operations: string[];
   current_artifacts: Artifact[];
   open_questions: Question[];
+  /** REQ-QG-08/09: per-action availability at the QA gate; null outside QA. */
+  quality_gate: QualityGateView | null;
+}
+
+/** One platform refusal of a QA-gate act: a stable code plus the sentence the
+ * window prints verbatim (the UI never derives availability from task state). */
+export interface QualityGateDenial {
+  code: string;
+  text: string;
+}
+
+/** The QA gate's public availability (task_status, REQ-QG-08/09). */
+export interface QualityGateView {
+  audit_running: boolean;
+  current_report: string | null;
+  open_blockers: string[];
+  may_accept: boolean;
+  accept_denied: QualityGateDenial | null;
+  may_return: boolean;
+  return_denied: QualityGateDenial | null;
 }
 
 export interface PipelineView {
@@ -163,6 +183,8 @@ export interface ActiveRow {
   owner_liveness: string; // alive | dead | unknown
   branch: string | null;
   worktree: string | null;
+  /** REQ-QG-09 AC3: «идёт аудит» for a live quality audit, null otherwise. */
+  note: string | null;
 }
 
 export interface ActiveSnapshot {

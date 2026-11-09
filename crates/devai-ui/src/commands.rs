@@ -331,6 +331,20 @@ pub const COMMAND_CONTRACTS: &[CommandContract] = &[
         version: 1,
         breaking: "",
     },
+    // The QA gate's two human acts (task 01a1bfa0, REQ-QG-01): the SAME
+    // platform operations as `devai task accept/return`. Each call returns the
+    // re-read status (with the public `quality_gate` fact), so the window
+    // reads the task after acting instead of patching local state.
+    CommandContract {
+        command: "task_accept",
+        version: 1,
+        breaking: "",
+    },
+    CommandContract {
+        command: "task_return",
+        version: 1,
+        breaking: "",
+    },
     // The phone-access controls (task 01a1be98): a new PUBLIC surface (five
     // IPC commands + the HTTP/JSON envelope), so it is recorded here at its
     // first shape like every other published command (quality return R9).
@@ -390,6 +404,11 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // as `devai task approve/reject` — the window invents no path of its own.
     ("task_approve", "task.approve"),
     ("task_reject", "task.reject"),
+    // The QA gate's two acts (REQ-QG-01 AC1/AC2/AC5): the SAME platform
+    // operations as `devai task accept/return` — one mutation, one event, no
+    // window path. The phone reaches them through the same catalogue.
+    ("task_accept", "task.accept"),
+    ("task_return", "task.return"),
     ("task_progress", "task.progress"),
     ("task_dependencies", "task.dependencies"),
     ("task_report", "task.report"),
@@ -461,6 +480,8 @@ pub const MODEL_MUTATION_COMMANDS: &[(&str, &str)] = &[
 pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_approve", "task.approve"),
     ("task_reject", "task.reject"),
+    ("task_accept", "task.accept"),
+    ("task_return", "task.return"),
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
     ("model_bundle_check", "model.bundle_check"),
@@ -836,6 +857,56 @@ pub fn task_reject_as(
     Ok(state.api().task_signature(&id_prefix)?)
 }
 
+/// `task.accept` — the QA gate's acceptance, the SAME operation as
+/// `devai task accept` (REQ-QG-01): one transition, one `task.accepted` event
+/// whose rationale is the operator's words. The answer is the task RE-READ
+/// through `task.status` (with the public `quality_gate` fact), exactly like
+/// the signature acts re-read their card.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_accept(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+) -> Result<StatusView, UiError> {
+    task_accept_as(state, id_prefix, rationale, None)
+}
+
+/// The SAME act under an explicit actor: the LAN boundary passes
+/// `<operator> · телефон: name (addr)` so history names the device while the
+/// person stays the author (REQ-QG-07 AC3).
+pub fn task_accept_as(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_accept(&id_prefix, rationale))?;
+    Ok(state.api().task_status(&id_prefix)?)
+}
+
+/// `task.return` — the QA gate's return to rework, the SAME operation as
+/// `devai task return`: one `quality.returned` event with the rationale and
+/// the separate stored staleness marker the workflow writes, not a second act.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_return(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+) -> Result<StatusView, UiError> {
+    task_return_as(state, id_prefix, rationale, None)
+}
+
+/// The return twin of `task_accept_as`.
+pub fn task_return_as(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_return(&id_prefix, rationale))?;
+    Ok(state.api().task_status(&id_prefix)?)
+}
+
 /// PipelineView{order,current,position,position_index,off_spine,terminal}
 /// — the stage order comes from the platform, never from the UI (AC1).
 #[tauri::command(rename_all = "snake_case")]
@@ -1206,12 +1277,19 @@ fn wait_row_from(
     policy: &InboxWaitPolicy,
     facts: InboxTaskFacts,
 ) -> Result<Option<WaitRow>, UiError> {
+    // REQ-QG-09 AC1: a RUNNING audit is not a human wait. The task stays in
+    // the active-executions view («идёт аудит») and the waiting section does
+    // not offer accept/return until the audit has finished.
+    if facts.task.state == TaskState::Qa && facts.audit_running {
+        return Ok(None);
+    }
     let InboxTaskFacts {
         task,
         questions,
         spec,
         report,
         report_note,
+        audit_running: _,
         convergence,
     } = facts;
     let open_questions: Vec<Question> = questions
@@ -1865,9 +1943,10 @@ mod tests {
             .map(|(cmd, _)| *cmd)
             .collect();
         mutations.sort_unstable();
-        // REQ-MS-07 + REQ-MC-01..05: the allowlist is the two signature acts
-        // plus the model surface (probe, switch and the three authoring
-        // writes + the draft check) — and NOTHING else may appear here.
+        // REQ-MS-07 + REQ-MC-01..05 + REQ-QG-01 AC4: the allowlist is the
+        // four human gate acts (two spec signatures + QA accept/return) plus
+        // the model surface (probe, switch and the three authoring writes +
+        // the draft check) — and NOTHING else may appear here.
         let mut expected = vec![
             "model_bundle_check",
             "model_bundle_create",
@@ -1875,8 +1954,10 @@ mod tests {
             "model_bundle_update",
             "model_probe",
             "model_switch",
+            "task_accept",
             "task_approve",
             "task_reject",
+            "task_return",
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -2662,6 +2743,7 @@ mod tests {
             spec: None,
             report: None,
             report_note: None,
+            audit_running: false,
             convergence: None,
         }
     }
@@ -2775,6 +2857,33 @@ mod tests {
             waiting_row.cli_hint
         );
         assert_eq!(waiting_row.open_questions.len(), 1);
+    }
+
+    /// REQ-QG-09 AC1: a QA task with a RUNNING audit is not a human wait —
+    /// the section keeps it out (its active row carries «идёт аудит»).
+    #[test]
+    fn a_running_audit_keeps_the_qa_task_out_of_the_waiting_section() {
+        let (mut facts, _, _) = composer_fixture();
+        let qa = facts
+            .tasks
+            .iter_mut()
+            .find(|f| f.task.state == TaskState::Qa && f.report.is_some())
+            .expect("the fixture has a signable QA row");
+        let id = qa.task.id;
+        qa.audit_running = true;
+        let snapshot = compose_wait_snapshot(facts).unwrap();
+        assert!(
+            !snapshot.waiting.iter().any(|r| r.task.id == id),
+            "a live audit must not be offered as a human wait"
+        );
+        // The OTHER QA row (no running audit) is still there — one row's
+        // process does not hide another row's decision.
+        assert!(
+            snapshot
+                .waiting
+                .iter()
+                .any(|r| r.task.state == TaskState::Qa)
+        );
     }
 
     /// The QA presentation arrives whole — the signable report on one row and

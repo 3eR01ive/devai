@@ -16,6 +16,7 @@ import SignatureSpecBody from "./signature/SignatureSpecBody.vue";
 import SignatureRatification from "./signature/SignatureRatification.vue";
 import SignatureReviewer from "./signature/SignatureReviewer.vue";
 import SignatureActions from "./signature/SignatureActions.vue";
+import type { HoldKind } from "./signature/useHoldToConfirm";
 
 const props = defineProps<{
   /** Ошибка подписи — показывается РЯДОМ С КНОПКАМИ (R: оператор смотрел на кнопки
@@ -53,6 +54,10 @@ function onChoice(index: number, accept: boolean) {
 function onAnswer(index: number, answer: string) {
   choices.value[index] = { ...choices.value[index], answer };
   rationale.value = mergeOqLines(rationale.value, choices.value);
+}
+// Удержание общее для четырёх гейтов; секция спеки принимает только свои два.
+function onHold(kind: HoldKind, text: string) {
+  if (kind === "approve" || kind === "reject") emit("apply", kind, text);
 }
 </script>
 
@@ -103,7 +108,7 @@ function onAnswer(index: number, answer: string) {
         :choices="choices"
         :busy="props.busy"
         @update:rationale="rationale = $event"
-        @apply="(kind, text) => emit('apply', kind, text)"
+        @apply="onHold"
       />
 
       <p v-if="props.signature.signature" class="muted small signed">
