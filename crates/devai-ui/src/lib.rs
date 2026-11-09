@@ -130,17 +130,23 @@ pub fn run() {
             // закрывалось сразу после запуска (08.11, живой APK). Дом платформы
             // на телефоне живёт в каталоге данных приложения; десктоп не
             // затронут — там решение принимает своя цепочка.
+            // Тот же каталог носит и запомненный дом приглашения (task
+            // 01a1bf78): относительный путь на телефоне не записывается, и
+            // «приложение помнит последний дом» (ratified Q4) осталось бы
+            // словом без файла.
             #[cfg(mobile)]
-            let session = {
+            let (session, pairing_store) = {
                 // Без env-мутаций: путь дома приходит явно (open_in_app_dir).
                 let dir = app
                     .path()
                     .app_data_dir()
                     .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                session::Session::open_in_app_dir(dir.join("home")).unwrap_or_else(|failure| {
-                    eprintln!("devai-ui: [{}] {}", failure.code, failure.message);
-                    std::process::exit(2);
-                })
+                let session =
+                    session::Session::open_in_app_dir(dir.join("home")).unwrap_or_else(|failure| {
+                        eprintln!("devai-ui: [{}] {}", failure.code, failure.message);
+                        std::process::exit(2);
+                    });
+                (session, dir.join("phone-pairing.json"))
             };
             #[cfg(not(mobile))]
             let session = bootstrap();
@@ -154,6 +160,13 @@ pub fn run() {
             if let Some(guard) = instance {
                 guard.spawn(handle.clone());
             }
+            // The invitation link (task 01a1bf78): a scanned `devai://pair`
+            // code opens the machine's page in THIS window — the same
+            // interface a browser gets (REQ-QRAPP-02) — and the app notices a
+            // revoked access by itself (REQ-QRAPP-05). Desktop has no pairing
+            // state at all: its flow is untouched (REQ-QRAPP-08).
+            #[cfg(mobile)]
+            lan::deeplink::start(app.handle(), pairing_store);
             // Ratified Q1 «должен»: an access that was on at the last
             // shutdown comes back on this launch. The token is never
             // persisted — a fresh invitation is issued each time.
@@ -180,6 +193,10 @@ pub fn run() {
         // JS API, never a data command (the api.ts door stays the only
         // path to platform data).
         .plugin(tauri_plugin_dialog::init())
+        // The `devai://pair` scheme (task 01a1bf78): Android hands the scanned
+        // link to THIS app, and the plugin forwards it to Rust — no hand-edited
+        // manifest and no second app in the middle (REQ-QRAPP-02).
+        .plugin(tauri_plugin_deep_link::init())
         .invoke_handler(handlers())
         .run(tauri::generate_context!())
         .expect("devai-ui failed to run");

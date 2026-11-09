@@ -32,6 +32,7 @@ function status(over: Partial<LanStatus>): LanStatus {
     address: null,
     invite_active: false,
     url: null,
+    app_url: null,
     token: null,
     qr_svg: null,
     qr_error: null,
@@ -87,6 +88,7 @@ describe("доступ с телефона", () => {
         address: "192.168.1.20:41234",
         invite_active: true,
         url: "http://192.168.1.20:41234/?token=abc",
+        app_url: "devai://pair?addr=192.168.1.20%3A41234&token=abc",
         token: "abc",
         qr_svg: "<svg data-testid='qr'></svg>",
       }),
@@ -97,6 +99,14 @@ describe("доступ с телефона", () => {
     expect(view.get("[data-testid='lan-address']").text()).toContain("192.168.1.20:41234");
     expect(view.get("[data-testid='lan-token']").text()).toBe("abc");
     expect(view.find("[data-testid='lan-qr'] svg").exists()).toBe(true);
+    // Оба варианта одного доступа видны СРАЗУ, без дополнительного нажатия
+    // (REQ-QRAPP-01 AC1): приложение — то, что в QR, браузер — тот же код.
+    expect(view.get("[data-testid='lan-app-link']").text()).toBe(
+      "devai://pair?addr=192.168.1.20%3A41234&token=abc",
+    );
+    expect(view.get("[data-testid='lan-browser-link']").text()).toBe(
+      "http://192.168.1.20:41234/?token=abc",
+    );
     view.unmount();
   });
 

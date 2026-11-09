@@ -48,7 +48,18 @@ const isBrowserPage =
   typeof window !== "undefined" &&
   typeof document !== "undefined" &&
   typeof fetch === "function";
-const useRpc = isBrowserPage && !hasTauriBridge;
+// Страницу отдал сам телефонный вход (`GET /` у lan::http) — она и в окне
+// приложения обязана говорить по HTTP: в окне существуют ОБА моста, и догадка
+// «по origin» тут ошибается (task 01a1bf78, REQ-QRAPP-02 AC5). Признак ставит
+// сервер, который эту страницу отдал.
+const lanShell =
+  typeof window !== "undefined" &&
+  (window as unknown as { __DEVAI_LAN__?: boolean }).__DEVAI_LAN__ === true;
+const useRpc = lanShell || (isBrowserPage && !hasTauriBridge);
+
+/// Сторож связи с домом нужен только странице без Rust-половины: в окне
+/// приложения отзыв замечает нативный слой (REQ-QRAPP-05).
+export const pageWatchesPairing = useRpc && !hasTauriBridge;
 
 /// POST /rpc: сервер уже знает сессию по HttpOnly-cookie, поэтому токена в
 /// JS нет вовсе (он живёт в адресе ровно один раз — при сканировании).

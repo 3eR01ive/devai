@@ -29,9 +29,18 @@ if [ "$ANDROID" = 1 ]; then
     . ./scripts/android-env.sh
     command -v cargo-tauri >/dev/null 2>&1 || { echo "build.sh: нет cargo-tauri (cargo install tauri-cli)" >&2; exit 1; }
     [ -d crates/devai-ui/gen/android ] || ( cd crates/devai-ui && cargo tauri android init --ci )
+    # Схема приглашения и http внутри домашней сети (task 01a1bf78): правки в
+    # сгенерированном проекте применяются здесь, до сборки.
+    bash scripts/android-pair.sh
     # Подпись: без ключа Gradle отдаёт *-unsigned.apk, который телефон не поставит.
     bash scripts/android-signing.sh
     ( cd crates/devai-ui && cargo tauri android build --apk --target aarch64 )
+    # Схема `devai://pair` обязана оказаться в манифесте собранного проекта:
+    # иначе сканирование снова уйдёт в браузер, а APK будет бесполезен.
+    grep -q 'android:scheme="devai"' crates/devai-ui/gen/android/app/src/main/AndroidManifest.xml || {
+        echo "build.sh: схема devai не попала в AndroidManifest.xml (plugins.deep-link)" >&2
+        exit 1
+    }
     apk_src="crates/devai-ui/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
     [ -f "$apk_src" ] || { echo "build.sh: APK не найден: $apk_src" >&2; exit 1; }
     mkdir -p bin

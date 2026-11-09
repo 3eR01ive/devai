@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../api", () => ({
   api: { inboxView: mocks.inboxView, sessionInfo: mocks.sessionInfo },
   toUiError: (e: unknown) => e,
+  // Окно приложения: сторожем связи владеет нативная половина, поэтому
+  // страница в тестах шапки не поднимает свой таймер (task 01a1bf78).
+  pageWatchesPairing: false,
 }));
 
 const stubs = {

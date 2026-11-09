@@ -26,5 +26,15 @@
   "bundle": {
     "active": false,
     "icon": ["icons/icon.png"]
+  },
+  "plugins": {
+    "deep-link": {
+      "mobile": [
+        { "scheme": ["devai"], "host": "pair", "path": [] }
+      ],
+      "desktop": {
+        "schemes": []
+      }
+    }
   }
 }

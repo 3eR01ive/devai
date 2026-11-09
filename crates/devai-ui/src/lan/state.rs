@@ -89,11 +89,18 @@ pub struct LanStatus {
     /// Whether an UNUSED invitation exists. This is what separates «приглашение
     /// использовано» (false, no QR) from «QR не отрендерился» (true + qr_error).
     pub invite_active: bool,
-    /// One-time pairing URL (carries the token); only while awaiting.
+    /// One-time pairing URL for a browser (carries the token); only while
+    /// awaiting. Kept visible as text next to the QR, so a phone WITHOUT the
+    /// app still opens the same interface (REQ-QRAPP-01 AC3, REQ-QRAPP-03).
     pub url: Option<String>,
+    /// The SAME invitation as a `devai://pair` link — the address the QR
+    /// encodes, so Android hands the scan to our app instead of a browser
+    /// (REQ-QRAPP-01 AC2). Built from the same token and address as `url`.
+    pub app_url: Option<String>,
     /// The invitation token itself, shown until a phone pairs; `None` after.
     pub token: Option<String>,
-    /// Rendered QR of `url` (SVG markup). The phone scans it with its camera.
+    /// Rendered QR of `app_url` (SVG markup). The phone scans it with its
+    /// camera and our application opens (REQ-QRAPP-02).
     pub qr_svg: Option<String>,
     /// Why the QR could not be rendered — distinct from a used invitation.
     pub qr_error: Option<String>,
@@ -117,6 +124,7 @@ impl LanStatus {
             address: None,
             invite_active: false,
             url: None,
+            app_url: None,
             token: None,
             qr_svg: None,
             qr_error: None,
@@ -326,16 +334,19 @@ impl LanAccess {
             LanState::Awaiting
         };
         let token = inner.invite.as_ref().map(|i| i.token.clone());
-        let url = token
-            .as_ref()
-            .zip(inner.address)
-            .map(|(t, addr)| format!("http://{addr}/?token={t}"));
-        let (qr_svg, qr_error) = qr_presentation(url.as_deref());
+        // Both addresses of ONE invitation (REQ-QRAPP-01 constraint): the
+        // browser URL and the app link are derived from the same address and
+        // the same one-time code, so they cannot disagree. The QR encodes the
+        // app link — Android hands `devai://pair` to our APK, not to a browser
+        // (REQ-QRAPP-02).
+        let (url, app_url) = invite_addresses(token.as_deref(), inner.address);
+        let (qr_svg, qr_error) = qr_presentation(app_url.as_deref());
         LanStatus {
             state,
             address: inner.address.map(|a| a.to_string()),
             invite_active: token.is_some(),
             url,
+            app_url,
             token,
             qr_svg,
             qr_error,
@@ -514,6 +525,40 @@ impl LanAccess {
         })
     }
 
+    /// The phone's health question (REQ-QRAPP-05/06). It never pairs and never
+    /// spends the code: it reports one of four facts, and a live session is
+    /// kept live by the question itself.
+    pub fn pair_state(&self, token: Option<&str>, cookie: Option<&str>) -> PairState {
+        let mut inner = self.lock();
+        if !inner.on {
+            return PairState::Off;
+        }
+        if let Some(secret) = cookie.filter(|s| !s.is_empty()) {
+            if let Some(session) = inner
+                .sessions
+                .iter_mut()
+                .find(|s| secret_eq(&s.secret, secret))
+            {
+                session.last_seen = Utc::now();
+                return PairState::Paired;
+            }
+        }
+        match token.filter(|t| !t.is_empty()) {
+            Some(token) => {
+                if inner
+                    .invite
+                    .as_ref()
+                    .is_some_and(|i| secret_eq(&i.token, token))
+                {
+                    PairState::Invite
+                } else {
+                    PairState::Refused("lan_token_invalid")
+                }
+            }
+            None => PairState::Refused("lan_token_required"),
+        }
+    }
+
     /// The network watchdog (REQ-LAN-08): if the bound address is no longer
     /// one of the machine's addresses, the access stops HONESTLY — off, with
     /// the reason — and is never re-bound to the new network by itself.
@@ -554,6 +599,23 @@ impl LanAccess {
     }
 }
 
+/// The two addresses of ONE invitation: the browser URL (shown as text) and
+/// the `devai://pair` link (encoded in the QR). A single producer, so the two
+/// can never carry a different token or a different machine — the constraint
+/// of REQ-QRAPP-01 is this function's shape, not a convention.
+fn invite_addresses(
+    token: Option<&str>,
+    addr: Option<SocketAddr>,
+) -> (Option<String>, Option<String>) {
+    match (token, addr) {
+        (Some(token), Some(addr)) => (
+            Some(format!("http://{addr}/?token={token}")),
+            Some(crate::lan::pair::app_link(addr, token)),
+        ),
+        _ => (None, None),
+    }
+}
+
 /// The QR presentation of an invitation URL, kept apart from the state so the
 /// two failure shapes are testable: a USED invitation has neither a QR nor an
 /// error; an invitation whose QR failed has the error (R8).
@@ -565,6 +627,18 @@ fn qr_presentation(url: Option<&str>) -> (Option<String>, Option<String>) {
         },
         None => (None, None),
     }
+}
+
+/// The fact `GET /pair` publishes: the phone's health question, answered
+/// without any data. Kept apart from [`PageAuth`] because it REFUSES nothing
+/// but a well-formed ask: «paired», «this code is valid and unused», «refused»
+/// or «the door is off» (REQ-QRAPP-05, REQ-QRAPP-06).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairState {
+    Paired,
+    Invite,
+    Refused(&'static str),
+    Off,
 }
 
 pub enum PageAuth {
@@ -753,7 +827,10 @@ mod tests {
         let status = lan.status();
         assert_eq!(status.state, LanState::Connected);
         assert!(
-            status.token.is_none() && status.url.is_none() && !status.invite_active,
+            status.token.is_none()
+                && status.url.is_none()
+                && status.app_url.is_none()
+                && !status.invite_active,
             "a used invitation is not shown as active any more"
         );
         assert_eq!(status.devices.len(), 1);
@@ -956,6 +1033,41 @@ mod tests {
         assert!(rebooted.persisted_enabled());
         let _ = lan.deactivate();
         assert!(!LanAccess::new(dir.path().join("lan-access.json")).persisted_enabled());
+    }
+
+    /// REQ-QRAPP-01: the invitation carries BOTH addresses, built from one
+    /// code and one machine address; the QR encodes the app link, so the scan
+    /// goes to the APK (REQ-QRAPP-02) while the browser link stays readable
+    /// text for a phone without the app (REQ-QRAPP-03).
+    #[test]
+    fn the_invitation_carries_one_code_as_an_app_link_and_a_browser_link() {
+        let (lan, _dir) = access();
+        let (token, _rx) = activate(&lan);
+        let status = lan.status();
+        let address = "192.168.1.20:4567";
+        assert_eq!(status.address.as_deref(), Some(address));
+        let browser = status.url.as_deref().expect("browser link");
+        let app = status.app_url.as_deref().expect("app link");
+
+        // The same code and the same machine in both, and the code is the
+        // published one.
+        assert_eq!(status.token.as_deref(), Some(token.as_str()));
+        assert!(browser.contains(&token));
+        assert!(browser.contains(address));
+        assert!(app.contains(&token));
+        let parsed = crate::lan::pair::parse_app_link(app).expect("the app link is valid");
+        assert_eq!(parsed.addr.to_string(), address);
+        assert_eq!(parsed.token, token);
+
+        // The QR is built from the app link, and it exists exactly while the
+        // invitation is unused.
+        assert!(
+            status
+                .qr_svg
+                .as_deref()
+                .is_some_and(|svg| svg.contains("<svg"))
+        );
+        assert!(status.invite_active);
     }
 
     /// R8: «QR не отрендерился» and «приглашение использовано» are two

@@ -14,6 +14,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { toUiError } from "./api";
 import { degradedBanner } from "./homes-view";
 import { subscribeWait, waitError, waitSnapshot } from "./inbox";
+import { pairFailure, subscribePairing } from "./pairing";
 import { sessionStore } from "./session";
 import { fmtTime } from "./settings";
 import type { SessionInfo, UiError } from "./types";
@@ -27,6 +28,7 @@ const shownError = computed(() => error.value ?? waitError.value);
 const waitBadge = computed(() => waitSnapshot.value?.badge ?? 0);
 const degraded = computed(() => degradedBanner(session.value));
 let unsubscribe: (() => void) | undefined;
+let stopPairing: (() => void) | undefined;
 const stopWatching = sessionStore.subscribe((s) => {
   session.value = s;
 });
@@ -38,9 +40,13 @@ onMounted(async () => {
     error.value = toUiError(e);
   }
   unsubscribe = subscribeWait();
+  // Отзыв доступа замечает само приложение (на телефоне — опросом /pair,
+  // в окне — нативной половиной); здесь только показ факта (REQ-QRAPP-05).
+  stopPairing = subscribePairing();
 });
 onUnmounted(() => {
   unsubscribe?.();
+  stopPairing?.();
   stopWatching();
 });
 </script>
@@ -73,6 +79,16 @@ onUnmounted(() => {
       </div>
       <div v-if="degraded" class="errorbox">
         <span class="code">{{ session?.degraded_from?.code }}</span>{{ degraded }}
+      </div>
+      <!-- Доступ отозван (или машина замолчала): экран честно говорит, что
+           случилось, и не стирает уже показанные данные молча — они остаются,
+           но помечены как последние (REQ-QRAPP-05 AC2, REQ-QRAPP-06 AC5). -->
+      <div v-if="pairFailure" class="errorbox" data-testid="pair-refusal">
+        <b>{{ pairFailure.title }}.</b> {{ pairFailure.hint }}
+        <div class="muted">
+          Данные ниже — последние полученные, пока доступ был открыт; обновляться
+          они больше не будут.
+        </div>
       </div>
       <RouterView />
     </main>
