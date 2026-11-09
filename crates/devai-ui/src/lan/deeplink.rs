@@ -133,6 +133,56 @@ pub fn refusal_task(
     }
 }
 
+/// What the platform said about the intent that started the process (quality
+/// return R1, rework #4). THREE outcomes, never two: «a link», «no link» and
+/// «could not read». Folding the last one into «no link» opened the remembered
+/// home after a scan that never landed — the person saw a home and believed
+/// the scan worked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// The platform read the intent: there was none.
+    None,
+    /// The platform read the intent: this link started the app.
+    Link(String),
+    /// The platform could not read the intent at all. Carries no error text on
+    /// purpose: a deep-link error may echo the link, and the link carries the
+    /// one-time code, which never reaches a log (REQ-QRAPP-07 AC3).
+    Unreadable,
+}
+
+/// What the live window said about the page it shows (quality return R2,
+/// rework #4). `Unreadable` is NOT `None`: the app is running INSIDE its own
+/// page, so a failed read still has a page to put screens on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnPage {
+    /// The window reports this address.
+    At(String),
+    /// There is no window at all: the app-side screens have nowhere to live.
+    None,
+    /// The window exists but did not report its address.
+    Unreadable,
+}
+
+/// The address of the app's own page on a phone: the origin Tauri serves the
+/// bundled assets from. Used ONLY when the live window cannot report its own
+/// address (see [`OwnPage`]) — the app is running in that page either way.
+pub const APP_PAGE_ON_PHONE: &str = "http://tauri.localhost/";
+
+/// The page the app-side screens go on, or `None` when the app has no page at
+/// all. A failed read becomes the bundled page and is named by code here; it
+/// is never reported as «своей страницы нет» (that silence was the warm-scan
+/// dead end of quality return R2).
+pub fn screen_base(page: OwnPage) -> Option<String> {
+    match page {
+        OwnPage::At(url) => Some(url),
+        OwnPage::None => None,
+        OwnPage::Unreadable => {
+            eprintln!("devai-ui: [{PAGE_UNREADABLE}] адрес своей страницы не прочитан");
+            Some(APP_PAGE_ON_PHONE.to_string())
+        }
+    }
+}
+
 /// What a launch without a link means (ratified Q4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resumed {
@@ -242,6 +292,11 @@ pub trait Screen: Send + Sync {
 const NAVIGATE_FAILED: &str = "pair_navigate_failed";
 /// The log code of a webview that could not drop the previous home's cookies.
 const SESSION_NOT_CLEARED: &str = "pair_session_not_cleared";
+/// The log code of a launching intent the platform could not hand over. The
+/// error text itself is not logged: it may echo the link and its code.
+const LAUNCH_UNREADABLE: &str = "pair_launch_unreadable";
+/// The log code of a window that could not report the address of its own page.
+const PAGE_UNREADABLE: &str = "pair_page_unreadable";
 
 /// Everything the pairing knows right now. One lock, so the boot, the scan and
 /// the answer cannot interleave halfway.
@@ -333,6 +388,20 @@ impl PairSession {
     /// code, so retrying is safe — and the «продолжить» action on the progress
     /// screen has a real pass to run (quality return R1).
     pub fn boot(&self, launched: Option<&str>, local: &[Ipv4Addr]) -> PairTask {
+        self.boot_with(
+            match launched {
+                Some(raw) => Launch::Link(raw.to_string()),
+                None => Launch::None,
+            },
+            local,
+        )
+    }
+
+    /// [`Self::boot`] with the platform's THREE-way answer: a link, no link,
+    /// or a read failure (quality return R1, rework #4). A failure is a
+    /// refusal with its own reason — never the remembered home, which would
+    /// look exactly like a scan that worked.
+    pub fn boot_with(&self, launched: Launch, local: &[Ipv4Addr]) -> PairTask {
         if let Some(raw) = self.with(|inner| inner.pending.take()) {
             self.with(|inner| inner.asking = None);
             return self.start_link(&raw, local);
@@ -341,9 +410,32 @@ impl PairSession {
             return ask_task(&link);
         }
         match launched {
-            Some(raw) if self.first_time(raw) => self.start_link(raw, local),
-            _ => self.resume_home(local),
+            Launch::Link(raw) if self.first_time(&raw) => self.start_link(&raw, local),
+            Launch::Link(_) => self.resume_home(local),
+            Launch::None => self.resume_home(local),
+            Launch::Unreadable => self.unread_launch(local),
         }
+    }
+
+    /// The launching intent could not be read: say so where the app can. The
+    /// failure is NOT «ссылки не было», so it never quietly opens the
+    /// remembered home — but that home is not lost either: the refusal is
+    /// shown ON it, with the way back (ratified Q3, the same rule a refused
+    /// NEW invitation follows). Nothing is marked as handled, so the same code
+    /// can be scanned again.
+    fn unread_launch(&self, local: &[Ipv4Addr]) -> PairTask {
+        eprintln!("devai-ui: [{LAUNCH_UNREADABLE}] ссылку запуска не удалось прочитать");
+        let current = match resume(self.store.load(), local) {
+            Resumed::Home { addr, .. } => {
+                self.with(|inner| inner.current = Some(addr));
+                Some(addr)
+            }
+            _ => self.current(),
+        };
+        self.refuse(
+            refusal_target(PairRefusal::LinkUnreadable, current, self.base()),
+            PairRefusal::LinkUnreadable,
+        )
     }
 
     /// `true` when this link was never handled by THIS PHONE — neither by this
@@ -550,10 +642,10 @@ mod mobile {
     pub fn start(app: &AppHandle, store_path: PathBuf) {
         // The bundled page address is known NOW and stays valid even when the
         // paired machine is gone: the refusal screen has to exist somewhere.
-        let base = app
-            .get_webview_window("main")
-            .and_then(|window| window.url().ok())
-            .map(|url| url.to_string());
+        // A window that cannot report its address is NOT «своей страницы нет»
+        // (quality return R2, rework #4): [`screen_base`] names the failure and
+        // keeps the bundled page.
+        let base = screen_base(own_page(app));
         app.manage(PairSession::new(
             PairStore::new(store_path),
             base,
@@ -578,7 +670,7 @@ mod mobile {
     pub fn boot(app: &AppHandle) -> PairTask {
         let launched = launched_link(app);
         app.state::<PairSession>()
-            .boot(launched.as_deref(), &net::local_ipv4s())
+            .boot_with(launched, &net::local_ipv4s())
     }
 
     pub fn report(app: &AppHandle, addr: &str, status: Option<u16>) -> PairTask {
@@ -588,9 +680,33 @@ mod mobile {
 
     /// The intent that launched the process. No sleep and no second thread: the
     /// plugin has it by the time the page asks.
-    fn launched_link(app: &AppHandle) -> Option<String> {
-        let urls = app.deep_link().get_current().ok().flatten()?;
-        urls.into_iter().next().map(|url| url.to_string())
+    ///
+    /// Three answers, not two (quality return R1, rework #4): a link, no link,
+    /// and a FAILED READ. The failure is carried as [`Launch::Unreadable`] — not
+    /// as «no link» — so a cold start by a scan can never quietly open the
+    /// remembered home. The plugin's error text is dropped on purpose: it may
+    /// echo the link, and the link carries the one-time code.
+    fn launched_link(app: &AppHandle) -> Launch {
+        match app.deep_link().get_current() {
+            Ok(Some(urls)) => match urls.into_iter().next() {
+                Some(url) => Launch::Link(url.to_string()),
+                None => Launch::None,
+            },
+            Ok(None) => Launch::None,
+            Err(_) => Launch::Unreadable,
+        }
+    }
+
+    /// The page the one window is showing. A FAILED read is its own answer, not
+    /// «no page» (quality return R2, rework #4).
+    fn own_page(app: &AppHandle) -> OwnPage {
+        match app.get_webview_window("main") {
+            None => OwnPage::None,
+            Some(window) => match window.url() {
+                Ok(url) => OwnPage::At(url.to_string()),
+                Err(_) => OwnPage::Unreadable,
+            },
+        }
     }
 }
 
@@ -1242,6 +1358,107 @@ mod tests {
             "the replayed intent must not be handled again"
         );
         assert_eq!(window.last(), "http://192.168.1.20:4567/");
+    }
+
+    /// R1 (quality return #4): a plugin that could NOT read the launching
+    /// intent is not a launch without a link. Before the fix the failure
+    /// became «ссылки не было», and a cold start by a scan quietly opened the
+    /// remembered home — the person believed the scan had worked.
+    #[test]
+    fn an_unreadable_launch_refuses_instead_of_opening_the_remembered_home() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let (session, window) = phone(&dir);
+            session.accept_scan(&pair::app_link(home(), "abc"));
+            let PairTask::Probe { addr: asked, .. } = session.boot(None, &local()) else {
+                panic!("probe expected");
+            };
+            let _ = session.report(&asked, Some(pair::STATUS_INVITE), &local());
+            // While a home works, the unreadable launch is a refusal ON it,
+            // not a lost session (ratified Q3).
+            assert_eq!(
+                session.boot_with(Launch::Unreadable, &local()),
+                PairTask::go(
+                    "http://192.168.1.20:4567/#/pair?reason=pair_link_unreadable&return=1"
+                )
+            );
+            assert!(window.last().contains("reason=pair_link_unreadable"));
+        }
+        // A new process over the same store: «no link» opens the remembered
+        // home, «could not read» must NOT — the two outcomes differ visibly.
+        let (quiet, quiet_window) = phone(&dir);
+        assert_eq!(
+            quiet.boot_with(Launch::None, &local()),
+            PairTask::go("http://192.168.1.20:4567/"),
+            "a launch without an intent still resumes the home"
+        );
+        assert!(!quiet_window.opened().is_empty());
+
+        let (unreadable, window) = phone(&dir);
+        let task = unreadable.boot_with(Launch::Unreadable, &local());
+        assert_eq!(
+            task,
+            PairTask::go("http://192.168.1.20:4567/#/pair?reason=pair_link_unreadable&return=1"),
+            "the failure is a screen with its own reason, on the home that still works"
+        );
+        assert_ne!(
+            task,
+            PairTask::go("http://192.168.1.20:4567/"),
+            "an unread scan must not pass for a plain resume of the home"
+        );
+        assert_eq!(
+            window.last(),
+            "http://192.168.1.20:4567/#/pair?reason=pair_link_unreadable&return=1"
+        );
+        // With nothing remembered there is still a screen: the bundled page.
+        let fresh = tempfile::TempDir::new().unwrap();
+        let (cold, cold_window) = phone(&fresh);
+        assert_eq!(
+            cold.boot_with(Launch::Unreadable, &local()),
+            PairTask::go("http://tauri.localhost/#/pair?reason=pair_link_unreadable")
+        );
+        assert!(cold_window.last().contains("reason=pair_link_unreadable"));
+        // Nothing was marked as handled by the failure: a later delivery of
+        // the link is still taken.
+        assert!(matches!(
+            unreadable.accept_scan(&pair::app_link(home(), "abc")),
+            PairTask::Go { .. }
+        ));
+    }
+
+    /// R2 (quality return #4): a window that cannot report its own address is
+    /// not a window without a page. Before the fix the error became «своей
+    /// страницы нет», and a warm scan silently answered `Idle`.
+    #[test]
+    fn an_unreadable_own_page_is_not_the_same_as_no_page() {
+        assert_eq!(
+            screen_base(OwnPage::At("http://tauri.localhost/".into())),
+            Some("http://tauri.localhost/".to_string())
+        );
+        // No window at all: nowhere to show an app-side screen.
+        assert_eq!(screen_base(OwnPage::None), None);
+        // A failed read still has the bundled page the app runs in.
+        assert_eq!(
+            screen_base(OwnPage::Unreadable),
+            Some(APP_PAGE_ON_PHONE.to_string())
+        );
+
+        // The warm scan the refusal named: with a readable page it is taken to
+        // the progress screen; with no page at all it stays silent (`Idle`,
+        // the behaviour of the old failure path).
+        let dir = tempfile::TempDir::new().unwrap();
+        let window = Arc::new(Recorder::default());
+        let session = PairSession::new(
+            PairStore::new(dir.path().join("phone-pairing.json")),
+            screen_base(OwnPage::Unreadable),
+            window.clone(),
+        );
+        let raw = pair::app_link(home(), "abc");
+        assert!(
+            matches!(session.accept_scan(&raw), PairTask::Go { .. }),
+            "an unreadable address must still take the scan somewhere"
+        );
+        assert!(window.last().contains("scan="), "{}", window.last());
     }
 
     /// R2: a record that cannot be read is said on the bundled page and

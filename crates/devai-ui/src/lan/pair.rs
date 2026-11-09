@@ -101,6 +101,11 @@ pub enum PairRefusal {
     /// The link itself is not a pairing link: wrong scheme, extra parameters,
     /// a path, or an address outside a home network (REQ-QRAPP-07).
     BadLink,
+    /// The invitation could not be READ at all: the platform refused to hand
+    /// over the launching intent (quality return R1). This is not «ссылки не
+    /// было» and not «ссылка испорчена» — the scan never reached the app, so
+    /// the person has to be told instead of getting the remembered home.
+    LinkUnreadable,
 }
 
 /// One row of the refusal vocabulary, parsed from the data file: the machine
@@ -854,7 +859,13 @@ mod tests {
             }
         };
     }
-    declare_refusal_variants!(InviteExpired, WrongNetwork, AccessClosed, BadLink);
+    declare_refusal_variants!(
+        InviteExpired,
+        WrongNetwork,
+        AccessClosed,
+        BadLink,
+        LinkUnreadable
+    );
 
     /// R6: the refusal catalogue is DATA (`data/pair-vocabulary.json`), not a
     /// typed table in code — and every enum variant has exactly one row.
