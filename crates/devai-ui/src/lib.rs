@@ -25,6 +25,7 @@
 //!     replaces the old exit-2-on-bad-home behavior for observed homes).
 
 mod commands;
+mod lan;
 mod session;
 
 use std::sync::Mutex;
@@ -87,13 +88,43 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::model_snapshot,
         commands::model_probe,
         commands::model_switch,
+        // LAN access from the phone (task 01a1be98): the same window-facing
+        // state machine the HTTP surface reads. The controls live with the
+        // phone plane (`lan::commands`), which owns their registration and
+        // their dispatch in ONE catalogue.
+        lan::commands::lan_status,
+        lan::commands::lan_enable,
+        lan::commands::lan_disable,
+        lan::commands::lan_new_invite,
+        lan::commands::lan_disconnect,
     ]
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The access state lives OUTSIDE the Tauri state object so the window
+    // close hook and the HTTP server can share it (task 01a1be98).
+    let control_home = session::resolve_control_home(&|k| std::env::var(k).ok());
+    let lan = std::sync::Arc::new(lan::LanAccess::new(control_home.join("lan-access.json")));
+
+    // Ratified Q4: the access OUTLIVES the window. While it is on, closing
+    // the window only hides it and the process keeps serving; a second
+    // launch hands «show» to the running instance instead of starting a
+    // second server (see lan::instance). R2: «another instance runs» and
+    // «the handoff socket could not be created» are different answers — the
+    // first exits quietly, the second is visible and the window still opens.
+    let instance = match lan::instance::acquire(control_home.join("ui-instance.sock")) {
+        lan::InstanceAcquire::Acquired(guard) => Some(guard),
+        lan::InstanceAcquire::AlreadyRunning => return,
+        lan::InstanceAcquire::Unavailable(message) => {
+            eprintln!("devai-ui: одиночный экземпляр недоступен: {message}");
+            None
+        }
+    };
+
+    let lan_for_close = lan.clone();
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             // На Android у процесса нет $HOME: цепочка DEVAI_HOME → ~/.devai
             // упирается в относительный путь, дом не открывается — и окно
             // закрывалось сразу после запуска (08.11, живой APK). Дом платформы
@@ -117,8 +148,30 @@ pub fn run() {
                 api: Mutex::new(session.api),
                 homes: Mutex::new(session.homes),
                 session: Mutex::new(session.info),
+                lan: lan.clone(),
             });
+            let handle = app.handle().clone();
+            if let Some(guard) = instance {
+                guard.spawn(handle.clone());
+            }
+            // Ratified Q1 «должен»: an access that was on at the last
+            // shutdown comes back on this launch. The token is never
+            // persisted — a fresh invitation is issued each time.
+            #[cfg(not(mobile))]
+            lan::restore_at_startup(handle, lan.clone());
             Ok(())
+        })
+        // Ratified Q4: with the access on, a close request hides the window
+        // instead of ending the process. Closing with the access off keeps
+        // the normal behaviour (the process exits).
+        .on_window_event(move |window, event| {
+            #[cfg(not(mobile))]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if lan_for_close.is_on() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         // Native folder picker for the homes registry (REQ-HOME-03, R1:
         // the operator lifted the "plugin out of cycle" justification —

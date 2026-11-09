@@ -45,6 +45,10 @@ pub struct AppState {
     pub api: std::sync::Mutex<Api>,
     pub homes: std::sync::Mutex<devai_api::Homes>,
     pub session: std::sync::Mutex<SessionInfo>,
+    /// LAN access to the phone (task 01a1be98): the access state machine,
+    /// the one-time invitations and the paired sessions. Shared with the
+    /// HTTP server thread, so the window and the phone read ONE state.
+    pub lan: std::sync::Arc<crate::lan::LanAccess>,
 }
 
 impl AppState {
@@ -67,7 +71,7 @@ impl AppState {
         self.homes.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn session(&self) -> std::sync::MutexGuard<'_, SessionInfo> {
+    pub(crate) fn session(&self) -> std::sync::MutexGuard<'_, SessionInfo> {
         self.session.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
@@ -321,6 +325,36 @@ pub const COMMAND_CONTRACTS: &[CommandContract] = &[
     },
     CommandContract {
         command: "task_reject",
+        version: 1,
+        breaking: "",
+    },
+    // The phone-access controls (task 01a1be98): a new PUBLIC surface (five
+    // IPC commands + the HTTP/JSON envelope), so it is recorded here at its
+    // first shape like every other published command (quality return R9).
+    // They are not domain operations: the operation plane is the local
+    // access, described by `lan::commands::LAN_SURFACE_CONTRACTS`.
+    CommandContract {
+        command: "lan_status",
+        version: 1,
+        breaking: "",
+    },
+    CommandContract {
+        command: "lan_enable",
+        version: 1,
+        breaking: "",
+    },
+    CommandContract {
+        command: "lan_disable",
+        version: 1,
+        breaking: "",
+    },
+    CommandContract {
+        command: "lan_new_invite",
+        version: 1,
+        breaking: "",
+    },
+    CommandContract {
+        command: "lan_disconnect",
         version: 1,
         breaking: "",
     },
@@ -711,6 +745,25 @@ pub fn task_signature(state: State<AppState>, id_prefix: String) -> Result<Signa
     Ok(state.api().task_signature(&id_prefix)?)
 }
 
+/// R6: the four actor-carrying writes repeated one skeleton — «read the
+/// session actor → open a write handle on the SAME home → call → re-read».
+/// One helper owns that skeleton; each command names only its own act.
+fn with_actor_write<T>(
+    state: &State<AppState>,
+    actor: Option<String>,
+    run: impl FnOnce(&Api) -> Result<T, ApiError>,
+) -> Result<T, UiError> {
+    let (home, actor) = {
+        let info = state.session();
+        (
+            info.home.clone(),
+            actor.unwrap_or_else(|| info.actor.clone()),
+        )
+    };
+    let write = state.write_api(&home, &actor)?;
+    Ok(run(&write)?)
+}
+
 /// `task.approve` — the SAME platform act as `devai task approve`
 /// (REQ-SIGN-05): the API writes the decision row; the window only calls it
 /// and never writes the store itself. Author is the session actor the API
@@ -721,16 +774,24 @@ pub fn task_approve(
     id_prefix: String,
     rationale: Option<String>,
 ) -> Result<SignatureView, UiError> {
-    let (home, actor) = {
-        let info = state.session();
-        (info.home.clone(), info.actor.clone())
-    };
-    let write = state.write_api(&home, &actor)?;
-    write.task_approve(&id_prefix, rationale)?;
-    let api = state.api();
+    task_approve_as(state, id_prefix, rationale, None)
+}
+
+/// The SAME signature act, recorded under an explicit actor. The LAN boundary
+/// passes `<operator> · телефон: …` here so history names the device while
+/// the person stays the author (REQ-LAN-06); the window passes `None` and the
+/// session actor is used unchanged. One write path — `Api::open` on the same
+/// home — for both surfaces.
+pub fn task_approve_as(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+    actor: Option<String>,
+) -> Result<SignatureView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_approve(&id_prefix, rationale))?;
     // The card is re-read from the store through the SAME read the section
     // renders — no local state is patched up (REQ-SIGN-04 AC6).
-    Ok(api.task_signature(&id_prefix)?)
+    Ok(state.api().task_signature(&id_prefix)?)
 }
 
 /// `task.reject` — same act as `devai task reject`: one event and one
@@ -741,14 +802,18 @@ pub fn task_reject(
     id_prefix: String,
     rationale: Option<String>,
 ) -> Result<SignatureView, UiError> {
-    let (home, actor) = {
-        let info = state.session();
-        (info.home.clone(), info.actor.clone())
-    };
-    let write = state.write_api(&home, &actor)?;
-    write.task_reject(&id_prefix, rationale)?;
-    let api = state.api();
-    Ok(api.task_signature(&id_prefix)?)
+    task_reject_as(state, id_prefix, rationale, None)
+}
+
+/// The rejection twin of `task_approve_as`: same act, explicit actor.
+pub fn task_reject_as(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+    actor: Option<String>,
+) -> Result<SignatureView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_reject(&id_prefix, rationale))?;
+    Ok(state.api().task_signature(&id_prefix)?)
 }
 
 /// PipelineView{order,current,position,position_index,off_spine,terminal}
@@ -913,12 +978,16 @@ pub fn model_probe(
     state: State<AppState>,
     bundle_id: String,
 ) -> Result<devai_api::ProbeView, UiError> {
-    let (home, actor) = {
-        let s = state.session();
-        (s.home.clone(), s.actor.clone())
-    };
-    let api = state.write_api(&home, &actor)?;
-    Ok(api.model_probe(&bundle_id)?)
+    model_probe_as(state, bundle_id, None)
+}
+
+/// The same probe under an explicit actor (LAN device marker, REQ-LAN-06).
+pub fn model_probe_as(
+    state: State<AppState>,
+    bundle_id: String,
+    actor: Option<String>,
+) -> Result<devai_api::ProbeView, UiError> {
+    with_actor_write(&state, actor, |api| api.model_probe(&bundle_id))
 }
 
 /// Switch to one DECLARED bundle (REQ-MS-04) — the operator's act, probed
@@ -932,12 +1001,17 @@ pub fn model_switch(
     bundle_id: String,
     reason: String,
 ) -> Result<devai_api::SwitchResultView, UiError> {
-    let (home, actor) = {
-        let s = state.session();
-        (s.home.clone(), s.actor.clone())
-    };
-    let api = state.write_api(&home, &actor)?;
-    Ok(api.model_switch(&bundle_id, &reason)?)
+    model_switch_as(state, bundle_id, reason, None)
+}
+
+/// The same switch under an explicit actor (LAN device marker, REQ-LAN-06).
+pub fn model_switch_as(
+    state: State<AppState>,
+    bundle_id: String,
+    reason: String,
+    actor: Option<String>,
+) -> Result<devai_api::SwitchResultView, UiError> {
+    with_actor_write(&state, actor, |api| api.model_switch(&bundle_id, &reason))
 }
 
 /// The human-wait section (REQ-GATE-01..10), published as one command at
@@ -1604,7 +1678,10 @@ mod tests {
                 continue;
             }
             let mapped = COMMAND_OPERATIONS.iter().any(|(c, _)| *c == name)
-                || COMMAND_REGISTRY_OPERATIONS.iter().any(|(c, _)| *c == name);
+                || COMMAND_REGISTRY_OPERATIONS.iter().any(|(c, _)| *c == name)
+                || crate::lan::commands::LAN_OPERATIONS
+                    .iter()
+                    .any(|o| o.command == name.as_str());
             assert!(
                 mapped,
                 "api.ts invokes `{name}` with no COMMAND_OPERATIONS/COMMAND_REGISTRY_OPERATIONS mapping"
@@ -2238,6 +2315,14 @@ mod tests {
         }
     }
 
+    /// Is the versioned command backed by one of the two registered planes?
+    fn contract_is_mapped(command: &str) -> bool {
+        COMMAND_OPERATIONS.iter().any(|(cmd, _)| *cmd == command)
+            || crate::lan::commands::LAN_OPERATIONS
+                .iter()
+                .any(|o| o.command == command)
+    }
+
     /// A breaking command shape is a RECORDED,
     /// versioned fact — every entry of the ledger is a mapped command with
     /// version >= 2 and a non-empty breaking note, and the section's
@@ -2265,11 +2350,13 @@ mod tests {
                     contract.command
                 );
             }
+            // Domain commands live in COMMAND_OPERATIONS; the phone-access
+            // controls are their own registered plane (LAN_OPERATIONS), which
+            // `lan::commands::the_phone_surface_is_registered_and_mirrored`
+            // pins in the other direction.
             assert!(
-                COMMAND_OPERATIONS
-                    .iter()
-                    .any(|(cmd, _)| *cmd == contract.command),
-                "{} is versioned but not mapped in COMMAND_OPERATIONS",
+                contract_is_mapped(contract.command),
+                "{} is versioned but not mapped in COMMAND_OPERATIONS or LAN_OPERATIONS",
                 contract.command
             );
         }
