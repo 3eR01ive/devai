@@ -28,6 +28,15 @@ pub const LIVE_WINDOW: chrono::Duration = chrono::Duration::seconds(60);
 
 const INVITE_TOKEN_BYTES: usize = 32;
 const SESSION_SECRET_BYTES: usize = 32;
+/// The id a session is listed by — short on purpose, it is a handle, not a key.
+const SESSION_ID_BYTES: usize = 8;
+
+/// The refusal codes the phone door and the pairing answers read. Declared ONCE
+/// here and named from here by `lan::http` and the state machine (quality
+/// return R6: the codes were spelled in two modules).
+pub const CODE_LAN_OFF: &str = "lan_off";
+pub const CODE_TOKEN_REQUIRED: &str = "lan_token_required";
+pub const CODE_TOKEN_INVALID: &str = "lan_token_invalid";
 
 /// The QR-render failure text: when the invitation exists but its QR did not
 /// render, the window says so instead of showing an empty slot that reads as
@@ -89,11 +98,18 @@ pub struct LanStatus {
     /// Whether an UNUSED invitation exists. This is what separates «приглашение
     /// использовано» (false, no QR) from «QR не отрендерился» (true + qr_error).
     pub invite_active: bool,
-    /// One-time pairing URL (carries the token); only while awaiting.
+    /// One-time pairing URL for a browser (carries the token); only while
+    /// awaiting. Kept visible as text next to the QR, so a phone WITHOUT the
+    /// app still opens the same interface (REQ-QRAPP-01 AC3, REQ-QRAPP-03).
     pub url: Option<String>,
+    /// The SAME invitation as a `devai://pair` link — the address the QR
+    /// encodes, so Android hands the scan to our app instead of a browser
+    /// (REQ-QRAPP-01 AC2). Built from the same token and address as `url`.
+    pub app_url: Option<String>,
     /// The invitation token itself, shown until a phone pairs; `None` after.
     pub token: Option<String>,
-    /// Rendered QR of `url` (SVG markup). The phone scans it with its camera.
+    /// Rendered QR of `app_url` (SVG markup). The phone scans it with its
+    /// camera and our application opens (REQ-QRAPP-02).
     pub qr_svg: Option<String>,
     /// Why the QR could not be rendered — distinct from a used invitation.
     pub qr_error: Option<String>,
@@ -117,6 +133,7 @@ impl LanStatus {
             address: None,
             invite_active: false,
             url: None,
+            app_url: None,
             token: None,
             qr_svg: None,
             qr_error: None,
@@ -226,6 +243,16 @@ struct Inner {
     persist_error: Option<String>,
 }
 
+/// What the persisted «was on» flag says. `Corrupt` is a FACT, not «off»
+/// (quality return R2): the window says the setting could not be read instead
+/// of silently starting with the access switched off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersistedAccess {
+    Off,
+    On,
+    Corrupt(String),
+}
+
 /// The access state machine + the persistence of the «was on» flag (Q1).
 /// Everything the HTTP boundary decides about authentication goes through
 /// this type, so the rules are unit-testable without a Tauri app or sockets.
@@ -260,14 +287,32 @@ impl LanAccess {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The persisted «was on» fact (ratified Q1). A missing/garbled file is
-    /// simply «off»: the platform does not invent an enabled access.
-    pub fn persisted_enabled(&self) -> bool {
-        std::fs::read_to_string(&self.state_file)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|doc| doc.get("enabled").and_then(|v| v.as_bool()))
-            .unwrap_or(false)
+    /// The persisted «was on» fact (ratified Q1), with the third outcome the
+    /// old boolean hid (quality return R2): a file that exists but cannot be
+    /// read is NOT «выключено» — a swallowed parse error made a broken setting
+    /// look exactly like a switched-off one.
+    pub fn persisted(&self) -> PersistedAccess {
+        let path = self.state_file.display().to_string();
+        let raw = match std::fs::read_to_string(&self.state_file) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return PersistedAccess::Off;
+            }
+            Err(error) => {
+                return PersistedAccess::Corrupt(format!("не удалось прочитать {path}: {error}"));
+            }
+        };
+        let doc: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(doc) => doc,
+            Err(error) => {
+                return PersistedAccess::Corrupt(format!("{path} испорчен: {error}"));
+            }
+        };
+        match doc.get("enabled").and_then(|value| value.as_bool()) {
+            Some(true) => PersistedAccess::On,
+            Some(false) => PersistedAccess::Off,
+            None => PersistedAccess::Corrupt(format!("в {path} нет поля «enabled»")),
+        }
     }
 
     /// Write the «was on» flag. EVERY step is a typed failure the caller must
@@ -326,16 +371,19 @@ impl LanAccess {
             LanState::Awaiting
         };
         let token = inner.invite.as_ref().map(|i| i.token.clone());
-        let url = token
-            .as_ref()
-            .zip(inner.address)
-            .map(|(t, addr)| format!("http://{addr}/?token={t}"));
-        let (qr_svg, qr_error) = qr_presentation(url.as_deref());
+        // Both addresses of ONE invitation (REQ-QRAPP-01 constraint): the
+        // browser URL and the app link are derived from the same address and
+        // the same one-time code, so they cannot disagree. The QR encodes the
+        // app link — Android hands `devai://pair` to our APK, not to a browser
+        // (REQ-QRAPP-02).
+        let (url, app_url) = invite_addresses(token.as_deref(), inner.address);
+        let (qr_svg, qr_error) = qr_presentation(app_url.as_deref());
         LanStatus {
             state,
             address: inner.address.map(|a| a.to_string()),
             invite_active: token.is_some(),
             url,
+            app_url,
             token,
             qr_svg,
             qr_error,
@@ -411,7 +459,7 @@ impl LanAccess {
         let mut inner = self.lock();
         if !inner.on {
             return Err(UiError {
-                code: "lan_off".into(),
+                code: CODE_LAN_OFF.into(),
                 message: "доступ с телефона выключен".into(),
             });
         }
@@ -430,9 +478,12 @@ impl LanAccess {
         before != inner.sessions.len()
     }
 
-    /// Page load from a browser. A valid session cookie wins (a reload does
-    /// not need a new code — ratified Q3); otherwise a matching invitation is
-    /// CONSUMED and becomes exactly one session (REQ-LAN-04 AC4).
+    /// Page load from a browser or from the app's window. A valid session
+    /// cookie admits the device without needing the code again (ratified Q3);
+    /// otherwise a matching invitation is CONSUMED into exactly one session
+    /// (REQ-LAN-04 AC4). A one-time code that was presented is spent by ANY
+    /// successful entry — a reload with a live cookie must not leave the code
+    /// the desktop already shows as used still alive (quality return R3).
     pub fn page_load(
         &self,
         token: Option<&str>,
@@ -442,21 +493,33 @@ impl LanAccess {
         let mut inner = self.lock();
         if !inner.on {
             return PageAuth::Deny {
-                code: "lan_off",
+                code: CODE_LAN_OFF,
                 message: "доступ с телефона выключен".into(),
             };
         }
+        let presented = token.filter(|token| !token.is_empty());
         if let Some(secret) = cookie.filter(|s| !s.is_empty()) {
-            if let Some(session) = inner
+            if let Some(index) = inner
                 .sessions
-                .iter_mut()
-                .find(|s| secret_eq(&s.secret, secret))
+                .iter()
+                .position(|s| secret_eq(&s.secret, secret))
             {
-                session.last_seen = Utc::now();
+                // The entry is allowed, so the presented code is spent: the
+                // door it opens is the one being walked through.
+                let live = presented.is_some_and(|token| {
+                    inner
+                        .invite
+                        .as_ref()
+                        .is_some_and(|invite| secret_eq(&invite.token, token))
+                });
+                if live {
+                    inner.invite = None;
+                }
+                inner.sessions[index].last_seen = Utc::now();
                 return PageAuth::Allow { set_cookie: None };
             }
         }
-        self.pair(&mut inner, token, device)
+        self.pair(&mut inner, presented, device)
     }
 
     /// Consume the invitation into exactly one session. The code is removed
@@ -464,7 +527,7 @@ impl LanAccess {
     fn pair(&self, inner: &mut Inner, token: Option<&str>, device: &DeviceClaim) -> PageAuth {
         let Some(token) = token.filter(|t| !t.is_empty()) else {
             return PageAuth::Deny {
-                code: "lan_token_required",
+                code: CODE_TOKEN_REQUIRED,
                 message: "нужен код приглашения".into(),
             };
         };
@@ -474,14 +537,14 @@ impl LanAccess {
             .is_some_and(|i| secret_eq(&i.token, token));
         if !valid {
             return PageAuth::Deny {
-                code: "lan_token_invalid",
+                code: CODE_TOKEN_INVALID,
                 message: "код приглашения недействителен или уже использован".into(),
             };
         }
         inner.invite = None;
         let now = Utc::now();
         let secret = fresh_secret(&self.counter, SESSION_SECRET_BYTES);
-        let id = fresh_secret(&self.counter, 8);
+        let id = fresh_secret(&self.counter, SESSION_ID_BYTES);
         inner.sessions.push(Session {
             id,
             secret: secret.clone(),
@@ -512,6 +575,40 @@ impl LanAccess {
             name: session.name.clone(),
             addr: device.addr.clone(),
         })
+    }
+
+    /// The phone's health question (REQ-QRAPP-05/06). It never pairs and never
+    /// spends the code: it reports one of four facts, and a live session is
+    /// kept live by the question itself.
+    pub fn pair_state(&self, token: Option<&str>, cookie: Option<&str>) -> PairState {
+        let mut inner = self.lock();
+        if !inner.on {
+            return PairState::Off;
+        }
+        if let Some(secret) = cookie.filter(|s| !s.is_empty()) {
+            if let Some(session) = inner
+                .sessions
+                .iter_mut()
+                .find(|s| secret_eq(&s.secret, secret))
+            {
+                session.last_seen = Utc::now();
+                return PairState::Paired;
+            }
+        }
+        match token.filter(|t| !t.is_empty()) {
+            Some(token) => {
+                if inner
+                    .invite
+                    .as_ref()
+                    .is_some_and(|i| secret_eq(&i.token, token))
+                {
+                    PairState::Invite
+                } else {
+                    PairState::Refused(CODE_TOKEN_INVALID)
+                }
+            }
+            None => PairState::Refused(CODE_TOKEN_REQUIRED),
+        }
     }
 
     /// The network watchdog (REQ-LAN-08): if the bound address is no longer
@@ -554,6 +651,24 @@ impl LanAccess {
     }
 }
 
+/// The two addresses of ONE invitation: the browser URL (shown as text) and
+/// the `devai://pair` link (encoded in the QR). Both come from the SAME
+/// producers in [`crate::lan::pair`], so they cannot carry a different token
+/// or a different machine — the constraint of REQ-QRAPP-01 is this function's
+/// shape, not a convention (quality return R4).
+fn invite_addresses(
+    token: Option<&str>,
+    addr: Option<SocketAddr>,
+) -> (Option<String>, Option<String>) {
+    match (token, addr) {
+        (Some(token), Some(addr)) => (
+            Some(crate::lan::pair::home_url(addr, Some(token))),
+            Some(crate::lan::pair::app_link(addr, token)),
+        ),
+        _ => (None, None),
+    }
+}
+
 /// The QR presentation of an invitation URL, kept apart from the state so the
 /// two failure shapes are testable: a USED invitation has neither a QR nor an
 /// error; an invitation whose QR failed has the error (R8).
@@ -565,6 +680,18 @@ fn qr_presentation(url: Option<&str>) -> (Option<String>, Option<String>) {
         },
         None => (None, None),
     }
+}
+
+/// The fact `GET /pair` publishes: the phone's health question, answered
+/// without any data. Kept apart from [`PageAuth`] because it REFUSES nothing
+/// but a well-formed ask: «paired», «this code is valid and unused», «refused»
+/// or «the door is off» (REQ-QRAPP-05, REQ-QRAPP-06).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairState {
+    Paired,
+    Invite,
+    Refused(&'static str),
+    Off,
 }
 
 pub enum PageAuth {
@@ -753,7 +880,10 @@ mod tests {
         let status = lan.status();
         assert_eq!(status.state, LanState::Connected);
         assert!(
-            status.token.is_none() && status.url.is_none() && !status.invite_active,
+            status.token.is_none()
+                && status.url.is_none()
+                && status.app_url.is_none()
+                && !status.invite_active,
             "a used invitation is not shown as active any more"
         );
         assert_eq!(status.devices.len(), 1);
@@ -772,6 +902,67 @@ mod tests {
             lan.page_load(None, Some(&cookie), &claims("Pixel 7")),
             PageAuth::Allow { set_cookie: None }
         ));
+    }
+
+    /// R3: a presented one-time code is spent by ANY successful entry. A phone
+    /// that already holds its session cookie and opens a FRESH invitation of the
+    /// same home must not leave that code alive for a second device.
+    #[test]
+    fn a_successful_entry_spends_the_presented_code_even_with_a_cookie() {
+        let (lan, _dir) = access();
+        let (token, _rx) = activate(&lan);
+        let PageAuth::Allow {
+            set_cookie: Some(cookie),
+        } = lan.page_load(Some(&token), None, &claims("Pixel"))
+        else {
+            panic!("first pairing");
+        };
+        // The desktop issues a new invitation for the next device.
+        let fresh = lan.new_invite().expect("access is on");
+        assert!(lan.status().invite_active);
+        // The paired app opens the home WITH that code and its live cookie.
+        assert!(matches!(
+            lan.page_load(Some(&fresh), Some(&cookie), &claims("Pixel")),
+            PageAuth::Allow { set_cookie: None }
+        ));
+        assert!(
+            !lan.status().invite_active,
+            "the entry spent the code: the desktop cannot show it as usable"
+        );
+        // And nobody else can use it any more.
+        assert!(matches!(
+            lan.page_load(Some(&fresh), None, &claims("другой телефон")),
+            PageAuth::Deny {
+                code: CODE_TOKEN_INVALID,
+                ..
+            }
+        ));
+    }
+
+    /// R2: a setting nobody can read is a FACT, not «выключено» — the third
+    /// outcome the old boolean hid.
+    #[test]
+    fn a_broken_persisted_flag_is_named_not_swallowed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("lan-access.json");
+        // No file at all: the access was never on.
+        let missing = LanAccess::new(path.clone());
+        assert_eq!(missing.persisted(), PersistedAccess::Off);
+        // A file that cannot be parsed is its own outcome and names the path.
+        std::fs::write(&path, "{ not json").unwrap();
+        let lan = LanAccess::new(path.clone());
+        match lan.persisted() {
+            PersistedAccess::Corrupt(reason) => {
+                assert!(reason.contains("lan-access.json"), "{reason}");
+                assert!(reason.contains("испорчен"), "{reason}");
+            }
+            other => panic!("a broken flag must be named: {other:?}"),
+        }
+        // Not «выключено»: the break stays a break until somebody repairs it.
+        assert!(matches!(lan.persisted(), PersistedAccess::Corrupt(_)));
+        // A record without the flag is broken too, not silently «off».
+        std::fs::write(&path, "{\"other\":1}").unwrap();
+        assert!(matches!(lan.persisted(), PersistedAccess::Corrupt(_)));
     }
 
     #[test]
@@ -893,7 +1084,7 @@ mod tests {
         let (lan, dir) = access();
         let (token, _rx) = activate(&lan);
         let _ = lan.page_load(Some(&token), None, &claims("Pixel"));
-        assert!(lan.persisted_enabled());
+        assert_eq!(lan.persisted(), PersistedAccess::On);
         // Same address: nothing happens.
         assert!(!lan.stop_if_network_changed(&["192.168.1.20".parse().unwrap()]));
         assert!(lan.is_on());
@@ -904,7 +1095,7 @@ mod tests {
         assert_eq!(status.reason_code.as_deref(), Some("network_changed"));
         assert!(status.address.is_none() && status.devices.is_empty());
         assert!(
-            !lan.persisted_enabled(),
+            lan.persisted() == PersistedAccess::Off,
             "the flag is cleared: a return to the old network must not restore it"
         );
         // No hidden recovery.
@@ -919,7 +1110,7 @@ mod tests {
         let status = lan.status();
         assert_eq!(status.state, LanState::Off);
         assert_eq!(status.reason_code.as_deref(), Some("no_local_address"));
-        assert!(!lan.persisted_enabled());
+        assert_eq!(lan.persisted(), PersistedAccess::Off);
     }
 
     /// R3: a refused write of the «was on» flag is a VISIBLE fact, not a
@@ -948,14 +1139,52 @@ mod tests {
     #[test]
     fn an_enabled_access_is_restored_from_the_persisted_flag_only() {
         let (lan, dir) = access();
-        assert!(!lan.persisted_enabled());
+        assert_eq!(lan.persisted(), PersistedAccess::Off);
         let (token, _rx) = activate(&lan);
         drop(token);
         // A fresh process on the same control home sees «was on».
         let rebooted = LanAccess::new(dir.path().join("lan-access.json"));
-        assert!(rebooted.persisted_enabled());
+        assert_eq!(rebooted.persisted(), PersistedAccess::On);
         let _ = lan.deactivate();
-        assert!(!LanAccess::new(dir.path().join("lan-access.json")).persisted_enabled());
+        assert_eq!(
+            LanAccess::new(dir.path().join("lan-access.json")).persisted(),
+            PersistedAccess::Off
+        );
+    }
+
+    /// REQ-QRAPP-01: the invitation carries BOTH addresses, built from one
+    /// code and one machine address; the QR encodes the app link, so the scan
+    /// goes to the APK (REQ-QRAPP-02) while the browser link stays readable
+    /// text for a phone without the app (REQ-QRAPP-03).
+    #[test]
+    fn the_invitation_carries_one_code_as_an_app_link_and_a_browser_link() {
+        let (lan, _dir) = access();
+        let (token, _rx) = activate(&lan);
+        let status = lan.status();
+        let address = "192.168.1.20:4567";
+        assert_eq!(status.address.as_deref(), Some(address));
+        let browser = status.url.as_deref().expect("browser link");
+        let app = status.app_url.as_deref().expect("app link");
+
+        // The same code and the same machine in both, and the code is the
+        // published one.
+        assert_eq!(status.token.as_deref(), Some(token.as_str()));
+        assert!(browser.contains(&token));
+        assert!(browser.contains(address));
+        assert!(app.contains(&token));
+        let parsed = crate::lan::pair::parse_app_link(app).expect("the app link is valid");
+        assert_eq!(parsed.addr.to_string(), address);
+        assert_eq!(parsed.token, token);
+
+        // The QR is built from the app link, and it exists exactly while the
+        // invitation is unused.
+        assert!(
+            status
+                .qr_svg
+                .as_deref()
+                .is_some_and(|svg| svg.contains("<svg"))
+        );
+        assert!(status.invite_active);
     }
 
     /// R8: «QR не отрендерился» and «приглашение использовано» are two

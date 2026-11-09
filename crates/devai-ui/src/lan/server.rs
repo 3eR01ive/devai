@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::commands::UiError;
 use crate::lan::http::{AppSurface, routes};
 use crate::lan::net::{local_ipv4s, pick_lan_address, spawn_watchdog};
-use crate::lan::state::{LanAccess, LanStatus};
+use crate::lan::state::{LanAccess, LanStatus, PersistedAccess};
 
 /// Bind, spawn the server thread and mark the access on. Returns the status
 /// the window renders. Called by the `lan_enable` command and at startup when
@@ -49,10 +49,22 @@ pub fn stop_access(lan: &LanAccess) -> LanStatus {
 }
 
 /// Startup restore of the persisted flag (ratified Q1). A failure to bind is
-/// not fatal: the window opens, the access stays off with its reason.
+/// not fatal: the window opens, the access stays off with its reason. A flag
+/// nobody can read is NOT «выключено» (quality return R2): it is named, so the
+/// operator reads why the access did not come back instead of seeing a fresh
+/// install state.
 pub fn restore_at_startup(app: tauri::AppHandle, lan: Arc<LanAccess>) {
-    if !lan.persisted_enabled() {
-        return;
+    match lan.persisted() {
+        PersistedAccess::On => {}
+        PersistedAccess::Off => return,
+        PersistedAccess::Corrupt(reason) => {
+            eprintln!("devai-ui: [lan_state_corrupt] настройка доступа: {reason}");
+            lan.refuse(
+                "lan_state_corrupt",
+                format!("настройку доступа не удалось прочитать: {reason}"),
+            );
+            return;
+        }
     }
     match start_access(app, lan) {
         Ok(status) => eprintln!(

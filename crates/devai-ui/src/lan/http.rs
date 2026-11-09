@@ -13,9 +13,21 @@ use std::sync::Arc;
 
 use crate::commands::UiError;
 use crate::lan::commands::dispatch_rpc;
-use crate::lan::state::{DeviceClaim, LanAccess, PageAuth};
+use crate::lan::pair::{PairRefusal, STATE_CLOSED, STATE_INVALID, STATE_INVITE, STATE_PAIRED};
+use crate::lan::state::{
+    CODE_LAN_OFF, CODE_TOKEN_INVALID, CODE_TOKEN_REQUIRED, DeviceClaim, LanAccess, PageAuth,
+    PairState,
+};
 
 const SESSION_COOKIE: &str = "devai_lan";
+
+/// The session cookie is kept on the device, not only in the tab: the app
+/// remembers the home it was paired with and re-opens it on the next launch
+/// (ratified Q4). There is no clock-based expiry anywhere in the access — the
+/// ratified decision of 09.11 is «живёт, пока его явно не закроют» — so the
+/// cookie's lifetime is long and the door is closed by the machine, not by
+/// time.
+const SESSION_MAX_AGE_SECS: u64 = 365 * 24 * 60 * 60;
 
 /// One embedded asset of the frontend bundle.
 pub struct Asset {
@@ -86,6 +98,7 @@ pub fn routes(lan: Arc<LanAccess>, surface: Arc<dyn Surface>) -> axum::Router {
     let ctx = ServerCtx { lan, surface };
     axum::Router::new()
         .route("/", axum::routing::get(page))
+        .route("/pair", axum::routing::get(pair_probe))
         .route("/rpc", axum::routing::post(rpc))
         .route("/*path", axum::routing::get(asset))
         .with_state(ctx)
@@ -109,6 +122,47 @@ pub fn asset_path(uri_path: &str) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join("/"))
 }
 
+/// `GET /pair[?token=…]` — the phone's cheap health question, and the only
+/// answer a revoked access can still get (REQ-QRAPP-05): it carries no data,
+/// only the fact. `200 paired` = this device's session lives; `200 invite` =
+/// the presented one-time code is valid and NOT spent; `401` = the code or the
+/// session is dead; `403` = the access is off.
+///
+/// The session cookie IS read here — that is how a paired device is told from
+/// an unpaired one — but the path never SETS a cookie, never spends the code
+/// and reveals nothing beyond the three state tokens above. The answer is
+/// readable from ANOTHER origin on purpose (`ACAO: *`): the app page asks the
+/// candidate machine this question before the window switches homes, and a
+/// switch that cannot be checked would cost the working session (quality
+/// return R2).
+async fn pair_probe(
+    axum::extract::State(ctx): axum::extract::State<ServerCtx>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let token = query.get("token").map(String::as_str);
+    let cookie = cookie_value(&headers, SESSION_COOKIE);
+    let (status, body) = match ctx.lan.pair_state(token, cookie.as_deref()) {
+        PairState::Paired => (
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "state": STATE_PAIRED }),
+        ),
+        PairState::Invite => (
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "state": STATE_INVITE }),
+        ),
+        PairState::Refused(code) => (
+            axum::http::StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "state": STATE_INVALID, "code": code }),
+        ),
+        PairState::Off => (
+            axum::http::StatusCode::FORBIDDEN,
+            serde_json::json!({ "state": STATE_CLOSED, "code": CODE_LAN_OFF }),
+        ),
+    };
+    json_readable_across_origins(status, body)
+}
+
 /// `GET /?token=…` — the QR target. A valid invitation pairs the device
 /// (cookie set), a valid session cookie reloads without a new code.
 async fn page(
@@ -122,16 +176,19 @@ async fn page(
     let cookie = cookie_value(&headers, SESSION_COOKIE);
     match ctx.lan.page_load(token, cookie.as_deref(), &device) {
         PageAuth::Deny { code, message } => {
-            if code == "lan_off" {
-                plain(axum::http::StatusCode::FORBIDDEN, &message)
+            if code == CODE_LAN_OFF {
+                refusal_page(axum::http::StatusCode::FORBIDDEN, code, &message)
             } else {
-                plain(axum::http::StatusCode::UNAUTHORIZED, &message)
+                refusal_page(axum::http::StatusCode::UNAUTHORIZED, code, &message)
             }
         }
         PageAuth::Allow { set_cookie } => {
             let mut response = index_response(&ctx);
             if let Some(secret) = set_cookie {
-                let value = format!("{SESSION_COOKIE}={secret}; Path=/; HttpOnly; SameSite=Lax");
+                let value = format!(
+                    "{SESSION_COOKIE}={secret}; Path=/; HttpOnly; SameSite=Lax; \
+                     Max-Age={SESSION_MAX_AGE_SECS}"
+                );
                 if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
                     response
                         .headers_mut()
@@ -224,10 +281,27 @@ fn unauthorized_rpc() -> axum::response::Response {
     )
 }
 
+/// The LAN page is served by the phone door itself, so it must talk HTTP
+/// (`POST /rpc`) exactly like the browser does. Inside the app window the Tauri
+/// IPC bridge also exists — the page has to know which door is its own, and
+/// guessing by origin is fragile. The server that serves the shell says it
+/// outright (REQ-QRAPP-02 AC5: the same interface, the same rights).
+fn lan_shell(bytes: Vec<u8>) -> Vec<u8> {
+    const MARKER: &[u8] = b"<script>window.__DEVAI_LAN__=true</script>";
+    let html = String::from_utf8_lossy(&bytes).to_string();
+    let at = html.find("</head>").unwrap_or(0);
+    let mut out = Vec::with_capacity(bytes.len() + MARKER.len());
+    out.extend_from_slice(html[..at].as_bytes());
+    out.extend_from_slice(MARKER);
+    out.extend_from_slice(html[at..].as_bytes());
+    out
+}
+
 fn index_response(ctx: &ServerCtx) -> axum::response::Response {
     match ctx.surface.asset("index.html") {
         Some(asset) => {
-            let mut response = axum::response::Response::new(axum::body::Body::from(asset.bytes));
+            let mut response =
+                axum::response::Response::new(axum::body::Body::from(lan_shell(asset.bytes)));
             response.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
@@ -257,6 +331,43 @@ fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+/// The refusal a browser sees when it presents a dead code or knocks on a
+/// closed door: the SAME three sentences the app shows, in an HTML page, so a
+/// phone without the app also reads «приглашение просрочено» instead of a bare
+/// HTTP status (REQ-QRAPP-06 AC1-3). A phone that remembered a home and comes
+/// back without a working session reads «доступ закрыт» — that is the ratified
+/// «отзыв виден и на следующем запуске» (Q4), and the page itself cannot say
+/// it because a dead session is refused the shell. Anything else falls back to
+/// the message the state machine produced.
+fn refusal_page(
+    status: axum::http::StatusCode,
+    code: &str,
+    message: &str,
+) -> axum::response::Response {
+    let refusal = match code {
+        CODE_TOKEN_INVALID => Some(PairRefusal::InviteExpired),
+        CODE_TOKEN_REQUIRED => Some(PairRefusal::AccessClosed),
+        CODE_LAN_OFF => Some(PairRefusal::AccessClosed),
+        _ => None,
+    };
+    let body = match refusal {
+        Some(refusal) => format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>{title}</title>\
+             <h1>{title}</h1><p>{hint}</p>",
+            title = refusal.text(),
+            hint = refusal.hint(),
+        ),
+        None => message.to_string(),
+    };
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+}
+
 fn plain(status: axum::http::StatusCode, message: &str) -> axum::response::Response {
     let mut response = axum::response::Response::new(axum::body::Body::from(message.to_string()));
     *response.status_mut() = status;
@@ -273,6 +384,22 @@ fn json(status: axum::http::StatusCode, body: serde_json::Value) -> axum::respon
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+}
+
+/// The same JSON answer, readable from another origin (`GET /pair` only). The
+/// app asks the candidate machine before it switches homes; without this
+/// header the question is a CORS failure and would read as silence — a working
+/// session would then never be able to move (quality return R2).
+fn json_readable_across_origins(
+    status: axum::http::StatusCode,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let mut response = json(status, body);
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
     );
     response
 }
@@ -418,6 +545,10 @@ mod tests {
             raw_cookie.to_ascii_lowercase().contains("httponly"),
             "the session cookie must not be readable from JS"
         );
+        assert!(
+            raw_cookie.contains("Max-Age="),
+            "the phone keeps the remembered home between launches (ratified Q4): {raw_cookie}"
+        );
         let (status, _, _) = call(&router, "GET", "/", Some(&cookie), "");
         assert_eq!(status, StatusCode::OK);
         let (status, _, _) = call(&router, "GET", &format!("/?token={invite}"), None, "");
@@ -500,5 +631,184 @@ mod tests {
         let cookie = cookie_of(&headers);
         let (status, _, _) = call(&router, "GET", "/assets/../secret", Some(&cookie), "");
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// REQ-QRAPP-02 AC5: the page served by the phone door declares itself as
+    /// the LAN surface, so the same bundle knows to talk `/rpc` inside the app
+    /// window too — one interface, one transport, two shells.
+    #[test]
+    fn the_served_shell_declares_the_lan_surface() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let invite = lan.status().token.unwrap();
+        let (status, _, body) = call(&router, "GET", &format!("/?token={invite}"), None, "");
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("__DEVAI_LAN__=true"),
+            "the shell must say which door serves it: {body}"
+        );
+        assert!(
+            body.matches("__DEVAI_LAN__").count() == 1,
+            "the marker is injected once, by the server that serves the shell"
+        );
+    }
+
+    /// REQ-QRAPP-05/06: one cheap question answers «paired», «this code is
+    /// valid but unused», «refused» — and asking it never SPENDS the code, so
+    /// the app can validate a scanned link before it opens the page.
+    #[test]
+    fn the_pair_question_distinguishes_a_live_session_from_a_dead_code() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let invite = lan.status().token.expect("a fresh invitation");
+
+        // No session and no code: the door is shut, and says which way.
+        let (status, _, body) = call(&router, "GET", "/pair", None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("lan_token_required"), "{body}");
+
+        // A valid invitation is reported as such and stays usable: the app
+        // asks first, the page load later is what pairs.
+        let (status, _, body) = call(&router, "GET", &format!("/pair?token={invite}"), None, "");
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(STATE_INVITE), "{body}");
+        assert_eq!(
+            lan.status().token.as_deref(),
+            Some(invite.as_str()),
+            "the question must not consume the code"
+        );
+
+        // Pair, then the same question answers «paired» with the cookie.
+        let (_, cookie) = pair(&router, &invite);
+        let (status, _, body) = call(&router, "GET", "/pair", Some(&cookie), "");
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(STATE_PAIRED), "{body}");
+        assert!(lan.status().devices[0].live, "the question keeps it live");
+
+        // A wrong code is refused with its own machine code.
+        let (status, _, body) = call(&router, "GET", "/pair?token=deadbeef", None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("lan_token_invalid"), "{body}");
+    }
+
+    /// The two ways a paired session dies are two different answers of the
+    /// same question — «токен отозван» and «доступ выключен» (REQ-QRAPP-06).
+    #[test]
+    fn a_revoked_session_and_a_switched_off_access_are_two_answers() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let invite = lan.status().token.expect("a fresh invitation");
+        let (_, cookie) = pair(&router, &invite);
+
+        // Revoked device: its cookie is dead, the access still serves.
+        lan.disconnect(&lan.status().devices[0].id);
+        let (status, _, body) = call(&router, "GET", "/pair", Some(&cookie), "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains(STATE_INVALID), "{body}");
+
+        // Access off: FORBIDDEN, and a phone already in the network reads it
+        // as «доступ закрыт» rather than «просрочено».
+        lan.deactivate();
+        let (status, _, body) = call(&router, "GET", "/pair", Some(&cookie), "");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains(STATE_CLOSED), "{body}");
+    }
+
+    /// REQ-QRAPP-06 AC1/AC3: a browser that presents a dead code reads the
+    /// same sentence the app would show — «приглашение просрочено» — instead
+    /// of a bare status or a generic «ошибка».
+    #[test]
+    fn a_dead_code_reads_as_an_expired_invitation_in_the_browser_too() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let (status, headers, body) = call(&router, "GET", "/?token=deadbeef", None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            headers.get("content-type").unwrap().to_str().unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(body.contains("приглашение просрочено"), "{body}");
+
+        // The consumed code reads the same way (one-time per pairing).
+        let invite = lan.status().token.unwrap();
+        let _ = pair(&router, &invite);
+        let (status, _, body) = call(&router, "GET", &format!("/?token={invite}"), None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("приглашение просрочено"), "{body}");
+    }
+
+    /// R3: a reload of an already-paired phone with a FRESH invitation spends
+    /// that code. Otherwise the desktop shows «приглашение использовано» while
+    /// the very same code still pairs another device.
+    #[test]
+    fn a_page_load_with_a_live_cookie_still_spends_the_presented_code() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let invite = lan.status().token.expect("a fresh invitation");
+        let (_, cookie) = pair(&router, &invite);
+        let fresh = lan.new_invite().expect("access is on");
+        let (status, _, _) = call(
+            &router,
+            "GET",
+            &format!("/?token={fresh}"),
+            Some(&cookie),
+            "",
+        );
+        assert_eq!(status, StatusCode::OK, "the cookie admits the device");
+        assert!(
+            !lan.status().invite_active,
+            "the successful entry spent the code"
+        );
+        // The same code is dead for anybody else.
+        let (status, _, body) = call(&router, "GET", &format!("/pair?token={fresh}"), None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("lan_token_invalid"), "{body}");
+    }
+
+    /// R2: the question the app page asks the candidate machine is readable
+    /// from ANOTHER origin, otherwise the window could never check an
+    /// invitation before leaving the working home. Only `/pair` says so.
+    #[test]
+    fn only_the_pair_question_is_readable_across_origins() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let invite = lan.status().token.unwrap();
+        let (status, headers, _) = call(&router, "GET", &format!("/pair?token={invite}"), None, "");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("access-control-allow-origin").unwrap(),
+            "*",
+            "the app's own page must be able to read the answer"
+        );
+        // A refused answer is readable too — the reason has to be told apart.
+        let (status, headers, _) = call(&router, "GET", "/pair?token=deadbeef", None, "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        // The shell and the data door stay closed to other origins.
+        for uri in ["/", "/rpc"] {
+            let (_, headers, _) = call(&router, "GET", uri, None, "");
+            assert!(
+                headers.get("access-control-allow-origin").is_none(),
+                "{uri} must not invite foreign origins"
+            );
+        }
+    }
+
+    /// Ratified Q4 + R5: a phone that remembered this home and comes back
+    /// after the access was turned off reads «доступ закрыт» — the sentence is
+    /// in the page the machine serves, because a dead session is refused the
+    /// application shell itself (there is no SPA left to poll `/pair`).
+    #[test]
+    fn a_revoked_remembered_session_reads_as_closed_access() {
+        let (lan, _dir) = context();
+        let router = router(lan.clone());
+        let invite = lan.status().token.unwrap();
+        let (_, cookie) = pair(&router, &invite);
+        // The device was disconnected: its cookie is worthless, the access on.
+        lan.disconnect(&lan.status().devices[0].id);
+        let (status, _, body) = call(&router, "GET", "/", Some(&cookie), "");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("доступ закрыт"), "{body}");
+        assert!(!body.contains("нужен код приглашения"), "{body}");
     }
 }

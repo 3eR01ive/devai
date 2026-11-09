@@ -47,9 +47,11 @@
 //!     a second launch re-shows the window through the instance socket).
 
 pub mod commands;
+pub mod deeplink;
 pub mod http;
 pub mod instance;
 pub mod net;
+pub mod pair;
 pub mod server;
 pub mod state;
 

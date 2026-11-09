@@ -51,7 +51,26 @@ const isBrowserPage =
   typeof window !== "undefined" &&
   typeof document !== "undefined" &&
   typeof fetch === "function";
-const useRpc = isBrowserPage && !hasTauriBridge;
+// Страницу отдал сам телефонный вход (`GET /` у lan::http) — она и в окне
+// приложения обязана говорить по HTTP: в окне существуют ОБА моста, и догадка
+// «по origin» тут ошибается (task 01a1bf78, REQ-QRAPP-02 AC5). Признак ставит
+// сервер, который эту страницу отдал.
+const lanShell =
+  typeof window !== "undefined" &&
+  (window as unknown as { __DEVAI_LAN__?: boolean }).__DEVAI_LAN__ === true;
+const useRpc = lanShell || (isBrowserPage && !hasTauriBridge);
+
+/// Сторож связи с домом нужен только странице, которую отдала машина: и в
+/// браузере, и в окне приложения это ОДНА И ТА ЖЕ страница — она сама спрашивает
+/// `/pair` (native-половине сеть запрещена гейтом `no-network`, задача
+/// 01a1bf78). Локальная страница приложения (`pairingShell`) дома не показывает,
+/// ей сторож не нужен.
+export const pageWatchesPairing = useRpc;
+
+/// Это СВОЯ страница приложения (tauri.localhost), а не отданная машиной: у
+/// неё есть мост в Rust, и только она проводит приглашение (см. pairingNative).
+/// Машинная страница — чужой origin, моста у неё нет по построению Tauri.
+export const pairingShell = hasTauriBridge && !lanShell;
 
 /// POST /rpc: сервер уже знает сессию по HttpOnly-cookie, поэтому токена в
 /// JS нет вовсе (он живёт в адресе ровно один раз — при сканировании).
@@ -88,7 +107,10 @@ async function rpc<T>(command: string, params?: Record<string, unknown>): Promis
 // Один и тот же вызов на обоих транспортах. Имя объявлено без generic-скобки:
 // тест src/commands.rs сканирует api.ts по вызовам-точкам и должен видеть
 // ровно реальные вызовы команд, а не объявление обёртки.
-const invoke = <T,>(command: string, params?: Record<string, unknown>): Promise<T> =>
+//
+// Экспортируется для `pairingNative.ts`: приглашение — не чтение данных, но
+// IPC-дверь остаётся одной (выбор транспорта и адрес машины решаются здесь).
+export const invoke = <T,>(command: string, params?: Record<string, unknown>): Promise<T> =>
   useRpc ? rpc<T>(command, params) : tauriInvoke<T>(command, params);
 
 export const api = {

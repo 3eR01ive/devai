@@ -8,6 +8,7 @@ import OpsView from "./views/OpsView.vue";
 import HomesView from "./views/HomesView.vue";
 import ModelsView from "./views/ModelsView.vue";
 import LanView from "./views/LanView.vue";
+import PairView from "./views/PairView.vue";
 
 // Hash history: production assets are served through the Tauri custom
 // protocol, где серверного SPA-fallback нет.
@@ -23,6 +24,9 @@ export const router = createRouter({
     { path: "/homes", name: "homes", component: HomesView },
     { path: "/models", name: "models", component: ModelsView },
     { path: "/lan", name: "lan", component: LanView },
+    // Отказ в приглашении (task 01a1bf78): экран открывает нативная половина
+    // приложения по `#/pair?reason=…`; на десктопе маршрут никому не показан.
+    { path: "/pair", name: "pair", component: PairView },
     { path: "/ops", name: "ops", component: OpsView },
   ],
 });

@@ -16,6 +16,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../api", () => ({
   api: { inboxView: mocks.inboxView, sessionInfo: mocks.sessionInfo },
   toUiError: (e: unknown) => e,
+  // Окно приложения в тестах шапки не проводит приглашение и не поднимает
+  // свой опрос: pairingShell=false, pageWatchesPairing=false (task 01a1bf78).
+  pageWatchesPairing: false,
+  pairingShell: false,
 }));
 
 const stubs = {

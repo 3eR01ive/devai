@@ -93,17 +93,18 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Включён и ждёт: QR + одноразовый код. -->
+    <!-- Включён и ждёт: QR + одноразовый код + оба адреса одного доступа. -->
     <div v-if="facts.showInvitation" class="panel">
       <div class="rowflex">
         <b>{{ facts.qrFailed ? "QR не построился" : "Отсканируйте камерой телефона" }}</b>
         <div class="spacer" />
         <button :disabled="busy" @click="newInvite">Новое приглашение</button>
       </div>
-      <!-- QR не построился — это отдельный факт, НЕ «код использован»:
-           адрес и код показаны текстом, телефон открывает страницу вручную. -->
+      <!-- QR несёт ссылку приложения (task 01a1bf78): Android отдаёт её нашему
+           APK, и интерфейс открывается внутри приложения. Браузерная ссылка
+           ниже — тот же доступ текстом, для телефона без приложения. -->
       <div v-if="facts.qrFailed" class="errorbox" data-testid="lan-qr-error">
-        {{ status?.qr_error }}. Откройте на телефоне: {{ status?.url }}
+        {{ status?.qr_error }}. Оба адреса ниже можно открыть вручную.
       </div>
       <div class="lan-qr">
         <!-- SVG строит сервер (crate qrcode): в QR только адрес машины и
@@ -112,6 +113,12 @@ onUnmounted(() => {
         <div class="lan-invite">
           <div class="mono" data-testid="lan-address">{{ status?.address }}</div>
           <div class="mono muted lan-token" data-testid="lan-token">{{ status?.token }}</div>
+          <!-- Оба варианта видны сразу и не спрятаны за нажатием: код один и
+               тот же, использование любого гасит приглашение целиком. -->
+          <div class="muted">В приложении:</div>
+          <div class="mono lan-token" data-testid="lan-app-link">{{ status?.app_url }}</div>
+          <div class="muted">В браузере (если приложения нет):</div>
+          <div class="mono lan-token" data-testid="lan-browser-link">{{ status?.url }}</div>
           <div class="muted">
             Код одноразовый: после первого подключения он гаснет, а телефон
             остаётся подключённым. «Новое приглашение» выпускает код для

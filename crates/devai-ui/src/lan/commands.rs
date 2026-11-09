@@ -40,8 +40,8 @@ pub struct SurfaceContract {
 pub const LAN_SURFACE_CONTRACTS: &[SurfaceContract] = &[
     SurfaceContract {
         surface: "phone-http",
-        version: 1,
-        shape: "GET / ?token=<invite> | cookie -> 200 shell / 401 / 403; POST /rpc {command,params} -> {ok,data|error}; GET /*path -> paired asset",
+        version: 2,
+        shape: "GET / ?token=<invite> | cookie -> 200 shell / 401 / 403; GET /pair[?token] -> 200 {state:paired|invite} / 401 / 403; POST /rpc {command,params} -> {ok,data|error}; GET /*path -> paired asset",
     },
     SurfaceContract {
         surface: "phone-rpc",

@@ -11,9 +11,14 @@
 // приложение: шапка читает общий стор секции (inbox.ts),
 // собственного таймера и второго вызова `inbox_view` здесь нет.
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { toUiError } from "./api";
+import { pairingShell, toUiError } from "./api";
 import { degradedBanner } from "./homes-view";
 import { subscribeWait, waitError, waitSnapshot } from "./inbox";
+import { pairFailure, pairingNotice, readNotice, subscribePairing } from "./pairing";
+import { windowBridge } from "./pairingNative";
+import type { PairTask } from "./pairingNative";
+import { pairingRunner, setPairingRunner, watchScans } from "./pairingWatch";
+import { pairNotice } from "./pairState";
 import { sessionStore } from "./session";
 import { fmtTime } from "./settings";
 import type { SessionInfo, UiError } from "./types";
@@ -26,7 +31,12 @@ const error = ref<UiError | null>(null);
 const shownError = computed(() => error.value ?? waitError.value);
 const waitBadge = computed(() => waitSnapshot.value?.badge ?? 0);
 const degraded = computed(() => degradedBanner(session.value));
+// Заметка о том, что доступ есть, но что-то не сохранилось (адрес дома):
+// код приехал в адресе открытой страницы, слова — из единственной декларации.
+const notice = computed(() => pairNotice(pairingNotice.value));
 let unsubscribe: (() => void) | undefined;
+let stopPairing: (() => void) | undefined;
+let stopScans: (() => void) | undefined;
 const stopWatching = sessionStore.subscribe((s) => {
   session.value = s;
 });
@@ -38,9 +48,40 @@ onMounted(async () => {
     error.value = toUiError(e);
   }
   unsubscribe = subscribeWait();
+  // Отзыв доступа замечает сама страница, которую отдала машина — и в
+  // браузере, и в окне приложения это один и тот же опрос `/pair`
+  // (REQ-QRAPP-05; сеть в Rust запрещена гейтом `no-network`).
+  stopPairing = subscribePairing();
+  pairingNotice.value = readNotice(window.location.search);
+  // Приглашение проводит СВОЯ страница приложения: у неё есть мост в Rust.
+  // Сбой самого моста — тоже видимый факт, а не тихо пропущенный запуск.
+  // Один и тот же проход запускают две вещи: первый экран после загрузки и
+  // смена адреса на экран принятого скана — тёплый скан не перезагружает
+  // документ, поэтому `onMounted` здесь уже не сработает (quality return R1).
+  if (pairingShell) {
+    const run = pairingRunner(
+      windowBridge(),
+      (done: PairTask) => {
+        // Нечего открывать (старый экран приглашения без ссылки) — возвращаемся
+        // к собственному дому окна, а не оставляем человека на служебной странице.
+        if (done.kind === "idle" && window.location.hash.startsWith("#/pair")) {
+          window.location.hash = "#/";
+        }
+      },
+      (e) => {
+        error.value = toUiError(e);
+      },
+    );
+    stopScans = watchScans(window, run);
+    setPairingRunner(run);
+    run();
+  }
 });
 onUnmounted(() => {
   unsubscribe?.();
+  stopPairing?.();
+  stopScans?.();
+  setPairingRunner(null);
   stopWatching();
 });
 </script>
@@ -73,6 +114,22 @@ onUnmounted(() => {
       </div>
       <div v-if="degraded" class="errorbox">
         <span class="code">{{ session?.degraded_from?.code }}</span>{{ degraded }}
+      </div>
+      <!-- Доступ отозван (или машина замолчала): экран честно говорит, что
+           случилось, и не стирает уже показанные данные молча — они остаются,
+           но помечены как последние (REQ-QRAPP-05 AC2, REQ-QRAPP-06 AC5). -->
+      <div v-if="pairFailure" class="errorbox" data-testid="pair-refusal">
+        <b>{{ pairFailure.title }}.</b> {{ pairFailure.hint }}
+        <div class="muted">
+          Данные ниже — последние полученные, пока доступ был открыт; обновляться
+          они больше не будут.
+        </div>
+      </div>
+      <!-- Доступ есть, но кое-что не сохранилось (адрес дома): код приехал в
+           адресе страницы, поэтому предупреждение видно и после перехода
+           (качество: R1 — проглоченная ошибка записи). -->
+      <div v-if="notice" class="errorbox" data-testid="pair-notice">
+        <span class="code">{{ pairingNotice }}</span>{{ notice.title }}. {{ notice.hint }}
       </div>
       <RouterView />
     </main>

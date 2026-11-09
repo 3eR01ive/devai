@@ -41,6 +41,12 @@ axum = { version = "0.7", default-features = false, features = ["http1", "json",
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 libc = "0.2"
+# REQ-QRAPP-02: the invitation link is a `devai://pair` scheme. On Android the
+# plugin's build script writes the intent-filter into the generated manifest
+# from `tauri.conf.json > plugins > deep-link`, and its Kotlin side forwards a
+# scanned link to Rust while the app runs; a cold start is read with
+# `get_current`. No manifest is edited by hand.
+tauri-plugin-deep-link = "2"
 
 [dev-dependencies]
 # R4: the ipc serde-output snapshot fixtures are compared as JSON.
