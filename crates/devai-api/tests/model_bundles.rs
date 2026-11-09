@@ -677,3 +677,113 @@ fn deleting_the_last_bundle_leaves_a_readable_empty_catalogue() {
     assert!(f.file().contains("bundles:"), "{}", f.file());
     assert!(f.api(ProbeVerdict::Ok, 1).model_snapshot().is_ok());
 }
+
+/// ASM-9, single source: the form's handle is the SERVER's answer, and a
+/// non-ASCII label is the case the old window-side copy got wrong. The id
+/// the form shows and the id the save writes are the same string by
+/// construction — this pin compares them on «İstanbul».
+#[test]
+fn the_handle_is_served_by_the_platform_and_matches_the_saved_id() {
+    let f = Fixture::new();
+    let api = f.api(ProbeVerdict::Ok, 1);
+    let served = api.model_bundle_handle("İstanbul");
+    assert_eq!(served.id, "istanbul");
+    assert_eq!(api.model_bundle_handle("Связка").id, "");
+
+    let mut draft = f.draft();
+    draft.label = "İstanbul".into();
+    let created = api.model_bundle_create(&draft).unwrap();
+    assert_eq!(
+        created.bundle_id, served.id,
+        "the id shown in the form must be exactly the id a save writes"
+    );
+    assert!(
+        devai_store::load_catalog(&f.home.path().join("config"))
+            .unwrap()
+            .get("istanbul")
+            .is_some()
+    );
+}
+
+/// A mutation whose OWN fact cannot be stored is not applied: the file is
+/// restored byte-for-byte and the history has no success row (REQ-MC-06
+/// AC5, REQ-MC-07 AC1). The trigger fails only the mutation fact — the
+/// probe fact written earlier still lands, which is what makes this a
+/// post-write failure and not a pre-write refusal.
+#[test]
+fn a_mutation_fact_that_cannot_be_recorded_rolls_the_file_back() {
+    let f = Fixture::new();
+    let before = f.file();
+    fail_fact_on_insert(&f, event_kind::MODEL_BUNDLE_CREATED);
+
+    let err = f
+        .api(ProbeVerdict::Ok, 3)
+        .model_bundle_create(&f.draft())
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode("store"), "{err}");
+    assert!(err.to_string().contains("nothing was applied"), "{err}");
+    assert_eq!(f.file(), before, "the file must be restored");
+    assert!(
+        devai_store::load_catalog(&f.home.path().join("config"))
+            .unwrap()
+            .get("hermes-alibaba")
+            .is_none()
+    );
+    assert!(
+        f.events()
+            .iter()
+            .all(|e| e.kind != event_kind::MODEL_BUNDLE_CREATED),
+        "a mutation that did not land must not leave a success row"
+    );
+}
+
+/// The edit of the record IN FORCE applies its fact in the SAME transaction
+/// as the identity move: when the fact cannot be stored, neither the file
+/// nor the marked record moves (REQ-MC-06 AC5).
+#[test]
+fn a_failed_edit_fact_leaves_the_marked_record_on_the_old_identity() {
+    let f = Fixture::new();
+    let api = f.api(ProbeVerdict::Ok, 1);
+    api.model_switch("hermes-live", "manual").unwrap();
+    let before = f.file();
+    let active_before = api.model_snapshot().unwrap().active.unwrap();
+    assert_eq!(active_before.model, "live-1");
+
+    let mut edit = f.draft();
+    edit.id = "hermes-live".into();
+    edit.editing = true;
+    edit.label = "Hermes Live".into();
+    edit.agent = "hermes".into();
+    edit.driver = "hermes".into();
+    edit.llm_provider = "deepseek".into();
+    edit.model = "live-2".into();
+    edit.reasoning = "high".into();
+    edit.file_revision = f.revision();
+    fail_fact_on_insert(&f, event_kind::MODEL_BUNDLE_UPDATED);
+
+    api.model_bundle_update(&edit).unwrap_err();
+
+    assert_eq!(f.file(), before, "the file must be restored");
+    let snapshot = api.model_snapshot().unwrap();
+    let active = snapshot.active.unwrap();
+    assert_eq!(active.model, "live-1", "the marked record stays as it was");
+    assert_eq!(active.id.as_deref(), Some("hermes-live"));
+    assert!(
+        f.events()
+            .iter()
+            .all(|e| e.kind != event_kind::MODEL_BUNDLE_UPDATED),
+        "no success row for an edit that did not land"
+    );
+}
+
+/// Fail ONE event kind at the store's own door: a BEFORE INSERT trigger
+/// aborts only the mutation fact, leaving probe rows writable.
+fn fail_fact_on_insert(f: &Fixture, kind: &str) {
+    let conn = rusqlite::Connection::open(f.home.path().join("devai.db")).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER fail_fact BEFORE INSERT ON workflow_events
+         WHEN NEW.kind = '{kind}'
+         BEGIN SELECT RAISE(ABORT, 'fact refused'); END;"
+    ))
+    .unwrap();
+}

@@ -7,6 +7,7 @@ import type {
   Artifact,
   ArtifactContent,
   BundleFormInput,
+  BundleHandleView,
   BundleMutationView,
   Decision,
   DependenciesView,
@@ -93,9 +94,12 @@ export const api = {
     invoke<ProbeView>("model_probe", { bundle_id }),
   modelSwitch: (bundle_id: string, reason: string) =>
     invoke<SwitchResultView>("model_switch", { bundle_id, reason }),
-  // Авторская поверхность связок (REQ-MC-01..09): проверка черновика и три
-  // записи в тот же файл, который читает консоль. Payload — те же имена
-  // полей объявления, никаких ключей/адресов сервиса.
+  // Авторская поверхность связок (REQ-MC-01..09): идентификатор новой
+  // связки считает СЕРВЕР (ASM-9), проверка черновика и три записи в тот
+  // же файл, который читает консоль. Payload — те же имена полей
+  // объявления, никаких ключей/адресов сервиса.
+  modelBundleHandle: (label: string) =>
+    invoke<BundleHandleView>("model_bundle_handle", { label }),
   modelBundleCheck: (input: BundleFormInput) =>
     invoke<ProbeView>("model_bundle_check", { input }),
   modelBundleCreate: (input: BundleFormInput) =>

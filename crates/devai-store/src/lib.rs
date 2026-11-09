@@ -1524,18 +1524,24 @@ impl Store {
     }
 
     /// Apply a new IDENTITY to the record of an edited bundle that is in
-    /// force (task 01a1be5c, REQ-MC-03 AC3/AC4): the same verified
-    /// record+marker transaction as the switch, WITHOUT a `model.switched`
-    /// event — the caller records the EDIT itself. The marker stays on the
-    /// record; a changed agent NAME creates/updates the new record and
-    /// marks it, leaving the old one intact and unmarked (runs in flight
-    /// keep their own stamped identity).
-    pub fn apply_bundle_identity(&self, s: &BundleSwitch) -> StoreResult<Option<AgentInstance>> {
+    /// force (task 01a1be5c, REQ-MC-03 AC3/AC4) AND append the edit's own
+    /// fact in ONE transaction (REQ-MC-06 AC5): the record, the marker and
+    /// the `kind` history row land together or not at all — there is no
+    /// window in which the record moved without its history row. The marker
+    /// stays on the record; a changed agent NAME creates/updates the new
+    /// record and marks it, leaving the old one intact and unmarked (runs in
+    /// flight keep their own stamped identity).
+    pub fn apply_bundle_identity_with_fact(
+        &self,
+        s: &BundleSwitch,
+        kind: &str,
+    ) -> StoreResult<Option<AgentInstance>> {
         let tx = self.conn.unchecked_transaction()?;
         let previous = Self::marked_agent(&tx)?;
         Self::upsert_switch_record(&tx, s)?;
         Self::move_marker(&tx, &s.agent)?;
         Self::verify_switch_record(&tx, s)?;
+        Self::append_event(&tx, kind, &s.actor, &s.payload, s.now)?;
         tx.commit()?;
         Ok(previous)
     }
@@ -1659,15 +1665,22 @@ impl Store {
         s: &BundleSwitch,
         payload: &serde_json::Value,
     ) -> StoreResult<()> {
+        Self::append_event(tx, event_kind::MODEL_SWITCHED, &s.actor, payload, s.now)
+    }
+
+    /// Append ONE home-level fact inside the caller's transaction: the kind
+    /// is the caller's (the switch and the bundle edit write different
+    /// facts, both in the same transaction as the move they describe).
+    fn append_event(
+        tx: &Transaction<'_>,
+        kind: &str,
+        actor: &str,
+        payload: &serde_json::Value,
+        at: Timestamp,
+    ) -> StoreResult<()> {
         tx.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,NULL,?2,?3,?4,?5)",
-            params![
-                new_id().to_string(),
-                event_kind::MODEL_SWITCHED,
-                s.actor,
-                payload.to_string(),
-                rows::ts(&s.now)
-            ],
+            params![new_id().to_string(), kind, actor, payload.to_string(), rows::ts(&at)],
         )?;
         Ok(())
     }

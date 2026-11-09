@@ -867,15 +867,21 @@ fn render_block(b: &ModelBundle) -> Vec<String> {
 /// digits and single hyphens, derived ONCE from the operator's name and
 /// never changed afterwards. `""` means the name carries no usable latin
 /// characters — the caller refuses with «выберите другое имя».
+///
+/// This is the ONE implementation of the rule: the window no longer mirrors
+/// it, it asks `model.bundle_handle` (the same function), so the id shown in
+/// the form IS the id a save writes. `char::to_lowercase` (not the ASCII
+/// fold) keeps a Latin base letter whose lower-case form carries a
+/// combining mark: «İstanbul» folds to `i` + U+0307 and yields `istanbul`,
+/// not `stanbul`.
 pub fn bundle_id_from_label(label: &str) -> String {
     let mut out = String::new();
     let mut dash = false;
-    for ch in label.chars() {
-        let c = ch.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
+    for ch in label.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
             dash = false;
-        } else if matches!(c, '-' | '_' | ' ' | '.' | '·' | '/') && !out.is_empty() && !dash {
+        } else if matches!(ch, '-' | '_' | ' ' | '.' | '·' | '/') && !out.is_empty() && !dash {
             out.push('-');
             dash = true;
         }
@@ -1476,13 +1482,17 @@ bundles:
     }
 
     /// The id is derived from the name once (ASM-9): latin letters/digits,
-    /// single hyphens; nothing latin → empty (the caller refuses).
+    /// single hyphens; nothing latin → empty (the caller refuses). A Latin
+    /// capital whose lower case is a base letter + combining mark keeps the
+    /// base letter (non-ASCII names are the parity trap the window used to
+    /// fall into with its own copy of the rule).
     #[test]
     fn the_handle_is_derived_from_the_name() {
         assert_eq!(bundle_id_from_label("Hermes · DeepSeek"), "hermes-deepseek");
         assert_eq!(bundle_id_from_label("  My   Model  "), "my-model");
         assert_eq!(bundle_id_from_label("A--B__C"), "a-b-c");
         assert_eq!(bundle_id_from_label("Связка"), "");
+        assert_eq!(bundle_id_from_label("İstanbul"), "istanbul");
     }
 
     /// ONE field catalogue: the key whitelist, the in-place writer and the

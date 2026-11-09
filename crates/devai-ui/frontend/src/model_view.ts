@@ -27,26 +27,3 @@ export function holdCompletes(elapsedMs: number): boolean {
  * нужен — но и здесь обработчика click нет, поэтому одиночный и двойной
  * клик ничего не удаляют. */
 export const HOLD_TO_DELETE_MS = HOLD_TO_SWITCH_MS;
-
-/**
- * Идентификатор новой связки из имени (ASM-9) — ЗЕРКАЛО
- * `devai_store::bundle_id_from_label`: нижний регистр, латиница/цифры,
- * одиночные дефисы. Показывается в форме ДО сохранения; после создания не
- * меняется. Пустая строка = из имени ничего не выводится (сервер откажет с
- * тем же смыслом — второй реализации правила записи здесь нет, только
- * предпросмотр).
- */
-export function bundleIdFromLabel(label: string): string {
-  let out = "";
-  let dash = false;
-  for (const ch of label.toLowerCase()) {
-    if (/[a-z0-9]/.test(ch)) {
-      out += ch;
-      dash = false;
-    } else if (/[-_ .·/]/.test(ch) && out.length > 0 && !dash) {
-      out += "-";
-      dash = true;
-    }
-  }
-  return out.replace(/-+$/, "");
-}

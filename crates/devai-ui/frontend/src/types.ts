@@ -444,6 +444,12 @@ export interface ProbePolicyInput {
   fresh_secs: number;
 }
 
+/** The handle a NEW bundle will carry, as the SERVER derives it (ASM-9).
+ * The window prints `id` verbatim and never derives it itself. */
+export interface BundleHandleView {
+  id: string;
+}
+
 /** The form payload — the declaration's own field names, nothing else. */
 export interface BundleFormInput {
   id: string;

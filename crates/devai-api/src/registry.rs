@@ -78,7 +78,12 @@ pub struct OpDescriptor {
 /// `model.bundle_update` / `model.bundle_delete`, `ModelSnapshot` gained
 /// `file_revision` + `form`, and `ModelEventView` gained `outcome_text` —
 /// wire-visible additions, so the stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@7";
+/// `@8` names the single-source follow-up of the same task: the form no
+/// longer derives a handle itself — `model.bundle_handle` is the ONE read
+/// that answers «what id will the save write?», so the window's copy of the
+/// rule could be deleted rather than kept in sync. Wire-visible addition
+/// (one Read operation), so the stamp says so.
+pub const SURFACE_VERSION: &str = "api-surface@8";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -544,6 +549,13 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "ONE platform operation: probe the declared target, and only on `ok` upsert the agent record by name (driver, LLM-provider, model AND reasoning level), move the single active marker, and append `model.switched` — all in one verified transaction (a failure rolls the whole switch back). A dead verdict writes `refused_probe` and changes nothing; unknown id / no_op / not_probeable refuse before any event. Mirrors `devai model switch`.",
         },
         OpDescriptor {
+            name: "model.bundle_handle",
+            class: OpClass::Read,
+            input: "label",
+            output: "BundleHandleView{id}",
+            description: "The handle a NEW bundle will carry, derived from the label by the store's ONE rule (ASM-9). A pure read: no file read, no event, no write. The window prints this value verbatim instead of mirroring the rule, so the id shown in the form is by construction the id a save writes.",
+        },
+        OpDescriptor {
             name: "model.bundle_check",
             class: OpClass::Mutation,
             input: "BundleFormInput{label, agent, driver, llm_provider, model, reasoning, probe{phrase, timeout_ms, fresh_secs}, editing, id?}",
@@ -801,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_version_v7_ships_the_name_plane_homes_profile_ratification_and_model_bundles() {
+    fn surface_version_v8_ships_the_name_plane_homes_profile_ratification_and_model_bundles() {
         // QA R5 (da/api-contract): the stamp and its increment are
         // pinned TOGETHER — @6 is by this test defined as "the @5
         // human-signboard + homes + ratification surface PLUS the
@@ -812,7 +824,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@7");
+        assert_eq!(SURFACE_VERSION, "api-surface@8");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -865,6 +877,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("@7 surface must publish {name} (REQ-MC-01..05)"));
             assert_eq!(op.class, OpClass::Mutation);
         }
+        // @8's own increment: the form's handle read is part of what the
+        // stamp claims (the window no longer derives it).
+        let handle = ops
+            .iter()
+            .find(|o| o.name == "model.bundle_handle")
+            .expect("@8 surface must publish model.bundle_handle (ASM-9)");
+        assert_eq!(handle.class, OpClass::Read);
     }
 
     #[test]

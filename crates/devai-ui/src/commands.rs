@@ -378,7 +378,10 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
     // The bundle-authoring surface (task 01a1be5c, REQ-MC-01..09): one draft
-    // probe and three writes, all on the same file the console reads.
+    // probe and three writes, all on the same file the console reads. The
+    // handle read is the ONE source of the id the form shows (ASM-9) — the
+    // window does not mirror the derivation.
+    ("model_bundle_handle", "model.bundle_handle"),
     ("model_bundle_check", "model.bundle_check"),
     ("model_bundle_create", "model.bundle_create"),
     ("model_bundle_update", "model.bundle_update"),
@@ -952,6 +955,18 @@ pub fn model_switch(
     };
     let api = state.write_api(&home, &actor)?;
     Ok(api.model_switch(&bundle_id, &reason)?)
+}
+
+/// The form's derived handle (ASM-9): the ONE source of «what id will the
+/// save write?». A pure read — no file read, no event, no write — answered
+/// by the same store rule `model.bundle_create` uses, so the window never
+/// mirrors the derivation.
+#[tauri::command(rename_all = "snake_case")]
+pub fn model_bundle_handle(
+    state: State<AppState>,
+    label: String,
+) -> Result<devai_api::BundleHandleView, UiError> {
+    Ok(state.api().model_bundle_handle(&label))
 }
 
 /// The form's «Проверить» (REQ-MC-02): ONE real probe of the current form

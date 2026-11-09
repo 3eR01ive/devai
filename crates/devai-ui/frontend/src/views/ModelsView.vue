@@ -13,7 +13,6 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { api, toUiError } from "../api";
 import {
-  bundleIdFromLabel,
   HOLD_TIMER_GRACE_MS,
   HOLD_TO_SWITCH_MS,
   holdCompletes,
@@ -55,7 +54,7 @@ interface FormState {
 }
 
 const formOpen = ref(false);
-/** id правимой связки; null — форма создания (id выводится из имени). */
+/** id правимой связки; null — форма создания (id приходит с сервера). */
 const editing = ref<string | null>(null);
 const form = ref<FormState>(blankForm());
 const formError = ref<UiError | null>(null);
@@ -63,13 +62,18 @@ const formProbe = ref<string | null>(null);
 const formBusy = ref(false);
 /** Редакция файла, на которой открыта форма (REQ-MC-06 AC6). */
 const formRevision = ref("");
+/** Идентификатор новой связки приходит С СЕРВЕРА (`model.bundle_handle`):
+ * окно не выводит его само (ASM-9), поэтому показанное и записанное — одно. */
+const formHandle = ref("");
+/** Порядковый номер запроса: ответ на устаревшее имя не перетирает новый. */
+let handleSeq = 0;
 
 const drivers = computed(() => snap.value?.form?.drivers ?? []);
 const selfProviderDriver = computed(
   () => snap.value?.form?.self_provider_driver ?? "",
 );
 /** Идентификатор показывается ДО сохранения; у правки он неизменяем. */
-const formId = computed(() => editing.value ?? bundleIdFromLabel(form.value.label));
+const formId = computed(() => editing.value ?? formHandle.value);
 const providerLocked = computed(
   () => form.value.driver === selfProviderDriver.value,
 );
@@ -96,6 +100,21 @@ function snapshotRevision(): string {
   return snap.value?.file_revision ?? "";
 }
 
+/** Спросить у платформы идентификатор, который сохранит форма. Правка
+ * берёт id записи из снимка и этим путём не ходит. */
+async function refreshHandle(label: string) {
+  if (!formOpen.value || editing.value !== null) return;
+  const seq = ++handleSeq;
+  try {
+    const h = await api.modelBundleHandle(label);
+    if (seq === handleSeq && editing.value === null) formHandle.value = h.id;
+  } catch {
+    // Предпросмотр не критичен: сохранение всё равно валидирует поле и
+    // назовёт причину. Устаревший ответ не подменяет актуальный.
+    if (seq === handleSeq) formHandle.value = "";
+  }
+}
+
 function openCreate() {
   // Без снимка нет ни списка драйверов, ни фабричной политики пробы —
   // форма не открывается на выдуманных значениях.
@@ -105,7 +124,9 @@ function openCreate() {
   formError.value = null;
   formProbe.value = null;
   formRevision.value = snapshotRevision();
+  formHandle.value = "";
   formOpen.value = true;
+  void refreshHandle(form.value.label);
 }
 
 function openEdit(b: ModelBundleView) {
@@ -131,6 +152,7 @@ function closeForm() {
   formOpen.value = false;
   formError.value = null;
   formProbe.value = null;
+  handleSeq += 1; // ответ в полёте больше не относится к этой форме
 }
 
 function payload(): BundleFormInput {
@@ -293,6 +315,15 @@ watch(
   },
 );
 
+// Идентификатор новой связки считает платформа (ASM-9): каждое изменение
+// имени спрашивает сервер, окно ничего не выводит само.
+watch(
+  () => form.value.label,
+  (label) => {
+    void refreshHandle(label);
+  },
+);
+
 onMounted(load);
 onUnmounted(cancelHold);
 </script>
@@ -341,9 +372,9 @@ onUnmounted(cancelHold);
         <span class="mono muted">идентификатор: {{ formId || "—" }}</span>
       </div>
       <div class="muted">
-        Идентификатор выводится из имени; после сохранения он не меняется.
-        Сохранение всегда проверяет введённые значения настоящим вызовом и пишет
-        файл только при успехе.
+        Идентификатор выводится из имени на платформе; после сохранения он не
+        меняется. Сохранение всегда проверяет введённые значения настоящим
+        вызовом и пишет файл только при успехе.
       </div>
 
       <div class="formgrid">

@@ -18,7 +18,7 @@ import {
   type FakeNode,
   type Harness,
 } from "./support/component-harness.ts";
-import { bundleIdFromLabel, holdCompletes } from "../src/model_view.ts";
+import { holdCompletes } from "../src/model_view.ts";
 
 let harness: Harness;
 
@@ -333,12 +333,6 @@ test("ModelsView: смена имени агента называет идущи
 
 // --- авторская поверхность (REQ-MC-01..09) ---------------------------
 
-test("bundleIdFromLabel: латиница/цифры/дефисы, кириллица не даёт идентификатора", () => {
-  assert.equal(bundleIdFromLabel("Hermes · DeepSeek"), "hermes-deepseek");
-  assert.equal(bundleIdFromLabel("  My   Model  "), "my-model");
-  assert.equal(bundleIdFromLabel("Связка"), "");
-});
-
 function inputByField(root: FakeNode, field: string): FakeNode {
   const node = elements(root).find(
     (n) => n.type === "input" && n.props["data-field"] === field,
@@ -347,9 +341,16 @@ function inputByField(root: FakeNode, field: string): FakeNode {
   return node!;
 }
 
-test("ModelsView: форма создания показывает идентификатор и не предлагает mock", async () => {
-  installInvoke((cmd) => {
+test("ModelsView: идентификатор приходит с сервера, окно его не выводит", async () => {
+  const asked: string[] = [];
+  installInvoke((cmd, args) => {
     if (cmd === "model_snapshot") return snapshot();
+    if (cmd === "model_bundle_handle") {
+      asked.push((args as { label: string }).label);
+      // Нарочно НЕ совпадает с выводом, который окно могло бы посчитать
+      // само: печатается ровно серверное значение (ASM-9, один источник).
+      return { id: "server-handle" };
+    }
     throw new Error(`unexpected command: ${cmd}`);
   });
   const view = await loadView(harness, "/src/views/ModelsView.vue");
@@ -358,10 +359,11 @@ test("ModelsView: форма создания показывает иденти�
   buttonByLabel(root, "Создать связку").props.onClick!({});
   await flush();
 
-  await typeInto(inputByField(root, "label"), "Hermes Alibaba");
+  await typeInto(inputByField(root, "label"), "İstanbul");
   await flush();
+  assert.ok(asked.includes("İstanbul"), `asked: ${asked.join(",")}`);
   const text = textOf(root);
-  assert.match(text, /идентификатор: hermes-alibaba/);
+  assert.match(text, /идентификатор: server-handle/);
   assert.match(text, /claude, hermes/);
   // The offered drivers carry no diagnostic mock; only the sentence explains it.
   assert.doesNotMatch(text, /Драйверы: [^.]*mock/);
@@ -373,6 +375,7 @@ test("ModelsView: сохранение новой связки уходит в �
   let sent: Record<string, unknown> | null = null;
   installInvoke((cmd, args) => {
     if (cmd === "model_snapshot") return snapshot();
+    if (cmd === "model_bundle_handle") return { id: "hermes-alibaba" };
     if (cmd === "model_bundle_create") {
       sent = (args as { input: Record<string, unknown> }).input;
       return {
@@ -444,6 +447,7 @@ test("ModelsView: фабричная политика пробы приходи�
   });
   installInvoke((cmd, args) => {
     if (cmd === "model_snapshot") return served;
+    if (cmd === "model_bundle_handle") return { id: "hermes-alibaba" };
     if (cmd === "model_bundle_create") {
       sent = (args as { input: Record<string, unknown> }).input;
       return {
@@ -482,6 +486,7 @@ test("ModelsView: фабричная политика пробы приходи�
 test("ModelsView: отказ платформы оставляет форму открытой и объясняет поле", async () => {
   installInvoke((cmd) => {
     if (cmd === "model_snapshot") return snapshot();
+    if (cmd === "model_bundle_handle") return { id: "hermes-alibaba" };
     if (cmd === "model_bundle_create") {
       return Promise.reject({
         code: "invalid_input",

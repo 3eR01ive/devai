@@ -1,17 +1,27 @@
-//! The model-bundle SURFACE of the platform API (task 01a1b71f,
-//! REQ-MS-04..07): one snapshot read, one probe, one switch.
+//! The model-bundle SURFACE of the platform API (tasks 01a1b71f and
+//! 01a1be5c, REQ-MS-04..07 / REQ-MC-01..09): ONE snapshot read, ONE probe,
+//! ONE switch — plus the AUTHORING door, which creates, edits and deletes a
+//! DECLARED bundle from the window.
 //!
-//! Everything the console and the window render comes out of these three
-//! methods — the window never walks the store and never composes several
-//! operations itself. The declared allow-list is config (`models.yaml`), the
-//! active record is the store's ONE marked agent row, the history is the
-//! append-only `model.probe` / `model.switched` events, and the run stamps on
-//! `role_executions` answer «what was actually used, and when?».
+//! Everything the console and the window render comes out of this module —
+//! the window never walks the store and never composes several operations
+//! itself. The declared allow-list is config (`models.yaml`), the active
+//! record is the store's ONE marked agent row, the history is the
+//! append-only `model.probe` / `model.switched` / `model.bundle_*` events,
+//! and the run stamps on `role_executions` answer «what was actually used,
+//! and when?».
 //!
-//! Security boundary (REQ-MS-08): the operations accept a bundle ID only.
-//! There is no parameter for a driver, a model, an LLM-provider or a
-//! base_url, and no read path copies a key/token into its result — the
-//! catalogue type has no such field to begin with.
+//! The authoring path is narrow on purpose: the form carries NAMES only
+//! (label, agent, driver, LLM-provider, model, reasoning level, probe
+//! policy), the handle of a new bundle is derived from the label ONCE and
+//! handed to the form by `model.bundle_handle` — the window never computes
+//! it — and a create/edit is written only after an `ok` probe of the exact
+//! values. The security boundary of REQ-MC-09 is therefore unchanged in
+//! KIND (REQ-MS-08): there is still no parameter for a key, a token, a
+//! credential name or a base_url anywhere in this module. The form's
+//! deny-by-default wire shape and the file's key white list both refuse
+//! such a field by name, and no read path copies a secret into its result —
+//! the catalogue type has no such field to begin with.
 
 use chrono::{Duration, Utc};
 use devai_core::types::{
@@ -275,6 +285,17 @@ pub struct BundleFormView {
     pub default_fresh_secs: u64,
 }
 
+/// The handle a NEW bundle will carry, as the server derives it (ASM-9).
+/// The window prints `id` VERBATIM: `bundle_id_from_label` lives in the
+/// store and is never mirrored on the client — one source, so the id shown
+/// in the form is by construction the id the save writes.
+#[derive(Serialize, Clone, Debug)]
+pub struct BundleHandleView {
+    /// `""` when the label carries no usable latin characters; a create
+    /// refuses that label with «выберите другое имя».
+    pub id: String,
+}
+
 /// The answer of one applied bundle mutation.
 #[derive(Serialize, Clone, Debug)]
 pub struct BundleMutationView {
@@ -444,6 +465,16 @@ impl Api {
         self.probe_view(&bundle)
     }
 
+    /// `model.bundle_handle` (ASM-9): the ONE source of a new bundle's
+    /// handle. A pure read — no file read, no event, no write — so the form
+    /// can show it while the operator types. The value is exactly what
+    /// `model_bundle_create` will write for the same label.
+    pub fn model_bundle_handle(&self, label: &str) -> BundleHandleView {
+        BundleHandleView {
+            id: devai_store::bundle_id_from_label(label.trim()),
+        }
+    }
+
     /// `model.bundle_check` (REQ-MC-02): the form's «Проверить» button — one
     /// real call over the CURRENT form values, one event, no file change.
     /// It does NOT reserve the answer for saving: the save probes again.
@@ -473,7 +504,7 @@ impl Api {
             event_kind::MODEL_BUNDLE_CREATED,
             &input.file_revision,
         )?;
-        let (revision, _) = self.write_bundle(
+        let (revision, old_text) = self.write_bundle(
             &bundle,
             None,
             &input.file_revision,
@@ -488,14 +519,17 @@ impl Api {
             &revision,
             None,
             bundle_outcome::CREATED,
+            &old_text,
         )
     }
 
     /// `model.bundle_update` (REQ-MC-03): the same probe-and-write path, with
     /// the handle fixed. When the edited record is the ONE in force and its
     /// identity changes, the new identity is applied to the marked record
-    /// (the marker stays); a name change marks the new record and leaves the
-    /// old one unmarked. Runs in flight keep their own stored stamp.
+    /// (the marker stays) IN THE SAME STORE TRANSACTION as the edit's own
+    /// fact (REQ-MC-06 AC5) — the record never moves without its history
+    /// row; a name change marks the new record and leaves the old one
+    /// unmarked. Runs in flight keep their own stored stamp.
     pub fn model_bundle_update(&self, input: &BundleFormInput) -> ApiResult<BundleMutationView> {
         let catalog = self.model_catalog()?;
         let previous = self.declared_bundle(&input.id)?;
@@ -511,7 +545,19 @@ impl Api {
             event_kind::MODEL_BUNDLE_UPDATED,
             &input.file_revision,
         )?;
-        let (revision, retarget) = self.commit_update(input, &previous, &bundle, &probe)?;
+        let (revision, retarget, old_text) =
+            self.commit_update(input, &previous, &bundle, &probe)?;
+        if retarget.needed {
+            // The fact was appended inside the identity transaction; there is
+            // nothing left to record here.
+            return Ok(mutation_view(
+                bundle_outcome::UPDATED,
+                &bundle,
+                Some(&probe),
+                retarget.agent_changed,
+                revision,
+            ));
+        }
         self.record_mutation(
             event_kind::MODEL_BUNDLE_UPDATED,
             &bundle,
@@ -520,6 +566,7 @@ impl Api {
             &revision,
             Some(retarget.agent_changed),
             bundle_outcome::UPDATED,
+            &old_text,
         )
     }
 
@@ -532,7 +579,7 @@ impl Api {
         previous: &ModelBundle,
         bundle: &ModelBundle,
         probe: &ProbeRecord,
-    ) -> ApiResult<(String, Retarget)> {
+    ) -> ApiResult<(String, Retarget, String)> {
         let active = self.store.active_agent()?;
         let retarget = self.retarget_of(active.as_ref(), previous, bundle);
         let (revision, old_text) = self.write_bundle(
@@ -543,9 +590,24 @@ impl Api {
             probe,
         )?;
         if retarget.needed {
-            self.apply_retarget(bundle, previous, &old_text, &input.file_revision, probe)?;
+            let payload = bundle_payload(
+                bundle,
+                bundle_outcome::UPDATED,
+                Some(probe),
+                Some(previous),
+                &revision,
+                Some(retarget.agent_changed),
+            );
+            self.apply_retarget(
+                bundle,
+                previous,
+                &old_text,
+                &input.file_revision,
+                probe,
+                payload,
+            )?;
         }
-        Ok((revision, retarget))
+        Ok((revision, retarget, old_text))
     }
 
     /// What an edit does to the record in force (REQ-MC-03): the marked
@@ -588,7 +650,7 @@ impl Api {
                 file_revision,
             ));
         }
-        let revision = self.write_remove(&bundle, file_revision)?;
+        let (revision, old_text) = self.write_remove(&bundle, file_revision)?;
         self.record_mutation(
             event_kind::MODEL_BUNDLE_DELETED,
             &bundle,
@@ -597,6 +659,7 @@ impl Api {
             &revision,
             None,
             bundle_outcome::DELETED,
+            &old_text,
         )
     }
 
@@ -667,10 +730,12 @@ impl Api {
     }
 
     /// The delete write step (REQ-MC-05): the declaration goes, nothing else.
-    fn write_remove(&self, bundle: &ModelBundle, revision: &str) -> ApiResult<String> {
+    /// The text it replaced comes back from the SAME read — a delete whose
+    /// fact cannot be recorded is restored byte-for-byte.
+    fn write_remove(&self, bundle: &ModelBundle, revision: &str) -> ApiResult<(String, String)> {
         let dir = self.model_config_dir();
         let edit = devai_store::CatalogEdit::Remove { id: &bundle.id };
-        devai_store::write_catalog(&dir, revision, &edit).map_err(|e| {
+        devai_store::write_catalog_with_previous(&dir, revision, &edit).map_err(|e| {
             self.fail_bundle(
                 event_kind::MODEL_BUNDLE_DELETED,
                 bundle,
@@ -682,9 +747,11 @@ impl Api {
         })
     }
 
-    /// Apply the edited identity to the marked record (the marker stays). A
-    /// failure AFTER the file was written puts the exact previous edition
-    /// back (REQ-MC-06 AC5) and records the failure with both causes.
+    /// Apply the edited identity to the marked record AND append the edit's
+    /// own fact in ONE store transaction (REQ-MC-06 AC5): the record, the
+    /// marker and the history row land together or not at all. A failure
+    /// AFTER the file was written puts the exact previous edition back and
+    /// records the failure with both causes.
     fn apply_retarget(
         &self,
         bundle: &ModelBundle,
@@ -692,9 +759,13 @@ impl Api {
         old_text: &str,
         file_revision: &str,
         probe: &ProbeRecord,
+        payload: serde_json::Value,
     ) -> ApiResult<()> {
-        let switch = self.identity_switch(bundle);
-        let Err(e) = self.store.apply_bundle_identity(&switch) else {
+        let switch = self.identity_switch(bundle, payload);
+        let Err(e) = self
+            .store
+            .apply_bundle_identity_with_fact(&switch, event_kind::MODEL_BUNDLE_UPDATED)
+        else {
             return Ok(());
         };
         let cause = self.restore_after_failed_retarget(bundle, old_text, e);
@@ -710,7 +781,11 @@ impl Api {
     }
 
     /// The store's identity-move request for an edited bundle in force.
-    fn identity_switch(&self, bundle: &ModelBundle) -> devai_store::BundleSwitch {
+    fn identity_switch(
+        &self,
+        bundle: &ModelBundle,
+        payload: serde_json::Value,
+    ) -> devai_store::BundleSwitch {
         devai_store::BundleSwitch {
             agent: bundle.agent.clone(),
             driver: bundle.driver.clone(),
@@ -718,7 +793,7 @@ impl Api {
             model: bundle.model.clone(),
             reasoning: bundle.reasoning.clone(),
             actor: self.actor().to_string(),
-            payload: serde_json::Value::Null,
+            payload,
             now: Utc::now(),
         }
     }
@@ -744,7 +819,10 @@ impl Api {
     }
 
     /// The applied mutation's fact and view (REQ-MC-07): ONE event with the
-    /// identity, the probe reference and the edition it wrote.
+    /// identity, the probe reference and the edition it wrote. If the fact
+    /// cannot be recorded, the file is put back to the exact pre-mutation
+    /// text (REQ-MC-06 AC5): an action the history cannot explain is not
+    /// applied at all.
     #[allow(clippy::too_many_arguments)]
     fn record_mutation(
         &self,
@@ -755,11 +833,12 @@ impl Api {
         revision: &str,
         agent_changed: Option<bool>,
         outcome: &str,
+        old_text: &str,
     ) -> ApiResult<BundleMutationView> {
         let payload = bundle_payload(bundle, outcome, probe, previous, revision, agent_changed);
         self.store
             .insert_event(None, kind, self.actor(), payload)
-            .map_err(|e| ApiError::at_step(BUNDLE_RECORD_STEP, e))?;
+            .map_err(|e| self.rollback_failed_fact(bundle, kind, old_text, e))?;
         Ok(mutation_view(
             outcome,
             bundle,
@@ -767,6 +846,37 @@ impl Api {
             agent_changed.unwrap_or(false),
             revision.to_string(),
         ))
+    }
+
+    /// The mutation fact could not be stored AFTER the file was written: put
+    /// the exact previous edition back, so a mutation is either applied AND
+    /// recorded or not applied at all (REQ-MC-06 AC5 / REQ-MC-07 AC1). The
+    /// caller gets BOTH causes; there is no history row because the attempt
+    /// never landed (the store is the very door that failed).
+    fn rollback_failed_fact(
+        &self,
+        bundle: &ModelBundle,
+        kind: &'static str,
+        old_text: &str,
+        e: devai_store::StoreError,
+    ) -> ApiError {
+        let code = crate::error::store_code(&e).0;
+        match devai_store::restore_catalog_text(&self.model_config_dir(), old_text) {
+            Ok(()) => ApiError::refused(
+                code,
+                format!(
+                    "bundle `{}` {kind} could not be recorded ({e}); the file was restored — nothing was applied",
+                    bundle.id
+                ),
+            ),
+            Err(back) => ApiError::refused(
+                code,
+                format!(
+                    "bundle `{}` {kind} could not be recorded ({e}); restoring the file also failed: {back}",
+                    bundle.id
+                ),
+            ),
+        }
     }
 
     /// The record a form is EDITING, if any (REQ-MC-02 AC1: a create form
