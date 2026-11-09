@@ -19,6 +19,13 @@
 //! there and then the window opens the machine's page (top level — the session
 //! cookie is SameSite, so an iframe would never receive it).
 //!
+//! A scan that arrives while the app is ALREADY showing its own page is a
+//! same-document navigation (only the fragment changes), so `onMounted` does
+//! not run again. The address therefore carries the link's fingerprint
+//! ([`pair::connect_url`]) and the page listens for the address change
+//! (`frontend/src/pairingWatch.ts`) — otherwise the person is left on
+//! «подключаюсь к дому…» for ever (quality return R1, warm scan).
+//!
 //! Desktop has no pairing SESSION: nothing is constructed, nothing navigates,
 //! and both commands answer `idle`, so the window keeps its own flow
 //! (REQ-QRAPP-08).
@@ -291,25 +298,47 @@ impl PairSession {
     /// the IPC bridge (a machine page does not), asks the boot question and
     /// carries the decision out. The progress screen is the app's own route, so
     /// no unrelated home flashes while the machine is asked.
+    ///
+    /// The SAME intent delivered twice (Android replays the launch intent, and
+    /// the plugin may hand over the same link again) is taken ONCE: it is
+    /// already being handled, so a second `pending` would only loop the window
+    /// back to the progress screen (quality return R2). A link that was
+    /// REFUSED is not held and can be scanned again (see [`Self::release`]).
     pub fn accept_scan(&self, raw: &str) -> PairTask {
-        self.with(|inner| {
+        let digest = pair::link_digest(raw);
+        let repeat = self.with(|inner| {
+            if inner.handled.as_deref() == Some(raw) {
+                return true;
+            }
             inner.pending = Some(raw.to_string());
             inner.handled = Some(raw.to_string());
-            inner.digest = Some(pair::link_digest(raw));
+            inner.digest = Some(digest.clone());
             inner.asking = None;
+            false
         });
+        if repeat {
+            return PairTask::Idle;
+        }
         match self.base() {
-            Some(base) => self.go(pair::connect_url(base)),
+            Some(base) => self.go(pair::connect_url(base, &digest)),
             None => PairTask::Idle,
         }
     }
 
     /// The page's first question: what to do now. `launched` is the intent that
     /// started the process (the plugin reads it while the page loads).
+    ///
+    /// A handshake that was interrupted (the page reloaded before it reported)
+    /// is ASKED AGAIN instead of being dropped: the question never spends the
+    /// code, so retrying is safe — and the «продолжить» action on the progress
+    /// screen has a real pass to run (quality return R1).
     pub fn boot(&self, launched: Option<&str>, local: &[Ipv4Addr]) -> PairTask {
-        self.with(|inner| inner.asking = None);
         if let Some(raw) = self.with(|inner| inner.pending.take()) {
+            self.with(|inner| inner.asking = None);
             return self.start_link(&raw, local);
+        }
+        if let Some(link) = self.with(|inner| inner.asking.clone()) {
+            return ask_task(&link);
         }
         match launched {
             Some(raw) if self.first_time(raw) => self.start_link(raw, local),
@@ -322,6 +351,12 @@ impl PairSession {
     /// every `load(webView)`, so an in-memory marker alone replayed a spent
     /// invitation after a restart (quality return R4); the digest of the link
     /// is kept on disk instead, and the link itself — and its code — never is.
+    ///
+    /// The mark is WRITTEN by [`Self::opened`], after the invitation actually
+    /// opened the home. A refused link writes nothing: the person must be able
+    /// to scan it again after fixing the network or getting a new code, and
+    /// nothing was spent by the question (quality return R2 — a mark on a
+    /// refusal would make the app swallow the retry).
     fn first_time(&self, raw: &str) -> bool {
         let digest = pair::link_digest(raw);
         let seen_here = self.with(|inner| {
@@ -340,14 +375,22 @@ impl PairSession {
                 return false;
             }
             // A record nobody can read is a fact to say out loud before the
-            // mark overwrites it.
+            // next write overwrites it.
             Remembered::Broken(error) => eprintln!("devai-ui: отметка о приглашении: {error}"),
             _ => {}
         }
-        if let Err(error) = self.store.mark_handled(&digest) {
-            eprintln!("devai-ui: отметка о приглашении: {error}");
-        }
         true
+    }
+
+    /// The invitation was NOT opened: drop its mark, so the same code can be
+    /// delivered again. Only a successful open is remembered (see
+    /// [`Self::first_time`]); holding a refused link would leave the person on
+    /// a dead screen with no way to retry.
+    fn release(&self) {
+        self.with(|inner| {
+            inner.handled = None;
+            inner.digest = None;
+        });
     }
 
     pub fn start_link(&self, raw: &str, local: &[Ipv4Addr]) -> PairTask {
@@ -357,13 +400,12 @@ impl PairSession {
                 ask_task(&link)
             }
             Err(refusal) => {
-                let task = refusal_task(refusal, self.current(), self.base());
-                if matches!(task, PairTask::Idle) {
-                    // A refusal with no screen: the code still reaches the
-                    // journal (the token never does).
-                    log_refusal(refusal);
-                }
-                task
+                // A refusal is a SCREEN, and the window must actually open it:
+                // returning `Go` without navigating left the person on the
+                // progress screen (the caller only carries out `Idle`, and the
+                // native half owns navigation).
+                let url = refusal_target(refusal, self.current(), self.base());
+                self.refuse(url, refusal)
             }
         }
     }
@@ -424,6 +466,7 @@ impl PairSession {
     }
 
     fn refuse(&self, url: Option<String>, refusal: PairRefusal) -> PairTask {
+        self.release();
         match url {
             Some(url) => self.go(url),
             None => {
@@ -975,18 +1018,22 @@ mod tests {
 
     /// A scanned link: the progress screen comes up (the person sees the scan
     /// was taken), and the next boot asks the machine WITHOUT spending the code.
+    /// The address carries the link's FINGERPRINT, so a second invitation is a
+    /// real address change rather than the same fragment (warm scan, R1).
     #[test]
     fn a_scan_shows_the_progress_screen_and_then_asks_the_machine() {
         let dir = tempfile::TempDir::new().unwrap();
         let (session, window) = phone(&dir);
         let raw = pair::app_link(home(), "abc");
+        let connect = pair::connect_url("http://tauri.localhost/", &pair::link_digest(&raw));
 
         let task = session.accept_scan(&raw);
-        assert_eq!(
-            task,
-            PairTask::go("http://tauri.localhost/#/pair?step=connect")
+        assert_eq!(task, PairTask::go(connect.clone()));
+        assert_eq!(window.last(), connect);
+        assert!(
+            connect.contains("scan="),
+            "the progress address must differ per invitation: {connect}"
         );
-        assert_eq!(window.last(), "http://tauri.localhost/#/pair?step=connect");
 
         let PairTask::Probe {
             url, addr: asked, ..
@@ -996,6 +1043,65 @@ mod tests {
         };
         assert_eq!(asked, "192.168.1.20:4567");
         assert_eq!(url, "http://192.168.1.20:4567/pair?token=abc");
+    }
+
+    /// R2: the SAME intent delivered twice while the process runs is taken
+    /// once. A second `pending` would send the window back to the progress
+    /// screen and replay the question instead of the one already under way.
+    #[test]
+    fn the_same_scan_delivered_twice_is_taken_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        let raw = pair::app_link(home(), "abc");
+        assert!(matches!(session.accept_scan(&raw), PairTask::Go { .. }));
+        assert_eq!(
+            session.accept_scan(&raw),
+            PairTask::Idle,
+            "a repeated delivery of the same invitation is not re-armed"
+        );
+        assert_eq!(
+            window.opened().len(),
+            1,
+            "the window did not navigate again"
+        );
+        // The one taken link is asked about; a boot while it is still
+        // unanswered repeats the QUESTION (safe, nothing is spent) instead of
+        // dropping the person on a dead progress screen.
+        assert!(matches!(
+            session.boot(None, &local()),
+            PairTask::Probe { .. }
+        ));
+        assert!(matches!(
+            session.boot(None, &local()),
+            PairTask::Probe { .. }
+        ));
+    }
+
+    /// R2: a refused invitation is RELEASED, not remembered — after fixing the
+    /// network the same code can be delivered again. A mark on a refusal would
+    /// make the app swallow the retry and leave the person on a dead screen.
+    #[test]
+    fn a_refused_scan_can_be_delivered_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, window) = phone(&dir);
+        // The first delivery is refused by the NETWORK check, before any ask.
+        let elsewhere = pair::app_link(addr("10.0.0.5:4567"), "abc");
+        assert!(matches!(
+            session.accept_scan(&elsewhere),
+            PairTask::Go { .. }
+        ));
+        let task = session.boot(None, &local());
+        assert!(matches!(task, PairTask::Go { .. }), "refusal screen shown");
+        assert!(
+            window.last().contains("reason=wrong_network"),
+            "{}",
+            window.last()
+        );
+        // The same link is taken again (the network may be fixed by now).
+        assert!(
+            matches!(session.accept_scan(&elsewhere), PairTask::Go { .. }),
+            "a refused invitation must remain retryable"
+        );
     }
 
     /// A live invitation opens the machine's page in the SAME window and the

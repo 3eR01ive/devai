@@ -5,13 +5,27 @@
 // а не список причин на этой стороне.
 import { mount } from "@vue/test-utils";
 import { createMemoryHistory, createRouter } from "vue-router";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PAIR_REASONS } from "../pairState";
 import PairView from "../views/PairView.vue";
 
+// Кнопка «продолжить» просит прогон у корня окна; здесь проверяется сама
+// просьба, а не сетевой обмен (его ведёт pairingRunner/windowBridge).
+const mocks = vi.hoisted(() => ({ continuePairing: vi.fn() }));
+
+vi.mock("../pairingWatch", () => ({
+  PAIR_CONNECT_TIMEOUT_MS: 8000,
+  requestPairingRun: mocks.continuePairing,
+}));
+
+afterEach(() => {
+  vi.useRealTimers();
+  mocks.continuePairing.mockClear();
+});
+
 const Blank = { template: "<div/>" };
 
-async function show(reason?: string, back = false, step?: string) {
+async function show(reason?: string, back = false, step?: string, scan?: string) {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
@@ -23,6 +37,7 @@ async function show(reason?: string, back = false, step?: string) {
   if (reason) query.push(`reason=${reason}`);
   if (back) query.push("return=1");
   if (step) query.push(`step=${step}`);
+  if (scan) query.push(`scan=${scan}`);
   await router.push(query.length ? `/pair?${query.join("&")}` : "/pair");
   await router.isReady();
   return mount(PairView, { global: { plugins: [router] } });
@@ -73,6 +88,39 @@ describe("отказ в приглашении", () => {
     // Никакой причины отказа и никакой «пустой ошибки» на этом экране нет.
     expect(view.find("[data-testid='pair-hint']").exists()).toBe(false);
     expect(view.find("a").exists()).toBe(false);
+    view.unmount();
+  });
+
+  it("скан можно продолжить, а по таймауту экран честно говорит о молчании", async () => {
+    vi.useFakeTimers();
+    const view = await show(undefined, false, "connect");
+    expect(view.find("[data-testid='pair-continue']").exists()).toBe(true);
+    expect(view.find("[data-testid='pair-stalled']").exists()).toBe(false);
+
+    // Машина не ответила — человек не остаётся на вечном «подключаюсь…».
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(view.find("[data-testid='pair-stalled']").exists()).toBe(true);
+
+    // «продолжить» просит новый проход и снова начинает ждать.
+    await view.get("[data-testid='pair-continue']").trigger("click");
+    expect(mocks.continuePairing).toHaveBeenCalledTimes(1);
+    expect(view.find("[data-testid='pair-stalled']").exists()).toBe(false);
+    view.unmount();
+  });
+
+  it("новый скан на том же экране начинает ожидание заново", async () => {
+    vi.useFakeTimers();
+    const view = await show(undefined, false, "connect", "first");
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(view.find("[data-testid='pair-stalled']").exists()).toBe(true);
+
+    // Второе приглашение — другой отпечаток в адресе: ожидание новое, а не
+    // унаследованное «машина не ответила» от прошлого скана.
+    await view.vm.$router.replace("/pair?step=connect&scan=second");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(view.find("[data-testid='pair-stalled']").exists()).toBe(false);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(view.find("[data-testid='pair-stalled']").exists()).toBe(true);
     view.unmount();
   });
 

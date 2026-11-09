@@ -17,11 +17,13 @@
 //! code, no session key — belongs with the vocabulary that describes it; its
 //! failures are typed ([`PairStoreError`]) and never swallowed.
 //!
-//! Single source of the refusal and notice vocabulary: [`REFUSALS`] and
-//! [`NOTICES`] spell every code, title and hint ONCE. The frontend module
-//! `frontend/src/generated/pair-vocabulary.ts` is generated from these rows
-//! (`frontend/scripts/gen-pair-vocabulary.mjs`), so no hand-written mirror can
-//! drift into a generic «ошибка связи» (REQ-QRAPP-06 AC4, quality return R5).
+//! Single source of the refusal and notice vocabulary: the declarative data
+//! `data/pair-vocabulary.json` spells every code, title and hint ONCE, and both
+//! halves read it — this module through [`refusals`]/[`notices`], the page by
+//! generating `frontend/src/generated/pair-vocabulary.ts` from the same file
+//! (`frontend/scripts/gen-pair-vocabulary.mjs`). A domain catalogue belongs in
+//! data, not in code (quality return R6), and no hand-written mirror can drift
+//! into a generic «ошибка связи» (REQ-QRAPP-06 AC4, quality return R5).
 
 // Read by the mobile wiring, by the always-compiled pairing session and by the
 // tests. Nothing CONSTRUCTS a pairing session on a desktop build, which is what
@@ -31,6 +33,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -60,7 +63,7 @@ pub const STATE_INVITE: &str = "invite";
 pub const STATE_INVALID: &str = "invalid";
 pub const STATE_CLOSED: &str = "closed";
 
-/// The notice codes the app leaves on a page it opened (see [`NOTICES`]).
+/// The notice codes the app leaves on a page it opened (see [`notices`]).
 pub const NOTICE_NOT_REMEMBERED: &str = "pair_not_remembered";
 pub const NOTICE_RECORD_BROKEN: &str = "pair_record_broken";
 
@@ -80,7 +83,12 @@ const TMP_EXTENSION: &str = "json.tmp";
 /// Why an invitation was not accepted. Every variant is a DIFFERENT sentence
 /// for the person and a different machine code (REQ-QRAPP-06): «просрочено»,
 /// «не та сеть», «доступ закрыт» are three facts, not one error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The variant name IS the row key in `data/pair-vocabulary.json` (snake
+/// case), so adding a reason means adding a variant and a data row — never a
+/// third copy of the words in code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PairRefusal {
     /// Used, replaced by a newer invitation or closed on the machine. The
     /// ratified decision of 09.11: an invitation never expires by the clock —
@@ -95,106 +103,93 @@ pub enum PairRefusal {
     BadLink,
 }
 
-/// One row of the refusal vocabulary: the machine code that travels on the
-/// wire, the words the person reads and the way out. THE single source of all
-/// three — the frontend module `src/generated/pair-vocabulary.ts` is rendered
-/// from these rows, so the two halves cannot drift (quality return R5).
+/// One row of the refusal vocabulary, parsed from the data file: the machine
+/// code that travels on the wire, the words the person reads and the way out.
+/// THE single source of all three — the frontend module
+/// `src/generated/pair-vocabulary.ts` is rendered from the same rows, so the
+/// two halves cannot drift (quality return R5).
+#[derive(Deserialize)]
 pub struct Refusal {
     pub kind: PairRefusal,
-    pub code: &'static str,
-    pub title: &'static str,
-    pub hint: &'static str,
+    pub code: String,
+    pub title: String,
+    pub hint: String,
 }
-
-/// `frontend/scripts/gen-pair-vocabulary.mjs` parses THIS table: keep one row
-/// per refusal, with `kind`/`code`/`title`/`hint` spelled as plain literals
-/// (no expressions, no quotes or backslashes inside the texts).
-pub const REFUSALS: &[Refusal] = &[
-    Refusal {
-        kind: PairRefusal::InviteExpired,
-        code: "invite_expired",
-        title: "приглашение просрочено",
-        hint: "Приглашение одноразовое: его уже использовали, заменили новым или доступ выключили. Выпустите новое приглашение на машине и отсканируйте его.",
-    },
-    Refusal {
-        kind: PairRefusal::WrongNetwork,
-        code: "wrong_network",
-        title: "не та сеть",
-        hint: "Телефон не в сети этой машины. Вернитесь в домашнюю сеть машины и откройте приглашение снова.",
-    },
-    Refusal {
-        kind: PairRefusal::AccessClosed,
-        code: "access_closed",
-        title: "доступ закрыт",
-        hint: "Доступ с телефона выключили или это устройство отключили на машине. Для возврата нужно новое приглашение.",
-    },
-    Refusal {
-        kind: PairRefusal::BadLink,
-        code: "pair_bad_link",
-        title: "ссылка не подходит",
-        hint: "Это не приглашение devai: ссылка испорчена, ведёт наружу или в локальный файл. Отсканируйте код из окна машины.",
-    },
-];
 
 /// A note the app leaves for the person AFTER the access was granted: the
-/// access works, but something was not kept. Same single source as the
-/// refusals, rendered into the same generated frontend module.
+/// access works, but something was not kept. Same data file as the refusals,
+/// rendered into the same generated frontend module.
+#[derive(Deserialize)]
 pub struct Notice {
-    pub code: &'static str,
-    pub title: &'static str,
-    pub hint: &'static str,
+    pub code: String,
+    pub title: String,
+    pub hint: String,
 }
 
-/// `frontend/scripts/gen-pair-vocabulary.mjs` parses THIS table too: same
-/// shape rule as [`REFUSALS`] (plain literals, no quotes in the texts).
-pub const NOTICES: &[Notice] = &[
-    Notice {
-        code: NOTICE_NOT_REMEMBERED,
-        title: "дом не запомнится",
-        hint: "Подключение работает, но адрес дома не сохранился на телефоне: при следующем запуске приложение его не откроет. Приглашение можно отсканировать снова, когда понадобится.",
-    },
-    Notice {
-        code: NOTICE_RECORD_BROKEN,
-        title: "запомненный дом испорчен",
-        hint: "Запись о прошлом доме на телефоне повреждена и забыта: подключение продолжается, но при следующем запуске адрес придётся отсканировать снова.",
-    },
-];
+/// The data file the vocabulary is declared in (quality return R6: a domain
+/// catalogue lives in data, not in a typed table in code). Compiled into the
+/// binary, so the app reads no file at run time and the data cannot go missing
+/// on the phone.
+const VOCABULARY_JSON: &str = include_str!("../../data/pair-vocabulary.json");
+
+#[derive(Deserialize)]
+struct Vocabulary {
+    refusals: Vec<Refusal>,
+    notices: Vec<Notice>,
+}
+
+fn vocabulary() -> &'static Vocabulary {
+    static VOCABULARY: OnceLock<Vocabulary> = OnceLock::new();
+    VOCABULARY.get_or_init(|| {
+        serde_json::from_str(VOCABULARY_JSON)
+            .expect("data/pair-vocabulary.json must parse (pinned by the tests)")
+    })
+}
+
+/// Every refusal row, in the order the file declares them.
+pub fn refusals() -> &'static [Refusal] {
+    &vocabulary().refusals
+}
+
+/// Every notice row, in the order the file declares them.
+pub fn notices() -> &'static [Notice] {
+    &vocabulary().notices
+}
 
 impl PairRefusal {
-    /// Every refusal the surface can publish. The generated frontend module
-    /// carries exactly these codes (see [`REFUSALS`]).
-    pub const ALL: &'static [PairRefusal] = &[
-        PairRefusal::InviteExpired,
-        PairRefusal::WrongNetwork,
-        PairRefusal::AccessClosed,
-        PairRefusal::BadLink,
-    ];
+    /// Every refusal the surface can publish, DERIVED from the data rows.
+    /// There is no hand-kept list to fall out of step with the table (quality
+    /// return: the third edit site is gone); a test walks every enum variant
+    /// and fails when one has no row.
+    pub fn all() -> impl Iterator<Item = PairRefusal> {
+        refusals().iter().map(|row| row.kind)
+    }
 
-    /// The one row that describes this refusal. The table is checked against
-    /// [`Self::ALL`] by `every_refusal_has_exactly_one_row`, so this lookup
-    /// cannot miss in a shipped build.
+    /// The one row that describes this refusal. The rows are checked against
+    /// every enum variant by the tests, so this lookup cannot miss in a
+    /// shipped build.
     pub fn row(self) -> &'static Refusal {
-        REFUSALS
+        refusals()
             .iter()
             .find(|row| row.kind == self)
-            .expect("every PairRefusal has a row in REFUSALS")
+            .expect("every PairRefusal has a row in data/pair-vocabulary.json")
     }
 
     /// The machine code that travels in the URL (`#/pair?reason=<code>`) and
     /// in the refusal page. Three misuse states, three different codes.
     pub fn code(self) -> &'static str {
-        self.row().code
+        self.row().code.as_str()
     }
 
     /// The words the person reads. Deliberately concrete: no technical codes,
     /// no «ошибка связи» umbrella (REQ-QRAPP-06 AC1-3).
     pub fn text(self) -> &'static str {
-        self.row().title
+        self.row().title.as_str()
     }
 
     /// What the person can do next — the refusal screen is not a dead end.
     pub fn hint(self) -> &'static str {
-        self.row().hint
+        self.row().hint.as_str()
     }
 }
 
@@ -362,8 +357,14 @@ pub fn refusal_url(base: &str, refusal: PairRefusal, can_return: bool) -> String
 /// The screen the app shows while it is answering the invitation: the person
 /// sees that the scan was taken, instead of the app's own (unrelated) home
 /// flashing before the machine's interface opens.
-pub fn connect_url(base: &str) -> String {
-    page_route(base, "step=connect")
+///
+/// `scan` is the link's FINGERPRINT (never the link or the code). It makes the
+/// address DIFFERENT for every invitation, so a second scan while the app is
+/// already on this screen is a real address change — a fragment-only navigation
+/// is a same-document load and would never re-run the handshake (quality
+/// return R1, warm scan).
+pub fn connect_url(base: &str, scan: &str) -> String {
+    page_route(base, &format!("step=connect&scan={scan}"))
 }
 
 /// ONE builder of the app's own screens (`#/pair?…`): a route is never spelled
@@ -522,9 +523,16 @@ impl PairStoreError {
     pub const RECORD_BROKEN: &'static str = NOTICE_RECORD_BROKEN;
 
     pub fn code(&self) -> &'static str {
+        // Exhaustive on purpose (quality return R7): a new variant has to
+        // CHOOSE which fact it is, instead of a catch-all handing it the
+        // «not remembered» sentence of a write failure.
         match self {
             PairStoreError::Read { .. } | PairStoreError::Parse { .. } => Self::RECORD_BROKEN,
-            _ => Self::NOT_REMEMBERED,
+            PairStoreError::NoDirectory
+            | PairStoreError::CreateDirectory { .. }
+            | PairStoreError::Write { .. }
+            | PairStoreError::Rename { .. }
+            | PairStoreError::Encode { .. } => Self::NOT_REMEMBERED,
         }
     }
 
@@ -831,59 +839,75 @@ mod tests {
         );
     }
 
-    /// R5: the vocabulary lives in ONE table and the frontend module is
-    /// GENERATED from it — every code, title and hint of both tables appears in
-    /// the generated file, so a hand-written mirror cannot drift into a generic
-    /// «ошибка» on the phone (REQ-QRAPP-06 AC4).
+    /// The enum↔data link, checked by the COMPILER: the list is spelled ONCE
+    /// and the generated match has no wildcard arm, so a new variant stops the
+    /// test build until it is walked here — and the loop below then demands
+    /// exactly one row for it in the data file. This is the link the review
+    /// found missing between the enum and the hand-kept list.
+    macro_rules! declare_refusal_variants {
+        ($($variant:ident),+ $(,)?) => {
+            const EVERY_REFUSAL: &[PairRefusal] = &[$(PairRefusal::$variant),+];
+            fn refusal_is_walked(kind: PairRefusal) {
+                match kind {
+                    $(PairRefusal::$variant => {})+
+                }
+            }
+        };
+    }
+    declare_refusal_variants!(InviteExpired, WrongNetwork, AccessClosed, BadLink);
+
+    /// R6: the refusal catalogue is DATA (`data/pair-vocabulary.json`), not a
+    /// typed table in code — and every enum variant has exactly one row.
     #[test]
-    fn the_vocabulary_is_declared_once_and_rendered_into_the_frontend() {
+    fn every_refusal_variant_has_exactly_one_data_row() {
+        for kind in EVERY_REFUSAL {
+            refusal_is_walked(*kind);
+            assert_eq!(
+                refusals().iter().filter(|row| row.kind == *kind).count(),
+                1,
+                "{} must have exactly one row in data/pair-vocabulary.json",
+                kind.code()
+            );
+            assert_eq!(kind.row().kind, *kind);
+        }
+        assert_eq!(
+            refusals().len(),
+            EVERY_REFUSAL.len(),
+            "a row names no variant"
+        );
+        assert_eq!(PairRefusal::all().count(), refusals().len());
+    }
+
+    /// R5: the words are declared ONCE in data and the frontend module is
+    /// GENERATED from the same rows — a hand-written mirror cannot drift into a
+    /// generic «ошибка» on the phone (REQ-QRAPP-06 AC4).
+    #[test]
+    fn the_refusal_data_is_rendered_into_the_frontend() {
         let generated = frontend("frontend/src/generated/pair-vocabulary.ts");
         let mut codes: Vec<&str> = Vec::new();
         let mut titles: Vec<&str> = Vec::new();
-        for row in REFUSALS {
+        for row in refusals() {
             assert_eq!(row.kind.code(), row.code, "a row answers for its kind");
             assert_eq!(row.kind.text(), row.title);
             assert_eq!(row.kind.hint(), row.hint);
             assert!(
-                generated.contains(row.code)
-                    && generated.contains(row.title)
-                    && generated.contains(row.hint),
+                generated.contains(row.code.as_str())
+                    && generated.contains(row.title.as_str())
+                    && generated.contains(row.hint.as_str()),
                 "the generated module does not carry `{}`",
                 row.code
             );
-            codes.push(row.code);
-            titles.push(row.title);
+            codes.push(row.code.as_str());
+            titles.push(row.title.as_str());
         }
         codes.sort_unstable();
         codes.dedup();
-        assert_eq!(codes.len(), REFUSALS.len(), "a code is shared");
+        assert_eq!(codes.len(), refusals().len(), "a code is shared");
         titles.sort_unstable();
         titles.dedup();
-        assert_eq!(titles.len(), REFUSALS.len(), "a text is shared");
-        assert_eq!(
-            REFUSALS.len(),
-            PairRefusal::ALL.len(),
-            "a refusal is missing from the table"
-        );
-        for kind in PairRefusal::ALL {
-            assert_eq!(
-                REFUSALS.iter().filter(|row| row.kind == *kind).count(),
-                1,
-                "{} has more than one row",
-                kind.code()
-            );
-        }
-        for notice in NOTICES {
-            assert!(
-                generated.contains(notice.code)
-                    && generated.contains(notice.title)
-                    && generated.contains(notice.hint),
-                "the generated module does not carry the notice `{}`",
-                notice.code
-            );
-        }
-        // The page-side helper does not spell a text of its own: it imports the
-        // generated module, so there is exactly one declaration site.
+        assert_eq!(titles.len(), refusals().len(), "a text is shared");
+        // The page-side helper does not spell a text of its own: it imports
+        // the generated module, so there is exactly one declaration site.
         let state = frontend("frontend/src/pairState.ts");
         assert!(
             state.contains("generated/pair-vocabulary"),
@@ -893,6 +917,25 @@ mod tests {
             !state.contains("title: \""),
             "pairState.ts must not declare a title of its own"
         );
+    }
+
+    /// R5: the notice rows are in the same data file and reach the page too.
+    #[test]
+    fn the_notice_data_is_rendered_into_the_frontend() {
+        let generated = frontend("frontend/src/generated/pair-vocabulary.ts");
+        assert_eq!(notices().len(), 2, "two notices are declared");
+        for notice in notices() {
+            assert!(
+                generated.contains(notice.code.as_str())
+                    && generated.contains(notice.title.as_str())
+                    && generated.contains(notice.hint.as_str()),
+                "the generated module does not carry the notice `{}`",
+                notice.code
+            );
+        }
+        // The codes the caller logs are the same ones the data declares.
+        assert!(notices().iter().any(|n| n.code == NOTICE_NOT_REMEMBERED));
+        assert!(notices().iter().any(|n| n.code == NOTICE_RECORD_BROKEN));
     }
 
     /// REQ-QRAPP-05 AC1: the machine's answer must fit inside one check
@@ -916,10 +959,9 @@ mod tests {
     }
 
     /// The remembered record holds an ADDRESS and a link FINGERPRINT — no
-    /// invitation code, no session key (REQ-QRAPP-07 AC3) — and the three
-    /// outcomes of `load` are three different facts (quality return R2).
+    /// invitation code, no session key (REQ-QRAPP-07 AC3).
     #[test]
-    fn the_remembered_home_holds_no_secret_and_a_broken_record_is_visible() {
+    fn the_remembered_home_holds_no_secret() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = PairStore::new(dir.path().join("phone-pairing.json"));
         assert_eq!(store.load(), Remembered::Absent, "nothing was ever kept");
@@ -940,23 +982,9 @@ mod tests {
             "the code itself is not kept"
         );
         assert!(raw.contains("192.168.1.20:4567"));
-        // A garbled record is NOT «ничего не помню»: it is a visible break.
-        std::fs::write(store.path(), "{ not json").unwrap();
-        match store.load() {
-            Remembered::Broken(error) => {
-                assert_eq!(error.code(), "pair_record_broken");
-                assert_eq!(error.code(), PairStoreError::RECORD_BROKEN);
-                assert!(error.message().contains("испорчена"));
-            }
-            other => panic!("a garbled record must be named: {other:?}"),
-        }
         store.save(home(), None).unwrap();
         store.forget().unwrap();
         assert_eq!(store.load(), Remembered::Absent);
-        // A public address can never be re-opened from the record either — and
-        // it is named as a broken record, not silently dropped.
-        std::fs::write(store.path(), "{\"home\":\"8.8.8.8:80\"}").unwrap();
-        assert!(matches!(store.load(), Remembered::Broken(_)));
         // The mark of a handled link survives a launch that keeps the home.
         store.save(home(), None).unwrap();
         store.mark_handled("deadbeefdeadbeef").unwrap();
@@ -968,7 +996,31 @@ mod tests {
             }),
             "marking a link keeps the remembered home"
         );
-        // The fingerprint is stable and is not the link.
+    }
+
+    /// The three outcomes of `load` are three different facts (quality return
+    /// R2): a garbled record or a public address is NAMED, never silently
+    /// dropped to «ничего не помню».
+    #[test]
+    fn a_broken_record_is_named_not_silently_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PairStore::new(dir.path().join("phone-pairing.json"));
+        std::fs::write(store.path(), "{ not json").unwrap();
+        match store.load() {
+            Remembered::Broken(error) => {
+                assert_eq!(error.code(), "pair_record_broken");
+                assert_eq!(error.code(), PairStoreError::RECORD_BROKEN);
+                assert!(error.message().contains("испорчена"));
+            }
+            other => panic!("a garbled record must be named: {other:?}"),
+        }
+        std::fs::write(store.path(), "{\"home\":\"8.8.8.8:80\"}").unwrap();
+        assert!(matches!(store.load(), Remembered::Broken(_)));
+    }
+
+    /// The fingerprint is stable, 16 hex characters and not the link itself.
+    #[test]
+    fn the_link_fingerprint_is_stable_and_not_the_link() {
         assert_eq!(
             link_digest("devai://pair?addr=a&token=b"),
             link_digest("devai://pair?addr=a&token=b")
@@ -1013,29 +1065,24 @@ mod tests {
             store.load(),
             Remembered::Absent | Remembered::Broken(_)
         ));
-        // Both notice codes the page shows are declared in the generated
-        // vocabulary, so the phone does not lose the notice on the way out.
-        let generated = frontend("frontend/src/generated/pair-vocabulary.ts");
-        for code in [
-            PairStoreError::NOT_REMEMBERED,
-            PairStoreError::RECORD_BROKEN,
-        ] {
-            assert!(
-                generated.contains(code),
-                "pair-vocabulary.ts does not declare `{code}`"
-            );
-        }
     }
 
     /// R4: the app's own screens (`#/pair?…`) come from ONE route builder —
-    /// the progress screen and the refusal screen cannot drift apart, and a
-    /// base that already carries a hash does not accumulate a second one.
+    /// the progress screen and the refusal screen cannot drift apart, a base
+    /// that already carries a hash does not accumulate a second one, and the
+    /// progress address is DIFFERENT for every invitation (its fingerprint is
+    /// part of the address, so a warm scan is a real navigation).
     #[test]
     fn the_apps_own_screens_are_built_from_one_route() {
         let base = "http://tauri.localhost/";
         assert_eq!(
-            connect_url(base),
-            "http://tauri.localhost/#/pair?step=connect"
+            connect_url(base, "0123456789abcdef"),
+            "http://tauri.localhost/#/pair?step=connect&scan=0123456789abcdef"
+        );
+        assert_ne!(
+            connect_url(base, "0123456789abcdef"),
+            connect_url(base, "fedcba9876543210"),
+            "a second invitation is a different address, not the same fragment"
         );
         assert_eq!(
             refusal_url(base, PairRefusal::WrongNetwork, false),
@@ -1049,6 +1096,69 @@ mod tests {
             ),
             "http://tauri.localhost/#/pair?reason=access_closed"
         );
+    }
+
+    /// R4: the route, its query keys and its `connect` value are a contract
+    /// with `router.ts`/`PairView.vue` — pinned on BOTH sides, like the poll
+    /// interval and the task wire shape, so the page cannot silently stop
+    /// understanding an address the native half builds (quality return R4).
+    #[test]
+    fn the_app_screen_contract_is_pinned_in_the_frontend() {
+        let router = frontend("frontend/src/router.ts");
+        assert!(
+            router.contains("path: \"/pair\""),
+            "the app's own route is not registered in router.ts"
+        );
+        let view = frontend("frontend/src/views/PairView.vue");
+        for needle in [
+            "route.query.step === \"connect\"",
+            "route.query.reason",
+            "route.query.return === \"1\"",
+        ] {
+            assert!(
+                view.contains(needle),
+                "PairView.vue does not read `{needle}`"
+            );
+        }
+        // The addresses the native half builds carry exactly those names.
+        assert!(connect_url("http://x/", "abc").contains("?step=connect&scan=abc"));
+        assert!(
+            refusal_url("http://x/", PairRefusal::BadLink, true)
+                .contains("?reason=pair_bad_link&return=1")
+        );
+    }
+
+    /// The scan listener lives in `pairingWatch.ts` and keys off the SAME
+    /// fragment this module builds; the page constant is pinned here so the
+    /// warm-scan fix cannot be lost by renaming one side (quality return R4).
+    #[test]
+    fn the_warm_scan_listener_uses_the_same_route() {
+        let watch = frontend("frontend/src/pairingWatch.ts");
+        assert!(
+            watch.contains("CONNECT_ROUTE = \"#/pair?step=connect\""),
+            "pairingWatch.ts must key off the native connect route"
+        );
+        assert!(
+            watch.contains("addEventListener(\"hashchange\""),
+            "the page must notice a same-document address change"
+        );
+    }
+
+    /// REQ-QRAPP-02: the scheme and host the Android intent filter is written
+    /// from are declared in `tauri.conf.json` and must equal the constants the
+    /// link parser checks — one declaration, two readers, pinned by a test.
+    #[test]
+    fn the_deep_link_scheme_is_declared_once() {
+        let conf = frontend("tauri.conf.json");
+        for needle in [
+            format!("\"scheme\": [\"{PAIR_SCHEME}\"]"),
+            format!("\"host\": \"{PAIR_HOST}\""),
+        ] {
+            assert!(
+                conf.contains(&needle),
+                "tauri.conf.json does not declare `{needle}`"
+            );
+        }
     }
 
     /// R1/R4: the notice that the home was not remembered travels in the

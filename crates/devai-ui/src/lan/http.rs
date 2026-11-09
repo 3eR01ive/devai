@@ -128,11 +128,13 @@ pub fn asset_path(uri_path: &str) -> Option<String> {
 /// the presented one-time code is valid and NOT spent; `401` = the code or the
 /// session is dead; `403` = the access is off.
 ///
-/// The answer is readable from ANOTHER origin on purpose (`ACAO: *`): the app
-/// page asks the candidate machine this question before the window switches
-/// homes, and a switch that cannot be checked would cost the working session
-/// (quality return R2). Nothing but the three tokens above is revealed, no
-/// cookie is accepted on that path, and the request never spends a code.
+/// The session cookie IS read here — that is how a paired device is told from
+/// an unpaired one — but the path never SETS a cookie, never spends the code
+/// and reveals nothing beyond the three state tokens above. The answer is
+/// readable from ANOTHER origin on purpose (`ACAO: *`): the app page asks the
+/// candidate machine this question before the window switches homes, and a
+/// switch that cannot be checked would cost the working session (quality
+/// return R2).
 async fn pair_probe(
     axum::extract::State(ctx): axum::extract::State<ServerCtx>,
     axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,

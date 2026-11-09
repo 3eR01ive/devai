@@ -15,7 +15,9 @@ import { pairingShell, toUiError } from "./api";
 import { degradedBanner } from "./homes-view";
 import { subscribeWait, waitError, waitSnapshot } from "./inbox";
 import { pairFailure, pairingNotice, readNotice, subscribePairing } from "./pairing";
-import { runPairing, windowBridge } from "./pairingNative";
+import { windowBridge } from "./pairingNative";
+import type { PairTask } from "./pairingNative";
+import { pairingRunner, setPairingRunner, watchScans } from "./pairingWatch";
 import { pairNotice } from "./pairState";
 import { sessionStore } from "./session";
 import { fmtTime } from "./settings";
@@ -34,6 +36,7 @@ const degraded = computed(() => degradedBanner(session.value));
 const notice = computed(() => pairNotice(pairingNotice.value));
 let unsubscribe: (() => void) | undefined;
 let stopPairing: (() => void) | undefined;
+let stopScans: (() => void) | undefined;
 const stopWatching = sessionStore.subscribe((s) => {
   session.value = s;
 });
@@ -52,22 +55,33 @@ onMounted(async () => {
   pairingNotice.value = readNotice(window.location.search);
   // Приглашение проводит СВОЯ страница приложения: у неё есть мост в Rust.
   // Сбой самого моста — тоже видимый факт, а не тихо пропущенный запуск.
+  // Один и тот же проход запускают две вещи: первый экран после загрузки и
+  // смена адреса на экран принятого скана — тёплый скан не перезагружает
+  // документ, поэтому `onMounted` здесь уже не сработает (quality return R1).
   if (pairingShell) {
-    try {
-      const done = await runPairing(windowBridge());
-      // Нечего открывать (старый экран приглашения без ссылки) — возвращаемся
-      // к собственному дому окна, а не оставляем человека на служебной странице.
-      if (done.kind === "idle" && window.location.hash.startsWith("#/pair")) {
-        window.location.hash = "#/";
-      }
-    } catch (e) {
-      error.value = toUiError(e);
-    }
+    const run = pairingRunner(
+      windowBridge(),
+      (done: PairTask) => {
+        // Нечего открывать (старый экран приглашения без ссылки) — возвращаемся
+        // к собственному дому окна, а не оставляем человека на служебной странице.
+        if (done.kind === "idle" && window.location.hash.startsWith("#/pair")) {
+          window.location.hash = "#/";
+        }
+      },
+      (e) => {
+        error.value = toUiError(e);
+      },
+    );
+    stopScans = watchScans(window, run);
+    setPairingRunner(run);
+    run();
   }
 });
 onUnmounted(() => {
   unsubscribe?.();
   stopPairing?.();
+  stopScans?.();
+  setPairingRunner(null);
   stopWatching();
 });
 </script>
