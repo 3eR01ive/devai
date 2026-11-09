@@ -22,7 +22,7 @@ use chrono::Utc;
 use devai_api::{Api, BundleFormInput, ErrorCode, ProbeRunner};
 use devai_core::types::*;
 use devai_runtime::probe::{ProbeOutcome, ProbeRequest};
-use devai_store::Store;
+use devai_store::{ProbePolicy, Store};
 use tempfile::TempDir;
 
 const MODELS: &str = r#"
@@ -52,6 +52,16 @@ impl Fixture {
         let home = TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join("config")).unwrap();
         std::fs::write(home.path().join("config/models.yaml"), MODELS).unwrap();
+        Store::open(home.path()).unwrap();
+        Fixture {
+            home,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// A home that declares NOTHING yet: no `config/models.yaml` at all.
+    fn empty() -> Self {
+        let home = TempDir::new().unwrap();
         Store::open(home.path()).unwrap();
         Fixture {
             home,
@@ -92,7 +102,10 @@ impl Fixture {
     }
 
     fn agents(&self) -> Vec<AgentInstance> {
-        Store::open(self.home.path()).unwrap().list_agents().unwrap()
+        Store::open(self.home.path())
+            .unwrap()
+            .list_agents()
+            .unwrap()
     }
 
     fn draft(&self) -> BundleFormInput {
@@ -104,9 +117,11 @@ impl Fixture {
             llm_provider: "alibaba".into(),
             model: "qwen-max".into(),
             reasoning: "medium".into(),
-            probe_phrase: "ping".into(),
-            probe_timeout_ms: 5_000,
-            fresh_secs: 60,
+            probe: ProbePolicy {
+                phrase: "ping".into(),
+                timeout_ms: 5_000,
+                fresh_secs: 60,
+            },
             editing: false,
             file_revision: self.revision(),
         }
@@ -183,7 +198,10 @@ fn a_duplicate_identity_refuses_and_names_both_records() {
     draft.model = "live-1".into();
     draft.reasoning = "high".into();
 
-    let err = f.api(ProbeVerdict::Ok, 1).model_bundle_create(&draft).unwrap_err();
+    let err = f
+        .api(ProbeVerdict::Ok, 1)
+        .model_bundle_create(&draft)
+        .unwrap_err();
     assert_eq!(err.code(), ErrorCode("duplicate_identity"));
     let text = err.to_string();
     assert!(
@@ -201,7 +219,10 @@ fn a_taken_handle_refuses_naming_the_existing_record() {
     let f = Fixture::new();
     let mut draft = f.draft();
     draft.label = "Hermes Live".into(); // → id hermes-live
-    let err = f.api(ProbeVerdict::Ok, 1).model_bundle_create(&draft).unwrap_err();
+    let err = f
+        .api(ProbeVerdict::Ok, 1)
+        .model_bundle_create(&draft)
+        .unwrap_err();
     assert_eq!(err.code(), ErrorCode("duplicate_id"));
     assert!(err.to_string().contains("Hermes Live"), "{err}");
 }
@@ -234,7 +255,7 @@ fn an_incomplete_form_refuses_before_any_probe() {
     assert!(err.to_string().contains("провайдер"), "{err}");
 
     let mut zero_timeout = f.draft();
-    zero_timeout.probe_timeout_ms = 0;
+    zero_timeout.probe.timeout_ms = 0;
     assert!(api.model_bundle_create(&zero_timeout).is_err());
 
     assert_eq!(f.calls.load(Ordering::SeqCst), 0, "no probe was launched");
@@ -264,15 +285,27 @@ fn editing_the_bundle_in_force_applies_the_new_identity_and_keeps_the_marker() {
 
     let snap = api.model_snapshot().unwrap();
     let active = snap.active.unwrap();
-    assert_eq!(active.model, "live-2", "the marked record took the new identity");
+    assert_eq!(
+        active.model, "live-2",
+        "the marked record took the new identity"
+    );
     assert_eq!(active.id.as_deref(), Some("hermes-live"));
-    assert!(snap.declared.iter().find(|b| b.id == "hermes-live").unwrap().active);
+    assert!(
+        snap.declared
+            .iter()
+            .find(|b| b.id == "hermes-live")
+            .unwrap()
+            .active
+    );
 
     let last = f.events().last().unwrap().clone();
     assert_eq!(last.kind, event_kind::MODEL_BUNDLE_UPDATED);
     assert_eq!(last.payload[json_field::OUTCOME], "updated");
     assert_eq!(last.payload[json_field::FROM][json_field::MODEL], "live-1");
-    assert_eq!(last.payload[json_field::BUNDLE][json_field::MODEL], "live-2");
+    assert_eq!(
+        last.payload[json_field::BUNDLE][json_field::MODEL],
+        "live-2"
+    );
 }
 
 #[test]
@@ -296,7 +329,12 @@ fn editing_a_non_active_bundle_leaves_the_record_in_force_alone() {
         .model_bundle_update(&draft)
         .unwrap();
 
-    let active = f.api(ProbeVerdict::Ok, 1).model_snapshot().unwrap().active.unwrap();
+    let active = f
+        .api(ProbeVerdict::Ok, 1)
+        .model_snapshot()
+        .unwrap()
+        .active
+        .unwrap();
     assert_eq!(active.id.as_deref(), Some("hermes-live"));
     assert_eq!(active.model, "live-1");
     let catalog = devai_store::load_catalog(&f.home.path().join("config")).unwrap();
@@ -377,7 +415,10 @@ fn deleting_another_bundle_removes_only_the_declaration() {
     assert_eq!(f.agents().len(), agents_before, "agent rows are untouched");
     let snap = f.api(ProbeVerdict::Ok, 1).model_snapshot().unwrap();
     assert_eq!(snap.active.unwrap().id.as_deref(), Some("hermes-live"));
-    assert_eq!(f.events().last().unwrap().kind, event_kind::MODEL_BUNDLE_DELETED);
+    assert_eq!(
+        f.events().last().unwrap().kind,
+        event_kind::MODEL_BUNDLE_DELETED
+    );
 }
 
 #[test]
@@ -399,7 +440,10 @@ fn a_stale_form_refuses_and_never_overwrites_the_other_edition() {
 
     let mut draft = f.draft();
     draft.file_revision = stale;
-    let err = f.api(ProbeVerdict::Ok, 1).model_bundle_create(&draft).unwrap_err();
+    let err = f
+        .api(ProbeVerdict::Ok, 1)
+        .model_bundle_create(&draft)
+        .unwrap_err();
     assert_eq!(err.code(), ErrorCode("stale_form"));
     assert_eq!(f.file(), other, "the other writer's edition survives");
 }
@@ -416,12 +460,13 @@ fn out_of_band_keys_are_rejected_by_name() {
         ("driver", "hermes"),
         ("model", "m"),
         ("reasoning", "high"),
-        ("probe_phrase", "ping"),
     ] {
         form.insert(k.to_string(), serde_json::json!(v));
     }
-    form.insert("probe_timeout_ms".into(), serde_json::json!(1));
-    form.insert("fresh_secs".into(), serde_json::json!(1));
+    form.insert(
+        "probe".into(),
+        serde_json::json!({"phrase": "ping", "timeout_ms": 1, "fresh_secs": 1}),
+    );
     form.insert(credential_key.clone(), serde_json::json!("secret"));
     let err = serde_json::from_value::<BundleFormInput>(serde_json::Value::Object(form))
         .unwrap_err()
@@ -435,13 +480,14 @@ fn out_of_band_keys_are_rejected_by_name() {
         ("driver", "hermes"),
         ("model", "m"),
         ("reasoning", "high"),
-        ("probe_phrase", "ping"),
-        ("base_url", "https://elsewhere"),
     ] {
         form.insert(k.to_string(), serde_json::json!(v));
     }
-    form.insert("probe_timeout_ms".into(), serde_json::json!(1));
-    form.insert("fresh_secs".into(), serde_json::json!(1));
+    form.insert("base_url".into(), serde_json::json!("https://elsewhere"));
+    form.insert(
+        "probe".into(),
+        serde_json::json!({"phrase": "ping", "timeout_ms": 1, "fresh_secs": 1}),
+    );
     let err = serde_json::from_value::<BundleFormInput>(serde_json::Value::Object(form))
         .unwrap_err()
         .to_string();
@@ -466,7 +512,10 @@ fn the_draft_check_writes_no_file_and_records_one_probe() {
     let before = f.file();
     let mut draft = f.draft();
     draft.editing = false;
-    let view = f.api(ProbeVerdict::Ok, 12).model_bundle_check(&draft).unwrap();
+    let view = f
+        .api(ProbeVerdict::Ok, 12)
+        .model_bundle_check(&draft)
+        .unwrap();
     assert_eq!(view.verdict, "ok");
     assert_eq!(view.bundle_id, "hermes-alibaba");
     assert_eq!(f.file(), before, "a check never writes the declaration");
@@ -489,7 +538,11 @@ fn creating_a_bundle_leaves_the_record_in_force_untouched() {
         .unwrap();
 
     let after = f.agents();
-    assert_eq!(after.len(), before.len(), "no agent row was added by a create");
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "no agent row was added by a create"
+    );
     assert_eq!(after.iter().filter(|a| a.active).count(), 1);
     let active = f
         .api(ProbeVerdict::Ok, 1)
@@ -516,7 +569,10 @@ fn editing_the_bundle_in_force_can_move_the_agent_name() {
     draft.llm_provider = "deepseek".into();
     draft.model = "live-1".into();
     draft.reasoning = "high".into();
-    let updated = f.api(ProbeVerdict::Ok, 2).model_bundle_update(&draft).unwrap();
+    let updated = f
+        .api(ProbeVerdict::Ok, 2)
+        .model_bundle_update(&draft)
+        .unwrap();
     assert!(updated.agent_changed, "the edit moved the agent NAME");
 
     let agents = f.agents();
@@ -529,4 +585,95 @@ fn editing_the_bundle_in_force_can_move_the_agent_name() {
     assert_eq!(snap.active.unwrap().agent, "hermes-next");
     let last = f.events().last().unwrap().clone();
     assert_eq!(last.payload[json_field::AGENT_CHANGED], true);
+}
+
+/// R4/R5: the wire form and the declaration share ONE field catalogue —
+/// every field the file accepts has a form field (and the form adds only its
+/// own transport fields). A field added to one side alone fails this pin.
+#[test]
+fn the_form_wire_carries_every_declared_field() {
+    let wire = serde_json::to_value(BundleFormInput::default()).unwrap();
+    let mut wire_keys: Vec<String> = wire.as_object().unwrap().keys().cloned().collect();
+    wire_keys.retain(|k| k != "editing" && k != "file_revision");
+    let mut expected = devai_store::bundle_keys();
+    wire_keys.sort();
+    expected.sort();
+    assert_eq!(
+        wire_keys, expected,
+        "the form carries exactly the declared fields"
+    );
+    let mut probe_keys: Vec<String> = wire["probe"].as_object().unwrap().keys().cloned().collect();
+    let mut expected_probe = devai_store::probe_keys();
+    probe_keys.sort();
+    expected_probe.sort();
+    assert_eq!(probe_keys, expected_probe);
+}
+
+/// R7 branch: a home that declares nothing yet gets a valid `bundles:` list
+/// on the first create — the file is created, not appended to nothing.
+#[test]
+fn creating_on_a_home_without_a_declared_file_creates_the_catalogue() {
+    let f = Fixture::empty();
+    assert_eq!(f.revision(), "", "an empty home carries the empty edition");
+    let created = f
+        .api(ProbeVerdict::Ok, 3)
+        .model_bundle_create(&f.draft())
+        .unwrap();
+    assert_eq!(created.outcome, "created");
+    assert_ne!(created.revision, "");
+
+    let catalog = devai_store::load_catalog(&f.home.path().join("config")).unwrap();
+    assert_eq!(catalog.ids(), vec!["hermes-alibaba"]);
+    let text = f.file();
+    assert!(text.contains("bundles:"), "{text}");
+    assert_eq!(
+        devai_store::catalog_revision(&f.home.path().join("config")).unwrap(),
+        created.revision
+    );
+}
+
+/// R7 branch: a write that cannot land leaves the file byte-identical, the
+/// probe evidence intact, and a `failed` fact naming the cause.
+#[test]
+fn a_failed_write_keeps_the_file_and_records_the_failure() {
+    let f = Fixture::new();
+    let before = f.file();
+    // Make the writer's own temp path a directory: creating the temp file
+    // fails deterministically, whatever the process runs as.
+    let block = f
+        .home
+        .path()
+        .join("config")
+        .join(format!(".models.yaml.tmp-{}", std::process::id()));
+    std::fs::create_dir(&block).unwrap();
+
+    let err = f
+        .api(ProbeVerdict::Ok, 5)
+        .model_bundle_create(&f.draft())
+        .unwrap_err();
+    std::fs::remove_dir(&block).unwrap();
+
+    assert_eq!(err.code(), ErrorCode("io"), "{err}");
+    assert_eq!(f.file(), before, "the file must not change");
+    let last = f.events().last().unwrap().clone();
+    assert_eq!(last.kind, event_kind::MODEL_BUNDLE_CREATED);
+    assert_eq!(last.payload[json_field::OUTCOME], "failed");
+    assert_eq!(last.payload[json_field::REASON], "io");
+    assert_eq!(last.payload[json_field::VERDICT], "ok");
+}
+
+/// R7 branch: deleting the LAST declaration leaves a valid, readable empty
+/// catalogue (no half-written file, no shape error on reopen).
+#[test]
+fn deleting_the_last_bundle_leaves_a_readable_empty_catalogue() {
+    let f = Fixture::new();
+    for id in ["hermes-live", "claude-live"] {
+        f.api(ProbeVerdict::Ok, 1)
+            .model_bundle_delete(id, &f.revision())
+            .unwrap();
+    }
+    let catalog = devai_store::load_catalog(&f.home.path().join("config")).unwrap();
+    assert!(catalog.bundles.is_empty());
+    assert!(f.file().contains("bundles:"), "{}", f.file());
+    assert!(f.api(ProbeVerdict::Ok, 1).model_snapshot().is_ok());
 }

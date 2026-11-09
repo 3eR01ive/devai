@@ -66,7 +66,7 @@ const formRevision = ref("");
 
 const drivers = computed(() => snap.value?.form?.drivers ?? []);
 const selfProviderDriver = computed(
-  () => snap.value?.form?.self_provider_driver ?? "claude",
+  () => snap.value?.form?.self_provider_driver ?? "",
 );
 /** Идентификатор показывается ДО сохранения; у правки он неизменяем. */
 const formId = computed(() => editing.value ?? bundleIdFromLabel(form.value.label));
@@ -74,6 +74,9 @@ const providerLocked = computed(
   () => form.value.driver === selfProviderDriver.value,
 );
 
+/** Начальные значения формы — ЦЕЛИКОМ от платформы (R8: доменных значений
+ * по умолчанию в окне нет). Пустые `""`/`0` значат «не заполнено», и сервер
+ * откажет с названием поля — подстановки на лету окно не делает. */
 function blankForm(): FormState {
   const f = snap.value?.form;
   return {
@@ -83,9 +86,9 @@ function blankForm(): FormState {
     llm_provider: "",
     model: "",
     reasoning: "",
-    probe_phrase: f?.default_phrase ?? "ping",
-    probe_timeout_ms: f?.default_timeout_ms ?? 20000,
-    fresh_secs: f?.default_fresh_secs ?? 900,
+    probe_phrase: f?.default_phrase ?? "",
+    probe_timeout_ms: f?.default_timeout_ms ?? 0,
+    fresh_secs: f?.default_fresh_secs ?? 0,
   };
 }
 
@@ -94,6 +97,9 @@ function snapshotRevision(): string {
 }
 
 function openCreate() {
+  // Без снимка нет ни списка драйверов, ни фабричной политики пробы —
+  // форма не открывается на выдуманных значениях.
+  if (!snap.value) return;
   editing.value = null;
   form.value = blankForm();
   formError.value = null;
@@ -136,9 +142,11 @@ function payload(): BundleFormInput {
     llm_provider: providerLocked.value ? "" : form.value.llm_provider,
     model: form.value.model,
     reasoning: form.value.reasoning,
-    probe_phrase: form.value.probe_phrase,
-    probe_timeout_ms: Number(form.value.probe_timeout_ms),
-    fresh_secs: Number(form.value.fresh_secs),
+    probe: {
+      phrase: form.value.probe_phrase,
+      timeout_ms: Number(form.value.probe_timeout_ms),
+      fresh_secs: Number(form.value.fresh_secs),
+    },
     editing: editing.value !== null,
     file_revision: formRevision.value,
   };
@@ -295,7 +303,7 @@ onUnmounted(cancelHold);
       <h2 style="margin: 0">Связка модели</h2>
       <span v-if="snap" class="mono muted">снимок {{ fmtTime(snap.snapshot_at) }}</span>
       <div class="spacer" />
-      <button @click="openCreate">Создать связку</button>
+      <button :disabled="!snap" @click="openCreate">Создать связку</button>
       <button @click="load">Обновить</button>
     </div>
 

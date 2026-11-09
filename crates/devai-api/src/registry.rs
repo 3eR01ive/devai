@@ -546,7 +546,7 @@ pub fn operations() -> Vec<OpDescriptor> {
         OpDescriptor {
             name: "model.bundle_check",
             class: OpClass::Mutation,
-            input: "BundleFormInput{label, agent, driver, llm_provider, model, reasoning, probe_phrase, probe_timeout_ms, fresh_secs, editing, id?}",
+            input: "BundleFormInput{label, agent, driver, llm_provider, model, reasoning, probe{phrase, timeout_ms, fresh_secs}, editing, id?}",
             output: "ProbeView{bundle_id, verdict, latency_ms, exit_code, output_excerpt, at}",
             description: "The form's «Проверить»: ONE real probe of the CURRENT form values, one `model.probe` event, and NOTHING written to config/models.yaml. A create draft does not need a declared record; an edit draft is addressed by its id. The save probes again — a passed check never authorizes a save (REQ-MC-02).",
         },

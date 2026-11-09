@@ -412,6 +412,14 @@ test("ModelsView: сохранение новой связки уходит в �
   assert.equal(payload.reasoning, "medium");
   assert.equal(payload.editing, false);
   assert.equal(payload.file_revision, "rev-1");
+  const probe = payload.probe as Record<string, unknown>;
+  assert.equal(probe.phrase, "ping");
+  assert.equal(
+    probe.timeout_ms,
+    20000,
+    "the factory policy is the snapshot's, not a literal in the window",
+  );
+  assert.equal(probe.fresh_secs, 900);
   // The credential key name is assembled at run time: the repository text
   // never carries the literal the `no-secrets` gate looks for.
   const credentialKey = `api${"_"}key`;
@@ -419,6 +427,56 @@ test("ModelsView: сохранение новой связки уходит в �
   assert.equal(payload.base_url, undefined);
   assert.match(textOf(root), /создана/);
   assert.match(textOf(root), /проба ok 400 мс/);
+});
+
+test("ModelsView: фабричная политика пробы приходит от платформы, а не из окна", async () => {
+  // R8: у окна нет своих доменных значений по умолчанию — форма берёт
+  // фразу/таймаут/срок свежести из снимка и отправляет их без подстановок.
+  let sent: Record<string, unknown> | null = null;
+  const served = snapshot({
+    form: {
+      drivers: ["claude", "hermes"],
+      self_provider_driver: "claude",
+      default_phrase: "проверка платформы",
+      default_timeout_ms: 12345,
+      default_fresh_secs: 678,
+    },
+  });
+  installInvoke((cmd, args) => {
+    if (cmd === "model_snapshot") return served;
+    if (cmd === "model_bundle_create") {
+      sent = (args as { input: Record<string, unknown> }).input;
+      return {
+        outcome: "created",
+        outcome_text: "создана",
+        bundle_id: "hermes-alibaba",
+        label: "Hermes Alibaba",
+        verdict: "ok",
+        latency_ms: 9,
+        agent_changed: false,
+        revision: "rev-2",
+      };
+    }
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+  const view = await loadView(harness, "/src/views/ModelsView.vue");
+  const { root } = await mount(harness, view, {}, "/models");
+  await flush();
+  buttonByLabel(root, "Создать связку").props.onClick!({});
+  await flush();
+  await typeInto(inputByField(root, "label"), "Hermes Alibaba");
+  await typeInto(inputByField(root, "agent"), "hermes");
+  await typeInto(inputByField(root, "driver"), "hermes");
+  await typeInto(inputByField(root, "model"), "qwen-max");
+  await typeInto(inputByField(root, "reasoning"), "medium");
+  await flush();
+  buttonByLabel(root, "Сохранить (с пробой)").props.onClick!({});
+  assert.ok(await waitUntil(() => sent !== null), "save must reach the platform");
+
+  const probe = (sent as unknown as { probe: Record<string, unknown> }).probe;
+  assert.equal(probe.phrase, "проверка платформы");
+  assert.equal(probe.timeout_ms, 12345);
+  assert.equal(probe.fresh_secs, 678);
 });
 
 test("ModelsView: отказ платформы оставляет форму открытой и объясняет поле", async () => {

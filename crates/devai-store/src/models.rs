@@ -92,10 +92,18 @@ impl Default for ProbePolicy {
     }
 }
 
+impl ProbePolicy {
+    /// The policy's fields in the struct's own order — the nested section's
+    /// ONE catalogue, shared by the writer and the loader's key check.
+    pub fn fields(&self) -> Vec<(String, String)> {
+        mapping_pairs(&serde_yaml::to_value(self).unwrap_or(serde_yaml::Value::Null))
+    }
+}
+
 /// One declared bundle. The field names ARE the config vocabulary:
 /// `driver` / `llm_provider` / `model` / `reasoning` — «provider» alone never
 /// appears.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelBundle {
     pub id: String,
     pub label: String,
@@ -129,6 +137,20 @@ impl ModelBundle {
             self.model.as_str(),
             self.reasoning.as_str(),
         )
+    }
+
+    /// The record as ordered `(key, text)` pairs in the struct's OWN field
+    /// order. Every writer surface walks this list and the loader's key
+    /// whitelist is derived from it, so a field added to the struct is
+    /// written, accepted and checked without a second catalogue to edit
+    /// (the parity test pins that).
+    pub fn fields(&self) -> Vec<(String, String)> {
+        mapping_pairs(&serde_yaml::to_value(self).unwrap_or(serde_yaml::Value::Null))
+    }
+
+    /// The nested `probe:` section's fields, same rule.
+    pub fn probe_fields(&self) -> Vec<(String, String)> {
+        self.probe.fields()
     }
 
     /// The identity as one readable string, for error texts and history.
@@ -203,20 +225,56 @@ impl ModelCatalog {
     }
 }
 
-/// The whitelist of keys a bundle record may carry. Everything else — in
-/// particular a key, a token, a credential name or `base_url` — is a typed
-/// load error naming the offending key (REQ-MS-02 AC2, REQ-MS-08 AC1).
-const BUNDLE_KEYS: &[&str] = &[
-    "id",
-    "label",
-    "agent",
-    "driver",
-    "llm_provider",
-    "model",
-    "reasoning",
-    "probe",
-];
-const PROBE_KEYS: &[&str] = &["phrase", "timeout_ms", "fresh_secs"];
+/// The nested section of a record: its key and its own fields.
+pub const PROBE_SECTION: &str = "probe";
+
+/// The declared key vocabulary of a record, DERIVED from the struct's own
+/// serialisation — there is no second list to keep in step (the loader, the
+/// writer and the wire form all follow [`ModelBundle::fields`]). A key the
+/// struct does not carry — a token, a credential name or `base_url` — is a
+/// typed load error naming the offending key (REQ-MS-02 AC2, REQ-MS-08 AC1,
+/// REQ-MC-09).
+pub fn bundle_keys() -> Vec<String> {
+    ModelBundle::default()
+        .fields()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// The same rule for the nested probe policy.
+pub fn probe_keys() -> Vec<String> {
+    ProbePolicy::default()
+        .fields()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Serialise one value as the text the file carries.
+fn scalar_text(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(s) => Some(yaml_scalar(s)),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Null => Some("null".to_string()),
+        _ => None,
+    }
+}
+
+fn mapping_pairs(value: &serde_yaml::Value) -> Vec<(String, String)> {
+    let Some(map) = value.as_mapping() else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| {
+            let key = k.as_str()?.to_string();
+            // A nested section (the `probe:` policy) carries no scalar text
+            // of its own; it is walked as a section by its own field list.
+            Some((key, scalar_text(v).unwrap_or_default()))
+        })
+        .collect()
+}
 
 fn cfg(msg: impl Into<String>) -> StoreError {
     StoreError::ModelBundle(msg.into())
@@ -240,12 +298,7 @@ pub fn load_catalog(config_dir: &Path) -> StoreResult<ModelCatalog> {
 /// home carries `""`). The surface serves it with the snapshot and the
 /// writer compares it — the whole stale-form rule rests on ONE value.
 pub fn catalog_revision(config_dir: &Path) -> StoreResult<String> {
-    let path = config_dir.join(MODEL_CONFIG_FILE);
-    match fs::read(&path) {
-        Ok(bytes) => Ok(revision_of(&bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(cfg(format!("read {}: {e}", path.display()))),
-    }
+    Ok(catalog_edition(config_dir)?.1)
 }
 
 fn revision_of(bytes: &[u8]) -> String {
@@ -253,21 +306,25 @@ fn revision_of(bytes: &[u8]) -> String {
     crate::hex_encode(&sha2::Sha256::digest(bytes))
 }
 
-/// The current FILE TEXT (empty when absent). The update path keeps it to
-/// restore the file if the store step of an edit fails (REQ-MC-06 AC5):
-/// the operator must never be left with a new file and an old record.
-pub fn catalog_text(config_dir: &Path) -> StoreResult<String> {
+/// Read the declared file ONCE: its text and its revision. A missing file is
+/// `("", "")` — the state a form opened on an empty home carries. Every
+/// writer step takes both from this one read (R6: no second `fs::read`).
+pub fn catalog_edition(config_dir: &Path) -> StoreResult<(String, String)> {
     let path = config_dir.join(MODEL_CONFIG_FILE);
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let text = String::from_utf8(bytes.clone())
+                .map_err(|e| cfg(format!("read {}: {e}", path.display())))?;
+            Ok((text, revision_of(&bytes)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((String::new(), String::new())),
         Err(e) => Err(cfg(format!("read {}: {e}", path.display()))),
     }
 }
 
-/// Put back the exact text read by [`catalog_text`] — used ONLY to undo an
-/// edit whose later step failed. Atomic like every write here and not
-/// revision-guarded: the caller owns the rollback.
+/// Put back the exact text a write replaced (`write_catalog_with_previous`)
+/// — used ONLY to undo an edit whose later step failed. Atomic like every
+/// write here and not revision-guarded: the caller owns the rollback.
 pub fn restore_catalog_text(config_dir: &Path, text: &str) -> StoreResult<()> {
     let path = config_dir.join(MODEL_CONFIG_FILE);
     write_atomic(&path, text)
@@ -300,30 +357,55 @@ pub fn write_catalog(
     expected_revision: &str,
     edit: &CatalogEdit<'_>,
 ) -> StoreResult<String> {
+    Ok(write_catalog_with_previous(config_dir, expected_revision, edit)?.0)
+}
+
+/// One whole-file edit that ALSO hands back the text it replaced. The read
+/// that guards the revision is the SAME read the caller may need to roll a
+/// later step back — a mutation never reads `models.yaml` twice (R6).
+pub fn write_catalog_with_previous(
+    config_dir: &Path,
+    expected_revision: &str,
+    edit: &CatalogEdit<'_>,
+) -> StoreResult<(String, String)> {
     let path = config_dir.join(MODEL_CONFIG_FILE);
-    let text = catalog_text(config_dir)?;
-    let found = match fs::read(&path) {
-        Ok(bytes) => revision_of(&bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(cfg(format!("read {}: {e}", path.display()))),
-    };
-    if found != expected_revision {
+    // ONE read gives both the text to edit and the revision to guard on.
+    let (text, found) = catalog_edition(config_dir)?;
+    ensure_revision(&path, &found, expected_revision)?;
+    let mut doc = Doc::parse(&text);
+    apply_edit(&mut doc, edit, &path)?;
+    let new_text = doc.render();
+    verify_edit(&new_text, edit, &path)?;
+    write_atomic(&path, &new_text)?;
+    Ok((revision_of(new_text.as_bytes()), text))
+}
+
+/// The stale-form guard: the caller's edition must still be the one on disk
+/// (REQ-MC-06 AC6) — a form opened on another edition refuses instead of
+/// overwriting it.
+fn ensure_revision(path: &Path, found: &str, expected: &str) -> StoreResult<()> {
+    if found != expected {
         return Err(StoreError::Stale {
             file: path.display().to_string(),
-            expected: expected_revision.to_string(),
-            found,
+            expected: expected.to_string(),
+            found: found.to_string(),
         });
     }
-    let mut doc = Doc::parse(&text);
+    Ok(())
+}
+
+fn apply_edit(doc: &mut Doc, edit: &CatalogEdit<'_>, path: &Path) -> StoreResult<()> {
     match edit {
-        CatalogEdit::Upsert { bundle, must_exist } => doc.upsert(bundle, *must_exist, &path)?,
-        CatalogEdit::Remove { id } => doc.remove(id, &path)?,
+        CatalogEdit::Upsert { bundle, must_exist } => doc.upsert(bundle, *must_exist, path),
+        CatalogEdit::Remove { id } => doc.remove(id, path),
     }
-    let new_text = doc.render();
-    // The edited document must LOAD. This is the same rule set the reader
-    // uses, so a writer bug is a refusal with nothing on disk, never a home
-    // that stops opening.
-    let written = parse_bundles(&new_text, &path)?;
+}
+
+/// The edited document must LOAD with the reader's own rules, and it must
+/// carry exactly the requested change — a writer bug is a refusal with
+/// nothing on disk, never a home that stops opening.
+fn verify_edit(new_text: &str, edit: &CatalogEdit<'_>, path: &Path) -> StoreResult<()> {
+    let written = parse_bundles(new_text, path)?;
     match edit {
         CatalogEdit::Upsert { bundle, .. } => {
             if written.iter().find(|b| b.id == bundle.id) != Some(*bundle) {
@@ -343,8 +425,7 @@ pub fn write_catalog(
             }
         }
     }
-    write_atomic(&path, &new_text)?;
-    Ok(revision_of(new_text.as_bytes()))
+    Ok(())
 }
 
 /// Write `text` to `path` through a sibling temp file and a rename: a reader
@@ -428,12 +509,7 @@ impl Doc {
         out
     }
 
-    fn upsert(
-        &mut self,
-        bundle: &ModelBundle,
-        must_exist: bool,
-        path: &Path,
-    ) -> StoreResult<()> {
+    fn upsert(&mut self, bundle: &ModelBundle, must_exist: bool, path: &Path) -> StoreResult<()> {
         let (root_idx, root_indent) = self.bundles_line(path)?;
         self.normalise_bundles_line(root_idx);
         let items = self.items(root_idx, root_indent, path)?;
@@ -456,10 +532,7 @@ impl Doc {
                 self.rewrite_record(start, end, bundle);
             }
             None => {
-                let at = items
-                    .last()
-                    .map(|i| i.end)
-                    .unwrap_or(root_idx + 1);
+                let at = items.last().map(|i| i.end).unwrap_or(root_idx + 1);
                 let block = render_block(bundle);
                 for (offset, line) in block.into_iter().enumerate() {
                     self.lines.insert(at + offset, line);
@@ -472,9 +545,10 @@ impl Doc {
     fn remove(&mut self, id: &str, path: &Path) -> StoreResult<()> {
         let (root_idx, root_indent) = self.bundles_line(path)?;
         let items = self.items(root_idx, root_indent, path)?;
-        let item = items.iter().find(|i| i.id == id).ok_or_else(|| {
-            StoreError::NotFound("model bundle".into(), id.to_string())
-        })?;
+        let item = items
+            .iter()
+            .find(|i| i.id == id)
+            .ok_or_else(|| StoreError::NotFound("model bundle".into(), id.to_string()))?;
         self.lines.drain(item.start..item.end);
         Ok(())
     }
@@ -491,10 +565,7 @@ impl Doc {
         }
         if self.lines.iter().any(|l| {
             let t = l.trim();
-            !t.is_empty()
-                && !t.starts_with('#')
-                && !t.starts_with('-')
-                && !t.contains(':')
+            !t.is_empty() && !t.starts_with('#') && !t.starts_with('-') && !t.contains(':')
         }) {
             return Err(cfg(format!(
                 "{}: no `bundles:` key — the declared catalogue cannot be written",
@@ -521,6 +592,24 @@ impl Doc {
     }
 
     fn items(&self, root_idx: usize, root_indent: usize, path: &Path) -> StoreResult<Vec<Item>> {
+        let (starts, boundary) = self.item_starts(root_idx, root_indent);
+        let mut items = Vec::with_capacity(starts.len());
+        for (n, start) in starts.iter().enumerate() {
+            let end = self.item_end(&starts, n, boundary, *start);
+            let block = self.lines[*start..end].join("\n");
+            items.push(Item {
+                start: *start,
+                end,
+                id: record_id(&block, path)?,
+            });
+        }
+        Ok(items)
+    }
+
+    /// The first line of every record under `bundles:`, plus the line where
+    /// the section ends. Trailing blank/comment lines are not part of a
+    /// record, so they survive a removal.
+    fn item_starts(&self, root_idx: usize, root_indent: usize) -> (Vec<usize>, usize) {
         let mut starts: Vec<usize> = Vec::new();
         let mut item_indent: Option<usize> = None;
         let mut boundary = self.lines.len();
@@ -550,98 +639,95 @@ impl Doc {
                 Some(_) => {}
             }
         }
-        let mut items = Vec::with_capacity(starts.len());
-        for (n, start) in starts.iter().enumerate() {
-            let mut end = starts.get(n + 1).copied().unwrap_or(boundary);
-            while end > *start + 1 && self.lines[end - 1].trim().is_empty() {
-                end -= 1;
-            }
-            while end > *start + 1 && self.lines[end - 1].trim_start().starts_with('#') {
-                end -= 1;
-            }
-            let block = self.lines[*start..end].join("\n");
-            let id = record_id(&block, path)?;
-            items.push(Item {
-                start: *start,
-                end,
-                id,
-            });
+        (starts, boundary)
+    }
+
+    /// Where record `n` ends: at the next record (or the section boundary),
+    /// minus its trailing blank/comment lines.
+    fn item_end(&self, starts: &[usize], n: usize, boundary: usize, start: usize) -> usize {
+        let mut end = starts.get(n + 1).copied().unwrap_or(boundary);
+        while end > start + 1 && self.lines[end - 1].trim().is_empty() {
+            end -= 1;
         }
-        Ok(items)
+        while end > start + 1 && self.lines[end - 1].trim_start().starts_with('#') {
+            end -= 1;
+        }
+        end
     }
 
     /// Rewrite only the keys the form owns, in place. Unchanged values keep
-    /// their exact line; changed values keep their inline comment.
+    /// their exact line; changed values keep their inline comment. The key
+    /// list IS the record's own serialisation (R4/R5: one catalogue).
     fn rewrite_record(&mut self, start: usize, end: usize, b: &ModelBundle) {
         let key_indent = detect_key_indent(&self.lines, start, end);
-        let mut end = end;
-        for (key, value) in [
-            ("label", b.label.clone()),
-            ("agent", b.agent.clone()),
-            ("driver", b.driver.clone()),
-            ("llm_provider", b.llm_provider.clone()),
-            ("model", b.model.clone()),
-            ("reasoning", b.reasoning.clone()),
-        ] {
-            end = set_key(
+        let end = self.rewrite_fields(start, end, key_indent, b);
+        self.rewrite_probe(start, end, key_indent, b);
+    }
+
+    /// The record's own scalar fields. `id` is the handle and `probe` is a
+    /// section, so neither is rewritten as a scalar.
+    fn rewrite_fields(
+        &mut self,
+        start: usize,
+        mut end: usize,
+        key_indent: usize,
+        b: &ModelBundle,
+    ) -> usize {
+        for (key, value) in b.fields() {
+            if key == "id" || key == PROBE_SECTION {
+                continue;
+            }
+            end = set_key(&mut self.lines, start, end, key_indent, &key, &value);
+        }
+        end
+    }
+
+    fn rewrite_probe(&mut self, start: usize, end: usize, key_indent: usize, b: &ModelBundle) {
+        let values = b.probe_fields();
+        let Some(probe_idx) = find_key(&self.lines, start, end, key_indent, PROBE_SECTION) else {
+            self.insert_probe(end, key_indent, &values);
+            return;
+        };
+        let probe_end = self.probe_section_end(probe_idx, end, key_indent);
+        let child_indent = detect_probe_indent(&self.lines, probe_idx + 1, probe_end, key_indent);
+        let mut probe_end = probe_end;
+        for (key, value) in values {
+            probe_end = set_key(
                 &mut self.lines,
-                start,
-                end,
-                key_indent,
-                key,
-                &yaml_scalar(&value),
+                probe_idx + 1,
+                probe_end,
+                child_indent,
+                &key,
+                &value,
             );
         }
-        let (phrase, timeout, fresh) = (
-            yaml_scalar(&b.probe.phrase),
-            b.probe.timeout_ms.to_string(),
-            b.probe.fresh_secs.to_string(),
-        );
-        match find_key(&self.lines, start, end, key_indent, "probe") {
-            Some(probe_idx) => {
-                let probe_end = self
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .skip(probe_idx + 1)
-                    .take(end - probe_idx - 1)
-                    .find(|(_, l)| {
-                        !l.trim().is_empty()
-                            && !l.trim_start().starts_with('#')
-                            && indent_of(l) <= key_indent
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap_or(end);
-                let child_indent = detect_probe_indent(&self.lines, probe_idx + 1, probe_end, key_indent);
-                let mut probe_end = probe_end;
-                for (key, value) in [
-                    ("phrase", phrase),
-                    ("timeout_ms", timeout),
-                    ("fresh_secs", fresh),
-                ] {
-                    probe_end = set_key(
-                        &mut self.lines,
-                        probe_idx + 1,
-                        probe_end,
-                        child_indent,
-                        key,
-                        &value,
-                    );
-                }
-            }
-            None => {
-                let probe_indent = " ".repeat(key_indent);
-                let child = " ".repeat(key_indent + 2);
-                let block = vec![
-                    format!("{probe_indent}probe:"),
-                    format!("{child}phrase: {phrase}"),
-                    format!("{child}timeout_ms: {timeout}"),
-                    format!("{child}fresh_secs: {fresh}"),
-                ];
-                for (offset, line) in block.into_iter().enumerate() {
-                    self.lines.insert(end + offset, line);
-                }
-            }
+    }
+
+    /// The first line after `probe:` that is back at the record's own indent
+    /// (or the record's end) — the section's last line.
+    fn probe_section_end(&self, probe_idx: usize, end: usize, key_indent: usize) -> usize {
+        self.lines
+            .iter()
+            .enumerate()
+            .skip(probe_idx + 1)
+            .take(end - probe_idx - 1)
+            .find(|(_, l)| {
+                !l.trim().is_empty()
+                    && !l.trim_start().starts_with('#')
+                    && indent_of(l) <= key_indent
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(end)
+    }
+
+    fn insert_probe(&mut self, at: usize, key_indent: usize, values: &[(String, String)]) {
+        let probe_indent = " ".repeat(key_indent);
+        let child = " ".repeat(key_indent + 2);
+        self.lines
+            .insert(at, format!("{probe_indent}{PROBE_SECTION}:"));
+        for (offset, (key, value)) in values.iter().enumerate() {
+            self.lines
+                .insert(at + 1 + offset, format!("{child}{key}: {value}"));
         }
     }
 }
@@ -681,12 +767,7 @@ fn detect_key_indent(lines: &[String], start: usize, end: usize) -> usize {
     indent_of(&lines[start]) + 2
 }
 
-fn detect_probe_indent(
-    lines: &[String],
-    start: usize,
-    end: usize,
-    key_indent: usize,
-) -> usize {
+fn detect_probe_indent(lines: &[String], start: usize, end: usize, key_indent: usize) -> usize {
     for line in &lines[start..end] {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
@@ -700,13 +781,7 @@ fn detect_probe_indent(
     key_indent + 2
 }
 
-fn find_key(
-    lines: &[String],
-    start: usize,
-    end: usize,
-    indent: usize,
-    key: &str,
-) -> Option<usize> {
+fn find_key(lines: &[String], start: usize, end: usize, indent: usize, key: &str) -> Option<usize> {
     (start..end).find(|&i| {
         let line = &lines[i];
         if indent_of(line) != indent {
@@ -768,21 +843,24 @@ fn yaml_scalar(value: &str) -> String {
 }
 
 /// A fresh record in the document's own layout (two-space item indent, four
-/// space keys, six space probe children) — the factory file's shape.
+/// space keys, six space probe children) — the factory file's shape. The
+/// keys and their order come from the record's own serialisation, the same
+/// list the in-place writer walks.
 fn render_block(b: &ModelBundle) -> Vec<String> {
-    vec![
-        format!("  - id: {}", yaml_scalar(&b.id)),
-        format!("    label: {}", yaml_scalar(&b.label)),
-        format!("    agent: {}", yaml_scalar(&b.agent)),
-        format!("    driver: {}", yaml_scalar(&b.driver)),
-        format!("    llm_provider: {}", yaml_scalar(&b.llm_provider)),
-        format!("    model: {}", yaml_scalar(&b.model)),
-        format!("    reasoning: {}", yaml_scalar(&b.reasoning)),
-        "    probe:".to_string(),
-        format!("      phrase: {}", yaml_scalar(&b.probe.phrase)),
-        format!("      timeout_ms: {}", b.probe.timeout_ms),
-        format!("      fresh_secs: {}", b.probe.fresh_secs),
-    ]
+    let mut out = Vec::new();
+    for (key, value) in b.fields() {
+        if key == PROBE_SECTION {
+            out.push(format!("    {PROBE_SECTION}:"));
+            for (child, child_value) in b.probe_fields() {
+                out.push(format!("      {child}: {child_value}"));
+            }
+        } else if key == "id" {
+            out.push(format!("  - {key}: {value}"));
+        } else {
+            out.push(format!("    {key}: {value}"));
+        }
+    }
+    out
 }
 
 /// The handle a new record carries (ASM-9): lower-case latin letters,
@@ -881,28 +959,28 @@ fn parse_bundle(item: &serde_yaml::Value, idx: usize, path: &Path) -> StoreResul
 /// The white list of bundle keys: everything else — a key, a token, a
 /// credential name or `base_url` — is a typed error naming the key.
 fn check_bundle_keys(map: &serde_yaml::Mapping, idx: usize, path: &Path) -> StoreResult<()> {
-    check_keys(map, BUNDLE_KEYS, idx, None, path)
+    check_keys(map, &bundle_keys(), idx, None, path)
 }
 
 /// The white list of `probe:` keys.
 fn check_probe_keys(map: &serde_yaml::Mapping, idx: usize, path: &Path) -> StoreResult<()> {
-    let Some(probe) = map.get(serde_yaml::Value::String("probe".into())) else {
+    let Some(probe) = map.get(serde_yaml::Value::String(PROBE_SECTION.into())) else {
         return Ok(());
     };
     let probe_map = probe.as_mapping().ok_or_else(|| {
         cfg(format!(
-            "{}: bundles[{idx}].probe must be a map",
+            "{}: bundles[{idx}].{PROBE_SECTION} must be a map",
             path.display()
         ))
     })?;
-    check_keys(probe_map, PROBE_KEYS, idx, Some("probe"), path)
+    check_keys(probe_map, &probe_keys(), idx, Some(PROBE_SECTION), path)
 }
 
 /// ONE deny-by-default key check for both levels: the caller passes the
 /// white list and the section name (`None` = the record itself).
 fn check_keys(
     map: &serde_yaml::Mapping,
-    allowed: &[&str],
+    allowed: &[String],
     idx: usize,
     section: Option<&str>,
     path: &Path,
@@ -913,7 +991,7 @@ fn check_keys(
     };
     for key in map.keys() {
         let key = key.as_str().unwrap_or("");
-        if !allowed.contains(&key) {
+        if !allowed.iter().any(|a| a == key) {
             return Err(cfg(format!(
                 "{}: {where_}: unknown field `{key}` — declared fields are {}",
                 path.display(),
@@ -1296,7 +1374,10 @@ bundles:
         assert_ne!(new_rev, rev);
 
         let after = fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap();
-        assert!(after.starts_with(&before), "the earlier text must be a prefix");
+        assert!(
+            after.starts_with(&before),
+            "the earlier text must be a prefix"
+        );
         assert!(after.contains("  - id: c\n    label: C\n"));
         assert!(after.contains("# header comment: the home's own words"));
         assert!(after.contains("label: A        # inline name"));
@@ -1371,7 +1452,9 @@ bundles:
         let d = tmp();
         write(d.path(), COMMENTED);
         let rev = catalog_revision(d.path()).unwrap();
-        let other = format!("{COMMENTED}  - id: z\n    label: Z\n    agent: z\n    driver: hermes\n    reasoning: low\n");
+        let other = format!(
+            "{COMMENTED}  - id: z\n    label: Z\n    agent: z\n    driver: hermes\n    reasoning: low\n"
+        );
         write(d.path(), &other);
 
         let c = bundle("c", "C", "c-agent", "hermes", "m");
@@ -1400,5 +1483,36 @@ bundles:
         assert_eq!(bundle_id_from_label("  My   Model  "), "my-model");
         assert_eq!(bundle_id_from_label("A--B__C"), "a-b-c");
         assert_eq!(bundle_id_from_label("Связка"), "");
+    }
+
+    /// ONE field catalogue: the key whitelist, the in-place writer and the
+    /// fresh-block writer all walk the record's own serialisation, so a
+    /// field added to `ModelBundle` cannot be accepted-but-not-written (or
+    /// written-but-not-accepted). The wire form's parity is pinned in the
+    /// API tests, where the form type lives.
+    #[test]
+    fn the_key_catalogue_is_the_structs_own_field_list() {
+        let expected = [
+            "id",
+            "label",
+            "agent",
+            "driver",
+            "llm_provider",
+            "model",
+            "reasoning",
+            PROBE_SECTION,
+        ];
+        assert_eq!(bundle_keys(), expected);
+        assert_eq!(probe_keys(), ["phrase", "timeout_ms", "fresh_secs"]);
+
+        let b = bundle("p", "P", "p", "hermes", "m");
+        let written: Vec<String> = b.fields().into_iter().map(|(key, _)| key).collect();
+        assert_eq!(written, expected, "the writer walks the same list");
+
+        let rendered = render_block(&b);
+        assert!(rendered[0].starts_with("  - id: "), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l == "    probe:"), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l.starts_with("      phrase: ")));
+        assert_eq!(rendered.len(), expected.len() + probe_keys().len());
     }
 }

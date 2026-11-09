@@ -16,8 +16,8 @@ pub use bundle::{BundleManifest, ImportOutcome};
 pub use error::{StoreError, StoreResult};
 pub use models::{
     CatalogEdit, MODEL_CONFIG_FILE, ModelBundle, ModelCatalog, PROBEABLE_DRIVERS, ProbePolicy,
-    SELF_PROVIDER_DRIVER, bundle_id_from_label, catalog_revision, catalog_text, load_catalog,
-    restore_catalog_text, write_catalog,
+    SELF_PROVIDER_DRIVER, bundle_id_from_label, bundle_keys, catalog_edition, catalog_revision,
+    load_catalog, probe_keys, restore_catalog_text, write_catalog, write_catalog_with_previous,
 };
 
 /// The ONE name of the home's store file (arch/no-magic: the homes cycle

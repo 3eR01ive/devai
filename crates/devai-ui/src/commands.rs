@@ -1635,6 +1635,34 @@ mod tests {
             .collect()
     }
 
+    /// R4/R5: the form's field list is ONE chain — the file writer and the
+    /// loader derive it from the record struct (pinned in devai-store), the
+    /// wire form and the window's TS interface are pinned HERE to the same
+    /// names. A domain field added on one side alone fails this test.
+    #[test]
+    fn bundle_form_fields_are_the_same_on_the_wire_and_in_the_window() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let types_ts =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/types.ts")).unwrap();
+        let wire = serde_json::to_value(devai_api::BundleFormInput::default()).unwrap();
+
+        let mut ts_fields = ts_interface_fields(&types_ts, "BundleFormInput");
+        let mut wire_fields: Vec<String> = wire.as_object().unwrap().keys().cloned().collect();
+        ts_fields.sort();
+        wire_fields.sort();
+        assert_eq!(
+            ts_fields, wire_fields,
+            "the window's form interface and the wire form must carry the same fields"
+        );
+
+        let mut ts_probe = ts_interface_fields(&types_ts, "ProbePolicyInput");
+        let mut wire_probe: Vec<String> =
+            wire["probe"].as_object().unwrap().keys().cloned().collect();
+        ts_probe.sort();
+        wire_probe.sort();
+        assert_eq!(ts_probe, wire_probe, "the probe policy's fields must match");
+    }
+
     /// REQ-WV-04 AC1 + AC4 (mechanical half, the window-content criterion
     /// itself is T7's harness): the frontend's data door is closed over
     /// this table — EVERY `invoke("<name>")` in api.ts must

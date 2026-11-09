@@ -436,6 +436,14 @@ export interface BundleFormView {
   default_fresh_secs: number;
 }
 
+/** The probe policy — the SAME nested shape the declaration carries, so the
+ * form and the file share one field catalogue (no flat `probe_*` copies). */
+export interface ProbePolicyInput {
+  phrase: string;
+  timeout_ms: number;
+  fresh_secs: number;
+}
+
 /** The form payload — the declaration's own field names, nothing else. */
 export interface BundleFormInput {
   id: string;
@@ -445,9 +453,7 @@ export interface BundleFormInput {
   llm_provider: string;
   model: string;
   reasoning: string;
-  probe_phrase: string;
-  probe_timeout_ms: number;
-  fresh_secs: number;
+  probe: ProbePolicyInput;
   editing: boolean;
   file_revision: string;
 }
