@@ -600,16 +600,17 @@ impl LanAccess {
 }
 
 /// The two addresses of ONE invitation: the browser URL (shown as text) and
-/// the `devai://pair` link (encoded in the QR). A single producer, so the two
-/// can never carry a different token or a different machine — the constraint
-/// of REQ-QRAPP-01 is this function's shape, not a convention.
+/// the `devai://pair` link (encoded in the QR). Both come from the SAME
+/// producers in [`crate::lan::pair`], so they cannot carry a different token
+/// or a different machine — the constraint of REQ-QRAPP-01 is this function's
+/// shape, not a convention (quality return R4).
 fn invite_addresses(
     token: Option<&str>,
     addr: Option<SocketAddr>,
 ) -> (Option<String>, Option<String>) {
     match (token, addr) {
         (Some(token), Some(addr)) => (
-            Some(format!("http://{addr}/?token={token}")),
+            Some(crate::lan::pair::home_url(addr, Some(token))),
             Some(crate::lan::pair::app_link(addr, token)),
         ),
         _ => (None, None),

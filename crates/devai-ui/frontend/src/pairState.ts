@@ -63,3 +63,31 @@ export function isPairReason(value: string | null | undefined): value is PairRea
 export function pairRefusal(reason: string | null | undefined): PairRefusalView | null {
   return isPairReason(reason) ? PAIR_REFUSALS[reason] : null;
 }
+
+// ---------------------------------------------------------------------------
+// Заметки, которые приложение оставляет человеку ПОСЛЕ перехода на дом
+// ---------------------------------------------------------------------------
+// Отказ — это «не пустили»; заметка — «пустили, но вот что не сохранилось».
+// Код едет в адресе открытой страницы (`?notice=…`), поэтому заметка видна
+// уже на интерфейсе машины, а не мигает на служебной странице приложения
+// (качество: R1 — проглоченная ошибка записи дома).
+export const PAIR_NOTICES = {
+  pair_not_remembered: {
+    title: "дом не запомнится",
+    hint:
+      "Подключение работает, но адрес дома не сохранился на телефоне: при " +
+      "следующем запуске приложение его не откроет. Приглашение можно " +
+      "отсканировать снова, когда понадобится.",
+  },
+} as const;
+
+export type PairNoticeCode = keyof typeof PAIR_NOTICES;
+
+export function isPairNotice(value: string | null | undefined): value is PairNoticeCode {
+  return !!value && value in PAIR_NOTICES;
+}
+
+/// Заметка из адреса страницы; неизвестный код — не повод придумывать текст.
+export function pairNotice(code: string | null | undefined): PairRefusalView | null {
+  return isPairNotice(code) ? PAIR_NOTICES[code] : null;
+}

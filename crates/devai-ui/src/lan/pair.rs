@@ -1,12 +1,14 @@
 //! The phone side of the invitation (task 01a1bf78, REQ-QRAPP-01…07): the
 //! `devai://pair` link the QR carries, the four refusals in plain words, the
-//! same-network test and the tiny HTTP probe that tells a live session from a
-//! revoked one.
+//! same-network test and the reading of the machine's cheap health answer.
 //!
-//! Everything in this module is pure or socket-only, so the whole pairing
-//! decision — «открыть этот дом» vs «сказать человеку вот такую причину» — is
-//! unit-testable without a Tauri app, a webview or a real machine on the LAN.
-//! The mobile wiring that acts on the decision lives in [`super::deeplink`].
+//! Everything here is PURE. The question `GET /pair` itself is asked by the
+//! page (the app's window), not by this process: the project's `no-network`
+//! gate forbids outbound sockets in its own code (local-first sovereignty),
+//! and the phone's interface is a page anyway. Rust decides, the page talks —
+//! see [`super::deeplink`]. So the whole pairing decision — «открыть этот
+//! дом» vs «сказать человеку вот такую причину» — is unit-testable without a
+//! Tauri app, a webview or a real machine on the LAN.
 //!
 //! Single source of the refusal vocabulary: the codes AND the human texts are
 //! declared here once. The frontend mirror (`frontend/src/pairState.ts`) is
@@ -19,8 +21,7 @@
 // (REQ-QRAPP-08). Compiled everywhere so one test run guards both halves.
 #![allow(dead_code)]
 
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -31,11 +32,25 @@ pub const PAIR_SCHEME: &str = "devai";
 /// `devai://pair?...` — the host carries the verb, so a stray `devai://file`
 /// link can never be mistaken for a pairing offer (REQ-QRAPP-07).
 pub const PAIR_HOST: &str = "pair";
-/// One check cycle stays under five seconds (REQ-QRAPP-05 AC1); connect+read
-/// must not eat the whole cycle.
+/// How long the page may wait for the machine's one-word answer. A check cycle
+/// stays under five seconds (REQ-QRAPP-05 AC1); the question must not eat it.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-/// How often the app asks the paired machine whether the session still lives.
+/// How often the page asks the paired machine whether the session still lives.
 pub const WATCH_POLL: Duration = Duration::from_secs(3);
+
+/// The three HTTP facts `GET /pair` can carry, as constants: the status is a
+/// DOMAIN fact of the pairing (a live invitation, a dead code, a closed
+/// access), not a magic number of the transport (quality return R6).
+pub const STATUS_INVITE: u16 = 200;
+pub const STATUS_REFUSED: u16 = 401;
+pub const STATUS_CLOSED: u16 = 403;
+
+/// The `state` token of the `/pair` answer — the vocabulary the surface
+/// publishes (pinned by `the_pair_answer_states_are_declared_once`).
+pub const STATE_PAIRED: &str = "paired";
+pub const STATE_INVITE: &str = "invite";
+pub const STATE_INVALID: &str = "invalid";
+pub const STATE_CLOSED: &str = "closed";
 
 /// Why an invitation was not accepted. Every variant is a DIFFERENT sentence
 /// for the person and a different machine code (REQ-QRAPP-06): «просрочено»,
@@ -244,12 +259,37 @@ pub fn home_url(addr: SocketAddr, token: Option<&str>) -> String {
     }
 }
 
-/// Where a refusal is shown: `<base>#/pair?reason=<code>`. The base is either
-/// the machine's page (a dead NEW invitation must not close the working one,
-/// ratified Q3) or the bundled app when the machine itself is not answering.
-pub fn refusal_url(base: &str, refusal: PairRefusal) -> String {
+/// Where a refusal is shown: `<base>#/pair?reason=<code>`. The base is the
+/// machine's page while it works (a dead NEW invitation must not close the
+/// working session, ratified Q3) or the bundled app page when no home is open.
+/// `can_return` tells the page that the working home is still there, so the
+/// refusal screen offers the way back instead of guessing from the reason.
+pub fn refusal_url(base: &str, refusal: PairRefusal, can_return: bool) -> String {
+    let back = if can_return { "&return=1" } else { "" };
+    page_route(base, &format!("reason={}{back}", refusal.code()))
+}
+
+/// The screen the app shows while it is answering the invitation: the person
+/// sees that the scan was taken, instead of the app's own (unrelated) home
+/// flashing before the machine's interface opens.
+pub fn connect_url(base: &str) -> String {
+    page_route(base, "step=connect")
+}
+
+/// ONE builder of the app's own screens (`#/pair?…`): a route is never spelled
+/// twice, so the refusal and the progress screen cannot drift apart.
+fn page_route(base: &str, query: &str) -> String {
     let base = base.split('#').next().unwrap_or(base);
-    format!("{base}#/pair?reason={}", refusal.code())
+    format!("{base}#/pair?{query}")
+}
+
+/// The same address plus the one fact the page shows once (a write of the
+/// remembered home failed: the app still works now, but the next launch will
+/// not know this home — quality return R1). The notice travels in the address
+/// the window opens, so nothing is swallowed and no second channel is needed.
+pub fn with_notice(url: &str, notice: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}notice={}", encode(notice))
 }
 
 /// Whether the machine's address is in the network this phone is on. Home
@@ -274,99 +314,48 @@ pub fn same_network_addr(home: SocketAddr, local: &[Ipv4Addr]) -> bool {
     }
 }
 
-/// What `GET /pair` answered.
+/// What `GET /pair` answered. The page reports the status it read; this module
+/// names the fact. Four different sentences for the person come from four
+/// different facts (REQ-QRAPP-06 AC4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Probe {
-    /// A session cookie is valid: the phone is still paired.
-    Paired,
-    /// The presented invitation is valid and not consumed yet.
+    /// 200: the presented one-time code is valid and not consumed yet.
     Invite,
-    /// The machine answered and refused (401/403): the code/session is dead.
+    /// 401: the machine answered and refused — the code is used/replaced.
     Refused,
+    /// 403: the access is turned off on the machine.
+    Closed,
     /// No answer at all: the address is silent.
     Silent,
 }
 
-/// Ask the machine one question over plain HTTP (the LAN surface is http by
-/// design; nothing leaves the home segment). Never logs and never returns the
-/// token: the caller only sees the fact.
-pub fn probe_pair(
-    addr: SocketAddr,
-    token: Option<&str>,
-    cookie: Option<&str>,
-    timeout: Duration,
-) -> Probe {
-    let path = match token {
-        Some(token) => format!("/pair?token={}", encode(token)),
-        None => "/pair".to_string(),
-    };
-    let mut request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
-         Accept: application/json\r\n"
-    );
-    if let Some(secret) = cookie.filter(|s| !s.is_empty()) {
-        request.push_str(&format!("Cookie: devai_lan={secret}\r\n"));
-    }
-    request.push_str("\r\n");
-
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
-        return Probe::Silent;
-    };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    if stream.write_all(request.as_bytes()).is_err() {
-        return Probe::Silent;
-    }
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 1024];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                raw.extend_from_slice(&buf[..n]);
-                // The `/pair` answer is tiny; a hostile/huge answer is cut.
-                if raw.len() > 8192 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    interpret(&String::from_utf8_lossy(&raw))
-}
-
-fn interpret(raw: &str) -> Probe {
-    let head = raw.split("\r\n").next().unwrap_or("");
-    let code = head.split_whitespace().nth(1).unwrap_or("");
-    match code {
-        "200" => {
-            if raw.contains("\"state\":\"invite\"") {
-                Probe::Invite
-            } else {
-                Probe::Paired
-            }
-        }
-        "401" | "403" => Probe::Refused,
+/// The ONE reading of the machine's status. Anything but the three known
+/// answers is silence, never a guess (quality return R6: no status literals in
+/// the decision).
+pub fn probe_from_status(status: Option<u16>) -> Probe {
+    match status {
+        Some(STATUS_INVITE) => Probe::Invite,
+        Some(STATUS_REFUSED) => Probe::Refused,
+        Some(STATUS_CLOSED) => Probe::Closed,
         _ => Probe::Silent,
     }
 }
 
-/// The refusal a probe result means for an already paired phone, or `None`
-/// while the session lives (REQ-QRAPP-05).
-pub fn classify(probe: Probe, home: SocketAddr, local: &[Ipv4Addr]) -> Option<PairRefusal> {
-    match probe {
-        Probe::Paired | Probe::Invite => None,
-        Probe::Refused => Some(PairRefusal::AccessClosed),
-        Probe::Silent => Some(silence(home, local)),
-    }
+/// The address the page asks for the one-word answer. One producer, so the
+/// question and the scanned link can never disagree about the address/code
+/// shape (quality return R4).
+pub fn probe_url(addr: SocketAddr, token: &str) -> String {
+    format!("http://{addr}/pair?token={}", encode(token))
 }
 
 /// The refusal a probe result means while ACCEPTING an invitation: a refusal
-/// here is a dead code, not a revoked session (REQ-QRAPP-06 AC1).
+/// here is a dead code, not a revoked session; a closed door is named as such
+/// (REQ-QRAPP-06 AC1/AC3 — «просрочено» and «доступ закрыт» are two facts).
 pub fn classify_invite(probe: Probe, home: SocketAddr, local: &[Ipv4Addr]) -> Option<PairRefusal> {
     match probe {
-        Probe::Invite | Probe::Paired => None,
+        Probe::Invite => None,
         Probe::Refused => Some(PairRefusal::InviteExpired),
+        Probe::Closed => Some(PairRefusal::AccessClosed),
         Probe::Silent => Some(silence(home, local)),
     }
 }
@@ -393,6 +382,62 @@ struct StoredPair {
     home: String,
 }
 
+/// A failed write of the remembered home. Typed on purpose (quality return
+/// R1): the caller must be able to SAY that the address was not kept — with a
+/// code and the exact path — instead of swallowing a string. Never carries a
+/// code or a session secret, so it is safe to show and to log.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PairStoreError {
+    NoDirectory,
+    CreateDirectory { path: String, reason: String },
+    Write { path: String, reason: String },
+    Rename { path: String, reason: String },
+    Encode { reason: String },
+}
+
+impl PairStoreError {
+    /// The machine code the page and the log show for any of the steps.
+    pub const CODE: &'static str = "pair_not_remembered";
+
+    pub fn code(&self) -> &'static str {
+        Self::CODE
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            PairStoreError::NoDirectory => None,
+            PairStoreError::CreateDirectory { path, .. }
+            | PairStoreError::Write { path, .. }
+            | PairStoreError::Rename { path, .. } => Some(path),
+            PairStoreError::Encode { .. } => None,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            PairStoreError::NoDirectory => "у файла пары нет каталога".to_string(),
+            PairStoreError::CreateDirectory { path, reason } => {
+                format!("не удалось создать каталог {path}: {reason}")
+            }
+            PairStoreError::Write { path, reason } => {
+                format!("не удалось записать {path}: {reason}")
+            }
+            PairStoreError::Rename { path, reason } => {
+                format!("не удалось сохранить {path}: {reason}")
+            }
+            PairStoreError::Encode { reason } => {
+                format!("не удалось собрать запись пары: {reason}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PairStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code(), self.message())
+    }
+}
+
 impl PairStore {
     pub fn new(path: impl Into<PathBuf>) -> PairStore {
         PairStore { path: path.into() }
@@ -410,22 +455,30 @@ impl PairStore {
         parse_home_addr(&doc.home).ok()
     }
 
-    pub fn save(&self, addr: SocketAddr) -> Result<(), String> {
-        let dir = self
-            .path
-            .parent()
-            .ok_or_else(|| "у файла пары нет каталога".to_string())?;
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("не удалось создать каталог {}: {e}", dir.display()))?;
+    /// Write the remembered home. EVERY step is a typed failure (R1): a
+    /// swallowed `create_dir_all`/`write`/`rename` left the person believing
+    /// the phone would re-open the home on the next launch.
+    pub fn save(&self, addr: SocketAddr) -> Result<(), PairStoreError> {
+        let dir = self.path.parent().ok_or(PairStoreError::NoDirectory)?;
+        std::fs::create_dir_all(dir).map_err(|error| PairStoreError::CreateDirectory {
+            path: dir.display().to_string(),
+            reason: error.to_string(),
+        })?;
         let body = serde_json::to_string(&StoredPair {
             home: addr.to_string(),
         })
-        .map_err(|e| format!("не удалось собрать запись пары: {e}"))?;
+        .map_err(|error| PairStoreError::Encode {
+            reason: error.to_string(),
+        })?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)
-            .map_err(|e| format!("не удалось записать {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| format!("не удалось сохранить {}: {e}", self.path.display()))
+        std::fs::write(&tmp, body).map_err(|error| PairStoreError::Write {
+            path: tmp.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        std::fs::rename(&tmp, &self.path).map_err(|error| PairStoreError::Rename {
+            path: self.path.display().to_string(),
+            reason: error.to_string(),
+        })
     }
 
     /// Forget the previous home — its address and (through the webview's own
@@ -515,31 +568,73 @@ mod tests {
         assert!(!same_network(ip("192.168.1.20"), &[]));
     }
 
-    /// REQ-QRAPP-05/06: the three refusals come from three different facts.
+    /// REQ-QRAPP-06 AC1/AC3 + R5: the three refusals come from three
+    /// DIFFERENT facts — a used code, a turned-off access and a silent address
+    /// are not one generic «ошибка».
     #[test]
     fn the_refusal_follows_the_fact_not_a_generic_error() {
         let local = vec![ip("192.168.1.42")];
-        assert_eq!(classify(Probe::Paired, home(), &local), None);
-        assert_eq!(
-            classify(Probe::Refused, home(), &local),
-            Some(PairRefusal::AccessClosed)
-        );
-        assert_eq!(
-            classify(Probe::Silent, home(), &local),
-            Some(PairRefusal::AccessClosed),
-            "silence in the phone's own network reads as a closed door"
-        );
-        assert_eq!(
-            classify(Probe::Silent, home(), &[ip("10.0.0.9")]),
-            Some(PairRefusal::WrongNetwork)
-        );
-        // While ACCEPTING an invitation a refusal is a dead code, not a
-        // revoked session.
+        // A presented invitation that the machine refuses is SPENT/REPLACED.
         assert_eq!(
             classify_invite(Probe::Refused, home(), &local),
             Some(PairRefusal::InviteExpired)
         );
+        // A machine whose access is off is CLOSED, not «просрочено».
+        assert_eq!(
+            classify_invite(Probe::Closed, home(), &local),
+            Some(PairRefusal::AccessClosed)
+        );
+        // A live invitation: no refusal at all.
         assert_eq!(classify_invite(Probe::Invite, home(), &local), None);
+        // Silence in the phone's own network reads as a closed door; silence
+        // outside it is the wrong network.
+        assert_eq!(
+            classify_invite(Probe::Silent, home(), &local),
+            Some(PairRefusal::AccessClosed)
+        );
+        assert_eq!(
+            classify_invite(Probe::Silent, home(), &[ip("10.0.0.9")]),
+            Some(PairRefusal::WrongNetwork)
+        );
+    }
+
+    /// R6: the machine's status is read in ONE place, and only the three known
+    /// answers mean something — a proxy page, a broken answer or no answer at
+    /// all is silence, never a guessed reason.
+    #[test]
+    fn the_status_is_read_in_one_place() {
+        assert_eq!(probe_from_status(Some(STATUS_INVITE)), Probe::Invite);
+        assert_eq!(probe_from_status(Some(STATUS_REFUSED)), Probe::Refused);
+        assert_eq!(probe_from_status(Some(STATUS_CLOSED)), Probe::Closed);
+        for unknown in [Some(0), Some(204), Some(404), Some(500), None] {
+            assert_eq!(
+                probe_from_status(unknown),
+                Probe::Silent,
+                "an unknown answer is silence: {unknown:?}"
+            );
+        }
+        // The four facts are four different states, not aliases.
+        let all = [Probe::Invite, Probe::Refused, Probe::Closed, Probe::Silent];
+        assert_eq!(all.len(), 4);
+        assert!(
+            all.iter()
+                .all(|p| all.iter().filter(|q| *q == p).count() == 1)
+        );
+    }
+
+    /// R4: the question the page asks and the link the QR carries are built
+    /// from the same shape — the probe address is the machine's own `/pair`
+    /// with the same one-time code.
+    #[test]
+    fn the_probe_address_is_the_machines_own_pair_door() {
+        let url = probe_url(home(), "0123456789abcdef");
+        assert_eq!(url, "http://192.168.1.20:4567/pair?token=0123456789abcdef");
+        // The token is percent-encoded exactly like in the app link, so the
+        // two producers cannot disagree.
+        assert_eq!(
+            probe_url(home(), "a b"),
+            "http://192.168.1.20:4567/pair?token=a%20b"
+        );
     }
 
     /// The vocabulary: four different sentences and four different codes, and
@@ -571,73 +666,24 @@ mod tests {
         assert_eq!(texts.len(), PairRefusal::ALL.len(), "a text is shared");
     }
 
-    /// REQ-QRAPP-05 AC1: one check cycle is under five seconds, and the two
-    /// halves of the app poll on the SAME cycle — the phone does not keep two
-    /// different clocks.
+    /// REQ-QRAPP-05 AC1: the machine's answer must fit inside one check
+    /// cycle, and the page is given the SAME budget Rust declares — the phone
+    /// does not keep two different clocks.
     #[test]
     fn one_check_cycle_is_under_five_seconds_in_both_halves() {
         assert!(
             WATCH_POLL <= std::time::Duration::from_secs(5),
             "the check cycle must stay under five seconds"
         );
+        assert!(
+            PROBE_TIMEOUT <= WATCH_POLL,
+            "the question must fit inside one cycle"
+        );
         let mirror = frontend("frontend/src/pairing.ts");
         assert!(
             mirror.contains(&format!("PAIR_POLL_MS = {}", WATCH_POLL.as_millis())),
             "the page's cycle drifted from lan::pair::WATCH_POLL"
         );
-    }
-
-    /// The probe over a real socket: a fake machine answers, and its status is
-    /// read as the fact it is. The token/cookie travel in the request but are
-    /// never part of the answer.
-    #[test]
-    fn the_probe_reads_the_machines_answer() {
-        use std::net::TcpListener;
-
-        fn serve(answer: &'static str) -> SocketAddr {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            std::thread::spawn(move || {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buf = [0u8; 2048];
-                    let _ = stream.read(&mut buf);
-                    let _ = stream.write_all(answer.as_bytes());
-                }
-            });
-            addr
-        }
-
-        let paired = serve(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
-             {\"state\":\"paired\",\"code\":\"\"}",
-        );
-        assert_eq!(
-            probe_pair(paired, None, Some("secret"), PROBE_TIMEOUT),
-            Probe::Paired
-        );
-
-        let invite = serve(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"state\":\"invite\"}",
-        );
-        assert_eq!(
-            probe_pair(invite, Some("abc"), None, PROBE_TIMEOUT),
-            Probe::Invite
-        );
-
-        let refused = serve("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
-        assert_eq!(
-            probe_pair(refused, None, Some("stale"), PROBE_TIMEOUT),
-            Probe::Refused
-        );
-
-        // A port nobody listens on: silence, not an error text.
-        let closed = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            drop(listener);
-            addr
-        };
-        assert_eq!(probe_pair(closed, None, None, PROBE_TIMEOUT), Probe::Silent);
     }
 
     /// The remembered home is an ADDRESS and nothing else: no invitation code,
@@ -661,5 +707,105 @@ mod tests {
         // A public address can never be re-opened from the file either.
         std::fs::write(store.path(), "{\"home\":\"8.8.8.8:80\"}").unwrap();
         assert_eq!(store.load(), None);
+    }
+
+    /// R1: a write that could not happen is a TYPED, nameable fact — a code,
+    /// the path it failed on and a sentence for the person. A swallowed string
+    /// left the phone silently forgetting the home it had just paired with.
+    #[test]
+    fn a_failed_remembered_write_names_the_code_and_the_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let store = PairStore::new(blocker.join("phone-pairing.json"));
+        let error = store.save(home()).expect_err("the write cannot succeed");
+        assert_eq!(error.code(), "pair_not_remembered");
+        assert_eq!(error.code(), PairStoreError::CODE);
+        let path = error.path().expect("the failing path is named");
+        assert!(
+            path.contains("blocked"),
+            "the failure names where it failed: {path}"
+        );
+        assert!(
+            error.message().contains(&path),
+            "the sentence carries the path: {}",
+            error.message()
+        );
+        assert!(
+            error.to_string().contains("[pair_not_remembered]"),
+            "the log line leads with the code: {error}"
+        );
+        // Nothing was invented on disk.
+        assert_eq!(store.load(), None);
+        // The code the page shows is declared in ITS vocabulary, so the phone
+        // does not silently lose the notice on the way to the interface.
+        let mirror = frontend("frontend/src/pairState.ts");
+        assert!(
+            mirror.contains(PairStoreError::CODE),
+            "pairState.ts does not declare `{}`",
+            PairStoreError::CODE
+        );
+    }
+
+    /// R4: the app's own screens (`#/pair?…`) come from ONE route builder —
+    /// the progress screen and the refusal screen cannot drift apart, and a
+    /// base that already carries a hash does not accumulate a second one.
+    #[test]
+    fn the_apps_own_screens_are_built_from_one_route() {
+        let base = "http://tauri.localhost/";
+        assert_eq!(
+            connect_url(base),
+            "http://tauri.localhost/#/pair?step=connect"
+        );
+        assert_eq!(
+            refusal_url(base, PairRefusal::WrongNetwork, false),
+            "http://tauri.localhost/#/pair?reason=wrong_network"
+        );
+        assert_eq!(
+            refusal_url(
+                "http://tauri.localhost/#/tasks",
+                PairRefusal::AccessClosed,
+                false
+            ),
+            "http://tauri.localhost/#/pair?reason=access_closed"
+        );
+    }
+
+    /// R1/R4: the notice that the home was not remembered travels in the
+    /// address the window opens, and the address it decorates stays the one
+    /// producer's address (no second string builder).
+    #[test]
+    fn the_notice_is_added_to_the_page_the_app_opens() {
+        let url = home_url(home(), Some("abc"));
+        assert_eq!(url, "http://192.168.1.20:4567/?token=abc");
+        assert_eq!(
+            with_notice(&url, "pair_not_remembered"),
+            "http://192.168.1.20:4567/?token=abc&notice=pair_not_remembered"
+        );
+        // A page without a query still gets a well-formed address.
+        assert_eq!(
+            with_notice("http://192.168.1.20:4567/", "pair_not_remembered"),
+            "http://192.168.1.20:4567/?notice=pair_not_remembered"
+        );
+    }
+
+    /// REQ-QRAPP-06 AC4: the `/pair` answer vocabulary is declared ONCE, and
+    /// the surface publishes exactly those tokens.
+    #[test]
+    fn the_pair_answer_states_are_declared_once() {
+        let mut unique = vec![STATE_PAIRED, STATE_INVITE, STATE_INVALID, STATE_CLOSED];
+        assert_eq!(unique.len(), 4);
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 4, "a state token is shared");
+        let surface =
+            std::fs::read_to_string(format!("{}/src/lan/http.rs", env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+        for state in unique {
+            assert!(
+                surface.contains(&format!("STATE_{}", state.to_uppercase())),
+                "the surface does not publish `{state}`"
+            );
+        }
     }
 }

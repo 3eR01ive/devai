@@ -97,6 +97,12 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         lan::commands::lan_disable,
         lan::commands::lan_new_invite,
         lan::commands::lan_disconnect,
+        // The pairing handshake (task 01a1bf78): the app's OWN page asks what
+        // to do with a scanned link and reports what the machine answered.
+        // Window-local on purpose — the phone's `/rpc` door does not route
+        // them, so a machine page can never repoint the app.
+        lan::deeplink::pair_boot,
+        lan::deeplink::pair_report,
     ]
 }
 
@@ -161,8 +167,9 @@ pub fn run() {
                 guard.spawn(handle.clone());
             }
             // The invitation link (task 01a1bf78): a scanned `devai://pair`
-            // code opens the machine's page in THIS window — the same
-            // interface a browser gets (REQ-QRAPP-02) — and the app notices a
+            // code brings the app's own page up, the page asks the machine one
+            // question and the window opens the machine's page — the same
+            // interface a browser gets (REQ-QRAPP-02). The page also notices a
             // revoked access by itself (REQ-QRAPP-05). Desktop has no pairing
             // state at all: its flow is untouched (REQ-QRAPP-08).
             #[cfg(mobile)]

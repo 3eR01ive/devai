@@ -8,9 +8,10 @@ import {
   pairFailure,
   pairReasonForAnswer,
   probePairing,
+  readNotice,
   resetPairingForTests,
 } from "../pairing";
-import { PAIR_REASONS, pairRefusal } from "../pairState";
+import { PAIR_REASONS, pairNotice, pairRefusal } from "../pairState";
 
 function answer(status: number): typeof fetch {
   return (async () => ({ ok: status === 200, status })) as unknown as typeof fetch;
@@ -67,5 +68,17 @@ describe("сторож связи", () => {
     expect(titles).toContain("не та сеть");
     expect(titles).toContain("доступ закрыт");
     expect(pairRefusal("unknown")).toBe(null);
+  });
+
+  it("заметка о незапомненном доме читается из адреса и имеет свои слова", async () => {
+    // Код объявляет Rust (`PairStoreError::CODE`), слова — здесь.
+    expect(readNotice("?token=abc&notice=pair_not_remembered")).toBe("pair_not_remembered");
+    expect(readNotice("?token=abc")).toBe(null);
+    expect(readNotice("?notice=")).toBe(null);
+    const notice = pairNotice("pair_not_remembered");
+    expect(notice?.title).toBe("дом не запомнится");
+    expect(notice?.hint.length).toBeGreaterThan(0);
+    // Неизвестный код не превращается в выдуманное предупреждение.
+    expect(pairNotice("something_else")).toBe(null);
   });
 });
