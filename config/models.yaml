@@ -19,8 +19,10 @@
 #   probe        phrase / timeout_ms / fresh_secs — the probe policy
 #
 # Identity = (agent, driver, llm_provider, model, reasoning): a repeated id or
-# a repeated identity fails the whole load naming both records. Edit a value
-# and re-run `devai init` (the file is created once, never overwritten).
+# a repeated identity fails the whole load naming both records. The file is
+# the ONE source of truth; the window's bundle form (create/edit/delete)
+# writes it atomically after a successful probe and keeps your comments.
+# `devai init` materialises the file once and never overwrites an existing copy.
 #
 # The two factory bundles name no model on purpose: the home operator
 # declares exactly the pairs their environment can reach.

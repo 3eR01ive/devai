@@ -14,7 +14,11 @@ pub mod seed;
 
 pub use bundle::{BundleManifest, ImportOutcome};
 pub use error::{StoreError, StoreResult};
-pub use models::{MODEL_CONFIG_FILE, ModelBundle, ModelCatalog, ProbePolicy, load_catalog};
+pub use models::{
+    CatalogEdit, MODEL_CONFIG_FILE, ModelBundle, ModelCatalog, PROBEABLE_DRIVERS, ProbePolicy,
+    SELF_PROVIDER_DRIVER, bundle_id_from_label, catalog_revision, catalog_text, load_catalog,
+    restore_catalog_text, write_catalog,
+};
 
 /// The ONE name of the home's store file (arch/no-magic: the homes cycle
 /// spread this literal across api/ui consumers; every join site now reads
@@ -1519,6 +1523,23 @@ impl Store {
         Ok(previous)
     }
 
+    /// Apply a new IDENTITY to the record of an edited bundle that is in
+    /// force (task 01a1be5c, REQ-MC-03 AC3/AC4): the same verified
+    /// record+marker transaction as the switch, WITHOUT a `model.switched`
+    /// event — the caller records the EDIT itself. The marker stays on the
+    /// record; a changed agent NAME creates/updates the new record and
+    /// marks it, leaving the old one intact and unmarked (runs in flight
+    /// keep their own stamped identity).
+    pub fn apply_bundle_identity(&self, s: &BundleSwitch) -> StoreResult<Option<AgentInstance>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let previous = Self::marked_agent(&tx)?;
+        Self::upsert_switch_record(&tx, s)?;
+        Self::move_marker(&tx, &s.agent)?;
+        Self::verify_switch_record(&tx, s)?;
+        tx.commit()?;
+        Ok(previous)
+    }
+
     /// The ONE marked agent record, read on an open connection/transaction
     /// (`active_agent` serves the same predicate without one).
     fn marked_agent(conn: &Connection) -> StoreResult<Option<AgentInstance>> {
@@ -1651,15 +1672,22 @@ impl Store {
         Ok(())
     }
 
-    /// Home-level history of the bundle surface (REQ-MS-05): every probe and
-    /// every switch attempt, oldest first. These events carry NO task — the
-    /// read is not a task read and is served by one operation for both the
-    /// console and the window.
+    /// Home-level history of the bundle surface (REQ-MS-05, REQ-MC-07):
+    /// every probe, every switch attempt and every bundle create/edit/delete
+    /// attempt, oldest first. These events carry NO task — the read is not a
+    /// task read and is served by one operation for both the console and the
+    /// window.
     pub fn model_events(&self) -> StoreResult<Vec<WorkflowEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,kind,actor,payload,created_at FROM workflow_events WHERE kind IN (?1,?2) ORDER BY seq",
+            "SELECT id,task_id,kind,actor,payload,created_at FROM workflow_events WHERE kind IN (?1,?2,?3,?4,?5) ORDER BY seq",
         )?;
-        let mut rows = stmt.query(params![event_kind::MODEL_PROBE, event_kind::MODEL_SWITCHED])?;
+        let mut rows = stmt.query(params![
+            event_kind::MODEL_PROBE,
+            event_kind::MODEL_SWITCHED,
+            event_kind::MODEL_BUNDLE_CREATED,
+            event_kind::MODEL_BUNDLE_UPDATED,
+            event_kind::MODEL_BUNDLE_DELETED
+        ])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
             out.push(rows::event_from_row(r)?);

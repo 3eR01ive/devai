@@ -6,6 +6,8 @@ import type {
   ActiveSnapshot,
   Artifact,
   ArtifactContent,
+  BundleFormInput,
+  BundleMutationView,
   Decision,
   DependenciesView,
   HomeRecord,
@@ -91,6 +93,17 @@ export const api = {
     invoke<ProbeView>("model_probe", { bundle_id }),
   modelSwitch: (bundle_id: string, reason: string) =>
     invoke<SwitchResultView>("model_switch", { bundle_id, reason }),
+  // Авторская поверхность связок (REQ-MC-01..09): проверка черновика и три
+  // записи в тот же файл, который читает консоль. Payload — те же имена
+  // полей объявления, никаких ключей/адресов сервиса.
+  modelBundleCheck: (input: BundleFormInput) =>
+    invoke<ProbeView>("model_bundle_check", { input }),
+  modelBundleCreate: (input: BundleFormInput) =>
+    invoke<BundleMutationView>("model_bundle_create", { input }),
+  modelBundleUpdate: (input: BundleFormInput) =>
+    invoke<BundleMutationView>("model_bundle_update", { input }),
+  modelBundleDelete: (bundle_id: string, file_revision: string) =>
+    invoke<BundleMutationView>("model_bundle_delete", { bundle_id, file_revision }),
 
   // --- homes registry (REQ-HOME-01…09) ---
   // Чтение: home.list / home.projects_all / home.tasks_all (Read-плоскость).

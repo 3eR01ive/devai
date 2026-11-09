@@ -15,11 +15,11 @@
 
 use chrono::{Duration, Utc};
 use devai_core::types::{
-    ExecutionBundle, Id, ProbeVerdict, SwitchReason, Timestamp, WorkflowEvent, event_kind,
-    evidence_kind, json_field, new_id, status_state, switch_outcome,
+    ExecutionBundle, Id, ProbeVerdict, SwitchReason, Timestamp, WorkflowEvent, bundle_outcome,
+    event_kind, evidence_kind, json_field, new_id, status_state, switch_outcome,
 };
 use devai_store::{ModelBundle, ModelCatalog, ProbePolicy};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Api;
 use crate::error::{ApiError, ApiResult};
@@ -163,6 +163,10 @@ pub struct ModelEventView {
     pub bundle_id: Option<String>,
     pub verdict: Option<String>,
     pub outcome: Option<String>,
+    /// The operator word of `outcome` for a bundle mutation (`создана` /
+    /// `изменена` / `удалена` / `отказано`); `None` for a switch row, whose
+    /// token the surface prints as stored (REQ-MC-07).
+    pub outcome_text: Option<String>,
     pub reason: Option<String>,
     /// The operator word of `reason` (core dictionary, R3).
     pub reason_text: Option<String>,
@@ -202,6 +206,11 @@ pub struct ModelSnapshot {
     pub history: Vec<ModelEventView>,
     pub failures: Option<FailuresBanner>,
     pub running: Vec<RunningBundleRow>,
+    /// The declared file edition this snapshot was read from (REQ-MC-06
+    /// AC6): the form carries it back on save, so a stale form refuses.
+    pub file_revision: String,
+    /// The closed vocabulary the form may offer (drivers, factory policy).
+    pub form: BundleFormView,
 }
 
 /// One probe as the surface returns it.
@@ -215,6 +224,70 @@ pub struct ProbeView {
     pub exit_code: Option<i32>,
     pub output_excerpt: String,
     pub at: Timestamp,
+}
+
+/// The operator's FORM input for one bundle (task 01a1be5c, REQ-MC-01/02/03).
+/// Every field is a NAME the declaration may carry — there is no key, token,
+/// credential or base-URL field to submit, and the wire shape is
+/// deny-by-default: anything else fails deserialization NAMING the offending
+/// key (REQ-MC-09 AC2). `editing` selects the edit rules (the model may stay
+/// empty only where it already was); `file_revision` is the file edition the
+/// form was opened on (REQ-MC-06 AC6).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BundleFormInput {
+    /// The handle being edited. IGNORED on create: a new handle is derived
+    /// from the name once (ASM-9) and never changes afterwards.
+    #[serde(default)]
+    pub id: String,
+    pub label: String,
+    pub agent: String,
+    pub driver: String,
+    #[serde(default)]
+    pub llm_provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub reasoning: String,
+    pub probe_phrase: String,
+    pub probe_timeout_ms: u64,
+    pub fresh_secs: u64,
+    #[serde(default)]
+    pub editing: bool,
+    #[serde(default)]
+    pub file_revision: String,
+}
+
+/// What the form needs to be truthful about its OWN vocabulary: the drivers
+/// that may be declared (the diagnostic `mock` is absent by construction),
+/// the driver that chooses its provider itself, and the factory probe policy
+/// the form STARTS from (ASM-5: a starting value, never a substitute for an
+/// empty input).
+#[derive(Serialize, Clone, Debug)]
+pub struct BundleFormView {
+    pub drivers: Vec<String>,
+    pub self_provider_driver: String,
+    pub default_phrase: String,
+    pub default_timeout_ms: u64,
+    pub default_fresh_secs: u64,
+}
+
+/// The answer of one applied bundle mutation.
+#[derive(Serialize, Clone, Debug)]
+pub struct BundleMutationView {
+    /// `created` | `updated` | `deleted`.
+    pub outcome: String,
+    pub outcome_text: String,
+    pub bundle_id: String,
+    pub label: String,
+    /// The probe the mutation rested on (absent for a deletion).
+    pub verdict: Option<String>,
+    pub latency_ms: Option<u64>,
+    /// The edit moved the agent NAME of the record in force (runs in flight
+    /// stay on the old one).
+    pub agent_changed: bool,
+    /// The file edition written — the next form opens on it.
+    pub revision: String,
 }
 
 /// The switch answer. `outcome` is `applied` or `refused_probe`; every other
@@ -284,6 +357,17 @@ impl Api {
             failures: self.failure_banner(&status, &catalog, &history, now, active_record.as_ref()),
             history,
             running: self.running_rows()?,
+            file_revision: devai_store::catalog_revision(&self.model_config_dir())?,
+            form: BundleFormView {
+                drivers: devai_store::PROBEABLE_DRIVERS
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect(),
+                self_provider_driver: devai_store::SELF_PROVIDER_DRIVER.to_string(),
+                default_phrase: devai_core::types::DEFAULT_PROBE_PHRASE.to_string(),
+                default_timeout_ms: devai_core::types::DEFAULT_PROBE_TIMEOUT_MS,
+                default_fresh_secs: devai_core::types::DEFAULT_PROBE_FRESH_SECS,
+            },
         })
     }
 
@@ -354,7 +438,259 @@ impl Api {
     /// `model.probe` (REQ-MS-03): one real call, one event, no state change.
     pub fn model_probe(&self, id: &str) -> ApiResult<ProbeView> {
         let bundle = self.declared_bundle(id)?;
-        let record = self.run_probe(&bundle)?;
+        self.probe_view(&bundle)
+    }
+
+    /// `model.bundle_check` (REQ-MC-02): the form's «Проверить» button — one
+    /// real call over the CURRENT form values, one event, no file change.
+    /// It does NOT reserve the answer for saving: the save probes again.
+    pub fn model_bundle_check(&self, input: &BundleFormInput) -> ApiResult<ProbeView> {
+        let previous = self.form_previous(input)?;
+        let bundle = form_bundle(input, previous.as_ref())?;
+        self.probe_view(&bundle)
+    }
+
+    /// `model.bundle_create` (REQ-MC-01): validate the form, derive the
+    /// handle from the name (ASM-9), refuse a taken handle or a duplicate
+    /// identity NAMING both records, PROBE the exact values, and only on a
+    /// successful verdict write the file atomically. A refusal is recorded
+    /// as an attempt; the file is not touched.
+    pub fn model_bundle_create(&self, input: &BundleFormInput) -> ApiResult<BundleMutationView> {
+        let catalog = self.model_catalog()?;
+        let bundle = form_bundle(input, None)?;
+        if let Some(other) = catalog.get(&bundle.id) {
+            return self.refuse_bundle(
+                event_kind::MODEL_BUNDLE_CREATED,
+                &bundle,
+                "duplicate_id",
+                format!(
+                    "связку создать нельзя: идентификатор `{}` уже занят записью «{}» — выберите другое имя",
+                    bundle.id, other.label
+                ),
+                None,
+                &input.file_revision,
+            );
+        }
+        self.refuse_duplicate_identity(
+            &catalog,
+            &bundle,
+            event_kind::MODEL_BUNDLE_CREATED,
+            &input.file_revision,
+        )?;
+        let probe = self.run_probe(&bundle)?;
+        if probe.outcome.verdict != ProbeVerdict::Ok {
+            return self.refuse_bundle(
+                event_kind::MODEL_BUNDLE_CREATED,
+                &bundle,
+                "probe_refused",
+                probe_refusal_text(&bundle, &probe),
+                Some(&probe),
+                &input.file_revision,
+            );
+        }
+        let dir = self.model_config_dir();
+        let edit = devai_store::CatalogEdit::Upsert {
+            bundle: &bundle,
+            must_exist: false,
+        };
+        let revision = match devai_store::write_catalog(&dir, &input.file_revision, &edit) {
+            Ok(revision) => revision,
+            Err(e) => {
+                return self.fail_bundle(
+                    event_kind::MODEL_BUNDLE_CREATED,
+                    &bundle,
+                    None,
+                    e,
+                    Some(&probe),
+                    &input.file_revision,
+                );
+            }
+        };
+        let payload = bundle_payload(
+            &bundle,
+            bundle_outcome::CREATED,
+            Some(&probe),
+            None,
+            &revision,
+            None,
+        );
+        self.store
+            .insert_event(None, event_kind::MODEL_BUNDLE_CREATED, self.actor(), payload)
+            .map_err(|e| ApiError::at_step(BUNDLE_RECORD_STEP, e))?;
+        Ok(mutation_view(bundle_outcome::CREATED, &bundle, Some(&probe), false, revision))
+    }
+
+    /// `model.bundle_update` (REQ-MC-03): the same probe-and-write path, with
+    /// the handle fixed. When the edited record is the ONE in force and its
+    /// identity changes, the new identity is applied to the marked record
+    /// (the marker stays); a name change marks the new record and leaves the
+    /// old one unmarked. Runs in flight keep their own stored stamp.
+    pub fn model_bundle_update(&self, input: &BundleFormInput) -> ApiResult<BundleMutationView> {
+        let catalog = self.model_catalog()?;
+        let previous = self.declared_bundle(&input.id)?;
+        let bundle = form_bundle(input, Some(&previous))?;
+        self.refuse_duplicate_identity(
+            &catalog,
+            &bundle,
+            event_kind::MODEL_BUNDLE_UPDATED,
+            &input.file_revision,
+        )?;
+        let probe = self.run_probe(&bundle)?;
+        if probe.outcome.verdict != ProbeVerdict::Ok {
+            return self.refuse_bundle(
+                event_kind::MODEL_BUNDLE_UPDATED,
+                &bundle,
+                "probe_refused",
+                probe_refusal_text(&bundle, &probe),
+                Some(&probe),
+                &input.file_revision,
+            );
+        }
+        let active = self.store.active_agent()?;
+        let retarget = active.as_ref().is_some_and(|a| same_identity(a, &previous))
+            && previous.identity() != bundle.identity();
+        let agent_changed = retarget && active.as_ref().is_some_and(|a| a.name != bundle.agent);
+        let dir = self.model_config_dir();
+        let old_text = devai_store::catalog_text(&dir)?;
+        let edit = devai_store::CatalogEdit::Upsert {
+            bundle: &bundle,
+            must_exist: true,
+        };
+        let revision = match devai_store::write_catalog(&dir, &input.file_revision, &edit) {
+            Ok(revision) => revision,
+            Err(e) => {
+                return self.fail_bundle(
+                    event_kind::MODEL_BUNDLE_UPDATED,
+                    &bundle,
+                    Some(&previous),
+                    e,
+                    Some(&probe),
+                    &input.file_revision,
+                );
+            }
+        };
+        if retarget {
+            let switch = devai_store::BundleSwitch {
+                agent: bundle.agent.clone(),
+                driver: bundle.driver.clone(),
+                llm_provider: bundle.llm_provider.clone(),
+                model: bundle.model.clone(),
+                reasoning: bundle.reasoning.clone(),
+                actor: self.actor().to_string(),
+                payload: serde_json::Value::Null,
+                now: Utc::now(),
+            };
+            if let Err(e) = self.store.apply_bundle_identity(&switch) {
+                // REQ-MC-06 AC5: a failed later step leaves the FILE as it
+                // was — restore the exact previous edition and say both.
+                let restored = devai_store::restore_catalog_text(&dir, &old_text);
+                let cause = match restored {
+                    Ok(()) => ApiError::at_step(BUNDLE_RECORD_STEP, e),
+                    Err(back) => ApiError::Refused {
+                        code: crate::error::store_code(&e),
+                        message: format!(
+                            "bundle `{}` edit failed at `{BUNDLE_RECORD_STEP}`: {e}; restoring the file also failed: {back}",
+                            bundle.id
+                        ),
+                    },
+                };
+                return Err(self.record_failed_bundle(
+                    event_kind::MODEL_BUNDLE_UPDATED,
+                    &bundle,
+                    Some(&previous),
+                    "write_failed",
+                    Some(&probe),
+                    &input.file_revision,
+                    cause,
+                ));
+            }
+        }
+        let payload = bundle_payload(
+            &bundle,
+            bundle_outcome::UPDATED,
+            Some(&probe),
+            Some(&previous),
+            &revision,
+            Some(agent_changed),
+        );
+        self.store
+            .insert_event(None, event_kind::MODEL_BUNDLE_UPDATED, self.actor(), payload)
+            .map_err(|e| ApiError::at_step(BUNDLE_RECORD_STEP, e))?;
+        Ok(mutation_view(
+            bundle_outcome::UPDATED,
+            &bundle,
+            Some(&probe),
+            agent_changed,
+            revision,
+        ))
+    }
+
+    /// `model.bundle_delete` (REQ-MC-05): remove the declaration only. The
+    /// bundle IN FORCE is never removed — the refusal is typed and says
+    /// «сначала переключитесь»; agent records are untouched either way.
+    pub fn model_bundle_delete(
+        &self,
+        id: &str,
+        file_revision: &str,
+    ) -> ApiResult<BundleMutationView> {
+        let bundle = self.declared_bundle(id)?;
+        let active = self.store.active_agent()?;
+        if active.as_ref().is_some_and(|a| same_identity(a, &bundle)) {
+            return self.refuse_bundle(
+                event_kind::MODEL_BUNDLE_DELETED,
+                &bundle,
+                "active_bundle",
+                format!(
+                    "связку «{}» удалить нельзя: она действующая — сначала переключитесь на другую, затем удаляйте",
+                    bundle.label
+                ),
+                None,
+                file_revision,
+            );
+        }
+        let dir = self.model_config_dir();
+        let edit = devai_store::CatalogEdit::Remove { id: &bundle.id };
+        let revision = match devai_store::write_catalog(&dir, file_revision, &edit) {
+            Ok(revision) => revision,
+            Err(e) => {
+                return self.fail_bundle(
+                    event_kind::MODEL_BUNDLE_DELETED,
+                    &bundle,
+                    None,
+                    e,
+                    None,
+                    file_revision,
+                )
+            }
+        };
+        let payload = bundle_payload(
+            &bundle,
+            bundle_outcome::DELETED,
+            None,
+            None,
+            &revision,
+            None,
+        );
+        self.store
+            .insert_event(None, event_kind::MODEL_BUNDLE_DELETED, self.actor(), payload)
+            .map_err(|e| ApiError::at_step(BUNDLE_RECORD_STEP, e))?;
+        Ok(mutation_view(bundle_outcome::DELETED, &bundle, None, false, revision))
+    }
+
+    /// The record a form is EDITING, if any (REQ-MC-02 AC1: a create form
+    /// needs no declared record; an edit form is addressed by its handle).
+    fn form_previous(&self, input: &BundleFormInput) -> ApiResult<Option<ModelBundle>> {
+        if input.editing {
+            Ok(Some(self.declared_bundle(&input.id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// One probe + its stored fact, as the surface returns it (REQ-MC-02:
+    /// the draft probe and the declared-bundle probe share ONE path).
+    fn probe_view(&self, bundle: &ModelBundle) -> ApiResult<ProbeView> {
+        let record = self.run_probe(bundle)?;
         Ok(ProbeView {
             bundle_id: bundle.id.clone(),
             verdict: record.outcome.verdict.as_str().to_string(),
@@ -364,6 +700,113 @@ impl Api {
             output_excerpt: record.outcome.output_excerpt,
             at: record.outcome.at,
         })
+    }
+
+    /// Refuse a create/edit whose identity another record already declares,
+    /// naming BOTH records (REQ-MC-04). The attempt is recorded.
+    fn refuse_duplicate_identity(
+        &self,
+        catalog: &ModelCatalog,
+        bundle: &ModelBundle,
+        kind: &'static str,
+        revision: &str,
+    ) -> ApiResult<()> {
+        let other = catalog
+            .bundles
+            .iter()
+            .find(|b| b.id != bundle.id && b.identity() == bundle.identity());
+        let Some(other) = other else {
+            return Ok(());
+        };
+        self.refuse_bundle(
+            kind,
+            bundle,
+            "duplicate_identity",
+            format!(
+                "сохранить нельзя: «{}» и «{}» объявляют одну и ту же связку ({}) — одна идентичность, одна запись",
+                other.label,
+                bundle.label,
+                bundle.identity_text()
+            ),
+            None,
+            revision,
+        )?;
+        Ok(())
+    }
+
+    /// A refused attempt: one history fact (`refused` + the reason token) and
+    /// the typed error. The file is not touched.
+    fn refuse_bundle(
+        &self,
+        kind: &'static str,
+        bundle: &ModelBundle,
+        code: &'static str,
+        message: String,
+        probe: Option<&ProbeRecord>,
+        revision: &str,
+    ) -> ApiResult<BundleMutationView> {
+        let payload = bundle_payload(
+            bundle,
+            bundle_outcome::REFUSED,
+            probe,
+            None,
+            revision,
+            None,
+        );
+        let mut payload = payload;
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert(json_field::REASON.into(), serde_json::json!(code));
+        }
+        self.store
+            .insert_event(None, kind, self.actor(), payload)
+            .map_err(|e| ApiError::at_step(BUNDLE_RECORD_STEP, e))?;
+        Err(ApiError::refused(code, message))
+    }
+
+    /// A write that failed: the file is unchanged (the store writer refuses
+    /// before replacing anything), the refused/failed fact is recorded, and
+    /// the cause keeps its typed code (R7).
+    fn fail_bundle(
+        &self,
+        kind: &'static str,
+        bundle: &ModelBundle,
+        previous: Option<&ModelBundle>,
+        e: devai_store::StoreError,
+        probe: Option<&ProbeRecord>,
+        revision: &str,
+    ) -> ApiResult<BundleMutationView> {
+        let (code, message) = match &e {
+            devai_store::StoreError::Stale { .. } => ("stale_form", e.to_string()),
+            _ => (crate::error::store_code(&e).0, e.to_string()),
+        };
+        Err(self.record_failed_bundle(
+            kind,
+            bundle,
+            previous,
+            code,
+            probe,
+            revision,
+            ApiError::refused(code, message),
+        ))
+    }
+
+    fn record_failed_bundle(
+        &self,
+        kind: &'static str,
+        bundle: &ModelBundle,
+        previous: Option<&ModelBundle>,
+        code: &'static str,
+        probe: Option<&ProbeRecord>,
+        revision: &str,
+        cause: ApiError,
+    ) -> ApiError {
+        let mut payload =
+            bundle_payload(bundle, bundle_outcome::FAILED, probe, previous, revision, None);
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert(json_field::REASON.into(), serde_json::json!(code));
+        }
+        let _ = self.store.insert_event(None, kind, self.actor(), payload);
+        cause
     }
 
     /// `model.switch` (REQ-MS-04): probe the target, decide, and — only on
@@ -589,6 +1032,222 @@ impl Api {
             })
             .map(|b| b.id.clone())
             .next()
+    }
+}
+
+/// The store step a bundle mutation can die in, named in the `failed` fact
+/// and in the caller's error (R7: the cause is never lost).
+const BUNDLE_RECORD_STEP: &str = "record_bundle_mutation";
+
+fn invalid(field: &'static str, message: impl Into<String>) -> ApiError {
+    ApiError::InvalidInput {
+        field,
+        message: message.into(),
+    }
+}
+
+/// The record the form describes, or a refusal NAMING the field that cannot
+/// be accepted (REQ-MC-08). `previous` is `Some` for an edit: an existing
+/// empty model may stay empty (ASM-3), a declared model may not be cleared,
+/// and a CREATED bundle never lacks a model or a level. Values are trimmed —
+/// the file carries what the operator sees in the form.
+fn form_bundle(input: &BundleFormInput, previous: Option<&ModelBundle>) -> ApiResult<ModelBundle> {
+    let label = input.label.trim();
+    let agent = input.agent.trim();
+    let driver = input.driver.trim();
+    let llm_provider = input.llm_provider.trim();
+    let model = input.model.trim();
+    let reasoning = input.reasoning.trim();
+    let phrase = input.probe_phrase.trim();
+    let drivers = devai_store::PROBEABLE_DRIVERS.join(", ");
+
+    if label.is_empty() {
+        return Err(invalid(
+            "label",
+            "поле «имя связки» не заполнено — из него выводится идентификатор",
+        ));
+    }
+    if agent.is_empty() {
+        return Err(invalid(
+            "agent",
+            "поле «агент» не заполнено — связка закрепляется за записью агента",
+        ));
+    }
+    if driver.is_empty() {
+        return Err(invalid(
+            "driver",
+            format!("поле «драйвер» не заполнено — допустимые драйверы: {drivers}"),
+        ));
+    }
+    if driver == "mock" {
+        return Err(invalid(
+            "driver",
+            "диагностический драйвер `mock` не может быть связкой: у него нет сетевой проверки — допустимые драйверы: claude, hermes",
+        ));
+    }
+    if !devai_store::PROBEABLE_DRIVERS.contains(&driver) {
+        return Err(invalid(
+            "driver",
+            format!("недопустимый драйвер `{driver}` — допустимые: {drivers}"),
+        ));
+    }
+    if driver == devai_store::SELF_PROVIDER_DRIVER && !llm_provider.is_empty() {
+        return Err(invalid(
+            "llm_provider",
+            format!(
+                "драйвер `{driver}` сам выбирает LLM-провайдера — поле провайдера должно быть пустым"
+            ),
+        ));
+    }
+    match previous {
+        None if model.is_empty() => {
+            return Err(invalid(
+                "model",
+                "поле «модель» не заполнено — связка без модели не создаётся: выберите модель провайдера",
+            ));
+        }
+        Some(prev) if !prev.model.trim().is_empty() && model.is_empty() => {
+            return Err(invalid(
+                "model",
+                "поле «модель» нельзя очистить у связки, где модель объявлена — укажите другую модель",
+            ));
+        }
+        _ => {}
+    }
+    if reasoning.is_empty() {
+        return Err(invalid(
+            "reasoning",
+            "поле «уровень размышления» не заполнено — уровень — часть связки, без него прогон не начинается",
+        ));
+    }
+    if phrase.is_empty() {
+        return Err(invalid(
+            "probe.phrase",
+            "фраза пробы пуста — проба делает один короткий вызов и не может быть пустой",
+        ));
+    }
+    if input.probe_timeout_ms == 0 {
+        return Err(invalid(
+            "probe.timeout_ms",
+            "таймаут пробы должен быть больше нуля",
+        ));
+    }
+    if input.fresh_secs == 0 {
+        return Err(invalid(
+            "probe.fresh_secs",
+            "срок свежести пробы должен быть больше нуля",
+        ));
+    }
+    let id = match previous {
+        Some(prev) => prev.id.clone(),
+        None => {
+            let id = devai_store::bundle_id_from_label(label);
+            if id.is_empty() {
+                return Err(invalid(
+                    "label",
+                    "из имени не выводится идентификатор: нужны латинские буквы или цифры — выберите другое имя",
+                ));
+            }
+            id
+        }
+    };
+    Ok(ModelBundle {
+        id,
+        label: label.to_string(),
+        agent: agent.to_string(),
+        driver: driver.to_string(),
+        llm_provider: llm_provider.to_string(),
+        model: model.to_string(),
+        reasoning: reasoning.to_string(),
+        probe: ProbePolicy {
+            phrase: phrase.to_string(),
+            timeout_ms: input.probe_timeout_ms,
+            fresh_secs: input.fresh_secs,
+        },
+    })
+}
+
+fn probe_refusal_text(bundle: &ModelBundle, probe: &ProbeRecord) -> String {
+    format!(
+        "связку «{}» сохранить нельзя: проба {} ({}) — файл не изменён",
+        bundle.label,
+        probe.outcome.verdict.as_str(),
+        devai_core::types::verdict_word(probe.outcome.verdict.as_str())
+    )
+}
+
+/// A bundle identity snapshot for the history (all five fields; the handle
+/// stays the event's separate `bundle_id`).
+fn bundle_identity(b: &ModelBundle) -> serde_json::Value {
+    serde_json::json!({
+        (json_field::AGENT): b.agent,
+        (json_field::DRIVER): b.driver,
+        (json_field::LLM_PROVIDER): b.llm_provider,
+        (json_field::MODEL): b.model,
+        (json_field::REASONING): b.reasoning,
+    })
+}
+
+/// The complete bundle-mutation payload in ONE place (REQ-MC-07): identity,
+/// `from` on an edit, outcome, the file revision, and — when a probe stood
+/// behind it — the verdict, latency and the probe event's id.
+fn bundle_payload(
+    b: &ModelBundle,
+    outcome: &str,
+    probe: Option<&ProbeRecord>,
+    from: Option<&ModelBundle>,
+    revision: &str,
+    agent_changed: Option<bool>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        (json_field::BUNDLE_ID): b.id,
+        (json_field::BUNDLE): bundle_identity(b),
+        (json_field::FROM): from.map(bundle_identity).unwrap_or(serde_json::Value::Null),
+        (json_field::OUTCOME): outcome,
+        (json_field::REVISION): revision,
+    });
+    let serde_json::Value::Object(map) = &mut payload else {
+        return payload;
+    };
+    if let Some(p) = probe {
+        map.insert(
+            json_field::VERDICT.into(),
+            serde_json::json!(p.outcome.verdict.as_str()),
+        );
+        map.insert(
+            json_field::LATENCY_MS.into(),
+            serde_json::json!(p.outcome.latency_ms),
+        );
+        map.insert(
+            json_field::PROBE_EVENT.into(),
+            serde_json::json!(p.event_id.to_string()),
+        );
+    }
+    if let Some(changed) = agent_changed {
+        map.insert(
+            json_field::AGENT_CHANGED.into(),
+            serde_json::json!(changed),
+        );
+    }
+    payload
+}
+
+fn mutation_view(
+    outcome: &str,
+    b: &ModelBundle,
+    probe: Option<&ProbeRecord>,
+    agent_changed: bool,
+    revision: String,
+) -> BundleMutationView {
+    BundleMutationView {
+        outcome: outcome.to_string(),
+        outcome_text: devai_core::types::bundle_outcome_word(outcome).to_string(),
+        bundle_id: b.id.clone(),
+        label: b.label.clone(),
+        verdict: probe.map(|p| p.outcome.verdict.as_str().to_string()),
+        latency_ms: probe.map(|p| p.outcome.latency_ms),
+        agent_changed,
+        revision,
     }
 }
 
@@ -840,6 +1499,11 @@ fn record_identity(a: &devai_core::types::AgentInstance) -> serde_json::Value {
 fn event_view(e: &WorkflowEvent) -> ModelEventView {
     let p = &e.payload;
     let bundle = p.get(json_field::BUNDLE);
+    let bundle_event = is_bundle_event(&e.kind);
+    let reason = p
+        .get(json_field::REASON)
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     ModelEventView {
         at: e.created_at,
         kind: e.kind.clone(),
@@ -856,15 +1520,21 @@ fn event_view(e: &WorkflowEvent) -> ModelEventView {
             .get(json_field::OUTCOME)
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        reason: p
-            .get(json_field::REASON)
+        outcome_text: p
+            .get(json_field::OUTCOME)
             .and_then(|v| v.as_str())
+            .filter(|_| bundle_event)
+            .map(devai_core::types::bundle_outcome_word)
             .map(str::to_string),
-        reason_text: p
-            .get(json_field::REASON)
-            .and_then(|v| v.as_str())
-            .map(devai_core::types::failure_word)
-            .map(str::to_string),
+        reason_text: reason.as_deref().map(|r| {
+            if bundle_event {
+                devai_core::types::bundle_reason_word(r)
+            } else {
+                devai_core::types::failure_word(r)
+            }
+            .to_string()
+        }),
+        reason,
         latency_ms: p.get(json_field::LATENCY_MS).and_then(|v| v.as_u64()),
         from: p
             .get(json_field::FROM)
@@ -876,6 +1546,17 @@ fn event_view(e: &WorkflowEvent) -> ModelEventView {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     }
+}
+
+/// The create/edit/delete rows carry their OWN reason vocabulary
+/// (REQ-MC-04/05/07); a switch reason stays the human-chosen one.
+fn is_bundle_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        event_kind::MODEL_BUNDLE_CREATED
+            | event_kind::MODEL_BUNDLE_UPDATED
+            | event_kind::MODEL_BUNDLE_DELETED
+    )
 }
 
 impl ModelEventView {

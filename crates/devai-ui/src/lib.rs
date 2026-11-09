@@ -87,6 +87,10 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::model_snapshot,
         commands::model_probe,
         commands::model_switch,
+        commands::model_bundle_check,
+        commands::model_bundle_create,
+        commands::model_bundle_update,
+        commands::model_bundle_delete,
     ]
 }
 

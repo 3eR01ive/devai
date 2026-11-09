@@ -2,10 +2,13 @@
 //! from (task 01a1b71f, REQ-MS-01/02/08).
 //!
 //! The file is `models.yaml` of the home config tree. It is DATA: the
-//! platform reads it, never rewrites it, and the switch operation accepts
-//! only the ids it declares — there is no free-form driver/model/provider
-//! input anywhere (keys live in the environment and in the driver's own
-//! config; they are not declared, not stored and not shown).
+//! platform reads it, and writes it ONLY on the operator's explicit act in
+//! the bundle form (task 01a1be5c — create/edit/delete) — atomically, after
+//! a successful probe, keeping the operator's comments and every untouched
+//! line, and only if no other writer got there first. The switch operation
+//! accepts only the ids it declares — there is no free-form driver/model/
+//! provider input anywhere (keys live in the environment and in the driver's
+//! own config; they are not declared, not stored and not shown).
 //!
 //! Grammar (deny-by-default):
 //!
@@ -52,7 +55,7 @@ pub const MODEL_CONFIG_FILE: &str = "models.yaml";
 pub const PROBEABLE_DRIVERS: &[&str] = &["claude", "hermes"];
 
 /// The driver whose LLM-provider field must stay empty (it picks one itself).
-const SELF_PROVIDER_DRIVER: &str = "claude";
+pub const SELF_PROVIDER_DRIVER: &str = "claude";
 
 fn default_phrase() -> String {
     devai_core::types::DEFAULT_PROBE_PHRASE.into()
@@ -232,14 +235,593 @@ pub fn load_catalog(config_dir: &Path) -> StoreResult<ModelCatalog> {
     })
 }
 
+/// The revision of the declared file: the hex SHA-256 of its bytes, or the
+/// empty string when the file does not exist yet (a form opened on an empty
+/// home carries `""`). The surface serves it with the snapshot and the
+/// writer compares it — the whole stale-form rule rests on ONE value.
+pub fn catalog_revision(config_dir: &Path) -> StoreResult<String> {
+    let path = config_dir.join(MODEL_CONFIG_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(revision_of(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(cfg(format!("read {}: {e}", path.display()))),
+    }
+}
+
+fn revision_of(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    crate::hex_encode(&sha2::Sha256::digest(bytes))
+}
+
+/// The current FILE TEXT (empty when absent). The update path keeps it to
+/// restore the file if the store step of an edit fails (REQ-MC-06 AC5):
+/// the operator must never be left with a new file and an old record.
+pub fn catalog_text(config_dir: &Path) -> StoreResult<String> {
+    let path = config_dir.join(MODEL_CONFIG_FILE);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(cfg(format!("read {}: {e}", path.display()))),
+    }
+}
+
+/// Put back the exact text read by [`catalog_text`] — used ONLY to undo an
+/// edit whose later step failed. Atomic like every write here and not
+/// revision-guarded: the caller owns the rollback.
+pub fn restore_catalog_text(config_dir: &Path, text: &str) -> StoreResult<()> {
+    let path = config_dir.join(MODEL_CONFIG_FILE);
+    write_atomic(&path, text)
+}
+
+/// One whole-file edit of the declared catalogue (REQ-MC-01/03/05/06).
+pub enum CatalogEdit<'a> {
+    /// Insert a record, or replace the record carrying the same id.
+    /// `must_exist` is the create/edit distinction: a create whose id is
+    /// taken refuses, an edit of a record that vanished refuses.
+    Upsert {
+        bundle: &'a ModelBundle,
+        must_exist: bool,
+    },
+    /// Remove one record.
+    Remove { id: &'a str },
+}
+
+/// Apply `edit` to `models.yaml` and return the NEW revision.
+///
+/// The write is ATOMIC (a temp file in the same directory, then rename), the
+/// whole resulting document is re-parsed with the SAME rules as a load
+/// before anything is replaced, and the caller's `expected_revision` must
+/// still match the bytes on disk — a stale form refuses instead of
+/// overwriting another writer (REQ-MC-06). The edit is surgical: only the
+/// affected record's lines change, so the operator's comments, blank lines
+/// and untouched declarations keep their exact lines.
+pub fn write_catalog(
+    config_dir: &Path,
+    expected_revision: &str,
+    edit: &CatalogEdit<'_>,
+) -> StoreResult<String> {
+    let path = config_dir.join(MODEL_CONFIG_FILE);
+    let text = catalog_text(config_dir)?;
+    let found = match fs::read(&path) {
+        Ok(bytes) => revision_of(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(cfg(format!("read {}: {e}", path.display()))),
+    };
+    if found != expected_revision {
+        return Err(StoreError::Stale {
+            file: path.display().to_string(),
+            expected: expected_revision.to_string(),
+            found,
+        });
+    }
+    let mut doc = Doc::parse(&text);
+    match edit {
+        CatalogEdit::Upsert { bundle, must_exist } => doc.upsert(bundle, *must_exist, &path)?,
+        CatalogEdit::Remove { id } => doc.remove(id, &path)?,
+    }
+    let new_text = doc.render();
+    // The edited document must LOAD. This is the same rule set the reader
+    // uses, so a writer bug is a refusal with nothing on disk, never a home
+    // that stops opening.
+    let written = parse_bundles(&new_text, &path)?;
+    match edit {
+        CatalogEdit::Upsert { bundle, .. } => {
+            if written.iter().find(|b| b.id == bundle.id) != Some(*bundle) {
+                return Err(cfg(format!(
+                    "{}: write verification failed — the edited document does not carry bundle `{}` with the requested values; nothing was written",
+                    path.display(),
+                    bundle.id
+                )));
+            }
+        }
+        CatalogEdit::Remove { id } => {
+            if written.iter().any(|b| b.id == *id) {
+                return Err(cfg(format!(
+                    "{}: write verification failed — bundle `{id}` is still declared; nothing was written",
+                    path.display()
+                )));
+            }
+        }
+    }
+    write_atomic(&path, &new_text)?;
+    Ok(revision_of(new_text.as_bytes()))
+}
+
+/// Write `text` to `path` through a sibling temp file and a rename: a reader
+/// sees either the old or the new file, never a half-written one. A failed
+/// step removes the temp file and leaves the target untouched.
+fn write_atomic(path: &Path, text: &str) -> StoreResult<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| cfg(format!("{} has no parent directory", path.display())))?;
+    fs::create_dir_all(dir)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(MODEL_CONFIG_FILE);
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let staged = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(StoreError::Io(e));
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(StoreError::Io(e));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// The comment-preserving editor of the declared document.
+//
+// YAML values are re-serialised, but the DOCUMENT is edited line by line:
+// the record being changed keeps every untouched line, every whole-line
+// comment and every inline comment on a changed line; a new record is a
+// rendered block appended after the last one; a removed record takes its
+// own lines (and the comments INSIDE it) and nothing else. Everything here
+// is deliberately boring: the reader's own parser validates the result
+// before a single byte reaches the disk.
+// ---------------------------------------------------------------------
+
+struct Doc {
+    lines: Vec<String>,
+    eol: &'static str,
+}
+
+/// One declared record as found in the text: `[start, end)` covers its
+/// content lines; trailing blank/comment lines are NOT part of it, so they
+/// survive a removal and stay attached to whatever follows.
+struct Item {
+    start: usize,
+    end: usize,
+    id: String,
+}
+
+impl Doc {
+    fn parse(text: &str) -> Self {
+        let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
+        if lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        for l in &mut lines {
+            if let Some(stripped) = l.strip_suffix('\r') {
+                *l = stripped.to_string();
+            }
+        }
+        Self { lines, eol }
+    }
+
+    fn render(&self) -> String {
+        if self.lines.is_empty() {
+            return String::new();
+        }
+        let mut out = self.lines.join(self.eol);
+        out.push_str(self.eol);
+        out
+    }
+
+    fn upsert(
+        &mut self,
+        bundle: &ModelBundle,
+        must_exist: bool,
+        path: &Path,
+    ) -> StoreResult<()> {
+        let (root_idx, root_indent) = self.bundles_line(path)?;
+        self.normalise_bundles_line(root_idx);
+        let items = self.items(root_idx, root_indent, path)?;
+        match items.iter().find(|i| i.id == bundle.id) {
+            Some(_) if !must_exist => {
+                return Err(cfg(format!(
+                    "{}: duplicate bundle id `{}` — a record with this id already exists",
+                    path.display(),
+                    bundle.id
+                )));
+            }
+            None if must_exist => {
+                return Err(StoreError::NotFound(
+                    "model bundle".into(),
+                    bundle.id.clone(),
+                ));
+            }
+            Some(item) => {
+                let (start, end) = (item.start, item.end);
+                self.rewrite_record(start, end, bundle);
+            }
+            None => {
+                let at = items
+                    .last()
+                    .map(|i| i.end)
+                    .unwrap_or(root_idx + 1);
+                let block = render_block(bundle);
+                for (offset, line) in block.into_iter().enumerate() {
+                    self.lines.insert(at + offset, line);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, id: &str, path: &Path) -> StoreResult<()> {
+        let (root_idx, root_indent) = self.bundles_line(path)?;
+        let items = self.items(root_idx, root_indent, path)?;
+        let item = items.iter().find(|i| i.id == id).ok_or_else(|| {
+            StoreError::NotFound("model bundle".into(), id.to_string())
+        })?;
+        self.lines.drain(item.start..item.end);
+        Ok(())
+    }
+
+    /// The `bundles:` line and its indent. A document without one is not a
+    /// catalogue yet: an EMPTY home gets the key on the first write.
+    fn bundles_line(&mut self, path: &Path) -> StoreResult<(usize, usize)> {
+        if let Some(idx) = self.lines.iter().position(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.starts_with("bundles:")
+        }) {
+            let indent = indent_of(&self.lines[idx]);
+            return Ok((idx, indent));
+        }
+        if self.lines.iter().any(|l| {
+            let t = l.trim();
+            !t.is_empty()
+                && !t.starts_with('#')
+                && !t.starts_with('-')
+                && !t.contains(':')
+        }) {
+            return Err(cfg(format!(
+                "{}: no `bundles:` key — the declared catalogue cannot be written",
+                path.display()
+            )));
+        }
+        self.lines.push("bundles:".to_string());
+        Ok((self.lines.len() - 1, 0))
+    }
+
+    /// `bundles: []` and an inline comment stay valid: the key is reduced to
+    /// a plain `bundles:` before items are inserted.
+    fn normalise_bundles_line(&mut self, idx: usize) {
+        let line = &self.lines[idx];
+        let indent = indent_of(line);
+        let after = line.trim_start().trim_start_matches("bundles:");
+        let comment = after.find('#').map(|h| after[h..].trim_end().to_string());
+        let mut normalised = format!("{}{}", " ".repeat(indent), "bundles:");
+        if let Some(c) = comment {
+            normalised.push(' ');
+            normalised.push_str(&c);
+        }
+        self.lines[idx] = normalised;
+    }
+
+    fn items(&self, root_idx: usize, root_indent: usize, path: &Path) -> StoreResult<Vec<Item>> {
+        let mut starts: Vec<usize> = Vec::new();
+        let mut item_indent: Option<usize> = None;
+        let mut boundary = self.lines.len();
+        for (i, line) in self.lines.iter().enumerate().skip(root_idx + 1) {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let ind = indent_of(line);
+            if ind <= root_indent {
+                boundary = i;
+                break;
+            }
+            if !(t == "-" || t.starts_with("- ")) {
+                continue;
+            }
+            match item_indent {
+                None => {
+                    item_indent = Some(ind);
+                    starts.push(i);
+                }
+                Some(expected) if ind == expected => starts.push(i),
+                Some(expected) if ind < expected => {
+                    boundary = i;
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        let mut items = Vec::with_capacity(starts.len());
+        for (n, start) in starts.iter().enumerate() {
+            let mut end = starts.get(n + 1).copied().unwrap_or(boundary);
+            while end > *start + 1 && self.lines[end - 1].trim().is_empty() {
+                end -= 1;
+            }
+            while end > *start + 1 && self.lines[end - 1].trim_start().starts_with('#') {
+                end -= 1;
+            }
+            let block = self.lines[*start..end].join("\n");
+            let id = record_id(&block, path)?;
+            items.push(Item {
+                start: *start,
+                end,
+                id,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Rewrite only the keys the form owns, in place. Unchanged values keep
+    /// their exact line; changed values keep their inline comment.
+    fn rewrite_record(&mut self, start: usize, end: usize, b: &ModelBundle) {
+        let key_indent = detect_key_indent(&self.lines, start, end);
+        let mut end = end;
+        for (key, value) in [
+            ("label", b.label.clone()),
+            ("agent", b.agent.clone()),
+            ("driver", b.driver.clone()),
+            ("llm_provider", b.llm_provider.clone()),
+            ("model", b.model.clone()),
+            ("reasoning", b.reasoning.clone()),
+        ] {
+            end = set_key(
+                &mut self.lines,
+                start,
+                end,
+                key_indent,
+                key,
+                &yaml_scalar(&value),
+            );
+        }
+        let (phrase, timeout, fresh) = (
+            yaml_scalar(&b.probe.phrase),
+            b.probe.timeout_ms.to_string(),
+            b.probe.fresh_secs.to_string(),
+        );
+        match find_key(&self.lines, start, end, key_indent, "probe") {
+            Some(probe_idx) => {
+                let probe_end = self
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .skip(probe_idx + 1)
+                    .take(end - probe_idx - 1)
+                    .find(|(_, l)| {
+                        !l.trim().is_empty()
+                            && !l.trim_start().starts_with('#')
+                            && indent_of(l) <= key_indent
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(end);
+                let child_indent = detect_probe_indent(&self.lines, probe_idx + 1, probe_end, key_indent);
+                let mut probe_end = probe_end;
+                for (key, value) in [
+                    ("phrase", phrase),
+                    ("timeout_ms", timeout),
+                    ("fresh_secs", fresh),
+                ] {
+                    probe_end = set_key(
+                        &mut self.lines,
+                        probe_idx + 1,
+                        probe_end,
+                        child_indent,
+                        key,
+                        &value,
+                    );
+                }
+            }
+            None => {
+                let probe_indent = " ".repeat(key_indent);
+                let child = " ".repeat(key_indent + 2);
+                let block = vec![
+                    format!("{probe_indent}probe:"),
+                    format!("{child}phrase: {phrase}"),
+                    format!("{child}timeout_ms: {timeout}"),
+                    format!("{child}fresh_secs: {fresh}"),
+                ];
+                for (offset, line) in block.into_iter().enumerate() {
+                    self.lines.insert(end + offset, line);
+                }
+            }
+        }
+    }
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn record_id(block: &str, path: &Path) -> StoreResult<String> {
+    let seq: serde_yaml::Value = serde_yaml::from_str(block).map_err(|e| {
+        cfg(format!(
+            "{}: cannot read a declared record at write time: {e}",
+            path.display()
+        ))
+    })?;
+    seq.as_sequence()
+        .and_then(|s| s.first())
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            cfg(format!(
+                "{}: a declared record carries no `id` — cannot edit it",
+                path.display()
+            ))
+        })
+}
+
+fn detect_key_indent(lines: &[String], start: usize, end: usize) -> usize {
+    for line in &lines[start + 1..end] {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        return indent_of(line);
+    }
+    indent_of(&lines[start]) + 2
+}
+
+fn detect_probe_indent(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    key_indent: usize,
+) -> usize {
+    for line in &lines[start..end] {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let ind = indent_of(line);
+        if ind > key_indent {
+            return ind;
+        }
+    }
+    key_indent + 2
+}
+
+fn find_key(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    indent: usize,
+    key: &str,
+) -> Option<usize> {
+    (start..end).find(|&i| {
+        let line = &lines[i];
+        if indent_of(line) != indent {
+            return false;
+        }
+        let t = line.trim_start();
+        t.strip_prefix(key)
+            .is_some_and(|rest| rest.starts_with(':'))
+    })
+}
+
+/// Set one scalar key: an existing line keeps its indent and its inline
+/// comment, a missing key is appended at the end of the block.
+fn set_key(
+    lines: &mut Vec<String>,
+    start: usize,
+    end: usize,
+    indent: usize,
+    key: &str,
+    value: &str,
+) -> usize {
+    match find_key(lines, start, end, indent, key) {
+        Some(i) => {
+            let old = &lines[i];
+            let colon = old.find(':').unwrap_or(old.len());
+            // Keep the operator's inline comment EXACTLY — including the
+            // spacing before it — when the value on its left is rewritten.
+            let suffix = old[colon..]
+                .find('#')
+                .map(|h| {
+                    let hash = colon + h;
+                    let mut start = hash;
+                    while start > colon && old.as_bytes()[start - 1] == b' ' {
+                        start -= 1;
+                    }
+                    if start == hash {
+                        format!(" {}", &old[hash..])
+                    } else {
+                        old[start..].to_string()
+                    }
+                })
+                .unwrap_or_default();
+            lines[i] = format!("{}{key}: {value}{suffix}", " ".repeat(indent));
+            end
+        }
+        None => {
+            lines.insert(end, format!("{}{key}: {value}", " ".repeat(indent)));
+            end + 1
+        }
+    }
+}
+
+/// A YAML scalar for a value the operator typed: serde_yaml quotes it when
+/// the text would otherwise parse as another type (`true`, `20000`).
+fn yaml_scalar(value: &str) -> String {
+    serde_yaml::to_string(&serde_yaml::Value::String(value.to_string()))
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// A fresh record in the document's own layout (two-space item indent, four
+/// space keys, six space probe children) — the factory file's shape.
+fn render_block(b: &ModelBundle) -> Vec<String> {
+    vec![
+        format!("  - id: {}", yaml_scalar(&b.id)),
+        format!("    label: {}", yaml_scalar(&b.label)),
+        format!("    agent: {}", yaml_scalar(&b.agent)),
+        format!("    driver: {}", yaml_scalar(&b.driver)),
+        format!("    llm_provider: {}", yaml_scalar(&b.llm_provider)),
+        format!("    model: {}", yaml_scalar(&b.model)),
+        format!("    reasoning: {}", yaml_scalar(&b.reasoning)),
+        "    probe:".to_string(),
+        format!("      phrase: {}", yaml_scalar(&b.probe.phrase)),
+        format!("      timeout_ms: {}", b.probe.timeout_ms),
+        format!("      fresh_secs: {}", b.probe.fresh_secs),
+    ]
+}
+
+/// The handle a new record carries (ASM-9): lower-case latin letters,
+/// digits and single hyphens, derived ONCE from the operator's name and
+/// never changed afterwards. `""` means the name carries no usable latin
+/// characters — the caller refuses with «выберите другое имя».
+pub fn bundle_id_from_label(label: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in label.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            dash = false;
+        } else if matches!(c, '-' | '_' | ' ' | '.' | '·' | '/') && !out.is_empty() && !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 /// Read and parse the file into records: document shape, per-record white
 /// list, then the cross-record rules. Each failure is typed and names the
 /// file (and the index) it came from.
 fn read_bundles(path: &Path) -> StoreResult<Vec<ModelBundle>> {
     let text =
         fs::read_to_string(path).map_err(|e| cfg(format!("read {}: {e}", path.display())))?;
+    parse_bundles(&text, path)
+}
+
+/// The SAME rules as [`read_bundles`], over text in hand — the writer
+/// validates the document it is about to replace with this exact function.
+fn parse_bundles(text: &str, path: &Path) -> StoreResult<Vec<ModelBundle>> {
     let doc: serde_yaml::Value =
-        serde_yaml::from_str(&text).map_err(|e| cfg(format!("parse {}: {e}", path.display())))?;
+        serde_yaml::from_str(text).map_err(|e| cfg(format!("parse {}: {e}", path.display())))?;
     let items = declared_list(&doc, path)?;
     let mut bundles = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
@@ -271,6 +853,9 @@ fn declared_list<'a>(
         }
     }
     match mapping.get(serde_yaml::Value::String("bundles".into())) {
+        // `bundles:` with nothing under it (the shape a home that had every
+        // record deleted keeps) is an EMPTY list, not a shape error.
+        Some(serde_yaml::Value::Null) => Ok(&[]),
         Some(v) => v
             .as_sequence()
             .map(Vec::as_slice)
@@ -643,5 +1228,177 @@ bundles:
             c.for_record("hermes", "hermes", "deepseek", "deepseek-v4.1-flash", "low")
                 .is_none()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The WRITER (task 01a1be5c, REQ-MC-06): whole-file, atomic, the
+    // reader's own rules, and the operator's comments preserved.
+    // -----------------------------------------------------------------
+
+    const COMMENTED: &str = "\
+# header comment: the home's own words
+bundles:
+  # the first one
+  - id: a
+    label: A        # inline name
+    agent: a
+    driver: hermes
+    model: m
+    reasoning: high
+    probe:
+      phrase: ping
+      timeout_ms: 20000
+      fresh_secs: 900
+
+  - id: b
+    label: B
+    agent: b
+    driver: claude
+    reasoning: medium
+";
+
+    fn bundle(id: &str, label: &str, agent: &str, driver: &str, model: &str) -> ModelBundle {
+        ModelBundle {
+            id: id.into(),
+            label: label.into(),
+            agent: agent.into(),
+            driver: driver.into(),
+            llm_provider: if driver == "claude" {
+                String::new()
+            } else {
+                "deepseek".into()
+            },
+            model: model.into(),
+            reasoning: "high".into(),
+            probe: ProbePolicy::default(),
+        }
+    }
+
+    /// A create appends ONE block; the header, the whole-line comment and the
+    /// untouched records keep their exact lines (REQ-MC-06 AC2/AC3).
+    #[test]
+    fn a_create_appends_one_block_and_keeps_every_earlier_line() {
+        let d = tmp();
+        write(d.path(), COMMENTED);
+        let before = fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap();
+        let rev = catalog_revision(d.path()).unwrap();
+
+        let c = bundle("c", "C", "c-agent", "hermes", "new-model");
+        let new_rev = write_catalog(
+            d.path(),
+            &rev,
+            &CatalogEdit::Upsert {
+                bundle: &c,
+                must_exist: false,
+            },
+        )
+        .unwrap();
+        assert_ne!(new_rev, rev);
+
+        let after = fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap();
+        assert!(after.starts_with(&before), "the earlier text must be a prefix");
+        assert!(after.contains("  - id: c\n    label: C\n"));
+        assert!(after.contains("# header comment: the home's own words"));
+        assert!(after.contains("label: A        # inline name"));
+        let catalog = load_catalog(d.path()).unwrap();
+        assert_eq!(catalog.ids(), vec!["a", "b", "c"]);
+        assert_eq!(catalog.get("c").unwrap().identity(), c.identity());
+    }
+
+    /// An edit rewrites only the record's own keys: the whole-line comment
+    /// INSIDE the record survives, the inline comment on a changed line
+    /// survives, and the other record keeps its bytes (REQ-MC-06 AC2/AC3).
+    #[test]
+    fn an_edit_keeps_comments_and_the_other_records_untouched() {
+        let d = tmp();
+        write(d.path(), COMMENTED);
+        let rev = catalog_revision(d.path()).unwrap();
+        let source = fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap();
+        let b_block = source
+            .split("  - id: b")
+            .nth(1)
+            .expect("the second record is present")
+            .to_string();
+
+        let mut edited = bundle("a", "A", "a", "hermes", "m-2");
+        edited.probe.timeout_ms = 5_000;
+        write_catalog(
+            d.path(),
+            &rev,
+            &CatalogEdit::Upsert {
+                bundle: &edited,
+                must_exist: true,
+            },
+        )
+        .unwrap();
+
+        let after = fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap();
+        assert!(after.contains("# the first one"));
+        assert!(after.contains("label: A        # inline name"), "{after}");
+        assert!(after.contains("model: m-2"));
+        assert!(after.contains("timeout_ms: 5000"));
+        assert!(after.ends_with(&b_block), "the other record moved: {after}");
+        let catalog = load_catalog(d.path()).unwrap();
+        let a = catalog.get("a").unwrap();
+        assert_eq!(a.model, "m-2");
+        assert_eq!(a.probe.timeout_ms, 5_000);
+    }
+
+    /// A delete removes exactly one record and leaves a valid file — even
+    /// when the last record goes (REQ-MC-05 AC1/AC6).
+    #[test]
+    fn a_delete_removes_one_record_and_the_last_one_leaves_an_empty_list() {
+        let d = tmp();
+        write(d.path(), COMMENTED);
+        let rev = catalog_revision(d.path()).unwrap();
+        let rev = write_catalog(d.path(), &rev, &CatalogEdit::Remove { id: "a" }).unwrap();
+        let after = fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap();
+        assert!(!after.contains("id: a"));
+        assert!(after.contains("# header comment"));
+        assert_eq!(load_catalog(d.path()).unwrap().ids(), vec!["b"]);
+
+        write_catalog(d.path(), &rev, &CatalogEdit::Remove { id: "b" }).unwrap();
+        let after = fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap();
+        assert!(after.contains("bundles:"));
+        assert!(load_catalog(d.path()).unwrap().bundles.is_empty());
+        assert!(after.contains("# header comment"));
+    }
+
+    /// A stale form refuses and leaves the file BYTE-IDENTICAL (REQ-MC-06
+    /// AC1/AC6) — the other writer's edition is never overwritten.
+    #[test]
+    fn a_stale_revision_refuses_and_writes_nothing() {
+        let d = tmp();
+        write(d.path(), COMMENTED);
+        let rev = catalog_revision(d.path()).unwrap();
+        let other = format!("{COMMENTED}  - id: z\n    label: Z\n    agent: z\n    driver: hermes\n    reasoning: low\n");
+        write(d.path(), &other);
+
+        let c = bundle("c", "C", "c-agent", "hermes", "m");
+        let err = write_catalog(
+            d.path(),
+            &rev,
+            &CatalogEdit::Upsert {
+                bundle: &c,
+                must_exist: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::Stale { .. }), "{err}");
+        assert_eq!(
+            fs::read_to_string(d.path().join(MODEL_CONFIG_FILE)).unwrap(),
+            other,
+            "the file must not change on a stale form"
+        );
+    }
+
+    /// The id is derived from the name once (ASM-9): latin letters/digits,
+    /// single hyphens; nothing latin → empty (the caller refuses).
+    #[test]
+    fn the_handle_is_derived_from_the_name() {
+        assert_eq!(bundle_id_from_label("Hermes · DeepSeek"), "hermes-deepseek");
+        assert_eq!(bundle_id_from_label("  My   Model  "), "my-model");
+        assert_eq!(bundle_id_from_label("A--B__C"), "a-b-c");
+        assert_eq!(bundle_id_from_label("Связка"), "");
     }
 }

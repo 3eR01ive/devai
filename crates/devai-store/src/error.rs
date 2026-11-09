@@ -72,6 +72,19 @@ pub enum StoreError {
     #[error("config error: {0}")]
     Config(String),
 
+    /// The declared bundle file changed under an open form (task 01a1be5c,
+    /// REQ-MC-06 AC6): the writer refuses instead of overwriting another
+    /// writer's edition. `expected` is the revision the form was opened on,
+    /// `found` the one on disk at save time.
+    #[error(
+        "declared bundle file `{file}` changed since the form was opened: expected revision `{expected}`, found `{found}` — reopen the form and repeat the action; the file was not modified"
+    )]
+    Stale {
+        file: String,
+        expected: String,
+        found: String,
+    },
+
     /// The declared model-bundle allow-list (`models.yaml`) is invalid
     /// (REQ-MS-02): the message names the file, the record and the offending
     /// key/value. This is the ONLY door to a bundle — free-form driver /
