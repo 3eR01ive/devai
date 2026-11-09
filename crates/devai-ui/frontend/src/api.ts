@@ -1,7 +1,12 @@
 // Единственная дверь фронта в данные: invoke к Rust-командам devai-ui.
 // Каждая команда — ровно одна опубликованная read-операция реестра API
 // (REQ-UI-02); список команд зеркалит COMMAND_OPERATIONS в src/commands.rs.
-import { invoke } from "@tauri-apps/api/core";
+//
+// Два транспорта, ОДНА дверь (task 01a1be98, REQ-LAN-05): в окне вызов идёт
+// через Tauri IPC, на телефоне — через POST /rpc того же процесса, который
+// диспетчеризует РОВНО те же команды (src/lan.rs → dispatch_rpc). Телефон не
+// получает отдельного набора прав и отдельной реализации чтения/записи.
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
   ActiveSnapshot,
   Artifact,
@@ -10,6 +15,7 @@ import type {
   DependenciesView,
   HomeRecord,
   HomeRecordsView,
+  LanStatus,
   LivenessView,
   ModelSnapshot,
   OpDescriptor,
@@ -30,6 +36,54 @@ import type {
   WorkspaceChangesView,
   WorkspaceDiffView,
 } from "./types";
+
+// Внутри Tauri webview есть мост; в браузере телефона его нет, и дверью
+// становится HTTP-поверхность того же окна. Всё остальное (окно, а также
+// node-харнесс фронтовых тестов, где нет ни window, ни document) идёт через
+// IPC-транспорт: браузер — это именно страница с document и fetch.
+const hasTauriBridge = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const isBrowserPage =
+  typeof window !== "undefined" &&
+  typeof document !== "undefined" &&
+  typeof fetch === "function";
+const useRpc = isBrowserPage && !hasTauriBridge;
+
+/// POST /rpc: сервер уже знает сессию по HttpOnly-cookie, поэтому токена в
+/// JS нет вовсе (он живёт в адресе ровно один раз — при сканировании).
+async function rpc<T>(command: string, params?: Record<string, unknown>): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch("./rpc", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ command, params: params ?? {} }),
+    });
+  } catch {
+    // Оборванная связь — это либо «отключить» на машине, либо смена сети
+    // (REQ-LAN-08 AC2): честное сообщение вместо вечного ожидания.
+    throw {
+      code: "lan_unreachable",
+      message: "связь с машиной потеряна — доступ выключен или сменилась сеть",
+    };
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw {
+      code: "lan_unauthorized",
+      message: "доступ с телефона закрыт — откройте страницу по новому коду",
+    };
+  }
+  const body = (await response.json()) as { ok: boolean; data?: T; error?: UiError };
+  if (!body.ok || body.error) {
+    throw body.error ?? { code: "ipc", message: "пустой ответ машины" };
+  }
+  return body.data as T;
+}
+
+// Один и тот же вызов на обоих транспортах. Имя объявлено без generic-скобки:
+// тест src/commands.rs сканирует api.ts по вызовам-точкам и должен видеть
+// ровно реальные вызовы команд, а не объявление обёртки.
+const invoke = <T,>(command: string, params?: Record<string, unknown>): Promise<T> =>
+  useRpc ? rpc<T>(command, params) : tauriInvoke<T>(command, params);
 
 export const api = {
   sessionInfo: () => invoke<SessionInfo>("session_info"),
@@ -105,6 +159,15 @@ export const api = {
     invoke<HomeRecordsView<Project>[]>("projects_all", { home }),
   tasksAll: (home: string | null) =>
     invoke<HomeRecordsView<Task>[]>("tasks_all", { home }),
+
+  // --- доступ с телефона (task 01a1be98, REQ-LAN-01…09) ---
+  // Один снимок состояния + управляющие действия. Те же команды
+  // диспетчеризуются по HTTP, поэтому панель работает и на самом телефоне.
+  lanStatus: () => invoke<LanStatus>("lan_status"),
+  lanEnable: () => invoke<LanStatus>("lan_enable"),
+  lanDisable: () => invoke<LanStatus>("lan_disable"),
+  lanNewInvite: () => invoke<LanStatus>("lan_new_invite"),
+  lanDisconnect: (id: string) => invoke<LanStatus>("lan_disconnect", { id }),
 };
 
 export function toUiError(e: unknown): UiError {

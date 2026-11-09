@@ -58,6 +58,7 @@ onUnmounted(() => {
         </RouterLink>
         <RouterLink to="/homes">Дома</RouterLink>
         <RouterLink to="/models">Связка модели</RouterLink>
+        <RouterLink to="/lan">Телефон</RouterLink>
         <RouterLink to="/ops">Операции API</RouterLink>
       </nav>
       <div class="statusbar" v-if="session">

@@ -45,6 +45,10 @@ pub struct AppState {
     pub api: std::sync::Mutex<Api>,
     pub homes: std::sync::Mutex<devai_api::Homes>,
     pub session: std::sync::Mutex<SessionInfo>,
+    /// LAN access to the phone (task 01a1be98): the access state machine,
+    /// the one-time invitations and the paired sessions. Shared with the
+    /// HTTP server thread, so the window and the phone read ONE state.
+    pub lan: std::sync::Arc<crate::lan::LanAccess>,
 }
 
 impl AppState {
@@ -427,6 +431,18 @@ pub const COMMAND_REGISTRY_OPERATIONS: &[(&str, &str)] = &[
     ("homes_activate", "home.activate"),
 ];
 
+/// The LAN controls (task 01a1be98): they manage the phone ACCESS, not domain
+/// data — no registry operation stands behind them. They are still the
+/// window's own commands and are dispatched to the SAME functions over HTTP.
+#[allow(dead_code)] // consumed by the frontend-parity test below
+pub const LAN_COMMANDS: &[&str] = &[
+    "lan_status",
+    "lan_enable",
+    "lan_disable",
+    "lan_new_invite",
+    "lan_disconnect",
+];
+
 // ---------------------------------------------------------------------
 // session / registry
 // ---------------------------------------------------------------------
@@ -721,9 +737,26 @@ pub fn task_approve(
     id_prefix: String,
     rationale: Option<String>,
 ) -> Result<SignatureView, UiError> {
+    task_approve_as(state, id_prefix, rationale, None)
+}
+
+/// The SAME signature act, recorded under an explicit actor. The LAN boundary
+/// passes `<operator> · телефон: …` here so history names the device while
+/// the person stays the author (REQ-LAN-06); the window passes `None` and the
+/// session actor is used unchanged. One write path — `Api::open` on the same
+/// home — for both surfaces.
+pub fn task_approve_as(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+    actor: Option<String>,
+) -> Result<SignatureView, UiError> {
     let (home, actor) = {
         let info = state.session();
-        (info.home.clone(), info.actor.clone())
+        (
+            info.home.clone(),
+            actor.unwrap_or_else(|| info.actor.clone()),
+        )
     };
     let write = state.write_api(&home, &actor)?;
     write.task_approve(&id_prefix, rationale)?;
@@ -741,9 +774,22 @@ pub fn task_reject(
     id_prefix: String,
     rationale: Option<String>,
 ) -> Result<SignatureView, UiError> {
+    task_reject_as(state, id_prefix, rationale, None)
+}
+
+/// The rejection twin of `task_approve_as`: same act, explicit actor.
+pub fn task_reject_as(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+    actor: Option<String>,
+) -> Result<SignatureView, UiError> {
     let (home, actor) = {
         let info = state.session();
-        (info.home.clone(), info.actor.clone())
+        (
+            info.home.clone(),
+            actor.unwrap_or_else(|| info.actor.clone()),
+        )
     };
     let write = state.write_api(&home, &actor)?;
     write.task_reject(&id_prefix, rationale)?;
@@ -913,9 +959,18 @@ pub fn model_probe(
     state: State<AppState>,
     bundle_id: String,
 ) -> Result<devai_api::ProbeView, UiError> {
+    model_probe_as(state, bundle_id, None)
+}
+
+/// The same probe under an explicit actor (LAN device marker, REQ-LAN-06).
+pub fn model_probe_as(
+    state: State<AppState>,
+    bundle_id: String,
+    actor: Option<String>,
+) -> Result<devai_api::ProbeView, UiError> {
     let (home, actor) = {
         let s = state.session();
-        (s.home.clone(), s.actor.clone())
+        (s.home.clone(), actor.unwrap_or_else(|| s.actor.clone()))
     };
     let api = state.write_api(&home, &actor)?;
     Ok(api.model_probe(&bundle_id)?)
@@ -932,9 +987,19 @@ pub fn model_switch(
     bundle_id: String,
     reason: String,
 ) -> Result<devai_api::SwitchResultView, UiError> {
+    model_switch_as(state, bundle_id, reason, None)
+}
+
+/// The same switch under an explicit actor (LAN device marker, REQ-LAN-06).
+pub fn model_switch_as(
+    state: State<AppState>,
+    bundle_id: String,
+    reason: String,
+    actor: Option<String>,
+) -> Result<devai_api::SwitchResultView, UiError> {
     let (home, actor) = {
         let s = state.session();
-        (s.home.clone(), s.actor.clone())
+        (s.home.clone(), actor.unwrap_or_else(|| s.actor.clone()))
     };
     let api = state.write_api(&home, &actor)?;
     Ok(api.model_switch(&bundle_id, &reason)?)
@@ -1123,11 +1188,296 @@ fn spec_of(task: &Task, facts: &SpecFacts) -> SpecPresentation {
     }
 }
 
+// ---------------------------------------------------------------------
+// LAN access from the phone (task 01a1be98, REQ-LAN-01…10)
+// ---------------------------------------------------------------------
+
+/// The window's one-button switch over the phone access. The state comes
+/// from the live server, never from a request flag (REQ-LAN-01 AC4).
+#[tauri::command]
+pub fn lan_status(state: State<AppState>) -> crate::lan::LanStatus {
+    state.lan.status()
+}
+
+/// «включить»: bind the machine's home-segment address and start serving.
+/// A refusal (no address, port taken) leaves the window honestly «выключен»
+/// with the reason (REQ-LAN-01 AC5).
+#[tauri::command]
+pub fn lan_enable(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> Result<crate::lan::LanStatus, UiError> {
+    crate::lan::start_access(app, state.lan.clone())
+}
+
+/// «отключить»: state off immediately, every session revoked, the listener
+/// asked to stop — the next request from the phone is refused (REQ-LAN-04
+/// AC6, REQ-LAN-09 AC4).
+#[tauri::command]
+pub fn lan_disable(state: State<AppState>) -> crate::lan::LanStatus {
+    crate::lan::stop_access(&state.lan)
+}
+
+/// Issue a fresh one-time invitation. The PREVIOUS invitation is retired;
+/// already paired phones stay connected (ratified Q2 «может», REQ-LAN-04).
+#[tauri::command]
+pub fn lan_new_invite(state: State<AppState>) -> Result<crate::lan::LanStatus, UiError> {
+    state.lan.new_invite()?;
+    Ok(state.lan.status())
+}
+
+/// Disconnect ONE paired device by the session id the status published.
+#[tauri::command(rename_all = "snake_case")]
+pub fn lan_disconnect(state: State<AppState>, id: String) -> crate::lan::LanStatus {
+    state.lan.disconnect(&id);
+    state.lan.status()
+}
+
+/// The command plane the phone may reach. It mirrors the window exactly:
+/// every name here is a `#[tauri::command]` of this module, and the HTTP
+/// dispatcher below has one arm per name. A name added here without the arm
+/// (or vice versa) fails `rpc_commands_are_registered_and_dispatched`.
+#[allow(dead_code)] // consumed by the dispatch-parity test below
+pub fn commands_for_rpc() -> &'static [&'static str] {
+    &[
+        "session_info",
+        "registry_operations",
+        "homes_list",
+        "homes_add",
+        "homes_set_enabled",
+        "homes_activate",
+        "projects_all",
+        "tasks_all",
+        "projects_list",
+        "projects_get",
+        "tasks_list",
+        "task_get",
+        "task_status",
+        "task_signature",
+        "task_approve",
+        "task_reject",
+        "task_progress",
+        "task_dependencies",
+        "task_report",
+        "task_events",
+        "task_decisions",
+        "task_active",
+        "task_workspace_changes",
+        "task_workspace_diff",
+        "artifacts_list",
+        "artifact_content",
+        "questions_list",
+        "executions_list",
+        "execution_liveness",
+        "inbox_view",
+        "model_snapshot",
+        "model_probe",
+        "model_switch",
+        "lan_status",
+        "lan_enable",
+        "lan_disable",
+        "lan_new_invite",
+        "lan_disconnect",
+    ]
+}
+
+fn to_json<T: Serialize>(value: T) -> Result<serde_json::Value, UiError> {
+    serde_json::to_value(value).map_err(|e| UiError {
+        code: "ipc".into(),
+        message: format!("не удалось сериализовать ответ: {e}"),
+    })
+}
+
+fn p_str(params: &serde_json::Value, key: &str) -> Result<String, UiError> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| UiError {
+            code: "ipc".into(),
+            message: format!("в запросе нет строкового поля `{key}`"),
+        })
+}
+
+fn p_opt_str(params: &serde_json::Value, key: &str) -> Option<String> {
+    params.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn p_bool(params: &serde_json::Value, key: &str) -> Result<bool, UiError> {
+    params
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| UiError {
+            code: "ipc".into(),
+            message: format!("в запросе нет булева поля `{key}`"),
+        })
+}
+
+fn p_opt_usize(params: &serde_json::Value, key: &str) -> Option<usize> {
+    params.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
+}
+
+/// The LAN write actor: the operator stays the author, the device suffix
+/// only names the source (REQ-LAN-06 AC1-3).
+fn lan_actor(app: &tauri::AppHandle, device: &crate::lan::DeviceClaim) -> String {
+    use tauri::Manager;
+    let base = app.state::<AppState>().session().actor.clone();
+    crate::lan::actor_marker(&base, device)
+}
+
+/// One door from HTTP to the SAME command functions (REQ-LAN-05): the phone
+/// gets the window's surface, not a re-implementation of it. Writes carry the
+/// device marker; reads are untouched and stay observational (REQ-LAN-10).
+pub fn dispatch_rpc(
+    app: &tauri::AppHandle,
+    device: &crate::lan::DeviceClaim,
+    command: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    use tauri::Manager;
+    macro_rules! st {
+        () => {
+            app.state::<AppState>()
+        };
+    }
+    match command {
+        "session_info" => to_json(session_info(st!())),
+        "registry_operations" => to_json(registry_operations(st!())?),
+        "homes_list" => to_json(homes_list(st!())?),
+        "homes_add" => to_json(homes_add(st!(), p_str(params, "path")?)?),
+        "homes_set_enabled" => to_json(homes_set_enabled(
+            st!(),
+            p_str(params, "path")?,
+            p_bool(params, "enabled")?,
+        )?),
+        "homes_activate" => to_json(homes_activate(st!(), p_str(params, "path")?)?),
+        "projects_all" => to_json(projects_all(st!(), p_opt_str(params, "home"))?),
+        "tasks_all" => to_json(tasks_all(st!(), p_opt_str(params, "home"))?),
+        "projects_list" => to_json(projects_list(st!())?),
+        "projects_get" => to_json(projects_get(st!(), p_str(params, "id_or_name")?)?),
+        "tasks_list" => to_json(tasks_list(st!())?),
+        "task_get" => to_json(task_get(st!(), p_str(params, "id_prefix")?)?),
+        "task_status" => to_json(task_status(st!(), p_str(params, "id_prefix")?)?),
+        "task_signature" => to_json(task_signature(st!(), p_str(params, "id_prefix")?)?),
+        "task_approve" => to_json(task_approve_as(
+            st!(),
+            p_str(params, "id_prefix")?,
+            p_opt_str(params, "rationale"),
+            Some(lan_actor(app, device)),
+        )?),
+        "task_reject" => to_json(task_reject_as(
+            st!(),
+            p_str(params, "id_prefix")?,
+            p_opt_str(params, "rationale"),
+            Some(lan_actor(app, device)),
+        )?),
+        "task_progress" => to_json(task_progress(st!(), p_str(params, "id_prefix")?)?),
+        "task_dependencies" => to_json(task_dependencies(st!(), p_str(params, "id_prefix")?)?),
+        "task_report" => to_json(task_report(st!(), p_str(params, "id_prefix")?)?),
+        "task_events" => to_json(task_events(
+            st!(),
+            p_str(params, "id_prefix")?,
+            p_opt_usize(params, "limit"),
+        )?),
+        "task_decisions" => to_json(task_decisions(st!(), p_str(params, "id_prefix")?)?),
+        "task_active" => to_json(task_active(st!())?),
+        "task_workspace_changes" => {
+            to_json(task_workspace_changes(st!(), p_str(params, "id_prefix")?)?)
+        }
+        "task_workspace_diff" => to_json(task_workspace_diff(
+            st!(),
+            p_str(params, "id_prefix")?,
+            p_str(params, "path")?,
+        )?),
+        "artifacts_list" => to_json(artifacts_list(st!(), p_str(params, "id_prefix")?)?),
+        "artifact_content" => to_json(artifact_content(st!(), p_str(params, "artifact_id")?)?),
+        "questions_list" => to_json(questions_list(st!(), p_str(params, "id_prefix")?)?),
+        "executions_list" => to_json(executions_list(st!(), p_opt_str(params, "task_ref"))?),
+        "execution_liveness" => to_json(execution_liveness(st!(), p_str(params, "exec_id")?)?),
+        "inbox_view" => to_json(inbox_view(st!())?),
+        "model_snapshot" => to_json(model_snapshot(st!())?),
+        "model_probe" => to_json(model_probe_as(
+            st!(),
+            p_str(params, "bundle_id")?,
+            Some(lan_actor(app, device)),
+        )?),
+        "model_switch" => to_json(model_switch_as(
+            st!(),
+            p_str(params, "bundle_id")?,
+            p_str(params, "reason")?,
+            Some(lan_actor(app, device)),
+        )?),
+        "lan_status" => to_json(lan_status(st!())),
+        "lan_enable" => to_json(lan_enable(app.clone(), st!())?),
+        "lan_disable" => to_json(lan_disable(st!())),
+        "lan_new_invite" => to_json(lan_new_invite(st!())?),
+        "lan_disconnect" => to_json(lan_disconnect(st!(), p_str(params, "id")?)),
+        other => Err(UiError {
+            code: "unknown_command".into(),
+            message: format!("команда `{other}` не доступна с телефона"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use devai_api::ParagraphSource;
     use devai_core::types::ArtifactKind;
+
+    /// Task 01a1be98 (REQ-LAN-05): the phone reaches the window's command
+    /// plane through ONE dispatch table. Every routed name must be (a) a
+    /// registered Tauri command and (b) an actual match arm — so a command
+    /// added to the window cannot silently stay unreachable from the phone,
+    /// and a routed name cannot point at nothing.
+    #[test]
+    fn rpc_commands_are_registered_and_dispatched() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let lib_rs = std::fs::read_to_string(format!("{crate_dir}/src/lib.rs")).unwrap();
+        let source = std::fs::read_to_string(format!("{crate_dir}/src/commands.rs")).unwrap();
+        assert!(!commands_for_rpc().is_empty());
+        for name in commands_for_rpc() {
+            assert!(
+                lib_rs.contains(&format!("commands::{name},")),
+                "`{name}` is routed over the LAN but not registered in the invoke handler"
+            );
+            assert!(
+                source.contains(&format!("\"{name}\" =>")),
+                "`{name}` is listed as routable but has no dispatch arm"
+            );
+        }
+        // The LAN-only controls are part of the same plane.
+        for name in [
+            "lan_status",
+            "lan_enable",
+            "lan_disable",
+            "lan_new_invite",
+            "lan_disconnect",
+        ] {
+            assert!(
+                commands_for_rpc().contains(&name),
+                "`{name}` must be routable"
+            );
+        }
+        // The other direction: no registered command may stay unreachable
+        // from the phone (REQ-LAN-05 AC1: the whole surface is available).
+        let start = lib_rs
+            .find("tauri::generate_handler![")
+            .expect("the handler registration moved");
+        let block = &lib_rs[start..];
+        let block = &block[..block.find(']').expect("unterminated handler list")];
+        let mut rest = block;
+        while let Some(i) = rest.find("commands::") {
+            rest = &rest[i + "commands::".len()..];
+            let end = rest.find(',').unwrap_or(rest.len());
+            let name = rest[..end].trim().to_string();
+            assert!(
+                commands_for_rpc().contains(&name.as_str()),
+                "`{name}` is registered in the window but not reachable from the phone"
+            );
+            rest = &rest[end..];
+        }
+    }
 
     /// REQ-SIGN-05 AC4 / REQ-MS-07: every data command's source is a
     /// published registry entry. The data plane stays Read-only; the ONLY
@@ -1604,7 +1954,8 @@ mod tests {
                 continue;
             }
             let mapped = COMMAND_OPERATIONS.iter().any(|(c, _)| *c == name)
-                || COMMAND_REGISTRY_OPERATIONS.iter().any(|(c, _)| *c == name);
+                || COMMAND_REGISTRY_OPERATIONS.iter().any(|(c, _)| *c == name)
+                || LAN_COMMANDS.contains(&name.as_str());
             assert!(
                 mapped,
                 "api.ts invokes `{name}` with no COMMAND_OPERATIONS/COMMAND_REGISTRY_OPERATIONS mapping"

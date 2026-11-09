@@ -689,3 +689,31 @@ export interface WorkspaceDiffView {
   diff: string | null;
   note: string | null;
 }
+
+// --- доступ с телефона (task 01a1be98, REQ-LAN-01…09) ---
+
+// Одно подключённое устройство. `id` — идентификатор сессии (по нему окно
+// может отключить ОДИН телефон), `live` — был ли контакт за последнюю минуту
+// (ratified Q5); сама сессия при молчании не рвётся (ratified Q3).
+export interface LanDevice {
+  id: string;
+  name: string;
+  addr: string;
+  connected_at: string;
+  last_seen: string;
+  live: boolean;
+}
+
+// Фактическое состояние доступа. `state` — не намерение, а факт:
+// off | awaiting (сервер поднят, телефон ещё не подключён) | connected.
+export interface LanStatus {
+  state: "off" | "awaiting" | "connected";
+  address: string | null;
+  url: string | null;
+  token: string | null;
+  qr_svg: string | null;
+  reason_code: string | null;
+  reason: string | null;
+  devices: LanDevice[];
+  started_at: string | null;
+}

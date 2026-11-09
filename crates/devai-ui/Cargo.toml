@@ -32,6 +32,15 @@ tauri = { version = "2", features = [] }
 # plugin pattern: crate dep here, init in main.rs, `dialog:allow-open` in
 # capabilities/default.json, `@tauri-apps/plugin-dialog` on the frontend.
 tauri-plugin-dialog = "2"
+# REQ-LAN (task 01a1be98): the phone talks to the SAME command plane over a
+# local HTTP surface. axum is a sync-friendly embeddable server (hyper 1);
+# qrcode renders the invitation as an SVG string, so the frontend needs no
+# QR dependency of its own; libc reads the machine's interface list
+# (getifaddrs) for the LAN binding and the network-change watchdog.
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+libc = "0.2"
 
 [dev-dependencies]
 # R4: the ipc serde-output snapshot fixtures are compared as JSON.
