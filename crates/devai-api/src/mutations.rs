@@ -234,6 +234,25 @@ pub struct RunOutcome {
     pub allowed_operations: Vec<String>,
 }
 
+/// Потолок сериализованной спеки (байты). Решение оператора 09.11: держим
+/// жёстко в публикации, а не только пожеланием в промпте роли.
+pub const MAX_SPEC_BYTES: usize = 20_000;
+
+/// Проверка потолка спеки, вынесенная из публикации: чистая, чтобы её можно
+/// было проверить тестом без сборки дома. Другие виды артефактов не трогает.
+fn spec_size_guard(kind: ArtifactKind, len: usize) -> ApiResult<()> {
+    if kind == ArtifactKind::RequirementsSpec && len > MAX_SPEC_BYTES {
+        return Err(ApiError::InvalidInput {
+            field: "spec_size",
+            message: format!(
+                "спека {len} байт при потолке {MAX_SPEC_BYTES} байт: сократите прозу и повторы в критериях — \
+                 платформа передаёт спеку роли одним аргументом, и большая спека не запускает роль"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// `task.revise` — publish a REQUIREMENTS_SPEC from consumer-supplied
 /// bytes (the file read is input handling, not persistence) and move the
 /// task to REVIEW through the same core command.
@@ -1164,6 +1183,12 @@ impl Api {
         created_by: Option<&str>,
         category: DataCategory,
     ) -> ApiResult<Artifact> {
+        // Потолок спеки (решение оператора 09.11): промпт роли передаётся роли
+        // ОДНИМ аргументом командной строки, а у Linux на аргумент лимит 128 КБ.
+        // Спека в 57 КБ + профиль + ревью + отчёт превышали его и роняли запуск
+        // агента («Argument list too long»). Жёсткий предел держит и смысл в
+        // разумных рамках: раздутая спека и есть источник противоречий.
+        spec_size_guard(kind, content.len())?;
         if let Some(c) = &contract {
             self.contract_gate(c, &content)?;
         }
@@ -2605,6 +2630,23 @@ fn not_advancing_refusal(kind: ArtifactKind) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    /// Решение оператора 09.11: потолок спеки держит ПЛАТФОРМА. Проверяем, что
+    /// превышение отклоняется типизированно, а граница и другие виды проходят.
+    #[test]
+    fn spec_size_cap_is_enforced_at_the_boundary() {
+        use crate::mutations::{MAX_SPEC_BYTES, spec_size_guard};
+        use devai_core::types::ArtifactKind;
+
+        assert!(spec_size_guard(ArtifactKind::RequirementsSpec, MAX_SPEC_BYTES).is_ok());
+        let err = spec_size_guard(ArtifactKind::RequirementsSpec, MAX_SPEC_BYTES + 1)
+            .expect_err("спека сверх потолка обязана отклоняться");
+        assert!(
+            err.to_string().contains("spec_size"),
+            "отказ типизирован полем spec_size: {err}"
+        );
+        // Другие артефакты потолком не ограничены.
+        assert!(spec_size_guard(ArtifactKind::ImplementationReport, MAX_SPEC_BYTES * 10).is_ok());
+    }
     use super::*;
     use crate::error::ErrorCode;
 
