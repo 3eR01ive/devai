@@ -5,19 +5,21 @@
 //! passed through exactly as `devai-api` produced them
 //! (store-is-cache / no read-time rederivation).
 //!
-//! The UI is read-only for DOMAIN data except the TWO signature mutations
-//! (REQ-SIGN-05): `task_approve` / `task_reject` are the operator's signature
-//! acts and call the SAME `Api` methods as the CLI — one mutation, one
-//! event/decision, no separate window path. Every other gate action stays in
-//! the CLI (OQ-UI-6 narrowed exactly to these two). The homes REGISTRY plane
-//! is a separate, allowed class of platform operations (REQ-HOME-06):
-//! `home.add`, `home.set_enabled`, `home.activate` write ONLY the
-//! registry file of the control home and never touch any home's domain
-//! rows. The mapping tables pin the split: `COMMAND_OPERATIONS` maps the
-//! data commands to published Read operations plus the two signature
-//! mutations listed in `SIGNATURE_MUTATION_COMMANDS`, and
-//! `COMMAND_REGISTRY_OPERATIONS` maps the management commands to the
-//! home-plane Registry operations — no other Mutation is reachable.
+//! The UI is read-only for DOMAIN data: a domain write reaches the window
+//! only through a human gate act, and each act calls the SAME `Api` method
+//! as the CLI — one mutation, one event/decision, no separate window path.
+//! Which acts those are is not this paragraph's business: the ONE list is
+//! `WINDOW_MUTATION_COMMANDS` below, and the plane test derives the window's
+//! mutating commands from the command table and fails on any pair that is
+//! not on it (REQ-SIGN-05 AC4, REQ-QG-01 AC4, REQ-MS-07; OQ-UI-6). The
+//! boundary is the person: an act the operator takes at a gate belongs to
+//! the window, everything the platform does on its own stays behind the CLI.
+//! The homes REGISTRY plane is a separate, allowed class of platform
+//! operations (REQ-HOME-06): its rows write ONLY the registry file of the
+//! control home and never touch any home's domain rows, and
+//! `COMMAND_REGISTRY_OPERATIONS` is that list. The mapping tables pin the
+//! split: `COMMAND_OPERATIONS` maps the data commands to published Read
+//! operations, so no other Mutation is reachable from here.
 
 use serde::Serialize;
 use tauri::State;
@@ -331,10 +333,11 @@ pub const COMMAND_CONTRACTS: &[CommandContract] = &[
         version: 1,
         breaking: "",
     },
-    // The QA gate's two human acts (task 01a1bfa0, REQ-QG-01): the SAME
-    // platform operations as `devai task accept/return`. Each call returns the
-    // re-read status (with the public `quality_gate` fact), so the window
-    // reads the task after acting instead of patching local state.
+    // The QA gate's human acts (task 01a1bfa0, REQ-QG-01): the SAME platform
+    // operations as `devai task accept/return` — the reason they sit here at
+    // all is that the person, not the window, decides at this gate. Each call
+    // returns the re-read status (with the public `quality_gate` fact), so the
+    // window reads the task after acting instead of patching local state.
     CommandContract {
         command: "task_accept",
         version: 1,
@@ -345,11 +348,12 @@ pub const COMMAND_CONTRACTS: &[CommandContract] = &[
         version: 1,
         breaking: "",
     },
-    // The phone-access controls (task 01a1be98): a new PUBLIC surface (five
-    // IPC commands + the HTTP/JSON envelope), so it is recorded here at its
-    // first shape like every other published command (quality return R9).
-    // They are not domain operations: the operation plane is the local
-    // access, described by `lan::commands::LAN_SURFACE_CONTRACTS`.
+    // The phone-access controls (task 01a1be98): a new PUBLIC surface — the
+    // rows below are its IPC commands and the HTTP/JSON envelope is described
+    // beside them — so it is recorded here at its first shape like every
+    // other published command (quality return R9). They are not domain
+    // operations: the operation plane is the local access, described by
+    // `lan::commands::LAN_SURFACE_CONTRACTS`.
     CommandContract {
         command: "lan_status",
         version: 1,
@@ -381,8 +385,8 @@ pub const COMMAND_CONTRACTS: &[CommandContract] = &[
 /// backed by a published Read operation; `session_info` is bootstrap state
 /// (`Api::open`, the ratified OQ-10 exception), not an operation.
 ///
-/// A new UI command touches FIVE places — the published table in
-/// `devai-api/registry.rs`, the two COMMAND_* tables here, `generate_handler!`
+/// A new UI command touches every site that pins it — the published table in
+/// `devai-api/registry.rs`, the `COMMAND_*` tables here, `generate_handler!`
 /// in main.rs, and the frontend pair (api.ts + types.ts). None of them can
 /// half-land silently: the CLI's `match OpClass` is compile-guarded,
 /// `frontend_invokes_are_exactly_mapped_reads` guards the frontend→table
@@ -400,13 +404,17 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // The signable surface of the APPROVAL card: ONE read for the whole
     // section (REQ-SIGN-07), registered beside task.status.
     ("task_signature", "task.signature"),
-    // The two signature mutations (REQ-SIGN-05 AC4): the SAME platform acts
-    // as `devai task approve/reject` — the window invents no path of its own.
+    // The signature mutations (REQ-SIGN-05 AC4): the SAME platform acts as
+    // `devai task approve/reject` — the window invents no path of its own. A
+    // signature is the person's act on the spec, which is the reason the
+    // window carries it at all instead of sending the operator to the CLI.
     ("task_approve", "task.approve"),
     ("task_reject", "task.reject"),
-    // The QA gate's two acts (REQ-QG-01 AC1/AC2/AC5): the SAME platform
+    // The QA gate's acts (REQ-QG-01 AC1/AC2/AC5): the SAME platform
     // operations as `devai task accept/return` — one mutation, one event, no
-    // window path. The phone reaches them through the same catalogue.
+    // window path. They are on this list for the same reason a signature is:
+    // the person, not the window, decides at this gate. The phone reaches
+    // them through the same catalogue.
     ("task_accept", "task.accept"),
     ("task_return", "task.return"),
     ("task_progress", "task.progress"),
@@ -427,16 +435,20 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // `inbox.snapshot` carries the demand table, the questions and the gate
     // presentations in a single call, so the IPC cost per row is O(1).
     ("inbox_view", "inbox.snapshot"),
-    // The home-plane Reads plus the model-bundle section: ONE snapshot read
-    // and TWO writes (probe/switch) — the only additions to the window's
-    // mutation allowlist besides the two signature acts (REQ-MS-07).
+    // The home-plane Reads plus the model-bundle section: the snapshot read
+    // and the writes the model screen needs, all listed in the mutation
+    // allowlist like every other window write (REQ-MS-07). The boundary is
+    // authorship: the operator picks and probes what the agents run on, so
+    // that surface belongs to the window; nothing else of the model plane is
+    // writable from here.
     ("model_snapshot", "model.snapshot"),
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
-    // The bundle-authoring surface (task 01a1be5c, REQ-MC-01..09): one draft
-    // probe and three writes, all on the same file the console reads. The
-    // handle read is the ONE source of the id the form shows (ASM-9) — the
-    // window does not mirror the derivation.
+    // The bundle-authoring surface (task 01a1be5c, REQ-MC-01..09): the rows
+    // below are its whole door, and they all write the same file the console
+    // reads — so a bundle authored in the window and one authored in the
+    // console cannot diverge. The handle read is the ONE source of the id the
+    // form shows (ASM-9) — the window does not mirror the derivation.
     ("model_bundle_handle", "model.bundle_handle"),
     ("model_bundle_check", "model.bundle_check"),
     ("model_bundle_create", "model.bundle_create"),
@@ -449,21 +461,26 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("tasks_all", "home.tasks_all"),
 ];
 
-/// The ONE allowlist of signature MUTATIONS reachable from the window
-/// (REQ-SIGN-05 AC4): exactly two pairs, no Read row, no third pair. The
-/// data plane stays read-only; these two are the only exception (the
-/// operator signs in the window) and they call the same API methods the CLI
-/// calls.
+/// The signature MUTATIONS reachable from the window (REQ-SIGN-05 AC4).
+/// The rows are data, the boundary is the reason: a signature is the
+/// person's own act, so the window carries it rather than sending the
+/// operator back to the CLI, and it calls the same API methods the CLI
+/// calls, so the decision row is written once. The data plane stays
+/// read-only; `WINDOW_MUTATION_COMMANDS` is the enforced whole and the plane
+/// test below derives the window's mutating commands from the command table.
 #[allow(dead_code)] // consumed by the plane tests below
 pub const SIGNATURE_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_approve", "task.approve"),
     ("task_reject", "task.reject"),
 ];
 
-/// The model-bundle mutations the section may reach (REQ-MS-07, REQ-MC-01..05):
-/// the window gets the model commands — one read (`model.snapshot`), the
-/// probe/switch pair and the four authoring doors. No other mutation is
-/// reachable, and the allowlist test below fails on an unlisted pair.
+/// The model mutations the section may reach (REQ-MS-07, REQ-MC-01..05): the
+/// rows below name the section's whole writable door — the read that feeds
+/// the form is not a mutation and never appears here. The boundary is
+/// authorship of the model bundle: the operator chooses and edits what the
+/// agents run on, and every authoring row writes the same file the console
+/// reads. `WINDOW_MUTATION_COMMANDS` is the enforced whole: the allowlist
+/// test below fails on a window mutation that is not on it.
 #[allow(dead_code)] // consumed by the plane tests below
 pub const MODEL_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("model_probe", "model.probe"),
@@ -587,9 +604,9 @@ pub fn homes_set_enabled(
 /// A reopen refusal degrades to the control home with its own typed cause
 /// (the REQ-HOME-07 shape) instead of leaving a dead handle behind.
 ///
-/// Three units, ≤40 lines each (R2 quality return, cl/short-units): pick
-/// the handle (`reopen_active`) → apply it to the session
-/// (`apply_session_home`).
+/// The work is split into small units, ≤40 lines each (R2 quality return,
+/// cl/short-units): pick the handle (`reopen_active`) → apply it to the
+/// session (`apply_session_home`), so each function stays reviewable alone.
 fn follow_active(state: &State<AppState>, active: Option<String>, actor: &str, control_home: &str) {
     let current = state.session().home.clone();
     if active.as_deref() == Some(current.as_str()) {
@@ -782,16 +799,18 @@ pub fn task_status(state: State<AppState>, id_prefix: String) -> Result<StatusVi
 }
 
 /// `task.signature` — the one read the APPROVAL signature section renders
-/// (REQ-SIGN-07): spec, requirements, document questions, reviewer block,
-/// previous-version diff, the two rights and the newest signature fact.
+/// (REQ-SIGN-07): the whole card in one call, `SignatureView` being the list
+/// of what it carries — so the section costs one round trip and the window
+/// composes nothing.
 #[tauri::command(rename_all = "snake_case")]
 pub fn task_signature(state: State<AppState>, id_prefix: String) -> Result<SignatureView, UiError> {
     Ok(state.api().task_signature(&id_prefix)?)
 }
 
-/// R6: the four actor-carrying writes repeated one skeleton — «read the
-/// session actor → open a write handle on the SAME home → call → re-read».
-/// One helper owns that skeleton; each command names only its own act.
+/// R6: the actor-carrying writes repeated one skeleton — «read the session
+/// actor → open a write handle on the SAME home → call → re-read». One
+/// helper owns that skeleton and the callers below are the list, so a new
+/// act cannot invent a write path of its own.
 fn with_actor_write<T>(
     state: &State<AppState>,
     actor: Option<String>,
@@ -1214,9 +1233,9 @@ pub fn compose_wait_snapshot(facts: InboxSnapshotView) -> Result<WaitSnapshot, U
     Ok(section.finish())
 }
 
-/// The three lists of the section, filled row by row: the platform's wait
-/// rows, the operator-stopped rows and the reference notes (ratified
-/// OQ-GATE-1). One struct so the grouping decision is made once per task and
+/// The section's lists live in one struct, filled row by row (ratified
+/// OQ-GATE-1): the fields below ARE the lists, this comment only says why
+/// they share one place — the grouping decision is made once per task and
 /// the badge in `finish` sees the very rows that were produced.
 #[derive(Default)]
 struct SectionRows {
@@ -1413,8 +1432,10 @@ mod tests {
                 );
             }
         }
-        // The allowlist is exactly the mutation commands of the table — no
-        // third pair, no Read row smuggled into it, no mutation outside it.
+        // The allowlist is compared against the mutation commands the table
+        // itself names, so a Read row smuggled in, or a mutation left out,
+        // fails here — the expected set is read from the data, never counted
+        // in prose.
         let mutation_cmds: Vec<&str> = COMMAND_OPERATIONS
             .iter()
             .filter(|(_, op)| {
@@ -1517,8 +1538,8 @@ mod tests {
     /// direction is guarded too. Every published `home.*` operation must
     /// have a UI command mapping — if the registry plane grows a row and
     /// the surface does not follow, this fails at `cargo test`, so the
-    /// five-place checklist of a new operation can never half-land
-    /// (the frontend→table direction is guarded by
+    /// checklist of a new operation can never half-land (the
+    /// frontend→table direction is guarded by
     /// `frontend_invokes_are_exactly_mapped_reads`).
     #[test]
     fn every_published_home_operation_is_wired_into_the_ui() {
@@ -1719,14 +1740,13 @@ mod tests {
 
     /// QA R4 (mt/change-isolation + ux/contract-stability) + R1
     /// (no-read-time-rederivation): the name/signboard plane crosses the
-    /// Rust↔TS boundary in exactly THREE serde shapes — the task row (the
-    /// stored name `human_name` AND the finished signboard `display`), the
-    /// `task.rename` outcome (`TaskRenameOutcome`), and the dependency
-    /// edge (both-end signage `task_display`/`depends_on_display`). The
-    /// fixture pins their exact JSON form (the `ui_error`/artifact idiom
-    /// above); the second half compares the pinned KEY SETS against the
-    /// `Task`/`TaskDependency` interfaces declared in `types.ts` — drift
-    /// on either side (a Rust rename, an unmoved TS field) fails the
+    /// Rust↔TS boundary in a closed set of serde shapes, each pinned by a
+    /// fixture below (the `ui_error`/artifact idiom above) — the fixtures are
+    /// the list, never a prose count. They also pin why the plane exists: the
+    /// window shows the stored name AND the finished signboard without
+    /// re-deriving either. The second half compares the pinned KEY SETS
+    /// against the `Task`/`TaskDependency` interfaces declared in `types.ts` —
+    /// drift on either side (a Rust rename, an unmoved TS field) fails the
     /// build now, not as a silent `undefined` in a rendered list.
     #[test]
     fn name_plane_serde_shapes_are_pinned_by_fixtures() {
@@ -1925,8 +1945,10 @@ mod tests {
                 "`{name}` is not registered in the invoke_handler of main.rs"
             );
         }
-        // REQ-SIGN-05 AC4: the frontend's Mutation commands are EXACTLY the
-        // two signature acts, and task_signature is a Read.
+        // REQ-SIGN-05 AC4: the window's mutating commands, derived from the
+        // command table, must equal the allowlist as a set — the literal
+        // below is an independent spelling of that set, so a row landing on
+        // one side only fails here; task_signature must stay a Read.
         let ops = devai_api::operations();
         let class_of = |name: &str| {
             COMMAND_OPERATIONS
@@ -1946,10 +1968,10 @@ mod tests {
             .map(|(cmd, _)| *cmd)
             .collect();
         mutations.sort_unstable();
-        // REQ-MS-07 + REQ-MC-01..05 + REQ-QG-01 AC4: the allowlist is the
-        // four human gate acts (two spec signatures + QA accept/return) plus
-        // the model surface (probe, switch and the three authoring writes +
-        // the draft check) — and NOTHING else may appear here.
+        // REQ-MS-07 + REQ-MC-01..05 + REQ-QG-01 AC4: the expected set is the
+        // allowlist's content compared as a set, so widening the window's
+        // writable surface means editing the allowlist and this literal —
+        // a row landing on one side only fails here.
         let mut expected = vec![
             "model_bundle_check",
             "model_bundle_create",
@@ -2400,10 +2422,10 @@ mod tests {
         );
     }
 
-    /// Shape pinning for the two shapes the wait section
-    /// publishes — pinned exactly like `ui_error`/`artifact_*`: a
-    /// renamed field or a moved tag fails HERE, in cargo test, not as a
-    /// silent `undefined` through types.ts at runtime.
+    /// Shape pinning for the shapes the wait section publishes — pinned
+    /// exactly like `ui_error`/`artifact_*`: the fixtures asserted below are
+    /// the list, and a renamed field or a moved tag fails HERE, in cargo
+    /// test, not as a silent `undefined` through types.ts at runtime.
     #[test]
     fn wait_section_shapes_are_pinned_by_fixtures() {
         let fixture = ipc_shapes_fixture();
@@ -2565,7 +2587,7 @@ mod tests {
         }
     }
 
-    /// Is the versioned command backed by one of the two registered planes?
+    /// Is the versioned command backed by a registered command plane?
     fn contract_is_mapped(command: &str) -> bool {
         COMMAND_OPERATIONS.iter().any(|(cmd, _)| *cmd == command)
             || crate::lan::commands::LAN_OPERATIONS
@@ -3271,13 +3293,10 @@ mod tests {
     }
 
     /// R2 quality return: the homes attributes are described ONCE
-    /// (`devai_api::HOME_*_SCHEMA`) and checked against all five sites that
-    /// spell them — the persisted `HomeEntry`, the wire `HomeRecord` (whose
-    /// serde output IS the `ipc_shapes.json` fixture pinned by the test
-    /// above), the published registry rows, the `types.ts` interfaces and
-    /// the views. Adding an attribute to one site without the schema fails
-    /// here; adding it to the schema without the TS type or the view usage
-    /// fails right after.
+    /// (`devai_api::HOME_*_SCHEMA`) and checked against every site that
+    /// spells them — the test below walks those sites, so adding an attribute
+    /// to one of them without the schema fails here, and adding it to the
+    /// schema without the TS type or the view usage fails right after.
     #[test]
     fn homes_record_schema_is_one_description_checked_on_every_site() {
         use devai_api::{
