@@ -1080,110 +1080,93 @@ impl Api {
         let executions = self.store.list_executions(None)?;
         let mut out = Vec::with_capacity(agents.len());
         for a in agents {
-            let latest = executions
-                .iter()
-                .filter(|e| {
-                    e.agent_name.as_deref() == Some(a.name.as_str())
-                        && matches!(
-                            e.status,
-                            ExecutionStatus::Completed | ExecutionStatus::Failed
-                        )
-                })
-                .max_by_key(|e| e.finished_at.unwrap_or(e.started_at));
-            let last_failure = self.store.latest_agent_failure_for_agent(&a.name)?;
-            let series = self.store.agent_failure_series_for_agent(&a.name)?;
-            let failures = self.store.agent_failure_total(&a.name)?;
-            let last_failure_at = last_failure.as_ref().map(|r| r.last_at);
-            let last_outcome_at = latest.and_then(|e| e.finished_at.or(Some(e.started_at)));
-            // REQ-AF-07 AC2, ASM-AF-05: availability folds executions AND
-            // recorded failures — a failure is an outcome too, and the NEWER
-            // of the two decides. A success resets nothing by itself here; it
-            // simply becomes the latest outcome. No stored status exists.
-            let availability = match (latest.map(|e| e.status), last_outcome_at, last_failure_at) {
-                // A recorded failure NEWER than the latest closed execution.
-                (Some(ExecutionStatus::Completed), Some(outcome), Some(failure))
-                    if failure > outcome =>
-                {
-                    "unavailable"
-                }
-                (Some(ExecutionStatus::Completed), _, _) => "available",
-                (Some(ExecutionStatus::Failed), _, _) => "unavailable",
-                // No closed execution but a recorded failure (an execution
-                // row the platform kept no outcome for): still unavailable.
-                (_, _, Some(_)) => "unavailable",
-                _ => "unknown",
-            };
-            let availability_word = match availability {
-                "available" => "доступен",
-                "unavailable" => "недоступен",
-                _ => "неизвестно",
-            };
-            // A failure without a recorded class is never dressed up: the
-            // row says «причина не классифицирована» (REQ-AF-03 AC5).
-            let last_class = last_failure.as_ref().map(|r| r.class.clone());
-            let last_class_word = match &last_class {
-                Some(c) => devai_core::agent_failure::word(c).to_string(),
-                None => "причина не классифицирована".to_string(),
-            };
-            let last_seen_at = match (last_outcome_at, last_failure_at) {
-                (Some(o), Some(f)) => o.max(f),
-                (Some(o), None) => o,
-                (None, Some(f)) => f,
-                (None, None) => a.created_at,
-            };
-            let series_count = series.as_ref().map(|s| s.consecutive_count).unwrap_or(0);
-            // REQ-AF-07 AC2: the time is ALWAYS on the line — an outcome
-            // time, else the failure time, else the record's own creation.
-            // AC1: the accumulated number of failures is named; «с <время>»
-            // is the FIRST failure of the current series, so the sentence
-            // reads «N отказов с 15:07» like the task's example.
-            let first_failure_at = series
-                .as_ref()
-                .map(|s| s.first_at)
-                .or(last_failure_at)
-                .unwrap_or(last_seen_at);
-            let line = match availability {
-                "unavailable" => format!(
-                    "{}: {}, {}, {} отказов с {}",
-                    a.name,
-                    availability_word,
-                    last_class_word,
-                    failures,
-                    short_time(first_failure_at)
-                ),
-                "available" => format!(
-                    "{}: {}, последний исход {}, отказов всего {}",
-                    a.name,
-                    availability_word,
-                    short_time(last_seen_at),
-                    failures
-                ),
-                _ => format!(
-                    "{}: {}, исходов нет, {}",
-                    a.name,
-                    availability_word,
-                    short_time(last_seen_at)
-                ),
-            };
-            out.push(AgentStatusView {
-                name: a.name,
-                driver: a.provider,
-                llm_provider: a.runtime,
-                model: a.model,
-                availability: availability.to_string(),
-                availability_word: availability_word.to_string(),
-                last_class,
-                last_class_word,
-                last_failure_at,
-                last_outcome_at,
-                last_seen_at,
-                failures,
-                series: series_count,
-                series_first_at: series.as_ref().map(|s| s.first_at),
-                line,
-            });
+            out.push(self.agent_status_of(&a, &executions)?);
         }
         Ok(out)
+    }
+
+    /// One row of the status surface: the derived facts plus the agent's own
+    /// identity. Nothing here is stored as a status (REQ-AF-07 AC3).
+    fn agent_status_of(
+        &self,
+        agent: &AgentInstance,
+        executions: &[RoleExecution],
+    ) -> ApiResult<AgentStatusView> {
+        let f = self.agent_status_facts(agent, executions)?;
+        Ok(AgentStatusView {
+            name: agent.name.clone(),
+            driver: agent.provider.clone(),
+            llm_provider: agent.runtime.clone(),
+            model: agent.model.clone(),
+            availability: f.availability.to_string(),
+            availability_word: f.availability_word,
+            last_class: f.last_class,
+            last_class_word: f.last_class_word,
+            last_failure_at: f.last_failure_at,
+            last_outcome_at: f.last_outcome_at,
+            last_seen_at: f.last_seen_at,
+            failures: f.failures,
+            series: f.series,
+            series_first_at: f.series_first_at,
+            line: f.line,
+        })
+    }
+
+    /// Fold the agent's stored executions, failure windows and series into
+    /// the facts the row shows — availability, the last class in words, the
+    /// counters and the times (REQ-AF-07 AC1/AC2, ASM-AF-05).
+    fn agent_status_facts(
+        &self,
+        agent: &AgentInstance,
+        executions: &[RoleExecution],
+    ) -> ApiResult<AgentStatusFacts> {
+        let latest = latest_agent_outcome(&agent.name, executions);
+        let last_outcome_at = latest.and_then(|e| e.finished_at.or(Some(e.started_at)));
+        let failure = self.agent_failure_state(agent)?;
+        let availability =
+            agent_availability(latest.map(|e| e.status), last_outcome_at, failure.last_at);
+        let last_seen_at = agent_last_seen(last_outcome_at, failure.last_at, agent.created_at);
+        let first_failure_at = failure
+            .series_first_at
+            .or(failure.last_at)
+            .unwrap_or(last_seen_at);
+        let line = agent_status_line(
+            &agent.name,
+            availability,
+            &failure.class_word,
+            failure.total,
+            first_failure_at,
+            last_seen_at,
+        );
+        Ok(AgentStatusFacts {
+            availability,
+            availability_word: agent_availability_word(availability).to_string(),
+            last_class: failure.class,
+            last_class_word: failure.class_word,
+            last_failure_at: failure.last_at,
+            last_outcome_at,
+            last_seen_at,
+            failures: failure.total,
+            series: failure.series,
+            series_first_at: failure.series_first_at,
+            line,
+        })
+    }
+
+    /// The stored failure side of one status row: the latest window of ANY
+    /// task, the open series and the accumulated total (REQ-AF-06 AC3/AC6).
+    fn agent_failure_state(&self, agent: &AgentInstance) -> ApiResult<AgentFailureState> {
+        let last = self.store.latest_agent_failure_for_agent(&agent.name)?;
+        let series = self.store.agent_failure_series_for_agent(&agent.name)?;
+        let class = last.as_ref().map(|r| r.class.clone());
+        Ok(AgentFailureState {
+            class_word: agent_class_word(class.as_deref()),
+            class,
+            last_at: last.as_ref().map(|r| r.last_at),
+            total: self.store.agent_failure_total(&agent.name)?,
+            series: series.as_ref().map(|s| s.consecutive_count).unwrap_or(0),
+            series_first_at: series.as_ref().map(|s| s.first_at),
+        })
     }
 
     pub fn contract_get(&self, name: &str, version: u32) -> ApiResult<Option<String>> {
@@ -1335,6 +1318,132 @@ pub struct AgentStatusView {
 /// stored zone). A line always carries a time (REQ-AF-07 AC2).
 fn short_time(ts: Timestamp) -> String {
     ts.format("%d.%m %H:%M").to_string()
+}
+
+/// The derived facts of one status row — availability, the last cause in
+/// words, the counters and the times. None of them is a stored status
+/// (REQ-AF-07 AC3); they are folded from executions, failures and the series.
+struct AgentStatusFacts {
+    availability: &'static str,
+    availability_word: String,
+    last_class: Option<String>,
+    last_class_word: String,
+    last_failure_at: Option<Timestamp>,
+    last_outcome_at: Option<Timestamp>,
+    last_seen_at: Timestamp,
+    failures: i64,
+    series: i64,
+    series_first_at: Option<Timestamp>,
+    line: String,
+}
+
+/// The stored failure side of one status row: the latest window of ANY task,
+/// the open series and the accumulated total (REQ-AF-06 AC3/AC6).
+struct AgentFailureState {
+    class: Option<String>,
+    class_word: String,
+    last_at: Option<Timestamp>,
+    total: i64,
+    series: i64,
+    series_first_at: Option<Timestamp>,
+}
+
+/// The agent's latest CLOSED execution (an outcome is either a completion or
+/// a failure) — the execution side of availability (REQ-AF-07 AC2).
+fn latest_agent_outcome<'a>(
+    agent_name: &str,
+    executions: &'a [RoleExecution],
+) -> Option<&'a RoleExecution> {
+    executions
+        .iter()
+        .filter(|e| {
+            e.agent_name.as_deref() == Some(agent_name)
+                && matches!(
+                    e.status,
+                    ExecutionStatus::Completed | ExecutionStatus::Failed
+                )
+        })
+        .max_by_key(|e| e.finished_at.unwrap_or(e.started_at))
+}
+
+/// Availability folds executions AND recorded failures: a failure is an
+/// outcome too, and the NEWER of the two decides. A success resets nothing
+/// here — it simply becomes the latest outcome. No stored status exists.
+fn agent_availability(
+    latest: Option<ExecutionStatus>,
+    last_outcome_at: Option<Timestamp>,
+    last_failure_at: Option<Timestamp>,
+) -> &'static str {
+    match (latest, last_outcome_at, last_failure_at) {
+        // A recorded failure NEWER than the latest closed execution.
+        (Some(ExecutionStatus::Completed), Some(outcome), Some(failure)) if failure > outcome => {
+            "unavailable"
+        }
+        (Some(ExecutionStatus::Completed), _, _) => "available",
+        (Some(ExecutionStatus::Failed), _, _) => "unavailable",
+        // No closed execution but a recorded failure (an execution row the
+        // platform kept no outcome for): still unavailable.
+        (_, _, Some(_)) => "unavailable",
+        _ => "unknown",
+    }
+}
+
+/// The ONE dictionary of availability words (REQ-AF-07 AC2).
+fn agent_availability_word(availability: &str) -> &'static str {
+    match availability {
+        "available" => "доступен",
+        "unavailable" => "недоступен",
+        _ => "неизвестно",
+    }
+}
+
+/// A failure without a recorded class is never dressed up: the row says
+/// «причина не классифицирована» (REQ-AF-03 AC5).
+fn agent_class_word(class: Option<&str>) -> String {
+    match class {
+        Some(c) => devai_core::agent_failure::word(c).to_string(),
+        None => "причина не классифицирована".to_string(),
+    }
+}
+
+/// The line always carries a time: an outcome time, else the failure time,
+/// else the record's own creation (REQ-AF-07 AC2).
+fn agent_last_seen(
+    last_outcome_at: Option<Timestamp>,
+    last_failure_at: Option<Timestamp>,
+    created_at: Timestamp,
+) -> Timestamp {
+    match (last_outcome_at, last_failure_at) {
+        (Some(o), Some(f)) => o.max(f),
+        (Some(o), None) => o,
+        (None, Some(f)) => f,
+        (None, None) => created_at,
+    }
+}
+
+/// The ONE rendered sentence the CLI and the window both print (REQ-AF-07
+/// AC6). «с <время>» is the FIRST failure of the current series, so it reads
+/// «N отказов с 15:07» like the task's example (AC1).
+fn agent_status_line(
+    name: &str,
+    availability: &str,
+    class_word: &str,
+    failures: i64,
+    first_failure_at: Timestamp,
+    last_seen_at: Timestamp,
+) -> String {
+    let word = agent_availability_word(availability);
+    match availability {
+        "unavailable" => format!(
+            "{name}: {word}, {class_word}, {failures} отказов с {}",
+            short_time(first_failure_at)
+        ),
+        "available" => format!(
+            "{name}: {word}, последний исход {}, отказов всего {failures}",
+            short_time(last_seen_at)
+        ),
+        _ => format!("{name}: {word}, исходов нет, {}", short_time(last_seen_at)),
+    }
 }
 
 /// Fold one stored failure + series into the human surface. One helper for

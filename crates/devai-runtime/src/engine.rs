@@ -10,11 +10,12 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use devai_core::agent_failure::Classified;
 use devai_core::error::CoreError;
 use devai_core::types::*;
 use devai_core::workflow;
 use devai_store::config::{
-    HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
+    AgentFailurePolicy, HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
 };
 use devai_store::{ArtifactDraft, Store, StoreError};
 
@@ -294,6 +295,134 @@ impl FormLoopHost for StageAttempts<'_> {
             self.store_err.get_or_insert(e);
         }
     }
+}
+
+/// The raw evidence one adapter error carries, before classification
+/// (task 01a1b60c, REQ-AF-01/10): both streams, the exit code, the duration,
+/// the driver-journal excerpt and an honest note when the journal is absent.
+#[derive(Default)]
+struct AgentFailureEvidence {
+    message: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    hint: Option<&'static str>,
+    reported_ms: Option<u64>,
+    log_tail: Option<String>,
+    log_note: Option<String>,
+}
+
+/// Everything the platform observed at execution completion, as fields — the
+/// store takes THIS shape and never parses text for the cause.
+fn agent_failure_evidence(err: &AdapterError) -> AgentFailureEvidence {
+    match err {
+        AdapterError::AgentFailure(r) => AgentFailureEvidence {
+            message: r.message.clone(),
+            exit_code: r.exit_code,
+            stdout: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+            hint: r.hint,
+            reported_ms: Some(r.duration_ms),
+            log_tail: r.driver_log_tail.clone(),
+            log_note: r.driver_log_note.clone(),
+        },
+        AdapterError::UnknownProvider(name) => AgentFailureEvidence {
+            message: format!("unknown agent provider `{name}`"),
+            hint: Some("unknown_provider"),
+            log_note: Some("процесс не запускался: неизвестный провайдер".into()),
+            ..Default::default()
+        },
+        AdapterError::Io(e) => AgentFailureEvidence {
+            message: format!("failed to launch agent process: {e}"),
+            hint: if e.kind() == std::io::ErrorKind::NotFound {
+                Some("launch_not_found")
+            } else {
+                None
+            },
+            log_note: Some("процесс не запустился — журнала драйвера за прогон нет".into()),
+            ..Default::default()
+        },
+        other => AgentFailureEvidence {
+            message: other.to_string(),
+            log_note: Some(
+                "журнал драйвера не приложен: отказ пришёл не от процесса драйвера".into(),
+            ),
+            ..Default::default()
+        },
+    }
+}
+
+/// The detailed cause and its ground, from code first, then text (REQ-AF-02).
+fn agent_failure_class(ev: &AgentFailureEvidence) -> Classified {
+    devai_core::agent_failure::classify(
+        ev.exit_code,
+        &format!("{}\n{}\n{}", ev.message, ev.stderr, ev.stdout),
+        ev.hint,
+    )
+}
+
+/// Fold the observed evidence into the store's input row: bounded tails, the
+/// classified cause, the declared threshold/window and the failure moment
+/// (REQ-AF-01 AC3, REQ-AF-10 AC4). `tail` is EMPTY when no stream spoke
+/// (REQ-AF-01 AC2); the process message rides its own field so the cause is
+/// never hidden (REQ-AF-09 AC3). The store's `provider` column is the DRIVER,
+/// `runtime` is the LLM-provider (REQ-MS-01 vocabulary).
+fn agent_failure_record(
+    task: &Task,
+    agent: &AgentInstance,
+    execution: &RoleExecution,
+    now: Timestamp,
+    ev: &AgentFailureEvidence,
+    classified: &Classified,
+    p: &AgentFailurePolicy,
+) -> AgentFailureRecord {
+    let duration_ms = agent_failure_duration_ms(ev, execution, now);
+    AgentFailureRecord {
+        id: new_id(),
+        task_id: task.id,
+        execution_id: Some(execution.id),
+        agent_name: agent.name.clone(),
+        driver: agent.provider.clone(),
+        llm_provider: agent.runtime.clone(),
+        model: agent.model.clone(),
+        class: classified.class.to_string(),
+        exit_code: ev.exit_code,
+        duration_ms: Some(duration_ms),
+        tail: agent_failure_tail(ev, p.tail_chars),
+        output_empty: ev.stdout.trim().is_empty() && ev.stderr.trim().is_empty(),
+        driver_log_tail: ev
+            .log_tail
+            .as_deref()
+            .map(|l| crate::adapters::tail_chars(l, p.driver_log_chars)),
+        driver_log_note: ev.log_note.clone(),
+        message: crate::adapters::tail_chars(&ev.message, p.tail_chars),
+        basis: classified.basis.clone(),
+        threshold: p.park_threshold as i64,
+        window_minutes: p.window_minutes as i64,
+        at: now,
+    }
+}
+
+/// The duration the adapter observed, else the platform's own measurement of
+/// the execution (REQ-AF-01 AC3).
+fn agent_failure_duration_ms(
+    ev: &AgentFailureEvidence,
+    execution: &RoleExecution,
+    now: Timestamp,
+) -> i64 {
+    ev.reported_ms
+        .unwrap_or_else(|| (now - execution.started_at).num_milliseconds().max(0) as u64) as i64
+}
+
+/// The bounded stream excerpt: stderr when it spoke, else stdout — EMPTY when
+/// neither did (REQ-AF-01 AC2).
+fn agent_failure_tail(ev: &AgentFailureEvidence, limit: usize) -> String {
+    let stream = if !ev.stderr.trim().is_empty() {
+        ev.stderr.as_str()
+    } else {
+        ev.stdout.as_str()
+    };
+    crate::adapters::tail_chars(stream, limit)
 }
 
 pub struct Engine<'a> {
@@ -876,131 +1005,62 @@ impl<'a> Engine<'a> {
         err: &AdapterError,
         actor: &str,
     ) -> Result<(), RuntimeError> {
-        let p = &self.agent_failure;
-        let (message, exit_code, stdout, stderr, hint, reported_ms, log_tail, log_note) = match err
-        {
-            AdapterError::AgentFailure(r) => (
-                r.message.clone(),
-                r.exit_code,
-                r.stdout.clone(),
-                r.stderr.clone(),
-                r.hint,
-                Some(r.duration_ms),
-                r.driver_log_tail.clone(),
-                r.driver_log_note.clone(),
-            ),
-            AdapterError::UnknownProvider(name) => (
-                format!("unknown agent provider `{name}`"),
-                None,
-                String::new(),
-                String::new(),
-                Some("unknown_provider"),
-                None,
-                None,
-                Some("процесс не запускался: неизвестный провайдер".into()),
-            ),
-            AdapterError::Io(e) => (
-                format!("failed to launch agent process: {e}"),
-                None,
-                String::new(),
-                String::new(),
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Some("launch_not_found")
-                } else {
-                    None
-                },
-                None,
-                None,
-                Some("процесс не запустился — журнала драйвера за прогон нет".into()),
-            ),
-            other => (
-                other.to_string(),
-                None,
-                String::new(),
-                String::new(),
-                None,
-                None,
-                None,
-                Some("журнал драйвера не приложен: отказ пришёл не от процесса драйвера".into()),
-            ),
-        };
+        let ev = agent_failure_evidence(err);
         let now = Utc::now();
-        let duration_ms = reported_ms
-            .unwrap_or_else(|| (now - execution.started_at).num_milliseconds().max(0) as u64)
-            as i64;
-        let classified = devai_core::agent_failure::classify(
-            exit_code,
-            &format!("{message}\n{stderr}\n{stdout}"),
-            hint,
+        let classified = agent_failure_class(&ev);
+        let rec = agent_failure_record(
+            task,
+            agent,
+            execution,
+            now,
+            &ev,
+            &classified,
+            &self.agent_failure,
         );
-        let output_empty = stdout.trim().is_empty() && stderr.trim().is_empty();
-        // `tail` is the bounded stream excerpt and is EMPTY when no output
-        // was produced (REQ-AF-01 AC2); the process message rides its own
-        // field so the cause is never hidden (REQ-AF-09 AC3).
-        let stream_text = if !stderr.trim().is_empty() {
-            stderr.as_str()
-        } else {
-            stdout.as_str()
-        };
-        let tail = crate::adapters::tail_chars(stream_text, p.tail_chars);
-        let message_bounded = crate::adapters::tail_chars(&message, p.tail_chars);
-        let driver_log_tail = log_tail
-            .as_deref()
-            .map(|l| crate::adapters::tail_chars(l, p.driver_log_chars));
-        let rec = AgentFailureRecord {
-            id: new_id(),
-            task_id: task.id,
-            execution_id: Some(execution.id),
-            agent_name: agent.name.clone(),
-            // The store's `provider` column is the DRIVER; `runtime` is the
-            // LLM-provider (REQ-MS-01 vocabulary).
-            driver: agent.provider.clone(),
-            llm_provider: agent.runtime.clone(),
-            model: agent.model.clone(),
-            class: classified.class.to_string(),
-            exit_code,
-            duration_ms: Some(duration_ms),
-            tail,
-            output_empty,
-            driver_log_tail,
-            driver_log_note: log_note,
-            message: message_bounded,
-            basis: classified.basis,
-            threshold: p.park_threshold as i64,
-            window_minutes: p.window_minutes as i64,
-            at: now,
-        };
-        let outcome = self.store.record_agent_failure(&rec)?;
-        if outcome.series_count < p.park_threshold as i64 {
+        let recorded = self.store.record_agent_failure(&rec)?;
+        if recorded.series_count < self.agent_failure.park_threshold as i64 {
             return Ok(());
         }
-        // At (or over) the threshold park the task — unless it is already in
-        // a hold/terminal state, where no further run can be started anyway.
+        self.park_agent_failure(task, agent, &rec, classified.class, &recorded, actor)
+    }
+
+    /// At (or over) the threshold park the task — unless it is already in a
+    /// hold/terminal state, where no further run can be started anyway. The
+    /// question is a normal workflow mutation on top of the recorded fact: it
+    /// gives no FAILED verdict and passes no gate (REQ-AF-05 AC4/AC6).
+    fn park_agent_failure(
+        &self,
+        task: &Task,
+        agent: &AgentInstance,
+        rec: &AgentFailureRecord,
+        class: &'static str,
+        recorded: &AgentFailureRecorded,
+        actor: &str,
+    ) -> Result<(), RuntimeError> {
         let current = self.store.get_task(&task.id.to_string())?;
         if current.state.is_hold() || current.state.is_terminal() {
             return Ok(());
         }
-        let question_id = new_id();
         let m = workflow::park_agent_failure(
             &current,
-            question_id,
+            new_id(),
             workflow::AgentFailureParking {
                 agent: &agent.name,
-                class: classified.class,
-                series_count: outcome.series_count,
-                threshold: p.park_threshold as i64,
-                first_at: outcome.first_at,
-                last_at: outcome.last_at,
+                class,
+                series_count: recorded.series_count,
+                threshold: self.agent_failure.park_threshold as i64,
+                first_at: recorded.first_at,
+                last_at: recorded.last_at,
                 tail: &rec.tail,
-                action: devai_core::agent_failure::action(classified.class),
-                execution_id: Some(execution.id),
+                action: devai_core::agent_failure::action(class),
+                execution_id: rec.execution_id,
             },
             actor,
-            now,
+            rec.at,
         )?;
         self.store.commit(current.lock_version, &m)?;
         self.store
-            .mark_agent_failure_parked(task.id, &agent.name, now)?;
+            .mark_agent_failure_parked(task.id, &agent.name, rec.at)?;
         Ok(())
     }
 

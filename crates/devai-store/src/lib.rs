@@ -1991,23 +1991,63 @@ impl Store {
     ) -> StoreResult<AgentFailureRecorded> {
         let tx = self.conn.unchecked_transaction()?;
         let floor = rec.at - chrono::Duration::minutes(rec.window_minutes.max(1));
-        // The anti-spam WINDOW is the (agent, class) pair, across tasks
-        // (REQ-AF-06 AC1/AC5): a row of ANY task of that pair inside the
-        // window means the event is already written and must not repeat.
-        let window: Option<(String, String)> = rows::unwrap_row(
+        let window = Self::agent_failure_window_row(&tx, rec, &floor)?;
+        let own = Self::agent_failure_own_row(&tx, rec, &floor)?;
+        let event_written = window.is_none();
+        let (window_count, window_started_at) = Self::grow_agent_failure_row(
+            &tx,
+            rec,
+            own,
+            window.as_ref().map(|w| w.1.as_str()),
+            event_written,
+        )?;
+        let (series_count, first_at) = Self::grow_agent_failure_series(&tx, rec)?;
+        let total_failures = Self::agent_failure_sum(&tx, &rec.agent_name)?;
+        let recorded = AgentFailureRecorded {
+            event_written,
+            window_count,
+            window_started_at,
+            series_count,
+            first_at,
+            last_at: rec.at,
+            total_failures,
+        };
+        if event_written {
+            Self::append_agent_failed_event(&tx, rec, &recorded)?;
+        }
+        tx.commit()?;
+        Ok(recorded)
+    }
+
+    /// The anti-spam WINDOW is the (agent, class) pair, across tasks
+    /// (REQ-AF-06 AC1/AC5): a row of ANY task of that pair inside the
+    /// window means the event is already written and must not repeat.
+    fn agent_failure_window_row(
+        tx: &Transaction<'_>,
+        rec: &AgentFailureRecord,
+        floor: &Timestamp,
+    ) -> StoreResult<Option<(String, String)>> {
+        rows::unwrap_row(
             tx.query_row(
                 "SELECT id, window_started_at FROM agent_failures \
                  WHERE agent_name=?1 AND class=?2 AND last_at>=?3 \
                  ORDER BY last_at DESC LIMIT 1",
-                params![rec.agent_name, rec.class, rows::ts(&floor)],
+                params![rec.agent_name, rec.class, rows::ts(floor)],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional(),
-        )?;
-        // THIS task's own evidence row of the pair inside the window — it
-        // grows; the row of another task is never overwritten, so every
-        // stuck task keeps its own class, message and tail (REQ-AF-05 AC3).
-        let own: Option<(String, i64)> = rows::unwrap_row(
+        )
+    }
+
+    /// THIS task's own evidence row of the pair inside the window — it
+    /// grows; the row of another task is never overwritten, so every
+    /// stuck task keeps its own class, message and tail (REQ-AF-05 AC3).
+    fn agent_failure_own_row(
+        tx: &Transaction<'_>,
+        rec: &AgentFailureRecord,
+        floor: &Timestamp,
+    ) -> StoreResult<Option<(String, i64)>> {
+        rows::unwrap_row(
             tx.query_row(
                 "SELECT id, window_count FROM agent_failures \
                  WHERE agent_name=?1 AND class=?2 AND task_id=?3 AND last_at>=?4 \
@@ -2016,91 +2056,106 @@ impl Store {
                     rec.agent_name,
                     rec.class,
                     rec.task_id.to_string(),
-                    rows::ts(&floor)
+                    rows::ts(floor)
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional(),
-        )?;
-        let event_written = window.is_none();
-        let (window_count, window_started_at) = match own {
+        )
+    }
+
+    /// Grow THIS task's row by one: a suppressed repeat updates the counter
+    /// and refreshes the evidence to the LATEST attempt (the event keeps the
+    /// first), a fresh row starts at 1. Returns the count and the window's
+    /// opening time — the event's own time when this record opened it,
+    /// else the already-open window's start.
+    fn grow_agent_failure_row(
+        tx: &Transaction<'_>,
+        rec: &AgentFailureRecord,
+        own: Option<(String, i64)>,
+        window_started: Option<&str>,
+        event_written: bool,
+    ) -> StoreResult<(i64, Timestamp)> {
+        let started = match (event_written, window_started) {
+            (true, _) | (false, None) => rec.at,
+            (false, Some(s)) => rows::parse_ts(s.to_string())?,
+        };
+        match own {
             Some((id, count)) => {
-                // A suppressed repeat: the counter grows, the evidence is
-                // refreshed to the LATEST attempt (the event keeps the first).
-                tx.execute(
-                    "UPDATE agent_failures SET window_count=?1, last_at=?2, exit_code=?3, \
-                     duration_ms=?4, tail=?5, output_empty=?6, driver_log_tail=?7, \
-                     driver_log_note=?8, basis=?9, threshold=?10, message=?11, execution_id=?12 \
-                     WHERE id=?13",
-                    params![
-                        count + 1,
-                        rows::ts(&rec.at),
-                        rec.exit_code,
-                        rec.duration_ms,
-                        rec.tail,
-                        rec.output_empty as i64,
-                        rec.driver_log_tail,
-                        rec.driver_log_note,
-                        rec.basis,
-                        rec.threshold,
-                        rec.message,
-                        rec.execution_id.map(|e| e.to_string()),
-                        id,
-                    ],
-                )?;
-                let started = if event_written {
-                    rec.at
-                } else {
-                    rows::parse_ts(
-                        window
-                            .as_ref()
-                            .map(|w| w.1.clone())
-                            .unwrap_or_else(|| rows::ts(&rec.at)),
-                    )?
-                };
-                (count + 1, started)
+                Self::update_agent_failure_row(tx, rec, &id, count + 1)?;
+                Ok((count + 1, started))
             }
             None => {
-                tx.execute(
-                    "INSERT INTO agent_failures(id,task_id,execution_id,agent_name,driver,llm_provider,model,class,message,exit_code,duration_ms,tail,output_empty,driver_log_tail,driver_log_note,basis,window_count,window_started_at,first_at,last_at,threshold,created_at) \
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,1,?17,?17,?17,?18,?17)",
-                    params![
-                        rec.id.to_string(),
-                        rec.task_id.to_string(),
-                        rec.execution_id.map(|e| e.to_string()),
-                        rec.agent_name,
-                        rec.driver,
-                        rec.llm_provider,
-                        rec.model,
-                        rec.class,
-                        rec.message,
-                        rec.exit_code,
-                        rec.duration_ms,
-                        rec.tail,
-                        rec.output_empty as i64,
-                        rec.driver_log_tail,
-                        rec.driver_log_note,
-                        rec.basis,
-                        rows::ts(&rec.at),
-                        rec.threshold,
-                    ],
-                )?;
-                let started = if event_written {
-                    rec.at
-                } else {
-                    rows::parse_ts(
-                        window
-                            .as_ref()
-                            .map(|w| w.1.clone())
-                            .unwrap_or_else(|| rows::ts(&rec.at)),
-                    )?
-                };
-                (1, started)
+                Self::insert_agent_failure_row(tx, rec)?;
+                Ok((1, started))
             }
-        };
+        }
+    }
 
-        // The SERIES counter: only a success resets it (REQ-AF-05 AC2/AC6).
-        let series: Option<(i64, String)> = rows::unwrap_row(
+    fn update_agent_failure_row(
+        tx: &Transaction<'_>,
+        rec: &AgentFailureRecord,
+        id: &str,
+        count: i64,
+    ) -> StoreResult<()> {
+        tx.execute(
+            "UPDATE agent_failures SET window_count=?1, last_at=?2, exit_code=?3, \
+             duration_ms=?4, tail=?5, output_empty=?6, driver_log_tail=?7, \
+             driver_log_note=?8, basis=?9, threshold=?10, message=?11, execution_id=?12 \
+             WHERE id=?13",
+            params![
+                count,
+                rows::ts(&rec.at),
+                rec.exit_code,
+                rec.duration_ms,
+                rec.tail,
+                rec.output_empty as i64,
+                rec.driver_log_tail,
+                rec.driver_log_note,
+                rec.basis,
+                rec.threshold,
+                rec.message,
+                rec.execution_id.map(|e| e.to_string()),
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_agent_failure_row(tx: &Transaction<'_>, rec: &AgentFailureRecord) -> StoreResult<()> {
+        tx.execute(
+            "INSERT INTO agent_failures(id,task_id,execution_id,agent_name,driver,llm_provider,model,class,message,exit_code,duration_ms,tail,output_empty,driver_log_tail,driver_log_note,basis,window_count,window_started_at,first_at,last_at,threshold,created_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,1,?17,?17,?17,?18,?17)",
+            params![
+                rec.id.to_string(),
+                rec.task_id.to_string(),
+                rec.execution_id.map(|e| e.to_string()),
+                rec.agent_name,
+                rec.driver,
+                rec.llm_provider,
+                rec.model,
+                rec.class,
+                rec.message,
+                rec.exit_code,
+                rec.duration_ms,
+                rec.tail,
+                rec.output_empty as i64,
+                rec.driver_log_tail,
+                rec.driver_log_note,
+                rec.basis,
+                rows::ts(&rec.at),
+                rec.threshold,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The stored series row of this (task, agent), if any.
+    fn agent_failure_series_row(
+        tx: &Transaction<'_>,
+        rec: &AgentFailureRecord,
+    ) -> StoreResult<Option<(i64, String)>> {
+        rows::unwrap_row(
             tx.query_row(
                 "SELECT consecutive_count, first_at FROM agent_failure_series \
                  WHERE task_id=?1 AND agent_name=?2",
@@ -2108,8 +2163,16 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional(),
-        )?;
-        let (series_count, first_at) = match series {
+        )
+    }
+
+    /// The SERIES counter: only a success resets it (REQ-AF-05 AC2/AC6).
+    fn grow_agent_failure_series(
+        tx: &Transaction<'_>,
+        rec: &AgentFailureRecord,
+    ) -> StoreResult<(i64, Timestamp)> {
+        let series = Self::agent_failure_series_row(tx, rec)?;
+        match series {
             Some((count, first)) => {
                 tx.execute(
                     "UPDATE agent_failure_series SET consecutive_count=?1, last_at=?2, last_class=?3 \
@@ -2122,7 +2185,7 @@ impl Store {
                         rec.agent_name,
                     ],
                 )?;
-                (count + 1, rows::parse_ts(first)?)
+                Ok((count + 1, rows::parse_ts(first)?))
             }
             None => {
                 tx.execute(
@@ -2135,67 +2198,75 @@ impl Store {
                         rec.class,
                     ],
                 )?;
-                (1, rec.at)
+                Ok((1, rec.at))
             }
-        };
-        let total_failures: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(window_count),0) FROM agent_failures WHERE agent_name=?1",
-            params![rec.agent_name],
-            |r| r.get(0),
-        )?;
-
-        if event_written {
-            let payload = serde_json::json!({
-                (json_field::TASK_ID): rec.task_id.to_string(),
-                "execution_id": rec.execution_id.map(|e| e.to_string()),
-                (json_field::AGENT): rec.agent_name,
-                (json_field::DRIVER): rec.driver,
-                (json_field::LLM_PROVIDER): rec.llm_provider,
-                (json_field::MODEL): rec.model,
-                (json_field::CLASS): rec.class,
-                (json_field::MESSAGE): rec.message,
-                // The three-class split stays intact: the detailed class is a
-                // SUB-class of provider, never a fourth stored value on the
-                // execution row (REQ-AF-03 AC1/AC2).
-                (json_field::FAILURE_CLASS): failure_class::PROVIDER,
-                (json_field::EXIT_CODE): rec.exit_code,
-                (json_field::DURATION_MS): rec.duration_ms,
-                (json_field::TAIL): rec.tail,
-                (json_field::OUTPUT_EMPTY): rec.output_empty,
-                (json_field::DRIVER_LOG_TAIL): rec.driver_log_tail,
-                (json_field::DRIVER_LOG_NOTE): rec.driver_log_note,
-                (json_field::BASIS): rec.basis,
-                (json_field::WINDOW_COUNT): window_count,
-                (json_field::WINDOW_STARTED_AT): rows::ts(&window_started_at),
-                (json_field::SERIES_COUNT): series_count,
-                (json_field::FAILURES_TOTAL): total_failures,
-                (json_field::FIRST_AT): rows::ts(&first_at),
-                (json_field::LAST_AT): rows::ts(&rec.at),
-                (json_field::THRESHOLD): rec.threshold,
-                (json_field::AT): rows::ts(&rec.at),
-            });
-            tx.execute(
-                "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) \
-                 VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    new_id().to_string(),
-                    rec.task_id.to_string(),
-                    event_kind::AGENT_FAILED,
-                    format!("agent:{}", rec.agent_name),
-                    payload.to_string(),
-                    rows::ts(&rec.at),
-                ],
-            )?;
         }
-        tx.commit()?;
-        Ok(AgentFailureRecorded {
-            event_written,
-            window_count,
-            window_started_at,
-            series_count,
-            first_at,
-            last_at: rec.at,
-            total_failures,
+    }
+
+    /// All actual failures of an agent so far (window counters summed, so a
+    /// suppressed repeat still counts — REQ-AF-06 AC6).
+    fn agent_failure_sum(tx: &Transaction<'_>, agent: &str) -> StoreResult<i64> {
+        Ok(tx.query_row(
+            "SELECT COALESCE(SUM(window_count),0) FROM agent_failures WHERE agent_name=?1",
+            params![agent],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The ONE `agent.failed` event of an open window (REQ-AF-06 AC2).
+    fn append_agent_failed_event(
+        tx: &Transaction<'_>,
+        rec: &AgentFailureRecord,
+        recorded: &AgentFailureRecorded,
+    ) -> StoreResult<()> {
+        let payload = Self::agent_failed_payload(rec, recorded);
+        tx.execute(
+            "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) \
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                new_id().to_string(),
+                rec.task_id.to_string(),
+                event_kind::AGENT_FAILED,
+                format!("agent:{}", rec.agent_name),
+                payload.to_string(),
+                rows::ts(&rec.at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn agent_failed_payload(
+        rec: &AgentFailureRecord,
+        recorded: &AgentFailureRecorded,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            (json_field::TASK_ID): rec.task_id.to_string(),
+            "execution_id": rec.execution_id.map(|e| e.to_string()),
+            (json_field::AGENT): rec.agent_name,
+            (json_field::DRIVER): rec.driver,
+            (json_field::LLM_PROVIDER): rec.llm_provider,
+            (json_field::MODEL): rec.model,
+            (json_field::CLASS): rec.class,
+            (json_field::MESSAGE): rec.message,
+            // The three-class split stays intact: the detailed class is a
+            // SUB-class of provider, never a fourth stored value on the
+            // execution row (REQ-AF-03 AC1/AC2).
+            (json_field::FAILURE_CLASS): failure_class::PROVIDER,
+            (json_field::EXIT_CODE): rec.exit_code,
+            (json_field::DURATION_MS): rec.duration_ms,
+            (json_field::TAIL): rec.tail,
+            (json_field::OUTPUT_EMPTY): rec.output_empty,
+            (json_field::DRIVER_LOG_TAIL): rec.driver_log_tail,
+            (json_field::DRIVER_LOG_NOTE): rec.driver_log_note,
+            (json_field::BASIS): rec.basis,
+            (json_field::WINDOW_COUNT): recorded.window_count,
+            (json_field::WINDOW_STARTED_AT): rows::ts(&recorded.window_started_at),
+            (json_field::SERIES_COUNT): recorded.series_count,
+            (json_field::FAILURES_TOTAL): recorded.total_failures,
+            (json_field::FIRST_AT): rows::ts(&recorded.first_at),
+            (json_field::LAST_AT): rows::ts(&recorded.last_at),
+            (json_field::THRESHOLD): rec.threshold,
+            (json_field::AT): rows::ts(&rec.at),
         })
     }
 
