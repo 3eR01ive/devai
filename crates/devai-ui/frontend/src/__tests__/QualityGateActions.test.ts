@@ -1,10 +1,13 @@
-// The QA gate's hold-actions at the component seam (REQ-QG-02/03/05): the
-// window adds only the non-empty rationale, the platform's refusal is shown
-// next to the buttons, and the return may go with drafted points alone.
+// The QA gate's hold-actions at the component seam (REQ-QG-02/03/05,
+// REQ-SAY-01/05): each button carries its consequence in words, the window
+// adds only the non-empty rationale, the platform's refusal is shown next to
+// the buttons, the return may go with drafted points alone, and a point of
+// «не проверено» joins the draft with one click.
 import { mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import QualityGateActions from "../components/quality/QualityGateActions.vue";
+import { ACCEPT_LABEL, RETURN_LABEL } from "../quality_gate_view";
 import { HOLD_MS } from "../signature_view";
 import type { QualityGateView } from "../types";
 
@@ -63,20 +66,36 @@ function mountActions(over: Partial<InstanceType<typeof QualityGateActions>["$pr
       draft: [],
       busy: false,
       error: null,
+      draftNote: "все замечания ниже уже здесь — сними те, что не надо возвращать.",
+      unchecked: [],
       ...over,
     },
   });
 }
 
 describe("QualityGateActions", () => {
+  it("signs both buttons with their consequence, never with an internal state", () => {
+    const w = mountActions();
+    const accept = w.find("button.hold.approve").text();
+    const rework = w.find("button.hold.rework").text();
+    expect(accept).toContain(ACCEPT_LABEL);
+    expect(rework).toContain(RETURN_LABEL);
+    for (const label of [accept, rework]) {
+      expect(label).not.toMatch(/ACCEPTED|REWORK|INCONSISTENT|PASS|FAIL/);
+    }
+    // The hold mechanic is explained beside the pair, not inside the label.
+    expect(w.text()).toContain("удерживай");
+    w.unmount();
+  });
+
   it("keeps both actions disabled and explains why while the rationale is empty", async () => {
     const w = mountActions();
     const accept = w.find("button.hold.approve");
     const rework = w.find("button.hold.rework");
     expect(accept.attributes("disabled")).toBeDefined();
     expect(rework.attributes("disabled")).toBeDefined();
-    expect(w.text()).toContain("сначала обоснование");
-    expect(w.text()).toContain("сначала обоснование или пункты");
+    expect(w.text()).toContain("без обоснования принять нельзя");
+    expect(w.text()).toContain("без обоснования или пунктов возврат недоступен");
 
     await w.find("textarea").setValue("принято человеком");
     expect(w.find("button.hold.approve").attributes("disabled")).toBeUndefined();
@@ -117,7 +136,44 @@ describe("QualityGateActions", () => {
     const [kind, text] = emits?.[0] as [string, string];
     expect(kind).toBe("return");
     expect(text).toContain("cargo fmt дрейф");
-    expect(text).toContain("сайт: a.rs:442");
+    expect(text).toContain("где: a.rs:442");
+    w.unmount();
+  });
+
+  it("shows the filled draft as the points that will go back, one text field each", async () => {
+    const w = mountActions({ draft: [draftItem] });
+    expect(w.text()).toContain("1 пункт(ов) уйдёт вместе с возвратом");
+    expect(w.text()).toContain("сними те, что не надо возвращать");
+    const input = w.find(".draft-item input");
+    expect((input.element as HTMLInputElement).value).toBe("cargo fmt дрейф");
+    await input.setValue("поправить форматирование");
+    const emitted = w.emitted("update:draft")?.[0]?.[0] as { requirement: string }[];
+    expect(emitted[0].requirement).toBe("поправить форматирование");
+    // A row can be taken out with one click: the operator removes, not adds.
+    await w.find(".draft-item button.remove").trigger("click");
+    expect(w.emitted("update:draft")).toHaveLength(2);
+    w.unmount();
+  });
+
+  it("adds a «не проверено» point to the draft with one click", async () => {
+    const w = mountActions({
+      unchecked: [
+        {
+          id: "brk/x",
+          what: "проверка не прошла",
+          site: "",
+          note: "нужен повторный прогон",
+          missing: "probe could not run",
+          line: "brk/x · балл —",
+        },
+      ],
+    });
+    expect(w.text()).toContain("не проверено: проверка не прошла");
+    await w.find(".unchecked-add button").trigger("click");
+    const emitted = w.emitted("update:draft")?.[0]?.[0] as { item_id: string; site: string }[];
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].item_id).toBe("brk/x");
+    expect(emitted[0].site).toBe("");
     w.unmount();
   });
 

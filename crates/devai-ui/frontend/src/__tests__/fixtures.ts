@@ -93,6 +93,8 @@ export function report(overrides: Partial<QualityReportView> = {}): QualityRepor
     status: "CURRENT",
     source: "flat_text",
     freshness: null,
+    // REQ-SAY-01..06: у плоского тела нет человеческого первого слоя.
+    first_layer: null,
     report: { score: 0.7 },
     report_text: "человеческий отчёт качества",
     ...overrides,

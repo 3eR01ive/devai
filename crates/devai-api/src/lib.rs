@@ -501,6 +501,7 @@ impl Api {
             report_text: Some(p.presented.text),
             source: p.presented.source.as_str().to_string(),
             freshness: Some(p.presented.freshness),
+            first_layer: p.presented.first_layer,
         })
     }
 
@@ -1212,8 +1213,17 @@ pub struct QualityReportView {
     /// REQ-QH-05: freshness as store fact — `stale` plus the marker and the
     /// re-audit execution it names. Never inferred from the report body.
     pub freshness: Option<ReportFreshness>,
+    /// REQ-SAY-01..05: the human FIRST LAYER of the same stored form — «что
+    /// нашёл аудит» in words, the findings with their human phrase / site /
+    /// what they cost, and «не проверено» kept apart. Read off the stored
+    /// facts at presentation time (the `report_text` precedent), never a
+    /// recomputation of the report. `None` when the shown body has no readable
+    /// human form — such a report stays the honest flat text / marker.
+    pub first_layer: Option<FirstLayerView>,
 }
 
+/// REQ-SAY-01..05: the human first layer published beside a stored report.
+pub use devai_runtime::human_view::first_layer::FirstLayerView;
 /// Why the report on screen is (or is not) the last word — raw store facts:
 /// the task phase, the stored artifact status, and the auditor execution.
 /// The shape lives with the human form's presentation module (one owner for

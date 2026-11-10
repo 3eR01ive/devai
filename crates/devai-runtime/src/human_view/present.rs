@@ -14,6 +14,7 @@ use devai_core::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::first_layer::{self, FirstLayerView};
 use super::{
     HumanReportView, REAUDIT_NOT_RUNNING, REAUDIT_NOT_STARTED, REAUDIT_RUNNING, REAUDIT_UNFINISHED,
     STALE_CAUSE_REQUIREMENTS_REVISION, STALE_CAUSE_REWORK_RETURN, STALE_MARKER,
@@ -92,6 +93,12 @@ impl RenderSource {
 pub struct RenderedReport {
     pub text: String,
     pub source: RenderSource,
+    /// REQ-SAY-01..05: the human first layer of the SAME stored form — «что
+    /// нашёл аудит», the findings in plain words and «не проверено» kept
+    /// apart. `None` whenever the body has no readable human form (a legacy
+    /// flat text, a damaged form, a broken body): such a report is shown as
+    /// what it is, never dressed up as the new layer.
+    pub first_layer: Option<FirstLayerView>,
 }
 
 /// The text of a report whose BLOB does not parse as JSON at all (rework R4):
@@ -113,6 +120,7 @@ pub fn render_stored_report(v: &Value) -> RenderedReport {
             Ok(form) => RenderedReport {
                 text: render_text(&form),
                 source: RenderSource::HumanForm,
+                first_layer: Some(first_layer::of(&form)),
             },
             Err(_) => RenderedReport {
                 text: match flat {
@@ -122,6 +130,7 @@ pub fn render_stored_report(v: &Value) -> RenderedReport {
                     None => "⚠ форма отчёта повреждена — рендеринга нет".to_string(),
                 },
                 source: RenderSource::CorruptForm,
+                first_layer: None,
             },
         };
     }
@@ -129,10 +138,12 @@ pub fn render_stored_report(v: &Value) -> RenderedReport {
         Some(flat) => RenderedReport {
             text: flat.to_string(),
             source: RenderSource::FlatText,
+            first_layer: None,
         },
         None => RenderedReport {
             text: "(report assembled before @2 — no rendering)".to_string(),
             source: RenderSource::Absent,
+            first_layer: None,
         },
     }
 }
@@ -158,6 +169,9 @@ pub struct PresentedReport {
     pub text: String,
     pub source: RenderSource,
     pub freshness: ReportFreshness,
+    /// The human first layer of the same stored form (REQ-SAY-01..05); `None`
+    /// when the body carries no readable human form.
+    pub first_layer: Option<FirstLayerView>,
 }
 
 impl PresentedReport {

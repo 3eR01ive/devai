@@ -1362,7 +1362,7 @@ fn task_run(
                 outln!("── quality report (platform-assembled) ──");
                 outln!("{text}");
             }
-            outln!("⏸ acceptance is a human gate — accept or return the result");
+            outln!("⏸ решение твоё: принять работу или вернуть её на переделку");
         }
         Gate::ReportFresh => {
             // The freshness gate stopped the run: no auditor execution was

@@ -26,6 +26,7 @@
 //! Code and probe output live in the per-item `evidence` layer (REQ-QH-04),
 //! never inside the visible one-line summary.
 
+pub mod first_layer;
 pub mod present;
 
 use std::collections::BTreeMap;
@@ -400,11 +401,7 @@ impl Buckets {
             HumanItem {
                 id: "score-threshold".into(),
                 kind: ItemKind::Threshold.as_str().into(),
-                summary: format!(
-                    "S={} ниже порога {} — вердикт не может быть пройден",
-                    fmt_num(score),
-                    fmt_num(theta)
-                ),
+                summary: "общий балл ниже порога — так вердикт не пройти".to_string(),
                 line: String::new(),
                 site: String::new(),
                 score: Some(score),
@@ -430,11 +427,8 @@ impl Buckets {
             HumanItem {
                 id: "blocked-weight".into(),
                 kind: ItemKind::Cap.as_str().into(),
-                summary: format!(
-                    "невыполненных проверок на вес {} > {} — вердикт не может быть готовым",
-                    fmt_num(blocked_weight),
-                    fmt_num(max_blocked_weight)
-                ),
+                summary: "слишком много проверок не выполнено — вердикт не может быть готовым"
+                    .to_string(),
                 line: String::new(),
                 site: String::new(),
                 score: None,
@@ -933,81 +927,120 @@ fn first_site(text: &str) -> Option<String> {
     None
 }
 
-/// Lay the stored form out as text. PURE LAYOUT: every number, group and
-/// order below is read from the struct — nothing is recomputed here, so the
-/// CLI text of one stored form is byte-identical on every read.
+/// Lay the stored form out as text. The ORDER is the human one (decision of
+/// 10.11, REQ-SAY-06 AC2): what the audit found → the findings in plain words
+/// → «не проверено» → the details and figures. PURE LAYOUT: every number,
+/// group and order below is read from the struct — nothing is recomputed, so
+/// the CLI text of one stored form is byte-identical on every read.
 pub fn render_text(view: &HumanReportView) -> String {
-    let mut out = render_headline(&view.headline);
-    for (gi, g) in view.groups.iter().enumerate() {
-        render_group(&mut out, gi, g);
-    }
+    let first = first_layer::of(view);
+    let mut out = vec![
+        "ОТЧЁТ КАЧЕСТВА · человеческая форма".to_string(),
+        String::new(),
+        first.found.clone(),
+    ];
+    render_findings(&mut out, &first.findings);
+    render_unchecked(&mut out, &first.unchecked, &first.unchecked_lead);
+    render_details(&mut out, view);
     out.join("\n")
 }
 
-/// The verdict block: machine verdict, S against the threshold, basis, and the
-/// per-group counts — all read off the stored struct. The count of fully
-/// passed points is printed when there is one, so the norm is accounted for
-/// instead of hidden (R4).
-fn render_headline(h: &HumanHeadline) -> Vec<String> {
+/// The findings of the first layer: what is wrong, where it was found and what
+/// it costs; the proof stays collapsed beneath the point it belongs to.
+fn render_findings(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    out.push(String::new());
+    out.push(format!("ЧТО НАШЁЛ АУДИТ ({})", rows.len()));
+    for (i, r) in rows.iter().enumerate() {
+        out.push(format!(
+            "  {}. {} — где: {} ({})",
+            i + 1,
+            r.what,
+            first_layer::site_phrase(&r.site),
+            r.note
+        ));
+        render_evidence(out, &r.evidence);
+    }
+}
+
+/// «Не проверено» as its OWN section (REQ-SAY-04): it is a hole in the data,
+/// not a defect — what was missing and what to do about it, per point.
+fn render_unchecked(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow], lead: &str) {
+    if rows.is_empty() {
+        return;
+    }
+    out.push(String::new());
+    out.push(format!("НЕ ПРОВЕРЕНО — ЧЕГО НЕ ХВАТИЛО ({})", rows.len()));
+    out.push(format!("  {lead}"));
+    for (i, r) in rows.iter().enumerate() {
+        out.push(format!("  {}. {}", i + 1, r.what));
+        out.push(format!("     где: {}", first_layer::site_phrase(&r.site)));
+        out.push(format!(
+            "     чего не хватило: {}",
+            r.missing
+                .as_deref()
+                .unwrap_or(first_layer::MISSING_UNRECORDED)
+        ));
+        out.push(format!("     что делать: {}", r.note));
+        render_evidence(out, &r.evidence);
+    }
+}
+
+/// The collapsed proof layer of one point, indented UNDER it — never code
+/// inside the sentence.
+fn render_evidence(out: &mut Vec<String>, evidence: &[String]) {
+    if evidence.is_empty() {
+        return;
+    }
+    out.push(format!(
+        "     └ доказательства (свёрнуто, {}):",
+        evidence.len()
+    ));
+    for e in evidence {
+        for line in e.lines() {
+            out.push(format!("       │ {}", line.trim_end()));
+        }
+    }
+}
+
+/// The details and figures: the verdict with its machine token, the one
+/// precision of every number (`fmt_num`) and the stored machine row of every
+/// point. Nothing is hidden — it is only no longer first (REQ-SAY-06).
+fn render_details(out: &mut Vec<String>, view: &HumanReportView) {
+    let h = &view.headline;
+    out.push(String::new());
+    out.push("ПОДРОБНОСТИ".to_string());
+    out.push(format!(
+        "  вердикт: {} ({}) — {}: {}",
+        h.verdict, h.machine_verdict, h.numbers, h.basis
+    ));
     let mut counts = format!(
-        "бьёт по вердикту: {} · нюансы: {} · якоря: {} · не проверено: {}",
+        "  бьёт по вердикту: {} · нюансы: {} · якоря: {} · не проверено: {}",
         h.counts.blocks, h.counts.nuances, h.counts.anchors, h.counts.unchecked
     );
     if h.counts.passed > 0 {
         counts.push_str(&format!(" · пройдено без замечаний: {}", h.counts.passed));
     }
-    vec![
-        "ОТЧЁТ КАЧЕСТВА · человеческая форма".to_string(),
-        String::new(),
-        format!(
-            "ВЕРДИКТ: {} ({}) — {}: {}",
-            h.verdict, h.machine_verdict, h.numbers, h.basis
-        ),
-        counts,
-    ]
-}
-
-/// One group: heading, lead, then its rows. An empty group prints no heading
-/// (the conditional-section precedent of §2.6 `render`).
-fn render_group(out: &mut Vec<String>, gi: usize, g: &HumanGroup) {
-    if g.items.is_empty() {
-        return;
-    }
-    out.push(String::new());
-    out.push(format!("{}) {} ({})", gi + 1, g.title, g.items.len()));
-    if !g.lead.is_empty() {
-        out.push(format!("   {}", g.lead));
-    }
-    for (ii, it) in g.items.iter().enumerate() {
-        if g.key == GROUP_ANCHORS {
-            out.push(it.line.clone());
+    out.push(counts);
+    for (gi, g) in view.groups.iter().enumerate() {
+        if g.items.is_empty() {
             continue;
         }
-        render_item(out, ii, it);
-    }
-}
-
-/// One stored item as the subordinated block of the CLI channel (REQ-QH-04):
-/// the short visible row, the essence, the reason, then the collapsed proof
-/// layer indented UNDER it — never code inside the sentence.
-fn render_item(out: &mut Vec<String>, ii: usize, it: &HumanItem) {
-    out.push(format!("  {}. {}", ii + 1, it.line));
-    if !it.summary.is_empty() {
-        out.push(format!("     суть: {}", it.summary));
-    }
-    if let Some(reason) = &it.reason {
-        out.push(format!("     причина: {}", reason));
-    }
-    if it.evidence.is_empty() {
-        return;
-    }
-    out.push(format!(
-        "     └ доказательства (свёрнуто, {}):",
-        it.evidence.len()
-    ));
-    for e in &it.evidence {
-        for line in e.lines() {
-            out.push(format!("       │ {}", line.trim_end()));
+        out.push(String::new());
+        out.push(format!("  {}) {} ({})", gi + 1, g.title, g.items.len()));
+        if !g.lead.is_empty() {
+            out.push(format!("     {}", g.lead));
+        }
+        for it in &g.items {
+            // An anchor line already carries its own «· name — закреплено»
+            // form (name only); every other row is the machine row of a point.
+            if g.key == GROUP_ANCHORS {
+                out.push(format!("     {}", it.line.trim_start()));
+            } else {
+                out.push(format!("     · {}", it.line));
+            }
         }
     }
 }
@@ -1419,7 +1452,15 @@ scoring:
         assert_eq!(row.id, "score-threshold");
         assert_eq!(row.kind, "threshold");
         assert_eq!(row.score, Some(0.55));
-        assert!(row.summary.contains("0.550") && row.summary.contains("0.800"));
+        // The visible sentence of the first layer is words: S and the threshold
+        // are the row's own figures (printed in «подробности»), never a number
+        // dump in the headline (REQ-SAY-02 AC2).
+        assert!(
+            !row.summary.chars().any(|c| c.is_ascii_digit()),
+            "the human sentence carries no figure: {}",
+            row.summary
+        );
+        assert!(row.summary.contains("порог"));
 
         // At or above theta there is no threshold row: the fact is absent, so
         // no row is invented.
@@ -1506,10 +1547,18 @@ scoring:
         // One precision for every figure of the form (`fmt_num`), the same
         // formatter the row's own weight/summary uses (rework R3/mt-dry).
         assert!(
-            v.groups[0].items[1].summary.contains("0.250 > 0.200"),
-            "{}",
+            !v.groups[0].items[1]
+                .summary
+                .chars()
+                .any(|c| c.is_ascii_digit()),
+            "the human sentence carries no figure: {}",
             v.groups[0].items[1].summary
         );
+        // The figures themselves are still the row's own fact, printed in the
+        // details layer by the one formatter.
+        assert_eq!(v.groups[0].items[1].weight, Some(0.25));
+        assert!(!v.groups[0].items[1].line.is_empty());
+        assert!(render_text(&v).contains("вес 0.250"));
         // The blocked check itself is «не проверено», never duplicated here.
         assert_eq!(v.groups[3].items.len(), 1);
         assert_eq!(v.groups[3].items[0].id, "brk/x");

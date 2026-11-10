@@ -250,6 +250,31 @@ export interface HumanForm {
   max_blocked_weight: number;
 }
 
+// The FIRST LAYER of a stored report (REQ-SAY-01..06): read off the stored
+// human form by the platform, printed verbatim here. It carries the human
+// wording («что нашёл аудит», чем грозит каждое замечание, что делать с
+// непроверенным) and NEVER a figure; every number stays in the stored row.
+export interface FirstLayerRow {
+  id: string;
+  what: string;
+  // Empty when the report named no site; the reader says «место не указано».
+  site: string;
+  // A finding: what it costs. An unchecked point: what to do about it.
+  note: string;
+  // Unchecked points only: what exactly was missing (the stored reason).
+  missing?: string;
+  // The stored machine row (id · score · weight · importance · site).
+  line: string;
+  evidence?: string[];
+}
+
+export interface FirstLayer {
+  found: string;
+  findings: FirstLayerRow[];
+  unchecked: FirstLayerRow[];
+  unchecked_lead: string;
+}
+
 export interface ReportFreshness {
   stale: boolean;
   marker: string;
@@ -275,6 +300,9 @@ export interface QualityReportView {
   // угадывая по тексту.
   source: string;
   freshness: ReportFreshness | null;
+  // REQ-SAY-01..06: человеческий первый слой того же отчёта; null — у тела
+  // нет читаемой человеческой формы (старый плоский текст / повреждение).
+  first_layer: FirstLayer | null;
 }
 
 export interface TaskDependency {

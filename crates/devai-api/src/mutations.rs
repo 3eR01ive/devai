@@ -2078,17 +2078,19 @@ impl Api {
         let events = self.store.events(task.id, None)?;
         let cause = present::stale_cause(&events, a.id);
         let freshness = present::freshness(task, a, &execs, cause.as_ref());
-        let (body, text, source) = match serde_json::from_slice::<serde_json::Value>(&blob) {
-            Ok(body) => {
-                let rendered = present::render_stored_report(&body);
-                (body, rendered.text, rendered.source)
-            }
-            Err(e) => (
-                serde_json::Value::Null,
-                present::corrupt_body_text(&short_id(&a.id), &e.to_string()),
-                devai_runtime::human_view::present::RenderSource::CorruptBody,
-            ),
-        };
+        let (body, text, source, first_layer) =
+            match serde_json::from_slice::<serde_json::Value>(&blob) {
+                Ok(body) => {
+                    let rendered = present::render_stored_report(&body);
+                    (body, rendered.text, rendered.source, rendered.first_layer)
+                }
+                Err(e) => (
+                    serde_json::Value::Null,
+                    present::corrupt_body_text(&short_id(&a.id), &e.to_string()),
+                    devai_runtime::human_view::present::RenderSource::CorruptBody,
+                    None,
+                ),
+            };
         Ok(Some(PresentedQuality {
             artifact: a.clone(),
             body,
@@ -2096,6 +2098,7 @@ impl Api {
                 text,
                 source,
                 freshness,
+                first_layer,
             },
         }))
     }
