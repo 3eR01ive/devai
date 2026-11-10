@@ -718,7 +718,7 @@ impl<'a> Engine<'a> {
 
             // DRAFT -> ANALYSIS is bookkeeping, not a role execution.
             if task.state == TaskState::Draft {
-                let m = workflow::start(&task, actor, Utc::now())?;
+                let m = workflow::start(&self.process, &task, actor, Utc::now())?;
                 self.store.commit(task.lock_version, &m)?;
                 continue;
             }
@@ -1441,6 +1441,7 @@ impl<'a> Engine<'a> {
                 // question commit atomically. No artifact is published —
                 // rejected bodies never become artifacts (REQ-FG-07 AC2).
                 let m = workflow::escalate_form_rejection(
+                    &self.process,
                     task,
                     new_id(),
                     role_slug,
@@ -1616,6 +1617,7 @@ impl<'a> Engine<'a> {
             serde_json::from_slice(&content).unwrap_or(serde_json::Value::Null);
         let m = match kind {
             ArtifactKind::RequirementsSpec => workflow::requirements_published(
+                &self.process,
                 task,
                 &fresh,
                 Some(&format!("{role_slug} execution {}", execution.id)),
@@ -1633,7 +1635,14 @@ impl<'a> Engine<'a> {
                     .and_then(|v| v.as_str())
                     .and_then(|s| Verdict::parse(s).ok())
                     .unwrap_or(Verdict::NeedsRevision);
-                workflow::review_recorded(task, verdict, out.summary.as_deref(), actor, Utc::now())?
+                workflow::review_recorded(
+                    &self.process,
+                    task,
+                    verdict,
+                    out.summary.as_deref(),
+                    actor,
+                    Utc::now(),
+                )?
             }
             ArtifactKind::ImplementationReport => {
                 // REQ-RG-01/02: the empty-rework gate serializes INSIDE the
@@ -1651,7 +1660,7 @@ impl<'a> Engine<'a> {
                     &fresh,
                     out.summary.clone(),
                 )?;
-                workflow::implementation_reported(task, &facts, actor, Utc::now())?
+                workflow::implementation_reported(&self.process, task, &facts, actor, Utc::now())?
             }
             ArtifactKind::QualityReport => {
                 // QA produced its report; acceptance is a HUMAN decision.

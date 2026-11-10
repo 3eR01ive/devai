@@ -162,6 +162,17 @@ impl Api {
         Ok(Self::open_session(home, actor, SessionKind::Human)?.with_autolaunch(false))
     }
 
+    /// The WRITE handle of a live human surface — the window. Same home and
+    /// actor as [`Api::open`], but a PLATFORM session: a human decision it
+    /// records may start the run the next state requires (REQ-AR-12). Signing
+    /// or returning a gate from the window must not leave the task without a
+    /// run — that was exactly the hole the operator rejected spec v3 over
+    /// (QA R4 on task 01a1b7dc). The READ plane (`open_observed`) still never
+    /// launches: observation must not spawn processes as a side effect.
+    pub fn open_for_window(home: &Path, actor: &str) -> ApiResult<Api> {
+        Self::open_session(home, actor, SessionKind::Human)
+    }
+
     /// The same entry with the session's provenance made explicit: the CLI
     /// classifies its own process (see [`SessionKind`]) and the API enforces
     /// the human-only acts against it.

@@ -40,6 +40,11 @@ pub const SUPERVISOR_LOG: &str = "supervisor.log";
 /// the process is gone (REQ-AR-03/07). `--wait` never re-runs a role.
 pub const OUTCOME_FILE: &str = "outcome.json";
 
+/// The runner's OWN record of its exit: the exit code plus the bounded tail of
+/// its transcript (REQ-AR-03). Written by `__supervise`, read by `exec get` —
+/// the platform's outcome survives the caller and is visible without it.
+pub const RUNNER_TAIL_FILE: &str = "role_output_tail.txt";
+
 /// One launch request as the API hands it to a runner.
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -59,14 +64,19 @@ pub struct LaunchRequest {
 /// the run handle the operator can quote; `AlreadyRunning` carries the id of
 /// the execution that already holds the task (REQ-AR-06: the refusal names it
 /// and does not touch the first run); `Refused` is «нельзя» with a reason.
+///
+/// `caller_run_id` is the number THIS call minted and handed to its runner —
+/// never the owner's run. In `AlreadyRunning` the owner is named by
+/// `execution_id` alone; the caller's own run number never became a run, so
+/// reading it as «the run that is going» would be wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchOutcome {
     Started {
-        run_id: String,
+        caller_run_id: String,
         execution_id: String,
     },
     AlreadyRunning {
-        run_id: String,
+        caller_run_id: String,
         execution_id: String,
     },
     Refused {
@@ -86,6 +96,10 @@ pub enum LaunchError {
     Timeout(String),
     /// The runner reported a refusal it could not classify itself.
     Runner(String),
+    /// REQ-AR-01 AC1: no way to place the runner OUTSIDE the caller's
+    /// resource-control area while the caller IS a systemd unit. Refused
+    /// typed — a same-session child would be swept with the unit.
+    NoScope(String),
 }
 
 impl std::fmt::Display for LaunchError {
@@ -95,6 +109,7 @@ impl std::fmt::Display for LaunchError {
             LaunchError::Spawn(m) => write!(f, "cannot start the platform runner: {m}"),
             LaunchError::Timeout(m) => write!(f, "{m}"),
             LaunchError::Runner(m) => write!(f, "platform runner: {m}"),
+            LaunchError::NoScope(m) => write!(f, "{m}"),
         }
     }
 }
@@ -176,6 +191,204 @@ pub fn ack_path(home: &Path, run_id: &str) -> PathBuf {
     home.join("tmp").join(format!("launch-{run_id}.ack"))
 }
 
+/// The tail bound lives in ONE place (`crate::tail`); re-exported here so
+/// every historical caller path keeps working against the single rule.
+pub use crate::tail::{TAIL_LINES, TailError, read_tail};
+
+/// How many lines of the runner's own transcript the launch error quotes —
+/// a diagnostic slice, deliberately far below [`TAIL_LINES`] (the evidence
+/// tail keeps the rest).
+const DIAGNOSTIC_TAIL_LINES: usize = 20;
+
+/// The files of one launch handshake.
+struct Handshake {
+    ack: PathBuf,
+    log: PathBuf,
+}
+
+/// Create the evidence dir, the ack dir and clear a stale ack of the same run
+/// id. A failed preparation refuses the launch — nothing was started.
+fn prepare_handshake(req: &LaunchRequest) -> Result<Handshake, LaunchError> {
+    let ack = ack_path(&req.home, &req.run_id);
+    if let Some(parent) = ack.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LaunchError::Spawn(format!("cannot create {}: {e}", parent.display())))?;
+    }
+    // A stale ack from a previous, identical run id would be read as this
+    // launch's answer — clear it first.
+    let _ = std::fs::remove_file(&ack);
+    let ev = run_evidence_dir(&req.home, &req.task_id, &req.run_id);
+    std::fs::create_dir_all(&ev)
+        .map_err(|e| LaunchError::Spawn(format!("cannot create {}: {e}", ev.display())))?;
+    Ok(Handshake {
+        ack,
+        log: ev.join(SUPERVISOR_LOG),
+    })
+}
+
+/// WHERE the runner lands (REQ-AR-01 AC1). Two acceptable answers and one
+/// refusal, decided from facts:
+///
+/// * `Some(systemd-run)` — the runner becomes its own transient USER unit, so
+///   stopping the calling unit cannot reach it. No root (a user scope).
+/// * no user manager + the caller is NOT a unit (`INVOCATION_ID` absent): the
+///   caller owns no cgroup anyone would sweep, and `setsid` already makes the
+///   runner its own session — that IS the guarantee the AC asks for.
+/// * no user manager + the caller IS a systemd unit: a session would still die
+///   with the unit's cgroup — exactly the 12/23/39/59-minute incident. This is
+///   refused typed, never reported as «started».
+fn scope_decision(
+    user_scope: Option<PathBuf>,
+    caller_is_unit: bool,
+) -> Result<Option<PathBuf>, LaunchError> {
+    match (user_scope, caller_is_unit) {
+        (Some(scope), _) => Ok(Some(scope)),
+        (None, false) => Ok(None),
+        (None, true) => Err(LaunchError::NoScope(format!(
+            "the caller runs inside a systemd unit and no user manager answered, so the role \
+             cannot be placed outside the caller's cgroup — a same-session child would be killed \
+             with the unit (REQ-AR-01). Start the platform from a user session, or enable the \
+             user manager (`systemctl --user`)"
+        ))),
+    }
+}
+
+/// The rootless marker of «my process is a unit's main process»: systemd
+/// exports `INVOCATION_ID` (and `JOURNAL_STREAM`) to every service it starts.
+fn caller_runs_inside_a_unit() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some() || std::env::var_os("JOURNAL_STREAM").is_some()
+}
+
+/// The two handles the runner writes into: its own transcript (stdout) and a
+/// clone for stderr. Opened HERE so a broken evidence path refuses the launch
+/// before a child exists.
+fn supervisor_sink(path: &Path) -> Result<(std::fs::File, std::fs::File), LaunchError> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| LaunchError::Spawn(format!("cannot open {}: {e}", path.display())))?;
+    let err = log
+        .try_clone()
+        .map_err(|e| LaunchError::Spawn(format!("cannot clone log handle: {e}")))?;
+    Ok((log, err))
+}
+
+/// The command head: the runner itself, or the transient user scope wrapping
+/// it (see [`scope_decision`]).
+fn scope_command(exe: &Path, scope: Option<&Path>) -> Command {
+    match scope {
+        Some(systemd_run) => {
+            let mut c = Command::new(systemd_run);
+            c.args(["--user", "--scope", "--quiet", "--collect", "--"]);
+            c.arg(exe);
+            c
+        }
+        None => Command::new(exe),
+    }
+}
+
+/// Build the runner command line. The runner is the PLATFORM, not a role, so
+/// it must not inherit the caller's run marker.
+fn runner_command(
+    exe: &Path,
+    req: &LaunchRequest,
+    hs: &Handshake,
+    scope: Option<&Path>,
+) -> Result<Command, LaunchError> {
+    let (log, log_err) = supervisor_sink(&hs.log)?;
+    let mut cmd = scope_command(exe, scope);
+    cmd.arg("--home")
+        .arg(&req.home)
+        .arg("--actor")
+        .arg(&req.actor)
+        .arg(RUNNER_SUBCOMMAND)
+        .arg("--task")
+        .arg(&req.task_id)
+        .arg("--run")
+        .arg(&req.run_id)
+        .arg("--ack")
+        .arg(&hs.ack);
+    if !req.agent.is_empty() {
+        cmd.arg("--agent").arg(&req.agent);
+    }
+    if let Some(ws) = &req.workspace {
+        cmd.arg("--workspace").arg(ws);
+    }
+    if req.force_reaudit {
+        cmd.arg("--force-reaudit");
+    }
+    cmd.env_remove("DEVAI_EVIDENCE_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    Ok(cmd)
+}
+
+/// Give the child its own SESSION when no user scope is available. `setsid`
+/// needs no privileges, so the role never requires root (REQ-AR-01/17); a
+/// failure surfaces as the child's inability to write the ack (the caller then
+/// refuses the launch — never a same-session fallback).
+fn detach_into_own_session(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches no shared state;
+        // the closure runs in the forked child before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+/// Bounded wait for the runner's handshake. Three exits: the handshake, the
+/// runner dying without one (its own tail IS the reason) and the timeout.
+fn wait_for_handshake(
+    child: &mut std::process::Child,
+    hs: &Handshake,
+) -> Result<LaunchOutcome, LaunchError> {
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    loop {
+        if let Some(text) = read_ack(&hs.ack) {
+            let _ = std::fs::remove_file(&hs.ack);
+            return parse_ack(&text);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_file(&hs.ack);
+            return Err(runner_died(&hs.log, status));
+        }
+        if Instant::now() >= deadline {
+            let _ = std::fs::remove_file(&hs.ack);
+            return Err(LaunchError::Timeout(format!(
+                "no execution reported within {}s — read {}",
+                ACK_TIMEOUT.as_secs(),
+                hs.log.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The runner exited before reporting: its transcript tail is the reason. An
+/// unreadable transcript is NAMED as such — never dressed up as «no output».
+fn runner_died(log: &Path, status: std::process::ExitStatus) -> LaunchError {
+    match read_tail(log, DIAGNOSTIC_TAIL_LINES) {
+        Ok(tail) if tail.trim().is_empty() => LaunchError::Runner(format!(
+            "runner exited with {status} without reporting an execution"
+        )),
+        Ok(tail) => LaunchError::Runner(format!("runner exited with {status}: {tail}")),
+        Err(e) => LaunchError::Runner(format!(
+            "runner exited with {status} without reporting an execution, and its transcript is \
+             unreadable ({e})"
+        )),
+    }
+}
+
 /// Start ONE detached platform runner and wait (bounded) for its handshake.
 ///
 /// The child is placed in its OWN session via `setsid(2)` — the mechanism the
@@ -191,135 +404,36 @@ pub fn launch(req: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
                 .to_string(),
         )
     })?;
-    let ack = ack_path(&req.home, &req.run_id);
-    if let Some(parent) = ack.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| LaunchError::Spawn(format!("cannot create {}: {e}", parent.display())))?;
-    }
-    // A stale ack from a previous, identical run id would be read as this
-    // launch's answer — clear it first.
-    let _ = std::fs::remove_file(&ack);
-    let ev = run_evidence_dir(&req.home, &req.task_id, &req.run_id);
-    std::fs::create_dir_all(&ev)
-        .map_err(|e| LaunchError::Spawn(format!("cannot create {}: {e}", ev.display())))?;
-    let log_path = ev.join(SUPERVISOR_LOG);
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| LaunchError::Spawn(format!("cannot open {}: {e}", log_path.display())))?;
-    let log_err = log
-        .try_clone()
-        .map_err(|e| LaunchError::Spawn(format!("cannot clone log handle: {e}")))?;
-
-    // REQ-AR-01: the runner must live OUTSIDE the caller's resource-control
-    // area, not merely in another session. A session (`setsid`) survives the
-    // caller's terminal, but NOT a systemd unit that is stopped: the default
-    // `KillMode=control-group` kills every process in the unit's cgroup,
-    // which is exactly the 12/23/39/59-minute incident. The rootless escape
-    // is a transient USER scope (`systemd-run --user --scope`): it registers
-    // the command as its own unit under the user manager, so stopping the
-    // calling unit leaves it alone. No root, no daemon of ours (ASM-5).
-    // Where no user manager answers (containers, CI), the launch falls back
-    // to `setsid` — the session guarantee — and says so in the supervisor log.
-    let scope = systemd_user_scope();
-    let mut cmd = match &scope {
-        Some(systemd_run) => {
-            let mut c = Command::new(systemd_run);
-            c.args(["--user", "--scope", "--quiet", "--collect", "--"]);
-            c.arg(&exe);
-            c
-        }
-        None => Command::new(&exe),
-    };
-    cmd.arg("--home")
-        .arg(&req.home)
-        .arg("--actor")
-        .arg(&req.actor)
-        .arg(RUNNER_SUBCOMMAND)
-        .arg("--task")
-        .arg(&req.task_id)
-        .arg("--run")
-        .arg(&req.run_id)
-        .arg("--ack")
-        .arg(&ack);
-    if !req.agent.is_empty() {
-        cmd.arg("--agent").arg(&req.agent);
-    }
-    if let Some(ws) = &req.workspace {
-        cmd.arg("--workspace").arg(ws);
-    }
-    if req.force_reaudit {
-        cmd.arg("--force-reaudit");
-    }
-    // The runner is the PLATFORM, not a role: it must not be classified as a
-    // role session by inheriting the caller's run marker.
-    cmd.env_remove("DEVAI_EVIDENCE_DIR")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+    // REQ-AR-01 AC1: a session INSIDE the caller's cgroup is not a guarantee.
+    let scope = scope_decision(systemd_user_scope(), caller_runs_inside_a_unit())?;
+    let hs = prepare_handshake(req)?;
+    let mut cmd = runner_command(&exe, req, &hs, scope.as_deref())?;
     if scope.is_none() {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| {
-                use std::io::Write as _;
-                writeln!(
-                    f,
-                    "launch: no user systemd scope available — the runner gets its own SESSION \
-                     (setsid), not its own cgroup; a caller unit that kills its cgroup can still \
-                     stop this role"
-                )
-            });
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: setsid is async-signal-safe and touches no shared state;
-            // the closure runs in the forked child before exec. A failure is
-            // reported through the child's own failure to write the ack (the
-            // caller then refuses the launch — never a same-session fallback).
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
+        note_session_scope(&hs.log);
+        detach_into_own_session(&mut cmd);
     }
     let mut child = cmd
         .spawn()
         .map_err(|e| LaunchError::Spawn(format!("{}: {e}", exe.display())))?;
+    wait_for_handshake(&mut child, &hs)
+}
 
-    let deadline = Instant::now() + ACK_TIMEOUT;
-    loop {
-        if let Some(text) = read_ack(&ack) {
-            let _ = std::fs::remove_file(&ack);
-            return parse_ack(&req.run_id, &text);
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            // The runner exited without a handshake: read the tail it wrote —
-            // that IS the reason, and it is already in the evidence tree.
-            let _ = std::fs::remove_file(&ack);
-            let tail = read_tail(&log_path, 20);
-            return Err(LaunchError::Runner(if tail.trim().is_empty() {
-                format!("runner exited with {status} without reporting an execution")
-            } else {
-                format!("runner exited with {status}: {tail}")
-            }));
-        }
-        if Instant::now() >= deadline {
-            let _ = std::fs::remove_file(&ack);
-            return Err(LaunchError::Timeout(format!(
-                "no execution reported within {}s — read {}",
-                ACK_TIMEOUT.as_secs(),
-                log_path.display()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// Record in the run's own transcript WHICH boundary the runner got. The
+/// session branch only happens when the caller owns no cgroup (see
+/// [`scope_decision`]), and saying so keeps the evidence honest.
+fn note_session_scope(log: &Path) {
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            writeln!(
+                f,
+                "launch: no user systemd manager — the runner gets its own SESSION (setsid); the \
+                 caller is not a systemd unit, so no unit cgroup can sweep the role"
+            )
+        });
 }
 
 /// Write the runner's handshake ATOMICALLY (tmp + rename): the caller either
@@ -346,12 +460,12 @@ fn read_ack(path: &Path) -> Option<String> {
 /// Parse one handshake line. Format (fields space-separated, reason LAST so it
 /// may contain spaces):
 /// `started <run> <exec>` · `busy <run> <exec>` · `refused <text…>`
-fn parse_ack(run_id: &str, line: &str) -> Result<LaunchOutcome, LaunchError> {
+fn parse_ack(line: &str) -> Result<LaunchOutcome, LaunchError> {
     if let Some(rest) = line.strip_prefix("started ") {
         let mut it = rest.splitn(2, ' ');
         if let (Some(run), Some(exec)) = (it.next(), it.next()) {
             return Ok(LaunchOutcome::Started {
-                run_id: run.to_string(),
+                caller_run_id: run.to_string(),
                 execution_id: exec.to_string(),
             });
         }
@@ -360,7 +474,7 @@ fn parse_ack(run_id: &str, line: &str) -> Result<LaunchOutcome, LaunchError> {
         let mut it = rest.splitn(2, ' ');
         if let (Some(run), Some(exec)) = (it.next(), it.next()) {
             return Ok(LaunchOutcome::AlreadyRunning {
-                run_id: run.to_string(),
+                caller_run_id: run.to_string(),
                 execution_id: exec.to_string(),
             });
         }
@@ -371,23 +485,9 @@ fn parse_ack(run_id: &str, line: &str) -> Result<LaunchOutcome, LaunchError> {
         });
     }
     Err(LaunchError::Runner(format!(
-        "unparseable handshake for run {run_id}: {line}"
+        "unparseable launch handshake: {line}"
     )))
 }
-
-/// Last `lines` lines of a text file — the output TAIL the platform keeps as
-/// evidence (the ratified answer: up to 4096 lines per stream).
-pub fn read_tail(path: &Path, lines: usize) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-    let all: Vec<&str> = text.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    all[start..].join("\n")
-}
-
-/// The ratified tail bound (OQ-1 answer: «4096 строк»).
-pub const TAIL_LINES: usize = 4096;
 
 #[cfg(test)]
 mod tests {
@@ -396,26 +496,26 @@ mod tests {
     #[test]
     fn handshake_lines_are_parsed_into_typed_outcomes() {
         assert_eq!(
-            parse_ack("r", "started r e1").unwrap(),
+            parse_ack("started r e1").unwrap(),
             LaunchOutcome::Started {
-                run_id: "r".into(),
+                caller_run_id: "r".into(),
                 execution_id: "e1".into()
             }
         );
         assert_eq!(
-            parse_ack("r", "busy r e9").unwrap(),
+            parse_ack("busy r e9").unwrap(),
             LaunchOutcome::AlreadyRunning {
-                run_id: "r".into(),
+                caller_run_id: "r".into(),
                 execution_id: "e9".into()
             }
         );
         assert_eq!(
-            parse_ack("r", "refused task is in APPROVAL, not a role stage").unwrap(),
+            parse_ack("refused task is in APPROVAL, not a role stage").unwrap(),
             LaunchOutcome::Refused {
                 reason: "task is in APPROVAL, not a role stage".into()
             }
         );
-        assert!(parse_ack("r", "garbage").is_err());
+        assert!(parse_ack("garbage").is_err());
     }
 
     #[test]
@@ -430,12 +530,17 @@ mod tests {
         );
     }
 
+    /// QA R4 AC3 / R3: a session inside the caller's cgroup is NOT accepted
+    /// when the caller is a unit — the launch is refused, never «started».
     #[test]
-    fn the_tail_keeps_the_last_lines_only() {
-        let d = tempfile::TempDir::new().unwrap();
-        let p = d.path().join("log");
-        std::fs::write(&p, "a\nb\nc\nd\n").unwrap();
-        assert_eq!(read_tail(&p, 2), "c\nd");
-        assert_eq!(read_tail(&d.path().join("absent"), 2), "");
+    fn a_unit_caller_without_a_user_scope_is_refused_typed() {
+        let refused = scope_decision(None, true).unwrap_err();
+        assert!(matches!(refused, LaunchError::NoScope(_)));
+        // No user manager, but the caller owns no unit cgroup: a session is
+        // the honest guarantee.
+        assert_eq!(scope_decision(None, false), Ok(None));
+        // A user scope always wins.
+        let scope = PathBuf::from("/usr/bin/systemd-run");
+        assert_eq!(scope_decision(Some(scope.clone()), true), Ok(Some(scope)));
     }
 }

@@ -82,19 +82,13 @@ pub struct ExecRequest {
 /// its log tail could not be written, and nothing here touches the checkout.
 fn persist_output_tail(evidence: Option<&std::path::Path>, out: &std::process::Output) {
     let Some(dir) = evidence else { return };
-    let tail = |bytes: &[u8]| -> String {
-        let text = String::from_utf8_lossy(bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.len().saturating_sub(crate::launch::TAIL_LINES);
-        lines[start..].join("\n")
-    };
     let body = format!(
         "exit: {}\n=== stdout (tail, up to {} lines) ===\n{}\n=== stderr (tail, up to {} lines) ===\n{}\n",
         out.status,
-        crate::launch::TAIL_LINES,
-        tail(&out.stdout),
-        crate::launch::TAIL_LINES,
-        tail(&out.stderr),
+        crate::tail::TAIL_LINES,
+        crate::tail::tail_of_bytes(&out.stdout, crate::tail::TAIL_LINES),
+        crate::tail::TAIL_LINES,
+        crate::tail::tail_of_bytes(&out.stderr, crate::tail::TAIL_LINES),
     );
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(dir.join("role_output.txt"), body);
@@ -151,25 +145,14 @@ fn run_captured(
         stderr: read(LIVE_STDERR_FILE),
     };
     for name in [LIVE_STDOUT_FILE, LIVE_STDERR_FILE] {
-        trim_stream_file(&dir.join(name));
+        // QA R3: ONE tail rule, and a failed bound is NAMED (our stderr lands
+        // in the run's supervisor.log) instead of vanishing — a stream that
+        // could not be bounded is a fact about the evidence, not «no output».
+        if let Err(e) = crate::tail::trim_to_tail(&dir.join(name), crate::tail::TAIL_LINES) {
+            eprintln!("runtime: cannot bound the live transcript: {e}");
+        }
     }
     Ok(out)
-}
-
-/// Bound one stored stream file to the ratified tail. The tail is read as
-/// lossy text exactly like the settled writer; a stream that cannot be read
-/// back is left as it landed rather than truncated blindly.
-fn trim_stream_file(path: &std::path::Path) {
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= crate::launch::TAIL_LINES {
-        return;
-    }
-    let start = lines.len() - crate::launch::TAIL_LINES;
-    let _ = std::fs::write(path, format!("{}\n", lines[start..].join("\n")));
 }
 
 #[derive(Debug, Clone)]
@@ -1354,13 +1337,16 @@ mod tests {
     fn a_stored_stream_is_bounded_to_the_ratified_tail() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("stream");
-        let body: String = (1..=crate::launch::TAIL_LINES + 4)
+        let body: String = (1..=crate::tail::TAIL_LINES + 4)
             .map(|n| format!("line {n}\n"))
             .collect();
         std::fs::write(&p, body).unwrap();
-        trim_stream_file(&p);
+        assert_eq!(
+            crate::tail::trim_to_tail(&p, crate::tail::TAIL_LINES),
+            Ok(true)
+        );
         let kept = std::fs::read_to_string(&p).unwrap();
-        assert_eq!(kept.lines().count(), crate::launch::TAIL_LINES);
+        assert_eq!(kept.lines().count(), crate::tail::TAIL_LINES);
         assert_eq!(kept.lines().next(), Some("line 5"));
     }
 

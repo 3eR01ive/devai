@@ -1568,12 +1568,17 @@ fn supervise(
         1
     };
     let ev = devai_runtime::launch::run_evidence_dir(&ctx.api().home(), &task_ref, &run_ref);
-    let tail = devai_runtime::launch::read_tail(
+    // ONE tail rule (QA R3); an unreadable transcript is named in the file
+    // instead of being written as an empty tail.
+    let tail = match devai_runtime::tail::read_tail(
         &ev.join(devai_runtime::launch::SUPERVISOR_LOG),
-        devai_runtime::launch::TAIL_LINES,
-    );
+        devai_runtime::tail::TAIL_LINES,
+    ) {
+        Ok(tail) => tail,
+        Err(e) => format!("(transcript unreadable: {e})"),
+    };
     let _ = std::fs::write(
-        ev.join("role_output_tail.txt"),
+        ev.join(devai_runtime::launch::RUNNER_TAIL_FILE),
         format!("exit_code: {code}\n{tail}\n"),
     );
     match result? {
@@ -2532,6 +2537,14 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
 // role executions
 // ---------------------------------------------------------------------------
 
+/// How many lines of a stored stream `exec get` shows. A diagnostic slice,
+/// deliberately far below the evidence bound (`TAIL_LINES` = 4096): the
+/// operator scans it in the terminal, the full tail stays in evidence.
+const EXEC_TAIL_LINES: usize = 20;
+/// The stderr slice is narrower than stdout's: errors are the sharp end, and
+/// the combined ordering matters more than volume.
+const EXEC_STDERR_TAIL_LINES: usize = 10;
+
 fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
         ExecCmd::Start {
@@ -2729,28 +2742,43 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                         .join(e.task_id.to_string())
                         .join(r.to_string())
                 });
+                // ONE tail rule (QA R3): a missing evidence file is silence
+                // (normal before the role writes), an UNREADABLE one is said
+                // out loud — the two are different facts.
                 let tail_of = |path: &std::path::Path, label: &str, lines: usize| {
-                    let text = std::fs::read_to_string(path).unwrap_or_default();
-                    if text.trim().is_empty() {
-                        return;
-                    }
-                    outln!("── output tail ({label}) ──");
-                    let all: Vec<&str> = text.lines().collect();
-                    let start = all.len().saturating_sub(lines);
-                    for line in &all[start..] {
-                        outln!("{line}");
+                    match devai_runtime::tail::read_tail(path, lines) {
+                        Ok(text) if text.trim().is_empty() => {}
+                        Ok(text) => {
+                            outln!("── output tail ({label}) ──");
+                            for line in text.lines() {
+                                outln!("{line}");
+                            }
+                        }
+                        Err(devai_runtime::tail::TailError::NotFound(_)) => {}
+                        Err(e) => outln!("── output tail ({label}) unavailable: {e} ──"),
                     }
                 };
-                tail_of(&ev.join("role_output.txt"), "role_output.txt", 20);
+                tail_of(
+                    &ev.join("role_output.txt"),
+                    "role_output.txt",
+                    EXEC_TAIL_LINES,
+                );
+                // The runner's own record (exit code + transcript tail) —
+                // written by `__supervise`, readable here ever since.
+                tail_of(
+                    &ev.join(devai_runtime::launch::RUNNER_TAIL_FILE),
+                    devai_runtime::launch::RUNNER_TAIL_FILE,
+                    EXEC_TAIL_LINES,
+                );
                 tail_of(
                     &ev.join(devai_runtime::LIVE_STDOUT_FILE),
                     "role_stdout.txt (live)",
-                    20,
+                    EXEC_TAIL_LINES,
                 );
                 tail_of(
                     &ev.join(devai_runtime::LIVE_STDERR_FILE),
                     "role_stderr.txt (live)",
-                    10,
+                    EXEC_STDERR_TAIL_LINES,
                 );
                 let mut candidates = vec![
                     ev.join("role_output.txt"),

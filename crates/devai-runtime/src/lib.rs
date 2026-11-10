@@ -20,6 +20,7 @@ pub mod probe;
 mod prompt;
 pub mod reclaim;
 pub mod revision;
+pub mod tail;
 pub mod taskname;
 pub mod worktree;
 
@@ -31,10 +32,11 @@ pub use adapters::{
 pub use context::{REWORK_CONTEXT_LABEL, rework_context};
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};
 pub use launch::{
-    ACK_TIMEOUT, LaunchError, LaunchOutcome, LaunchRequest, RUNNER_SUBCOMMAND, TAIL_LINES,
-    run_evidence_dir, runner_exe, write_ack,
+    ACK_TIMEOUT, LaunchError, LaunchOutcome, LaunchRequest, RUNNER_SUBCOMMAND, run_evidence_dir,
+    runner_exe, write_ack,
 };
 pub use liveness::{
     Liveness, OwnerInfo, boot_time_epoch, check_owner, current_host, current_owner,
 };
 pub use prompt::{build_system_prompt, build_user_prompt, extract_json_object};
+pub use tail::{TAIL_LINES, TailError, read_tail, tail_of, tail_of_bytes, trim_to_tail};

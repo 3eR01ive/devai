@@ -1960,394 +1960,42 @@ pub fn load_task_name_policy(dir: &Path) -> StoreResult<TaskNamePolicy> {
 // ---------------------------------------------------------------------------
 // PROCESS DECLARATION (REQ-AR-09/11/14/15/16) — the state machine as data.
 // ---------------------------------------------------------------------------
+//
+// The DECLARATION itself (states, named conditions, transitions, holds,
+// brakes, validation) lives in `devai_core::process`: the workflow commands
+// resolve every target there, so the domain owns the data AND the resolution.
+// This module owns only the FILE: the directory scan, the `where_` labelling
+// and the mapping onto the store's config error type.
 
-/// The declaration version THIS build speaks. A home whose
-/// `config/workflow/process.yaml` declares another version is refused with a
-/// typed config error at `devai init` (and held loudly by the engine): the
-/// platform never runs a home silently under rules it was not built for
-/// (REQ-AR-16).
-pub const SUPPORTED_PROCESS_VERSION: u32 = 1;
+pub use devai_core::process::{
+    HoldKind, PROCESS_RETURN_STATE, Process, ProcessBrakes, ProcessHolds, ProcessState,
+    ProcessTransition, SUPPORTED_PROCESS_VERSION, Target, process_condition, process_executor,
+};
 
-/// The special transition address: «the remembered working stage» of a hold
-/// (`return_state`), not a fixed state name. Spelled once.
-pub const PROCESS_RETURN_STATE: &str = "RETURN_STATE";
-
-/// Who executes a state (REQ-AR-09). Closed vocabulary, declared per state.
-pub mod process_executor {
-    pub const ROLE: &str = "role";
-    pub const HUMAN: &str = "human";
-    pub const NONE: &str = "none";
-}
-
-/// The condition names the PLATFORM ITSELF emits — the engine/API write these
-/// exact literals into the declaration's vocabulary. A declaration that does
-/// not list an emitted name cannot cover the outcome and fails validation
-/// (REQ-AR-14/15), instead of running with a transition nothing can trigger.
-pub mod process_condition {
-    /// The human started the task (DRAFT → the first role stage).
-    pub const HUMAN_START: &str = "human_start";
-    /// The role finished and published its artifact (the normal role outcome).
-    pub const ROLE_FINISHED: &str = "role_finished";
-    /// A human signed a gate.
-    pub const HUMAN_APPROVED: &str = "human_approved";
-    /// A human rejected the requirements.
-    pub const HUMAN_REJECTED: &str = "human_rejected";
-    /// A human accepted the result (final acceptance).
-    pub const HUMAN_ACCEPTED: &str = "human_accepted";
-    /// A human returned the result for rework.
-    pub const HUMAN_RETURNED: &str = "human_returned";
-    /// A human released a hold.
-    pub const HUMAN_RESUMED: &str = "human_resumed";
-    /// The role's launch failed (spawn/platform failure — never «the role
-    /// worked», REQ-AR-13).
-    pub const LAUNCH_FAILED: &str = "launch_failed";
-    /// The execution produced no outcome at all (the vanished process,
-    /// REQ-AR-05 AC2) — spelled out so «no outcome» has a transition too.
-    pub const OUTCOME_MISSING: &str = "outcome_missing";
-
-    /// Names a role state MUST cover (REQ-AR-14).
-    pub const ROLE_REQUIRED: &[&str] = &[ROLE_FINISHED, LAUNCH_FAILED, OUTCOME_MISSING];
-    /// Names a human state must cover at least one of.
-    pub const HUMAN_NAMES: &[&str] = &[
-        HUMAN_START,
-        HUMAN_APPROVED,
-        HUMAN_REJECTED,
-        HUMAN_ACCEPTED,
-        HUMAN_RETURNED,
-        HUMAN_RESUMED,
-    ];
-}
-
-/// One state of the declared process.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessState {
-    /// The `TaskState` wire name (e.g. `IMPLEMENTATION`).
-    pub state: String,
-    /// `role` | `human` | `none` (closed vocabulary).
-    pub executor: String,
-    /// The role slug for `executor: role`; absent otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    /// Every outcome this state can produce. Each must have a transition
-    /// (REQ-AR-14); an unknown name is refused (REQ-AR-15).
-    #[serde(default)]
-    pub outcomes: Vec<String>,
-}
-
-/// One declared transition: `from` + condition name `on` → `to`.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessTransition {
-    pub from: String,
-    pub on: String,
-    pub to: String,
-}
-
-/// The declared brakes (REQ-AR-09/13). A tripped brake parks the task in
-/// `park_state` with the reason and the counter; nothing auto-continues from
-/// a park.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessBrakes {
-    /// Consecutive rounds of the SAME state with no new artifact (a «круг без
-    /// сдвига»): at this count the task parks instead of launching again.
-    pub max_rounds_without_shift: u32,
-    /// Consecutive failed LAUNCHES (not role results): at this count the
-    /// task parks (REQ-AR-13).
-    pub max_consecutive_failures: u32,
-    /// Failure CLASSES that park on their FIRST occurrence (REQ-AR-09: «классы
-    /// отказов, паркующие сразу»): a platform/provider failure will not fix
-    /// itself by another round, so a human decides. Names come from the
-    /// closed `failure_class` vocabulary; an unknown name refuses init.
-    #[serde(default)]
-    pub park_immediately: Vec<String>,
-    /// Where a tripped brake parks the task — a hold state.
-    pub park_state: String,
-}
-
-/// The whole process declaration: states, named transitions, brakes, and the
-/// closed vocabulary of condition names that makes the declaration a
-/// declaration (REQ-AR-15) rather than an embedded script.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProcessPolicy {
-    pub version: u32,
-    /// The closed list of condition names transitions may use.
-    pub conditions: Vec<String>,
-    pub states: Vec<ProcessState>,
-    pub transitions: Vec<ProcessTransition>,
-    pub brakes: ProcessBrakes,
-}
-
-impl ProcessPolicy {
-    /// The role that executes `state`, when the declaration names one. This
-    /// is the question the launcher and the engine ask — «запуск производен
-    /// от состояния» (REQ-AR-11).
-    pub fn role_for(&self, state: &str) -> Option<&str> {
-        self.states
-            .iter()
-            .find(|s| s.state == state && s.executor == process_executor::ROLE)
-            .and_then(|s| s.role.as_deref())
-    }
-
-    /// The declared executor of `state` (`role`/`human`/`none`), if declared.
-    pub fn executor_for(&self, state: &str) -> Option<&str> {
-        self.states
-            .iter()
-            .find(|s| s.state == state)
-            .map(|s| s.executor.as_str())
-    }
-
-    /// The declared target of one transition, used by tests and by the init
-    /// report; the workflow commands themselves remain the enforcement point
-    /// (REQ-AR-17: the stage/gate semantics do not change).
-    pub fn transition_target(&self, from: &str, on: &str) -> Option<&str> {
-        self.transitions
-            .iter()
-            .find(|t| t.from == from && t.on == on)
-            .map(|t| t.to.as_str())
-    }
-
-    /// True when the declaration says a failure of `class` parks the task on
-    /// its FIRST occurrence (REQ-AR-09: «классы отказов, паркующие сразу»).
-    pub fn parks_immediately(&self, class: &str) -> bool {
-        self.brakes.park_immediately.iter().any(|c| c == class)
-    }
-
-    /// Loud validation (init + stage time). Everything a declaration can get
-    /// wrong is refused HERE with the file, the state and the condition
-    /// named — never absorbed into a default.
-    pub fn validate(&self, where_: &str) -> StoreResult<()> {
-        if self.version != SUPPORTED_PROCESS_VERSION {
-            return Err(cfg_err(format!(
-                "{where_}: process.version {} is not supported by this build (expected {}) — \
-                 a home on another declaration version must not run silently under these rules; \
-                 update the declaration (or the platform) explicitly",
-                self.version, SUPPORTED_PROCESS_VERSION
-            )));
-        }
-        if self.conditions.is_empty() {
-            return Err(cfg_err(format!(
-                "{where_}: process.conditions is empty — transitions need a closed vocabulary of names"
-            )));
-        }
-        let mut seen_conditions: Vec<&str> = Vec::new();
-        for c in &self.conditions {
-            if c.trim().is_empty() {
-                return Err(cfg_err(format!(
-                    "{where_}: process.conditions contains a blank name"
-                )));
-            }
-            if seen_conditions.contains(&c.as_str()) {
-                return Err(cfg_err(format!(
-                    "{where_}: process.conditions declares `{c}` twice"
-                )));
-            }
-            seen_conditions.push(c);
-        }
-        // The platform emits these names itself; a declaration that does not
-        // know them cannot cover the outcomes it will receive.
-        for required in process_condition::ROLE_REQUIRED {
-            if !seen_conditions.contains(required) {
-                return Err(cfg_err(format!(
-                    "{where_}: process.conditions does not declare `{required}` — the platform \
-                     emits it, so a transition on it must be expressible"
-                )));
-            }
-        }
-        if self.states.is_empty() {
-            return Err(cfg_err(format!(
-                "{where_}: process.states is empty — there is no process to run"
-            )));
-        }
-        let mut seen_states: Vec<String> = Vec::new();
-        for st in &self.states {
-            let parsed = devai_core::types::TaskState::parse(&st.state).map_err(|_| {
-                cfg_err(format!(
-                    "{where_}: process.states names unknown state `{}` (expected one of DRAFT, \
-                     ANALYSIS, REVIEW, APPROVAL, IMPLEMENTATION, QA, REWORK, WAITING_FOR_INPUT, \
-                     PAUSED, BLOCKED, FAILED, ACCEPTED, CANCELLED)",
-                    st.state
-                ))
-            })?;
-            let _ = parsed;
-            if seen_states.contains(&st.state) {
-                return Err(cfg_err(format!(
-                    "{where_}: process.states declares `{}` twice",
-                    st.state
-                )));
-            }
-            seen_states.push(st.state.clone());
-            match st.executor.as_str() {
-                process_executor::ROLE => {
-                    if st
-                        .role
-                        .as_deref()
-                        .map(|r| r.trim().is_empty())
-                        .unwrap_or(true)
-                    {
-                        return Err(cfg_err(format!(
-                            "{where_}: state {} has executor `role` but names no role",
-                            st.state
-                        )));
-                    }
-                }
-                process_executor::HUMAN | process_executor::NONE => {
-                    if st.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-                        return Err(cfg_err(format!(
-                            "{where_}: state {} has executor `{}` but names a role — only \
-                             `role` states are executed by a role",
-                            st.state, st.executor
-                        )));
-                    }
-                }
-                other => {
-                    return Err(cfg_err(format!(
-                        "{where_}: state {} declares unknown executor `{other}` (expected \
-                         `role`, `human` or `none`)",
-                        st.state
-                    )));
-                }
-            }
-            for outcome in &st.outcomes {
-                if !seen_conditions.contains(&outcome.as_str()) {
-                    return Err(cfg_err(format!(
-                        "{where_}: state {} declares outcome `{outcome}` which is not in \
-                         process.conditions — the transition vocabulary is closed (REQ-AR-15)",
-                        st.state
-                    )));
-                }
-                if self.transition_target(&st.state, outcome).is_none() {
-                    return Err(cfg_err(format!(
-                        "{where_}: DEAD END — state {} declares outcome `{outcome}` but no \
-                         transition covers it; init refuses a process that can strand the task \
-                         (REQ-AR-14)",
-                        st.state
-                    )));
-                }
-            }
-            if st.executor == process_executor::ROLE {
-                for required in process_condition::ROLE_REQUIRED {
-                    if !st.outcomes.iter().any(|o| o == required) {
-                        return Err(cfg_err(format!(
-                            "{where_}: DEAD END — role state {} does not cover the `{required}` \
-                             outcome; every role state must cover «role finished», «launch \
-                             failed» and «no outcome» (REQ-AR-14)",
-                            st.state
-                        )));
-                    }
-                }
-            }
-            if st.executor == process_executor::HUMAN
-                && !st
-                    .outcomes
-                    .iter()
-                    .any(|o| process_condition::HUMAN_NAMES.contains(&o.as_str()))
-            {
-                return Err(cfg_err(format!(
-                    "{where_}: human state {} covers no human outcome — a gate that can never \
-                     be decided is a dead end",
-                    st.state
-                )));
-            }
-        }
-        for t in &self.transitions {
-            if !seen_conditions.contains(&t.on.as_str()) {
-                return Err(cfg_err(format!(
-                    "{where_}: transition {}.on = `{}` is not a declared condition name — \
-                     conditions are named, never expressions (REQ-AR-15)",
-                    t.from, t.on
-                )));
-            }
-            if !seen_states.contains(&t.from) {
-                return Err(cfg_err(format!(
-                    "{where_}: transition from unknown state `{}`",
-                    t.from
-                )));
-            }
-            if t.to != PROCESS_RETURN_STATE && !seen_states.contains(&t.to) {
-                return Err(cfg_err(format!(
-                    "{where_}: transition `{}` → `{}` targets unknown state `{}` (or the \
-                     special address `{PROCESS_RETURN_STATE}`)",
-                    t.from, t.on, t.to
-                )));
-            }
-        }
-        if self.brakes.max_rounds_without_shift == 0 {
-            return Err(cfg_err(format!(
-                "{where_}: brakes.max_rounds_without_shift must be >= 1 — a zero budget parks \
-                 on the first round and the process can never run"
-            )));
-        }
-        if self.brakes.max_consecutive_failures == 0 {
-            return Err(cfg_err(format!(
-                "{where_}: brakes.max_consecutive_failures must be >= 1 — a zero budget parks \
-                 on the first failed launch"
-            )));
-        }
-        // «Классы отказов, паркующие сразу» (REQ-AR-09): a name outside the
-        // closed failure-class vocabulary would silently never fire, so it is
-        // refused here — an inert brake is worse than none.
-        for class in &self.brakes.park_immediately {
-            if !devai_core::types::failure_class::KNOWN.contains(&class.as_str()) {
-                return Err(cfg_err(format!(
-                    "{where_}: brakes.park_immediately names `{class}`, which is not a failure \
-                     class the platform records (expected one of: {})",
-                    devai_core::types::failure_class::KNOWN.join(", ")
-                )));
-            }
-        }
-        let park = devai_core::types::TaskState::parse(&self.brakes.park_state).map_err(|_| {
-            cfg_err(format!(
-                "{where_}: brakes.park_state `{}` is not a state name",
-                self.brakes.park_state
-            ))
-        })?;
-        if !park.is_hold() {
-            return Err(cfg_err(format!(
-                "{where_}: brakes.park_state `{}` is not a hold state — a park must be \
-                 releasable by a human",
-                self.brakes.park_state
-            )));
-        }
-        Ok(())
-    }
-}
+/// The declaration under its historical name — one type, two spellings that
+/// both mean `devai_core::process::Process`.
+pub use devai_core::process::Process as ProcessPolicy;
 
 /// The factory declaration — the embedded `config/workflow/process.yaml`.
 /// ONE source for the default: the loader parses these very bytes, so a home
 /// without the file and a home with the untouched factory file behave
 /// identically (the `factory_inbox_wait_policy` idiom).
-pub fn factory_process_policy() -> StoreResult<ProcessPolicy> {
-    parse_process_policy(
-        include_str!("../../../config/workflow/process.yaml"),
-        "embedded config/workflow/process.yaml",
-    )
+pub fn factory_process_policy() -> StoreResult<Process> {
+    Ok(Process::factory().clone())
 }
 
-fn parse_process_policy(text: &str, where_: &str) -> StoreResult<ProcessPolicy> {
-    let doc: serde_yaml::Value = serde_yaml::from_str(text)
-        .map_err(|e| cfg_err(format!("{where_}: parse process declaration: {e}")))?;
-    let section = doc
-        .get("process")
-        .ok_or_else(|| cfg_err(format!("{where_}: no `process:` section")))?;
-    let policy: ProcessPolicy = serde_yaml::from_value(section.clone()).map_err(|e| {
-        cfg_err(format!(
-            "{where_}: process section is invalid (keys: version, conditions, states, \
-             transitions, brakes): {e}"
-        ))
-    })?;
-    policy.validate(where_)?;
-    Ok(policy)
+/// Parse one declaration document and validate it. A malformed or diverging
+/// declaration is a LOUD config error naming the file — never a default.
+fn parse_process_policy(text: &str, where_: &str) -> StoreResult<Process> {
+    devai_core::process::parse(text, where_).map_err(cfg_err)
 }
 
 /// Merge-scan `workflow/*.yaml` for the `process:` key — the same idiom as
 /// `load_humanize_policy`: files without the section are inert, the LAST
 /// declared section wins, a malformed declaration is a LOUD config error
 /// naming the file. An absent directory/file returns the factory bytes.
-pub fn load_process_policy(dir: &Path) -> StoreResult<ProcessPolicy> {
-    let mut policy: Option<ProcessPolicy> = None;
+pub fn load_process_policy(dir: &Path) -> StoreResult<Process> {
+    let mut policy: Option<Process> = None;
     if dir.is_dir() {
         let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
@@ -2371,7 +2019,6 @@ pub fn load_process_policy(dir: &Path) -> StoreResult<ProcessPolicy> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // REWORK CONTEXT delivery policy (R-001..R-007) — platform workflow data.
 // ---------------------------------------------------------------------------
 

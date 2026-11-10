@@ -121,7 +121,8 @@ fn mk_engine(store: &Store) -> Engine<'_> {
 
 fn approved(store: &Store, id: &str) {
     let t = store.resolve_task(id).unwrap();
-    let m = workflow::approve_requirements(&t, Some("test"), "tester", Utc::now()).unwrap();
+    let m =
+        workflow::approve_requirements(&proc(), &t, Some("test"), "tester", Utc::now()).unwrap();
     store.commit(t.lock_version, &m).unwrap();
 }
 
@@ -130,7 +131,17 @@ fn accepted(store: &Store, id: &str) {
     let a = store.artifacts(t.id).unwrap();
     // &[]: this task stores no dependency edges (REQ-08 AC2 — the absence
     // of rows is an empty set, so acceptance is unchanged for old tasks).
-    let m = workflow::accept(&t, &a, &[], &[], Some("test"), "tester", Utc::now()).unwrap();
+    let m = workflow::accept(
+        &proc(),
+        &t,
+        &a,
+        &[],
+        &[],
+        Some("test"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(t.lock_version, &m).unwrap();
 }
 
@@ -451,7 +462,8 @@ fn rejection_loops_back_through_a_new_spec_version() {
 
     // human REJECT in APPROVAL → back to ANALYSIS
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::reject_requirements(&cur, Some("too thin"), "tester", Utc::now()).unwrap();
+    let m = workflow::reject_requirements(&proc(), &cur, Some("too thin"), "tester", Utc::now())
+        .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     // The engine now re-runs analyst (publishing spec v2, superseding v1)
@@ -565,7 +577,7 @@ fn form_agent(store: &Store, name: &str) {
 /// is exactly ONE stage's behavior.
 fn to_analysis(store: &Store, t: &Task) {
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::start(&cur, "tester", Utc::now()).unwrap();
+    let m = workflow::start(&proc(), &cur, "tester", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 }
 
@@ -929,6 +941,7 @@ fn holds_and_terminals_stop_the_engine() {
     let engine = mk_engine(&store);
     // start, then pause
     let m = workflow::start(
+        &proc(),
         &store.get_task(&t.id.to_string()).unwrap(),
         "tester",
         Utc::now(),
@@ -936,7 +949,7 @@ fn holds_and_terminals_stop_the_engine() {
     .unwrap();
     store.commit(t.lock_version, &m).unwrap();
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::pause(&cur, Some("brake"), "tester", Utc::now()).unwrap();
+    let m = workflow::pause(&proc(), &cur, Some("brake"), "tester", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -1252,7 +1265,7 @@ fn non_git_workspace_fails_the_writing_stage_and_never_claims_freshness() {
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let mut facts = workflow::ImplementationReportFacts::bare(new_id());
     facts.summary = Some("manual".into());
-    let m = workflow::implementation_reported(&cur, &facts, "tester", Utc::now()).unwrap();
+    let m = workflow::implementation_reported(&proc(), &cur, &facts, "tester", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -1700,6 +1713,7 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
     // QA returns with three concrete points — the precedent's shape.
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("п1; п2; п3"),
@@ -1792,7 +1806,7 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
     store
         .answer_question(open[0].id, "operator ratified", "operator", Utc::now())
         .unwrap();
-    let m = workflow::answer_question(&held, open[0].id, "operator", Utc::now()).unwrap();
+    let m = workflow::answer_question(&proc(), &held, open[0].id, "operator", Utc::now()).unwrap();
     store.commit(held.lock_version, &m).unwrap();
     let cur = store.get_task(&t.id.to_string()).unwrap();
     assert_eq!(cur.state, TaskState::Rework);
@@ -1816,7 +1830,8 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
         1,
         "the collector surfaces only the human's ratifications"
     );
-    let m = workflow::implementation_reported(&cur, &facts, "operator", Utc::now()).unwrap();
+    let m =
+        workflow::implementation_reported(&proc(), &cur, &facts, "operator", Utc::now()).unwrap();
     assert_eq!(
         m.task.state,
         TaskState::Qa,
@@ -1852,6 +1867,7 @@ fn rework_with_new_commit_still_reaches_qa() {
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("fix the points"),
@@ -2510,6 +2526,7 @@ fn the_rework_execution_actually_receives_the_assembled_section() {
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("THE-WIRING-MARKER — return text as the human wrote it"),
@@ -2594,6 +2611,7 @@ fn a_returned_reports_findings_are_delivered_labelled_stale_never_dropped() {
     // two ways the reader can now answer: CURRENT report vs STALE fallback.
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("вернись к находкам"),
@@ -2723,6 +2741,7 @@ fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
     drive_to_report(&store, &t, &ws); // the whole cycle runs on a home WITHOUT the workflow dir
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("FACTORY-FALLBACK-MARKER"),
@@ -2901,6 +2920,7 @@ fn the_empty_rework_gate_trips_the_return_text_into_the_next_window() {
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("GATE-CYCLE-RATIONALE — п1; п2"),
@@ -3229,4 +3249,11 @@ fn a_marked_bundle_without_a_reasoning_level_refuses_the_run() {
         store.list_executions(Some(t.id)).unwrap().is_empty(),
         "the refusal happens before any execution row or driver launch"
     );
+}
+
+/// The process declaration every workflow command resolves its target from
+/// (REQ-AR-09): the factory bytes, parsed once. A test that changes the
+/// declaration changes the walk — that is the point of the data.
+fn proc() -> &'static devai_core::process::Process {
+    devai_core::process::Process::factory()
 }

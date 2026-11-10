@@ -9,6 +9,7 @@ description = "Devai domain: entities, workflow state machine, sovereignty rules
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

@@ -5,12 +5,14 @@
 
 pub mod error;
 pub mod inbox;
+pub mod process;
 pub mod types;
 pub mod vocab;
 pub mod workflow;
 
 pub use error::{CoreError, CoreResult};
 pub use inbox::{InboxWaitPolicy, WaitGroup, WaitStatePolicy, WaitVariant};
+pub use process::{HoldKind, Process, ProcessState, Target};
 pub use types::{
     AgentInstance, Artifact, ArtifactKind, ArtifactStatus, ContractRef, DataCategory, Decision,
     DependencyKind, DependencyNode, EpicVertex, EventDraft, ExecutionStatus, Id, Project, Question,

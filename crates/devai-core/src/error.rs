@@ -27,6 +27,18 @@ pub enum CoreError {
     /// covers every open blocker.
     #[error("open blocking dependencies: {}", blockers.join(", "))]
     OpenBlockers { blockers: Vec<String> },
+
+    /// REQ-AR-09/16: the declared process has no edge the platform code needs.
+    /// The declaration is the only source of targets, so a missing edge is a
+    /// loud disagreement between the code and the data — never a reason to
+    /// fall back to a code-side default. `devai init` refuses such a
+    /// declaration up front; this variant is the run-time twin of the same
+    /// fact (a home whose declaration changed under a running platform).
+    #[error(
+        "the declared process has no transition from `{from}` on `{on}` — the declaration and the \
+         platform code disagree"
+    )]
+    UndeclaredEdge { from: String, on: String },
 }
 
 impl CoreError {

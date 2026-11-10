@@ -8,6 +8,7 @@
 use serde_json::json;
 
 use crate::error::{CoreError, CoreResult};
+use crate::process::{HoldKind, Process, ProcessTransition, Target, process_condition};
 use crate::types::*;
 
 /// The effect of one validated workflow command.
@@ -58,30 +59,86 @@ fn require_state(
     }
 }
 
-/// Builds a mutation that changes the task state and appends one event.
+/// The edges the platform CODE can walk — `(from, condition)` pairs, WITHOUT
+/// targets: the target is the declaration's business (REQ-AR-09). This table
+/// is the code's half of the contract, and `Process::validate` refuses a
+/// declaration that does not cover it, so a drift between the two is an init
+/// refusal rather than a silent preference for one side.
+pub fn emitted_edges() -> &'static [(TaskState, &'static str)] {
+    const EDGES: &[(TaskState, &'static str)] = &[
+        (TaskState::Draft, process_condition::HUMAN_START),
+        (TaskState::Analysis, process_condition::SPEC_PUBLISHED),
+        (TaskState::Review, process_condition::SPEC_PUBLISHED),
+        (TaskState::Approval, process_condition::SPEC_PUBLISHED),
+        (TaskState::Implementation, process_condition::SPEC_PUBLISHED),
+        (TaskState::Qa, process_condition::SPEC_PUBLISHED),
+        (TaskState::Rework, process_condition::SPEC_PUBLISHED),
+        (TaskState::Review, process_condition::REVIEW_FINISHED),
+        (TaskState::Review, process_condition::REVIEW_REJECTED),
+        (TaskState::Approval, process_condition::HUMAN_APPROVED),
+        (TaskState::Approval, process_condition::HUMAN_REJECTED),
+        (
+            TaskState::Implementation,
+            process_condition::IMPLEMENTATION_REPORTED,
+        ),
+        (
+            TaskState::Rework,
+            process_condition::IMPLEMENTATION_REPORTED,
+        ),
+        (TaskState::Qa, process_condition::HUMAN_ACCEPTED),
+        (TaskState::Qa, process_condition::HUMAN_RETURNED),
+        (TaskState::WaitingForInput, process_condition::HUMAN_RESUMED),
+        (TaskState::Paused, process_condition::HUMAN_RESUMED),
+        (TaskState::Blocked, process_condition::HUMAN_RESUMED),
+        (TaskState::Failed, process_condition::HUMAN_RESUMED),
+        (TaskState::Analysis, process_condition::LAUNCH_FAILED),
+        (TaskState::Review, process_condition::LAUNCH_FAILED),
+        (TaskState::Implementation, process_condition::LAUNCH_FAILED),
+        (TaskState::Rework, process_condition::LAUNCH_FAILED),
+        (TaskState::Qa, process_condition::LAUNCH_FAILED),
+    ];
+    EDGES
+}
+
+/// The declared target of `on` from the task's current state. `RETURN_STATE`
+/// resolves to the remembered stage of the hold being released; a hold with no
+/// remembered stage is state corruption, not a silent self-transition.
+fn declared_target(process: &Process, task: &Task, on: &str) -> CoreResult<TaskState> {
+    match process.target(task.state.as_str(), on)? {
+        Target::State(to) => Ok(to),
+        Target::ReturnState => task.return_state.ok_or_else(|| {
+            CoreError::guard(format!(
+                "{on}: the declaration sends `{}` back to its remembered stage, and none is recorded",
+                task.state.as_str()
+            ))
+        }),
+    }
+}
+
+/// Builds a mutation that walks the DECLARED edge `(task.state, on)` and
+/// appends one event. This is the only place a process state changes: the
+/// address comes from [`Process`], never from this module.
 fn transition(
+    process: &Process,
     task: &Task,
-    to: TaskState,
+    on: &'static str,
     kind: &'static str,
     actor: &str,
     now: Timestamp,
     mut payload: serde_json::Value,
-) -> Mutation {
+) -> CoreResult<Mutation> {
+    let to = declared_target(process, task, on)?;
+    let from = task.state;
     let mut next = task.clone();
-    let from = next.state;
     next.state = to;
     next.updated_at = now;
     next.lock_version += 1;
-    if to.is_hold() {
-        next.return_state = Some(from);
-    } else {
-        next.return_state = None;
-    }
+    next.return_state = to.is_hold().then_some(from);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("from".into(), json!(from.as_str()));
         obj.insert("to".into(), json!(to.as_str()));
     }
-    Mutation {
+    Ok(Mutation {
         task: next,
         events: vec![EventDraft {
             kind,
@@ -90,7 +147,48 @@ fn transition(
         }],
         artifact_status: Vec::new(),
         questions: Vec::new(),
+    })
+}
+
+/// Builds a mutation that parks the task in the DECLARED address of a custody
+/// hold (`process.holds`). Same body shape as a transition — the address is
+/// data here too, so no command assigns a hold state from code.
+fn hold(
+    process: &Process,
+    task: &Task,
+    kind: HoldKind,
+    event_kind: &'static str,
+    actor: &str,
+    now: Timestamp,
+    mut payload: serde_json::Value,
+) -> CoreResult<Mutation> {
+    let to = process.hold_target(kind)?;
+    let from = task.state;
+    let mut next = task.clone();
+    next.state = to;
+    next.updated_at = now;
+    next.lock_version += 1;
+    next.return_state = to.is_hold().then_some(from);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("from".into(), json!(from.as_str()));
+        obj.insert("to".into(), json!(to.as_str()));
     }
+    Ok(Mutation {
+        task: next,
+        events: vec![EventDraft {
+            kind: event_kind,
+            actor: actor.to_string(),
+            payload,
+        }],
+        artifact_status: Vec::new(),
+        questions: Vec::new(),
+    })
+}
+
+/// The declared edge list of one process, as `from → on → to` triples — the
+/// shape the init report and the declaration tests read.
+pub fn declared_edges(process: &Process) -> Vec<ProcessTransition> {
+    process.transitions.clone()
 }
 
 /// Builds a mutation for an event that does not change the workflow state
@@ -257,21 +355,22 @@ pub fn effective_blockers(
 // commands
 // ---------------------------------------------------------------------------
 
-pub fn start(task: &Task, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
+pub fn start(process: &Process, task: &Task, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
     require_state(
         task,
         &[TaskState::Draft],
         "start",
         CoreError::hint("task is created but its workflow not started"),
     )?;
-    Ok(transition(
+    transition(
+        process,
         task,
-        TaskState::Analysis,
+        process_condition::HUMAN_START,
         event_kind::WORKFLOW_STARTED,
         actor,
         now,
         json!({}),
-    ))
+    )
 }
 
 /// A new Requirements Specification version was published (by the Analyst
@@ -291,6 +390,7 @@ pub fn start(task: &Task, actor: &str, now: Timestamp) -> CoreResult<Mutation> {
 /// title is never touched (REQ-TN-01 AC2). The name lands on the task row
 /// inside the SAME commit as the transition and its event.
 pub fn requirements_published(
+    process: &Process,
     task: &Task,
     artifacts: &[Artifact],
     reason: Option<&str>,
@@ -329,8 +429,9 @@ pub fn requirements_published(
     // signboard); presence replaces it whole.
     let name_now: Option<&str> = human_name.or(task.human_name.as_deref());
     let mut m = transition(
+        process,
         task,
-        TaskState::Review,
+        process_condition::SPEC_PUBLISHED,
         if is_revise {
             event_kind::REQUIREMENTS_REVISED
         } else {
@@ -344,7 +445,7 @@ pub fn requirements_published(
             (json_field::REASON): reason,
             (json_field::HUMAN_NAME): name_now,
         }),
-    );
+    )?;
     m.task.requirements_seq = spec.seq;
     m.task.human_name = name_now.map(|s| s.to_string());
 
@@ -387,6 +488,7 @@ pub fn requirements_published(
 }
 
 pub fn review_recorded(
+    process: &Process,
     task: &Task,
     verdict: Verdict,
     summary: Option<&str>,
@@ -399,21 +501,25 @@ pub fn review_recorded(
         "record-review",
         CoreError::hint("an independent review applies only in REVIEW"),
     )?;
-    let to = match verdict {
-        Verdict::Approved => TaskState::Approval,
-        _ => TaskState::Analysis,
+    // The verdict names the declared edge: a go verdict finishes the review,
+    // anything else is a rejection — «куда» is the declaration's answer.
+    let condition = match verdict {
+        Verdict::Approved => process_condition::REVIEW_FINISHED,
+        _ => process_condition::REVIEW_REJECTED,
     };
-    Ok(transition(
+    transition(
+        process,
         task,
-        to,
+        condition,
         event_kind::REVIEW_RECORDED,
         actor,
         now,
         json!({ (json_field::VERDICT): verdict.as_str(), (json_field::SUMMARY): summary }),
-    ))
+    )
 }
 
 pub fn approve_requirements(
+    process: &Process,
     task: &Task,
     rationale: Option<&str>,
     actor: &str,
@@ -430,9 +536,10 @@ pub fn approve_requirements(
     if task.requirements_seq == 0 {
         return Err(CoreError::guard("no requirements version to approve"));
     }
-    Ok(transition(
+    transition(
+        process,
         task,
-        TaskState::Implementation,
+        process_condition::HUMAN_APPROVED,
         event_kind::REQUIREMENTS_APPROVED,
         actor,
         now,
@@ -440,10 +547,11 @@ pub fn approve_requirements(
             "requirements_seq": task.requirements_seq,
             "rationale": rationale,
         }),
-    ))
+    )
 }
 
 pub fn reject_requirements(
+    process: &Process,
     task: &Task,
     rationale: Option<&str>,
     actor: &str,
@@ -455,14 +563,15 @@ pub fn reject_requirements(
         "reject",
         CoreError::hint("requirements can be rejected only while in APPROVAL"),
     )?;
-    Ok(transition(
+    transition(
+        process,
         task,
-        TaskState::Analysis,
+        process_condition::HUMAN_REJECTED,
         event_kind::REQUIREMENTS_REJECTED,
         actor,
         now,
         json!({ (json_field::RATIONALE): rationale }),
-    ))
+    )
 }
 
 /// R5 QA (rl/error-handling/rel/error-context): the TYPED outcome of
@@ -557,6 +666,7 @@ impl ImplementationReportFacts {
 /// distinct `qa.rework_gate_incomparable` record and NO verdict claim
 /// (REQ-RG-04).
 pub fn implementation_reported(
+    process: &Process,
     task: &Task,
     facts: &ImplementationReportFacts,
     actor: &str,
@@ -599,7 +709,9 @@ pub fn implementation_reported(
                         });
                         match ratified {
                             None => {
-                                return Ok(empty_rework_trip(task, facts, prior, p, c, actor, now));
+                                return empty_rework_trip(
+                                    process, task, facts, prior, p, c, actor, now,
+                                );
                             }
                             Some(d) => {
                                 payload[json_field::GATE] = json!("empty-rework");
@@ -668,13 +780,14 @@ pub fn implementation_reported(
     }
 
     let mut m = transition(
+        process,
         task,
-        TaskState::Qa,
+        process_condition::IMPLEMENTATION_REPORTED,
         event_kind::IMPLEMENTATION_REPORTED,
         actor,
         now,
         payload,
-    );
+    )?;
     if let Some((reason, prev_report)) = incomparable {
         m.events.push(EventDraft {
             kind: event_kind::QA_REWORK_GATE_INCOMPARABLE,
@@ -697,6 +810,7 @@ pub fn implementation_reported(
 /// the same transaction (REQ-RG-02: no quiet log-only exit, no state change
 /// without an answerable question).
 fn empty_rework_trip(
+    process: &Process,
     task: &Task,
     facts: &ImplementationReportFacts,
     prior: &PriorImplementationReport,
@@ -704,11 +818,12 @@ fn empty_rework_trip(
     cur_sha: &str,
     actor: &str,
     now: Timestamp,
-) -> Mutation {
+) -> CoreResult<Mutation> {
     let question_id = new_id();
-    let mut m = transition(
+    let mut m = hold(
+        process,
         task,
-        TaskState::WaitingForInput,
+        HoldKind::Question,
         event_kind::QUESTION_RAISED,
         actor,
         now,
@@ -717,7 +832,7 @@ fn empty_rework_trip(
             "blocking": true,
             (json_field::GATE): "empty-rework",
         }),
-    );
+    )?;
     m.events.push(EventDraft {
         kind: event_kind::QA_REWORK_GATE_TRIPPED,
         actor: actor.to_string(),
@@ -730,23 +845,57 @@ fn empty_rework_trip(
             (json_field::QUESTION_ID): question_id.to_string(),
         }),
     });
-    m.questions.push(QuestionDraft {
+    m.questions.push(empty_rework_question(
+        task,
+        facts,
+        prior,
+        prev_sha,
+        cur_sha,
+        question_id,
+    ));
+    Ok(m)
+}
+
+/// The answerable half of the trip (REQ-RG-02): the operator is told WHAT was
+/// skipped, both commits, the QA return that opened the cycle and the one
+/// command that can legitimately ratify a no-op.
+fn empty_rework_question(
+    task: &Task,
+    facts: &ImplementationReportFacts,
+    prior: &PriorImplementationReport,
+    prev_sha: &str,
+    cur_sha: &str,
+    question_id: Id,
+) -> QuestionDraft {
+    let rationale = facts
+        .qa_return_rationale
+        .as_deref()
+        .unwrap_or("(rationale not stored)");
+    QuestionDraft {
         id: question_id,
         text: format!(
-            "REWORK publication {} names commit {cur_sha} — the SAME commit as report {} ({prev_sha}): the rework captured no new changes. QA returned with: {}. If the points were genuinely already satisfied, the operator may ratify the no-op explicitly: `devai task ratify-empty-rework {} --rationale \"why no fixes were required\"` (a stored human decision — the QA transition will cite it). Otherwise run the implementation-agent with the actual fixes and publish again.",
-            facts.current_report,
-            prior.artifact_id,
-            facts.qa_return_rationale.as_deref().unwrap_or("(rationale not stored)"),
-            task.id,
+            "REWORK publication {} names commit {cur_sha} — the SAME commit as report {} \
+             ({prev_sha}): the rework captured no new changes. QA returned with: {rationale}. If \
+             the points were genuinely already satisfied, the operator may ratify the no-op \
+             explicitly: `devai task ratify-empty-rework {} --rationale \"why no fixes were \
+             required\"` (a stored human decision — the QA transition will cite it). Otherwise \
+             run the implementation-agent with the actual fixes and publish again.",
+            facts.current_report, prior.artifact_id, task.id,
         ),
-        context: Some(format!("gate=empty-rework prev={} current={} commit={cur_sha}", prior.artifact_id, facts.current_report)),
-        options: vec!["ratify-empty-rework (no fixes were required)".into(), "re-run implementation with fixes".into()],
+        context: Some(format!(
+            "gate=empty-rework prev={} current={} commit={cur_sha}",
+            prior.artifact_id, facts.current_report
+        )),
+        options: vec![
+            "ratify-empty-rework (no fixes were required)".into(),
+            "re-run implementation with fixes".into(),
+        ],
         blocking: true,
-    });
-    m
+    }
 }
 
 pub fn accept(
+    process: &Process,
     task: &Task,
     artifacts: &[Artifact],
     deps: &[TaskDependency],
@@ -769,25 +918,34 @@ pub fn accept(
     if !blockers.is_empty() {
         return Err(CoreError::OpenBlockers { blockers });
     }
-    let has_quality = artifacts
-        .iter()
-        .any(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current);
-    if !has_quality {
-        return Err(CoreError::guard(
-            "acceptance requires a CURRENT QUALITY_REPORT artifact: checks must be independent of the implementation",
-        ));
-    }
+    require_current_quality_report(artifacts)?;
     Ok(transition(
+        process,
         task,
-        TaskState::Accepted,
+        process_condition::HUMAN_ACCEPTED,
         event_kind::TASK_ACCEPTED,
         actor,
         now,
         json!({ "rationale": rationale }),
+    )?)
+}
+
+/// Acceptance is not a formality: an independent, CURRENT quality report is
+/// the platform's evidence that somebody else checked the work.
+fn require_current_quality_report(artifacts: &[Artifact]) -> CoreResult<()> {
+    if artifacts
+        .iter()
+        .any(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
+    {
+        return Ok(());
+    }
+    Err(CoreError::guard(
+        "acceptance requires a CURRENT QUALITY_REPORT artifact: checks must be independent of the implementation",
     ))
 }
 
 pub fn return_to_rework(
+    process: &Process,
     task: &Task,
     artifacts: &[Artifact],
     rationale: Option<&str>,
@@ -801,43 +959,50 @@ pub fn return_to_rework(
         CoreError::hint("QA results can be returned only in QA"),
     )?;
     let mut m = transition(
+        process,
         task,
-        TaskState::Rework,
+        process_condition::HUMAN_RETURNED,
         event_kind::QUALITY_RETURNED,
         actor,
         now,
         json!({ (json_field::RATIONALE): rationale }),
-    );
+    )?;
 
-    // Ratified OQ-QH-3: rework is a DATA change, not only a presentation one.
-    // The quality report the return just rejected stops being CURRENT — a
-    // stale report that still reads as CURRENT is «старьё выглядит решением»
-    // at the store level, which no presentation layer could honestly fix.
-    // Nothing is deleted: the row keeps its content and moves to STALE until
-    // a new audit publishes its successor.
+    stale_rejected_report(&mut m, artifacts, actor);
+    Ok(m)
+}
+
+/// Ratified OQ-QH-3: rework is a DATA change, not only a presentation one.
+/// The quality report the return just rejected stops being CURRENT — a stale
+/// report that still reads as CURRENT is «старьё выглядит решением» at the
+/// store level, which no presentation layer could honestly fix. Nothing is
+/// deleted: the row keeps its content and moves to STALE until a new audit
+/// publishes its successor.
+fn stale_rejected_report(m: &mut Mutation, artifacts: &[Artifact], actor: &str) {
     let rejected: Vec<Id> = artifacts
         .iter()
         .filter(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
         .map(|a| a.id)
         .collect();
-    if !rejected.is_empty() {
-        m.artifact_status
-            .extend(rejected.iter().map(|id| (*id, ArtifactStatus::Stale)));
-        m.events.push(EventDraft {
-            kind: event_kind::ARTIFACTS_STALED,
-            actor: actor.to_string(),
-            payload: json!({
-                (json_field::STALED): rejected.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
-                (json_field::CAUSE): stale_cause::REWORK_RETURN,
-            }),
-        });
+    if rejected.is_empty() {
+        return;
     }
-    Ok(m)
+    m.artifact_status
+        .extend(rejected.iter().map(|id| (*id, ArtifactStatus::Stale)));
+    m.events.push(EventDraft {
+        kind: event_kind::ARTIFACTS_STALED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::STALED): rejected.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+            (json_field::CAUSE): stale_cause::REWORK_RETURN,
+        }),
+    });
 }
 
 /// A role raises a question. Blocking questions move the task to
 /// WAITING_FOR_INPUT; the stage is remembered for restoration on answer.
 pub fn raise_question(
+    process: &Process,
     task: &Task,
     question_id: Id,
     blocking: bool,
@@ -854,17 +1019,19 @@ pub fn raise_question(
         "raise-blocking-question",
         CoreError::hint("only an active stage can wait for input"),
     )?;
-    Ok(transition(
+    hold(
+        process,
         task,
-        TaskState::WaitingForInput,
+        HoldKind::Question,
         event_kind::QUESTION_RAISED,
         actor,
         now,
         payload,
-    ))
+    )
 }
 
 pub fn answer_question(
+    process: &Process,
     task: &Task,
     question_id: Id,
     actor: &str,
@@ -876,17 +1043,15 @@ pub fn answer_question(
         "answer",
         CoreError::hint("the task is not waiting for input"),
     )?;
-    let to = task.return_state.ok_or_else(|| {
-        CoreError::guard("WAITING_FOR_INPUT without a remembered stage is a state corruption")
-    })?;
     let mut m = transition(
+        process,
         task,
-        to,
+        process_condition::HUMAN_RESUMED,
         event_kind::QUESTION_ANSWERED,
         actor,
         now,
         json!({ "question_id": question_id.to_string() }),
-    );
+    )?;
     m.task.return_state = None;
     Ok(m)
 }
@@ -900,6 +1065,7 @@ pub fn answer_question(
 /// log-only exit. The workflow effect of a form exhaustion is exactly this
 /// park — the stage itself is replayed by the next `advance` once answered.
 pub fn escalate_form_rejection(
+    process: &Process,
     task: &Task,
     question_id: Id,
     role_slug: &str,
@@ -924,9 +1090,10 @@ pub fn escalate_form_rejection(
     // machine list (no model): the shape of the failure is classified from
     // the violation texts themselves, which are platform-owned literals.
     let retelling = form_escalation_retelling(role_slug, attempts, violations);
-    let mut m = transition(
+    let mut m = hold(
+        process,
         task,
-        TaskState::WaitingForInput,
+        HoldKind::Question,
         event_kind::QUESTION_RAISED,
         actor,
         now,
@@ -937,7 +1104,7 @@ pub fn escalate_form_rejection(
             (json_field::ROLE): role_slug,
             (json_field::ATTEMPT): attempts,
         }),
-    );
+    )?;
     m.events.push(EventDraft {
         kind: event_kind::EXECUTION_FORM_ESCALATED,
         actor: actor.to_string(),
@@ -1036,6 +1203,7 @@ fn form_escalation_retelling(role_slug: &str, attempts: u32, violations: &[Strin
 // ---------------------------------------------------------------------------
 
 pub fn pause(
+    process: &Process,
     task: &Task,
     reason: Option<&str>,
     actor: &str,
@@ -1047,17 +1215,19 @@ pub fn pause(
         "pause",
         CoreError::hint("cannot pause a terminal or already-held task"),
     )?;
-    Ok(transition(
+    hold(
+        process,
         task,
-        TaskState::Paused,
+        HoldKind::Pause,
         event_kind::TASK_PAUSED,
         actor,
         now,
         json!({ "reason": reason }),
-    ))
+    )
 }
 
 pub fn block(
+    process: &Process,
     task: &Task,
     reason: Option<&str>,
     actor: &str,
@@ -1069,17 +1239,19 @@ pub fn block(
         "block",
         CoreError::hint("cannot block a terminal or already-held task"),
     )?;
-    Ok(transition(
+    hold(
+        process,
         task,
-        TaskState::Blocked,
+        HoldKind::Block,
         event_kind::TASK_BLOCKED,
         actor,
         now,
         json!({ "reason": reason }),
-    ))
+    )
 }
 
 pub fn cancel(
+    process: &Process,
     task: &Task,
     reason: Option<&str>,
     actor: &str,
@@ -1091,14 +1263,15 @@ pub fn cancel(
         "cancel",
         CoreError::hint("cannot cancel a terminal or already-held task"),
     )?;
-    Ok(transition(
+    hold(
+        process,
         task,
-        TaskState::Cancelled,
+        HoldKind::Cancel,
         event_kind::TASK_CANCELLED,
         actor,
         now,
         json!({ "reason": reason }),
-    ))
+    )
 }
 
 /// Releases a hold state (PAUSED / BLOCKED / FAILED → remembered stage).
@@ -1111,6 +1284,7 @@ pub fn cancel(
 /// the last blocker closes — resume stays a human act until a human issues
 /// it, the platform never decides on the operator's behalf.
 pub fn resume(
+    process: &Process,
     task: &Task,
     deps: &[TaskDependency],
     decisions: &[Decision],
@@ -1127,15 +1301,21 @@ pub fn resume(
     if !blockers.is_empty() {
         return Err(CoreError::OpenBlockers { blockers });
     }
-    let to = task.return_state.ok_or_else(|| {
-        CoreError::guard("hold state without a remembered stage is a state corruption")
-    })?;
-    let mut m = transition(task, to, event_kind::TASK_RESUMED, actor, now, json!({}));
+    let mut m = transition(
+        process,
+        task,
+        process_condition::HUMAN_RESUMED,
+        event_kind::TASK_RESUMED,
+        actor,
+        now,
+        json!({}),
+    )?;
     m.task.return_state = None;
     Ok(m)
 }
 
 pub fn fail(
+    process: &Process,
     task: &Task,
     reason: Option<&str>,
     actor: &str,
@@ -1147,14 +1327,116 @@ pub fn fail(
         "fail",
         CoreError::hint("only an active stage can fail"),
     )?;
-    Ok(transition(
+    hold(
+        process,
         task,
-        TaskState::Failed,
+        HoldKind::Fail,
         event_kind::TASK_FAILED,
         actor,
         now,
         json!({ "reason": reason }),
-    ))
+    )
+}
+
+/// Park a task on a PLATFORM-side stop: a failed launch walks the declared
+/// `launch_failed` edge of its state (the declaration says where a failed
+/// launch sends each role state); a brake that is not an outcome parks in the
+/// declared `brakes.park_state`. Both addresses are data.
+pub fn park_on_launch_failure(
+    process: &Process,
+    task: &Task,
+    reason: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    let declared = process
+        .target(task.state.as_str(), process_condition::LAUNCH_FAILED)
+        .ok();
+    match declared {
+        Some(Target::State(_)) => transition(
+            process,
+            task,
+            process_condition::LAUNCH_FAILED,
+            event_kind::TASK_BLOCKED,
+            actor,
+            now,
+            json!({ "reason": reason }),
+        ),
+        _ => {
+            let to = process.park_state()?;
+            park_at(
+                process,
+                task,
+                to,
+                event_kind::TASK_BLOCKED,
+                actor,
+                now,
+                json!({ "reason": reason }),
+            )
+        }
+    }
+}
+
+/// Park in the declared brake address regardless of the current state — the
+/// shape a tripped brake uses (rounds without a shift, consecutive failures).
+pub fn park(
+    process: &Process,
+    task: &Task,
+    reason: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    let to = process.park_state()?;
+    park_at(
+        process,
+        task,
+        to,
+        event_kind::TASK_BLOCKED,
+        actor,
+        now,
+        json!({ "reason": reason }),
+    )
+}
+
+/// One explicit address for a platform park (already resolved by the caller,
+/// so a brake that names its own park state and a declared outcome edge share
+/// the same body).
+fn park_at(
+    _process: &Process,
+    task: &Task,
+    to: TaskState,
+    kind: &'static str,
+    actor: &str,
+    now: Timestamp,
+    mut payload: serde_json::Value,
+) -> CoreResult<Mutation> {
+    if !ACTIVE_STATES.contains(&task.state) {
+        return Err(CoreError::InvalidTransition {
+            op: "park",
+            from: task.state.as_str().to_string(),
+            hint: CoreError::hint("only an active stage can be parked"),
+        });
+    }
+    let from = task.state;
+    let mut next = task.clone();
+    next.state = to;
+    next.updated_at = now;
+    next.lock_version += 1;
+    next.return_state = Some(from);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("from".into(), json!(from.as_str()));
+        obj.insert("to".into(), json!(to.as_str()));
+    }
+    Ok(Mutation {
+        task: next,
+        events: vec![EventDraft {
+            kind,
+            actor: actor.to_string(),
+            payload,
+        }],
+        artifact_status: Vec::new(),
+        questions: Vec::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------

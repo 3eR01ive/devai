@@ -52,7 +52,7 @@ fn commit(store: &Store, base: &Task, m: Mutation) {
 /// Drive a task through the standard flow into IMPLEMENTATION.
 fn to_implementation(store: &Store) -> (Task, Artifact, Artifact) {
     let mut t = draft(store);
-    commit(store, &t, workflow::start(&t, "u", now()).unwrap());
+    commit(store, &t, workflow::start(&proc(), &t, "u", now()).unwrap());
     t = store.get_task(&t.id.to_string()).unwrap();
 
     let spec = publish(
@@ -66,20 +66,20 @@ fn to_implementation(store: &Store) -> (Task, Artifact, Artifact) {
     commit(
         store,
         &t,
-        workflow::requirements_published(&t, &arts, None, None, "analyst", now()).unwrap(),
+        workflow::requirements_published(&proc(), &t, &arts, None, None, "analyst", now()).unwrap(),
     );
     t = store.get_task(&t.id.to_string()).unwrap();
 
     commit(
         store,
         &t,
-        workflow::review_recorded(&t, Verdict::Approved, None, "reviewer", now()).unwrap(),
+        workflow::review_recorded(&proc(), &t, Verdict::Approved, None, "reviewer", now()).unwrap(),
     );
     t = store.get_task(&t.id.to_string()).unwrap();
     commit(
         store,
         &t,
-        workflow::approve_requirements(&t, Some("ok"), "u", now()).unwrap(),
+        workflow::approve_requirements(&proc(), &t, Some("ok"), "u", now()).unwrap(),
     );
     t = store.get_task(&t.id.to_string()).unwrap();
     (t, spec.clone(), spec)
@@ -92,7 +92,7 @@ fn create_resolve_commit_and_locking() {
     let by_prefix = store.resolve_task(&t.id.to_string()[..8]).unwrap();
     assert_eq!(by_prefix.id, t.id);
 
-    let m = workflow::start(&by_prefix, "u", now()).unwrap();
+    let m = workflow::start(&proc(), &by_prefix, "u", now()).unwrap();
     commit(&store, &by_prefix, m);
     let reloaded = store.get_task(&t.id.to_string()).unwrap();
     assert_eq!(reloaded.state, TaskState::Analysis);
@@ -100,7 +100,7 @@ fn create_resolve_commit_and_locking() {
 
     // stale optimistic write must fail, not silently overwrite
     let stale = by_prefix.clone(); // lock 1, task is now lock 2
-    let m = workflow::pause(&reloaded, Some("x"), "u", now()).unwrap();
+    let m = workflow::pause(&proc(), &reloaded, Some("x"), "u", now()).unwrap();
     let err = store.commit(stale.lock_version, &m).unwrap_err();
     assert!(
         format!("{err}").contains("concurrent modification"),
@@ -136,6 +136,7 @@ fn revision_marks_dependents_stale_persistently() {
         &store,
         &t,
         workflow::implementation_reported(
+            &proc(),
             &t,
             &workflow::ImplementationReportFacts::bare(new_id()),
             "impl",
@@ -155,8 +156,16 @@ fn revision_marks_dependents_stale_persistently() {
         vec![],
     );
     let arts = store.artifacts(t.id).unwrap();
-    let m = workflow::requirements_published(&t, &arts, Some("scope change"), None, "u", now())
-        .unwrap();
+    let m = workflow::requirements_published(
+        &proc(),
+        &t,
+        &arts,
+        Some("scope change"),
+        None,
+        "u",
+        now(),
+    )
+    .unwrap();
     commit(&store, &t, m);
 
     let arts = store.artifacts(t.id).unwrap();
@@ -282,20 +291,21 @@ fn export_import_roundtrip_restores_everything() {
     commit(
         &store,
         &t,
-        workflow::raise_question(&t, q.id, true, "impl", now()).unwrap(),
+        workflow::raise_question(&proc(), &t, q.id, true, "impl", now()).unwrap(),
     );
     t = store.get_task(&t.id.to_string()).unwrap();
     store.answer_question(q.id, "worktree", "u", now()).unwrap();
     commit(
         &store,
         &t,
-        workflow::answer_question(&t, q.id, "u", now()).unwrap(),
+        workflow::answer_question(&proc(), &t, q.id, "u", now()).unwrap(),
     );
     t = store.get_task(&t.id.to_string()).unwrap();
     commit(
         &store,
         &t,
         workflow::implementation_reported(
+            &proc(),
             &t,
             &workflow::ImplementationReportFacts::bare(new_id()),
             "impl",
@@ -991,7 +1001,11 @@ fn read_plane_hands_finished_signboards_on_edges_and_graph() {
 
     // c: legacy task past analysis WITHOUT a name (OQ-TN-2: keeps the title).
     let mut c = draft(&store);
-    commit(&store, &c, workflow::start(&c, "u", now()).unwrap());
+    commit(
+        &store,
+        &c,
+        workflow::start(&proc(), &c, "u", now()).unwrap(),
+    );
     c = store.get_task(&c.id.to_string()).unwrap();
     publish(
         &store,
@@ -1004,7 +1018,7 @@ fn read_plane_hands_finished_signboards_on_edges_and_graph() {
     commit(
         &store,
         &c,
-        workflow::requirements_published(&c, &arts, None, None, "analyst", now()).unwrap(),
+        workflow::requirements_published(&proc(), &c, &arts, None, None, "analyst", now()).unwrap(),
     );
     let c = store.get_task(&c.id.to_string()).unwrap();
     assert_eq!(c.human_name, None);
@@ -1130,4 +1144,11 @@ fn running_executions_reads_only_running_rows() {
     assert_eq!(running.len(), 1, "only the RUNNING row is listed");
     assert_eq!(running[0].id, live.id);
     assert_eq!(running[0].status.as_str(), "RUNNING");
+}
+
+/// The process declaration every workflow command resolves its target from
+/// (REQ-AR-09): the factory bytes, parsed once. A test that changes the
+/// declaration changes the walk — that is the point of the data.
+fn proc() -> &'static devai_core::process::Process {
+    devai_core::process::Process::factory()
 }

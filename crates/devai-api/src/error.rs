@@ -114,6 +114,7 @@ fn core_code(e: &CoreError) -> ErrorCode {
         CoreError::Guard(..) => ErrorCode("guard"),
         CoreError::UnknownVariant { .. } => ErrorCode("unknown_variant"),
         CoreError::OpenBlockers { .. } => ErrorCode("open_blockers"),
+        CoreError::UndeclaredEdge { .. } => ErrorCode("process_declaration"),
     }
 }
 

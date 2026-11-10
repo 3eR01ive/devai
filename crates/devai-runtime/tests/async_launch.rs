@@ -81,7 +81,7 @@ fn the_runner_gets_its_own_session_and_hands_back_a_handle() {
 
     match out {
         LaunchOutcome::Started {
-            run_id: r,
+            caller_run_id: r,
             execution_id,
         } => {
             assert_eq!(r, run_id);
@@ -248,5 +248,13 @@ fn the_tail_helper_keeps_the_last_lines() {
     let d = tempfile::TempDir::new().unwrap();
     let p = Path::new(d.path()).join("log");
     std::fs::write(&p, "1\n2\n3\n").unwrap();
-    assert_eq!(devai_runtime::launch::read_tail(&p, 2), "2\n3");
+    assert_eq!(
+        devai_runtime::tail::read_tail(&p, 2),
+        Ok("2\n3".to_string())
+    );
+    // An absent file is a TYPED miss, never an empty tail (QA R3).
+    assert!(matches!(
+        devai_runtime::tail::read_tail(&d.path().join("absent"), 2),
+        Err(devai_runtime::tail::TailError::NotFound(_))
+    ));
 }

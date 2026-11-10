@@ -40,80 +40,13 @@ pub struct Reclaimed {
 /// Returns the rows actually closed — an empty result means «nothing was
 /// provable», never «nothing was wrong».
 pub fn reclaim(store: &Store, task: Option<devai_core::types::Id>) -> StoreResult<Vec<Reclaimed>> {
-    let running = match task {
-        Some(t) => store
-            .list_executions(Some(t))?
-            .into_iter()
-            .filter(|e| e.status == ExecutionStatus::Running)
-            .collect::<Vec<_>>(),
-        None => store.running_executions()?,
-    };
     let boot = boot_time_epoch();
     let mut closed = Vec::new();
-    for e in running {
-        let (class, evidence) = match (e.owner_pid, e.owner_host.as_deref(), e.owner_process_start)
-        {
-            (None, None, _) => (
-                failure_class::LOST_BEFORE_OWNERSHIP,
-                "RUNNING row with no owner recorded (written before the platform owned \
-                 processes) — closed by the ratified «потеряно до введения владения» rule"
-                    .to_string(),
-            ),
-            (pid, host, start) => match check_owner(pid, host, start) {
-                Liveness::Dead => {
-                    let started_epoch = e.started_at.timestamp();
-                    let restarted = boot.map(|b| started_epoch < b).unwrap_or(false);
-                    if restarted {
-                        (
-                            failure_class::HOST_RESTARTED,
-                            format!(
-                                "owner pid={pid:?} started {} — BEFORE this boot ({}); the host \
-                                 restarted, nothing of this row can still run",
-                                e.started_at.to_rfc3339(),
-                                boot.map(|b| b.to_string()).unwrap_or_else(|| "?".into())
-                            ),
-                        )
-                    } else {
-                        (
-                            failure_class::PROCESS_VANISHED,
-                            format!(
-                                "owner pid={pid:?} host={host:?} start={start:?} is gone on this \
-                                 host (no /proc entry or a recycled pid) and the host did not \
-                                 reboot since the row started"
-                            ),
-                        )
-                    }
-                }
-                // Alive, or NOT provable (another host / no /proc). Never
-                // guessed dead — the human closes an unprovable row.
-                Liveness::Alive | Liveness::Unknown => continue,
-            },
+    for e in running_rows(store, task)? {
+        let Some((class, evidence)) = classify(&e, boot) else {
+            continue;
         };
-        store.finish_execution_classified(
-            &e,
-            ExecutionStatus::Failed,
-            None,
-            Some(&format!(
-                "platform closed this execution: {class} — {evidence}. The slot is free; the \
-                 role is not re-run automatically (no automatic retries)."
-            )),
-            Some(class),
-            Utc::now(),
-        )?;
-        store.insert_event(
-            Some(e.task_id),
-            event_kind::EXECUTION_LOST,
-            "platform",
-            serde_json::json!({
-                "execution_id": e.id.to_string(),
-                "role": e.role_slug,
-                "failure_class": class,
-                "owner_pid": e.owner_pid,
-                "owner_host": e.owner_host,
-                "owner_process_start": e.owner_process_start,
-                "evidence": evidence,
-            }),
-        )?;
+        close_row(store, &e, class, &evidence)?;
         closed.push(Reclaimed {
             execution: e,
             class,
@@ -121,4 +54,103 @@ pub fn reclaim(store: &Store, task: Option<devai_core::types::Id>) -> StoreResul
         });
     }
     Ok(closed)
+}
+
+/// The RUNNING rows in scope — one task's, or every home's.
+fn running_rows(
+    store: &Store,
+    task: Option<devai_core::types::Id>,
+) -> StoreResult<Vec<RoleExecution>> {
+    Ok(match task {
+        Some(t) => store
+            .list_executions(Some(t))?
+            .into_iter()
+            .filter(|e| e.status == ExecutionStatus::Running)
+            .collect(),
+        None => store.running_executions()?,
+    })
+}
+
+/// WHY this row is provably dead, or `None` when its fate is not provable.
+/// The three classes are the ratified OQ-4 answers; everything else — another
+/// host, a missing `/proc`, an uncomparable clock — is left to a human.
+fn classify(e: &RoleExecution, boot: Option<i64>) -> Option<(&'static str, String)> {
+    let (pid, host, start) = (e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
+    if pid.is_none() && host.is_none() {
+        return Some((
+            failure_class::LOST_BEFORE_OWNERSHIP,
+            "RUNNING row with no owner recorded (written before the platform owned \
+             processes) — closed by the ratified «потеряно до введения владения» rule"
+                .to_string(),
+        ));
+    }
+    match check_owner(pid, host, start) {
+        Liveness::Alive | Liveness::Unknown => None,
+        Liveness::Dead => Some(dead_class(e, pid, host, start, boot)),
+    }
+}
+
+/// The class of a row whose owner is gone on THIS host: a reboot since the row
+/// started is a different fact from a vanished process.
+fn dead_class(
+    e: &RoleExecution,
+    pid: Option<i64>,
+    host: Option<&str>,
+    start: Option<i64>,
+    boot: Option<i64>,
+) -> (&'static str, String) {
+    let restarted = boot.map(|b| e.started_at.timestamp() < b).unwrap_or(false);
+    if restarted {
+        return (
+            failure_class::HOST_RESTARTED,
+            format!(
+                "owner pid={pid:?} started {} — BEFORE this boot ({}); the host restarted, \
+                 nothing of this row can still run",
+                e.started_at.to_rfc3339(),
+                boot.map(|b| b.to_string()).unwrap_or_else(|| "?".into())
+            ),
+        );
+    }
+    (
+        failure_class::PROCESS_VANISHED,
+        format!(
+            "owner pid={pid:?} host={host:?} start={start:?} is gone on this host (no /proc entry \
+             or a recycled pid) and the host did not reboot since the row started"
+        ),
+    )
+}
+
+/// Close the row as FAILED with the class and say so in the event log. The
+/// slot is freed; the role is not re-run (no automatic retries).
+fn close_row(
+    store: &Store,
+    e: &RoleExecution,
+    class: &'static str,
+    evidence: &str,
+) -> StoreResult<()> {
+    store.finish_execution_classified(
+        e,
+        ExecutionStatus::Failed,
+        None,
+        Some(&format!(
+            "platform closed this execution: {class} — {evidence}. The slot is free; the role is \
+             not re-run automatically (no automatic retries)."
+        )),
+        Some(class),
+        Utc::now(),
+    )?;
+    store.insert_event(
+        Some(e.task_id),
+        event_kind::EXECUTION_LOST,
+        "platform",
+        serde_json::json!({
+            "execution_id": e.id.to_string(),
+            "role": e.role_slug,
+            "failure_class": class,
+            "owner_pid": e.owner_pid,
+            "owner_host": e.owner_host,
+            "owner_process_start": e.owner_process_start,
+            "evidence": evidence,
+        }),
+    )
 }

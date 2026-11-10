@@ -381,3 +381,47 @@ fn revising_the_spec_starts_the_reviewer_itself() {
         "the revision started the reviewer through a platform runner: {argv:?}"
     );
 }
+
+/// REQ-AR-12 AC1 from THE OPERATOR'S OWN SURFACE: the window signs gates, and
+/// its write handle must therefore be a live platform session — signing the
+/// requirements gate starts the implementation run itself (QA R4 on task
+/// 01a1b7dc: `write_api` opened the bootstrap door and the task sat in
+/// IMPLEMENTATION with no run).
+#[test]
+fn signing_the_gate_from_the_window_starts_the_implementation_itself() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = TempDir::new().unwrap();
+    // EXACTLY the door `AppState::write_api` opens for a signature.
+    let api = Api::open_for_window(dir.path(), "operator").unwrap();
+    api.seed_config(None).unwrap();
+    let script = stub_runner(dir.path(), "started");
+    unsafe { std::env::set_var("DEVAI_RUNNER", &script) };
+    let id = task(&api, "window signature");
+    api.task_start(&id).unwrap(); // DRAFT -> ANALYSIS (launch 1)
+    api.task_revise(ReviseReq {
+        id: id.clone(),
+        name: "spec.md".into(),
+        content: br#"{"requirements":[],"human_paragraph":"window signed"}"#.to_vec(),
+        reason: None,
+    })
+    .unwrap(); // -> REVIEW (launch 2)
+    api.task_review(&id, Verdict::Approved, None).unwrap(); // -> APPROVAL
+    assert_eq!(api.task_get(&id).unwrap().state, TaskState::Approval);
+
+    // Forget the earlier launches; only the SIGNATURE may write here.
+    let marker = dir.path().join("argv");
+    std::fs::write(&marker, "").unwrap();
+    api.task_approve(&id, Some("ok".into())).unwrap();
+    unsafe { std::env::remove_var("DEVAI_RUNNER") };
+
+    assert_eq!(
+        api.task_get(&id).unwrap().state,
+        TaskState::Implementation,
+        "the signature moved the task to the role state"
+    );
+    let argv = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        argv.contains("__supervise") && argv.contains(&id),
+        "the window's signature started the implementation through a platform runner: {argv:?}"
+    );
+}

@@ -746,9 +746,12 @@ pub struct RoleExecution {
     pub bundle: Option<ExecutionBundle>,
     /// The RUN this execution belongs to (REQ-AR-04/07): one launch drives a
     /// chain of executions, and every row of that chain carries the same
-    /// value — the id of the run's FIRST execution. `None` on rows written
-    /// before the v14 rung or imported from an older bundle: «run identity
-    /// not recorded», never a guessed one.
+    /// value. The run number is minted by the LAUNCH (`task_run` →
+    /// `new_id()`), BEFORE the first execution row exists, and is handed to
+    /// the runner as its own identity — it is NOT the id of the first
+    /// execution (the two are different values by construction). `None` on
+    /// rows written before the v14 rung or imported from an older bundle:
+    /// «run identity not recorded», never a guessed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Id>,
 }

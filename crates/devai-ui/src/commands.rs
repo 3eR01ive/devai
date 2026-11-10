@@ -60,7 +60,11 @@ impl AppState {
     /// `task_approve` падал «attempt to write a readonly database» — и кнопка
     /// подписи выглядела мёртвой (08.11, живой гейт).
     fn write_api(&self, path: &str, actor: &str) -> Result<Api, UiError> {
-        Ok(Api::open(std::path::Path::new(path), actor)?)
+        // The WINDOW door (REQ-AR-12): a live platform session, so a signature
+        // it records starts the next role itself. `Api::open` is the bootstrap
+        // door and deliberately never launches — using it here left the task
+        // in IMPLEMENTATION with no run (QA R4 on task 01a1b7dc).
+        Ok(Api::open_for_window(std::path::Path::new(path), actor)?)
     }
 
     fn api(&self) -> std::sync::MutexGuard<'_, Api> {

@@ -4,8 +4,9 @@
 -- inside ONE platform-owned process. Every row of that chain carries the same
 -- run id, so «all executions of run N, including the later ones» is answered
 -- from stored data alone, without a live caller and without re-deriving the
--- chain from timestamps. The first execution's id IS the run number (the
--- spec leaves the shape to the implementation: ASM-4 / unknowns).
+-- chain from timestamps. The run number is minted by the LAUNCH before the
+-- first execution row exists, and is NOT the first execution's id (the spec
+-- leaves the shape to the implementation: ASM-4 / unknowns).
 --
 -- ADDITIVE ONLY: one nullable column and one addressed index. Rows written
 -- before this rung keep NULL — «no run identity recorded», never a guessed
