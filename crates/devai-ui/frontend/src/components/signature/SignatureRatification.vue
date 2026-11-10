@@ -75,4 +75,19 @@ const emit = defineEmits<{
   flex: 1;
   min-width: 180px;
 }
+/* Палец: каждая пара «радио + слово» — цель не меньше 44px по высоте,
+   свой ответ занимает строку целиком. */
+@media (max-width: 1199px) {
+  .oq-choice label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 44px;
+    padding-right: 8px;
+  }
+  .own-answer {
+    width: 100%;
+    min-width: 0;
+  }
+}
 </style>

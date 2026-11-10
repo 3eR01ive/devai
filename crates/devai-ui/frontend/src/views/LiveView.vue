@@ -63,24 +63,23 @@ onUnmounted(() => {
       </thead>
       <tbody>
         <tr v-for="r in snap.rows" :key="r.id">
-          <td><RouterLink class="title-link" :to="`/task/${r.task_id}`">{{ shortId(r.task_id) }}</RouterLink></td>
-          <td class="mono">
-            {{ r.role }}
+          <td data-label="Задача" data-mobile="title"><RouterLink class="title-link" :to="`/task/${r.task_id}`">{{ shortId(r.task_id) }}</RouterLink></td>
+          <td class="mono" data-label="Роль@вер">{{ r.role }}
             <div v-if="r.note" class="chip-att">{{ r.note }}</div>
           </td>
-          <td>{{ r.agent_name ?? "—" }}</td>
-          <td><StateChip :token="r.state" /></td>
-          <td class="mono muted">{{ fmtElapsed(r.elapsed_seconds) }}</td>
-          <td class="mono muted">{{ r.owner_pid ?? "?" }}@{{ r.owner_host ?? "?" }}</td>
-          <td><StateChip :token="r.owner_liveness" /></td>
-          <td class="mono muted">
+          <td data-label="Агент">{{ r.agent_name ?? "—" }}</td>
+          <td data-label="Состояние" data-mobile="head"><StateChip :token="r.state" /></td>
+          <td class="mono muted" data-label="Шёл" data-mobile="head">{{ fmtElapsed(r.elapsed_seconds) }}</td>
+          <td class="mono muted" data-label="Owner">{{ r.owner_pid ?? "?" }}@{{ r.owner_host ?? "?" }}</td>
+          <td data-label="Live" data-mobile="head"><StateChip :token="r.owner_liveness" /></td>
+          <td class="mono muted" data-label="Stale-признаки">
             <template v-if="r.stale">
               {{ r.stale_terminal_task ? "task-terminal" : "" }}
               {{ r.stale_dead_owner ? "dead-owner" : "" }}
             </template>
             <template v-else>—</template>
           </td>
-          <td class="mono muted">
+          <td class="mono muted" data-label="Worktree">
             <template v-if="r.branch || r.worktree">{{ r.branch ?? "" }}<br v-if="r.worktree" />{{ r.worktree ?? "" }}</template>
             <template v-else>—</template>
           </td>

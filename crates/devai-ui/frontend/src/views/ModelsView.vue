@@ -17,6 +17,7 @@ import {
   HOLD_TO_SWITCH_MS,
   holdCompletes,
 } from "../model_view";
+import { holdMoveCancels, holdPoint, type HoldPoint } from "../hold_gesture";
 import { fmtTime } from "../settings";
 import type {
   BundleFormInput,
@@ -37,6 +38,7 @@ const holdProgress = ref(0);
 let holdTimer: ReturnType<typeof setTimeout> | undefined;
 let progressTimer: ReturnType<typeof setInterval> | undefined;
 let holdStart = 0;
+let holdOrigin: HoldPoint | null = null;
 
 const status = computed(() => snap.value?.status ?? null);
 
@@ -270,10 +272,11 @@ function holdKey(kind: "switch" | "delete", id: string): string {
   return kind === "delete" ? `del:${id}` : `sw:${id}`;
 }
 
-function startHold(kind: "switch" | "delete", id: string) {
+function startHold(kind: "switch" | "delete", id: string, event: PointerEvent) {
   cancelHold();
   holding.value = holdKey(kind, id);
   holdStart = performance.now();
+  holdOrigin = holdPoint(event);
   // Удержание — единственный путь применения: таймер заканчивается ровно на
   // пороге, а прогресс только заливает кнопку. Обработчика click нет.
   progressTimer = setInterval(() => {
@@ -297,11 +300,19 @@ function startHold(kind: "switch" | "delete", id: string) {
   }, HOLD_TO_SWITCH_MS + HOLD_TIMER_GRACE_MS);
 }
 
+// Смахивание пальцем отменяет удержание переключения/удаления (REQ-RESP-06):
+// сдвиг больше порога от точки нажатия, даже внутри кнопки.
+function moveHold(event: PointerEvent) {
+  if (!holding.value || !holdOrigin) return;
+  if (holdMoveCancels(holdOrigin, holdPoint(event))) cancelHold();
+}
+
 function cancelHold() {
   if (holdTimer) clearTimeout(holdTimer);
   if (progressTimer) clearInterval(progressTimer);
   holdTimer = undefined;
   progressTimer = undefined;
+  holdOrigin = null;
   holding.value = null;
   holdProgress.value = 0;
 }
@@ -480,24 +491,25 @@ onUnmounted(cancelHold);
         </thead>
         <tbody>
           <tr v-for="b in snap.declared" :key="b.id" :class="{ active: b.active }">
-            <td>
+            <td data-label="Связка" data-mobile="title">
               <b>{{ b.label }}</b>
               <div class="mono muted">{{ b.id }}</div>
             </td>
-            <td class="mono">{{ b.agent }}</td>
-            <td class="mono">{{ b.driver }}</td>
-            <td class="mono">{{ b.llm_provider_text }}</td>
-            <td class="mono">{{ b.model_text }}</td>
-            <td class="mono">{{ b.reasoning_text }}</td>
-            <td>
+            <td class="mono" data-label="Агент">{{ b.agent }}</td>
+            <td class="mono" data-label="Драйвер">{{ b.driver }}</td>
+            <td class="mono" data-label="LLM-провайдер">{{ b.llm_provider_text }}</td>
+            <td class="mono" data-label="Модель">{{ b.model_text }}</td>
+            <td class="mono" data-label="Уровень размышления">{{ b.reasoning_text }}</td>
+            <td data-label="Проба">
               <button @click="probe(b.id)">Проба</button>
               <div v-if="probeLine[b.id]" class="mono muted">{{ probeLine[b.id] }}</div>
             </td>
-            <td>
+            <td data-label="Применение">
               <button
                 class="hold"
                 :style="{ '--fill': `${(holding === `sw:${b.id}` ? holdProgress : 0) * 100}%` }"
-                @pointerdown="startHold('switch', b.id)"
+                @pointerdown="startHold('switch', b.id, $event)"
+                @pointermove="moveHold($event)"
                 @pointerup="cancelHold"
                 @pointerleave="cancelHold"
                 @pointercancel="cancelHold"
@@ -505,7 +517,7 @@ onUnmounted(cancelHold);
                 {{ b.active ? "Переключено" : "Удержать: переключить" }}
               </button>
             </td>
-            <td>
+            <td data-label="Правка">
               <button @click="openEdit(b)">Править</button>
               <div v-if="b.active" class="muted" data-testid="delete-locked">
                 действующая — сначала переключитесь
@@ -515,7 +527,8 @@ onUnmounted(cancelHold);
                 class="hold"
                 data-testid="delete-hold"
                 :style="{ '--fill': `${(holding === `del:${b.id}` ? holdProgress : 0) * 100}%` }"
-                @pointerdown="startHold('delete', b.id)"
+                @pointerdown="startHold('delete', b.id, $event)"
+                @pointermove="moveHold($event)"
                 @pointerup="cancelHold"
                 @pointerleave="cancelHold"
                 @pointercancel="cancelHold"
@@ -580,5 +593,12 @@ button.hold {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+/* Телефон — одна колонка (REQ-RESP-01): auto-fill на 600px давал две по
+   272px, то есть форме связки — десктопную раскладку на телефоне. */
+@media (max-width: 767px) {
+  .formgrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 </style>

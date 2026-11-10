@@ -103,9 +103,11 @@ onUnmounted(() => {
         <RouterLink to="/ops">Операции API</RouterLink>
       </nav>
       <div class="statusbar" v-if="session">
-        активный home <b>{{ session.home }}</b><br />
-        реестр в <b>{{ session.control_home }}</b> · actor
-        <b>{{ session.actor }}</b> · снимок {{ fmtTime(session.opened_at) }}
+        <span class="st-home"><span class="st-label">активный home </span><b>{{ session.home }}</b></span>
+        <span class="st-registry">
+          <span class="st-label">реестр в </span><b>{{ session.control_home }}</b> · actor
+          <b>{{ session.actor }}</b> · снимок {{ fmtTime(session.opened_at) }}
+        </span>
       </div>
     </header>
     <main class="content">

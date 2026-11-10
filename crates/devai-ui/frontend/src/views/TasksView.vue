@@ -133,21 +133,21 @@ function taskLink(b: HomeRecordsView<Task>, t: Task) {
         </thead>
         <tbody>
           <tr v-for="t in rows(b)" :key="b.home_path + ':' + t.id">
-            <td>
+            <td data-label="Задача" data-mobile="title">
               <RouterLink class="title-link" :to="taskLink(b, t)">{{ t.display }}</RouterLink>
             </td>
-            <td class="mono muted">{{ shortId(t.id) }}</td>
-            <td class="muted" :title="b.home_path">
+            <td class="mono muted" data-label="id">{{ shortId(t.id) }}</td>
+            <td class="muted" :title="b.home_path" data-label="Дом">
               <!-- REQ-HOME-04 AC1 (R7 quality return): карточка несёт и имя
                    дома, и путь — видимым текстом, не только в title. -->
               <div>{{ homeAttribution(b) }}</div>
               <div class="mono" style="font-size: 12px">{{ b.home_path }}</div>
             </td>
-            <td>
+            <td data-label="Состояние" data-mobile="head">
               <StateChip :token="t.state" />
               <StateChip v-if="t.return_state" :token="t.return_state" />
             </td>
-            <td class="mono muted">{{ fmtTime(t.updated_at) }}</td>
+            <td class="mono muted" data-label="Обновлена" data-mobile="head">{{ fmtTime(t.updated_at) }}</td>
           </tr>
         </tbody>
       </table>

@@ -396,7 +396,7 @@ async function activateForeignHome() {
                 :gap-milli="convergence.gap_milli"
                 break-on-profile
               />
-              <p class="muted mono" style="margin: 2px 0 0; font-size: 11px">
+              <p class="muted mono stage-caption">
                 время стадии
                 {{ s.stage_total_seconds === null ? "неизвестно" : `${s.stage_total_seconds} с` }} ·
                 кругов {{ s.counters.rounds_total }} · не измерено
@@ -497,9 +497,9 @@ async function activateForeignHome() {
               </thead>
               <tbody>
                 <tr v-for="f in ws.files" :key="f.path">
-                  <td class="mono">{{ f.status }}</td>
-                  <td class="mono">{{ f.path }}</td>
-                  <td><button @click="openWorkspaceDiff(f)">дифф</button></td>
+                  <td class="mono" data-label="Что" data-mobile="head">{{ f.status }}</td>
+                  <td class="mono" data-label="Путь" data-mobile="title">{{ f.path }}</td>
+                  <td data-label="Действия"><button @click="openWorkspaceDiff(f)">дифф</button></td>
                 </tr>
               </tbody>
             </table>
@@ -550,11 +550,11 @@ async function activateForeignHome() {
           </thead>
           <tbody>
             <tr v-for="a in artifacts" :key="a.id">
-              <td class="mono">{{ a.kind }}</td>
-              <td>{{ a.name }} <span class="muted mono">{{ shortId(a.id) }}</span></td>
-              <td>{{ a.seq }}</td>
-              <td><StateChip :token="a.status" /></td>
-              <td><button @click="openContent(a)">содержимое</button></td>
+              <td class="mono" data-label="Вид">{{ a.kind }}</td>
+              <td data-label="Имя" data-mobile="title">{{ a.name }} <span class="muted mono">{{ shortId(a.id) }}</span></td>
+              <td data-label="Seq">{{ a.seq }}</td>
+              <td data-label="Статус" data-mobile="head"><StateChip :token="a.status" /></td>
+              <td data-label="Действия"><button @click="openContent(a)">содержимое</button></td>
             </tr>
           </tbody>
         </table>
@@ -596,15 +596,15 @@ async function activateForeignHome() {
           </thead>
           <tbody>
             <tr v-for="e in executions" :key="e.id">
-              <td class="mono">{{ e.role_slug }}@{{ e.role_version }} <span class="muted">·{{ e.attempt ?? 1 }}</span></td>
-              <td>{{ e.agent_name ?? "—" }}</td>
-              <td><StateChip :token="e.status" /></td>
-              <td>
+              <td class="mono" data-label="Роль@вер" data-mobile="title">{{ e.role_slug }}@{{ e.role_version }} <span class="muted">·{{ e.attempt ?? 1 }}</span></td>
+              <td data-label="Агент">{{ e.agent_name ?? "—" }}</td>
+              <td data-label="Статус" data-mobile="head"><StateChip :token="e.status" /></td>
+              <td data-label="Live" data-mobile="head">
                 <StateChip v-if="liveness[e.id]" :token="liveness[e.id].liveness" />
                 <span v-else class="muted">—</span>
               </td>
-              <td class="mono muted">{{ fmtTime(e.started_at) }} → {{ fmtTime(e.finished_at) }}</td>
-              <td class="mono muted">{{ e.failure_class ?? "—" }}</td>
+              <td class="mono muted" data-label="Старт / финиш">{{ fmtTime(e.started_at) }} → {{ fmtTime(e.finished_at) }}</td>
+              <td class="mono muted" data-label="Класс сбоя">{{ e.failure_class ?? "—" }}</td>
             </tr>
           </tbody>
         </table>
@@ -655,13 +655,13 @@ async function activateForeignHome() {
           </thead>
           <tbody>
             <tr v-for="ev in events" :key="ev.id">
-              <td class="mono">{{ ev.kind }}</td>
-              <td class="muted">{{ ev.actor }}</td>
-              <td class="mono muted">{{ fmtTime(ev.created_at) }}</td>
+              <td class="mono" data-label="Событие" data-mobile="title">{{ ev.kind }}</td>
+              <td class="muted" data-label="Актор">{{ ev.actor }}</td>
+              <td class="mono muted" data-label="Время" data-mobile="head">{{ fmtTime(ev.created_at) }}</td>
               <!-- REQ-QG-07 AC2: обоснование решения видно РЯДОМ С событием,
                    не только в раскрытом payload. -->
-              <td class="muted event-rationale">{{ eventRationale(ev) ?? "—" }}</td>
-              <td>
+              <td class="muted event-rationale" data-label="Обоснование">{{ eventRationale(ev) ?? "—" }}</td>
+              <td data-label="Данные">
                 <details v-if="ev.payload && JSON.stringify(ev.payload) !== '{}'">
                   <summary class="muted mono">payload</summary>
                   <pre class="content">{{ JSON.stringify(ev.payload, null, 2) }}</pre>
@@ -678,6 +678,17 @@ async function activateForeignHome() {
 </template>
 
 <style scoped>
+/* Подпись «время стадии…» — служебная: на десктопе 11px, на телефоне и
+   планшете не мельче 12px (REQ-RESP-08 AC3). */
+.stage-caption {
+  margin: 2px 0 0;
+  font-size: 11px;
+}
+@media (max-width: 1199px) {
+  .stage-caption {
+    font-size: 12px;
+  }
+}
 .chip-stage {
   padding: 2px 8px;
   border: 1px solid var(--slate);

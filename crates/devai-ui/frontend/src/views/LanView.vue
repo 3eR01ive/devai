@@ -154,14 +154,14 @@ onUnmounted(() => {
         </thead>
         <tbody>
           <tr v-for="d in status?.devices ?? []" :key="d.id">
-            <td>
+            <td data-label="Устройство" data-mobile="title">
               <b>{{ d.name }}</b>
               <span v-if="!d.live" class="mono muted"> · не отвечает</span>
             </td>
-            <td class="mono">{{ d.addr }}</td>
-            <td class="mono">{{ fmtTime(d.connected_at) }}</td>
-            <td class="mono">{{ fmtTime(d.last_seen) }}</td>
-            <td><button :disabled="busy" @click="disconnect(d.id)">Отключить</button></td>
+            <td class="mono" data-label="Адрес">{{ d.addr }}</td>
+            <td class="mono" data-label="Подключено" data-mobile="head">{{ fmtTime(d.connected_at) }}</td>
+            <td class="mono" data-label="Последний контакт">{{ fmtTime(d.last_seen) }}</td>
+            <td data-label="Действия"><button :disabled="busy" @click="disconnect(d.id)">Отключить</button></td>
           </tr>
         </tbody>
       </table>
@@ -182,6 +182,12 @@ onUnmounted(() => {
   border-radius: 999px;
   padding: 1px 9px;
 }
+/* Телефон и планшет: служебная подпись не мельче 12px (REQ-RESP-08 AC3). */
+@media (max-width: 1199px) {
+  .lan-state {
+    font-size: 12px;
+  }
+}
 .lan-state.off {
   color: var(--slate);
 }
@@ -195,12 +201,15 @@ onUnmounted(() => {
 }
 .lan-qr {
   display: flex;
+  flex-wrap: wrap;
   gap: 18px;
   align-items: flex-start;
   margin-top: 10px;
 }
 .lan-qr-image :deep(svg) {
   display: block;
+  max-width: 100%;
+  height: auto;
   background: #fff;
   border-radius: 6px;
   padding: 4px;
@@ -210,6 +219,15 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 6px;
   max-width: 520px;
+  min-width: 0;
+}
+/* Телефон: QR и приглашение — друг под другом, а не в две колонки
+   (REQ-RESP-01). Планшет и десктоп сохраняют текущий ряд. */
+@media (max-width: 767px) {
+  .lan-qr {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 .lan-token {
   word-break: break-all;
