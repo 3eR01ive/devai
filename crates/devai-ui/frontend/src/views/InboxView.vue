@@ -15,8 +15,10 @@
 // сворачивает (детали не развёрнуты по умолчанию). Токены состояний
 // сравниваются через общий словарь states.ts, длинные машинные
 // тела режутся именованной константой.
-import { onMounted, onUnmounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 import { pollMs, setPollMs, POLL_CHOICES, shortId } from "../settings";
+import { api } from "../api";
+import type { AgentStatusView, UiError } from "../types";
 import {
   refreshWait,
   setWaitInterval,
@@ -42,6 +44,21 @@ const interval = ref(pollMs());
 const expanded = ref<Record<string, boolean>>({});
 let unsubscribe: (() => void) | undefined;
 
+// Статус агентов — отдельные строки секции (задача 01a1b60c, REQ-AF-07).
+// Источник — published read `agent.status`; текст строки приходит с платформы
+// целиком (`line`), окно его не собирает.
+const agents = ref<AgentStatusView[]>([]);
+const agentsError = ref<UiError | null>(null);
+
+async function loadAgents() {
+  agentsError.value = null;
+  try {
+    agents.value = await api.agentStatuses();
+  } catch (e) {
+    agentsError.value = e as UiError;
+  }
+}
+
 function isExpanded(taskId: string): boolean {
   return expanded.value[taskId] === true;
 }
@@ -60,7 +77,16 @@ function applyInterval(ms: number) {
 
 onMounted(() => {
   unsubscribe = subscribeWait();
+  loadAgents();
+  // Строки агентов обновляются на каждом снимке ожидания — тот же ритм
+  // опроса, без своего таймера.
+  watch(waitSnapshot, loadAgents);
 });
+
+function refreshAll() {
+  refreshWait();
+  loadAgents();
+}
 onUnmounted(() => unsubscribe?.());
 </script>
 
@@ -74,10 +100,22 @@ onUnmounted(() => unsubscribe?.());
           <option v-for="ms in POLL_CHOICES" :key="ms" :value="ms">{{ ms / 1000 }} с</option>
         </select>
       </label>
-      <button @click="refreshWait">Обновить</button>
+      <button @click="refreshAll">Обновить</button>
     </div>
     <div v-if="error" class="errorbox">
       <span class="code">{{ error.code }}</span>{{ error.message }}
+    </div>
+    <div v-if="agentsError" class="errorbox">
+      <span class="code">{{ agentsError.code }}</span>{{ agentsError.message }}
+    </div>
+
+    <!-- Статус агентов: отдельная строка на агента, слова платформы. -->
+    <div v-if="agents.length" class="panel" style="margin-bottom: 12px">
+      <div class="body">
+        <p v-for="a in agents" :key="a.name" class="mono" style="margin: 0 0 4px">
+          {{ a.line }}
+        </p>
+      </div>
     </div>
 
     <template v-if="snap">
@@ -109,6 +147,36 @@ onUnmounted(() => unsubscribe?.());
               {{ isExpanded(row.task.id) ? "свернуть" : "показать" }}
             </span>
           </p>
+
+          <!-- Отказ агента (задача 01a1b60c, REQ-AF-08): имя, класс словами,
+               число отказов и полный текст причины. Кнопок починки нет:
+               платформа только называет причину и паркует. -->
+          <div v-if="row.agent_failure" class="panel" style="margin: 6px 0">
+            <div class="body">
+              <p style="margin: 0 0 4px">
+                <b>Отказ агента:</b> {{ row.agent_failure.agent }} —
+                {{ row.agent_failure.class_word }} ({{ row.agent_failure.class }}),
+                {{ row.agent_failure.series_count }} из {{ row.agent_failure.threshold }}
+                <span v-if="row.agent_failure.parked" class="mono" style="color: var(--orange); font-weight: 700">● задача припаркована</span>
+              </p>
+              <p class="muted" style="margin: 0 0 4px">
+                Действие: {{ row.agent_failure.action }}. Платформа сама модель,
+                провайдера и ключ не меняет.
+              </p>
+              <p class="mono" style="margin: 0 0 4px; white-space: pre-wrap">{{ row.agent_failure.message }}</p>
+              <p v-if="row.agent_failure.tail" class="mono" style="margin: 0 0 4px; white-space: pre-wrap">{{ row.agent_failure.tail }}</p>
+              <p v-else class="muted" style="margin: 0 0 4px">
+                вывода не было — хвост пуст, сохранён код возврата
+                <span v-if="row.agent_failure.exit_code !== null">({{ row.agent_failure.exit_code }})</span>
+              </p>
+              <p v-if="row.agent_failure.driver_log_tail" class="mono" style="margin: 0 0 4px; white-space: pre-wrap">
+                {{ row.agent_failure.driver_log_tail }}
+              </p>
+              <p v-else-if="row.agent_failure.driver_log_note" class="muted" style="margin: 0">
+                {{ row.agent_failure.driver_log_note }}
+              </p>
+            </div>
+          </div>
 
           <!-- Мини-график сходимости стадии строки (REQ-CV-12/13): срез
                приходит в фактах снимка; null — только у терминальной

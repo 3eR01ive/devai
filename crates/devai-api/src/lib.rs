@@ -343,6 +343,7 @@ impl Api {
             .collect();
         let artifacts = self.store.artifacts(t.id)?;
         let convergence = self.task_convergence(&t, &artifacts, &executions);
+        let agent_failure = self.task_agent_failure(&t)?;
         Ok(ProgressView {
             task: t.clone(),
             snapshot_at: now,
@@ -360,7 +361,28 @@ impl Api {
                 .collect(),
             running_executions: running,
             convergence,
+            agent_failure,
         })
+    }
+
+    /// The task's latest stored agent failure with its series — the ONE
+    /// source of the progress line and of the wait row. `parked` is a fact
+    /// of the stored state (`parked_at` on the series AND a hold state),
+    /// never a guess.
+    fn task_agent_failure(&self, task: &Task) -> ApiResult<Option<AgentFailureView>> {
+        let Some(row) = self.store.latest_agent_failure(task.id)? else {
+            return Ok(None);
+        };
+        let series = self.store.agent_failure_series(task.id, &row.agent_name)?;
+        let total = self.store.agent_failure_total(&row.agent_name)?;
+        let parked = task.state == TaskState::WaitingForInput
+            && series.as_ref().is_some_and(|s| s.parked_at.is_some());
+        Ok(Some(agent_failure_view(
+            &row,
+            series.as_ref(),
+            parked,
+            total,
+        )))
     }
 
     /// Cross-task RUNNING snapshot with per-row liveness triage — the
@@ -619,6 +641,7 @@ impl Api {
         } else {
             None
         };
+        let agent_failure = self.task_agent_failure(&task)?;
         Ok(InboxTaskFacts {
             task,
             questions: owned_questions,
@@ -627,6 +650,7 @@ impl Api {
             report_note,
             audit_running,
             convergence,
+            agent_failure,
         })
     }
 
@@ -1047,6 +1071,121 @@ impl Api {
         Ok(self.store.list_agents()?)
     }
 
+    /// The agent status rows (task 01a1b60c, REQ-AF-07): availability from
+    /// the latest executed outcome, the last failure class in words, the
+    /// counters and the time. Derived at read time from stored executions and
+    /// failure windows — no second stored status exists (REQ-AF-07 AC3).
+    pub fn agent_status_list(&self) -> ApiResult<Vec<AgentStatusView>> {
+        let agents = self.store.list_agents()?;
+        let executions = self.store.list_executions(None)?;
+        let mut out = Vec::with_capacity(agents.len());
+        for a in agents {
+            let latest = executions
+                .iter()
+                .filter(|e| {
+                    e.agent_name.as_deref() == Some(a.name.as_str())
+                        && matches!(
+                            e.status,
+                            ExecutionStatus::Completed | ExecutionStatus::Failed
+                        )
+                })
+                .max_by_key(|e| e.finished_at.unwrap_or(e.started_at));
+            let last_failure = self.store.latest_agent_failure_for_agent(&a.name)?;
+            let series = self.store.agent_failure_series_for_agent(&a.name)?;
+            let failures = self.store.agent_failure_total(&a.name)?;
+            let last_failure_at = last_failure.as_ref().map(|r| r.last_at);
+            let last_outcome_at = latest.and_then(|e| e.finished_at.or(Some(e.started_at)));
+            // REQ-AF-07 AC2, ASM-AF-05: availability folds executions AND
+            // recorded failures — a failure is an outcome too, and the NEWER
+            // of the two decides. A success resets nothing by itself here; it
+            // simply becomes the latest outcome. No stored status exists.
+            let availability = match (latest.map(|e| e.status), last_outcome_at, last_failure_at) {
+                // A recorded failure NEWER than the latest closed execution.
+                (Some(ExecutionStatus::Completed), Some(outcome), Some(failure))
+                    if failure > outcome =>
+                {
+                    "unavailable"
+                }
+                (Some(ExecutionStatus::Completed), _, _) => "available",
+                (Some(ExecutionStatus::Failed), _, _) => "unavailable",
+                // No closed execution but a recorded failure (an execution
+                // row the platform kept no outcome for): still unavailable.
+                (_, _, Some(_)) => "unavailable",
+                _ => "unknown",
+            };
+            let availability_word = match availability {
+                "available" => "доступен",
+                "unavailable" => "недоступен",
+                _ => "неизвестно",
+            };
+            // A failure without a recorded class is never dressed up: the
+            // row says «причина не классифицирована» (REQ-AF-03 AC5).
+            let last_class = last_failure.as_ref().map(|r| r.class.clone());
+            let last_class_word = match &last_class {
+                Some(c) => devai_core::agent_failure::word(c).to_string(),
+                None => "причина не классифицирована".to_string(),
+            };
+            let last_seen_at = match (last_outcome_at, last_failure_at) {
+                (Some(o), Some(f)) => o.max(f),
+                (Some(o), None) => o,
+                (None, Some(f)) => f,
+                (None, None) => a.created_at,
+            };
+            let series_count = series.as_ref().map(|s| s.consecutive_count).unwrap_or(0);
+            // REQ-AF-07 AC2: the time is ALWAYS on the line — an outcome
+            // time, else the failure time, else the record's own creation.
+            // AC1: the accumulated number of failures is named; «с <время>»
+            // is the FIRST failure of the current series, so the sentence
+            // reads «N отказов с 15:07» like the task's example.
+            let first_failure_at = series
+                .as_ref()
+                .map(|s| s.first_at)
+                .or(last_failure_at)
+                .unwrap_or(last_seen_at);
+            let line = match availability {
+                "unavailable" => format!(
+                    "{}: {}, {}, {} отказов с {}",
+                    a.name,
+                    availability_word,
+                    last_class_word,
+                    failures,
+                    short_time(first_failure_at)
+                ),
+                "available" => format!(
+                    "{}: {}, последний исход {}, отказов всего {}",
+                    a.name,
+                    availability_word,
+                    short_time(last_seen_at),
+                    failures
+                ),
+                _ => format!(
+                    "{}: {}, исходов нет, {}",
+                    a.name,
+                    availability_word,
+                    short_time(last_seen_at)
+                ),
+            };
+            out.push(AgentStatusView {
+                name: a.name,
+                driver: a.provider,
+                llm_provider: a.runtime,
+                model: a.model,
+                availability: availability.to_string(),
+                availability_word: availability_word.to_string(),
+                last_class,
+                last_class_word,
+                last_failure_at,
+                last_outcome_at,
+                last_seen_at,
+                failures,
+                series: series_count,
+                series_first_at: series.as_ref().map(|s| s.first_at),
+                line,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn contract_get(&self, name: &str, version: u32) -> ApiResult<Option<String>> {
         Ok(self.store.get_contract(name, version)?)
     }
@@ -1156,6 +1295,80 @@ pub struct ProgressView {
     /// The convergence slice (REQ-CV-12); `null` on terminal tasks and on
     /// rows outside the wait section.
     pub convergence: Option<ConvergenceView>,
+    /// The task's stored agent-failure fact (task 01a1b60c, REQ-AF-05 AC3):
+    /// the latest failure, its class and the series (`k из N`). Present also
+    /// BELOW the parking threshold — such a failure is a progress line, not
+    /// a park. `null` when the task has no recorded agent failure.
+    pub agent_failure: Option<AgentFailureView>,
+}
+
+/// One agent's derived status row (task 01a1b60c, REQ-AF-07): availability
+/// from the LATEST executed outcome, the last failure class in human words,
+/// the failure counters and the time. There is NO stored status field — this
+/// is folded from stored executions, failure windows and the series at read
+/// time (REQ-AF-07 AC3). `line` is the ONE rendered sentence the CLI and the
+/// window both print (AC6).
+#[derive(Serialize, Clone, Debug)]
+pub struct AgentStatusView {
+    pub name: String,
+    pub driver: String,
+    pub llm_provider: String,
+    pub model: String,
+    /// `available` | `unavailable` | `unknown` (REQ-AF-07 AC2).
+    pub availability: String,
+    pub availability_word: String,
+    pub last_class: Option<String>,
+    pub last_class_word: String,
+    pub last_failure_at: Option<Timestamp>,
+    pub last_outcome_at: Option<Timestamp>,
+    /// Always present: outcome time, else failure time, else record creation.
+    pub last_seen_at: Timestamp,
+    /// All actual failures (suppressed repeats included).
+    pub failures: i64,
+    /// The current consecutive series (max across tasks); 0 after a success.
+    pub series: i64,
+    pub series_first_at: Option<Timestamp>,
+    pub line: String,
+}
+
+/// The compact time of the ONE agent-status line: day + HH:MM (UTC, the
+/// stored zone). A line always carries a time (REQ-AF-07 AC2).
+fn short_time(ts: Timestamp) -> String {
+    ts.format("%d.%m %H:%M").to_string()
+}
+
+/// Fold one stored failure + series into the human surface. One helper for
+/// progress, the inbox facts and the status line, so the words and the
+/// action can never drift between them (REQ-AF-04/07).
+pub fn agent_failure_view(
+    row: &AgentFailureRow,
+    series: Option<&AgentFailureSeries>,
+    parked: bool,
+    total: i64,
+) -> AgentFailureView {
+    let class_word = devai_core::agent_failure::word(&row.class).to_string();
+    let action = devai_core::agent_failure::action(&row.class).to_string();
+    AgentFailureView {
+        agent: row.agent_name.clone(),
+        class: row.class.clone(),
+        class_word,
+        action,
+        series_count: series.map(|s| s.consecutive_count).unwrap_or(0),
+        threshold: row.threshold,
+        window_count: row.window_count,
+        total_failures: total,
+        first_at: series.map(|s| s.first_at).unwrap_or(row.first_at),
+        last_at: row.last_at,
+        parked,
+        exit_code: row.exit_code,
+        duration_ms: row.duration_ms,
+        tail: row.tail.clone(),
+        output_empty: row.output_empty,
+        driver_log_tail: row.driver_log_tail.clone(),
+        driver_log_note: row.driver_log_note.clone(),
+        message: row.message.clone(),
+        basis: row.basis.clone(),
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]

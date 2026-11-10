@@ -97,6 +97,49 @@ pub fn task_from_row(r: &Row) -> StoreResult<Task> {
     })
 }
 
+/// One stored `agent_failures` row (task 01a1b60c): the shared 21-column
+/// projection of `AgentFailureRow`.
+pub fn agent_failure_from_row(r: &Row) -> StoreResult<AgentFailureRow> {
+    Ok(AgentFailureRow {
+        id: parse_id(get(r, 0)?)?,
+        task_id: parse_id(get(r, 1)?)?,
+        execution_id: opt_id(get(r, 2)?)?,
+        agent_name: get(r, 3)?,
+        driver: get(r, 4)?,
+        llm_provider: get(r, 5)?,
+        model: get(r, 6)?,
+        class: get(r, 7)?,
+        message: get(r, 8)?,
+        exit_code: get(r, 9)?,
+        duration_ms: get(r, 10)?,
+        tail: get(r, 11)?,
+        output_empty: get::<i64>(r, 12)? != 0,
+        driver_log_tail: get(r, 13)?,
+        driver_log_note: get(r, 14)?,
+        basis: get(r, 15)?,
+        window_count: get(r, 16)?,
+        window_started_at: parse_ts(get(r, 17)?)?,
+        first_at: parse_ts(get(r, 18)?)?,
+        last_at: parse_ts(get(r, 19)?)?,
+        threshold: get(r, 20)?,
+        created_at: parse_ts(get(r, 21)?)?,
+    })
+}
+
+/// One `agent_failure_series` row (task 01a1b60c): the CURRENT consecutive
+/// failure counter of one (task, agent) pair.
+pub fn agent_failure_series_from_row(r: &Row) -> StoreResult<AgentFailureSeries> {
+    Ok(AgentFailureSeries {
+        task_id: parse_id(get(r, 0)?)?,
+        agent_name: get(r, 1)?,
+        consecutive_count: get(r, 2)?,
+        first_at: parse_ts(get(r, 3)?)?,
+        last_at: parse_ts(get(r, 4)?)?,
+        last_class: get(r, 5)?,
+        parked_at: opt_ts(get(r, 6)?)?,
+    })
+}
+
 pub fn project_from_row(r: &Row) -> StoreResult<Project> {
     Ok(Project {
         id: parse_id(get(r, 0)?)?,

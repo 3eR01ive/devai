@@ -33,7 +33,7 @@
 
 use chrono::{DateTime, Utc};
 use devai_core::inbox::InboxWaitPolicy;
-use devai_core::types::{Artifact, ArtifactKind, ArtifactStatus, Question, Task};
+use devai_core::types::{AgentFailureView, Artifact, ArtifactKind, ArtifactStatus, Question, Task};
 use serde::Serialize;
 
 use crate::{ApiResult, ConvergenceView, QualityReportView};
@@ -73,6 +73,12 @@ pub struct InboxTaskFacts {
     /// and for rows outside the wait section. The row picks the stage to
     /// draw (its gate's, else the last).
     pub convergence: Option<ConvergenceView>,
+    /// The task's stored agent-failure fact (task 01a1b60c, REQ-AF-08): a
+    /// task parked by the failure threshold presents the agent, the class,
+    /// the count and the question; a task with a BELOW-threshold failure
+    /// carries it too (it is a progress line, not a wait row — membership is
+    /// still decided by the stored state). `null` when none was recorded.
+    pub agent_failure: Option<AgentFailureView>,
 }
 
 /// The spec artifact the APPROVAL gate presents, plus its body. `current`

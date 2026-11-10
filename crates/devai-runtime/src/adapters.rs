@@ -81,6 +81,192 @@ pub struct ExecOutput {
     pub summary: Option<String>,
 }
 
+/// What the platform OBSERVED when an agent process failed (task 01a1b60c,
+/// REQ-AF-01/10): both streams whole (the stored row keeps them untruncated),
+/// the exit code, the measured duration and the DRIVER's own journal excerpt
+/// for this run. The engine turns this into the bounded event/`agent.failed`
+/// record; the adapter never touches the store.
+#[derive(Debug, Clone)]
+pub struct AgentFailureReport {
+    /// Human/platform text — the execution row's `error` carries it WHOLE,
+    /// including both streams, so nothing is hidden (REQ-AF-09 AC3).
+    pub message: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// Structural driver hint for the classifier (`unknown_provider`,
+    /// `launch_not_found`); `None` = classify from code + text alone.
+    pub hint: Option<&'static str>,
+    pub duration_ms: u64,
+    /// Bounded excerpt of the driver's own journalled log for THIS run.
+    pub driver_log_tail: Option<String>,
+    /// Why the journal is absent/empty — an honest note, never a guess.
+    pub driver_log_note: Option<String>,
+}
+
+impl std::fmt::Display for AgentFailureReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        if !self.stderr.is_empty() {
+            write!(f, "\nstderr:\n{}", self.stderr)?;
+        } else {
+            write!(f, "\nstderr: (empty)")?;
+        }
+        if !self.stdout.is_empty() {
+            write!(f, "\nstdout:\n{}", self.stdout)?;
+        } else {
+            write!(f, "\nstdout: (empty)")?;
+        }
+        if let Some(log) = &self.driver_log_tail {
+            write!(f, "\ndriver journal:\n{log}")?;
+        } else if let Some(note) = &self.driver_log_note {
+            write!(f, "\ndriver journal: {note}")?;
+        }
+        Ok(())
+    }
+}
+
+impl AgentFailureReport {
+    /// True when NEITHER stream carried anything — the 07.11 shape (a bare
+    /// `exit status: 2`), where the driver journal is the only evidence
+    /// (REQ-AF-01 AC2, REQ-AF-10).
+    pub fn output_empty(&self) -> bool {
+        self.stdout.trim().is_empty() && self.stderr.trim().is_empty()
+    }
+}
+
+/// A snapshot of the DRIVER's own journal taken BEFORE the process starts:
+/// the platform reads only bytes appended during the run (ratified R1:
+/// «платформа читает собственный журнал драйвера за прогон; чужие логи —
+/// нет»). The adapter knows the driver's log location; the engine only sees
+/// the excerpt.
+struct DriverJournal {
+    path: Option<std::path::PathBuf>,
+    start_len: u64,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DriverJournal {
+    /// The driver's own journal file, if the platform knows one. `hermes`
+    /// writes `$HERMES_HOME/logs/errors.log` (default `~/.hermes/logs/...`)
+    /// — the file the 07.11 incident was diagnosed in by hand. `HERMES_HOME`
+    /// is the profile home (`~/.hermes`) itself, so `logs/` is joined to it
+    /// directly; a pre-existing `~/.hermes/.hermes` layout is kept as a
+    /// fallback so a wrong guess never hides an existing journal.
+    fn path_for(driver: &str) -> Option<std::path::PathBuf> {
+        match driver {
+            "hermes" => {
+                let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+                if let Some(home) = std::env::var_os("HERMES_HOME") {
+                    let home = std::path::PathBuf::from(home);
+                    candidates.push(home.join("logs").join("errors.log"));
+                    candidates.push(home.join(".hermes").join("logs").join("errors.log"));
+                }
+                if let Some(home) = std::env::var_os("HOME") {
+                    candidates.push(
+                        std::path::PathBuf::from(home)
+                            .join(".hermes")
+                            .join("logs")
+                            .join("errors.log"),
+                    );
+                }
+                let existing = candidates.iter().find(|p| p.is_file()).cloned();
+                existing.or_else(|| candidates.into_iter().next())
+            }
+            _ => None,
+        }
+    }
+
+    fn snapshot(driver: &str) -> Self {
+        let path = Self::path_for(driver);
+        let start_len = path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        DriverJournal {
+            path,
+            start_len,
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The excerpt of what THIS run appended, bounded to `max_chars` from the
+    /// end. Absent file / nothing appended is an honest note (REQ-AF-10 AC3).
+    fn tail_since(&self, max_chars: usize) -> (Option<String>, Option<String>) {
+        let Some(path) = &self.path else {
+            return (
+                None,
+                Some(
+                    "журнал драйвера не найден: платформа не знает файл журнала этого драйвера"
+                        .into(),
+                ),
+            );
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    None,
+                    Some(format!(
+                        "журнал драйвера не прочитан ({}): {e}",
+                        path.display()
+                    )),
+                );
+            }
+        };
+        let appended = if bytes.len() as u64 > self.start_len {
+            &bytes[self.start_len as usize..]
+        } else {
+            &[]
+        };
+        let text = String::from_utf8_lossy(appended);
+        if text.trim().is_empty() {
+            return (
+                None,
+                Some(format!(
+                    "журнал драйвера за прогон пуст ({}); прогон начат {}",
+                    path.display(),
+                    self.started_at
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                )),
+            );
+        }
+        let bounded = tail_chars(&text, max_chars);
+        (
+            Some(format!(
+                "журнал {} за прогон с {}:\n{}",
+                path.display(),
+                self.started_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                bounded
+            )),
+            None,
+        )
+    }
+}
+
+/// How many trailing characters of the driver journal the adapter keeps
+/// before the engine applies the DECLARED `driver_log_chars` limit: enough
+/// to hold a useful stack, never the whole file (REQ-AF-10 AC4).
+const DRIVER_LOG_READ_CHARS: usize = 4000;
+
+/// The bounded tail of a text: the LAST `max_chars` characters (the end of
+/// a log is where the cause is), marked when cut. The full text stays on the
+/// execution row.
+pub fn tail_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let skip = count - max_chars;
+    format!(
+        "…(усечено, показаны последние {} символов)\n{}",
+        max_chars,
+        text.chars().skip(skip).collect::<String>()
+    )
+}
+
 /// The two protocol halves of a failed role reply (REQ-FG-01, ASM-3):
 /// `BadOutput` is a RESPONSE-FORM rejection — the reply did not satisfy the
 /// stored reply-shape contract, a cheap fix the SAME role can make;
@@ -99,6 +285,12 @@ pub enum AdapterError {
     Io(#[from] std::io::Error),
     #[error("agent error: {0}")]
     Agent(String),
+    /// The agent process itself failed, with the observed evidence retained
+    /// as data (task 01a1b60c, REQ-AF-01/10): exit code, both streams whole,
+    /// duration and the driver-journal excerpt. The engine writes the
+    /// `agent.failed` fact from THIS, not by parsing the text.
+    #[error("{0}")]
+    AgentFailure(Box<AgentFailureReport>),
     /// Form rejection with the FULL structured violation list — every json
     /// path, not truncated to the first (REQ-FG-01 AC2). The joined string
     /// stays in the Display for humans and stored row `error` text; the Vec
@@ -120,9 +312,10 @@ impl AdapterError {
     pub fn failure_class(&self) -> &'static str {
         match self {
             AdapterError::BadOutput { .. } => devai_core::types::failure_class::RESPONSE_FORM,
-            AdapterError::Agent(_) | AdapterError::Io(_) | AdapterError::UnknownProvider(_) => {
-                devai_core::types::failure_class::PROVIDER
-            }
+            AdapterError::Agent(_)
+            | AdapterError::AgentFailure(_)
+            | AdapterError::Io(_)
+            | AdapterError::UnknownProvider(_) => devai_core::types::failure_class::PROVIDER,
             AdapterError::Platform(_) => devai_core::types::failure_class::PLATFORM,
         }
     }
@@ -183,6 +376,12 @@ impl AgentRuntime {
             "mock-form-flaky" => Self::mock_form_flaky(req),
             "mock-form-broken" => Self::mock_form_broken(req),
             "mock-spec-noecho" => Self::mock_spec_no_echo(req),
+            // The AGENT-FAILURE fixture (task 01a1b60c): a deterministic
+            // provider-class refusal shaped like the 07.11 incident — bare
+            // exit 2, EMPTY streams, the 404 text only in the process
+            // message. Proves the `agent.failed` path without a network or a
+            // live driver; never seeded as an agent.
+            "mock-agent-fail" => Self::mock_agent_fail(req),
             other => Err(AdapterError::UnknownProvider(other.to_string())),
         }
     }
@@ -316,14 +515,38 @@ impl AgentRuntime {
             cmd.arg("--effort").arg(&req.reasoning);
         }
 
-        let out = cmd.output()?;
+        let journal = DriverJournal::snapshot("claude");
+        let started = std::time::Instant::now();
+        let out = cmd.output().map_err(|e| {
+            AdapterError::AgentFailure(Box::new(AgentFailureReport {
+                message: format!("failed to launch `claude`: {e}"),
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                hint: if e.kind() == std::io::ErrorKind::NotFound {
+                    Some("launch_not_found")
+                } else {
+                    None
+                },
+                duration_ms: started.elapsed().as_millis() as u64,
+                driver_log_tail: None,
+                driver_log_note: Some(
+                    "процесс не запустился — журнала драйвера за прогон нет".into(),
+                ),
+            }))
+        })?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(AdapterError::Agent(format!(
-                "`claude` exited with {}: {}",
-                out.status,
-                err.trim()
-            )));
+            let (driver_log_tail, driver_log_note) = journal.tail_since(DRIVER_LOG_READ_CHARS);
+            return Err(AdapterError::AgentFailure(Box::new(AgentFailureReport {
+                message: format!("`claude` exited with {}", out.status),
+                exit_code: out.status.code(),
+                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                hint: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                driver_log_tail,
+                driver_log_note,
+            })));
         }
         let envelope: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
             AdapterError::Agent(format!("cannot parse `claude` json envelope: {e}"))
@@ -337,7 +560,17 @@ impl AgentRuntime {
                 .get("result")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown agent error");
-            return Err(AdapterError::Agent(msg.to_string()));
+            let (driver_log_tail, driver_log_note) = journal.tail_since(DRIVER_LOG_READ_CHARS);
+            return Err(AdapterError::AgentFailure(Box::new(AgentFailureReport {
+                message: format!("`claude` reported is_error: {msg}"),
+                exit_code: out.status.code(),
+                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                hint: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                driver_log_tail,
+                driver_log_note,
+            })));
         }
         let text = envelope
             .get("result")
@@ -405,14 +638,38 @@ impl AgentRuntime {
         // forcing isolation would break the R3 premise (keys outside the
         // store). An operator who wants a hermetised agent keeps that
         // choice in hermes config, out of platform argv.
-        let out = cmd.output()?;
+        let journal = DriverJournal::snapshot(PROVIDER_HERMES);
+        let started = std::time::Instant::now();
+        let out = cmd.output().map_err(|e| {
+            AdapterError::AgentFailure(Box::new(AgentFailureReport {
+                message: format!("failed to launch `{PROVIDER_HERMES}`: {e}"),
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                hint: if e.kind() == std::io::ErrorKind::NotFound {
+                    Some("launch_not_found")
+                } else {
+                    None
+                },
+                duration_ms: started.elapsed().as_millis() as u64,
+                driver_log_tail: None,
+                driver_log_note: Some(
+                    "процесс не запустился — журнала драйвера за прогон нет".into(),
+                ),
+            }))
+        })?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(AdapterError::Agent(format!(
-                "`hermes` exited with {}: {}",
-                out.status,
-                err.trim()
-            )));
+            let (driver_log_tail, driver_log_note) = journal.tail_since(DRIVER_LOG_READ_CHARS);
+            return Err(AdapterError::AgentFailure(Box::new(AgentFailureReport {
+                message: format!("`{PROVIDER_HERMES}` exited with {}", out.status),
+                exit_code: out.status.code(),
+                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                hint: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                driver_log_tail,
+                driver_log_note,
+            })));
         }
         Self::hermes_text_to_output(req, &String::from_utf8_lossy(&out.stdout))
     }
@@ -718,6 +975,24 @@ impl AgentRuntime {
             content: text,
             summary: summarize(Some(name), &json),
         })
+    }
+
+    /// The AGENT-FAILURE fixture (task 01a1b60c): the 07.11 shape — a bare
+    /// non-zero exit, EMPTY streams, the provider text only in the process
+    /// message. `_req` is unused: the failure is deterministic.
+    fn mock_agent_fail(_req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
+        Err(AdapterError::AgentFailure(Box::new(AgentFailureReport {
+            message: "`mock-agent-fail` exited with exit status: 2: 404 Model not exist".into(),
+            exit_code: Some(2),
+            stdout: String::new(),
+            stderr: String::new(),
+            hint: None,
+            duration_ms: 1,
+            driver_log_tail: None,
+            driver_log_note: Some(
+                "журнал драйвера не найден: платформа не знает файл журнала этого драйвера".into(),
+            ),
+        })))
     }
 
     /// Protocol fixture: first answer violates the stored contract, every

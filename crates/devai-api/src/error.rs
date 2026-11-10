@@ -160,6 +160,7 @@ fn adapter_code(e: &AdapterError) -> ErrorCode {
         AdapterError::UnknownProvider(..) => ErrorCode("unknown_provider"),
         AdapterError::Io(..) => ErrorCode("adapter_io"),
         AdapterError::Agent(..) => ErrorCode("agent_error"),
+        AdapterError::AgentFailure(..) => ErrorCode("agent_error"),
         AdapterError::BadOutput { .. } => ErrorCode("contract_violation"),
         AdapterError::Platform(..) => ErrorCode("platform_contract"),
     }

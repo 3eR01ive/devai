@@ -3,12 +3,14 @@
 //! interfaces (CLI / REST / MCP) only translate user intent into commands
 //! and render domain results.
 
+pub mod agent_failure;
 pub mod error;
 pub mod inbox;
 pub mod types;
 pub mod vocab;
 pub mod workflow;
 
+pub use agent_failure::class as agent_failure_class;
 pub use error::{CoreError, CoreResult};
 pub use inbox::{InboxWaitPolicy, WaitGroup, WaitStatePolicy, WaitVariant};
 pub use types::{

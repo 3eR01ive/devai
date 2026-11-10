@@ -94,6 +94,10 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         "workflow/task-name.yaml",
         include_str!("../../../config/workflow/task-name.yaml"),
     ),
+    (
+        "workflow/agent-failure.yaml",
+        include_str!("../../../config/workflow/agent-failure.yaml"),
+    ),
     ("models.yaml", include_str!("../../../config/models.yaml")),
 ];
 
@@ -1619,6 +1623,93 @@ pub fn load_response_form_policy(dir: &Path) -> StoreResult<ResponseFormPolicy> 
                 ))
             })?;
         }
+    }
+    Ok(policy)
+}
+
+// ---------------------------------------------------------------------------
+// Agent-failure visibility (task 01a1b60c, REQ-AF-05/06/10) — platform
+// protocol data.
+// ---------------------------------------------------------------------------
+
+/// Declarative policy of agent-failure visibility: the parking threshold, the
+/// anti-spam window and the bounded tails. Lives in
+/// `config/workflow/agent-failure.yaml` (the `agent_failure:` section); the
+/// factory `Default` is that file's meaning verbatim, so a home without the
+/// file behaves like one that has it at defaults (the `ResponseFormPolicy`
+/// idiom).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentFailurePolicy {
+    /// N consecutive failures of one agent on one task park the task
+    /// (REQ-AF-05 AC1). `< 1` is rejected loudly.
+    pub park_threshold: u32,
+    /// Anti-spam window in minutes per (agent, class) (REQ-AF-06 AC1).
+    /// Zero is rejected loudly — an empty window would suppress forever.
+    pub window_minutes: u32,
+    /// Bounded error tail in characters carried by the event and compact
+    /// surfaces (REQ-AF-01 AC4).
+    pub tail_chars: usize,
+    /// Bounded driver-journal tail in characters (REQ-AF-10 AC4).
+    pub driver_log_chars: usize,
+}
+
+impl Default for AgentFailurePolicy {
+    fn default() -> Self {
+        AgentFailurePolicy {
+            park_threshold: 3,
+            window_minutes: 10,
+            tail_chars: 2000,
+            driver_log_chars: 2000,
+        }
+    }
+}
+
+/// Merge-scan `workflow/*.yaml` for the `agent_failure:` key with the loud
+/// validation REQ-AF-05/06 demand: a threshold below 1 or a zero window is
+/// an error naming the field and its meaning, never a silently ignored typo.
+pub fn load_agent_failure_policy(dir: &Path) -> StoreResult<AgentFailurePolicy> {
+    let mut policy = AgentFailurePolicy::default();
+    if !dir.is_dir() {
+        return Ok(policy);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    for p in &paths {
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if let Some(section) = doc.get("agent_failure") {
+            policy = serde_yaml::from_value::<AgentFailurePolicy>(section.clone()).map_err(|e| {
+                cfg_err(format!(
+                    "{}: agent_failure must declare park_threshold (>= 1), window_minutes (>= 1) and the positive tail sizes tail_chars/driver_log_chars: {e}",
+                    p.display()
+                ))
+            })?;
+        }
+    }
+    if policy.park_threshold < 1 {
+        return Err(cfg_err(format!(
+            "{}: agent_failure.park_threshold must be >= 1 (N consecutive failures park the task)",
+            dir.display()
+        )));
+    }
+    if policy.window_minutes < 1 {
+        return Err(cfg_err(format!(
+            "{}: agent_failure.window_minutes must be >= 1 (the anti-spam window cannot be empty)",
+            dir.display()
+        )));
+    }
+    if policy.tail_chars < 1 || policy.driver_log_chars < 1 {
+        return Err(cfg_err(format!(
+            "{}: agent_failure.tail_chars and driver_log_chars must be >= 1",
+            dir.display()
+        )));
     }
     Ok(policy)
 }

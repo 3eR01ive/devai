@@ -750,6 +750,125 @@ fn default_attempt() -> u32 {
     1
 }
 
+/// The CURRENT consecutive-failure series of one (task, agent) pair
+/// (task 01a1b60c, REQ-AF-05/06): a counter row, not an event edit. A
+/// successful execution of the same agent ANYWHERE deletes the row — only
+/// success resets the series (REQ-AF-05 AC2/AC6). `parked_at` records that
+/// the threshold already parked the task, so one series never parks twice in
+/// the same failure.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AgentFailureSeries {
+    pub task_id: Id,
+    pub agent_name: String,
+    pub consecutive_count: i64,
+    pub first_at: Timestamp,
+    pub last_at: Timestamp,
+    pub last_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_at: Option<Timestamp>,
+}
+
+/// The human surface of one task's agent failure (task 01a1b60c,
+/// REQ-AF-05/08): the latest stored failure, the series and the declared
+/// threshold. Words and the action come from the ONE class dictionary, never
+/// from a local copy; the tail is the bounded tail, the full text stays in
+/// the execution row and the `agent.failed` event (REQ-AF-09 AC3).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentFailureView {
+    pub agent: String,
+    pub class: String,
+    pub class_word: String,
+    pub action: String,
+    pub series_count: i64,
+    pub threshold: i64,
+    /// Failures counted inside the current anti-spam window of this class.
+    pub window_count: i64,
+    /// All actual failures of this agent ever recorded (window counters
+    /// summed) — suppressed repeats are included (REQ-AF-06 AC6).
+    pub total_failures: i64,
+    pub first_at: Timestamp,
+    pub last_at: Timestamp,
+    pub parked: bool,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<i64>,
+    pub tail: String,
+    pub output_empty: bool,
+    pub driver_log_tail: Option<String>,
+    pub driver_log_note: Option<String>,
+    pub message: String,
+    pub basis: String,
+}
+
+/// One stored `agent.failed` counter window (task 01a1b60c, REQ-AF-01/06):
+/// the full evidence of the failure that OPENED the window, plus the live
+/// counter. Repeats inside the window update this row, never append events.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentFailureRow {
+    pub id: Id,
+    pub task_id: Id,
+    pub execution_id: Option<Id>,
+    pub agent_name: String,
+    pub driver: String,
+    pub llm_provider: String,
+    pub model: String,
+    pub class: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<i64>,
+    pub tail: String,
+    pub output_empty: bool,
+    pub driver_log_tail: Option<String>,
+    pub driver_log_note: Option<String>,
+    pub message: String,
+    pub basis: String,
+    pub window_count: i64,
+    pub window_started_at: Timestamp,
+    pub first_at: Timestamp,
+    pub last_at: Timestamp,
+    pub threshold: i64,
+    pub created_at: Timestamp,
+}
+
+/// Input of one recorded agent failure: everything the platform observed at
+/// execution completion (REQ-AF-01 AC3). The store owns the counters, the
+/// window boundary and the conditional event write.
+#[derive(Clone, Debug)]
+pub struct AgentFailureRecord {
+    pub id: Id,
+    pub task_id: Id,
+    pub execution_id: Option<Id>,
+    pub agent_name: String,
+    pub driver: String,
+    pub llm_provider: String,
+    pub model: String,
+    pub class: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<i64>,
+    pub tail: String,
+    pub output_empty: bool,
+    pub driver_log_tail: Option<String>,
+    pub driver_log_note: Option<String>,
+    pub message: String,
+    pub basis: String,
+    pub threshold: i64,
+    pub window_minutes: i64,
+    pub at: Timestamp,
+}
+
+/// What one recording produced (task 01a1b60c, REQ-AF-06 AC2/AC3): whether
+/// the anti-spam window let the event through, the window counter, the
+/// separate series counter, and the accumulated total (suppressed repeats
+/// included).
+#[derive(Clone, Debug)]
+pub struct AgentFailureRecorded {
+    pub event_written: bool,
+    pub window_count: i64,
+    pub window_started_at: Timestamp,
+    pub series_count: i64,
+    pub first_at: Timestamp,
+    pub last_at: Timestamp,
+    pub total_failures: i64,
+}
+
 /// The executed model bundle as STORED on one execution row (REQ-MS-01/05):
 /// four independent fields — the DRIVER (`mock`/`claude`/`hermes`), the
 /// LLM-provider behind it (empty = the driver chooses), the model (empty =
@@ -1384,6 +1503,15 @@ pub mod event_kind {
     /// last attempt's violations.
     pub const EXECUTION_FORM_ESCALATED: &str = "execution.form_escalated";
     pub const EXECUTION_CANCELLED: &str = "execution.cancelled";
+    /// One record of an AGENT failure at execution completion (task
+    /// 01a1b60c, REQ-AF-01/06): class from the closed list, agent/driver/
+    /// LLM-provider/model, exit code, duration, the bounded tail of the
+    /// captured output, the emptiness flag, the driver-journal evidence and
+    /// the anti-spam counters. Written by the PLATFORM on completion, not by
+    /// the launching loop; a repeat of the same class inside the declared
+    /// window increments the counter instead of appending another event
+    /// (REQ-AF-06).
+    pub const AGENT_FAILED: &str = "agent.failed";
     /// The v6→v7 single-writer migration closed duplicate RUNNING rows of
     /// one task (ratified OQ-1: newest `started_at` survives, the rest are
     /// closed FAILED). One fact event per duplicated task — actor
@@ -1516,6 +1644,7 @@ pub mod event_kind {
         EXECUTION_CANCELLED,
         EXECUTION_SINGLE_WRITER_REPAIR,
         EXECUTION_USAGE_MISSING,
+        AGENT_FAILED,
         ARTIFACT_PUBLISHED,
         ARTIFACT_SUPERSEDED,
         DECISIONS_BACKFILLED,
@@ -1660,6 +1789,29 @@ pub mod json_field {
     /// transaction that rolled back names the step it died on. Written only
     /// on the `failed` outcome — an applied/refused switch carries no step.
     pub const FAILURE_STEP: &str = "failure_step";
+    // Agent failures (task 01a1b60c, REQ-AF-01/02/06): the class word, the
+    // bounded error tail, the emptiness flag, the driver-journal evidence,
+    // the basis of the class, the duration, and the anti-spam counters —
+    // one vocabulary for the event producer and every read surface.
+    pub const CLASS: &str = "class";
+    pub const TAIL: &str = "tail";
+    pub const OUTPUT_EMPTY: &str = "output_empty";
+    pub const DRIVER_LOG_TAIL: &str = "driver_log_tail";
+    pub const DRIVER_LOG_NOTE: &str = "driver_log_note";
+    pub const BASIS: &str = "basis";
+    /// The driver process's own failure message (bounded on the event; the
+    /// full text stays on the execution row).
+    pub const MESSAGE: &str = "message";
+    pub const DURATION_MS: &str = "duration_ms";
+    pub const WINDOW_COUNT: &str = "window_count";
+    pub const WINDOW_STARTED_AT: &str = "window_started_at";
+    pub const SERIES_COUNT: &str = "series_count";
+    pub const FAILURES_TOTAL: &str = "failures_total";
+    pub const FIRST_AT: &str = "first_at";
+    pub const LAST_AT: &str = "last_at";
+    pub const THRESHOLD: &str = "threshold";
+    /// The observation time of the failure itself.
+    pub const AT: &str = "at";
 
     /// The COMPLETE enumerable vocabulary of payload field names the platform
     /// itself mints. Load-time policy validation checks user-authored field
@@ -1729,6 +1881,22 @@ pub mod json_field {
         FRESHNESS,
         REVISION,
         FAILURE_STEP,
+        CLASS,
+        TAIL,
+        OUTPUT_EMPTY,
+        DRIVER_LOG_TAIL,
+        DRIVER_LOG_NOTE,
+        BASIS,
+        MESSAGE,
+        DURATION_MS,
+        WINDOW_COUNT,
+        WINDOW_STARTED_AT,
+        SERIES_COUNT,
+        FAILURES_TOTAL,
+        FIRST_AT,
+        LAST_AT,
+        THRESHOLD,
+        AT,
     ];
 }
 

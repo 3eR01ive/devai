@@ -95,6 +95,13 @@
       "to": 13,
       "script": "migrations/013_model_bundle_indexes.sql",
       "apply": "script"
+    },
+    {
+      "id": "014_agent_failures",
+      "from": 13,
+      "to": 14,
+      "script": "migrations/014_agent_failures.sql",
+      "apply": "script"
     }
   ]
 }

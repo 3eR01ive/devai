@@ -324,6 +324,54 @@ CREATE TABLE workflow_events(
 );
 CREATE INDEX events_task ON workflow_events(task_id, seq);
 
+-- Agent failures (task 01a1b60c, REQ-AF-01/02/06): one evidence row per
+-- (task, agent, class) inside an anti-spam WINDOW. The WINDOW itself is the
+-- (agent, class) pair: the first failure of a class in the window appends
+-- the `agent.failed` event, later ones (of ANY task) grow their own row's
+-- `window_count` instead of flooding the event history — and every stuck
+-- task keeps its own class/tail for its progress line (REQ-AF-05 AC3,
+-- REQ-AF-06). The full error text stays on the execution row / event;
+-- `tail` is the bounded excerpt. `agent_failure_series` is the CURRENT consecutive-failure
+-- counter per (task, agent) — a success of the same agent anywhere deletes
+-- the row, nothing else resets it (REQ-AF-05).
+CREATE TABLE agent_failures(
+  id                TEXT PRIMARY KEY,
+  task_id           TEXT NOT NULL,
+  execution_id      TEXT NULL,
+  agent_name        TEXT NOT NULL,
+  driver            TEXT NOT NULL DEFAULT '',
+  llm_provider      TEXT NOT NULL DEFAULT '',
+  model             TEXT NOT NULL DEFAULT '',
+  class             TEXT NOT NULL,
+  message           TEXT NOT NULL DEFAULT '',
+  exit_code         INTEGER NULL,
+  duration_ms       INTEGER NULL,
+  tail              TEXT NOT NULL DEFAULT '',
+  output_empty      INTEGER NOT NULL DEFAULT 0,
+  driver_log_tail   TEXT NULL,
+  driver_log_note   TEXT NULL,
+  basis             TEXT NOT NULL DEFAULT '',
+  window_count      INTEGER NOT NULL DEFAULT 1,
+  window_started_at TEXT NOT NULL,
+  first_at          TEXT NOT NULL,
+  last_at           TEXT NOT NULL,
+  threshold         INTEGER NOT NULL DEFAULT 0,
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX agent_failures_agent ON agent_failures(agent_name, last_at);
+CREATE INDEX agent_failures_task ON agent_failures(task_id, last_at);
+
+CREATE TABLE agent_failure_series(
+  task_id           TEXT NOT NULL,
+  agent_name        TEXT NOT NULL,
+  consecutive_count INTEGER NOT NULL,
+  first_at          TEXT NOT NULL,
+  last_at           TEXT NOT NULL,
+  last_class        TEXT NOT NULL,
+  parked_at         TEXT NULL,
+  PRIMARY KEY(task_id, agent_name)
+);
+
 CREATE TRIGGER wf_events_no_update BEFORE UPDATE ON workflow_events
 BEGIN SELECT RAISE(ABORT, 'workflow_events is append-only'); END;
 CREATE TRIGGER wf_events_no_delete BEFORE DELETE ON workflow_events

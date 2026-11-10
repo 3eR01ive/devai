@@ -123,6 +123,7 @@
         "report": null,
         "report_note": null,
         "convergence": null,
+        "agent_failure": null,
         "spec": {
           "artifact": {
             "category": "ARTIFACT",

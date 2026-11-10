@@ -1,6 +1,8 @@
 // Фикстуры секции ожидания для компонентных тестов:
 // ровно те поля, что публикует `inbox_view` (WaitSnapshot, types.ts).
 import type {
+  AgentFailureView,
+  AgentStatusView,
   Artifact,
   Question,
   QualityReportView,
@@ -109,12 +111,66 @@ export function row(task: Task, overrides: Partial<WaitRow> = {}): WaitRow {
     report: null,
     report_note: null,
     convergence: null,
+    // Отказ агента отсутствует в фикстуре по умолчанию (задача 01a1b60c).
+    agent_failure: null,
     ...overrides,
   };
 }
 
 export function note(task: Task, q: Question): WaitNote {
   return { task, question: q };
+}
+
+/// Строка статуса агента (задача 01a1b60c, REQ-AF-07): одна фраза платформы
+/// приходит целиком в `line`, окно её не собирает.
+export function agentStatus(overrides: Partial<AgentStatusView> = {}): AgentStatusView {
+  return {
+    name: "hermes",
+    driver: "hermes",
+    llm_provider: "deepseek",
+    model: "deepseek-v4",
+    availability: "unavailable",
+    availability_word: "недоступен",
+    last_class: "provider_model",
+    last_class_word: "модель исчезла у провайдера",
+    last_failure_at: "2026-11-10T12:07:00Z",
+    last_outcome_at: "2026-11-10T12:07:00Z",
+    last_seen_at: "2026-11-10T12:07:00Z",
+    failures: 5,
+    series: 3,
+    series_first_at: "2026-11-10T12:00:00Z",
+    line: "hermes: недоступен, модель исчезла у провайдера, 5 отказов с 10.11 12:00",
+    ...overrides,
+  };
+}
+
+/// Факт отказа агента (задача 01a1b60c, REQ-AF-08): хвост ограничен, полный
+/// текст остаётся в строке выполнения.
+export function agentFailure(
+  overrides: Partial<AgentFailureView> = {},
+): AgentFailureView {
+  return {
+    agent: "hermes",
+    class: "provider_model",
+    class_word: "модель исчезла у провайдера",
+    action: "перевыпустить агента",
+    series_count: 3,
+    threshold: 3,
+    window_count: 1,
+    total_failures: 3,
+    first_at: "2026-11-10T12:00:00Z",
+    last_at: "2026-11-10T12:07:00Z",
+    parked: true,
+    exit_code: 2,
+    duration_ms: 900,
+    tail: "404 Model not exist",
+    output_empty: false,
+    driver_log_tail: null,
+    driver_log_note: "журнал драйвера за прогон пуст",
+    message: "`hermes` exited with exit status: 2",
+    basis: "text:model not exist",
+    ...overrides,
+  };
 }
 
 export function snapshot(overrides: Partial<WaitSnapshot> = {}): WaitSnapshot {

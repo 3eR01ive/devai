@@ -84,6 +84,7 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::artifacts_list,
         commands::artifact_content,
         commands::questions_list,
+        commands::agent_statuses,
         commands::executions_list,
         commands::execution_liveness,
         commands::inbox_view,
@@ -104,7 +105,6 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::model_bundle_create,
         commands::model_bundle_update,
         commands::model_bundle_delete,
-
         // The pairing handshake (task 01a1bf78): the app's OWN page asks what
         // to do with a scanned link and reports what the machine answered.
         // Window-local on purpose — the phone's `/rpc` door does not route

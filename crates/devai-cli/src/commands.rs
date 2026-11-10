@@ -2050,18 +2050,29 @@ fn agent(ctx: &Ctx, cmd: AgentCmd, json: bool) -> Result<()> {
             );
         }
         AgentCmd::List => {
-            // (API agent.list read.)
-            let as_ = ctx.api().agent_list().map_err(render_api_error)?;
+            // REQ-AF-07: the status line is the platform-derived row — the
+            // same words `agent.status` publishes to the window.
+            let as_ = ctx.api().agent_status_list().map_err(render_api_error)?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&as_)?);
             } else {
                 for a in as_ {
+                    outln!("{}", a.line);
                     outln!(
-                        "{}  provider={}  model={}  runtime={}",
-                        a.name,
-                        a.provider,
-                        a.model,
-                        a.runtime
+                        "  driver={}  provider={}  model={}  failures={}  series={}",
+                        a.driver,
+                        if a.llm_provider.trim().is_empty() {
+                            "-"
+                        } else {
+                            &a.llm_provider
+                        },
+                        if a.model.trim().is_empty() {
+                            "-"
+                        } else {
+                            &a.model
+                        },
+                        a.failures,
+                        a.series,
                     );
                 }
             }
@@ -2726,6 +2737,33 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         }
     }
     outln!("---");
+    // REQ-AF-05 AC3: a failure BELOW the threshold is a progress line. The
+    // row is stored data (`task.progress.agent_failure`), the words come from
+    // the ONE class dictionary.
+    if let Some(f) = &v.agent_failure {
+        outln!(
+            "agent:  отказ агента: {} ({}), {} из {}",
+            f.class_word,
+            f.class,
+            f.series_count,
+            f.threshold
+        );
+        outln!(
+            "agent:  {} — {}; последний {}; всего отказов {}",
+            f.agent,
+            f.action,
+            f.last_at,
+            f.total_failures
+        );
+        if !f.tail.trim().is_empty() {
+            outln!("agent:  хвост: {}", f.tail.replace('\n', " / "));
+        }
+        if let Some(log) = &f.driver_log_tail {
+            outln!("agent:  журнал драйвера: {}", log.replace('\n', " / "));
+        } else if let Some(note) = &f.driver_log_note {
+            outln!("agent:  журнал драйвера: {note}");
+        }
+    }
     outln!("running executions:");
     if running.is_empty() {
         outln!("  (no running executions)");

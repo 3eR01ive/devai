@@ -269,6 +269,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: questions_list_rpc,
     },
     RpcCommand {
+        name: "agent_statuses",
+        handler: agent_statuses_rpc,
+    },
+    RpcCommand {
         name: "executions_list",
         handler: executions_list_rpc,
     },
@@ -746,6 +750,14 @@ fn executions_list_rpc(
         state(app),
         param_opt_str(params, "task_ref"),
     )?)
+}
+
+fn agent_statuses_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    _params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::agent_statuses(state(app))?)
 }
 
 fn execution_liveness_rpc(

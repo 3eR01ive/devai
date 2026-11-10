@@ -91,6 +91,12 @@ const DECISIONS_BACKFILL_REASON: &str = "approve/reject/return rationales lived 
 /// is auditable, never silent.
 const SINGLE_WRITER_REPAIR_REASON: &str = "single-writer migration: the v7 index allows at most one RUNNING execution per task_id; within each duplicated group the newest started_at stays RUNNING (equal started_at resolves on the UUIDv7 id order, same tie discipline as rung 003), the others are closed FAILED — a status/finished_at/error write only, no row or event is deleted or rewritten";
 
+/// The shared 21-column projection of `agent_failures` (task 01a1b60c):
+/// producer (`record_agent_failure`) and every read path use ONE column
+/// list, so a column added to the table cannot be read in a different order
+/// by two surfaces (the `rows::agent_failure_from_row` index order).
+const AGENT_FAILURE_COLUMNS: &str = "id,task_id,execution_id,agent_name,driver,llm_provider,model,class,message,exit_code,duration_ms,tail,output_empty,driver_log_tail,driver_log_note,basis,window_count,window_started_at,first_at,last_at,threshold,created_at";
+
 /// The loser predicate of the v7 repair: a RUNNING row that has a strictly
 /// better RUNNING sibling in its task under the total order (started_at,
 /// id) — newest started_at wins, ties break on the UUIDv7 id (lexicographic
@@ -1956,6 +1962,358 @@ impl Store {
             ],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Agent failures (task 01a1b60c, REQ-AF-01/05/06)
+    // ------------------------------------------------------------------
+
+    /// One actual agent failure. The platform calls this at execution
+    /// completion (never the launching loop, REQ-AF-01 AC6). Inside ONE
+    /// transaction:
+    ///   * the (agent, class) anti-spam WINDOW decides the event: its first
+    ///     failure appends exactly one `agent.failed` event, a repeat inside
+    ///     the window appends nothing (REQ-AF-06 AC1/AC2);
+    ///   * the (task, agent, class) evidence row grows (`window_count += 1`)
+    ///     or is created, so EVERY task keeps its own class/message/tail for
+    ///     its progress line even when the window suppressed its event
+    ///     (REQ-AF-05 AC3);
+    ///   * the (task, agent) SERIES counter grows by one (REQ-AF-05 AC2);
+    ///   * the accumulated total is recomputed from window counters, so a
+    ///     suppressed repeat still counts toward the parking threshold
+    ///     (REQ-AF-06 AC6).
+    ///     A restart cannot lose the counters or the window boundary: they
+    ///     are rows, not process state.
+    pub fn record_agent_failure(
+        &self,
+        rec: &AgentFailureRecord,
+    ) -> StoreResult<AgentFailureRecorded> {
+        let tx = self.conn.unchecked_transaction()?;
+        let floor = rec.at - chrono::Duration::minutes(rec.window_minutes.max(1));
+        // The anti-spam WINDOW is the (agent, class) pair, across tasks
+        // (REQ-AF-06 AC1/AC5): a row of ANY task of that pair inside the
+        // window means the event is already written and must not repeat.
+        let window: Option<(String, String)> = rows::unwrap_row(
+            tx.query_row(
+                "SELECT id, window_started_at FROM agent_failures \
+                 WHERE agent_name=?1 AND class=?2 AND last_at>=?3 \
+                 ORDER BY last_at DESC LIMIT 1",
+                params![rec.agent_name, rec.class, rows::ts(&floor)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional(),
+        )?;
+        // THIS task's own evidence row of the pair inside the window — it
+        // grows; the row of another task is never overwritten, so every
+        // stuck task keeps its own class, message and tail (REQ-AF-05 AC3).
+        let own: Option<(String, i64)> = rows::unwrap_row(
+            tx.query_row(
+                "SELECT id, window_count FROM agent_failures \
+                 WHERE agent_name=?1 AND class=?2 AND task_id=?3 AND last_at>=?4 \
+                 ORDER BY last_at DESC LIMIT 1",
+                params![
+                    rec.agent_name,
+                    rec.class,
+                    rec.task_id.to_string(),
+                    rows::ts(&floor)
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional(),
+        )?;
+        let event_written = window.is_none();
+        let (window_count, window_started_at) = match own {
+            Some((id, count)) => {
+                // A suppressed repeat: the counter grows, the evidence is
+                // refreshed to the LATEST attempt (the event keeps the first).
+                tx.execute(
+                    "UPDATE agent_failures SET window_count=?1, last_at=?2, exit_code=?3, \
+                     duration_ms=?4, tail=?5, output_empty=?6, driver_log_tail=?7, \
+                     driver_log_note=?8, basis=?9, threshold=?10, message=?11, execution_id=?12 \
+                     WHERE id=?13",
+                    params![
+                        count + 1,
+                        rows::ts(&rec.at),
+                        rec.exit_code,
+                        rec.duration_ms,
+                        rec.tail,
+                        rec.output_empty as i64,
+                        rec.driver_log_tail,
+                        rec.driver_log_note,
+                        rec.basis,
+                        rec.threshold,
+                        rec.message,
+                        rec.execution_id.map(|e| e.to_string()),
+                        id,
+                    ],
+                )?;
+                let started = if event_written {
+                    rec.at
+                } else {
+                    rows::parse_ts(
+                        window
+                            .as_ref()
+                            .map(|w| w.1.clone())
+                            .unwrap_or_else(|| rows::ts(&rec.at)),
+                    )?
+                };
+                (count + 1, started)
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO agent_failures(id,task_id,execution_id,agent_name,driver,llm_provider,model,class,message,exit_code,duration_ms,tail,output_empty,driver_log_tail,driver_log_note,basis,window_count,window_started_at,first_at,last_at,threshold,created_at) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,1,?17,?17,?17,?18,?17)",
+                    params![
+                        rec.id.to_string(),
+                        rec.task_id.to_string(),
+                        rec.execution_id.map(|e| e.to_string()),
+                        rec.agent_name,
+                        rec.driver,
+                        rec.llm_provider,
+                        rec.model,
+                        rec.class,
+                        rec.message,
+                        rec.exit_code,
+                        rec.duration_ms,
+                        rec.tail,
+                        rec.output_empty as i64,
+                        rec.driver_log_tail,
+                        rec.driver_log_note,
+                        rec.basis,
+                        rows::ts(&rec.at),
+                        rec.threshold,
+                    ],
+                )?;
+                let started = if event_written {
+                    rec.at
+                } else {
+                    rows::parse_ts(
+                        window
+                            .as_ref()
+                            .map(|w| w.1.clone())
+                            .unwrap_or_else(|| rows::ts(&rec.at)),
+                    )?
+                };
+                (1, started)
+            }
+        };
+
+        // The SERIES counter: only a success resets it (REQ-AF-05 AC2/AC6).
+        let series: Option<(i64, String)> = rows::unwrap_row(
+            tx.query_row(
+                "SELECT consecutive_count, first_at FROM agent_failure_series \
+                 WHERE task_id=?1 AND agent_name=?2",
+                params![rec.task_id.to_string(), rec.agent_name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional(),
+        )?;
+        let (series_count, first_at) = match series {
+            Some((count, first)) => {
+                tx.execute(
+                    "UPDATE agent_failure_series SET consecutive_count=?1, last_at=?2, last_class=?3 \
+                     WHERE task_id=?4 AND agent_name=?5",
+                    params![
+                        count + 1,
+                        rows::ts(&rec.at),
+                        rec.class,
+                        rec.task_id.to_string(),
+                        rec.agent_name,
+                    ],
+                )?;
+                (count + 1, rows::parse_ts(first)?)
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO agent_failure_series(task_id,agent_name,consecutive_count,first_at,last_at,last_class,parked_at) \
+                     VALUES(?1,?2,1,?3,?3,?4,NULL)",
+                    params![
+                        rec.task_id.to_string(),
+                        rec.agent_name,
+                        rows::ts(&rec.at),
+                        rec.class,
+                    ],
+                )?;
+                (1, rec.at)
+            }
+        };
+        let total_failures: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(window_count),0) FROM agent_failures WHERE agent_name=?1",
+            params![rec.agent_name],
+            |r| r.get(0),
+        )?;
+
+        if event_written {
+            let payload = serde_json::json!({
+                (json_field::TASK_ID): rec.task_id.to_string(),
+                "execution_id": rec.execution_id.map(|e| e.to_string()),
+                (json_field::AGENT): rec.agent_name,
+                (json_field::DRIVER): rec.driver,
+                (json_field::LLM_PROVIDER): rec.llm_provider,
+                (json_field::MODEL): rec.model,
+                (json_field::CLASS): rec.class,
+                (json_field::MESSAGE): rec.message,
+                // The three-class split stays intact: the detailed class is a
+                // SUB-class of provider, never a fourth stored value on the
+                // execution row (REQ-AF-03 AC1/AC2).
+                (json_field::FAILURE_CLASS): failure_class::PROVIDER,
+                (json_field::EXIT_CODE): rec.exit_code,
+                (json_field::DURATION_MS): rec.duration_ms,
+                (json_field::TAIL): rec.tail,
+                (json_field::OUTPUT_EMPTY): rec.output_empty,
+                (json_field::DRIVER_LOG_TAIL): rec.driver_log_tail,
+                (json_field::DRIVER_LOG_NOTE): rec.driver_log_note,
+                (json_field::BASIS): rec.basis,
+                (json_field::WINDOW_COUNT): window_count,
+                (json_field::WINDOW_STARTED_AT): rows::ts(&window_started_at),
+                (json_field::SERIES_COUNT): series_count,
+                (json_field::FAILURES_TOTAL): total_failures,
+                (json_field::FIRST_AT): rows::ts(&first_at),
+                (json_field::LAST_AT): rows::ts(&rec.at),
+                (json_field::THRESHOLD): rec.threshold,
+                (json_field::AT): rows::ts(&rec.at),
+            });
+            tx.execute(
+                "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    new_id().to_string(),
+                    rec.task_id.to_string(),
+                    event_kind::AGENT_FAILED,
+                    format!("agent:{}", rec.agent_name),
+                    payload.to_string(),
+                    rows::ts(&rec.at),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(AgentFailureRecorded {
+            event_written,
+            window_count,
+            window_started_at,
+            series_count,
+            first_at,
+            last_at: rec.at,
+            total_failures,
+        })
+    }
+
+    /// The newest stored failure of a task (any class) — the evidence a
+    /// progress row / wait row presents.
+    pub fn latest_agent_failure(&self, task_id: Id) -> StoreResult<Option<AgentFailureRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {AGENT_FAILURE_COLUMNS} FROM agent_failures WHERE task_id=?1 \
+             ORDER BY last_at DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(params![task_id.to_string()])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(rows::agent_failure_from_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The newest stored failure of an agent (any task) — the status line's
+    /// class evidence (REQ-AF-07).
+    pub fn latest_agent_failure_for_agent(
+        &self,
+        agent: &str,
+    ) -> StoreResult<Option<AgentFailureRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {AGENT_FAILURE_COLUMNS} FROM agent_failures WHERE agent_name=?1 \
+             ORDER BY last_at DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(params![agent])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(rows::agent_failure_from_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn agent_failure_series(
+        &self,
+        task_id: Id,
+        agent: &str,
+    ) -> StoreResult<Option<AgentFailureSeries>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id,agent_name,consecutive_count,first_at,last_at,last_class,parked_at \
+             FROM agent_failure_series WHERE task_id=?1 AND agent_name=?2",
+        )?;
+        let mut rows = stmt.query(params![task_id.to_string(), agent])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(rows::agent_failure_series_from_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The longest CURRENT series of an agent across tasks — what the status
+    /// line shows as «N отказов подряд» (REQ-AF-07).
+    pub fn agent_failure_series_for_agent(
+        &self,
+        agent: &str,
+    ) -> StoreResult<Option<AgentFailureSeries>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id,agent_name,consecutive_count,first_at,last_at,last_class,parked_at \
+             FROM agent_failure_series WHERE agent_name=?1 \
+             ORDER BY consecutive_count DESC, last_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![agent])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(rows::agent_failure_series_from_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// All actual failures of an agent (window counters summed — suppressed
+    /// repeats included, REQ-AF-06 AC6).
+    pub fn agent_failure_total(&self, agent: &str) -> StoreResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(window_count),0) FROM agent_failures WHERE agent_name=?1",
+            params![agent],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The latest anti-spam window row of one (agent, class) — the status
+    /// surface shows its count/time.
+    pub fn agent_failure_window(
+        &self,
+        agent: &str,
+        class: &str,
+    ) -> StoreResult<Option<AgentFailureRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {AGENT_FAILURE_COLUMNS} FROM agent_failures \
+             WHERE agent_name=?1 AND class=?2 ORDER BY last_at DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(params![agent, class])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(rows::agent_failure_from_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A success of the agent ANYWHERE resets its series (REQ-AF-05 AC2/AC6:
+    /// only success resets — answering the parked question does not).
+    pub fn reset_agent_failure_series(&self, agent: &str) -> StoreResult<()> {
+        self.conn.execute(
+            "DELETE FROM agent_failure_series WHERE agent_name=?1",
+            params![agent],
+        )?;
+        Ok(())
+    }
+
+    /// Record that the threshold already parked this task on this series, so
+    /// the same series never parks twice.
+    pub fn mark_agent_failure_parked(
+        &self,
+        task_id: Id,
+        agent: &str,
+        at: Timestamp,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "UPDATE agent_failure_series SET parked_at=?1 WHERE task_id=?2 AND agent_name=?3",
+            params![rows::ts(&at), task_id.to_string(), agent],
+        )?;
         Ok(())
     }
 

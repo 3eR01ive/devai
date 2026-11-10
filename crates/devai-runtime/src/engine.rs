@@ -322,6 +322,13 @@ pub struct Engine<'a> {
     /// platform-owned `config/workflow/*.yaml` data, never hardcoded at a
     /// call site. `max_repair_attempts = 0` keeps today's one-shot behavior.
     response_form: ResponseFormPolicy,
+    /// Declarative agent-failure visibility (task 01a1b60c, REQ-AF-05/06/10):
+    /// parking threshold, anti-spam window and bounded tails from
+    /// `config/workflow/agent-failure.yaml`.
+    agent_failure: devai_store::config::AgentFailurePolicy,
+    /// A present-but-broken failure policy is LOUD at the next stage — the
+    /// same held-error discipline as the humanization template.
+    agent_failure_config_error: Option<String>,
     /// Declarative humanization template (task 01a1acfe, REQ-HP-04): the
     /// paragraph's volume window, explanation slots, register and detector
     /// thresholds — `config/workflow/humanize.yaml`, loaded once per run,
@@ -376,6 +383,18 @@ impl<'a> Engine<'a> {
         let response_form =
             devai_store::config::load_response_form_policy(&cfg_dir.join("workflow"))
                 .unwrap_or_default();
+        // Agent-failure policy (task 01a1b60c). Absent file/dir => factory
+        // defaults; present-but-broken => held and raised loudly at the next
+        // stage, never a silently disabled threshold/window.
+        let mut agent_failure_config_error = None;
+        let agent_failure =
+            match devai_store::config::load_agent_failure_policy(&cfg_dir.join("workflow")) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    agent_failure_config_error = Some(e.to_string());
+                    devai_store::config::AgentFailurePolicy::default()
+                }
+            };
         // Humanization template (REQ-HP-04). Absent file/dir => the embedded
         // factory bytes (`Default` — the same values `humanize.yaml`
         // declares). Present-but-broken => the error is HELD and raised
@@ -426,6 +445,8 @@ impl<'a> Engine<'a> {
             workspace,
             force_reaudit: false,
             response_form,
+            agent_failure,
+            agent_failure_config_error,
             humanize,
             humanize_config_error,
             task_name,
@@ -841,6 +862,148 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Persist ONE observed agent failure and, at the declared threshold,
+    /// park the task (task 01a1b60c, REQ-AF-01/05/06/10). The counter,
+    /// window boundary and conditional `agent.failed` event land in the
+    /// store's single transaction; the parking question is a normal
+    /// workflow mutation on top of it. A below-threshold failure leaves the
+    /// task where it is — visible in progress, not parked (REQ-AF-05 AC3).
+    fn note_agent_failure(
+        &self,
+        task: &Task,
+        agent: &AgentInstance,
+        execution: &RoleExecution,
+        err: &AdapterError,
+        actor: &str,
+    ) -> Result<(), RuntimeError> {
+        let p = &self.agent_failure;
+        let (message, exit_code, stdout, stderr, hint, reported_ms, log_tail, log_note) = match err
+        {
+            AdapterError::AgentFailure(r) => (
+                r.message.clone(),
+                r.exit_code,
+                r.stdout.clone(),
+                r.stderr.clone(),
+                r.hint,
+                Some(r.duration_ms),
+                r.driver_log_tail.clone(),
+                r.driver_log_note.clone(),
+            ),
+            AdapterError::UnknownProvider(name) => (
+                format!("unknown agent provider `{name}`"),
+                None,
+                String::new(),
+                String::new(),
+                Some("unknown_provider"),
+                None,
+                None,
+                Some("процесс не запускался: неизвестный провайдер".into()),
+            ),
+            AdapterError::Io(e) => (
+                format!("failed to launch agent process: {e}"),
+                None,
+                String::new(),
+                String::new(),
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Some("launch_not_found")
+                } else {
+                    None
+                },
+                None,
+                None,
+                Some("процесс не запустился — журнала драйвера за прогон нет".into()),
+            ),
+            other => (
+                other.to_string(),
+                None,
+                String::new(),
+                String::new(),
+                None,
+                None,
+                None,
+                Some("журнал драйвера не приложен: отказ пришёл не от процесса драйвера".into()),
+            ),
+        };
+        let now = Utc::now();
+        let duration_ms = reported_ms
+            .unwrap_or_else(|| (now - execution.started_at).num_milliseconds().max(0) as u64)
+            as i64;
+        let classified = devai_core::agent_failure::classify(
+            exit_code,
+            &format!("{message}\n{stderr}\n{stdout}"),
+            hint,
+        );
+        let output_empty = stdout.trim().is_empty() && stderr.trim().is_empty();
+        // `tail` is the bounded stream excerpt and is EMPTY when no output
+        // was produced (REQ-AF-01 AC2); the process message rides its own
+        // field so the cause is never hidden (REQ-AF-09 AC3).
+        let stream_text = if !stderr.trim().is_empty() {
+            stderr.as_str()
+        } else {
+            stdout.as_str()
+        };
+        let tail = crate::adapters::tail_chars(stream_text, p.tail_chars);
+        let message_bounded = crate::adapters::tail_chars(&message, p.tail_chars);
+        let driver_log_tail = log_tail
+            .as_deref()
+            .map(|l| crate::adapters::tail_chars(l, p.driver_log_chars));
+        let rec = AgentFailureRecord {
+            id: new_id(),
+            task_id: task.id,
+            execution_id: Some(execution.id),
+            agent_name: agent.name.clone(),
+            // The store's `provider` column is the DRIVER; `runtime` is the
+            // LLM-provider (REQ-MS-01 vocabulary).
+            driver: agent.provider.clone(),
+            llm_provider: agent.runtime.clone(),
+            model: agent.model.clone(),
+            class: classified.class.to_string(),
+            exit_code,
+            duration_ms: Some(duration_ms),
+            tail,
+            output_empty,
+            driver_log_tail,
+            driver_log_note: log_note,
+            message: message_bounded,
+            basis: classified.basis,
+            threshold: p.park_threshold as i64,
+            window_minutes: p.window_minutes as i64,
+            at: now,
+        };
+        let outcome = self.store.record_agent_failure(&rec)?;
+        if outcome.series_count < p.park_threshold as i64 {
+            return Ok(());
+        }
+        // At (or over) the threshold park the task — unless it is already in
+        // a hold/terminal state, where no further run can be started anyway.
+        let current = self.store.get_task(&task.id.to_string())?;
+        if current.state.is_hold() || current.state.is_terminal() {
+            return Ok(());
+        }
+        let question_id = new_id();
+        let m = workflow::park_agent_failure(
+            &current,
+            question_id,
+            workflow::AgentFailureParking {
+                agent: &agent.name,
+                class: classified.class,
+                series_count: outcome.series_count,
+                threshold: p.park_threshold as i64,
+                first_at: outcome.first_at,
+                last_at: outcome.last_at,
+                tail: &rec.tail,
+                action: devai_core::agent_failure::action(classified.class),
+                execution_id: Some(execution.id),
+            },
+            actor,
+            now,
+        )?;
+        self.store.commit(current.lock_version, &m)?;
+        self.store
+            .mark_agent_failure_parked(task.id, &agent.name, now)?;
+        Ok(())
+    }
+
     /// Run exactly one stage end-to-end: guard, execute (through the
     /// adapter-owned form loop, this engine hosting one execution row per
     /// attempt), publish, commit. `StageResult::Escalated` is returned when
@@ -949,6 +1112,9 @@ impl<'a> Engine<'a> {
         // `Ok(None)` => NO section is added (a first-run prompt stays
         // byte-identical); a broken delivery table fails loudly HERE, never
         // masquerades as "nothing to deliver".
+        if let Some(err) = &self.agent_failure_config_error {
+            return Err(RuntimeError::Store(StoreError::Config(err.clone())));
+        }
         if let Some(err) = &self.rework_config_error {
             return Err(RuntimeError::Store(StoreError::Config(err.clone())));
         }
@@ -1312,6 +1478,15 @@ impl<'a> Engine<'a> {
                 if let Some(se) = hook.store_err {
                     return Err(RuntimeError::Store(se));
                 }
+                // THE agent-failure fact (task 01a1b60c, REQ-AF-01 AC6):
+                // written by the PLATFORM here, at completion of the failed
+                // execution — never by the launching loop, so a killed or
+                // restarted driver cannot erase it. Form and platform
+                // failures are NOT agent failures and write no such event
+                // (REQ-AF-01 AC5).
+                if e.failure_class() == failure_class::PROVIDER {
+                    self.note_agent_failure(task, &agent, &hook.open, &e, actor)?;
+                }
                 // The failing attempt's row was closed by the host with its
                 // class; the task state is untouched — history says what
                 // happened, workflow says nothing moved.
@@ -1486,6 +1661,10 @@ impl<'a> Engine<'a> {
             None,
             Utc::now(),
         )?;
+        // REQ-AF-05 AC2/AC6: a successful execution of the agent ANYWHERE
+        // resets its consecutive-failure series. Answering a parked question
+        // does not — only success does.
+        self.store.reset_agent_failure_series(&agent.name)?;
 
         // Publish the result as a formal, content-addressed artifact.
         let depends: Vec<Id> = spec.iter().map(|s| s.id).collect();
