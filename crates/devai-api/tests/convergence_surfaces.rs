@@ -165,6 +165,7 @@ fn both_stages_are_present_whatever_the_task_state() {
             owner_host: None,
             owner_process_start: None,
             bundle: None,
+            run_id: None,
         })
         .unwrap();
     home.publish(

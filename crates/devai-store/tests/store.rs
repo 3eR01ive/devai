@@ -261,6 +261,7 @@ fn export_import_roundtrip_restores_everything() {
         owner_host: Some("fixture-host".into()),
         owner_process_start: Some(1_730_000_000),
         bundle: None,
+        run_id: None,
     };
     store.start_execution(&e).unwrap();
     let q = Question {
@@ -740,6 +741,7 @@ fn execution_id_prefix_resolution_fails_loudly_on_ambiguity() {
         owner_host: None,
         owner_process_start: None,
         bundle: None,
+        run_id: None,
     };
     let a = exec("01a1a5db-3ba0-7a5b-8176-3f38ad4c1ea8", ta.id);
     let b = exec("01a1a5db-3ba1-7a5b-8176-3f38ad4c1ea9", tb.id);
@@ -1114,6 +1116,7 @@ fn running_executions_reads_only_running_rows() {
         owner_host: None,
         owner_process_start: None,
         bundle: None,
+        run_id: None,
     };
     let live = row(t1.id, ExecutionStatus::Running);
     let done = row(t2.id, ExecutionStatus::Running);

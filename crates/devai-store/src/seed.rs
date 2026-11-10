@@ -67,6 +67,11 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
     // the volume window of the human signboard is config, a broken or
     // inverted declaration fails the seed loudly.
     config::load_task_name_policy(&dir.join("workflow"))?;
+    // REQ-AR-14/15/16: the process declaration is validated at init — the
+    // closed condition vocabulary, every state's outcome coverage (dead ends
+    // refuse init), the brake budgets and the declaration version. A broken
+    // or foreign-version declaration never reaches a run.
+    config::load_process_policy(&dir.join("workflow"))?;
     let inserted = config::seed_roles(store, &cfg, now)?;
 
     for (name, version, schema) in contracts() {

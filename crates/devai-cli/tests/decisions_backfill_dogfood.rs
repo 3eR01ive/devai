@@ -188,13 +188,12 @@ fn backfill_runs_on_open_lands_deterministic_rows_and_progress_stays_clean() {
 
     // Any command opens the store — the rung lands here.
     devai(home.path(), &["task", "events", &id]);
-    // v13 (task 01a1b71f): the additive model-bundle rungs add the active
-    // marker, the run stamp, the partial unique index, the reasoning level
-    // and the two addressed-read indexes; the ladder top moves with them.
+    // v14 (task 01a1b7dc): the run identity of an execution (REQ-AR-04/07)
+    // joins the ladder; the top moves with it.
     assert_eq!(
         version_of(home.path()),
-        13,
-        "fresh install lands at the ladder top (v13 with the model-bundle rungs 011/012/013)"
+        14,
+        "fresh install lands at the ladder top (v14 with the run-id rung 014)"
     );
 
     // The human view stays exactly as it was (ratified OQ1 variant (б)):
@@ -377,7 +376,16 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
 
     let r1 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r1["gate"], "WAITING_APPROVAL", "{r1}");
 
@@ -398,7 +406,16 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     );
     let r2 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r2["gate"], "WAITING_ACCEPT", "{r2}");
 
@@ -448,8 +465,8 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     );
     assert_eq!(
         version_of(home.path()),
-        13,
-        "the walked ladder ends at the v13 top"
+        14,
+        "the walked ladder ends at the v14 top"
     );
     println!("──── dogfood evidence: APPROVED_DECISIONS with backfilled rows ────\n{section}");
 }

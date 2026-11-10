@@ -65,6 +65,7 @@ fn running_audit_row(task: &Task) -> RoleExecution {
         owner_host: None,
         owner_process_start: None,
         bundle: None,
+        run_id: None,
     }
 }
 

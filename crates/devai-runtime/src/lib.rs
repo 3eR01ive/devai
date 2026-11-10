@@ -14,19 +14,27 @@ pub mod evaluation;
 pub mod gate;
 pub mod human_view;
 pub mod humanize;
+pub mod launch;
 pub mod liveness;
 pub mod probe;
 mod prompt;
+pub mod reclaim;
 pub mod revision;
 pub mod taskname;
 pub mod worktree;
 
 pub use adapters::{
-    AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
-    artifact_violations, contract_violations, form_repair_section, validate_against_contract,
-    validate_reply,
+    AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, LIVE_STDERR_FILE,
+    LIVE_STDOUT_FILE, RunOutcome, artifact_violations, contract_violations, form_repair_section,
+    validate_against_contract, validate_reply,
 };
 pub use context::{REWORK_CONTEXT_LABEL, rework_context};
 pub use engine::{Engine, Gate, RunReport, RuntimeError, RuntimeResult, StepOutcome};
-pub use liveness::{Liveness, OwnerInfo, check_owner, current_host, current_owner};
+pub use launch::{
+    ACK_TIMEOUT, LaunchError, LaunchOutcome, LaunchRequest, RUNNER_SUBCOMMAND, TAIL_LINES,
+    run_evidence_dir, runner_exe, write_ack,
+};
+pub use liveness::{
+    Liveness, OwnerInfo, boot_time_epoch, check_owner, current_host, current_owner,
+};
 pub use prompt::{build_system_prompt, build_user_prompt, extract_json_object};

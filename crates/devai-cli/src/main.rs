@@ -71,6 +71,25 @@ enum Cmd {
     /// (CLI first) is built on. Read-only, machine-complete.
     #[command(subcommand)]
     Api(ApiCmd),
+    /// PLATFORM INTERNAL: one detached role runner (REQ-AR-01/03). Started by
+    /// `task run` in its own session; it opens the execution row, writes the
+    /// handshake the caller waits for, drives the chain and records the exit
+    /// code and output tail. Not an operator command.
+    #[command(hide = true, name = "__supervise")]
+    Supervise {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        ack: std::path::PathBuf,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+        #[arg(long)]
+        force_reaudit: bool,
+    },
     /// Export a task bundle for portability (domain data + artifacts, no caches)
     Export {
         #[arg(long)]
@@ -242,6 +261,10 @@ enum TaskCmd {
         /// revision). Persists an override decision + event; never implied.
         #[arg(long)]
         force_reaudit: bool,
+        /// WAIT for the launched run to finish instead of returning at once
+        /// (REQ-AR-04: the default is the handle; waiting is separate).
+        #[arg(long)]
+        wait: bool,
     },
     /// Publish/replace a REQUIREMENTS_SPEC and move to REVIEW
     Revise {
@@ -615,6 +638,17 @@ enum ExecCmd {
         exec_id: String,
     },
     List {
+        #[arg(long)]
+        task: Option<String>,
+        /// Only the executions of one RUN, including the later ones a chain
+        /// produced (REQ-AR-04 AC2).
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// Close executions whose owner process is PROVABLY gone (REQ-AR-05):
+    /// host restarted, pid vanished, or a pre-ownership RUNNING row. A typed
+    /// report of what was closed and why; nothing is killed.
+    Reap {
         #[arg(long)]
         task: Option<String>,
     },

@@ -23,7 +23,8 @@ use crate::{
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
     MergeRecordReq, MutationResult, ProfileRatifyReq, ProfileRevokeReq, ProjectAddReq, PublishReq,
-    ReviseReq, RunReq, TaskCreateReq, TaskProjectSetReq, TaskRenameReq,
+    ReviseReq, RunLaunch, RunReq, SupervisedRunReq, TaskCreateReq, TaskProjectSetReq,
+    TaskRenameReq,
 };
 
 pub struct Ctx {
@@ -100,6 +101,16 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
         Cmd::Model(c) => model(ctx, c, json),
         Cmd::Contract(c) => contract(ctx, c, json),
         Cmd::Exec(c) => exec(ctx, c, json),
+        // PLATFORM INTERNAL (hidden): one detached runner. Its stdout/stderr
+        // are the run's evidence log, so this arm prints only facts.
+        Cmd::Supervise {
+            task,
+            run,
+            ack,
+            agent,
+            workspace,
+            force_reaudit,
+        } => supervise(ctx, task, run, ack, agent, workspace, force_reaudit, json),
         Cmd::Api(c) => api_registry(ctx, c, json),
         Cmd::Export { task, out } => export(ctx, &task, &out, json),
         Cmd::Import { dir } => import(ctx, &dir, json),
@@ -721,12 +732,14 @@ fn task_execution(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             agent,
             workspace,
             force_reaudit,
+            wait,
         } => task_run(
             ctx,
             &id,
             agent.as_deref().unwrap_or(""),
             workspace.as_deref(),
             force_reaudit,
+            wait,
             json,
         )?,
         TaskCmd::Merge {
@@ -1304,8 +1317,13 @@ fn task_run(
     agent: &str,
     workspace: Option<&Path>,
     force_reaudit: bool,
+    wait: bool,
     json: bool,
 ) -> Result<()> {
+    // REQ-AR-04: the launch is ASYNCHRONOUS. The command returns a handle and
+    // exits; the role process belongs to the platform (REQ-AR-01) and is not
+    // in this command's session or process group any more. `--wait` is the
+    // separate, explicit wish to stay.
     let o = ctx
         .api()
         .task_run(RunReq {
@@ -1315,12 +1333,130 @@ fn task_run(
             force_reaudit,
         })
         .map_err(render_api_error)?;
-    let report = o.report;
-    if json {
-        outln!("{}", serde_json::to_string_pretty(&report)?);
+    if json && (!wait || o.outcome == RunLaunch::Refused) {
+        outln!("{}", serde_json::to_string_pretty(&o)?);
+    } else if !json {
+        match o.outcome {
+            RunLaunch::Started => {
+                outln!(
+                    "run {} started: execution {} in {}",
+                    short(&Uuid::parse_str(&o.run_id).unwrap_or_else(|_| Uuid::nil())),
+                    o.execution_id
+                        .as_deref()
+                        .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
+                        .unwrap_or_else(|| "-".into()),
+                    o.state
+                );
+                outln!(
+                    "the role runs in its own session — status: `devai exec get <id>`, log tail: \
+                     $DEVAI_HOME/evidence/<task>/<run>/supervisor.log; wait: --wait"
+                );
+            }
+            RunLaunch::AlreadyRunning => {
+                outln!(
+                    "task {} already has a run: execution {} ({})",
+                    short(&Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil())),
+                    o.execution_id
+                        .as_deref()
+                        .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
+                        .unwrap_or_else(|| "-".into()),
+                    o.reason.as_deref().unwrap_or("one owner per task")
+                );
+            }
+            RunLaunch::Refused => {
+                outln!(
+                    "launch refused: {}",
+                    o.reason.as_deref().unwrap_or("no reason recorded")
+                );
+            }
+        }
+    }
+    if o.outcome == RunLaunch::Refused || !wait {
         return Ok(());
     }
-    for s in &report.steps {
+    // `--wait` on a task that already had a run waits for THAT run's owner
+    // (the handle in `execution_id` is the execution that owns the task).
+    let Some(first) = o.execution_id.as_deref() else {
+        return Ok(());
+    };
+    wait_for_run(ctx, first, json)
+}
+
+/// `--wait`: stay with the launched run until its PLATFORM-OWNED runner is
+/// gone, then render the settled outcome the runner stored. It waits on the
+/// runner PROCESS (REQ-AR-03), not on «no RUNNING row»: between two stages of
+/// one chain there is a moment with no row, and that moment is not the end.
+/// Closing this terminal does not disturb the run (REQ-AR-01/07).
+fn wait_for_run(ctx: &Ctx, first_exec: &str, json: bool) -> Result<()> {
+    let row = ctx.api().exec_get(first_exec).map_err(render_api_error)?;
+    loop {
+        let state = devai_runtime::liveness::check_owner(
+            row.owner_pid,
+            row.owner_host.as_deref(),
+            row.owner_process_start,
+        );
+        if state != devai_runtime::liveness::Liveness::Alive {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let task_ref = row.task_id.to_string();
+    let run_id = row
+        .run_id
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| row.id.to_string());
+    let outcome_path =
+        devai_runtime::launch::run_evidence_dir(&ctx.api().home(), &task_ref, &run_id)
+            .join(devai_runtime::launch::OUTCOME_FILE);
+    if let Ok(text) = std::fs::read_to_string(&outcome_path) {
+        if let Ok(view) = serde_json::from_str::<devai_api::RunOutcome>(&text) {
+            return render_run_outcome(&view, &run_id, json);
+        }
+    }
+    // No stored outcome: the runner stopped without finishing the chain
+    // (killed, refused, engine error). The rows carry the reason — show them.
+    let es = ctx
+        .api()
+        .exec_list(Some(&task_ref))
+        .map_err(render_api_error)?;
+    let of_run: Vec<&RoleExecution> = es
+        .iter()
+        .filter(|e| e.run_id.map(|r| r.to_string()).as_deref() == Some(run_id.as_str()))
+        .collect();
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&of_run)?);
+    } else {
+        outln!("run {run_id} produced no outcome — the runner stopped first:");
+        for e in &of_run {
+            outln!(
+                "  {}  {:<22} {}{}",
+                short(&e.id),
+                e.role_slug,
+                e.status.as_str(),
+                e.error
+                    .as_deref()
+                    .map(|err| format!(" — {}", ellipsis(err, 200)))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    if let Some(row) = of_run.first() {
+        if let Some(err) = &row.error {
+            bail!("the run did not finish: {err}");
+        }
+    }
+    bail!("the run did not produce an outcome")
+}
+
+/// Render a SETTLED run the way the synchronous `task run` used to: the step
+/// lines, then the human gate (paragraphs first — ratified OQ-HP-1) with the
+/// stored quality report. `--json` keeps printing exactly the `RunReport`.
+fn render_run_outcome(o: &devai_api::RunOutcome, run_id: &str, json: bool) -> Result<()> {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&o.report)?);
+        return Ok(());
+    }
+    for s in &o.report.steps {
         outln!(
             "{} → {}: `{}` on `{}`  artifact {} ({})",
             s.from.as_str(),
@@ -1334,27 +1470,19 @@ fn task_run(
             outln!("   ↳ {}", ellipsis(sum, 160));
         }
     }
-    match report.gate {
+    match o.report.gate {
         Gate::WaitingApproval => {
-            // REQ-HP-05: the human paragraphs open the gate view — the
-            // operator reads «what happens / what will change» BEFORE any
-            // formal structure, verbatim from the stored artifacts.
             for (label, text) in &o.gate_human_paragraphs {
                 outln!("── {label}: человеческий абзац ──");
                 outln!("{text}");
             }
-            outln!("⏸ APPROVAL is a human gate — approve or reject the requirements")
+            outln!("⏸ APPROVAL is a human gate — approve or reject the requirements");
         }
         Gate::WaitingAccept => {
-            // The paragraph of the code the operator is accepting comes
-            // first (ratified OQ-HP-1: implementation-report is read at
-            // this gate); the assembled report follows as the machine half.
             for (label, text) in &o.gate_human_paragraphs {
                 outln!("── {label}: человеческий абзац ──");
                 outln!("{text}");
             }
-            // The assembled report (the stored human form) is for the human
-            // at the gate.
             if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
                 outln!("{marker}");
             }
@@ -1365,11 +1493,6 @@ fn task_run(
             outln!("⏸ acceptance is a human gate — accept or return the result");
         }
         Gate::ReportFresh => {
-            // The freshness gate stopped the run: no auditor execution was
-            // started, no artifact was published. The human decides.
-            // REQ-005: CURRENT-by-status selection lives in the API.
-            // REQ-HP-05: the paragraph of the implementation being judged
-            // opens the view here too, before the machine rendering.
             for (label, text) in &o.gate_human_paragraphs {
                 outln!("── {label}: человеческий абзац ──");
                 outln!("{text}");
@@ -1394,7 +1517,7 @@ fn task_run(
             }
             outln!(
                 "   decide explicitly: accept/return this report, or re-audit an unchanged workspace with `devai task run {} --force-reaudit`",
-                short(&report.task_id)
+                short(&o.report.task_id)
             );
         }
         Gate::Terminal(st) => outln!("task finished: {}", st.as_str()),
@@ -1402,6 +1525,78 @@ fn task_run(
     }
     if !o.allowed_operations.is_empty() {
         outln!("next: {}", o.allowed_operations.join(" | "));
+    }
+    outln!("run: {run_id} (status: `devai exec list --run {run_id}`)");
+    Ok(())
+}
+
+/// The hidden runner arm (`__supervise`, REQ-AR-01/03): open the execution
+/// row owned by THIS detached process, hand the caller the id, drive the
+/// chain, and close the row with the role's own outcome. Everything it prints
+/// lands in the run's `supervisor.log` under the home's evidence tree.
+fn supervise(
+    ctx: &Ctx,
+    task: String,
+    run: String,
+    ack: std::path::PathBuf,
+    agent: Option<String>,
+    workspace: Option<std::path::PathBuf>,
+    force_reaudit: bool,
+    json: bool,
+) -> Result<()> {
+    let task_ref = task.clone();
+    let run_ref = run.clone();
+    let req = SupervisedRunReq {
+        task_id: task,
+        agent: agent.unwrap_or_default(),
+        workspace,
+        force_reaudit,
+        run_id: run,
+        ack,
+    };
+    let result = ctx
+        .api()
+        .task_run_supervised(&req)
+        .map_err(render_api_error);
+    // REQ-AR-03: the platform KEEPS the outcome in evidence — the runner's own
+    // exit code and the bounded TAIL of this transcript (the ratified 4096
+    // lines), written next to `supervisor.log` and `outcome.json`. The caller
+    // may be long gone; these files are the platform's record.
+    let code = if matches!(&result, Ok(Some(_)) | Ok(None)) {
+        0
+    } else {
+        1
+    };
+    let ev = devai_runtime::launch::run_evidence_dir(&ctx.api().home(), &task_ref, &run_ref);
+    let tail = devai_runtime::launch::read_tail(
+        &ev.join(devai_runtime::launch::SUPERVISOR_LOG),
+        devai_runtime::launch::TAIL_LINES,
+    );
+    let _ = std::fs::write(
+        ev.join("role_output_tail.txt"),
+        format!("exit_code: {code}\n{tail}\n"),
+    );
+    match result? {
+        Some(report) => {
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                outln!(
+                    "run finished: task {} now {}",
+                    short(&report.task_id),
+                    report.now.as_str()
+                );
+                for s in &report.steps {
+                    outln!("{} → {} ({})", s.from.as_str(), s.to.as_str(), s.role);
+                }
+            }
+        }
+        None => {
+            // The refusal was handed to the caller through the handshake
+            // (busy / not a role state / tripped brake); this process exits
+            // cleanly, it has nothing to drive.
+            outln!("nothing started — the caller was told through the handshake");
+        }
     }
     Ok(())
 }
@@ -2359,6 +2554,8 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                     role,
                     agent,
                     inputs,
+                    // A manual start is its own run.
+                    run_id: None,
                 })
                 .map_err(render_api_error)?;
             outln!(
@@ -2398,12 +2595,20 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 short(&e.id)
             );
         }
-        ExecCmd::List { task } => {
-            // (API exec.list read.)
-            let es = ctx
+        ExecCmd::List { task, run } => {
+            // (API exec.list read; `--run` keeps the executions of ONE run —
+            // including the later stages a chain produced, REQ-AR-04 AC2.)
+            let mut es = ctx
                 .api()
                 .exec_list(task.as_deref())
                 .map_err(render_api_error)?;
+            if let Some(run) = &run {
+                es.retain(|e| {
+                    e.run_id
+                        .map(|r| r.to_string().starts_with(&run.to_lowercase()))
+                        .unwrap_or(false)
+                });
+            }
             if json {
                 outln!("{}", serde_json::to_string_pretty(&es)?);
             } else if es.is_empty() {
@@ -2424,7 +2629,7 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                         "{}  {:<22} {:<12} {:<10}{} {}",
                         short(&e.id),
                         e.role_slug,
-                        short(&e.task_id),
+                        e.run_id.map(|r| short(&r)).unwrap_or_else(|| "-".into()),
                         e.status.as_str(),
                         flags,
                         e.summary
@@ -2434,6 +2639,45 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                             .unwrap_or_default()
                     );
                 }
+            }
+        }
+        ExecCmd::Reap { task } => {
+            // REQ-AR-05: prove dead owners gone and close their rows. The
+            // verdicts are typed rows (class + evidence), never a kill.
+            let closed = ctx
+                .api()
+                .exec_reap(task.as_deref())
+                .map_err(render_api_error)?;
+            if json {
+                let rows: Vec<serde_json::Value> = closed
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "execution_id": r.execution.id.to_string(),
+                            "task_id": r.execution.task_id.to_string(),
+                            "role": r.execution.role_slug,
+                            "failure_class": r.class,
+                            "evidence": r.evidence,
+                        })
+                    })
+                    .collect();
+                outln!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if closed.is_empty() {
+                outln!("nothing to reap: no RUNNING execution is provably dead");
+            } else {
+                for r in &closed {
+                    outln!(
+                        "closed {} ({}) as FAILED [{}] — {}",
+                        short(&r.execution.id),
+                        r.execution.role_slug,
+                        r.class,
+                        ellipsis(&r.evidence, 120)
+                    );
+                }
+                outln!(
+                    "{} execution(s) closed; unprovable rows were left untouched and keep their slot",
+                    closed.len()
+                );
             }
         }
         ExecCmd::Get { exec_id } => {
@@ -2446,6 +2690,12 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 outln!("id:        {}", e.id);
                 outln!("task:      {}", e.task_id);
                 outln!("role:      {}@{}", e.role_slug, e.role_version);
+                outln!(
+                    "run:       {}",
+                    e.run_id
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
                 outln!("agent:     {}", e.agent_name.as_deref().unwrap_or("-"));
                 outln!("status:    {}", e.status.as_str());
                 outln!("attempt:   {}", e.attempt);
@@ -2461,6 +2711,74 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 }
                 if let Some(fc) = &e.failure_class {
                     outln!("failure:   [{fc}]");
+                }
+                // REQ-AR-07: the stored tail and the last-activity time are
+                // readable without the launching terminal and survive any
+                // wrapper restart — they are evidence files, not process
+                // memory. While the role runs the LIVE transcript files
+                // (`role_stdout.txt`/`role_stderr.txt`) are written by the
+                // role's own process; after it exits `role_output.txt` adds
+                // the exit code and both bounded tails.
+                let home = ctx.api().home();
+                let ev = home
+                    .join("evidence")
+                    .join(e.task_id.to_string())
+                    .join(e.id.to_string());
+                let run_ev = e.run_id.map(|r| {
+                    home.join("evidence")
+                        .join(e.task_id.to_string())
+                        .join(r.to_string())
+                });
+                let tail_of = |path: &std::path::Path, label: &str, lines: usize| {
+                    let text = std::fs::read_to_string(path).unwrap_or_default();
+                    if text.trim().is_empty() {
+                        return;
+                    }
+                    outln!("── output tail ({label}) ──");
+                    let all: Vec<&str> = text.lines().collect();
+                    let start = all.len().saturating_sub(lines);
+                    for line in &all[start..] {
+                        outln!("{line}");
+                    }
+                };
+                tail_of(&ev.join("role_output.txt"), "role_output.txt", 20);
+                tail_of(
+                    &ev.join(devai_runtime::LIVE_STDOUT_FILE),
+                    "role_stdout.txt (live)",
+                    20,
+                );
+                tail_of(
+                    &ev.join(devai_runtime::LIVE_STDERR_FILE),
+                    "role_stderr.txt (live)",
+                    10,
+                );
+                let mut candidates = vec![
+                    ev.join("role_output.txt"),
+                    ev.join(devai_runtime::LIVE_STDOUT_FILE),
+                    ev.join(devai_runtime::LIVE_STDERR_FILE),
+                ];
+                if let Some(run_ev) = &run_ev {
+                    candidates.push(run_ev.join(devai_runtime::launch::SUPERVISOR_LOG));
+                }
+                let activity = candidates
+                    .iter()
+                    .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+                    .max();
+                match activity {
+                    Some(t) => {
+                        let ago = std::time::SystemTime::now()
+                            .duration_since(t)
+                            .unwrap_or_default()
+                            .as_secs();
+                        outln!("activity:  {ago}s ago");
+                    }
+                    // The ratified answer to the activity question: «по
+                    // последней строке, до неё — старт». No output file yet
+                    // is not «no activity» — the start IS the last known fact.
+                    None => outln!(
+                        "activity:  no output yet; started {}",
+                        e.started_at.format("%Y-%m-%d %H:%M:%S")
+                    ),
                 }
             }
         }

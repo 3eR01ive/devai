@@ -111,6 +111,12 @@ pub enum RuntimeError {
     MissingArtifact(&'static str),
     #[error("engine reached the {0}-step safety limit while in state {1}")]
     StepLimit(usize, &'static str),
+    /// The process DECLARATION and the code disagree (REQ-AR-09/16): a state
+    /// the declaration says a role executes has no stage binding, or the
+    /// declaration is broken. Loud — never a silent fallback to a hardcoded
+    /// stage map.
+    #[error("process declaration: {0}")]
+    Process(String),
     #[error("no evaluation profile for `quality-auditor` in {0} — run `devai init`")]
     MissingProfile(String),
     #[error("contract {0}@{1} not found — run `devai init`")]
@@ -150,7 +156,7 @@ pub enum RuntimeError {
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 /// Where the engine stopped and why.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Gate {
     /// Awaiting a human `approve`/`reject` in APPROVAL.
@@ -182,7 +188,7 @@ impl std::fmt::Display for Gate {
 }
 
 /// One autonomous stage the engine actually ran.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StepOutcome {
     pub from: TaskState,
     pub to: TaskState,
@@ -194,7 +200,7 @@ pub struct StepOutcome {
     pub summary: Option<String>,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RunReport {
     pub task_id: Id,
     pub now: TaskState,
@@ -353,6 +359,21 @@ pub struct Engine<'a> {
     /// (Engine::new stays infallible, as every caller assumes) and raised
     /// in `run_stage` before any prompt is built.
     rework_config_error: Option<String>,
+    /// The PROCESS DECLARATION (REQ-AR-09/11): which state is executed by
+    /// which role, which outcomes exist, which brakes park the task. Loaded
+    /// once per run from `config/workflow/process.yaml` — the engine asks the
+    /// declaration «who runs this state», it does not keep a second copy.
+    process: devai_store::config::ProcessPolicy,
+    /// A present-but-broken/foreign-version declaration is LOUD at the next
+    /// advance (REQ-AR-16: never silent work under unknown rules).
+    process_config_error: Option<String>,
+    /// The execution row a DETACHED runner already opened (REQ-AR-08): the
+    /// engine adopts it instead of opening a second RUNNING row, so the
+    /// caller's handle points at the very row this process drives. Consumed
+    /// by the FIRST stage; later stages of the chain open their own rows.
+    adopted: std::cell::RefCell<Option<RoleExecution>>,
+    /// The run number every row of this chain carries (REQ-AR-04/07).
+    run_id: Option<Id>,
 }
 
 impl<'a> Engine<'a> {
@@ -416,6 +437,17 @@ impl<'a> Engine<'a> {
                 Vec::new()
             }
         };
+        // PROCESS DECLARATION (REQ-AR-09/11/16): the state-executor map and
+        // the brakes are DATA. Loaded here once; a broken or foreign-version
+        // declaration is held and raised before any stage starts.
+        let (process, process_config_error) =
+            match devai_store::config::load_process_policy(&cfg_dir.join("workflow")) {
+                Ok(p) => (p, None),
+                Err(e) => (
+                    devai_store::config::factory_process_policy().unwrap(),
+                    Some(e.to_string()),
+                ),
+            };
         let workspace = std::env::current_dir().unwrap_or_else(|_| store.root().to_path_buf());
         Engine {
             store,
@@ -432,7 +464,27 @@ impl<'a> Engine<'a> {
             task_name_config_error,
             rework,
             rework_config_error,
+            process,
+            process_config_error,
+            adopted: std::cell::RefCell::new(None),
+            run_id: None,
         }
+    }
+
+    /// Carry the execution row a detached runner opened, and the run number
+    /// of the chain (REQ-AR-04/08). The engine then DRIVES that row instead
+    /// of opening its own — one owner, one row, one handle.
+    pub fn with_adopted_execution(mut self, execution: RoleExecution) -> Self {
+        self.run_id = execution.run_id.or(self.run_id);
+        self.adopted = std::cell::RefCell::new(Some(execution));
+        self
+    }
+
+    /// Stamp `run_id` on every row this engine opens (a supervisor minted
+    /// the run number before spawning).
+    pub fn with_run_id(mut self, run_id: Id) -> Self {
+        self.run_id = Some(run_id);
+        self
     }
 
     /// Override the probe workspace (tests, monorepo subdirs).
@@ -654,6 +706,12 @@ impl<'a> Engine<'a> {
         agent_name: &str,
         actor: &str,
     ) -> RuntimeResult<RunReport> {
+        // REQ-AR-16: a broken/foreign-version declaration stops here, loudly
+        // and before any row or prompt: the platform never runs a home under
+        // rules it cannot read.
+        if let Some(err) = &self.process_config_error {
+            return Err(RuntimeError::Process(err.clone()));
+        }
         let mut steps = Vec::new();
         loop {
             let task = self.store.resolve_task(task_ref)?;
@@ -665,18 +723,38 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            let (role_slug, kind) = match task.state {
-                TaskState::Analysis => ("requirements-analyst", ArtifactKind::RequirementsSpec),
-                TaskState::Review => ("requirements-reviewer", ArtifactKind::ReviewReport),
+            // REQ-AR-11: «запуск производен от состояния» — WHO executes the
+            // state is the declaration's answer, not a second stage map in
+            // code. The artifact kind each stage publishes is stage semantics
+            // (REQ-AR-17), so it stays beside the role it belongs to.
+            let stage_kind = |s: TaskState| match s {
+                TaskState::Analysis => Some(ArtifactKind::RequirementsSpec),
+                TaskState::Review => Some(ArtifactKind::ReviewReport),
                 TaskState::Implementation | TaskState::Rework => {
-                    ("implementation-agent", ArtifactKind::ImplementationReport)
+                    Some(ArtifactKind::ImplementationReport)
                 }
-                TaskState::Qa => ("quality-auditor", ArtifactKind::QualityReport),
-                TaskState::Approval => return Ok(self.report(&task, steps, Gate::WaitingApproval)),
-                TaskState::Accepted | TaskState::Cancelled => {
-                    return Ok(self.report(&task, steps, Gate::Terminal(task.state)));
-                }
-                s => return Ok(self.report(&task, steps, Gate::Hold(s))),
+                TaskState::Qa => Some(ArtifactKind::QualityReport),
+                _ => None,
+            };
+            let Some(role_slug) = self.process.role_for(task.state.as_str()) else {
+                // No declared role for this state: a human gate, a hold or a
+                // terminal state — the platform launches nothing (REQ-AR-11
+                // AC2) and the caller learns where the task stands.
+                return Ok(match task.state {
+                    TaskState::Approval => self.report(&task, steps, Gate::WaitingApproval),
+                    TaskState::Accepted | TaskState::Cancelled => {
+                        self.report(&task, steps, Gate::Terminal(task.state))
+                    }
+                    s => self.report(&task, steps, Gate::Hold(s)),
+                });
+            };
+            let role_slug = role_slug.to_string();
+            let Some(kind) = stage_kind(task.state) else {
+                return Err(RuntimeError::Process(format!(
+                    "state {} is declared as executed by role `{role_slug}`, but the platform has \
+                     no stage artifact for it — the declaration and the stage semantics disagree",
+                    task.state.as_str()
+                )));
             };
 
             if steps.len() >= self.max_steps {
@@ -747,7 +825,7 @@ impl<'a> Engine<'a> {
 
             let step = match self.run_stage(
                 &task,
-                role_slug,
+                &role_slug,
                 kind,
                 agent_name,
                 actor,
@@ -1045,46 +1123,71 @@ impl<'a> Engine<'a> {
         // owner — same process, same stage.
         let (owner_pid, owner_host, owner_process_start) =
             crate::liveness::current_owner().into_columns();
-        let execution = RoleExecution {
-            id: new_id(),
-            task_id: task.id,
-            role_slug: role.slug.clone(),
-            role_version: role.version,
-            agent_name: Some(agent.name.clone()),
-            status: ExecutionStatus::Running,
-            inputs: input_arts.iter().map(|a| a.id.to_string()).collect(),
-            summary: None,
-            error: None,
-            started_at: now,
-            finished_at: None,
-            workspace_revision: Some(revision.clone()),
-            // The ROOT attempt (1): subsequent attempts of the same stage
-            // clone this row with a fresh id, `attempt = n` and
-            // `parent_execution` pointing here (REQ-FG-06 lineage).
-            attempt: 1,
-            parent_execution: None,
-            failure_class: None,
-            owner_pid,
-            owner_host,
-            owner_process_start,
-            // The run STAMP (REQ-MS-05): taken off the resolved agent record
-            // AT START — the attempt loop clones this template, so every
-            // attempt of the stage carries one stamp. `llm_provider` is the
-            // record's `runtime` field (the store's driver column is
-            // `provider`), empty/`local` meaning «the driver chooses».
-            bundle: Some(devai_core::types::ExecutionBundle::new(
-                &agent.provider,
-                agent.runtime.as_str(),
-                &agent.model,
-                &agent.reasoning,
-            )),
+        // REQ-AR-08: a detached runner may have opened this stage's row
+        // BEFORE the engine started (that row is the caller's handle). The
+        // engine then DRIVES it — it must not open a second RUNNING row, and
+        // the handle must point at the row that actually runs.
+        // The runner's row belongs to THIS stage; taking it leaves the later
+        // stages of the chain to open their own rows.
+        let adopted = match self.adopted.borrow_mut().take() {
+            Some(row) if row.task_id == task.id && row.role_slug == role.slug => Some(row),
+            Some(row) => {
+                return Err(RuntimeError::Process(format!(
+                    "the runner adopted execution {} for role `{}` of task {}, but the current \
+                     stage is `{}` on task {} — the launch and the stage disagree",
+                    row.id, row.role_slug, row.task_id, role.slug, task.id
+                )));
+            }
+            None => None,
+        };
+        let execution = match adopted.clone() {
+            Some(row) => row,
+            None => RoleExecution {
+                id: new_id(),
+                task_id: task.id,
+                role_slug: role.slug.clone(),
+                role_version: role.version,
+                agent_name: Some(agent.name.clone()),
+                status: ExecutionStatus::Running,
+                inputs: input_arts.iter().map(|a| a.id.to_string()).collect(),
+                summary: None,
+                error: None,
+                started_at: now,
+                finished_at: None,
+                workspace_revision: Some(revision.clone()),
+                // The ROOT attempt (1): subsequent attempts of the same stage
+                // clone this row with a fresh id, `attempt = n` and
+                // `parent_execution` pointing here (REQ-FG-06 lineage).
+                attempt: 1,
+                parent_execution: None,
+                failure_class: None,
+                owner_pid,
+                owner_host,
+                owner_process_start,
+                // The run STAMP (REQ-MS-05): taken off the resolved agent record
+                // AT START — the attempt loop clones this template, so every
+                // attempt of the stage carries one stamp. `llm_provider` is the
+                // record's `runtime` field (the store's driver column is
+                // `provider`), empty/`local` meaning «the driver chooses».
+                bundle: Some(devai_core::types::ExecutionBundle::new(
+                    &agent.provider,
+                    agent.runtime.as_str(),
+                    &agent.model,
+                    &agent.reasoning,
+                )),
+                // The run number of this chain (REQ-AR-04/07): minted by the
+                // launcher, inherited by every execution the chain produces.
+                run_id: self.run_id,
+            },
         };
         // REQ-SW-01/02: a second RUNNING row for this task cannot commit —
         // the partial unique index rejects it and `start_execution` answers
         // with the named SingleWriterBusy error citing the live row. The
         // form loop stays legal under the invariant: attempt n+1 opens only
         // after attempt n closed (REQ-SW-01 AC4).
-        self.store.start_execution(&execution)?;
+        if adopted.is_none() {
+            self.store.start_execution(&execution)?;
+        }
 
         // REQ-WT-01: a writing role runs inside platform isolation. The
         // worktree is created (or the task's branch re-attached) BEFORE the

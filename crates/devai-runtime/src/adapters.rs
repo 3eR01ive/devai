@@ -74,6 +74,104 @@ pub struct ExecRequest {
     pub task_name: devai_store::config::TaskNamePolicy,
 }
 
+/// Keep the TAIL of the role's own output in the run's evidence directory
+/// (REQ-AR-03: «фиксирует код возврата и хвост stderr/stdout в evidence»).
+/// The ratified answer to the open question is 4096 lines per stream; the
+/// file travels with the execution dir and survives any wrapper restart
+/// (REQ-AR-07). Best effort by design: a role's answer is never lost because
+/// its log tail could not be written, and nothing here touches the checkout.
+fn persist_output_tail(evidence: Option<&std::path::Path>, out: &std::process::Output) {
+    let Some(dir) = evidence else { return };
+    let tail = |bytes: &[u8]| -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(crate::launch::TAIL_LINES);
+        lines[start..].join("\n")
+    };
+    let body = format!(
+        "exit: {}\n=== stdout (tail, up to {} lines) ===\n{}\n=== stderr (tail, up to {} lines) ===\n{}\n",
+        out.status,
+        crate::launch::TAIL_LINES,
+        tail(&out.stdout),
+        crate::launch::TAIL_LINES,
+        tail(&out.stderr),
+    );
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join("role_output.txt"), body);
+}
+
+/// The LIVE transcript files of one execution, in its evidence dir. The child
+/// process owns these handles, so the files grow (and their mtime moves) WHILE
+/// the role works — that is the «время последней активности» and the readable
+/// tail a status command reports before the role exits (REQ-AR-07), which is
+/// exactly the «а точно идёт?» question this task exists for. On completion
+/// they are bounded to the ratified 4096-line tail; `role_output.txt` keeps
+/// the settled form (exit code + both tails).
+pub const LIVE_STDOUT_FILE: &str = "role_stdout.txt";
+pub const LIVE_STDERR_FILE: &str = "role_stderr.txt";
+
+/// Run `cmd` with its stdout/stderr aimed INTO the execution's evidence dir
+/// when one exists, else capture exactly as before. The returned `Output`
+/// carries the same bytes `Command::output` would have captured, so the
+/// adapters parse identical input; only the SIDE EFFECT (two files written by
+/// the child, readable mid-run) is new. A home where the evidence dir cannot
+/// be prepared falls back to in-memory capture — a role never dies because a
+/// log could not be opened.
+fn run_captured(
+    cmd: &mut std::process::Command,
+    evidence: Option<&std::path::Path>,
+) -> std::io::Result<std::process::Output> {
+    let Some(dir) = evidence else {
+        return cmd.output();
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return cmd.output();
+    }
+    let open = |name: &str| -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(dir.join(name))
+    };
+    let (Ok(stdout), Ok(stderr)) = (open(LIVE_STDOUT_FILE), open(LIVE_STDERR_FILE)) else {
+        return cmd.output();
+    };
+    let child_stderr = stderr.try_clone()?;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(child_stderr))
+        .spawn()?;
+    let status = child.wait()?;
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
+    let out = std::process::Output {
+        status,
+        stdout: read(LIVE_STDOUT_FILE),
+        stderr: read(LIVE_STDERR_FILE),
+    };
+    for name in [LIVE_STDOUT_FILE, LIVE_STDERR_FILE] {
+        trim_stream_file(&dir.join(name));
+    }
+    Ok(out)
+}
+
+/// Bound one stored stream file to the ratified tail. The tail is read as
+/// lossy text exactly like the settled writer; a stream that cannot be read
+/// back is left as it landed rather than truncated blindly.
+fn trim_stream_file(path: &std::path::Path) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= crate::launch::TAIL_LINES {
+        return;
+    }
+    let start = lines.len() - crate::launch::TAIL_LINES;
+    let _ = std::fs::write(path, format!("{}\n", lines[start..].join("\n")));
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecOutput {
     /// Contract-shaped JSON bytes — becomes the artifact body verbatim.
@@ -316,7 +414,11 @@ impl AgentRuntime {
             cmd.arg("--effort").arg(&req.reasoning);
         }
 
-        let out = cmd.output()?;
+        let out = run_captured(&mut cmd, req.evidence.as_deref())?;
+        // REQ-AR-03: the platform keeps the exit code and the output tail as
+        // run evidence, whatever the outcome — the row's `error`/`summary`
+        // stays the short human fact, the tail lives in the evidence tree.
+        persist_output_tail(req.evidence.as_deref(), &out);
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             return Err(AdapterError::Agent(format!(
@@ -405,7 +507,9 @@ impl AgentRuntime {
         // forcing isolation would break the R3 premise (keys outside the
         // store). An operator who wants a hermetised agent keeps that
         // choice in hermes config, out of platform argv.
-        let out = cmd.output()?;
+        let out = run_captured(&mut cmd, req.evidence.as_deref())?;
+        // the same evidence discipline as the claude path (REQ-AR-03).
+        persist_output_tail(req.evidence.as_deref(), &out);
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             return Err(AdapterError::Agent(format!(
@@ -1201,6 +1305,64 @@ fn one_line(s: &str) -> String {
 mod tests {
     use super::*;
     use devai_core::types::{ContractRef, new_id};
+
+    /// REQ-AR-07: the status command must show a TAIL and a last-activity
+    /// time WHILE the role runs. The child owns the evidence file handles, so
+    /// the file is readable before the process exits — that is the property
+    /// pinned here (the caller polls the file from another thread).
+    #[test]
+    fn the_live_transcript_is_readable_before_the_role_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let ev = dir.path().join("evidence");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "echo first; sleep 1; echo second"]);
+        let out_path = ev.join(LIVE_STDOUT_FILE);
+        let worker = {
+            let ev = ev.clone();
+            std::thread::spawn(move || run_captured(&mut cmd, Some(&ev)))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let live = std::fs::read_to_string(&out_path).unwrap_or_default();
+            if live.contains("first") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the transcript was not readable while the role ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = worker.join().unwrap().unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"first\nsecond\n");
+        assert_eq!(
+            std::fs::read_to_string(&out_path).unwrap(),
+            "first\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn without_an_evidence_dir_the_capture_stays_in_memory() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "echo hello"]);
+        let out = run_captured(&mut cmd, None).unwrap();
+        assert_eq!(out.stdout, b"hello\n");
+    }
+
+    #[test]
+    fn a_stored_stream_is_bounded_to_the_ratified_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("stream");
+        let body: String = (1..=crate::launch::TAIL_LINES + 4)
+            .map(|n| format!("line {n}\n"))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        trim_stream_file(&p);
+        let kept = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(kept.lines().count(), crate::launch::TAIL_LINES);
+        assert_eq!(kept.lines().next(), Some("line 5"));
+    }
 
     fn role(slug: &str, contract: &str) -> RoleDefinition {
         RoleDefinition {

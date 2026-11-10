@@ -29,8 +29,12 @@ use std::path::{Path, PathBuf};
 use devai_core::types::*;
 use devai_core::workflow::{self, Mutation};
 use devai_runtime::human_view::present::{self, PresentedReport, ReportFreshness};
+use devai_runtime::launch::{self, LaunchOutcome, LaunchRequest};
+use devai_runtime::reclaim;
 use devai_runtime::{Engine, Gate, RunReport, liveness};
+use devai_store::config::ProcessPolicy;
 use devai_store::{ArtifactDraft, StoreError, bundle, guess_media_type, seed};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::inbox::pick_spec_artifact;
@@ -209,7 +213,7 @@ pub struct RunReq {
     pub force_reaudit: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunOutcome {
     pub report: RunReport,
     /// The CURRENT quality report row (the `ReportFresh` gate names it).
@@ -232,6 +236,50 @@ pub struct RunOutcome {
     /// Additive to the machine surface — `--json` keeps rendering `report`.
     pub gate_human_paragraphs: Vec<(String, String)>,
     pub allowed_operations: Vec<String>,
+    /// The run this outcome belongs to (REQ-AR-04/07). A `--wait` caller
+    /// reads it back from the stored evidence; `None` on the inline path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Потолок сериализованной спеки (байты). Решение оператора 09.11: держим
+/// жёстко в публикации, а не только пожеланием в промпте роли.
+/// The typed outcome of an ASYNC launch (REQ-AR-04): the run number, the
+/// execution the caller can quote, and which of the three states happened.
+/// `--wait` is a separate caller concern; this type never waits.
+#[derive(Serialize, Clone, Debug)]
+pub struct RunStartOutcome {
+    /// The run number (the id of the chain's first execution).
+    pub run_id: String,
+    /// The execution handle: the first execution of this launch, or — for
+    /// `already_running` — the execution that already owns the task
+    /// (REQ-AR-06: the refusal names it and touches nothing).
+    pub execution_id: Option<String>,
+    pub outcome: RunLaunch,
+    /// Why the launch was refused («нельзя» carries a reason, REQ-AR-04).
+    pub reason: Option<String>,
+    /// The task state the launch was asked in.
+    pub state: String,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunLaunch {
+    Started,
+    AlreadyRunning,
+    Refused,
+}
+
+/// The supervisor's request: one detached runner, one run.
+#[derive(Debug, Clone)]
+pub struct SupervisedRunReq {
+    pub task_id: String,
+    pub agent: String,
+    pub workspace: Option<PathBuf>,
+    pub force_reaudit: bool,
+    pub run_id: String,
+    /// Where the caller expects the handshake (plain file, atomic rename).
+    pub ack: PathBuf,
 }
 
 /// Потолок сериализованной спеки (байты). Решение оператора 09.11: держим
@@ -456,6 +504,10 @@ pub struct ExecStartReq {
     pub role: String,
     pub agent: Option<String>,
     pub inputs: Vec<String>,
+    /// The RUN this row belongs to (REQ-AR-04/07). A detached runner passes
+    /// the number its caller minted; a manual `exec start` passes `None` and
+    /// the row becomes its own run (its id).
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -739,6 +791,10 @@ impl Api {
             .filter(|(_, s)| *s == ArtifactStatus::Superseded)
             .count();
         self.store.commit(task.lock_version, &m)?;
+        // REQ-AR-11/12: entering a state a ROLE executes starts that run —
+        // decided by the platform from the declaration, after the human act
+        // is safely stored (a failed launch never undoes the decision).
+        self.autostart_if_role_state(&m.task);
         Ok(MutationResult {
             task: m.task.clone(),
             previous_state: task.state,
@@ -857,7 +913,7 @@ impl Api {
 
     // ---- task: run / revise ------------------------------------------------
 
-    pub fn task_run(&self, req: RunReq) -> ApiResult<RunOutcome> {
+    pub fn task_run_inline(&self, req: RunReq) -> ApiResult<RunOutcome> {
         // REQ-SW-05: the labeled early single-writer refusal. A pre-check
         // failure on an unknown id resolves inside the engine exactly as
         // before; the enforcement point stays the store index.
@@ -869,6 +925,14 @@ impl Api {
             engine = engine.with_workspace(w);
         }
         let report = engine.advance(&req.id, &req.agent, &self.actor)?;
+        self.run_view(report, None)
+    }
+
+    /// The rendering half of a settled run: the gate presentation (stored
+    /// quality report, freshness, human paragraphs) plus the allowed
+    /// operations. Shared by the inline drive and the `--wait` read-back of a
+    /// detached run, so both paths show the operator the SAME gate view.
+    fn run_view(&self, report: RunReport, run_id: Option<String>) -> ApiResult<RunOutcome> {
         // The gate renderings read the presented quality report — the same
         // status-aware selection (REQ-005, REQ-QH-05/06) the UI panel uses:
         // the stored human form when present, the §2.6 text otherwise, plus
@@ -927,7 +991,470 @@ impl Api {
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect(),
+            run_id,
         })
+    }
+
+    // ---- asynchronous launch (REQ-AR-01..08) -------------------------------
+
+    /// `task run` — the ASYNC launch (REQ-AR-04): mint a run number, start a
+    /// detached platform runner, and return the handle as soon as the runner
+    /// has opened the execution row. The caller never waits for a role, and
+    /// the role never dies with the caller (REQ-AR-01).
+    ///
+    /// Outcomes are typed, not exceptions: `started` (with the execution id),
+    /// `already_running` (with the id of the execution that owns the task —
+    /// REQ-AR-06, and the first run is not touched) and `refused` (a reason —
+    /// «нельзя», e.g. the state is executed by a human). A spawn/handshake
+    /// failure is NOT one of them: nothing was started, it is recorded as a
+    /// launch failure event (REQ-AR-13) and returned as a typed refusal.
+    pub fn task_run(&self, req: RunReq) -> ApiResult<RunStartOutcome> {
+        let run_id = new_id().to_string();
+        let task = self.store.resolve_task(&req.id)?;
+        // REQ-AR-05/08: a provably dead owner must not hold the slot while a
+        // new launch asks for it — the platform closes it first.
+        reclaim::reclaim(&self.store, Some(task.id))?;
+        let task = self.store.resolve_task(&req.id)?;
+        let policy = self.process_policy()?;
+        let state = task.state.as_str().to_string();
+        // «Состояние с человеком прогона не порождает» (REQ-AR-11 AC2). A
+        // DRAFT is the one bookkeeping step the runner performs before the
+        // first role opens, so it is launchable.
+        if task.state != TaskState::Draft && policy.role_for(&state).is_none() {
+            let executor = policy.executor_for(&state).unwrap_or("none");
+            return Ok(RunStartOutcome {
+                run_id,
+                execution_id: None,
+                outcome: RunLaunch::Refused,
+                reason: Some(format!(
+                    "state {state} is executed by `{executor}`, not by a role — nothing to launch"
+                )),
+                state,
+            });
+        }
+        let request = LaunchRequest {
+            home: self.home.clone(),
+            task_id: task.id.to_string(),
+            agent: req.agent.clone(),
+            workspace: req.workspace.clone(),
+            force_reaudit: req.force_reaudit,
+            actor: self.actor.clone(),
+            run_id: run_id.clone(),
+        };
+        match launch::launch(&request) {
+            Ok(LaunchOutcome::Started {
+                run_id,
+                execution_id,
+            }) => Ok(RunStartOutcome {
+                run_id,
+                execution_id: Some(execution_id),
+                outcome: RunLaunch::Started,
+                reason: None,
+                state,
+            }),
+            Ok(LaunchOutcome::AlreadyRunning {
+                run_id,
+                execution_id,
+            }) => Ok(RunStartOutcome {
+                run_id,
+                execution_id: Some(execution_id),
+                outcome: RunLaunch::AlreadyRunning,
+                reason: Some(
+                    "one owner per task: the first run keeps running and was not touched"
+                        .to_string(),
+                ),
+                state,
+            }),
+            Ok(LaunchOutcome::Refused { reason }) => {
+                // A refusal that came back FROM the runner means the launch
+                // was attempted and did not happen (no executable agent, a
+                // tripped brake): REQ-AR-13 makes it an EVENT with the
+                // consecutive counter, never silence. The check that lives
+                // in `task_run` itself (a human-executed state) is a typed
+                // «нельзя» and is NOT a launch failure — nothing was tried.
+                self.record_launch_failure(&task, &reason)?;
+                Ok(RunStartOutcome {
+                    run_id,
+                    execution_id: None,
+                    outcome: RunLaunch::Refused,
+                    reason: Some(reason),
+                    state,
+                })
+            }
+            Err(e) => {
+                // REQ-AR-13: a launch that did not happen is an EVENT with a
+                // class and a consecutive counter — never silence, and never
+                // confused with «the role ran».
+                self.record_launch_failure(&task, &e.to_string())?;
+                Err(ApiError::refused(
+                    "launch_failed",
+                    format!("launch failed: {e}"),
+                ))
+            }
+        }
+    }
+
+    /// The detached runner's entry (the CLI's hidden `__supervise` command):
+    /// DRAFT bookkeeping, brakes, the execution row (owned by THIS process),
+    /// the handshake, then the engine drive of the whole chain. Every refusal
+    /// travels through the ack file, so the caller that already returned still
+    /// gets no phantom handle (REQ-AR-08).
+    pub fn task_run_supervised(&self, req: &SupervisedRunReq) -> ApiResult<Option<RunReport>> {
+        match self.supervised_inner(req) {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                // The caller may have already given up (timeout); writing the
+                // ack is best effort — the log keeps the reason either way.
+                let _ = launch::write_ack(&req.ack, &format!("refused {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    fn supervised_inner(&self, req: &SupervisedRunReq) -> ApiResult<Option<RunReport>> {
+        let task = self.store.resolve_task(&req.task_id)?;
+        // DRAFT -> ANALYSIS is bookkeeping, not a role execution (the same
+        // step the inline engine took): the runner performs it before it can
+        // open a stage row.
+        let task = if task.state == TaskState::Draft {
+            let m = workflow::start(&task, &self.actor, Utc::now())?;
+            self.store.commit(task.lock_version, &m)?;
+            self.store.get_task(&task.id.to_string())?
+        } else {
+            task
+        };
+        let policy = self.process_policy()?;
+        let state = task.state.as_str().to_string();
+        let Some(role) = policy.role_for(&state).map(|r| r.to_string()) else {
+            let executor = policy.executor_for(&state).unwrap_or("none");
+            let reason = format!(
+                "state {state} is executed by `{executor}`, not by a role — nothing to launch"
+            );
+            let _ = launch::write_ack(&req.ack, &format!("refused {reason}"));
+            return Ok(None);
+        };
+        // REQ-AR-08: the launch is indivisible — an execution id is handed out
+        // only when the role can actually run. An EMPTY agent means «the marked
+        // model bundle»; with none marked (or an incomplete one) the platform
+        // must refuse BEFORE opening a RUNNING row, not leave a doomed row that
+        // holds the slot and then dies. An explicit agent is resolved by the
+        // engine (built-ins + registered records); only the bundle needs this
+        // pre-flight look.
+        if req.agent.trim().is_empty() {
+            let usable = matches!(
+                self.store.active_agent()?,
+                Some(a) if !a.reasoning.trim().is_empty()
+            );
+            if !usable {
+                let reason = "no active model bundle — the platform has no executable agent for \
+                              this state; pick one: `devai model switch <id>` (or run the role with \
+                              an explicit --agent)"
+                    .to_string();
+                let _ = launch::write_ack(&req.ack, &format!("refused {reason}"));
+                return Ok(None);
+            }
+        }
+        // REQ-AR-05: prove-dead rows are closed before the guard asks.
+        reclaim::reclaim(&self.store, Some(task.id))?;
+        let task = self.store.resolve_task(&req.task_id)?;
+
+        // BRAKE: rounds without a shift (REQ-AR-09/13). A round is an
+        // execution of the same stage role since the task's last NEW artifact;
+        // at the declared count the task parks with the reason and counter and
+        // nothing auto-continues from a park.
+        let last_artifact = self
+            .store
+            .artifacts(task.id)?
+            .iter()
+            .map(|a| a.created_at)
+            .max();
+        let rounds = self
+            .store
+            .list_executions(Some(task.id))?
+            .into_iter()
+            .filter(|e| {
+                e.role_slug == role && last_artifact.map(|t| e.started_at > t).unwrap_or(true)
+            })
+            .count() as u32;
+        let limit = policy.brakes.max_rounds_without_shift;
+        if rounds >= limit {
+            let reason = format!(
+                "brake: {rounds} round(s) of `{role}` without a new artifact (limit {limit})"
+            );
+            self.park(&task, "rounds_without_shift", rounds, limit, &reason)?;
+            let _ = launch::write_ack(&req.ack, &format!("refused {reason}"));
+            return Ok(None);
+        }
+
+        // REQ-AR-06: the refusal must CARRY the owner's id, so the busy
+        // answer is read off the stored rows before the guard's prose runs.
+        // (The guard below stays the enforcement point; this is the typed
+        // answer to the same fact.)
+        //
+        // «Идёт прогон» is wider than «есть строка RUNNING»: between two
+        // stages of one chain there is a moment with no RUNNING row while the
+        // runner is very much alive. The owner PROCESS is the truth — a row
+        // whose owner is alive means the chain has not let go of the task, so
+        // a second chain must not start in that window either.
+        if let Some(owner) = self
+            .store
+            .list_executions(Some(task.id))?
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.status == ExecutionStatus::Running
+                    || liveness::check_owner(
+                        e.owner_pid,
+                        e.owner_host.as_deref(),
+                        e.owner_process_start,
+                    ) == liveness::Liveness::Alive
+            })
+        {
+            let _ = launch::write_ack(&req.ack, &format!("busy {} {}", req.run_id, owner.id));
+            return Ok(None);
+        }
+        let started = match self.exec_start_in(
+            ExecStartReq {
+                id: task.id.to_string(),
+                role: role.clone(),
+                agent: if req.agent.is_empty() {
+                    None
+                } else {
+                    Some(req.agent.clone())
+                },
+                inputs: Vec::new(),
+                run_id: Some(req.run_id.clone()),
+            },
+            req.workspace.as_deref(),
+        ) {
+            Ok(s) => s,
+            Err(ApiError::Store(StoreError::SingleWriterBusy { existing_id, .. })) => {
+                // REQ-AR-06: the refusal names the execution that already
+                // owns the task; the first run is not signalled, not killed,
+                // not touched.
+                let _ = launch::write_ack(&req.ack, &format!("busy {} {existing_id}", req.run_id));
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        // A live row now exists and its owner is THIS process (exec_start
+        // stamped it): the caller gets the handle only at this point
+        // (REQ-AR-08).
+        launch::write_ack(
+            &req.ack,
+            &format!("started {} {}", req.run_id, started.execution.id),
+        )
+        .map_err(|e| {
+            ApiError::refused(
+                "launch_failed",
+                format!("cannot hand the execution id to the caller: {e}"),
+            )
+        })?;
+        self.store.insert_event(
+            Some(task.id),
+            event_kind::EXECUTION_LAUNCHED,
+            "platform",
+            serde_json::json!({
+                "run_id": req.run_id,
+                "execution_id": started.execution.id.to_string(),
+                "role": role,
+                "agent": started.execution.agent_name,
+                "owner_pid": started.execution.owner_pid,
+                "owner_host": started.execution.owner_host,
+                "owner_process_start": started.execution.owner_process_start,
+            }),
+        )?;
+
+        // Drives the row this process opened (adoption), NOT a second one.
+        let mut engine = Engine::new(&self.store)
+            .with_adopted_execution(started.execution.clone())
+            .with_force_reaudit(req.force_reaudit);
+        if let Some(w) = req.workspace.as_deref() {
+            engine = engine.with_workspace(w);
+        }
+        let report = match engine.advance(&req.task_id, &req.agent, &self.actor) {
+            Ok(r) => r,
+            Err(e) => {
+                // The row must never be left RUNNING by an engine failure
+                // (REQ-AR-05/08): close it with the platform class.
+                let row = self
+                    .store
+                    .get_execution(&started.execution.id.to_string())?;
+                if row.status == ExecutionStatus::Running {
+                    let _ = self.store.finish_execution_classified(
+                        &row,
+                        ExecutionStatus::Failed,
+                        None,
+                        Some(&format!("engine failed: {e}")),
+                        Some(failure_class::PLATFORM),
+                        Utc::now(),
+                    );
+                }
+                // REQ-AR-09: «классы отказов, паркующие сразу» — the
+                // declaration decides whether THIS failure needs no second
+                // round. The task is re-read: the engine may have advanced
+                // through stages before the failing one.
+                let class = self
+                    .store
+                    .get_execution(&started.execution.id.to_string())?
+                    .failure_class;
+                if let Some(class) = class.as_deref() {
+                    if policy.parks_immediately(class) {
+                        let cur = self.store.get_task(&task.id.to_string())?;
+                        let reason = format!(
+                            "failure class `{class}` is declared to park immediately — another \
+                             round cannot fix it; engine error: {e}"
+                        );
+                        let _ = self.park(&cur, "park_immediately", 1, 1, &reason);
+                    }
+                }
+                return Err(e.into());
+            }
+        };
+        // REQ-AR-08/05: the handle row must never be left RUNNING. The engine
+        // adopts it for the FIRST stage — but a gate that stops the run BEFORE
+        // any stage (a FRESH quality report, a human gate, a hold) leaves it
+        // untouched. Close it as a completed no-work run whose summary names
+        // the gate, so the slot is free and the row explains itself.
+        let row = self
+            .store
+            .get_execution(&started.execution.id.to_string())?;
+        if row.status == ExecutionStatus::Running {
+            self.store.finish_execution_classified(
+                &row,
+                ExecutionStatus::Completed,
+                Some(&format!(
+                    "run stopped at {:?} before the stage started — no role work was done",
+                    report.gate
+                )),
+                None,
+                None,
+                Utc::now(),
+            )?;
+        }
+        // REQ-AR-03/07: the run's OUTCOME belongs to the platform and outlives
+        // the caller. Persist the same gate view a synchronous run rendered
+        // into the run's evidence dir, so `--wait` (and any later reader) sees
+        // the settled report without re-running anything.
+        let view = self.run_view(report.clone(), Some(req.run_id.clone()))?;
+        let outcome_path = launch::run_evidence_dir(&self.home, &task.id.to_string(), &req.run_id)
+            .join(launch::OUTCOME_FILE);
+        if let Ok(text) = serde_json::to_string_pretty(&view) {
+            let _ = std::fs::write(&outcome_path, text);
+        }
+        Ok(Some(report))
+    }
+
+    /// Park the task on a tripped brake: the state change, the reason with
+    /// the counter, and the dedicated event. `workflow::block` keeps every
+    /// workflow rule (a terminal task cannot be parked, the remembered stage
+    /// is kept for a human release) — a park is not a private store write.
+    fn park(
+        &self,
+        task: &Task,
+        brake: &str,
+        counter: u32,
+        limit: u32,
+        reason: &str,
+    ) -> ApiResult<()> {
+        let m = workflow::block(task, Some(reason), "platform", Utc::now())?;
+        self.store.commit(task.lock_version, &m)?;
+        self.store.insert_event(
+            Some(task.id),
+            event_kind::PROCESS_PARKED,
+            "platform",
+            serde_json::json!({
+                "brake": brake,
+                "counter": counter,
+                "limit": limit,
+                "reason": reason,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// REQ-AR-13: a launch that did not happen is recorded as an event with
+    /// its class and the CONSECUTIVE counter (derived from the append-only
+    /// log, so a restart cannot silently reset it), and parks the task at the
+    /// declared threshold. Nothing is retried automatically.
+    fn record_launch_failure(&self, task: &Task, reason_text: &str) -> ApiResult<()> {
+        let policy = self.process_policy()?;
+        let consecutive = self.consecutive_launch_failures(task.id)? + 1;
+        let limit = policy.brakes.max_consecutive_failures;
+        let mut parked = false;
+        if consecutive >= limit {
+            let reason = format!(
+                "launch failed {consecutive} time(s) in a row (limit {limit}): {reason_text}"
+            );
+            self.park(
+                task,
+                "consecutive_launch_failures",
+                consecutive,
+                limit,
+                &reason,
+            )?;
+            parked = true;
+        }
+        self.store.insert_event(
+            Some(task.id),
+            event_kind::EXECUTION_LAUNCH_FAILED,
+            "platform",
+            serde_json::json!({
+                "failure_class": failure_class::SPAWN,
+                "consecutive": consecutive,
+                "limit": limit,
+                "parked": parked,
+                "reason": reason_text,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// The tail of the append-only log: how many launch failures sit in a row
+    /// right now. Derived, never stored separately — a counter field could
+    /// drift from the events that justify it.
+    fn consecutive_launch_failures(&self, task_id: Id) -> ApiResult<u32> {
+        let events = self.store.events(task_id, None)?;
+        let n = events
+            .iter()
+            .rev()
+            .take_while(|ev| ev.kind == event_kind::EXECUTION_LAUNCH_FAILED)
+            .count();
+        Ok(n as u32)
+    }
+
+    /// The process declaration in force (REQ-AR-09/16): one loader, the same
+    /// one the engine and `devai init` use. A broken declaration is a typed
+    /// refusal here, never an implicit fallback.
+    fn process_policy(&self) -> ApiResult<ProcessPolicy> {
+        devai_store::config::load_process_policy(&self.config_dir().join("workflow"))
+            .map_err(ApiError::from)
+    }
+
+    /// REQ-AR-11/12: a state that the declaration says a role executes REQUIRES
+    /// a run — after a human decision the platform starts it itself, without a
+    /// second command. Called after every committed workflow mutation; a state
+    /// executed by a human or by nobody launches nothing.
+    ///
+    /// A failed auto-launch never fails the human act that triggered it: the
+    /// rejection/approval is already stored, and the failure is recorded by
+    /// `task_run` as a launch event with its counter (REQ-AR-13).
+    fn autostart_if_role_state(&self, task: &Task) {
+        if !self.autolaunch {
+            return;
+        }
+        let Ok(policy) = self.process_policy() else {
+            return;
+        };
+        if policy.role_for(task.state.as_str()).is_none() {
+            return;
+        }
+        let _ = self.task_run(RunReq {
+            id: task.id.to_string(),
+            agent: String::new(),
+            workspace: None,
+            force_reaudit: false,
+        });
     }
 
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
@@ -954,6 +1481,9 @@ impl Api {
             Utc::now(),
         )?;
         self.store.commit(task.lock_version, &m)?;
+        // REQ-AR-11: publishing a revised requirements spec lands in REVIEW —
+        // a role state, so the platform starts the reviewer itself.
+        self.autostart_if_role_state(&m.task);
         Ok(ReviseOutcome {
             task: m.task.clone(),
             staled_ids: m
@@ -1512,6 +2042,9 @@ impl Api {
         let cur = self.ratify_release_question(&task, &trip, &decision)?;
         let m = self.ratify_withheld_passage(&cur, &current, &decision)?;
         self.store.commit(cur.lock_version, &m)?;
+        // REQ-AR-11: the ratified passage lands in QA — a role state, so the
+        // auditor's run starts here, without a second command.
+        self.autostart_if_role_state(&m.task);
         Ok(RatifyResult {
             task: cur,
             decision,
@@ -1738,6 +2271,10 @@ impl Api {
             .answer_question(q.id, text, &self.actor, Utc::now())?;
         let m = workflow::answer_question(&task, q.id, &self.actor, Utc::now())?;
         self.store.commit(task.lock_version, &m)?;
+        // REQ-AR-11: the answer releases the hold and returns the task to the
+        // stage that asked — a role state, so the platform starts that run
+        // itself (no second command).
+        self.autostart_if_role_state(&m.task);
         Ok(AnsweredOutcome {
             question_id: q.id,
             from_state: task.state,
@@ -1793,6 +2330,13 @@ impl Api {
     // ---- executions --------------------------------------------------------
 
     pub fn exec_start(&self, req: ExecStartReq) -> ApiResult<ExecStarted> {
+        self.exec_start_in(req, None)
+    }
+
+    /// The same start with the RUN's workspace known: a detached runner was
+    /// launched with `--workspace`, so the revision stamped on the row must be
+    /// THAT workspace's (REQ-001/REQ-006: platform-side, not the caller's cwd).
+    fn exec_start_in(&self, req: ExecStartReq, workspace: Option<&Path>) -> ApiResult<ExecStarted> {
         let task = self.store.resolve_task(&req.id)?;
         workflow::check_execution_allowed(&req.role, &task)?;
         // REQ-SW-02 AC2: the labeled early refusal of a second RUNNING row
@@ -1805,7 +2349,7 @@ impl Api {
             .map(|r| r.version)
             .unwrap_or(1);
         let inputs = self.execution_inputs(&req.inputs)?;
-        let e = self.new_execution_row(req, task.id, version, inputs)?;
+        let e = self.new_execution_row(req, task.id, version, inputs, workspace)?;
         self.store.start_execution(&e)?;
         Ok(ExecStarted { execution: e, task })
     }
@@ -1830,9 +2374,24 @@ impl Api {
         task_id: Id,
         role_version: u32,
         inputs: Vec<String>,
+        workspace: Option<&Path>,
     ) -> ApiResult<RoleExecution> {
-        let revision = Engine::new(&self.store).current_revision()?;
+        let revision = match workspace {
+            Some(w) => Engine::new(&self.store)
+                .with_workspace(w)
+                .current_revision()?,
+            None => Engine::new(&self.store).current_revision()?,
+        };
         let (owner_pid, owner_host, owner_process_start) = liveness::current_owner().into_columns();
+        // REQ-AR-04/07: the run identity of this row. A detached runner hands
+        // in the number its caller minted (the whole chain shares it); a
+        // manual start IS its own run — its id is the run number.
+        let run_id = match req.run_id.as_deref() {
+            Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|_| {
+                ApiError::refused("invalid_input", format!("run_id `{raw}` is not a uuid"))
+            })?),
+            None => None,
+        };
         // REQ-MS-05: the run stamp is taken from the agent RECORD at start —
         // the manual path reads the same row the engine does, so a manual row
         // answers «what did this run use?» exactly like an engine row. No
@@ -1871,6 +2430,7 @@ impl Api {
             owner_host,
             owner_process_start,
             bundle: stamp,
+            run_id,
         })
     }
 
@@ -3181,6 +3741,7 @@ mod tests {
             role: "analyst".into(),
             agent: None,
             inputs: vec![],
+            run_id: None,
         })
         .unwrap();
 
@@ -3190,6 +3751,7 @@ mod tests {
                 role: "analyst".into(),
                 agent: None,
                 inputs: vec![],
+                run_id: None,
             })
             .unwrap_err();
         assert_eq!(e.code(), ErrorCode("single_writer_busy"));
@@ -3420,6 +3982,7 @@ scoring:
             owner_host: None,
             owner_process_start: None,
             bundle: None,
+            run_id: None,
         }
     }
 
@@ -3961,7 +4524,7 @@ scoring:
         let dir = tempfile::tempdir().unwrap();
         let api = seeded_api(dir.path());
         let o = api
-            .task_run(RunReq {
+            .task_run_inline(RunReq {
                 id: api
                     .task_create(TaskCreateReq {
                         title: "show-me".into(),

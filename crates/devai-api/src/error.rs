@@ -142,6 +142,7 @@ fn runtime_code(e: &RuntimeError) -> ErrorCode {
         RuntimeError::MissingRole(..) => ErrorCode("missing_role"),
         RuntimeError::MissingArtifact(..) => ErrorCode("missing_artifact"),
         RuntimeError::StepLimit(..) => ErrorCode("step_limit"),
+        RuntimeError::Process(..) => ErrorCode("process_declaration"),
         RuntimeError::MissingProfile(..) => ErrorCode("missing_profile"),
         RuntimeError::MissingContract(..) => ErrorCode("missing_contract"),
         RuntimeError::Worktree(inner) => worktree_code(inner),

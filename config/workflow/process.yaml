@@ -1,0 +1,118 @@
+# Декларация процесса (REQ-AR-09/11/14/15/16).
+#
+# Это ДАННЫЕ платформы, а не код: какие состояния существуют, КТО в них
+# исполняет (роль или человек), какие исходы у состояния бывают и куда они
+# ведут, и тормоза, паркующие задачу. Движок читает файл: правка процесса —
+# правка этого объявления, без правки кода. Условия перехода — ИМЕНА из
+# закрытого перечня ниже (REQ-AR-15), а не выражения на языке реализации.
+#
+# version ОБЯЗАТЕЛЕН и сверяется при инициализации: дом на другой версии
+# объявления получает типизированный отказ, а не тихо живёт по новым правилам
+# (REQ-AR-16).
+
+process:
+  version: 1
+
+  # Закрытый перечень имён условий. Неизвестное имя в transitions отвергается
+  # при `devai init` — опечатка не становится «новым» переходом.
+  conditions:
+    - human_start       # человек запустил дело (DRAFT → ANALYSIS)
+    - role_finished     # роль отработала и опубликовала свой артефакт
+    - human_approved    # человек подписал гейт
+    - human_rejected    # человек отклонил требования
+    - human_accepted    # человек принял результат (QA → ACCEPTED)
+    - human_returned    # человек вернул результат на доработку
+    - human_resumed     # человек снял парковку/удержание
+    - launch_failed     # запуск роли не состоялся (ошибка порождения)
+    - outcome_missing   # у исполнения не пришло исхода (иначе — вечное RUNNING)
+
+  # Рабочие состояния и их исполнители. Для role обязательны исходы
+  # role_finished, launch_failed и outcome_missing: у каждого рабочего
+  # состояния покрыт каждый исход, включая «исход не пришёл» (REQ-AR-14).
+  states:
+    - state: DRAFT
+      executor: none
+      outcomes: [human_start]
+    - state: ANALYSIS
+      executor: role
+      role: requirements-analyst
+      outcomes: [role_finished, launch_failed, outcome_missing]
+    - state: REVIEW
+      executor: role
+      role: requirements-reviewer
+      outcomes: [role_finished, human_approved, human_rejected, launch_failed, outcome_missing]
+    - state: APPROVAL
+      executor: human
+      outcomes: [human_approved, human_rejected]
+    - state: IMPLEMENTATION
+      executor: role
+      role: implementation-agent
+      outcomes: [role_finished, launch_failed, outcome_missing]
+    - state: REWORK
+      executor: role
+      role: implementation-agent
+      outcomes: [role_finished, launch_failed, outcome_missing]
+    - state: QA
+      executor: role
+      role: quality-auditor
+      outcomes: [role_finished, human_accepted, human_returned, launch_failed, outcome_missing]
+    - state: WAITING_FOR_INPUT
+      executor: none
+      outcomes: [human_resumed]
+    - state: PAUSED
+      executor: none
+      outcomes: [human_resumed]
+    - state: BLOCKED
+      executor: none
+      outcomes: [human_resumed]
+    - state: FAILED
+      executor: none
+      outcomes: [human_resumed]
+    - state: ACCEPTED
+      executor: none
+      outcomes: []
+    - state: CANCELLED
+      executor: none
+      outcomes: []
+
+  # «условие → состояние». RETURN_STATE — особый адрес: вернуть запомненную
+  # рабочую стадию (return_state удержания), а не фиксированное состояние.
+  transitions:
+    - { from: DRAFT, on: human_start, to: ANALYSIS }
+    - { from: ANALYSIS, on: role_finished, to: REVIEW }
+    - { from: ANALYSIS, on: launch_failed, to: BLOCKED }
+    - { from: ANALYSIS, on: outcome_missing, to: BLOCKED }
+    - { from: REVIEW, on: role_finished, to: APPROVAL }
+    - { from: REVIEW, on: human_approved, to: APPROVAL }
+    - { from: REVIEW, on: human_rejected, to: ANALYSIS }
+    - { from: REVIEW, on: launch_failed, to: BLOCKED }
+    - { from: REVIEW, on: outcome_missing, to: BLOCKED }
+    - { from: APPROVAL, on: human_approved, to: IMPLEMENTATION }
+    - { from: APPROVAL, on: human_rejected, to: ANALYSIS }
+    - { from: IMPLEMENTATION, on: role_finished, to: QA }
+    - { from: IMPLEMENTATION, on: launch_failed, to: BLOCKED }
+    - { from: IMPLEMENTATION, on: outcome_missing, to: BLOCKED }
+    - { from: REWORK, on: role_finished, to: QA }
+    - { from: REWORK, on: launch_failed, to: BLOCKED }
+    - { from: REWORK, on: outcome_missing, to: BLOCKED }
+    - { from: QA, on: role_finished, to: QA }
+    - { from: QA, on: human_accepted, to: ACCEPTED }
+    - { from: QA, on: human_returned, to: REWORK }
+    - { from: QA, on: launch_failed, to: BLOCKED }
+    - { from: QA, on: outcome_missing, to: BLOCKED }
+    - { from: WAITING_FOR_INPUT, on: human_resumed, to: RETURN_STATE }
+    - { from: PAUSED, on: human_resumed, to: RETURN_STATE }
+    - { from: BLOCKED, on: human_resumed, to: RETURN_STATE }
+    - { from: FAILED, on: human_resumed, to: RETURN_STATE }
+
+  # Тормоза (REQ-AR-13). Сработавший переводит задачу в park_state с причиной
+  # и счётчиком; из парковки автоматического продолжения нет — только человек.
+  brakes:
+    max_rounds_without_shift: 3   # кругов без нового артефакта подряд
+    max_consecutive_failures: 3   # несостоявшихся запусков подряд
+    # Классы отказов, паркующие СРАЗУ, первым же случаем (REQ-AR-09):
+    # платформа и провайдер повтором не починятся — решает человек.
+    # Имена — из закрытого перечня классов отказа; неизвестное отвергается
+    # при инициализации, а не молча не срабатывает.
+    park_immediately: [platform, provider]
+    park_state: BLOCKED

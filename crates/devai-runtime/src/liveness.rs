@@ -106,6 +106,13 @@ pub fn check_owner(pid: Option<i64>, host: Option<&str>, process_start: Option<i
     }
     // Pid present: close pid-reuse with the process start time (kill(pid,0)
     // alone would be fooled by a recycled pid — explicit OQ-3 ratification).
+    // A ZOMBIE is not a live owner either: the process has already exited and
+    // only its exit status waits for the parent to collect it. A `--wait`
+    // caller is exactly such a parent — counting its own un-reaped child as
+    // «alive» would make the wait endless.
+    if proc_is_zombie(pid) {
+        return Liveness::Dead;
+    }
     match (process_start, proc_start_epoch(pid)) {
         // Tolerance absorbs a clock step (NTP/manual) between write and
         // check; both sides otherwise derive from the same boot-fixed
@@ -126,6 +133,24 @@ pub fn current_host() -> Option<String> {
     let raw = fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
     let h = raw.trim().to_string();
     (!h.is_empty()).then_some(h)
+}
+
+/// True when `/proc/<pid>/stat` reports the process state `Z` (zombie): the
+/// process is GONE for every purpose except its parent's `wait`, so it is
+/// never a live owner. Unreadable `/proc` answers `false` — the caller then
+/// keeps the conservative comparison instead of inventing a verdict.
+fn proc_is_zombie(pid: i64) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(tail) = stat.rfind(')') else {
+        return false;
+    };
+    stat[tail + 1..]
+        .split_whitespace()
+        .next()
+        .map(|state| state == "Z")
+        .unwrap_or(false)
 }
 
 /// Process start time in whole epoch seconds: `btime` (boot, epoch secs)
@@ -157,6 +182,15 @@ fn boot_epoch_secs() -> Option<i64> {
     stat.lines()
         .find_map(|l| l.strip_prefix("btime "))
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// Epoch seconds of the current boot (REQ-AR-05 AC1): a row that STARTED
+/// before this value cannot still be running — it is the `host_restarted`
+/// class, distinguishable from an ordinary vanished process. `None` when
+/// `/proc` cannot answer: the caller then records `process_vanished` only,
+/// never claims a reboot it could not observe.
+pub fn boot_time_epoch() -> Option<i64> {
+    boot_epoch_secs()
 }
 
 #[cfg(test)]

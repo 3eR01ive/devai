@@ -61,9 +61,9 @@ pub use mutations::{
     MergeResult, MutationResult, OverrideResult, ProfileRatifyOutcome, ProfileRatifyReq,
     ProfileRevokeOutcome, ProfileRevokeReq, ProfileState, ProfileStateItem, ProjectAddReq,
     PublishOutcome, PublishReq, PublishedRow, QuestionAsked, RatifyResult, ReviseOutcome,
-    ReviseReq, RunOutcome, RunReq, TaskCreateReq, TaskCreated, TaskProjectBackfillOutcome,
-    TaskProjectSetOutcome, TaskProjectSetReq, TaskRenameOutcome, TaskRenameReq, UnlinkResult,
-    WorkflowOp,
+    ReviseReq, RunLaunch, RunOutcome, RunReq, RunStartOutcome, SupervisedRunReq, TaskCreateReq,
+    TaskCreated, TaskProjectBackfillOutcome, TaskProjectSetOutcome, TaskProjectSetReq,
+    TaskRenameOutcome, TaskRenameReq, UnlinkResult, WorkflowOp,
 };
 pub use quality_gate::{
     AUDIT_RUNNING, AUDIT_RUNNING_LABEL, DENIAL_CODES as QUALITY_GATE_DENIAL_CODES,
@@ -136,6 +136,11 @@ pub struct Api {
     /// production, a controlled runner in tests — so the probe/switch path is
     /// testable without launching an external process.
     probe_runner: ProbeRunner,
+    /// REQ-AR-11/12: may this handle start the run a state requires? A live
+    /// platform session (the CLI, the window) does; the bootstrap/observation
+    /// and test doors do not — they must not spawn processes as a side effect
+    /// of opening a home.
+    autolaunch: bool,
 }
 
 /// One probe call as the surface invokes it. The default is
@@ -151,7 +156,10 @@ impl Api {
     /// the registry — it happens before the domain exists — but it is also
     /// no longer a consumer-side `Store::open`. The handle stays inside.
     pub fn open(home: &Path, actor: &str) -> ApiResult<Api> {
-        Self::open_session(home, actor, SessionKind::Human)
+        // The bootstrap door (tests, diagnostics, seeding) never launches as
+        // a side effect of a mutation: a state-driven run belongs to a live
+        // platform session (REQ-AR-11/12).
+        Ok(Self::open_session(home, actor, SessionKind::Human)?.with_autolaunch(false))
     }
 
     /// The same entry with the session's provenance made explicit: the CLI
@@ -164,7 +172,18 @@ impl Api {
             actor: actor.to_string(),
             session,
             probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
+            // A live platform session is allowed to start the run a state
+            // requires (REQ-AR-11/12).
+            autolaunch: true,
         })
+    }
+
+    /// Turn the state-driven auto-launch on/off for THIS handle. The default
+    /// follows the door: a live platform session launches, the bootstrap
+    /// `open` (tests, diagnostics) does not. Never a hidden global switch.
+    pub fn with_autolaunch(mut self, enabled: bool) -> Self {
+        self.autolaunch = enabled;
+        self
     }
 
     /// Substitute the probe runner (tests / diagnostics). The default is the
@@ -188,9 +207,11 @@ impl Api {
             home: home.to_path_buf(),
             actor: actor.to_string(),
             // An observation handle is the human UI's read plane; it writes
-            // nothing, so the human-only gate never sees it.
+            // nothing, so the human-only gate never sees it — and it never
+            // launches (a read door must not spawn).
             session: SessionKind::Human,
             probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
+            autolaunch: false,
         })
     }
 
@@ -1083,6 +1104,20 @@ impl Api {
             owner_process_start: e.owner_process_start,
             liveness: live.as_str().to_string(),
         })
+    }
+
+    /// REQ-AR-05: close every execution whose owner is PROVABLY gone. The
+    /// write is a row closure plus an `execution.lost` event — never a signal,
+    /// never a kill; unprovable rows stay untouched and nameable.
+    pub fn exec_reap(
+        &self,
+        task_ref: Option<&str>,
+    ) -> ApiResult<Vec<devai_runtime::reclaim::Reclaimed>> {
+        let tid = match task_ref {
+            Some(id) => Some(self.store.resolve_task(id)?.id),
+            None => None,
+        };
+        Ok(devai_runtime::reclaim::reclaim(&self.store, tid)?)
     }
 
     // ------------------------------------------------------------------

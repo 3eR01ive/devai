@@ -264,8 +264,8 @@ fn v3_database_gains_the_graph_additively() {
     );
     assert_eq!(
         devai_store::SCHEMA_VERSION,
-        13,
-        "the ladder top is now v13 (the model-bundle rungs 011/012/013, task 01a1b71f)"
+        14,
+        "the ladder top is now v14 (the run-identity column, task 01a1b7dc)"
     );
 
     let t = store.get_task(&t_id.to_string()).unwrap();

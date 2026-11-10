@@ -310,6 +310,8 @@ pub fn execution_from_row(r: &Row) -> StoreResult<RoleExecution> {
             get::<Option<String>>(r, 20)?,
             get::<Option<String>>(r, 21)?,
         ),
+        // Pre-v14 rows carry NULL: no run identity, never a guessed one.
+        run_id: opt_id(get(r, 22)?)?,
     })
 }
 
