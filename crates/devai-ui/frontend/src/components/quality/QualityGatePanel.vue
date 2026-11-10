@@ -1,19 +1,21 @@
 <script setup lang="ts">
 // Панель отчёта качества (REQ-QG-03/04/05/08/09, REQ-SAY-01..06): экран
 // говорит по-человечески и решает человек. Сверху — работа и то, что от него
-// хотят; две кнопки подписаны последствием; каждое замечание — фразой (что не
-// так, где, чем грозит), а служебное имя проверки и числа уходят в раскрытие;
-// «не проверено» стоит отдельным разделом, не вперемешку с недостатками;
-// черновик возврата приходит заполненным. Ничего не пересчитывается: первый
-// слой приходит готовым от платформы (`quality_gate_view.ts` держит чистые
-// правила окна), а подробности — сохранённые группы отчёта.
+// хотят; две кнопки подписаны последствием; оценка аудита — словами, рядом
+// сохранённый балл работы (решение оператора 10.11); каждое замечание — фразой
+// (что не так, где, чем грозит), а служебное имя проверки и остальные числа
+// уходят в раскрытие; «не проверено» стоит отдельным разделом, не вперемешку с
+// недостатками; черновик возврата приходит заполненным. Устаревший отчёт первым
+// делом объясняет обычными словами, что решать по нему нельзя и что делать.
+// Ничего не пересчитывается: первый слой приходит готовым от платформы
+// (`quality_gate_view.ts` держит чистые правила окна), а подробности —
+// сохранённые группы отчёта.
 import { computed, ref, watch } from "vue";
 import {
   filterOptions,
   freshnessBanner,
   groupsForFilter,
   hasEvidence,
-  isNameOnlyGroup,
   presentReport,
   showsPassedNote,
   siteText,
@@ -117,21 +119,25 @@ function addPoint(it: HumanFormItem) {
     </div>
 
     <template v-if="props.report">
-      <div v-if="banner.stale" class="stale-banner">
-        <strong>{{ banner.head }}</strong>
-        <span class="mono muted">{{ banner.detail }}</span>
-      </div>
-
-      <!-- ПЕРВЫЙ СЛОЙ: что от человека хотят и что нашёл аудит — словами. -->
+      <!-- ПЕРВЫЙ СЛОЙ: что от человека хотят и что нашёл аудит — словами.
+           Устаревший отчёт первым делом объясняет обычными словами, что
+           решать по нему нельзя и что делать, — и не призывает принять или
+           вернуть (REQ-SAY-01 AC7). -->
       <div class="qr-head">
-        <p class="qr-appeal">{{ prompt.head }}</p>
-        <p v-if="prompt.why" class="muted qr-why">{{ prompt.why }}</p>
+        <p v-if="banner.stale" class="qr-stale">{{ banner.plain }}</p>
+        <template v-else>
+          <p class="qr-appeal">{{ prompt.head }}</p>
+          <p v-if="prompt.why" class="muted qr-why">{{ prompt.why }}</p>
+        </template>
         <p v-if="firstLayer" class="qr-found">{{ firstLayer.found }}</p>
+        <p v-if="firstLayer" class="muted qr-score">{{ firstLayer.score_line }}</p>
       </div>
 
-      <!-- Действия гейта — ровно тогда, когда платформа их публикует (QA). -->
+      <!-- Действия гейта — ровно тогда, когда платформа их публикует (QA) и
+           отчёт по-прежнему текущий: по устаревшему отчёту решение не
+           предлагается. -->
       <QualityGateActions
-        v-if="props.gate"
+        v-if="props.gate && !banner.stale"
         :gate="props.gate"
         :draft="draft"
         :busy="props.busy"
@@ -204,6 +210,12 @@ function addPoint(it: HumanFormItem) {
            делось, только больше не первым (REQ-SAY-06 AC1/AC2). -->
       <details class="qr-details" :open="!firstLayer">
         <summary class="muted">подробности и числа</summary>
+        <!-- Устаревание: платформенный маркер и сырые факты стора — здесь, а
+             не в первом слое (REQ-SAY-01 AC7). -->
+        <div v-if="banner.stale" class="qr-stale-facts">
+          <p class="mono muted" style="margin: 6px 0 0">{{ banner.head }}</p>
+          <p class="mono muted" style="margin: 2px 0 0">{{ banner.detail }}</p>
+        </div>
         <div class="rowflex" style="margin: 6px 0">
           <span class="mono muted">artifact {{ shortId(props.report.artifact) }} · seq {{ props.report.seq }} · {{ props.report.contract }}</span>
           <span class="mono muted">создан {{ fmtTime(props.report.created_at) }}</span>
@@ -241,9 +253,12 @@ function addPoint(it: HumanFormItem) {
             <p v-if="g.lead" class="muted" style="margin: 0 0 4px">{{ g.lead }}</p>
             <ul class="qr-items">
               <li v-for="it in g.items" :key="it.id" class="qr-item-row">
-                <template v-if="isNameOnlyGroup(g)">
-                  <span class="mono">{{ it.line }}</span>
-                </template>
+                <!-- Закреплённое читается как замечание (REQ-SAY-03 AC6):
+                     человеческая фраза первой, служебная строка — в раскрытии. -->
+                <details v-if="g.key === 'anchors'" class="qr-item">
+                  <summary><span class="qr-what">{{ it.summary }}</span></summary>
+                  <p class="muted qr-machine">машинная строка: <span class="mono">{{ it.line }}</span></p>
+                </details>
                 <details v-else class="qr-item">
                   <summary><span class="mono">{{ it.line }}</span></summary>
                   <div class="qr-summary">{{ it.summary }}</div>
@@ -254,7 +269,7 @@ function addPoint(it: HumanFormItem) {
                     <pre class="content">{{ (it.evidence ?? []).join("\n\n") }}</pre>
                   </details>
                 </details>
-                <button v-if="!isNameOnlyGroup(g)" class="add small" @click="addPoint(it)">
+                <button v-if="g.key !== 'anchors'" class="add small" @click="addPoint(it)">
                   {{ inDraft(draft, it.id) ? "снять из черновика" : "в черновик возврата" }}
                 </button>
               </li>
@@ -278,6 +293,13 @@ function addPoint(it: HumanFormItem) {
 .qr-appeal {
   margin: 0;
   font-weight: 600;
+}
+.qr-stale {
+  margin: 0;
+  font-weight: 600;
+}
+.qr-score {
+  margin: 2px 0 0;
 }
 .qr-why {
   margin: 2px 0 0;

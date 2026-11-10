@@ -5,10 +5,12 @@
 //! Presentation only, on top of facts the stored form ALREADY decided: the
 //! machine verdict token, the group counts, the group membership, and the
 //! stored `summary` / `site` / `reason` / `evidence` of every item. Nothing is
-//! re-scored, re-grouped or re-ordered, and no figure is printed in this layer
-//! — the numbers keep their one home in the stored row (`HumanItem::line`) and
-//! are read in the «подробности» layer. An item id is carried along, but only
-//! for the collapsed detail of its own row.
+//! re-scored, re-grouped or re-ordered. ONE figure does stand in this layer by
+//! the operator's decision of 10.11 (REQ-SAY-02): the saved overall score of
+//! the work, next to the verbal assessment — read as stored, formatted by the
+//! one formatter, never re-computed. Every other number keeps its one home in
+//! the stored row (`HumanItem::line`) and is read in the «подробности» layer.
+//! An item id is carried along, but only for the collapsed detail of its row.
 //!
 //! ONE wording for both channels (ratified decision of 10.11: the terminal
 //! report and the window change together): `render_text` lays the CLI report
@@ -75,6 +77,11 @@ pub const MISSING_UNRECORDED: &str = "причина в отчёте не зап
 /// The honest answer when a stored point names no site at all.
 pub const SITE_UNNAMED: &str = "место не указано";
 
+/// What the saved figure next to the assessment is, in words. The operator's
+/// decision of 10.11 (REQ-SAY-02): the human sees BOTH the meaning and the
+/// number, so the score is named for what it is instead of floating alone.
+pub const SCORE_LEAD: &str = "сохранённый балл работы";
+
 /// One row of the first layer.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FirstLayerRow {
@@ -105,6 +112,10 @@ pub struct FirstLayerRow {
 pub struct FirstLayerView {
     /// What the audit found, in one or two plain sentences.
     pub found: String,
+    /// The saved overall score of the work, as stored — «сохранённый балл
+    /// работы: 0.975». Read from `headline.score` by the one number formatter
+    /// (`fmt_num`), never recomputed from the groups (REQ-SAY-02, v4).
+    pub score_line: String,
     /// The findings the human is deciding about — decision items first, then
     /// the ones that do not block, in the stored order.
     pub findings: Vec<FirstLayerRow>,
@@ -119,7 +130,10 @@ pub struct FirstLayerView {
 /// outcome the platform decided.
 pub fn found(h: &HumanHeadline) -> String {
     match h.machine_verdict.as_str() {
-        "PASS" if h.counts.nuances == 0 => FOUND_PASS.to_string(),
+        "PASS" if h.counts.blocks == 0 && h.counts.nuances == 0 => FOUND_PASS.to_string(),
+        // A passed report that still carries a row below 1.0 is never called
+        // «замечаний не нашёл»: the sentence must not contradict the rows the
+        // human is about to read.
         "PASS" => FOUND_PASS_NUANCES.to_string(),
         "FAIL" => FOUND_FAIL.to_string(),
         "INCONCLUSIVE" if h.counts.unchecked > 0 => {
@@ -166,6 +180,13 @@ pub fn site_phrase(site: &str) -> String {
     } else {
         site.to_string()
     }
+}
+
+/// The saved score line of the first layer: the figure is the headline's own
+/// value, printed by the ONE number formatter — the same precision the details
+/// layer uses, and nothing is re-computed from the group rows.
+pub fn score_line(h: &HumanHeadline) -> String {
+    format!("{SCORE_LEAD}: {}", super::fmt_num(h.score))
 }
 
 fn row(it: &HumanItem, note: &str, missing: Option<String>) -> FirstLayerRow {
@@ -219,6 +240,7 @@ pub fn of(view: &HumanReportView) -> FirstLayerView {
         .collect();
     FirstLayerView {
         found: found(&view.headline),
+        score_line: score_line(&view.headline),
         findings,
         unchecked,
         unchecked_lead: UNCHECKED_LEAD.to_string(),
@@ -292,6 +314,11 @@ mod tests {
     fn the_found_sentence_never_contradicts_the_stored_outcome() {
         assert_eq!(found(&headline("PASS", 0, 0, 0)), FOUND_PASS);
         assert_eq!(found(&headline("PASS", 0, 2, 0)), FOUND_PASS_NUANCES);
+        assert_eq!(
+            found(&headline("PASS", 1, 0, 0)),
+            FOUND_PASS_NUANCES,
+            "a passed report with a row below 1.0 is not «замечаний не нашёл»"
+        );
         assert_eq!(found(&headline("FAIL", 3, 1, 1)), FOUND_FAIL);
         assert!(!found(&headline("FAIL", 3, 1, 1)).contains("годно"));
         assert_eq!(found(&headline("INCONCLUSIVE", 0, 0, 0)), FOUND_NOT_READY);
@@ -303,17 +330,34 @@ mod tests {
         assert!(!odd.contains("годно") && !odd.contains("нельзя"));
     }
 
-    /// The found sentence says nothing numeric: the figures live in the
-    /// details layer only.
+    /// The assessment SENTENCE says nothing numeric: the figure that stands
+    /// next to it is a separate piece of the layer (REQ-SAY-02 v4: «рядом с
+    /// оценкой стоит сохранённый балл работы»).
     #[test]
     fn the_found_sentence_carries_no_figures() {
         for verdict in ["PASS", "FAIL", "INCONCLUSIVE", "SOMETHING_NEW"] {
             let text = found(&headline(verdict, 2, 2, 2));
             assert!(
                 !text.chars().any(|c| c.is_ascii_digit()),
-                "{verdict}: a figure leaked into the first layer: {text}"
+                "{verdict}: a figure leaked into the sentence: {text}"
             );
         }
+    }
+
+    /// The score line is the stored headline score, printed by the one
+    /// formatter — no re-scoring from groups, no second precision.
+    #[test]
+    fn the_score_line_is_the_stored_score_and_not_a_recount() {
+        let h = headline("FAIL", 3, 1, 1);
+        assert_eq!(score_line(&h), "сохранённый балл работы: 0.500");
+        // Same three-decimal precision as every other figure in the form.
+        let mut odd = h.clone();
+        odd.score = 0.9754;
+        assert_eq!(score_line(&odd), "сохранённый балл работы: 0.975");
+        // It travels in the layer beside the sentence the human reads.
+        let v = view(h, vec![]);
+        let first = of(&v);
+        assert_eq!(first.score_line, "сохранённый балл работы: 0.500");
     }
 
     /// Decision items come first, then the points that do not block; neither

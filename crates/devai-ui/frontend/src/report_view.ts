@@ -143,7 +143,34 @@ export function shortArtifact(id: string): string {
  * the stale-banner branch is covered by `tests/report_view.test.ts`). */
 export type FreshnessBanner =
   | { stale: false }
-  | { stale: true; head: string; detail: string };
+  | {
+      stale: true;
+      /** Платформенный маркер — служебный слой; печатается в подробностях. */
+      head: string;
+      /** Сырые факты стора (статус отчёта, фаза задачи, execution) — тоже в
+       * подробностях: в первом слое стоят только обычные слова. */
+      detail: string;
+      /** Что случилось и что делать — обычными словами, первым делом
+       * (REQ-SAY-01 AC7): устаревший отчёт не приглашает решать, он
+       * объясняет и говорит, чего ждать. */
+      plain: string;
+    };
+
+/** Устаревший отчёт: почему решать нельзя, обычными словами. */
+const STALE_PLAIN = "Этот отчёт устарел — решать по нему уже нельзя: он больше не текущий.";
+/** Что делать, когда новый аудит уже идёт (факт стора: RUNNING execution). */
+const STALE_TODO_RUNNING = " Новый аудит уже идёт — дождись его отчёта, тогда решение появится.";
+/** Что делать, когда нового прогона ещё нет: ждать новый отчёт. */
+const STALE_TODO_WAITING = " Дождись нового отчёта аудита — решение появится вместе с ним.";
+
+/** The human sentence of an outdated report, built ONLY from the stored
+ * freshness facts — the running/waiting split is the one fact the store
+ * records (`execution_status`), nothing else is inferred. */
+export function stalePlain(freshness: ReportFreshness | null | undefined): string {
+  const todo =
+    freshness?.execution_status === "RUNNING" ? STALE_TODO_RUNNING : STALE_TODO_WAITING;
+  return STALE_PLAIN + todo;
+}
 
 export function freshnessBanner(
   freshness: ReportFreshness | null | undefined,
@@ -154,7 +181,12 @@ export function freshnessBanner(
   if (freshness.execution) {
     parts.push(`execution ${shortArtifact(freshness.execution)} (${freshness.execution_status})`);
   }
-  return { stale: true, head: freshness.marker, detail: parts.join(" · ") };
+  return {
+    stale: true,
+    head: freshness.marker,
+    detail: parts.join(" · "),
+    plain: stalePlain(freshness),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -175,12 +207,6 @@ export function visibleGroups(form: HumanForm): HumanFormGroup[] {
  * (a v1 form has no `passed` field at all). */
 export function showsPassedNote(form: HumanForm): boolean {
   return (form.headline.counts.passed ?? 0) > 0;
-}
-
-/** Anchors are name-only rows: the stored line and nothing else; every other
- * group also prints summary, reason and the evidence layer. */
-export function isNameOnlyGroup(group: HumanFormGroup): boolean {
-  return group.key === "anchors";
 }
 
 /** The collapsed proof layer exists exactly when evidence was stored. */

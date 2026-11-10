@@ -41,6 +41,7 @@ function firstLayer(): FirstLayer {
   });
   return {
     found: "Принять как есть нельзя: есть замечания, которые мешают.",
+    score_line: "сохранённый балл работы: 0.820",
     findings: [
       it("cl/fmt", "cargo fmt дрейф", "a.rs:442", "без этого работу принять нельзя", ["probe: fmt отстаёт"]),
       it("n/one", "мелкая придирка", "", "на будущее — принять не мешает"),
@@ -98,6 +99,14 @@ function report(): QualityReportView {
             key: "unchecked", title: "НЕ ПРОВЕРЕНО", lead: "",
             items: [one("brk/x", "проверка не прошла", "")],
           },
+          {
+            key: "anchors", title: "ЯКОРЯ", lead: "",
+            items: [{
+              id: "anch/a", kind: "anchor", summary: "ратифицированный инвариант",
+              site: "", line: "  · anch/a — закреплено: решение 01a1b1b8-dec (guerrero)",
+              score: 1, weight: 0, importance: 0, ratified_by: "решение 01a1b1b8-dec (guerrero)",
+            }],
+          },
         ],
         blocked_weight: 0.1,
         max_blocked_weight: 0.2,
@@ -137,9 +146,12 @@ describe("QualityGatePanel", () => {
     const head = w.find(".qr-head").text();
     expect(head).toContain("принять эту работу или вернуть её на переделку");
     expect(head).toContain("Принять как есть нельзя");
-    // The first layer knows no machine token and no figure.
+    // The appeal and the assessment know no machine token and no figure; the
+    // saved score stands beside them as its own element (REQ-SAY-02 v4).
     expect(head).not.toMatch(/FAIL|INCONCLUSIVE|PASS/);
-    expect(head).not.toMatch(/\d/);
+    expect(w.find(".qr-appeal").text()).not.toMatch(/\d/);
+    expect(w.find(".qr-found").text()).not.toMatch(/\d/);
+    expect(w.find(".qr-score").text()).toBe("сохранённый балл работы: 0.820");
     // Both buttons are signed by their consequence.
     expect(w.text()).toContain(ACCEPT_LABEL);
     expect(w.text()).toContain(RETURN_LABEL);
@@ -234,6 +246,48 @@ describe("QualityGatePanel", () => {
     );
     expect(w.find(".qr-appeal").text()).toContain("ни принять, ни вернуть нельзя");
     expect(w.find(".qr-why").text()).toContain("нет текущего отчёта");
+    w.unmount();
+  });
+
+  it("reads the anchors like every finding: human phrase first, service row in the expansion", () => {
+    const w = mountPanel();
+    const anchors = w.find("details.qr-details");
+    // The machine id is present — in the details layer, under the row.
+    const rows = anchors.findAll(".qr-group").filter((g) => g.text().includes("anch/a"));
+    expect(rows).toHaveLength(1);
+    const row = rows[0].find("details.qr-item");
+    expect(row.find("summary").text()).toContain("ратифицированный инвариант");
+    expect(row.find("summary").text()).not.toContain("anch/a");
+    expect(row.text()).toContain("закреплено: решение 01a1b1b8-dec (guerrero)");
+    w.unmount();
+  });
+
+  it("explains an outdated report in plain words and offers no accept/return", () => {
+    const r = report();
+    r.freshness = {
+      stale: true,
+      marker: "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит ещё не запущен",
+      report_seq: 1,
+      report_status: "STALE",
+      task_state: "REWORK",
+      execution: null,
+      execution_status: null,
+    };
+    const w = mount(QualityGatePanel, {
+      props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
+    });
+    // What happened and what to do comes first, in human words.
+    expect(w.find(".qr-stale").text()).toContain("решать по нему уже нельзя");
+    expect(w.find(".qr-stale").text()).toContain("Дождись нового отчёта аудита");
+    // No appeal to accept or return, and no buttons at all.
+    expect(w.find(".qr-appeal").exists()).toBe(false);
+    expect(w.findComponent(QualityGateActions).exists()).toBe(false);
+    // The machine marker and the store facts stay reachable in the details.
+    const details = w.find("details.qr-details").text();
+    expect(details).toContain("УСТАРЕЛ");
+    expect(details).toContain("фаза REWORK");
+    // The report itself is still readable.
+    expect(w.find(".qr-findings").text()).toContain("cargo fmt дрейф");
     w.unmount();
   });
 

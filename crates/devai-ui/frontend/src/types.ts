@@ -270,6 +270,9 @@ export interface FirstLayerRow {
 
 export interface FirstLayer {
   found: string;
+  // Сохранённый балл работы рядом с оценкой словами (REQ-SAY-02 v4): готовая
+  // строка платформы, печатается как есть — окно не форматирует числа.
+  score_line: string;
   findings: FirstLayerRow[];
   unchecked: FirstLayerRow[];
   unchecked_lead: string;

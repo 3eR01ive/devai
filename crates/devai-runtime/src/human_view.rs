@@ -928,16 +928,18 @@ fn first_site(text: &str) -> Option<String> {
 }
 
 /// Lay the stored form out as text. The ORDER is the human one (decision of
-/// 10.11, REQ-SAY-06 AC2): what the audit found → the findings in plain words
-/// → «не проверено» → the details and figures. PURE LAYOUT: every number,
-/// group and order below is read from the struct — nothing is recomputed, so
-/// the CLI text of one stored form is byte-identical on every read.
+/// 10.11, REQ-SAY-06 AC2): what the audit found → the saved score beside it →
+/// the findings in plain words → «не проверено» → the details and figures.
+/// PURE LAYOUT: every number, group and order below is read from the struct —
+/// nothing is recomputed, so the CLI text of one stored form is byte-identical
+/// on every read.
 pub fn render_text(view: &HumanReportView) -> String {
     let first = first_layer::of(view);
     let mut out = vec![
         "ОТЧЁТ КАЧЕСТВА · человеческая форма".to_string(),
         String::new(),
         first.found.clone(),
+        first.score_line.clone(),
     ];
     render_findings(&mut out, &first.findings);
     render_unchecked(&mut out, &first.unchecked, &first.unchecked_lead);
@@ -1034,10 +1036,12 @@ fn render_details(out: &mut Vec<String>, view: &HumanReportView) {
             out.push(format!("     {}", g.lead));
         }
         for it in &g.items {
-            // An anchor line already carries its own «· name — закреплено»
-            // form (name only); every other row is the machine row of a point.
+            // An anchor reads like every other point (REQ-SAY-03 AC6): the
+            // stored human phrase first, the service row («· id — закреплено:
+            // решение …») underneath, never a bare id at the head of the line.
             if g.key == GROUP_ANCHORS {
-                out.push(format!("     {}", it.line.trim_start()));
+                out.push(format!("     · {}", it.summary));
+                out.push(format!("       {}", it.line.trim_start()));
             } else {
                 out.push(format!("     · {}", it.line));
             }
