@@ -51,7 +51,12 @@ pub struct ExecRequest {
     /// (`DEVAI_HOME/evidence/<task>/<execution>`), exported to the agent
     /// process as `DEVAI_EVIDENCE_DIR`. Run artifacts (logs, evidence files)
     /// go here and never into the source tree (REQ-WT-05). Location is
-    /// platform-owned, not agent-chosen.
+    /// platform-owned, not agent-chosen. The engine issues it to EVERY
+    /// execution — a read-only role included: the exit code, output tail and
+    /// live transcript written here are the PLATFORM's observation of the run
+    /// (REQ-AR-03/07), not the role's output artifact, so reading and writing
+    /// roles differ in workspace RIGHTS only, never in whether the run leaves
+    /// a trace.
     pub evidence: Option<std::path::PathBuf>,
     /// Response-form correction loop context (REQ-FG-02 AC2): on attempt N>1
     /// the ORIGINAL task context is kept by the unchanged fields above and
@@ -103,6 +108,11 @@ fn persist_output_tail(evidence: Option<&std::path::Path>, out: &std::process::O
 /// the settled form (exit code + both tails).
 pub const LIVE_STDOUT_FILE: &str = "role_stdout.txt";
 pub const LIVE_STDERR_FILE: &str = "role_stderr.txt";
+
+/// The `mock-process` fixture's child command (adapters.rs `mock_process`): a
+/// deterministic line on each stream, so a test can assert the tail AND the
+/// live transcript of a READ-ONLY run without any provider binary.
+const MOCK_PROCESS_SCRIPT: &str = "echo process-fixture-stdout; echo process-fixture-stderr >&2";
 
 /// Run `cmd` with its stdout/stderr aimed INTO the execution's evidence dir
 /// when one exists, else capture exactly as before. The returned `Output`
@@ -264,6 +274,9 @@ impl AgentRuntime {
             "mock-form-flaky" => Self::mock_form_flaky(req),
             "mock-form-broken" => Self::mock_form_broken(req),
             "mock-spec-noecho" => Self::mock_spec_no_echo(req),
+            // Real-child fixture: proves a run's evidence is written for a
+            // READ-ONLY role too (see `mock_process`).
+            "mock-process" => Self::mock_process(req),
             other => Err(AdapterError::UnknownProvider(other.to_string())),
         }
     }
@@ -585,9 +598,11 @@ impl AgentRuntime {
     /// the ratified set: `-m` from `ExecRequest.model` (R3), `--provider`
     /// from `provider_override` only when it is a real override (OQ-4),
     /// `-t` from the capability table below (R2/OQ-2), `--usage-file`
-    /// inside the platform evidence dir only when one exists (R5; ratified
-    /// OQ-1: writing roles only — read-only roles keep `evidence = None`,
-    /// extending evidence there is a separate task).
+    /// inside the platform evidence dir whenever one exists — and the engine
+    /// now issues one to EVERY execution, reading roles included, because
+    /// usage is a cost fact the platform collects about the run, not an
+    /// artifact the role produces. The flag is absent only when the request
+    /// carries no evidence path at all (a bare driver/probe call).
     fn hermes_argv(req: &ExecRequest) -> Result<Vec<String>, AdapterError> {
         let mut argv = vec!["-z".to_string(), Self::hermes_prompt(req)];
         let toolsets = hermes_toolsets_for(&req.role)?;
@@ -623,8 +638,9 @@ impl AgentRuntime {
 const HERMES_USAGE_FILE: &str = "usage.json";
 
 /// The usage path when this execution HAS a platform evidence dir;
-/// `None` exactly when it does not (ratified OQ-1: read-only roles run
-/// with `evidence = None`, so `--usage-file` is not passed to them).
+/// `None` exactly when it does not (a bare driver/probe call without a run
+/// behind it). Run executions — reading roles included — always carry one,
+/// so the cost report of a run is collected the same way whoever produced it.
 pub fn hermes_usage_path(req: &ExecRequest) -> Option<std::path::PathBuf> {
     req.evidence.as_ref().map(|ev| ev.join(HERMES_USAGE_FILE))
 }
@@ -878,6 +894,29 @@ impl AgentRuntime {
         Err(AdapterError::BadOutput {
             violations: vec!["mock-form-broken: no contract to fail".into()],
         })
+    }
+
+    /// Offline PROCESS fixture (REQ-AR-03/07): the reply is `mock`'s
+    /// deterministic contract body, but the run goes through a REAL child on
+    /// the SAME capture path the live drivers use — [`run_captured`] into the
+    /// execution's evidence dir, then [`persist_output_tail`] once it exits.
+    /// It exists so a test can prove the platform's observation of a
+    /// READ-ONLY role (exit code, bounded tail, live transcript timestamps):
+    /// the difference between a reading and a writing role is RIGHTS over the
+    /// workspace, never whether the run leaves a trace. Not seeded as an
+    /// agent anywhere.
+    fn mock_process(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", MOCK_PROCESS_SCRIPT]);
+        let out = run_captured(&mut cmd, req.evidence.as_deref())?;
+        persist_output_tail(req.evidence.as_deref(), &out);
+        if !out.status.success() {
+            return Err(AdapterError::Agent(format!(
+                "`mock-process` exited with {}",
+                out.status
+            )));
+        }
+        Self::mock(req)
     }
 }
 
@@ -1897,7 +1936,8 @@ mod tests {
     #[test]
     fn hermes_argv_omits_absent_overrides_and_usage() {
         let mut r = req("hermes", "review-report");
-        // Read-only shape (ratified OQ-1): evidence=None => no --usage-file.
+        // No evidence path at all (a bare driver/probe call): no --usage-file.
+        // A RUN, by contrast, always has one — reading roles included.
         r.evidence = None;
         r.role.tools = vec![];
         // the ratified OQ-6 answer: an EMPTY level (the explicit diagnostic path) emits no

@@ -777,6 +777,83 @@ fn form_loop_disabled_by_config_keeps_todays_failure() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// REQ-AR-03/07 (rework 10.11): the run's evidence is the PLATFORM'S
+// observation, not the role's output artifact — a READ-ONLY role leaves an
+// exit code, an output tail and a last-activity time exactly like a writing
+// one. The role difference stays where it belongs: rights over the workspace.
+// ---------------------------------------------------------------------------
+#[test]
+fn a_read_only_role_run_leaves_its_exit_code_tail_and_activity() {
+    let (_d, store) = store();
+    let t = Task::new(
+        "Reading role evidence",
+        "The analyst observes the run; it produces no artifact in the tree",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    to_analysis(&store, &t);
+    // The seeded analyst is READ-ONLY (`filesystem:read`) — exactly the role
+    // whose run used to leave no exit code, no tail and no activity time.
+    let analyst = store.get_role("requirements-analyst").unwrap().unwrap();
+    assert!(
+        !analyst.writes_workspace(),
+        "the fixture role must be read-only, else this proves nothing"
+    );
+    form_agent(&store, "mock-process");
+    let r = mk_engine(&store)
+        .advance(&t.id.to_string(), "mock-process", "tester")
+        .unwrap();
+    assert_eq!(r.gate, Gate::WaitingApproval);
+
+    let rows = analyst_rows(&store, t.id);
+    assert_eq!(rows.len(), 1);
+    let ev = store
+        .root()
+        .join("evidence")
+        .join(t.id.to_string())
+        .join(rows[0].id.to_string());
+
+    // AC1: the exit code and BOTH tails, written after the child returned.
+    let settled = std::fs::read_to_string(ev.join("role_output.txt")).unwrap_or_else(|e| {
+        panic!(
+            "a read-only run must leave its settled evidence in {}: {e}",
+            ev.display()
+        )
+    });
+    assert!(settled.contains("exit: exit status: 0"), "{settled}");
+    assert!(settled.contains("process-fixture-stdout"), "{settled}");
+    assert!(settled.contains("process-fixture-stderr"), "{settled}");
+
+    // AC2: the live transcript the status command reads, and its mtime —
+    // «время последней активности» — belong to THIS run, not to "no data".
+    let live = ev.join(devai_runtime::LIVE_STDOUT_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap(),
+        "process-fixture-stdout\n"
+    );
+    let at = std::fs::metadata(&live).unwrap().modified().unwrap();
+    let ago = std::time::SystemTime::now()
+        .duration_since(at)
+        .unwrap_or_default();
+    assert!(
+        ago.as_secs() < 300,
+        "the activity stamp is this run's: {ago:?}"
+    );
+
+    // The difference between roles did NOT disappear: the reading role ran
+    // in the declared workspace, so no worktree was prepared for it.
+    assert_eq!(rows[0].status, ExecutionStatus::Completed);
+    let worktrees = store
+        .events(t.id, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == event_kind::WORKTREE_PREPARED)
+        .count();
+    assert_eq!(worktrees, 0, "a reading role gets no worktree");
+}
+
 #[test]
 fn platform_stamps_spec_echo_fields_from_stored_data() {
     let (_d, store) = store();

@@ -1200,6 +1200,29 @@ impl<'a> Engine<'a> {
         // current state (AC2).
         let writing = role.writes_workspace();
         let evidence = self.evidence_dir(task.id, execution.id);
+        // REQ-WT-05 AC1 / REQ-AR-03/07: the run-artifact directory belongs to
+        // EVERY execution, reading or writing. The exit code, the bounded
+        // output tail, the live transcript and its last-activity time are the
+        // PLATFORM'S observation of the run — not the role's output artifact —
+        // so a read-only role (analyst, auditor) keeps them exactly like a
+        // writing one. `writing` decides RIGHTS over the workspace only (the
+        // isolation worktree vs the declared workspace); it must never decide
+        // whether the run leaves a trace. A directory that cannot be prepared
+        // fails the run HERE, before any role process exists (REQ-AR-08 AC1).
+        if let Err(e) = std::fs::create_dir_all(&evidence) {
+            let _ = self.store.finish_execution_classified(
+                &execution,
+                ExecutionStatus::Failed,
+                None,
+                Some(&format!(
+                    "cannot create platform evidence dir {}: {e}",
+                    evidence.display()
+                )),
+                Some(failure_class::PLATFORM),
+                Utc::now(),
+            );
+            return Err(RuntimeError::Store(e.into()));
+        }
         let mut isolated: Option<worktree::Worktree> = None;
         if writing {
             match worktree::prepare(
@@ -1209,20 +1232,6 @@ impl<'a> Engine<'a> {
                 revision.git_head.as_deref(),
             ) {
                 Ok(wt) => {
-                    if let Err(e) = std::fs::create_dir_all(&evidence) {
-                        let _ = self.store.finish_execution_classified(
-                            &execution,
-                            ExecutionStatus::Failed,
-                            None,
-                            Some(&format!(
-                                "cannot create platform evidence dir {}: {e}",
-                                evidence.display()
-                            )),
-                            Some(failure_class::PLATFORM),
-                            Utc::now(),
-                        );
-                        return Err(RuntimeError::Store(e.into()));
-                    }
                     self.store.insert_event(
                         Some(task.id),
                         event_kind::WORKTREE_PREPARED,
@@ -1360,7 +1369,13 @@ impl<'a> Engine<'a> {
                     .map(|w| w.dir.clone())
                     .unwrap_or_else(|| self.workspace.clone()),
             ),
-            evidence: if writing { Some(evidence) } else { None },
+            // REQ-AR-03/07: EVERY role gets its run-artifact path — the
+            // observation of the run (exit code, tail, live transcript) is the
+            // platform's, not a privilege of writing roles. The role-vs-role
+            // difference stays where it belongs: `workspace` above (isolation
+            // worktree for a writing role, declared workspace for a reading
+            // one) and the declarative `tools:` capabilities.
+            evidence: Some(evidence),
             // Attempt 1 answers the ORIGINAL question; the loop fills this
             // in for re-prompts (REQ-FG-02 AC2).
             repair: None,
