@@ -45,7 +45,7 @@ fn in_state(task: &Task, target: TaskState, artifacts: &mut Vec<Artifact>) -> Ta
     if target == TaskState::Draft {
         return t;
     }
-    t = workflow::start(&t, actor, now()).unwrap().task;
+    t = workflow::start(&proc(), &t, actor, now()).unwrap().task;
     if target == TaskState::Analysis {
         return t;
     }
@@ -57,25 +57,26 @@ fn in_state(task: &Task, target: TaskState, artifacts: &mut Vec<Artifact>) -> Ta
         vec![],
     );
     artifacts.push(spec.clone());
-    t = workflow::requirements_published(&t, artifacts, None, None, actor, now())
+    t = workflow::requirements_published(&proc(), &t, artifacts, None, None, actor, now())
         .unwrap()
         .task;
     if target == TaskState::Review {
         return t;
     }
-    t = workflow::review_recorded(&t, Verdict::Approved, None, "reviewer", now())
+    t = workflow::review_recorded(&proc(), &t, Verdict::Approved, None, "reviewer", now())
         .unwrap()
         .task;
     if target == TaskState::Approval {
         return t;
     }
-    t = workflow::approve_requirements(&t, None, actor, now())
+    t = workflow::approve_requirements(&proc(), &t, None, actor, now())
         .unwrap()
         .task;
     if target == TaskState::Implementation {
         return t;
     }
     t = workflow::implementation_reported(
+        &proc(),
         &t,
         &workflow::ImplementationReportFacts::bare(new_id()),
         "impl",
@@ -96,7 +97,7 @@ fn full_happy_lifecycle() {
     let mut artifacts = vec![];
     let mut t = draft_task();
 
-    t = workflow::start(&t, "u", now()).unwrap().task;
+    t = workflow::start(&proc(), &t, "u", now()).unwrap().task;
     assert_eq!(t.state, TaskState::Analysis);
 
     let spec = artifact(
@@ -107,23 +108,24 @@ fn full_happy_lifecycle() {
         vec![],
     );
     artifacts.push(spec.clone());
-    t = workflow::requirements_published(&t, &artifacts, None, None, "analyst", now())
+    t = workflow::requirements_published(&proc(), &t, &artifacts, None, None, "analyst", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Review);
     assert_eq!(t.requirements_seq, 1);
 
-    t = workflow::review_recorded(&t, Verdict::Approved, None, "reviewer", now())
+    t = workflow::review_recorded(&proc(), &t, Verdict::Approved, None, "reviewer", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Approval);
 
-    t = workflow::approve_requirements(&t, Some("ok"), "u", now())
+    t = workflow::approve_requirements(&proc(), &t, Some("ok"), "u", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Implementation);
 
     t = workflow::implementation_reported(
+        &proc(),
         &t,
         &workflow::ImplementationReportFacts::bare(new_id()),
         "impl",
@@ -134,7 +136,7 @@ fn full_happy_lifecycle() {
     assert_eq!(t.state, TaskState::Qa);
 
     // accept requires a quality report (and no open 'blocks' edge — &[])
-    let err = workflow::accept(&t, &artifacts, &[], &[], None, "u", now()).unwrap_err();
+    let err = workflow::accept(&proc(), &t, &artifacts, &[], &[], None, "u", now()).unwrap_err();
     assert!(err.to_string().contains("QUALITY_REPORT"));
 
     let qr = artifact(
@@ -145,7 +147,7 @@ fn full_happy_lifecycle() {
         vec![spec.id],
     );
     artifacts.push(qr);
-    t = workflow::accept(&t, &artifacts, &[], &[], None, "u", now())
+    t = workflow::accept(&proc(), &t, &artifacts, &[], &[], None, "u", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Accepted);
@@ -156,8 +158,15 @@ fn full_happy_lifecycle() {
 fn review_can_send_back_to_analysis() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);
-    let t = workflow::review_recorded(&t, Verdict::NeedsRevision, Some("gaps"), "reviewer", now())
-        .unwrap();
+    let t = workflow::review_recorded(
+        &proc(),
+        &t,
+        Verdict::NeedsRevision,
+        Some("gaps"),
+        "reviewer",
+        now(),
+    )
+    .unwrap();
     assert_eq!(t.task.state, TaskState::Analysis);
 }
 
@@ -165,15 +174,22 @@ fn review_can_send_back_to_analysis() {
 fn qa_can_return_to_rework_and_back() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
-    let t = workflow::return_to_rework(&t, &artifacts, Some("tests missing"), "auditor", now())
-        .unwrap()
-        .task;
+    let t = workflow::return_to_rework(
+        &proc(),
+        &t,
+        &artifacts,
+        Some("tests missing"),
+        "auditor",
+        now(),
+    )
+    .unwrap()
+    .task;
     assert_eq!(t.state, TaskState::Rework);
     // The rework brought REAL changes: the gate compares stored stamped
     // commits, a new one passes REWORK → QA exactly as before (REQ-RG-01 AC4).
     let prev = new_id();
     let facts = gate_facts(&prev, Some("aaaa"), "bbbb");
-    let t = workflow::implementation_reported(&t, &facts, "impl", now())
+    let t = workflow::implementation_reported(&proc(), &t, &facts, "impl", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Qa);
@@ -222,9 +238,16 @@ fn ratification(prev: &Id, current: &Id) -> Decision {
 fn rework_task() -> Task {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
-    workflow::return_to_rework(&t, &artifacts, Some("п1; п2; п3"), "auditor", now())
-        .unwrap()
-        .task
+    workflow::return_to_rework(
+        &proc(),
+        &t,
+        &artifacts,
+        Some("п1; п2; п3"),
+        "auditor",
+        now(),
+    )
+    .unwrap()
+    .task
 }
 
 /// Ratified OQ-QH-3: returning a report to rework is a DATA change — the
@@ -244,7 +267,8 @@ fn qa_return_stales_the_rejected_quality_report() {
         vec![],
     );
     artifacts.push(qr.clone());
-    let m = workflow::return_to_rework(&t, &artifacts, Some("п1"), "auditor", now()).unwrap();
+    let m =
+        workflow::return_to_rework(&proc(), &t, &artifacts, Some("п1"), "auditor", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Rework);
     assert!(
         m.artifact_status.contains(&(qr.id, ArtifactStatus::Stale)),
@@ -269,7 +293,7 @@ fn qa_return_stales_the_rejected_quality_report() {
 
     // Nothing to stale: no event is invented (an empty return stays quiet).
     let bare = in_state(&draft_task(), TaskState::Qa, &mut artifacts);
-    let m2 = workflow::return_to_rework(&bare, &[], Some("п1"), "auditor", now()).unwrap();
+    let m2 = workflow::return_to_rework(&proc(), &bare, &[], Some("п1"), "auditor", now()).unwrap();
     assert!(m2.artifact_status.is_empty());
     assert!(
         m2.events
@@ -286,7 +310,7 @@ fn empty_rework_gate_trips_loud_instead_of_silent_qa() {
     let t = rework_task();
     let prev = new_id();
     let facts = gate_facts(&prev, Some("c0ffee"), "c0ffee");
-    let m = workflow::implementation_reported(&t, &facts, "impl", now()).unwrap();
+    let m = workflow::implementation_reported(&proc(), &t, &facts, "impl", now()).unwrap();
     assert_eq!(m.task.state, TaskState::WaitingForInput);
     assert_eq!(m.task.return_state, Some(TaskState::Rework));
     let tripped = m
@@ -334,7 +358,7 @@ fn ratified_identical_rework_reaches_qa_citing_the_decision() {
     let mut facts = gate_facts(&prev, Some("c0ffee"), "c0ffee");
     let d = ratification(&prev, &facts.current_report);
     facts.ratifications.push(d.clone());
-    let m = workflow::implementation_reported(&t, &facts, "operator", now()).unwrap();
+    let m = workflow::implementation_reported(&proc(), &t, &facts, "operator", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Qa);
     let ev = &m.events[0];
     assert_eq!(ev.kind, event_kind::IMPLEMENTATION_REPORTED);
@@ -353,7 +377,7 @@ fn ratification_is_bound_to_its_cycle_pair_never_lifetime() {
         .ratifications
         .push(ratification(&prev, &facts.current_report));
     assert_eq!(
-        workflow::implementation_reported(&t, &facts, "operator", now())
+        workflow::implementation_reported(&proc(), &t, &facts, "operator", now())
             .unwrap()
             .task
             .state,
@@ -369,7 +393,7 @@ fn ratification_is_bound_to_its_cycle_pair_never_lifetime() {
         body: workflow::ReportBodyRead::Readable,
     }];
     t2.current_report = new_id();
-    let m = workflow::implementation_reported(&rework_task(), &t2, "impl", now()).unwrap();
+    let m = workflow::implementation_reported(&proc(), &rework_task(), &t2, "impl", now()).unwrap();
     assert_eq!(
         m.task.state,
         TaskState::WaitingForInput,
@@ -385,7 +409,7 @@ fn incomparable_commits_warn_distinctly_and_claim_no_verdict() {
     let prev = new_id();
     let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
     facts.current_commit = None;
-    let m = workflow::implementation_reported(&t, &facts, "impl", now()).unwrap();
+    let m = workflow::implementation_reported(&proc(), &t, &facts, "impl", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Qa);
     assert!(
         m.events[0].payload.get(json_field::VERDICT).is_none(),
@@ -405,7 +429,8 @@ fn incomparable_commits_warn_distinctly_and_claim_no_verdict() {
     // And with neither side comparable: still distinct, still no verdict.
     let mut none = gate_facts(&prev, None, "ignored");
     none.current_commit = None;
-    let m = workflow::implementation_reported(&rework_task(), &none, "impl", now()).unwrap();
+    let m =
+        workflow::implementation_reported(&proc(), &rework_task(), &none, "impl", now()).unwrap();
     assert!(m.events[0].payload.get(json_field::VERDICT).is_none());
 }
 
@@ -423,7 +448,8 @@ fn corrupt_and_missing_bodies_get_their_own_incomparable_phrases() {
     let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
     facts.priors[0].commit = None;
     facts.priors[0].body = workflow::ReportBodyRead::Corrupt;
-    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    let m =
+        workflow::implementation_reported(&proc(), &rework_task(), &facts, "impl", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Qa, "semantics unchanged: proceed");
     let warn = m
         .events
@@ -441,7 +467,8 @@ fn corrupt_and_missing_bodies_get_their_own_incomparable_phrases() {
     let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
     facts.current_commit = None;
     facts.current_body = workflow::ReportBodyRead::Corrupt;
-    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    let m =
+        workflow::implementation_reported(&proc(), &rework_task(), &facts, "impl", now()).unwrap();
     let warn = m
         .events
         .iter()
@@ -457,7 +484,8 @@ fn corrupt_and_missing_bodies_get_their_own_incomparable_phrases() {
     let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
     facts.priors[0].commit = None;
     facts.priors[0].body = workflow::ReportBodyRead::Missing;
-    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    let m =
+        workflow::implementation_reported(&proc(), &rework_task(), &facts, "impl", now()).unwrap();
     let warn = m
         .events
         .iter()
@@ -470,7 +498,8 @@ fn corrupt_and_missing_bodies_get_their_own_incomparable_phrases() {
     // the new vocabulary REFINES the record, it does not rewrite it.
     let mut facts = gate_facts(&prev, Some("c0ffee"), "ignored");
     facts.current_commit = None;
-    let m = workflow::implementation_reported(&rework_task(), &facts, "impl", now()).unwrap();
+    let m =
+        workflow::implementation_reported(&proc(), &rework_task(), &facts, "impl", now()).unwrap();
     let warn = m
         .events
         .iter()
@@ -491,7 +520,7 @@ fn first_publication_from_implementation_is_never_gated() {
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
     let prev = new_id();
     let facts = gate_facts(&prev, Some("c0ffee"), "c0ffee");
-    let m = workflow::implementation_reported(&t, &facts, "impl", now()).unwrap();
+    let m = workflow::implementation_reported(&proc(), &t, &facts, "impl", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Qa);
     assert!(
         m.events
@@ -505,9 +534,9 @@ fn first_publication_from_implementation_is_never_gated() {
 fn allowed_ops_rework_lists_the_gate_primitive() {
     // REQ-RG-05: the chosen loud mechanism is visible in the operations table.
     let t = rework_task();
-    let ops = workflow::allowed_ops(&t);
+    let ops = workflow::allowed_ops(proc(), &t);
     assert!(
-        ops.contains(&"raise-question"),
+        ops.contains(&"raise-question".to_string()),
         "Rework must surface the blocking question: {ops:?}"
     );
 }
@@ -519,12 +548,13 @@ fn implementation_cannot_start_without_approval() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);
     // an external agent tries to jump straight to implementation
-    let err = workflow::approve_requirements(&t, None, "external", now()).unwrap_err();
+    let err = workflow::approve_requirements(&proc(), &t, None, "external", now()).unwrap_err();
     assert!(
         err.to_string().contains("not allowed in state REVIEW"),
         "{err}"
     );
     let err = workflow::implementation_reported(
+        &proc(),
         &t,
         &workflow::ImplementationReportFacts::bare(new_id()),
         "external",
@@ -533,7 +563,7 @@ fn implementation_cannot_start_without_approval() {
     .unwrap_err();
     assert!(err.to_string().contains("IMPLEMENTATION"), "{err}");
     // and cannot run an implementation role while awaiting review approval
-    assert!(workflow::check_execution_allowed("implementation-agent", &t).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "implementation-agent", &t).is_err());
 }
 
 #[test]
@@ -548,7 +578,8 @@ fn cannot_publish_spec_from_draft() {
         vec![],
     );
     artifacts.push(spec);
-    let err = workflow::requirements_published(&t, &artifacts, None, None, "u", now()).unwrap_err();
+    let err = workflow::requirements_published(&proc(), &t, &artifacts, None, None, "u", now())
+        .unwrap_err();
     assert!(
         err.to_string().contains("not allowed in state DRAFT"),
         "{err}"
@@ -559,14 +590,63 @@ fn cannot_publish_spec_from_draft() {
 fn role_execution_stage_matrix() {
     let mut artifacts = vec![];
     let impl_task = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    assert!(workflow::check_execution_allowed("requirements-analyst", &impl_task).is_err());
-    assert!(workflow::check_execution_allowed("implementation-agent", &impl_task).is_ok());
-    assert!(workflow::check_execution_allowed("quality-auditor", &impl_task).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "requirements-analyst", &impl_task).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "implementation-agent", &impl_task).is_ok());
+    assert!(workflow::check_execution_allowed(proc(), "quality-auditor", &impl_task).is_err());
 
     let mut a2 = vec![];
     let qa_task = in_state(&draft_task(), TaskState::Qa, &mut a2);
-    assert!(workflow::check_execution_allowed("quality-auditor", &qa_task).is_ok());
-    assert!(workflow::check_execution_allowed("implementation-agent", &qa_task).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "quality-auditor", &qa_task).is_ok());
+    assert!(workflow::check_execution_allowed(proc(), "implementation-agent", &qa_task).is_err());
+}
+
+/// Rework R1: the DECLARATION, not a code roster, decides who may run where.
+/// A state's declared executor is accepted; every other role is refused with a
+/// reason that names the declared one. Editing the declaration (here: making
+/// `requirements-reviewer` the executor of ANALYSIS) moves the answer without
+/// touching code — the live repro of the audit finding.
+#[test]
+fn the_declaration_is_the_only_role_stage_authority() {
+    let mut artifacts = vec![];
+    let analysis = in_state(&draft_task(), TaskState::Analysis, &mut artifacts);
+
+    // The factory declaration: ANALYSIS is the analyst's.
+    assert!(workflow::check_execution_allowed(proc(), "requirements-analyst", &analysis).is_ok());
+    let err = workflow::check_execution_allowed(proc(), "requirements-reviewer", &analysis)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("requirements-reviewer") && err.contains("requirements-analyst"),
+        "the refusal names the attempted and the declared role: {err}"
+    );
+
+    // Same code, another declaration: ANALYSIS is now the reviewer's, and the
+    // analyst is the one refused.
+    let mut edited = proc().clone();
+    for st in &mut edited.states {
+        if st.state == TaskState::Analysis.as_str() {
+            st.role = Some("requirements-reviewer".into());
+        }
+    }
+    assert!(
+        workflow::check_execution_allowed(&edited, "requirements-reviewer", &analysis).is_ok(),
+        "a declaration that names the role must admit its run"
+    );
+    assert!(
+        workflow::check_execution_allowed(&edited, "requirements-analyst", &analysis).is_err(),
+        "the same declaration now refuses the analyst"
+    );
+
+    // A state with no role executor admits no role at all, and says whose it is.
+    let mut a2 = vec![];
+    let approval = in_state(&draft_task(), TaskState::Approval, &mut a2);
+    let err = workflow::check_execution_allowed(proc(), "implementation-agent", &approval)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("human") && err.contains("APPROVAL"),
+        "a human state names its executor: {err}"
+    );
 }
 
 #[test]
@@ -581,13 +661,13 @@ fn accepted_task_accepts_no_more_operations() {
         vec![],
     );
     artifacts.push(qr);
-    let t = workflow::accept(&t, &artifacts, &[], &[], None, "u", now())
+    let t = workflow::accept(&proc(), &t, &artifacts, &[], &[], None, "u", now())
         .unwrap()
         .task;
-    assert!(workflow::pause(&t, None, "u", now()).is_err());
-    assert!(workflow::cancel(&t, None, "u", now()).is_err());
-    assert!(workflow::start(&t, "u", now()).is_err());
-    assert!(workflow::allowed_ops(&t).is_empty());
+    assert!(workflow::pause(&proc(), &t, None, "u", now()).is_err());
+    assert!(workflow::cancel(&proc(), &t, None, "u", now()).is_err());
+    assert!(workflow::start(&proc(), &t, "u", now()).is_err());
+    assert!(workflow::allowed_ops(proc(), &t).is_empty());
 }
 
 // --- holds and intervention -------------------------------------------------
@@ -597,11 +677,11 @@ fn blocking_question_parks_and_answers_restores() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Analysis, &mut artifacts);
     let q = new_id();
-    let m = workflow::raise_question(&t, q, true, "analyst", now()).unwrap();
+    let m = workflow::raise_question(&proc(), &t, q, true, "analyst", now()).unwrap();
     assert_eq!(m.task.state, TaskState::WaitingForInput);
     assert_eq!(m.task.return_state, Some(TaskState::Analysis));
 
-    let m = workflow::answer_question(&m.task, q, "u", now()).unwrap();
+    let m = workflow::answer_question(&proc(), &m.task, q, "u", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Analysis);
     assert_eq!(m.task.return_state, None);
 }
@@ -610,7 +690,7 @@ fn blocking_question_parks_and_answers_restores() {
 fn nonblocking_question_keeps_state() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Analysis, &mut artifacts);
-    let m = workflow::raise_question(&t, new_id(), false, "analyst", now()).unwrap();
+    let m = workflow::raise_question(&proc(), &t, new_id(), false, "analyst", now()).unwrap();
     assert_eq!(m.task.state, TaskState::Analysis);
 }
 
@@ -618,10 +698,14 @@ fn nonblocking_question_keeps_state() {
 fn pause_resume_roundtrip() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    let t = workflow::pause(&t, Some("lunch"), "u", now()).unwrap().task;
+    let t = workflow::pause(&proc(), &t, Some("lunch"), "u", now())
+        .unwrap()
+        .task;
     assert_eq!(t.state, TaskState::Paused);
     assert_eq!(t.return_state, Some(TaskState::Implementation));
-    let t = workflow::resume(&t, &[], &[], "u", now()).unwrap().task;
+    let t = workflow::resume(&proc(), &t, &[], &[], "u", now())
+        .unwrap()
+        .task;
     assert_eq!(t.state, TaskState::Implementation);
 }
 
@@ -629,18 +713,22 @@ fn pause_resume_roundtrip() {
 fn block_and_fail_releases() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    let b = workflow::block(&t, Some("need access"), "u", now())
+    let b = workflow::block(&proc(), &t, Some("need access"), "u", now())
         .unwrap()
         .task;
     assert_eq!(b.state, TaskState::Blocked);
-    let b = workflow::resume(&b, &[], &[], "u", now()).unwrap().task;
+    let b = workflow::resume(&proc(), &b, &[], &[], "u", now())
+        .unwrap()
+        .task;
     assert_eq!(b.state, TaskState::Implementation);
 
-    let f = workflow::fail(&t, Some("runtime crashed"), "runtime", now())
+    let f = workflow::fail(&proc(), &t, Some("runtime crashed"), "runtime", now())
         .unwrap()
         .task;
     assert_eq!(f.state, TaskState::Failed);
-    let f = workflow::resume(&f, &[], &[], "u", now()).unwrap().task;
+    let f = workflow::resume(&proc(), &f, &[], &[], "u", now())
+        .unwrap()
+        .task;
     assert_eq!(f.state, TaskState::Implementation);
 }
 
@@ -648,11 +736,11 @@ fn block_and_fail_releases() {
 fn cancel_from_active_and_not_from_hold_twice() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);
-    let t = workflow::cancel(&t, Some("dropped"), "u", now())
+    let t = workflow::cancel(&proc(), &t, Some("dropped"), "u", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Cancelled);
-    assert!(workflow::cancel(&t, None, "u", now()).is_err());
+    assert!(workflow::cancel(&proc(), &t, None, "u", now()).is_err());
 }
 
 // --- revise & staleness ------------------------------------------------------
@@ -697,6 +785,7 @@ fn revise_supersedes_old_spec_and_stales_dependents() {
     artifacts.extend([plan.clone(), patch.clone(), report.clone()]);
 
     t = workflow::implementation_reported(
+        &proc(),
         &t,
         &workflow::ImplementationReportFacts::bare(new_id()),
         "impl",
@@ -714,9 +803,16 @@ fn revise_supersedes_old_spec_and_stales_dependents() {
         vec![],
     );
     artifacts.push(spec2.clone());
-    let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now())
-            .unwrap();
+    let m = workflow::requirements_published(
+        &proc(),
+        &t,
+        &artifacts,
+        Some("scope change"),
+        None,
+        "u",
+        now(),
+    )
+    .unwrap();
     t = m.task;
     assert_eq!(t.state, TaskState::Review);
     assert_eq!(t.requirements_seq, 2);
@@ -745,7 +841,7 @@ fn revise_supersedes_old_spec_and_stales_dependents() {
 fn approval_reject_returns_to_analysis() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Approval, &mut artifacts);
-    let t = workflow::reject_requirements(&t, Some("nope"), "u", now())
+    let t = workflow::reject_requirements(&proc(), &t, Some("nope"), "u", now())
         .unwrap()
         .task;
     assert_eq!(t.state, TaskState::Analysis);
@@ -755,10 +851,10 @@ fn approval_reject_returns_to_analysis() {
 fn allowed_ops_projection() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Approval, &mut artifacts);
-    let ops = workflow::allowed_ops(&t);
-    assert!(ops.contains(&"approve"));
-    assert!(ops.contains(&"reject"));
-    assert!(!ops.contains(&"accept"));
+    let ops = workflow::allowed_ops(proc(), &t);
+    assert!(ops.contains(&"approve".to_string()));
+    assert!(ops.contains(&"reject".to_string()));
+    assert!(!ops.contains(&"accept".to_string()));
 }
 
 // --- REQ-007: the store already superseded at v3 — the stale closure must
@@ -786,6 +882,7 @@ fn revise_from_v3_shaped_snapshot_stales_dependents_without_double_flip() {
     );
     artifacts.extend([plan.clone(), report.clone()]);
     t = workflow::implementation_reported(
+        &proc(),
         &t,
         &workflow::ImplementationReportFacts::bare(new_id()),
         "impl",
@@ -818,9 +915,16 @@ fn revise_from_v3_shaped_snapshot_stales_dependents_without_double_flip() {
         .chain(std::iter::once(spec2.clone()))
         .collect();
 
-    let m =
-        workflow::requirements_published(&t, &artifacts, Some("scope change"), None, "u", now())
-            .unwrap();
+    let m = workflow::requirements_published(
+        &proc(),
+        &t,
+        &artifacts,
+        Some("scope change"),
+        None,
+        "u",
+        now(),
+    )
+    .unwrap();
     assert_eq!(m.task.state, TaskState::Review);
     assert_eq!(m.task.requirements_seq, 2);
 
@@ -909,7 +1013,7 @@ fn decision(task: &Task, kind: &str, verdict: Verdict, refs: Vec<String>) -> Dec
 fn resume_refuses_open_blocks_edges_and_carries_the_blocker_ids_as_data() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    let t = workflow::pause(&t, None, "u", now()).unwrap().task;
+    let t = workflow::pause(&proc(), &t, None, "u", now()).unwrap().task;
 
     let blocker_a = new_id();
     let blocker_b = new_id();
@@ -926,7 +1030,7 @@ fn resume_refuses_open_blocks_edges_and_carries_the_blocker_ids_as_data() {
             DependencyKind::Parent,
         ),
     ];
-    let err = workflow::resume(&t, &deps, &[], "u", now()).unwrap_err();
+    let err = workflow::resume(&proc(), &t, &deps, &[], "u", now()).unwrap_err();
     match &err {
         devai_core::CoreError::OpenBlockers { blockers } => {
             assert_eq!(
@@ -957,7 +1061,7 @@ fn resume_refuses_open_blocks_edges_and_carries_the_blocker_ids_as_data() {
             d.depends_on_state
         };
     }
-    let err = workflow::resume(&t, &deps, &[], "u", now()).unwrap_err();
+    let err = workflow::resume(&proc(), &t, &deps, &[], "u", now()).unwrap_err();
     assert!(
         matches!(&err, devai_core::CoreError::OpenBlockers { blockers } if blockers.len() == 2),
         "CANCELLED does not close (OQ1): {err}"
@@ -970,7 +1074,7 @@ fn resume_refuses_open_blocks_edges_and_carries_the_blocker_ids_as_data() {
         };
     }
     assert!(
-        workflow::resume(&t, &deps, &[], "u", now()).is_err(),
+        workflow::resume(&proc(), &t, &deps, &[], "u", now()).is_err(),
         "FAILED does not close (OQ1)"
     );
 
@@ -983,7 +1087,9 @@ fn resume_refuses_open_blocks_edges_and_carries_the_blocker_ids_as_data() {
             d.depends_on_state
         };
     }
-    let r = workflow::resume(&t, &deps, &[], "u", now()).unwrap().task;
+    let r = workflow::resume(&proc(), &t, &deps, &[], "u", now())
+        .unwrap()
+        .task;
     assert_eq!(
         r.state,
         TaskState::Implementation,
@@ -1012,7 +1118,7 @@ fn acceptance_is_refused_while_a_blocking_edge_is_open() {
         DependencyKind::Blocks,
     )];
     // REQ-03 AC3: the human gate refuses and enumerates the blocker.
-    let err = workflow::accept(&t, &artifacts, &deps, &[], None, "u", now()).unwrap_err();
+    let err = workflow::accept(&proc(), &t, &artifacts, &deps, &[], None, "u", now()).unwrap_err();
     assert!(
         matches!(&err, devai_core::CoreError::OpenBlockers { blockers } if blockers == &vec![blocker.to_string()]),
         "{err}"
@@ -1025,7 +1131,17 @@ fn acceptance_is_refused_while_a_blocking_edge_is_open() {
         DependencyKind::Blocks,
     )];
     assert!(
-        workflow::accept(&t, &artifacts, &deps_cancelled, &[], None, "u", now()).is_err(),
+        workflow::accept(
+            &proc(),
+            &t,
+            &artifacts,
+            &deps_cancelled,
+            &[],
+            None,
+            "u",
+            now()
+        )
+        .is_err(),
         "CANCELLED does not close (OQ1)"
     );
     // The same acceptance passes with the edge closed (blocker ACCEPTED).
@@ -1035,7 +1151,7 @@ fn acceptance_is_refused_while_a_blocking_edge_is_open() {
         TaskState::Accepted,
         DependencyKind::Blocks,
     )];
-    let accepted = workflow::accept(&t, &artifacts, &deps_closed, &[], None, "u", now())
+    let accepted = workflow::accept(&proc(), &t, &artifacts, &deps_closed, &[], None, "u", now())
         .unwrap()
         .task;
     assert_eq!(accepted.state, TaskState::Accepted);
@@ -1048,7 +1164,7 @@ fn human_override_decision_releases_the_dependency_gate() {
     // covering every currently-open blocker.
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    let t = workflow::pause(&t, None, "u", now()).unwrap().task;
+    let t = workflow::pause(&proc(), &t, None, "u", now()).unwrap().task;
     let blocker_a = new_id();
     let blocker_b = new_id();
     let deps = vec![
@@ -1065,7 +1181,7 @@ fn human_override_decision_releases_the_dependency_gate() {
         vec![blocker_a.to_string()],
     )];
     assert!(
-        workflow::resume(&t, &deps, &partial, "u", now()).is_err(),
+        workflow::resume(&proc(), &t, &deps, &partial, "u", now()).is_err(),
         "exact coverage required"
     );
     // A non-APPROVED verdict is not a ratification.
@@ -1076,7 +1192,7 @@ fn human_override_decision_releases_the_dependency_gate() {
         blockers.clone(),
     )];
     assert!(
-        workflow::resume(&t, &deps, &rejected, "u", now()).is_err(),
+        workflow::resume(&proc(), &t, &deps, &rejected, "u", now()).is_err(),
         "only APPROVED ratifies"
     );
     // An override recorded for ANOTHER task says nothing here.
@@ -1088,7 +1204,7 @@ fn human_override_decision_releases_the_dependency_gate() {
     );
     foreign.task_id = new_id();
     assert!(
-        workflow::resume(&t, &deps, &[foreign], "u", now()).is_err(),
+        workflow::resume(&proc(), &t, &deps, &[foreign], "u", now()).is_err(),
         "decisions are per task"
     );
     // A NEW blocker opened after the ratification re-opens the gate.
@@ -1101,11 +1217,13 @@ fn human_override_decision_releases_the_dependency_gate() {
     let mut deps_grown = deps.clone();
     deps_grown.push(dep(&t, new_id(), TaskState::Draft, DependencyKind::Blocks));
     assert!(
-        workflow::resume(&t, &deps_grown, &full, "u", now()).is_err(),
+        workflow::resume(&proc(), &t, &deps_grown, &full, "u", now()).is_err(),
         "new blockers are not covered"
     );
     // The exact full-coverage APPROVED decision releases resume…
-    let r = workflow::resume(&t, &deps, &full, "u", now()).unwrap().task;
+    let r = workflow::resume(&proc(), &t, &deps, &full, "u", now())
+        .unwrap()
+        .task;
     assert_eq!(
         r.state,
         TaskState::Implementation,
@@ -1133,7 +1251,7 @@ fn human_override_decision_releases_the_dependency_gate() {
         Verdict::Approved,
         vec![qb.to_string()],
     )];
-    let a = workflow::accept(&q, &qa_artifacts, &qdeps, &qfull, None, "u", now())
+    let a = workflow::accept(&proc(), &q, &qa_artifacts, &qdeps, &qfull, None, "u", now())
         .unwrap()
         .task;
     assert_eq!(
@@ -1173,12 +1291,12 @@ fn edges_of_other_tasks_never_gate_this_one() {
     // function robust against a graph slice handed to it wholesale).
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    let t = workflow::pause(&t, None, "u", now()).unwrap().task;
+    let t = workflow::pause(&proc(), &t, None, "u", now()).unwrap().task;
     let mut foreign = dep(&t, new_id(), TaskState::Analysis, DependencyKind::Blocks);
     foreign.task_id = new_id();
     let deps = [foreign];
     assert!(workflow::open_blockers(&t, &deps).is_empty());
-    assert!(workflow::resume(&t, &deps, &[], "u", now()).is_ok());
+    assert!(workflow::resume(&proc(), &t, &deps, &[], "u", now()).is_ok());
 }
 
 // --- REQ-PROG-03: pipeline projection is engine-owned display data. ---
@@ -1225,7 +1343,7 @@ fn pipeline_projection_maps_states_to_their_spine_position() {
     // every spine node's ops set comes from the same engine (no CLI table):
     for s in order {
         t.state = *s;
-        let _ = workflow::allowed_ops(&t);
+        let _ = workflow::allowed_ops(proc(), &t);
     }
 }
 
@@ -1237,12 +1355,13 @@ fn pipeline_projection_maps_states_to_their_spine_position() {
 #[test]
 fn form_escalation_carries_a_human_retelling_of_the_refusal() {
     let mut t = draft_task();
-    t = workflow::start(&t, "tester", now()).unwrap().task; // active stage
+    t = workflow::start(&proc(), &t, "tester", now()).unwrap().task; // active stage
     let violations = vec![
         "$.human_paragraph: missing required key".to_string(),
         "$.version: expected integer, got string".to_string(),
     ];
     let m = workflow::escalate_form_rejection(
+        &proc(),
         &t,
         new_id(),
         "requirements-analyst",
@@ -1289,11 +1408,12 @@ fn form_escalation_carries_a_human_retelling_of_the_refusal() {
 #[test]
 fn form_escalation_retells_an_unreadable_paragraph_in_plain_words() {
     let mut t = draft_task();
-    t = workflow::start(&t, "tester", now()).unwrap().task;
+    t = workflow::start(&proc(), &t, "tester", now()).unwrap().task;
     let violations = vec![
         "$.human_paragraph: paragraph is 57 chars, below the configured minimum 200 — write in plain words what happens now and what will change (empty filler is rejected)".to_string(),
     ];
     let m = workflow::escalate_form_rejection(
+        &proc(),
         &t,
         new_id(),
         "requirements-reviewer",
@@ -1317,7 +1437,7 @@ fn form_escalation_retells_an_unreadable_paragraph_in_plain_words() {
 fn publication_stamps_and_replaces_the_human_name() {
     let base = draft_task();
     let mut artifacts = vec![];
-    let mut t = workflow::start(&base, "u", now()).unwrap().task;
+    let mut t = workflow::start(&proc(), &base, "u", now()).unwrap().task;
 
     // REQ-TN-01/02: publishing a CURRENT spec with a name stamps it on the
     // task in the SAME mutation; the formal title stays byte-for-byte the
@@ -1331,6 +1451,7 @@ fn publication_stamps_and_replaces_the_human_name() {
     );
     artifacts.push(spec1);
     let m = workflow::requirements_published(
+        &proc(),
         &t,
         &artifacts,
         None,
@@ -1360,6 +1481,7 @@ fn publication_stamps_and_replaces_the_human_name() {
     );
     artifacts.push(spec2);
     let m = workflow::requirements_published(
+        &proc(),
         &t,
         &artifacts,
         Some("scope change"),
@@ -1382,8 +1504,16 @@ fn publication_stamps_and_replaces_the_human_name() {
         vec![],
     );
     artifacts.push(spec3);
-    let m = workflow::requirements_published(&t, &artifacts, Some("legacy body"), None, "u", now())
-        .unwrap();
+    let m = workflow::requirements_published(
+        &proc(),
+        &t,
+        &artifacts,
+        Some("legacy body"),
+        None,
+        "u",
+        now(),
+    )
+    .unwrap();
     assert_eq!(m.task.human_name.as_deref(), Some("Новая вывеска"));
     assert_eq!(m.task.requirements_seq, 3);
 }
@@ -1493,4 +1623,11 @@ fn serialized_task_carries_the_finished_signboard() {
         serde_json::to_value(&bare).unwrap()["display"],
         "just the title"
     );
+}
+
+/// The process declaration every workflow command resolves its target from
+/// (REQ-AR-09): the factory bytes, parsed once. A test that changes the
+/// declaration changes the walk — that is the point of the data.
+fn proc() -> &'static devai_core::process::Process {
+    devai_core::process::Process::factory()
 }

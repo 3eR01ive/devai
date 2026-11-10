@@ -51,7 +51,12 @@ pub struct ExecRequest {
     /// (`DEVAI_HOME/evidence/<task>/<execution>`), exported to the agent
     /// process as `DEVAI_EVIDENCE_DIR`. Run artifacts (logs, evidence files)
     /// go here and never into the source tree (REQ-WT-05). Location is
-    /// platform-owned, not agent-chosen.
+    /// platform-owned, not agent-chosen. The engine issues it to EVERY
+    /// execution — a read-only role included: the exit code, output tail and
+    /// live transcript written here are the PLATFORM's observation of the run
+    /// (REQ-AR-03/07), not the role's output artifact, so reading and writing
+    /// roles differ in workspace RIGHTS only, never in whether the run leaves
+    /// a trace.
     pub evidence: Option<std::path::PathBuf>,
     /// Response-form correction loop context (REQ-FG-02 AC2): on attempt N>1
     /// the ORIGINAL task context is kept by the unchanged fields above and
@@ -72,6 +77,98 @@ pub struct ExecRequest {
     /// the analyst prompt section read THIS, a home without the file
     /// behaves like the factory defaults (`TaskNamePolicy::default()`).
     pub task_name: devai_store::config::TaskNamePolicy,
+}
+
+/// Keep the TAIL of the role's own output in the run's evidence directory
+/// (REQ-AR-03: «фиксирует код возврата и хвост stderr/stdout в evidence»).
+/// The ratified answer to the open question is 4096 lines per stream; the
+/// file travels with the execution dir and survives any wrapper restart
+/// (REQ-AR-07). Best effort by design: a role's answer is never lost because
+/// its log tail could not be written, and nothing here touches the checkout.
+fn persist_output_tail(evidence: Option<&std::path::Path>, out: &std::process::Output) {
+    let Some(dir) = evidence else { return };
+    let body = format!(
+        "exit: {}\n=== stdout (tail, up to {} lines) ===\n{}\n=== stderr (tail, up to {} lines) ===\n{}\n",
+        out.status,
+        crate::tail::TAIL_LINES,
+        crate::tail::tail_of_bytes(&out.stdout, crate::tail::TAIL_LINES),
+        crate::tail::TAIL_LINES,
+        crate::tail::tail_of_bytes(&out.stderr, crate::tail::TAIL_LINES),
+    );
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        crate::trace::note_failure("role evidence dir", dir, &e);
+        return;
+    }
+    let path = dir.join("role_output.txt");
+    if let Err(e) = std::fs::write(&path, body) {
+        crate::trace::note_failure("role output tail", &path, &e);
+    }
+}
+
+/// The LIVE transcript files of one execution, in its evidence dir. The child
+/// process owns these handles, so the files grow (and their mtime moves) WHILE
+/// the role works — that is the «время последней активности» and the readable
+/// tail a status command reports before the role exits (REQ-AR-07), which is
+/// exactly the «а точно идёт?» question this task exists for. On completion
+/// they are bounded to the ratified 4096-line tail; `role_output.txt` keeps
+/// the settled form (exit code + both tails).
+pub const LIVE_STDOUT_FILE: &str = "role_stdout.txt";
+pub const LIVE_STDERR_FILE: &str = "role_stderr.txt";
+
+/// The `mock-process` fixture's child command (adapters.rs `mock_process`): a
+/// deterministic line on each stream, so a test can assert the tail AND the
+/// live transcript of a READ-ONLY run without any provider binary.
+const MOCK_PROCESS_SCRIPT: &str = "echo process-fixture-stdout; echo process-fixture-stderr >&2";
+
+/// Run `cmd` with its stdout/stderr aimed INTO the execution's evidence dir
+/// when one exists, else capture exactly as before. The returned `Output`
+/// carries the same bytes `Command::output` would have captured, so the
+/// adapters parse identical input; only the SIDE EFFECT (two files written by
+/// the child, readable mid-run) is new. A home where the evidence dir cannot
+/// be prepared falls back to in-memory capture — a role never dies because a
+/// log could not be opened.
+fn run_captured(
+    cmd: &mut std::process::Command,
+    evidence: Option<&std::path::Path>,
+) -> std::io::Result<std::process::Output> {
+    let Some(dir) = evidence else {
+        return cmd.output();
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return cmd.output();
+    }
+    let open = |name: &str| -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(dir.join(name))
+    };
+    let (Ok(stdout), Ok(stderr)) = (open(LIVE_STDOUT_FILE), open(LIVE_STDERR_FILE)) else {
+        return cmd.output();
+    };
+    let child_stderr = stderr.try_clone()?;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(child_stderr))
+        .spawn()?;
+    let status = child.wait()?;
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
+    let out = std::process::Output {
+        status,
+        stdout: read(LIVE_STDOUT_FILE),
+        stderr: read(LIVE_STDERR_FILE),
+    };
+    for name in [LIVE_STDOUT_FILE, LIVE_STDERR_FILE] {
+        // QA R3: ONE tail rule, and a failed bound is NAMED (our stderr lands
+        // in the run's supervisor.log) instead of vanishing — a stream that
+        // could not be bounded is a fact about the evidence, not «no output».
+        if let Err(e) = crate::tail::trim_to_tail(&dir.join(name), crate::tail::TAIL_LINES) {
+            eprintln!("runtime: cannot bound the live transcript: {e}");
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +479,9 @@ impl AgentRuntime {
             // message. Proves the `agent.failed` path without a network or a
             // live driver; never seeded as an agent.
             "mock-agent-fail" => Self::mock_agent_fail(req),
+            // Real-child fixture: proves a run's evidence is written for a
+            // READ-ONLY role too (see `mock_process`).
+            "mock-process" => Self::mock_process(req),
             other => Err(AdapterError::UnknownProvider(other.to_string())),
         }
     }
@@ -517,7 +617,7 @@ impl AgentRuntime {
 
         let journal = DriverJournal::snapshot("claude");
         let started = std::time::Instant::now();
-        let out = cmd.output().map_err(|e| {
+        let out = run_captured(&mut cmd, req.evidence.as_deref()).map_err(|e| {
             AdapterError::AgentFailure(Box::new(AgentFailureReport {
                 message: format!("failed to launch `claude`: {e}"),
                 exit_code: None,
@@ -535,6 +635,7 @@ impl AgentRuntime {
                 ),
             }))
         })?;
+        persist_output_tail(req.evidence.as_deref(), &out);
         if !out.status.success() {
             let (driver_log_tail, driver_log_note) = journal.tail_since(DRIVER_LOG_READ_CHARS);
             return Err(AdapterError::AgentFailure(Box::new(AgentFailureReport {
@@ -640,7 +741,7 @@ impl AgentRuntime {
         // choice in hermes config, out of platform argv.
         let journal = DriverJournal::snapshot(PROVIDER_HERMES);
         let started = std::time::Instant::now();
-        let out = cmd.output().map_err(|e| {
+        let out = run_captured(&mut cmd, req.evidence.as_deref()).map_err(|e| {
             AdapterError::AgentFailure(Box::new(AgentFailureReport {
                 message: format!("failed to launch `{PROVIDER_HERMES}`: {e}"),
                 exit_code: None,
@@ -658,6 +759,7 @@ impl AgentRuntime {
                 ),
             }))
         })?;
+        persist_output_tail(req.evidence.as_deref(), &out);
         if !out.status.success() {
             let (driver_log_tail, driver_log_note) = journal.tail_since(DRIVER_LOG_READ_CHARS);
             return Err(AdapterError::AgentFailure(Box::new(AgentFailureReport {
@@ -755,9 +857,11 @@ impl AgentRuntime {
     /// the ratified set: `-m` from `ExecRequest.model` (R3), `--provider`
     /// from `provider_override` only when it is a real override (OQ-4),
     /// `-t` from the capability table below (R2/OQ-2), `--usage-file`
-    /// inside the platform evidence dir only when one exists (R5; ratified
-    /// OQ-1: writing roles only — read-only roles keep `evidence = None`,
-    /// extending evidence there is a separate task).
+    /// inside the platform evidence dir whenever one exists — and the engine
+    /// now issues one to EVERY execution, reading roles included, because
+    /// usage is a cost fact the platform collects about the run, not an
+    /// artifact the role produces. The flag is absent only when the request
+    /// carries no evidence path at all (a bare driver/probe call).
     fn hermes_argv(req: &ExecRequest) -> Result<Vec<String>, AdapterError> {
         let mut argv = vec!["-z".to_string(), Self::hermes_prompt(req)];
         let toolsets = hermes_toolsets_for(&req.role)?;
@@ -793,8 +897,9 @@ impl AgentRuntime {
 const HERMES_USAGE_FILE: &str = "usage.json";
 
 /// The usage path when this execution HAS a platform evidence dir;
-/// `None` exactly when it does not (ratified OQ-1: read-only roles run
-/// with `evidence = None`, so `--usage-file` is not passed to them).
+/// `None` exactly when it does not (a bare driver/probe call without a run
+/// behind it). Run executions — reading roles included — always carry one,
+/// so the cost report of a run is collected the same way whoever produced it.
 pub fn hermes_usage_path(req: &ExecRequest) -> Option<std::path::PathBuf> {
     req.evidence.as_ref().map(|ev| ev.join(HERMES_USAGE_FILE))
 }
@@ -1066,6 +1171,29 @@ impl AgentRuntime {
         Err(AdapterError::BadOutput {
             violations: vec!["mock-form-broken: no contract to fail".into()],
         })
+    }
+
+    /// Offline PROCESS fixture (REQ-AR-03/07): the reply is `mock`'s
+    /// deterministic contract body, but the run goes through a REAL child on
+    /// the SAME capture path the live drivers use — [`run_captured`] into the
+    /// execution's evidence dir, then [`persist_output_tail`] once it exits.
+    /// It exists so a test can prove the platform's observation of a
+    /// READ-ONLY role (exit code, bounded tail, live transcript timestamps):
+    /// the difference between a reading and a writing role is RIGHTS over the
+    /// workspace, never whether the run leaves a trace. Not seeded as an
+    /// agent anywhere.
+    fn mock_process(req: &ExecRequest) -> Result<ExecOutput, AdapterError> {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", MOCK_PROCESS_SCRIPT]);
+        let out = run_captured(&mut cmd, req.evidence.as_deref())?;
+        persist_output_tail(req.evidence.as_deref(), &out);
+        if !out.status.success() {
+            return Err(AdapterError::Agent(format!(
+                "`mock-process` exited with {}",
+                out.status
+            )));
+        }
+        Self::mock(req)
     }
 }
 
@@ -1476,6 +1604,67 @@ fn one_line(s: &str) -> String {
 mod tests {
     use super::*;
     use devai_core::types::{ContractRef, new_id};
+
+    /// REQ-AR-07: the status command must show a TAIL and a last-activity
+    /// time WHILE the role runs. The child owns the evidence file handles, so
+    /// the file is readable before the process exits — that is the property
+    /// pinned here (the caller polls the file from another thread).
+    #[test]
+    fn the_live_transcript_is_readable_before_the_role_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let ev = dir.path().join("evidence");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "echo first; sleep 1; echo second"]);
+        let out_path = ev.join(LIVE_STDOUT_FILE);
+        let worker = {
+            let ev = ev.clone();
+            std::thread::spawn(move || run_captured(&mut cmd, Some(&ev)))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let live = std::fs::read_to_string(&out_path).unwrap_or_default();
+            if live.contains("first") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the transcript was not readable while the role ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = worker.join().unwrap().unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"first\nsecond\n");
+        assert_eq!(
+            std::fs::read_to_string(&out_path).unwrap(),
+            "first\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn without_an_evidence_dir_the_capture_stays_in_memory() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "echo hello"]);
+        let out = run_captured(&mut cmd, None).unwrap();
+        assert_eq!(out.stdout, b"hello\n");
+    }
+
+    #[test]
+    fn a_stored_stream_is_bounded_to_the_ratified_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("stream");
+        let body: String = (1..=crate::tail::TAIL_LINES + 4)
+            .map(|n| format!("line {n}\n"))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        assert_eq!(
+            crate::tail::trim_to_tail(&p, crate::tail::TAIL_LINES),
+            Ok(true)
+        );
+        let kept = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(kept.lines().count(), crate::tail::TAIL_LINES);
+        assert_eq!(kept.lines().next(), Some("line 5"));
+    }
 
     fn role(slug: &str, contract: &str) -> RoleDefinition {
         RoleDefinition {
@@ -2024,7 +2213,8 @@ mod tests {
     #[test]
     fn hermes_argv_omits_absent_overrides_and_usage() {
         let mut r = req("hermes", "review-report");
-        // Read-only shape (ratified OQ-1): evidence=None => no --usage-file.
+        // No evidence path at all (a bare driver/probe call): no --usage-file.
+        // A RUN, by contrast, always has one — reading roles included.
         r.evidence = None;
         r.role.tools = vec![];
         // the ratified OQ-6 answer: an EMPTY level (the explicit diagnostic path) emits no

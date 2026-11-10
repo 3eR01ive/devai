@@ -141,6 +141,7 @@ impl Fixture {
             owner_host: None,
             owner_process_start: None,
             bundle: Some(ExecutionBundle::new("hermes", "deepseek", "live-1", "high")),
+            run_id: None,
         };
         store.start_execution(&e).unwrap();
         store
@@ -170,6 +171,7 @@ impl Fixture {
             owner_host: None,
             owner_process_start: None,
             bundle: Some(ExecutionBundle::new("hermes", "deepseek", "live-1", "high")),
+            run_id: None,
         };
         self.store().start_execution(&e).unwrap();
     }
@@ -313,6 +315,7 @@ fn running_and_unstamped_rows_never_decide_the_status() {
         owner_host: None,
         owner_process_start: None,
         bundle: None,
+        run_id: None,
     };
     store.start_execution(&legacy).unwrap();
     store

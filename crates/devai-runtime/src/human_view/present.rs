@@ -423,6 +423,7 @@ mod tests {
             owner_host: None,
             owner_process_start: None,
             bundle: None,
+            run_id: None,
         }
     }
 

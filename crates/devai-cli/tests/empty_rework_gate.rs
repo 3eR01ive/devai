@@ -130,7 +130,16 @@ fn unchanged_rework_parks_loudly_and_only_a_human_ratifies_the_no_op() {
     // First passage: ANALYSIS → … → APPROVAL (human gate), then to QA.
     devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     devai(
         home.path(),
@@ -138,7 +147,16 @@ fn unchanged_rework_parks_loudly_and_only_a_human_ratifies_the_no_op() {
     );
     devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(
         devai_json(home.path(), &["task", "status", &id])["task"]["state"],
@@ -155,7 +173,16 @@ fn unchanged_rework_parks_loudly_and_only_a_human_ratifies_the_no_op() {
     // platform stamp names the same branch tip as the first report (A1).
     devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
 
     // LOUD, not silent: the task parks in WAITING_FOR_INPUT returning to
@@ -282,7 +309,16 @@ fn unchanged_rework_parks_loudly_and_only_a_human_ratifies_the_no_op() {
     );
     devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(
         devai_json(home.path(), &["task", "status", &id])["task"]["state"],
@@ -371,7 +407,16 @@ fn rework_that_actually_changes_something_is_never_touched_by_the_gate() {
     let ws_str = ws.path().to_str().unwrap();
     devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     devai(
         home.path(),
@@ -379,7 +424,16 @@ fn rework_that_actually_changes_something_is_never_touched_by_the_gate() {
     );
     devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     devai(
         home.path(),
@@ -392,7 +446,16 @@ fn rework_that_actually_changes_something_is_never_touched_by_the_gate() {
     std::fs::write(wt.join("fixed.txt"), "п1 done\n").unwrap();
     devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
 
     let st = devai_json(home.path(), &["task", "status", &id]);

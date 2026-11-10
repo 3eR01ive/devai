@@ -188,13 +188,12 @@ fn backfill_runs_on_open_lands_deterministic_rows_and_progress_stays_clean() {
 
     // Any command opens the store — the rung lands here.
     devai(home.path(), &["task", "events", &id]);
-    // v14 (task 01a1b60c): the additive agent-failure rungs add the failure
-    // evidence windows and the per-task failure series; the ladder top moves
-    // with them.
+    // v15: rung 014 (agent failures, task 01a1b60c) + rung 015 (run identity,
+    // task 01a1b7dc) — the top moves with both.
     assert_eq!(
         version_of(home.path()),
-        14,
-        "fresh install lands at the ladder top (v14 with the agent-failure rung 014)"
+        15,
+        "fresh install lands at the ladder top (v15)"
     );
 
     // The human view stays exactly as it was (ratified OQ1 variant (б)):
@@ -377,7 +376,16 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
 
     let r1 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r1["gate"], "WAITING_APPROVAL", "{r1}");
 
@@ -398,7 +406,16 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     );
     let r2 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r2["gate"], "WAITING_ACCEPT", "{r2}");
 
@@ -448,8 +465,8 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     );
     assert_eq!(
         version_of(home.path()),
-        14,
-        "the walked ladder ends at the v14 top (agent-failure rung 014)"
+        15,
+        "the walked ladder ends at the v15 top"
     );
     println!("──── dogfood evidence: APPROVED_DECISIONS with backfilled rows ────\n{section}");
 }

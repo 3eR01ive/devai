@@ -102,6 +102,13 @@
       "to": 14,
       "script": "migrations/014_agent_failures.sql",
       "apply": "script"
+    },
+    {
+      "id": "015_execution_run_id",
+      "from": 14,
+      "to": 15,
+      "script": "migrations/015_execution_run_id.sql",
+      "apply": "additive_run_id_column"
     }
   ]
 }

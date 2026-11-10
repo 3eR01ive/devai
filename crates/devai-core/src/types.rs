@@ -744,6 +744,16 @@ pub struct RoleExecution {
     /// as an empty identity and never re-derived from `agent_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<ExecutionBundle>,
+    /// The RUN this execution belongs to (REQ-AR-04/07): one launch drives a
+    /// chain of executions, and every row of that chain carries the same
+    /// value. The run number is minted by the LAUNCH (`task_run` →
+    /// `new_id()`), BEFORE the first execution row exists, and is handed to
+    /// the runner as its own identity — it is NOT the id of the first
+    /// execution (the two are different values by construction). `None` on
+    /// rows written before the v14 rung or imported from an older bundle:
+    /// «run identity not recorded», never a guessed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Id>,
 }
 
 fn default_attempt() -> u32 {
@@ -1216,6 +1226,35 @@ pub mod failure_class {
     /// Never replayed to the role (REQ-FG-03 AC2) — the role is not guilty
     /// of a shape the platform assembled.
     pub const PLATFORM: &str = "platform";
+    /// The role's owner PROCESS vanished on this host (REQ-AR-05 AC1): OOM,
+    /// `kill -9`, a crashed supervisor. The platform recorded the absence
+    /// itself — no human had to guess from `pgrep`.
+    pub const PROCESS_VANISHED: &str = "process_vanished";
+    /// The owner was gone because the HOST rebooted (REQ-AR-05 AC1): the row
+    /// started before the current boot, so nothing about it can still run.
+    pub const HOST_RESTARTED: &str = "host_restarted";
+    /// A RUNNING row written before the platform owned processes (owner
+    /// columns NULL). The ratified OQ-4 answer: such rows are closed as
+    /// failures with this class — «потеряно до введения владения» — instead
+    /// of blocking launches forever.
+    pub const LOST_BEFORE_OWNERSHIP: &str = "lost_before_ownership";
+    /// The LAUNCH itself failed — the supervisor could not be spawned or the
+    /// stage could not start (REQ-AR-08/13). Distinct from «the role ran and
+    /// failed»: the role never produced a result at all.
+    pub const SPAWN: &str = "spawn";
+
+    /// The closed vocabulary of classes a declaration may name as
+    /// park-immediately (`process.brakes.park_immediately`) — an unknown name
+    /// is a typo that would silently never fire, so init refuses it.
+    pub const KNOWN: &[&str] = &[
+        RESPONSE_FORM,
+        PROVIDER,
+        PLATFORM,
+        PROCESS_VANISHED,
+        HOST_RESTARTED,
+        LOST_BEFORE_OWNERSHIP,
+        SPAWN,
+    ];
 }
 
 /// The closed vocabulary of the `cause` token on `artifacts.staled` events —
@@ -1492,6 +1531,28 @@ pub mod event_kind {
     pub const EXECUTION_STARTED: &str = "execution.started";
     pub const EXECUTION_FINISHED: &str = "execution.finished";
     pub const EXECUTION_FAILED: &str = "execution.failed";
+    /// The platform LAUNCHED a role in its own detached process (REQ-AR-01/
+    /// 04). Payload: run id, execution id, owner pid/host/start, agent.
+    pub const EXECUTION_LAUNCHED: &str = "execution.launched";
+    /// A LAUNCH did not happen (REQ-AR-13): spawn failure, unusable stage,
+    /// skipped by a brake. Distinct from `execution.failed` — the role never
+    /// produced a result. Payload: `{failure_class, consecutive, reason,
+    /// parked}` — the counter does NOT reset by itself.
+    pub const EXECUTION_LAUNCH_FAILED: &str = "execution.launch_failed";
+    /// The platform PROVED an owner process gone (REQ-AR-05 AC1) and closed
+    /// its RUNNING row itself: OOM, `kill -9`, a reboot. Payload: id, the
+    /// class (`process_vanished` / `host_restarted` /
+    /// `lost_before_ownership`) and the evidence the reader used.
+    pub const EXECUTION_LOST: &str = "execution.lost";
+    /// A declared brake tripped (REQ-AR-09/13): the task is parked with the
+    /// reason and the counter; nothing auto-continues from here.
+    pub const PROCESS_PARKED: &str = "process.parked";
+    /// A best-effort evidence write of the run did NOT land (rework R5): the
+    /// settled outcome a `--wait` caller reads back. The role's result is not
+    /// lost — the rows still explain the run — but the failure is a FACT with
+    /// the path and the reason, never silence. Payload: `{run_id, path,
+    /// reason, what}`.
+    pub const EXECUTION_EVIDENCE_UNWRITTEN: &str = "execution.evidence_unwritten";
     /// One attempt of the response-form correction loop was rejected by the
     /// contract gate (REQ-FG-07: the loop is LOUD — attempts and the FULL
     /// violation list are events, not silent retries). Payload: execution id,
@@ -1639,6 +1700,11 @@ pub mod event_kind {
         EXECUTION_STARTED,
         EXECUTION_FINISHED,
         EXECUTION_FAILED,
+        EXECUTION_LAUNCHED,
+        EXECUTION_LAUNCH_FAILED,
+        EXECUTION_LOST,
+        PROCESS_PARKED,
+        EXECUTION_EVIDENCE_UNWRITTEN,
         EXECUTION_FORM_REJECTED,
         EXECUTION_FORM_ESCALATED,
         EXECUTION_CANCELLED,

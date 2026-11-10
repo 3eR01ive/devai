@@ -7,7 +7,8 @@
 //! seeds it; `init`/seed are not registry operations, they are the
 //! ratified OQ-10 bootstrap pair behind the API surface.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context as _, Result, bail};
 use devai_core::types::*;
@@ -23,7 +24,8 @@ use crate::{
 use devai_api::{
     AdvanceReq, AgentAddReq, Api, ApiError, AskReq, ContractAddReq, DependReq, ExecStartReq,
     MergeRecordReq, MutationResult, ProfileRatifyReq, ProfileRevokeReq, ProjectAddReq, PublishReq,
-    ReviseReq, RunReq, TaskCreateReq, TaskProjectSetReq, TaskRenameReq,
+    ReviseReq, RunLaunch, RunReq, SupervisedRunReq, TaskCreateReq, TaskProjectSetReq,
+    TaskRenameReq,
 };
 
 pub struct Ctx {
@@ -100,6 +102,16 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
         Cmd::Model(c) => model(ctx, c, json),
         Cmd::Contract(c) => contract(ctx, c, json),
         Cmd::Exec(c) => exec(ctx, c, json),
+        // PLATFORM INTERNAL (hidden): one detached runner. Its stdout/stderr
+        // are the run's evidence log, so this arm prints only facts.
+        Cmd::Supervise {
+            task,
+            run,
+            ack,
+            agent,
+            workspace,
+            force_reaudit,
+        } => supervise(ctx, task, run, ack, agent, workspace, force_reaudit, json),
         Cmd::Api(c) => api_registry(ctx, c, json),
         Cmd::Export { task, out } => export(ctx, &task, &out, json),
         Cmd::Import { dir } => import(ctx, &dir, json),
@@ -721,12 +733,14 @@ fn task_execution(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
             agent,
             workspace,
             force_reaudit,
+            wait,
         } => task_run(
             ctx,
             &id,
             agent.as_deref().unwrap_or(""),
             workspace.as_deref(),
             force_reaudit,
+            wait,
             json,
         )?,
         TaskCmd::Merge {
@@ -1304,8 +1318,13 @@ fn task_run(
     agent: &str,
     workspace: Option<&Path>,
     force_reaudit: bool,
+    wait: bool,
     json: bool,
 ) -> Result<()> {
+    // REQ-AR-04: the launch is ASYNCHRONOUS. The command returns a handle and
+    // exits; the role process belongs to the platform (REQ-AR-01) and is not
+    // in this command's session or process group any more. `--wait` is the
+    // separate, explicit wish to stay.
     let o = ctx
         .api()
         .task_run(RunReq {
@@ -1315,12 +1334,162 @@ fn task_run(
             force_reaudit,
         })
         .map_err(render_api_error)?;
-    let report = o.report;
-    if json {
-        outln!("{}", serde_json::to_string_pretty(&report)?);
+    if json && (!wait || o.outcome == RunLaunch::Refused) {
+        outln!("{}", serde_json::to_string_pretty(&o)?);
+    } else if !json {
+        render_launch_outcome(&o, id);
+    }
+    if o.outcome == RunLaunch::Refused || !wait {
         return Ok(());
     }
-    for s in &report.steps {
+    // `--wait` on a task that already had a run waits for THAT run's owner
+    // (the handle in `execution_id` is the execution that owns the task).
+    let Some(first) = o.execution_id.as_deref() else {
+        return Ok(());
+    };
+    wait_for_run(ctx, first, json)
+}
+
+/// The human rendering of the three typed launch outcomes (REQ-AR-04):
+/// «запущено» names the handle and how to watch it, «уже идёт» names the
+/// owner, «нельзя» names the reason. Extracted from `task_run` so the
+/// command's own body stays the launch + the optional wait.
+fn render_launch_outcome(o: &devai_api::RunStartOutcome, task: &str) {
+    match o.outcome {
+        RunLaunch::Started => {
+            outln!(
+                "run {} started: execution {} in {}",
+                short(&Uuid::parse_str(&o.run_id).unwrap_or_else(|_| Uuid::nil())),
+                o.execution_id
+                    .as_deref()
+                    .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
+                    .unwrap_or_else(|| "-".into()),
+                o.state
+            );
+            outln!(
+                "the role runs in its own session — status: `devai exec get <id>`, log tail: \
+                 $DEVAI_HOME/evidence/<task>/<run>/supervisor.log; wait: --wait"
+            );
+        }
+        RunLaunch::AlreadyRunning => outln!(
+            "task {} already has a run: execution {} ({})",
+            short(&Uuid::parse_str(task).unwrap_or_else(|_| Uuid::nil())),
+            o.execution_id
+                .as_deref()
+                .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
+                .unwrap_or_else(|| "-".into()),
+            o.reason.as_deref().unwrap_or("one owner per task")
+        ),
+        RunLaunch::Refused => outln!(
+            "launch refused: {}",
+            o.reason.as_deref().unwrap_or("no reason recorded")
+        ),
+    }
+}
+
+/// `--wait`: stay with the launched run until its PLATFORM-OWNED runner is
+/// gone, then render the settled outcome the runner stored. It waits on the
+/// runner PROCESS (REQ-AR-03), not on «no RUNNING row»: between two stages of
+/// one chain there is a moment with no row, and that moment is not the end.
+/// Closing this terminal does not disturb the run (REQ-AR-01/07).
+///
+/// The wait is a COURIER, not the owner: it is bounded by [`WAIT_MAX`], so a
+/// process whose liveness never becomes provable cannot pin this terminal
+/// forever (log/dead-ends). Hitting the bound says so and leaves the run
+/// untouched — the platform-owned process keeps going either way.
+fn wait_for_run(ctx: &Ctx, first_exec: &str, json: bool) -> Result<()> {
+    let row = ctx.api().exec_get(first_exec).map_err(render_api_error)?;
+    let since = std::time::Instant::now();
+    loop {
+        let state = devai_runtime::liveness::check_owner(
+            row.owner_pid,
+            row.owner_host.as_deref(),
+            row.owner_process_start,
+        );
+        if state != devai_runtime::liveness::Liveness::Alive {
+            break;
+        }
+        if since.elapsed() >= WAIT_MAX {
+            outln!(
+                "--wait stopped after {}h: execution {first_exec} is still owned by pid {:?} on \
+                 {:?} and the run is NOT affected — check it later with `devai exec get {first_exec}`",
+                WAIT_MAX.as_secs() / 3600,
+                row.owner_pid,
+                row.owner_host.as_deref().unwrap_or("-")
+            );
+            return Ok(());
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL);
+    }
+    let task_ref = row.task_id.to_string();
+    let run_id = row
+        .run_id
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| row.id.to_string());
+    if let Some(view) = stored_outcome(ctx, &task_ref, &run_id) {
+        return render_run_outcome(&view, &run_id, json);
+    }
+    // No stored outcome: the runner stopped without finishing the chain
+    // (killed, refused, engine error). The rows carry the reason — show them.
+    report_unfinished_run(ctx, &task_ref, &run_id, json)
+}
+
+/// The settled report the runner stored (`outcome.json`), when it is there and
+/// readable. A missing/unparsable file is `None` — the caller then reports
+/// from the rows instead of inventing an outcome.
+fn stored_outcome(ctx: &Ctx, task_ref: &str, run_id: &str) -> Option<devai_api::RunOutcome> {
+    let path = devai_runtime::launch::run_evidence_dir(&ctx.api().home(), task_ref, run_id)
+        .join(devai_runtime::launch::OUTCOME_FILE);
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The runner is gone and left no `outcome.json`: list the run's executions
+/// and fail with the first recorded error. A separate function so
+/// `wait_for_run` reads as «wait, then render» (short units).
+fn report_unfinished_run(ctx: &Ctx, task_ref: &str, run_id: &str, json: bool) -> Result<()> {
+    let es = ctx
+        .api()
+        .exec_list(Some(task_ref))
+        .map_err(render_api_error)?;
+    let of_run: Vec<&RoleExecution> = es
+        .iter()
+        .filter(|e| e.run_id.map(|r| r.to_string()).as_deref() == Some(run_id))
+        .collect();
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&of_run)?);
+    } else {
+        outln!("run {run_id} produced no outcome — the runner stopped first:");
+        for e in &of_run {
+            outln!(
+                "  {}  {:<22} {}{}",
+                short(&e.id),
+                e.role_slug,
+                e.status.as_str(),
+                e.error
+                    .as_deref()
+                    .map(|err| format!(" — {}", ellipsis(err, 200)))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    if let Some(row) = of_run.first() {
+        if let Some(err) = &row.error {
+            bail!("the run did not finish: {err}");
+        }
+    }
+    bail!("the run did not produce an outcome")
+}
+
+/// Render a SETTLED run the way the synchronous `task run` used to: the step
+/// lines, then the human gate (paragraphs first — ratified OQ-HP-1) with the
+/// stored quality report. `--json` keeps printing exactly the `RunReport`.
+fn render_run_outcome(o: &devai_api::RunOutcome, run_id: &str, json: bool) -> Result<()> {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&o.report)?);
+        return Ok(());
+    }
+    for s in &o.report.steps {
         outln!(
             "{} → {}: `{}` on `{}`  artifact {} ({})",
             s.from.as_str(),
@@ -1334,74 +1503,161 @@ fn task_run(
             outln!("   ↳ {}", ellipsis(sum, 160));
         }
     }
-    match report.gate {
+    render_gate(o);
+    if !o.allowed_operations.is_empty() {
+        outln!("next: {}", o.allowed_operations.join(" | "));
+    }
+    outln!("run: {run_id} (status: `devai exec list --run {run_id}`)");
+    Ok(())
+}
+
+/// The gate block of a settled run: the stored human paragraphs FIRST
+/// (ratified OQ-HP-1 — the operator reads them before anything else), then
+/// what the gate is and what can be done at it. A flat dispatch over the
+/// declared gate: each arm prints its own facts and shares only the two
+/// helpers below.
+fn render_gate(o: &devai_api::RunOutcome) {
+    for (label, text) in &o.gate_human_paragraphs {
+        outln!("── {label}: человеческий абзац ──");
+        outln!("{text}");
+    }
+    match o.report.gate {
         Gate::WaitingApproval => {
-            // REQ-HP-05: the human paragraphs open the gate view — the
-            // operator reads «what happens / what will change» BEFORE any
-            // formal structure, verbatim from the stored artifacts.
-            for (label, text) in &o.gate_human_paragraphs {
-                outln!("── {label}: человеческий абзац ──");
-                outln!("{text}");
-            }
-            outln!("⏸ APPROVAL is a human gate — approve or reject the requirements")
+            outln!("⏸ APPROVAL is a human gate — approve or reject the requirements");
         }
         Gate::WaitingAccept => {
-            // The paragraph of the code the operator is accepting comes
-            // first (ratified OQ-HP-1: implementation-report is read at
-            // this gate); the assembled report follows as the machine half.
-            for (label, text) in &o.gate_human_paragraphs {
-                outln!("── {label}: человеческий абзац ──");
-                outln!("{text}");
-            }
-            // The assembled report (the stored human form) is for the human
-            // at the gate.
-            if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
-                outln!("{marker}");
-            }
-            if let Some(text) = &o.gate_report_text {
-                outln!("── quality report (platform-assembled) ──");
-                outln!("{text}");
-            }
+            render_freshness(o);
+            render_quality_text(o);
             outln!("⏸ acceptance is a human gate — accept or return the result");
         }
         Gate::ReportFresh => {
-            // The freshness gate stopped the run: no auditor execution was
-            // started, no artifact was published. The human decides.
-            // REQ-005: CURRENT-by-status selection lives in the API.
-            // REQ-HP-05: the paragraph of the implementation being judged
-            // opens the view here too, before the machine rendering.
-            for (label, text) in &o.gate_human_paragraphs {
-                outln!("── {label}: человеческий абзац ──");
-                outln!("{text}");
-            }
-            if let Some(a) = &o.current_quality_report {
-                outln!(
+            match &o.current_quality_report {
+                Some(a) => outln!(
                     "⏸ quality report v{} ({}) is FRESH — it is bound to exactly the recomputed workspace revision; the auditor was NOT re-run",
                     a.seq,
                     short(&a.id)
-                );
-            } else {
-                outln!(
+                ),
+                None => outln!(
                     "⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run"
-                );
+                ),
             }
-            if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
-                outln!("{marker}");
-            }
-            if let Some(text) = &o.gate_report_text {
-                outln!("── quality report (platform-assembled) ──");
-                outln!("{text}");
-            }
+            render_freshness(o);
+            render_quality_text(o);
             outln!(
                 "   decide explicitly: accept/return this report, or re-audit an unchanged workspace with `devai task run {} --force-reaudit`",
-                short(&report.task_id)
+                short(&o.report.task_id)
             );
         }
         Gate::Terminal(st) => outln!("task finished: {}", st.as_str()),
         Gate::Hold(st) => outln!("task held in {} — release it first", st.as_str()),
     }
-    if !o.allowed_operations.is_empty() {
-        outln!("next: {}", o.allowed_operations.join(" | "));
+}
+
+/// The freshness marker of the quality report, when the platform computed one.
+fn render_freshness(o: &devai_api::RunOutcome) {
+    if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
+        outln!("{marker}");
+    }
+}
+
+/// The platform-assembled quality report text, when the gate carries one.
+fn render_quality_text(o: &devai_api::RunOutcome) {
+    if let Some(text) = &o.gate_report_text {
+        outln!("── quality report (platform-assembled) ──");
+        outln!("{text}");
+    }
+}
+
+/// The hidden runner arm (`__supervise`, REQ-AR-01/03): open the execution
+/// row owned by THIS detached process, hand the caller the id, drive the
+/// chain, and close the row with the role's own outcome. Everything it prints
+/// lands in the run's `supervisor.log` under the home's evidence tree.
+fn supervise(
+    ctx: &Ctx,
+    task: String,
+    run: String,
+    ack: std::path::PathBuf,
+    agent: Option<String>,
+    workspace: Option<std::path::PathBuf>,
+    force_reaudit: bool,
+    json: bool,
+) -> Result<()> {
+    let task_ref = task.clone();
+    let run_ref = run.clone();
+    let req = SupervisedRunReq {
+        task_id: task,
+        agent: agent.unwrap_or_default(),
+        workspace,
+        force_reaudit,
+        run_id: run,
+        ack,
+    };
+    let result = ctx
+        .api()
+        .task_run_supervised(&req)
+        .map_err(render_api_error);
+    let code = if matches!(&result, Ok(Some(_)) | Ok(None)) {
+        0
+    } else {
+        1
+    };
+    record_runner_exit(&ctx.api().home(), &task_ref, &run_ref, code);
+    render_supervised_result(result, json)
+}
+
+/// REQ-AR-03: the platform KEEPS the outcome in evidence — the runner's own
+/// exit code and the bounded TAIL of this transcript (the ratified 4096
+/// lines), written next to `supervisor.log` and `outcome.json` through the
+/// SAME address `exec get` reads. The caller may be long gone; these files
+/// are the platform's record.
+fn record_runner_exit(home: &Path, task: &str, run: &str, code: i32) {
+    let ev = devai_runtime::launch::run_evidence_dir(home, task, run);
+    // ONE tail rule (QA R3); an unreadable transcript is named in the file
+    // instead of being written as an empty tail.
+    let tail = match devai_runtime::tail::read_tail(
+        &ev.join(devai_runtime::launch::SUPERVISOR_LOG),
+        devai_runtime::tail::TAIL_LINES,
+    ) {
+        Ok(tail) => tail,
+        Err(e) => format!("(transcript unreadable: {e})"),
+    };
+    // R5: the record is best effort — the runner's exit is not cancelled by a
+    // failed write — but the failure is NOT silence: it lands in this
+    // process's stderr, which is the run's own `supervisor.log`.
+    let tail_path = devai_runtime::launch::runner_tail_path(home, task, run);
+    if let Err(e) = std::fs::write(&tail_path, format!("exit_code: {code}\n{tail}\n")) {
+        devai_runtime::trace::note_failure("runner exit record", &tail_path, &e);
+    }
+}
+
+/// What the runner prints to its own transcript once the chain is over: the
+/// settled report, or the fact that the refusal travelled through the
+/// handshake and there was nothing to drive.
+fn render_supervised_result(
+    result: Result<Option<devai_runtime::RunReport>>,
+    json: bool,
+) -> Result<()> {
+    match result? {
+        Some(report) => {
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                outln!(
+                    "run finished: task {} now {}",
+                    short(&report.task_id),
+                    report.now.as_str()
+                );
+                for s in &report.steps {
+                    outln!("{} → {} ({})", s.from.as_str(), s.to.as_str(), s.role);
+                }
+            }
+        }
+        None => {
+            // The refusal was handed to the caller through the handshake
+            // (busy / not a role state / tripped brake); this process exits
+            // cleanly, it has nothing to drive.
+            outln!("nothing started — the caller was told through the handshake");
+        }
     }
     Ok(())
 }
@@ -2348,6 +2604,26 @@ fn contract(ctx: &Ctx, cmd: ContractCmd, json: bool) -> Result<()> {
 // role executions
 // ---------------------------------------------------------------------------
 
+/// How many lines of a stored stream `exec get` shows. A diagnostic slice,
+/// deliberately far below the evidence bound (`TAIL_LINES` = 4096): the
+/// operator scans it in the terminal, the full tail stays in evidence.
+const EXEC_TAIL_LINES: usize = 20;
+/// The stderr slice is narrower than stdout's: errors are the sharp end, and
+/// the combined ordering matters more than volume.
+const EXEC_STDERR_TAIL_LINES: usize = 10;
+
+/// How often `--wait` re-observes the owner process of the launched run.
+/// The wait is on the PROCESS (REQ-AR-03), and the store is the record of
+/// which process it is — so this is a poll of platform data, not a pipe.
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The ceiling of `--wait`. The observed death window is 12–59 minutes, so a
+/// working role never reaches this; the bound exists so a liveness verdict
+/// that never becomes provable (`unknown` forever, e.g. a foreign pid) cannot
+/// keep a terminal in a loop with no exit (log/dead-ends). Hitting it is not
+/// a failure of the run: the runner is detached and keeps working.
+const WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
 fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
         ExecCmd::Start {
@@ -2370,6 +2646,8 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                     role,
                     agent,
                     inputs,
+                    // A manual start is its own run.
+                    run_id: None,
                 })
                 .map_err(render_api_error)?;
             outln!(
@@ -2409,12 +2687,20 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 short(&e.id)
             );
         }
-        ExecCmd::List { task } => {
-            // (API exec.list read.)
-            let es = ctx
+        ExecCmd::List { task, run } => {
+            // (API exec.list read; `--run` keeps the executions of ONE run —
+            // including the later stages a chain produced, REQ-AR-04 AC2.)
+            let mut es = ctx
                 .api()
                 .exec_list(task.as_deref())
                 .map_err(render_api_error)?;
+            if let Some(run) = &run {
+                es.retain(|e| {
+                    e.run_id
+                        .map(|r| r.to_string().starts_with(&run.to_lowercase()))
+                        .unwrap_or(false)
+                });
+            }
             if json {
                 outln!("{}", serde_json::to_string_pretty(&es)?);
             } else if es.is_empty() {
@@ -2435,7 +2721,7 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                         "{}  {:<22} {:<12} {:<10}{} {}",
                         short(&e.id),
                         e.role_slug,
-                        short(&e.task_id),
+                        e.run_id.map(|r| short(&r)).unwrap_or_else(|| "-".into()),
                         e.status.as_str(),
                         flags,
                         e.summary
@@ -2445,6 +2731,45 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                             .unwrap_or_default()
                     );
                 }
+            }
+        }
+        ExecCmd::Reap { task } => {
+            // REQ-AR-05: prove dead owners gone and close their rows. The
+            // verdicts are typed rows (class + evidence), never a kill.
+            let closed = ctx
+                .api()
+                .exec_reap(task.as_deref())
+                .map_err(render_api_error)?;
+            if json {
+                let rows: Vec<serde_json::Value> = closed
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "execution_id": r.execution.id.to_string(),
+                            "task_id": r.execution.task_id.to_string(),
+                            "role": r.execution.role_slug,
+                            "failure_class": r.class,
+                            "evidence": r.evidence,
+                        })
+                    })
+                    .collect();
+                outln!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if closed.is_empty() {
+                outln!("nothing to reap: no RUNNING execution is provably dead");
+            } else {
+                for r in &closed {
+                    outln!(
+                        "closed {} ({}) as FAILED [{}] — {}",
+                        short(&r.execution.id),
+                        r.execution.role_slug,
+                        r.class,
+                        ellipsis(&r.evidence, 120)
+                    );
+                }
+                outln!(
+                    "{} execution(s) closed; unprovable rows were left untouched and keep their slot",
+                    closed.len()
+                );
             }
         }
         ExecCmd::Get { exec_id } => {
@@ -2457,6 +2782,12 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 outln!("id:        {}", e.id);
                 outln!("task:      {}", e.task_id);
                 outln!("role:      {}@{}", e.role_slug, e.role_version);
+                outln!(
+                    "run:       {}",
+                    e.run_id
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "-".into())
+                );
                 outln!("agent:     {}", e.agent_name.as_deref().unwrap_or("-"));
                 outln!("status:    {}", e.status.as_str());
                 outln!("attempt:   {}", e.attempt);
@@ -2473,6 +2804,13 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 if let Some(fc) = &e.failure_class {
                     outln!("failure:   [{fc}]");
                 }
+                // REQ-AR-07: the stored tail and the last-activity time are
+                // readable without the launching terminal and survive any
+                // wrapper restart — they are evidence files, not process
+                // memory. The block has ONE home (`render_evidence`), and
+                // every path it reads comes from `launch::*` — the same
+                // functions the writers use.
+                render_evidence(&e, &ctx.api().home());
             }
         }
         ExecCmd::Liveness { exec_id } => {
@@ -2499,6 +2837,117 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The evidence block of `exec get` in HUMAN form (REQ-AR-07): every stored
+/// file that exists, announced with its own header and its last lines, in a
+/// fixed order — the settled `role_output.txt`, the runner's exit record, the
+/// live stdout, the live stderr — then the last-activity line. Two dirs are
+/// involved and each address comes from ONE source: the execution's own dir
+/// (`launch::run_evidence_dir` with the execution id) and the RUN's dir
+/// (`launch::run_evidence_dir`/`launch::runner_tail_path` with the run id) —
+/// exactly where `__supervise` and the adapters wrote them.
+fn render_evidence(e: &RoleExecution, home: &Path) {
+    let task_id = e.task_id.to_string();
+    let ev = devai_runtime::launch::run_evidence_dir(home, &task_id, &e.id.to_string());
+    print_tail(
+        &ev.join("role_output.txt"),
+        "role_output.txt",
+        EXEC_TAIL_LINES,
+    );
+    let mut candidates = vec![
+        ev.join("role_output.txt"),
+        ev.join(devai_runtime::LIVE_STDOUT_FILE),
+        ev.join(devai_runtime::LIVE_STDERR_FILE),
+    ];
+    // The runner's own record (exit code + transcript tail) is written by
+    // `__supervise` under the RUN's dir; the same address is read here, so
+    // the record the platform wrote is the record the operator sees.
+    if let Some(run_id) = e.run_id {
+        let run = run_id.to_string();
+        print_tail(
+            &devai_runtime::launch::runner_tail_path(home, &task_id, &run),
+            devai_runtime::launch::RUNNER_TAIL_FILE,
+            EXEC_TAIL_LINES,
+        );
+        candidates.push(
+            devai_runtime::launch::run_evidence_dir(home, &task_id, &run)
+                .join(devai_runtime::launch::SUPERVISOR_LOG),
+        );
+    }
+    print_tail(
+        &ev.join(devai_runtime::LIVE_STDOUT_FILE),
+        "role_stdout.txt (live)",
+        EXEC_TAIL_LINES,
+    );
+    print_tail(
+        &ev.join(devai_runtime::LIVE_STDERR_FILE),
+        "role_stderr.txt (live)",
+        EXEC_STDERR_TAIL_LINES,
+    );
+    report_activity(&candidates, e);
+}
+
+/// ONE tail rule (QA R3): a missing evidence file is silence (normal before
+/// the role writes), an UNREADABLE one is said out loud — the two are
+/// different facts. An empty file prints nothing either.
+fn print_tail(path: &Path, label: &str, lines: usize) {
+    match devai_runtime::tail::read_tail(path, lines) {
+        Ok(text) if text.trim().is_empty() => {}
+        Ok(text) => {
+            outln!("── output tail ({label}) ──");
+            for line in text.lines() {
+                outln!("{line}");
+            }
+        }
+        Err(devai_runtime::tail::TailError::NotFound(_)) => {}
+        Err(e) => outln!("── output tail ({label}) unavailable: {e} ──"),
+    }
+}
+
+/// The last-activity line: the newest evidence mtime, or — the ratified
+/// answer «по последней строке, до неё — старт» — the start, because no output
+/// file yet is not «no activity».
+fn report_activity(paths: &[PathBuf], e: &RoleExecution) {
+    match last_activity(paths) {
+        Some(t) => {
+            let ago = SystemTime::now()
+                .duration_since(t)
+                .unwrap_or_default()
+                .as_secs();
+            outln!("activity:  {ago}s ago");
+        }
+        None => outln!(
+            "activity:  no output yet; started {}",
+            e.started_at.format("%Y-%m-%d %H:%M:%S")
+        ),
+    }
+}
+
+/// The newest mtime over the evidence files — the «когда роль последний раз
+/// подавала голос» fact. A MISSING file is simply not a candidate; a file
+/// whose metadata/mtime cannot be read is NAMED, never folded into «no
+/// output» (same discipline as the tail rule above).
+fn last_activity(paths: &[PathBuf]) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    for p in paths {
+        let at = match std::fs::metadata(p) {
+            Ok(m) => match m.modified() {
+                Ok(t) => t,
+                Err(e) => {
+                    outln!("── activity unavailable for {}: {e} ──", p.display());
+                    continue;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                outln!("── activity unavailable for {}: {e} ──", p.display());
+                continue;
+            }
+        };
+        newest = Some(newest.map_or(at, |cur| cur.max(at)));
+    }
+    newest
 }
 
 /// `devai task active [--json]` — «что сейчас активно» in one view: a

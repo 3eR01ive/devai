@@ -271,8 +271,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.run",
             class: OpClass::Mutation,
             input: "RunReq{id, agent, workspace, force_reaudit}",
-            output: "RunOutcome{report, current_quality_report, gate_report_text, gate_report_freshness, gate_human_paragraphs, allowed_operations}",
-            description: "Drive assigned roles through all autonomous stages to the next human gate; refuses while a RUNNING execution exists (single writer). force_reaudit carries the --force-reaudit gate semantics. Mirrors `task run`.",
+            output: "RunStartOutcome{run_id, execution_id, outcome(started|already_running|refused), reason, state}",
+            description: "ASYNC launch (REQ-AR-04): starts a detached platform runner in its own session, returns the run number and the execution handle as soon as the runner opened the row — never waits for a role, never leaves the role in the caller's process group. A second launch is the typed `already_running` outcome naming the execution that owns the task (REQ-AR-06); a human-executed state is `refused` with a reason. force_reaudit carries the --force-reaudit gate semantics. Mirrors `devai task run`.",
         },
         OpDescriptor {
             name: "task.revise",
@@ -669,6 +669,13 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "exec_id_prefix",
             output: "LivenessView{id, status, owner_pid, owner_host, liveness}",
             description: "Liveness verdict (alive/dead/unknown) for the recorded owner of one execution — orphans distinguishable by data, not pgrep. Backs `exec liveness`.",
+        },
+        OpDescriptor {
+            name: "exec.reap",
+            class: OpClass::Mutation,
+            input: "Option<task_ref>",
+            output: "Vec<Reclaimed{execution, class, evidence}>",
+            description: "Close every RUNNING execution whose owner process is PROVABLY gone (host-restarted, process_vanished, or lost_before_ownership for pre-owner rows) with its failure class and an `execution.lost` event; unprovable rows stay untouched and the slot stays held (REQ-AR-05). Never signals a process. Backs `exec reap`.",
         },
         OpDescriptor {
             name: "exec.active_rows",

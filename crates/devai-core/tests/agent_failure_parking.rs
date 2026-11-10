@@ -23,6 +23,7 @@ fn the_threshold_parks_with_the_accepted_question_form() {
     let now = Utc::now();
     let question = new_id();
     let m = workflow::park_agent_failure(
+        devai_core::process::Process::factory(),
         &t,
         question,
         workflow::AgentFailureParking {
@@ -82,6 +83,7 @@ fn an_already_held_task_is_refused() {
     t.state = TaskState::WaitingForInput;
     t.return_state = Some(TaskState::Analysis);
     let err = workflow::park_agent_failure(
+        devai_core::process::Process::factory(),
         &t,
         new_id(),
         workflow::AgentFailureParking {

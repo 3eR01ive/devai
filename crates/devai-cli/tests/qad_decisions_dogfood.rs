@@ -153,7 +153,16 @@ fn dogfood_qa_auditor_prompt_carries_approved_decision_rationale() {
     // -- analyst + reviewer: stop at the human approval gate.
     let r1 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r1["gate"], "WAITING_APPROVAL", "{r1}");
 
@@ -173,7 +182,16 @@ fn dogfood_qa_auditor_prompt_carries_approved_decision_rationale() {
     // -- implementation + QA in one driven cycle; stops at acceptance.
     let r2 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r2["gate"], "WAITING_ACCEPT", "{r2}");
 
@@ -232,6 +250,7 @@ fn dogfood_qa_auditor_prompt_carries_approved_decision_rationale() {
             "--workspace",
             ws_str,
             "--force-reaudit",
+            "--wait",
         ],
     );
     let prompt2 = auditor_prompt(home.path(), &id);

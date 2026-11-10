@@ -98,6 +98,10 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         "workflow/agent-failure.yaml",
         include_str!("../../../config/workflow/agent-failure.yaml"),
     ),
+    (
+        "workflow/process.yaml",
+        include_str!("../../../config/workflow/process.yaml"),
+    ),
     ("models.yaml", include_str!("../../../config/models.yaml")),
 ];
 
@@ -2045,6 +2049,67 @@ pub fn load_task_name_policy(dir: &Path) -> StoreResult<TaskNamePolicy> {
 }
 
 // ---------------------------------------------------------------------------
+// PROCESS DECLARATION (REQ-AR-09/11/14/15/16) — the state machine as data.
+// ---------------------------------------------------------------------------
+//
+// The DECLARATION itself (states, named conditions, transitions, holds,
+// brakes, validation) lives in `devai_core::process`: the workflow commands
+// resolve every target there, so the domain owns the data AND the resolution.
+// This module owns only the FILE: the directory scan, the `where_` labelling
+// and the mapping onto the store's config error type.
+
+pub use devai_core::process::{
+    HoldKind, PROCESS_RETURN_STATE, Process, ProcessBrakes, ProcessHolds, ProcessState,
+    ProcessTransition, SUPPORTED_PROCESS_VERSION, Target, process_condition, process_executor,
+};
+
+/// The declaration under its historical name — one type, two spellings that
+/// both mean `devai_core::process::Process`.
+pub use devai_core::process::Process as ProcessPolicy;
+
+/// The factory declaration — the embedded `config/workflow/process.yaml`.
+/// ONE source for the default: the loader parses these very bytes, so a home
+/// without the file and a home with the untouched factory file behave
+/// identically (the `factory_inbox_wait_policy` idiom).
+pub fn factory_process_policy() -> StoreResult<Process> {
+    Ok(Process::factory().clone())
+}
+
+/// Parse one declaration document and validate it. A malformed or diverging
+/// declaration is a LOUD config error naming the file — never a default.
+fn parse_process_policy(text: &str, where_: &str) -> StoreResult<Process> {
+    devai_core::process::parse(text, where_).map_err(cfg_err)
+}
+
+/// Merge-scan `workflow/*.yaml` for the `process:` key — the same idiom as
+/// `load_humanize_policy`: files without the section are inert, the LAST
+/// declared section wins, a malformed declaration is a LOUD config error
+/// naming the file. An absent directory/file returns the factory bytes.
+pub fn load_process_policy(dir: &Path) -> StoreResult<Process> {
+    let mut policy: Option<Process> = None;
+    if dir.is_dir() {
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+            .collect();
+        paths.sort();
+        for p in &paths {
+            let text =
+                fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+            let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+                .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+            if doc.get("process").is_some() {
+                policy = Some(parse_process_policy(&text, &p.display().to_string())?);
+            }
+        }
+    }
+    match policy {
+        Some(p) => Ok(p),
+        None => factory_process_policy(),
+    }
+}
+
 // REWORK CONTEXT delivery policy (R-001..R-007) — platform workflow data.
 // ---------------------------------------------------------------------------
 
@@ -3255,5 +3320,159 @@ scoring:
             e.contains("task_name section is invalid"),
             "a typo'd key must be loud: {e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod process_declaration_tests {
+    use super::*;
+
+    /// The factory declaration is the state machine the platform ships: the
+    /// declared executor map must be exactly today's stage roles, and it must
+    /// pass its own validation (a factory file that does not is a build bug).
+    #[test]
+    fn the_factory_declaration_maps_every_stage_to_its_role() {
+        let p = factory_process_policy().expect("factory declaration is valid");
+        assert_eq!(p.version, SUPPORTED_PROCESS_VERSION);
+        for (state, role) in [
+            ("ANALYSIS", "requirements-analyst"),
+            ("REVIEW", "requirements-reviewer"),
+            ("IMPLEMENTATION", "implementation-agent"),
+            ("REWORK", "implementation-agent"),
+            ("QA", "quality-auditor"),
+        ] {
+            assert_eq!(p.role_for(state), Some(role), "state {state}");
+        }
+        // A human gate and a terminal state declare NO role: nothing is
+        // launched there (REQ-AR-11 AC2).
+        assert_eq!(p.role_for("APPROVAL"), None);
+        assert_eq!(p.executor_for("APPROVAL"), Some(process_executor::HUMAN));
+        assert_eq!(p.executor_for("ACCEPTED"), Some(process_executor::NONE));
+        // The brakes are data too.
+        assert!(p.brakes.max_rounds_without_shift >= 1);
+        assert!(p.brakes.max_consecutive_failures >= 1);
+    }
+
+    /// REQ-AR-16: a declaration from another version is a TYPED refusal that
+    /// names both versions — never a silent run under unknown rules.
+    #[test]
+    fn a_foreign_declaration_version_is_refused_with_both_versions_named() {
+        let mut p = factory_process_policy().unwrap();
+        p.version = SUPPORTED_PROCESS_VERSION + 1;
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains("process.version"), "{e}");
+        assert!(
+            e.contains(&(SUPPORTED_PROCESS_VERSION + 1).to_string()),
+            "{e}"
+        );
+        assert!(e.contains(&SUPPORTED_PROCESS_VERSION.to_string()), "{e}");
+    }
+
+    /// REQ-AR-09: the declaration names the failure CLASSES that park at
+    /// once. A name outside the recorded vocabulary would silently never
+    /// fire — an inert brake is worse than none — so init refuses it.
+    #[test]
+    fn a_park_immediately_class_outside_the_vocabulary_is_refused() {
+        let mut p = factory_process_policy().unwrap();
+        assert!(p.parks_immediately(devai_core::types::failure_class::PLATFORM));
+        // `spawn` is deliberately NOT immediate: the consecutive counter owns
+        // a transient spawn failure, so one attempt never parks the task.
+        assert!(!p.parks_immediately(devai_core::types::failure_class::SPAWN));
+        p.brakes.park_immediately.push("no_such_class".into());
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains("no_such_class"), "{e}");
+        assert!(e.contains("park_immediately"), "{e}");
+    }
+
+    /// REQ-AR-14: an outcome with no transition is a DEAD END and init
+    /// refuses it, naming the state and the uncovered outcome.
+    #[test]
+    fn an_uncovered_outcome_refuses_the_declaration_as_a_dead_end() {
+        let mut p = factory_process_policy().unwrap();
+        p.transitions
+            .retain(|t| !(t.from == "ANALYSIS" && t.on == process_condition::OUTCOME_MISSING));
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains("DEAD END"), "{e}");
+        assert!(e.contains("ANALYSIS"), "{e}");
+        assert!(e.contains(process_condition::OUTCOME_MISSING), "{e}");
+    }
+
+    /// REQ-AR-15: conditions are NAMES from the closed list — an unknown name
+    /// (a typo, an expression) is refused by name.
+    #[test]
+    fn a_transition_on_an_unknown_condition_name_is_refused() {
+        let mut p = factory_process_policy().unwrap();
+        // An extra transition whose condition is an EXPRESSION rather than a
+        // declared name — exactly what the closed list refuses.
+        p.transitions.push(ProcessTransition {
+            from: "ANALYSIS".into(),
+            on: "role.finished == true".into(),
+            to: "REVIEW".into(),
+        });
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains("role.finished == true"), "{e}");
+        assert!(e.contains("condition name"), "{e}");
+    }
+
+    /// A role state must cover the three platform-emitted outcomes — dropping
+    /// one from `outcomes` is refused even when a transition exists.
+    #[test]
+    fn a_role_state_must_declare_its_launch_and_missing_outcomes() {
+        let mut p = factory_process_policy().unwrap();
+        for st in &mut p.states {
+            if st.state == devai_core::types::TaskState::Rework.as_str() {
+                st.outcomes
+                    .retain(|o| o != process_condition::LAUNCH_FAILED);
+            }
+        }
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains("REWORK"), "{e}");
+        assert!(e.contains(process_condition::LAUNCH_FAILED), "{e}");
+    }
+
+    /// REQ-AR-15 / rework R10: conditions are a CLOSED vocabulary on BOTH
+    /// sides. A name the declaration invents is refused by init instead of
+    /// living on as an edge no command can ever emit.
+    #[test]
+    fn a_declared_condition_this_build_never_emits_is_refused_by_init() {
+        let mut p = factory_process_policy().unwrap();
+        // The factory file covers the build's vocabulary exactly.
+        assert_eq!(p.conditions.len(), process_condition::ALL.len());
+        p.conditions.push("role_finished".into());
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains("role_finished"), "{e}");
+        assert!(e.contains("never emits"), "{e}");
+
+        // And the other direction is refused too: a build-emitted name the
+        // declaration dropped can never be expressed by a transition.
+        let mut p = factory_process_policy().unwrap();
+        p.conditions
+            .retain(|c| c != process_condition::OUTCOME_MISSING);
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains(process_condition::OUTCOME_MISSING), "{e}");
+    }
+
+    /// A declaration loaded from the home's workflow directory is the one in
+    /// force (data changes behavior, not code) — and a broken one fails the
+    /// load loudly.
+    #[test]
+    fn the_loader_reads_the_home_declaration_and_refuses_a_broken_one() {
+        let d = tempfile::TempDir::new().unwrap();
+        let wf = d.path().join("workflow");
+        fs::create_dir_all(&wf).unwrap();
+        let factory = include_str!("../../../config/workflow/process.yaml");
+        fs::write(wf.join("process.yaml"), factory).unwrap();
+        let p = load_process_policy(&wf).unwrap();
+        assert_eq!(p.role_for("QA"), Some("quality-auditor"));
+
+        // No `process:` section anywhere -> factory bytes (the humanize idiom).
+        fs::write(wf.join("process.yaml"), "humanize:\n  min_chars: 1\n").unwrap();
+        let p = load_process_policy(&wf).unwrap();
+        assert_eq!(p.version, SUPPORTED_PROCESS_VERSION);
+
+        // A broken declaration is loud and names the file.
+        fs::write(wf.join("process.yaml"), "process:\n  version: 1\n").unwrap();
+        let e = load_process_policy(&wf).unwrap_err().to_string();
+        assert!(e.contains("process.yaml"), "{e}");
     }
 }

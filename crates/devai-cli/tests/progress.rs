@@ -12,6 +12,12 @@ use devai_core::types::Task;
 use devai_core::workflow;
 use tempfile::TempDir;
 
+/// The factory declaration — the role/stage authority the ops listing asks
+/// (REQ-AR-09 AC1: `run-role-execution(…)` entries are derived, not tabled).
+fn proc() -> devai_core::process::Process {
+    devai_core::process::Process::factory().clone()
+}
+
 fn devai(home: &Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_devai"))
         .arg("--home")
@@ -128,7 +134,7 @@ fn progress_lifecycle_through_the_real_binary() {
     let task: Task = serde_json::from_value(j["task"].clone()).unwrap();
     assert_eq!(
         j["allowed_operations"],
-        serde_json::to_value(workflow::allowed_ops(&task)).unwrap(),
+        serde_json::to_value(workflow::allowed_ops(&proc(), &task)).unwrap(),
         "progress ops must be exactly workflow::allowed_ops"
     );
     assert_eq!(

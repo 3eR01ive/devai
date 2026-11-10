@@ -124,7 +124,16 @@ fn merge_gate_is_the_only_path_into_the_baseline() {
     let ws_str = ws.path().to_str().unwrap();
     devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     devai(
         home.path(),
@@ -132,7 +141,16 @@ fn merge_gate_is_the_only_path_into_the_baseline() {
     );
     devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
 
     let branch = format!("rework/{id}");

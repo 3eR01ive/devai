@@ -66,6 +66,7 @@ fn execution(id: Id, inputs: &[Id], started: i64, finished: Option<i64>) -> Role
         // Связка моделей (задача 01a1b71f) добавила штамп прогона; тест
         // сходимости его не использует — держим пустым явно.
         bundle: None,
+        run_id: None,
     }
 }
 

@@ -6,6 +6,7 @@ Commands:
   fail      
   cancel    
   list      
+  reap      Close executions whose owner process is PROVABLY gone (REQ-AR-05): host restarted, pid vanished, or a pre-ownership RUNNING row. A typed report of what was closed and why; nothing is killed
   get       One execution row by id/prefix — observable without the launching terminal (REQ-API-07, via the API exec.get operation)
   liveness  Liveness of the recorded owner of an execution: alive | dead | unknown — orphans distinguishable by stored data, not pgrep (REQ-API-07 AC3, via the API exec.liveness operation; read-only, never signals the process)
   help      Print this message or the help of the given subcommand(s)

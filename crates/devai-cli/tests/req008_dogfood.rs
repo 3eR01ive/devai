@@ -139,7 +139,16 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
     let ws_str = ws.path().to_str().unwrap();
     let r1 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r1["gate"], "WAITING_APPROVAL", "{r1}");
     devai(
@@ -150,7 +159,16 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
     // -- full cycle into QA: platform-assembled quality-report@5 is published
     let r2 = devai_json(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(r2["gate"], "WAITING_ACCEPT", "{r2}");
 
@@ -304,7 +322,16 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
         .len();
     let fresh_text = devai(
         home.path(),
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     println!("──── dogfood evidence: freshness re-run stdout ────\n{fresh_text}");
     assert!(
@@ -320,10 +347,34 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
         .as_array()
         .unwrap()
         .clone();
+    // REQ-AR-04/08: the async run hands out a handle, so it opens exactly ONE
+    // bookkeeping row. The freshness gate stops BEFORE any stage, so that row
+    // is closed with no work — the auditor was NOT re-run and no artifact
+    // was added. (The old synchronous command opened no row at all; the
+    // meaning pinned here is «zero auditor work», not a row count.)
     assert_eq!(
         execs_after.len(),
-        execs.len(),
-        "freshness gate started ZERO new executions"
+        execs.len() + 1,
+        "the freshness gate runs no stage; only the run handle row is opened"
+    );
+    let handle_row = execs_after
+        .iter()
+        .find(|e| {
+            !execs
+                .iter()
+                .any(|old| old["id"].as_str() == e["id"].as_str())
+        })
+        .expect("the new row is the run handle");
+    assert_eq!(
+        handle_row["status"], "COMPLETED",
+        "the handle row is closed, never left RUNNING: {handle_row}"
+    );
+    assert!(
+        handle_row["summary"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no role work was done"),
+        "and says the gate stopped it: {handle_row}"
     );
     assert_eq!(
         devai_json(home.path(), &["task", "report", &id])["seq"],
@@ -335,8 +386,8 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
     let events = events.as_array().unwrap();
     assert_eq!(
         events.len(),
-        events_before + 1,
-        "the only trace is one event: the ask"
+        events_before + 4,
+        "the trace is exactly: execution.started, execution.launched, the ask, execution.finished"
     );
     let fresh_ev = events
         .iter()
@@ -359,6 +410,7 @@ fn dogfood_full_cycle_fresh_then_forced_reaudit() {
             "--workspace",
             ws_str,
             "--force-reaudit",
+            "--wait",
         ],
     );
     let first_lines: String = forced_text

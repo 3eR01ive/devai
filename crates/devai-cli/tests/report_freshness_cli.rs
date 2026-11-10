@@ -86,6 +86,7 @@ fn start_running_audit(store: &Store, task_id: devai_core::types::Id) -> String 
         owner_host: None,
         owner_process_start: None,
         bundle: None,
+        run_id: None,
     };
     store.start_execution(&exec).unwrap();
     devai_core::types::short_id(&exec.id)
@@ -131,6 +132,7 @@ fn report_channel_marks_a_returned_report_stale_and_names_the_running_reaudit() 
         let cur = store.get_task(&id).unwrap();
         assert_eq!(cur.state, TaskState::Qa);
         let m = workflow::return_to_rework(
+            &proc(),
             &cur,
             &store.artifacts(task_id).unwrap(),
             Some("ещё раз, с тестами"),
@@ -169,4 +171,11 @@ fn report_channel_marks_a_returned_report_stale_and_names_the_running_reaudit() 
         running.contains(&exec_short),
         "the marker names the running execution {exec_short}:\n{running}"
     );
+}
+
+/// The process declaration every workflow command resolves its target from
+/// (REQ-AR-09): the factory bytes, parsed once. A test that changes the
+/// declaration changes the walk — that is the point of the data.
+fn proc() -> &'static devai_core::process::Process {
+    devai_core::process::Process::factory()
 }

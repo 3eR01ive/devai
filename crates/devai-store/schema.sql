@@ -237,7 +237,14 @@ CREATE TABLE role_executions(
   driver             TEXT NULL,
   llm_provider       TEXT NULL,
   model              TEXT NULL,
-  reasoning          TEXT NULL
+  reasoning          TEXT NULL,
+  -- v14 run identity (REQ-AR-04/07): the number of the RUN this execution
+  -- belongs to — one chain of executions from one launch. Every execution a
+  -- chain spawns carries the same value. The run number is minted by the
+  -- LAUNCH before the first execution row exists and is NOT the first
+  -- execution's id (the implementation's answer to the spec's open «как
+  -- выглядит номер»). NULL = written before v14, no run identity recorded.
+  run_id             TEXT NULL
 );
 CREATE INDEX exec_task ON role_executions(task_id);
 -- The single-writer invariant pinned at the database level (REQ-SW-01,

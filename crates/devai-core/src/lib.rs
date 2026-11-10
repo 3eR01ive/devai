@@ -6,6 +6,7 @@
 pub mod agent_failure;
 pub mod error;
 pub mod inbox;
+pub mod process;
 pub mod types;
 pub mod vocab;
 pub mod workflow;
@@ -13,6 +14,7 @@ pub mod workflow;
 pub use agent_failure::class as agent_failure_class;
 pub use error::{CoreError, CoreResult};
 pub use inbox::{InboxWaitPolicy, WaitGroup, WaitStatePolicy, WaitVariant};
+pub use process::{HoldKind, Process, ProcessState, Target};
 pub use types::{
     AgentInstance, Artifact, ArtifactKind, ArtifactStatus, ContractRef, DataCategory, Decision,
     DependencyKind, DependencyNode, EpicVertex, EventDraft, ExecutionStatus, Id, Project, Question,
@@ -21,5 +23,5 @@ pub use types::{
 };
 pub use workflow::{
     Mutation, allowed_ops, check_execution_allowed, effective_blockers, open_blockers,
-    override_covers, role_allowed_states,
+    override_covers,
 };

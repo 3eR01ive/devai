@@ -121,7 +121,8 @@ fn mk_engine(store: &Store) -> Engine<'_> {
 
 fn approved(store: &Store, id: &str) {
     let t = store.resolve_task(id).unwrap();
-    let m = workflow::approve_requirements(&t, Some("test"), "tester", Utc::now()).unwrap();
+    let m =
+        workflow::approve_requirements(&proc(), &t, Some("test"), "tester", Utc::now()).unwrap();
     store.commit(t.lock_version, &m).unwrap();
 }
 
@@ -130,7 +131,17 @@ fn accepted(store: &Store, id: &str) {
     let a = store.artifacts(t.id).unwrap();
     // &[]: this task stores no dependency edges (REQ-08 AC2 — the absence
     // of rows is an empty set, so acceptance is unchanged for old tasks).
-    let m = workflow::accept(&t, &a, &[], &[], Some("test"), "tester", Utc::now()).unwrap();
+    let m = workflow::accept(
+        &proc(),
+        &t,
+        &a,
+        &[],
+        &[],
+        Some("test"),
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     store.commit(t.lock_version, &m).unwrap();
 }
 
@@ -451,7 +462,8 @@ fn rejection_loops_back_through_a_new_spec_version() {
 
     // human REJECT in APPROVAL → back to ANALYSIS
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::reject_requirements(&cur, Some("too thin"), "tester", Utc::now()).unwrap();
+    let m = workflow::reject_requirements(&proc(), &cur, Some("too thin"), "tester", Utc::now())
+        .unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     // The engine now re-runs analyst (publishing spec v2, superseding v1)
@@ -565,7 +577,7 @@ fn form_agent(store: &Store, name: &str) {
 /// is exactly ONE stage's behavior.
 fn to_analysis(store: &Store, t: &Task) {
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::start(&cur, "tester", Utc::now()).unwrap();
+    let m = workflow::start(&proc(), &cur, "tester", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 }
 
@@ -765,6 +777,83 @@ fn form_loop_disabled_by_config_keeps_todays_failure() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// REQ-AR-03/07 (rework 10.11): the run's evidence is the PLATFORM'S
+// observation, not the role's output artifact — a READ-ONLY role leaves an
+// exit code, an output tail and a last-activity time exactly like a writing
+// one. The role difference stays where it belongs: rights over the workspace.
+// ---------------------------------------------------------------------------
+#[test]
+fn a_read_only_role_run_leaves_its_exit_code_tail_and_activity() {
+    let (_d, store) = store();
+    let t = Task::new(
+        "Reading role evidence",
+        "The analyst observes the run; it produces no artifact in the tree",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    to_analysis(&store, &t);
+    // The seeded analyst is READ-ONLY (`filesystem:read`) — exactly the role
+    // whose run used to leave no exit code, no tail and no activity time.
+    let analyst = store.get_role("requirements-analyst").unwrap().unwrap();
+    assert!(
+        !analyst.writes_workspace(),
+        "the fixture role must be read-only, else this proves nothing"
+    );
+    form_agent(&store, "mock-process");
+    let r = mk_engine(&store)
+        .advance(&t.id.to_string(), "mock-process", "tester")
+        .unwrap();
+    assert_eq!(r.gate, Gate::WaitingApproval);
+
+    let rows = analyst_rows(&store, t.id);
+    assert_eq!(rows.len(), 1);
+    let ev = store
+        .root()
+        .join("evidence")
+        .join(t.id.to_string())
+        .join(rows[0].id.to_string());
+
+    // AC1: the exit code and BOTH tails, written after the child returned.
+    let settled = std::fs::read_to_string(ev.join("role_output.txt")).unwrap_or_else(|e| {
+        panic!(
+            "a read-only run must leave its settled evidence in {}: {e}",
+            ev.display()
+        )
+    });
+    assert!(settled.contains("exit: exit status: 0"), "{settled}");
+    assert!(settled.contains("process-fixture-stdout"), "{settled}");
+    assert!(settled.contains("process-fixture-stderr"), "{settled}");
+
+    // AC2: the live transcript the status command reads, and its mtime —
+    // «время последней активности» — belong to THIS run, not to "no data".
+    let live = ev.join(devai_runtime::LIVE_STDOUT_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap(),
+        "process-fixture-stdout\n"
+    );
+    let at = std::fs::metadata(&live).unwrap().modified().unwrap();
+    let ago = std::time::SystemTime::now()
+        .duration_since(at)
+        .unwrap_or_default();
+    assert!(
+        ago.as_secs() < 300,
+        "the activity stamp is this run's: {ago:?}"
+    );
+
+    // The difference between roles did NOT disappear: the reading role ran
+    // in the declared workspace, so no worktree was prepared for it.
+    assert_eq!(rows[0].status, ExecutionStatus::Completed);
+    let worktrees = store
+        .events(t.id, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == event_kind::WORKTREE_PREPARED)
+        .count();
+    assert_eq!(worktrees, 0, "a reading role gets no worktree");
+}
+
 #[test]
 fn platform_stamps_spec_echo_fields_from_stored_data() {
     let (_d, store) = store();
@@ -929,6 +1018,7 @@ fn holds_and_terminals_stop_the_engine() {
     let engine = mk_engine(&store);
     // start, then pause
     let m = workflow::start(
+        &proc(),
         &store.get_task(&t.id.to_string()).unwrap(),
         "tester",
         Utc::now(),
@@ -936,7 +1026,7 @@ fn holds_and_terminals_stop_the_engine() {
     .unwrap();
     store.commit(t.lock_version, &m).unwrap();
     let cur = store.get_task(&t.id.to_string()).unwrap();
-    let m = workflow::pause(&cur, Some("brake"), "tester", Utc::now()).unwrap();
+    let m = workflow::pause(&proc(), &cur, Some("brake"), "tester", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -1252,7 +1342,7 @@ fn non_git_workspace_fails_the_writing_stage_and_never_claims_freshness() {
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let mut facts = workflow::ImplementationReportFacts::bare(new_id());
     facts.summary = Some("manual".into());
-    let m = workflow::implementation_reported(&cur, &facts, "tester", Utc::now()).unwrap();
+    let m = workflow::implementation_reported(&proc(), &cur, &facts, "tester", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 
     let r = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
@@ -1700,6 +1790,7 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
     // QA returns with three concrete points — the precedent's shape.
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("п1; п2; п3"),
@@ -1792,7 +1883,7 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
     store
         .answer_question(open[0].id, "operator ratified", "operator", Utc::now())
         .unwrap();
-    let m = workflow::answer_question(&held, open[0].id, "operator", Utc::now()).unwrap();
+    let m = workflow::answer_question(&proc(), &held, open[0].id, "operator", Utc::now()).unwrap();
     store.commit(held.lock_version, &m).unwrap();
     let cur = store.get_task(&t.id.to_string()).unwrap();
     assert_eq!(cur.state, TaskState::Rework);
@@ -1816,7 +1907,8 @@ fn empty_rework_gate_trips_loud_and_ratified_no_op_reopens_qa() {
         1,
         "the collector surfaces only the human's ratifications"
     );
-    let m = workflow::implementation_reported(&cur, &facts, "operator", Utc::now()).unwrap();
+    let m =
+        workflow::implementation_reported(&proc(), &cur, &facts, "operator", Utc::now()).unwrap();
     assert_eq!(
         m.task.state,
         TaskState::Qa,
@@ -1852,6 +1944,7 @@ fn rework_with_new_commit_still_reaches_qa() {
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("fix the points"),
@@ -2510,6 +2603,7 @@ fn the_rework_execution_actually_receives_the_assembled_section() {
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("THE-WIRING-MARKER — return text as the human wrote it"),
@@ -2594,6 +2688,7 @@ fn a_returned_reports_findings_are_delivered_labelled_stale_never_dropped() {
     // two ways the reader can now answer: CURRENT report vs STALE fallback.
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("вернись к находкам"),
@@ -2723,6 +2818,7 @@ fn an_absent_workflow_config_still_delivers_from_the_factory_bytes() {
     drive_to_report(&store, &t, &ws); // the whole cycle runs on a home WITHOUT the workflow dir
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("FACTORY-FALLBACK-MARKER"),
@@ -2901,6 +2997,7 @@ fn the_empty_rework_gate_trips_the_return_text_into_the_next_window() {
     drive_to_report(&store, &t, &ws);
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::return_to_rework(
+        &proc(),
         &cur,
         &store.artifacts(t.id).unwrap(),
         Some("GATE-CYCLE-RATIONALE — п1; п2"),
@@ -3326,7 +3423,7 @@ fn agent_failures_are_recorded_and_park_at_the_threshold() {
     assert!(series.parked_at.is_some());
 
     // Answering restores the stage but does NOT reset the series.
-    let m = workflow::answer_question(&parked, q.id, "tester", Utc::now()).unwrap();
+    let m = workflow::answer_question(&proc(), &parked, q.id, "tester", Utc::now()).unwrap();
     store.commit(parked.lock_version, &m).unwrap();
     let back = store.get_task(&id).unwrap();
     assert_eq!(back.state, TaskState::Analysis);
@@ -3363,4 +3460,11 @@ fn agent_failures_are_recorded_and_park_at_the_threshold() {
             .is_none(),
         "success anywhere resets the agent's series"
     );
+}
+
+/// The process declaration every workflow command resolves its target from
+/// (REQ-AR-09): the factory bytes, parsed once. A test that changes the
+/// declaration changes the walk — that is the point of the data.
+fn proc() -> &'static devai_core::process::Process {
+    devai_core::process::Process::factory()
 }

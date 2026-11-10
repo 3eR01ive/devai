@@ -124,7 +124,7 @@ fn analysis_task(home: &Path, title: &str) -> String {
 }
 
 #[test]
-fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
+fn second_start_is_refused_by_name_and_a_dead_owner_is_reclaimed() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     devai(h, &["init"]);
@@ -173,37 +173,40 @@ fn second_start_is_refused_by_name_and_orphan_resolution_unblocks_run() {
         "the resolution command is printed: {err}"
     );
 
-    // REQ-SW-05: `task run` refuses while the orphan stands unresolved.
+    // The orphan is PROVABLY dead (the CLI that opened it is gone). Newer
+    // law: REQ-AR-05 makes that the platform's own finding — see below.
     let ws = workspace();
     let ws_str = ws.path().to_str().unwrap();
-    let err = devai_refused(
-        h,
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
-    );
-    assert!(
-        err.contains("single-writer guard") && err.contains(&exec_a),
-        "task run blocked by the same named row: {err}"
-    );
 
-    // The allowed exit: a human closes the row — then the next run PASSES
-    // (the engine drives analyst → reviewer and stops at the approval gate).
-    devai(
-        h,
-        &[
-            "exec",
-            "fail",
-            &exec_a,
-            "--error",
-            "human resolved the orphan",
-        ],
-    );
+    // REQ-AR-05 (ratified, supersedes the human-only exit for a PROVABLY
+    // dead owner): `task run` proves the orphan gone, closes its row with a
+    // class, frees the slot and drives the run itself. That is not a silent
+    // takeover — the closed row and the `execution.lost` event stay named.
     let r = devai_json(
         h,
-        &["task", "run", &id, "--agent", "mock", "--workspace", ws_str],
+        &[
+            "task",
+            "run",
+            &id,
+            "--agent",
+            "mock",
+            "--workspace",
+            ws_str,
+            "--wait",
+        ],
     );
     assert_eq!(
         r["gate"], "WAITING_APPROVAL",
-        "after resolution the run proceeds: {r}"
+        "a provably dead owner no longer blocks the run: {r}"
+    );
+    let closed = devai_json(h, &["exec", "get", &exec_a]);
+    assert_eq!(
+        closed["status"], "FAILED",
+        "the orphan row is closed, not left RUNNING: {closed}"
+    );
+    assert_eq!(
+        closed["failure_class"], "process_vanished",
+        "and the class says WHY: {closed}"
     );
 }
 
@@ -241,12 +244,15 @@ fn live_owner_task_run_refusal_is_labeled_live_not_orphan() {
                 owner_host: devai_runtime::current_host(),
                 owner_process_start: None,
                 bundle: None,
+                run_id: None,
             })
             .unwrap();
     }
     let exec_a = running_exec_id(h, &id);
     let ws = workspace();
-    let err = devai_refused(
+    // REQ-AR-06: the second launch is a TYPED outcome, not an error: it names
+    // the execution that already owns the task and does not touch it.
+    let v = devai_json(
         h,
         &[
             "task",
@@ -258,11 +264,20 @@ fn live_owner_task_run_refusal_is_labeled_live_not_orphan() {
             ws.path().to_str().unwrap(),
         ],
     );
-    assert!(
-        err.contains("LIVE writer") && !err.contains("ORPHAN"),
-        "a live owner is labeled live: {err}"
+    assert_eq!(
+        v["outcome"], "already_running",
+        "a live owner is reported as already running: {v}"
     );
-    assert!(err.contains(&exec_a), "and names the in-flight row: {err}");
+    assert_eq!(
+        v["execution_id"].as_str(),
+        Some(exec_a.as_str()),
+        "the refusal names the in-flight row: {v}"
+    );
+    let first = devai_json(h, &["exec", "get", &exec_a]);
+    assert_eq!(
+        first["status"], "RUNNING",
+        "the first run is not touched by the refusal: {first}"
+    );
 }
 
 #[test]

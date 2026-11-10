@@ -287,6 +287,7 @@ fn task_active_on_closed_pipe_dies_quietly() {
                     owner_host: devai_runtime::current_host(),
                     owner_process_start: None,
                     bundle: None,
+                    run_id: None,
                 })
                 .unwrap();
         }

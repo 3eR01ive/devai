@@ -210,13 +210,16 @@ fn gate_refusal_texts_survive_the_move_to_api_errors() {
         "devai: ratify-empty-rework applies to the empty-rework gate (REWORK, or WAITING_FOR_INPUT returning to REWORK); the task is in DRAFT"
     );
 
-    // exec start in DRAFT refuses through the core role/stage matrix…
+    // exec start in DRAFT refuses through the declared role/stage authority…
     let (_so, se) = fail(home, &["exec", "start", &aid, "--role", "quality-auditor"]);
     assert!(se.contains("run-role-execution"), "{se}");
-    // …with a legal role it starts; double-close then refuses with the
-    // exact old sentence (full ids in text, as the pre-API handler had).
+    // …with the declared executor it starts; double-close then refuses with
+    // the exact old sentence (full ids in text, as the pre-API handler had).
     ok(home, &["task", "start", &aid]);
-    ok(home, &["exec", "start", &aid, "--role", "analyst"]);
+    ok(
+        home,
+        &["exec", "start", &aid, "--role", "requirements-analyst"],
+    );
     let listing = ok(home, &["--json", "exec", "list", "--task", &aid]);
     let v: serde_json::Value = serde_json::from_str(&listing).unwrap();
     let eid = v[0]["id"].as_str().unwrap().to_string();

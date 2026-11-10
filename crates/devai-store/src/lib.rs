@@ -192,6 +192,7 @@ const RUNG_APPLIERS: &[(&str, RungApply)] = &[
         "additive_model_reasoning_column",
         additive_model_reasoning_column,
     ),
+    ("additive_run_id_column", additive_run_id_column),
 ];
 
 /// The switch request of [`Store::apply_bundle_switch`] — the exact content
@@ -1728,7 +1729,7 @@ impl Store {
         rows::unwrap_row(
             self.conn
                 .query_row(
-                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning
+                    "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning,run_id
                      FROM role_executions
                      WHERE status <> 'RUNNING' AND driver=?1 AND llm_provider=?2 AND model=?3 AND reasoning=?4
                      ORDER BY finished_at DESC, id DESC LIMIT 1",
@@ -1833,8 +1834,8 @@ impl Store {
         // before provenance existed and for manual rows without one.
         let revision = e.workspace_revision.as_ref().map(|r| json_string(r));
         let insert = tx.execute(
-            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9,?10,?11,NULL,?12,?13,?14,?15,?16,?17,?18)",
+            "INSERT INTO role_executions(id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning,run_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,NULL,?9,?10,?11,NULL,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 e.id.to_string(),
                 e.task_id.to_string(),
@@ -1860,6 +1861,7 @@ impl Store {
                 e.bundle.as_ref().map(|b| b.llm_provider.clone()),
                 e.bundle.as_ref().map(|b| b.model.clone()),
                 e.bundle.as_ref().map(|b| b.reasoning.clone()),
+                e.run_id.map(|r| r.to_string()),
             ],
         );
         if let Err(err) = insert {
@@ -2399,7 +2401,7 @@ impl Store {
         // would finish the WRONG execution — over main's widened row (the
         // form-loop columns attempt/parent_execution/failure_class ride in).
         let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning
+            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning,run_id
              FROM role_executions WHERE id=?1 OR id LIKE ?1 || '%' LIMIT 2",
         )?;
         let mut rows = stmt.query(params![id.to_lowercase()])?;
@@ -2421,11 +2423,11 @@ impl Store {
     pub fn list_executions(&self, task_id: Option<Id>) -> StoreResult<Vec<RoleExecution>> {
         let (sql, args): (&str, Vec<Option<String>>) = match task_id {
             Some(t) => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning FROM role_executions WHERE task_id=?1 ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning,run_id FROM role_executions WHERE task_id=?1 ORDER BY started_at",
                 vec![Some(t.to_string())],
             ),
             None => (
-                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning FROM role_executions ORDER BY started_at",
+                "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning,run_id FROM role_executions ORDER BY started_at",
                 vec![],
             ),
         };
@@ -2444,7 +2446,7 @@ impl Store {
     /// memory; the single-writer index allows at most one per task anyway.
     pub fn running_executions(&self) -> StoreResult<Vec<RoleExecution>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning FROM role_executions WHERE status='RUNNING' ORDER BY started_at",
+            "SELECT id,task_id,role_slug,role_version,agent_name,status,inputs,summary,error,started_at,finished_at,workspace_revision,attempt,parent_execution,failure_class,owner_pid,owner_host,owner_process_start,driver,llm_provider,model,reasoning,run_id FROM role_executions WHERE status='RUNNING' ORDER BY started_at",
         )?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
@@ -2868,6 +2870,15 @@ fn additive_model_bundle_columns(tx: &Transaction<'_>, step: &SchemaRung) -> Sto
 /// and one nullable column; the shared column-presence skip keeps a re-run
 /// over an already-shaped home a no-op.
 fn additive_model_reasoning_column(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
+    apply_script_with_column_skip(tx, step.script)
+}
+
+/// Rung v13→v14 (REQ-AR-04/07): the run identity on an execution row.
+/// Additive only — one nullable column and an index; rows written before the
+/// rung keep NULL («no run identity recorded»), nothing is rewritten. The
+/// shared column-presence skip makes a re-run over an already-shaped home a
+/// no-op.
+fn additive_run_id_column(tx: &Transaction<'_>, step: &SchemaRung) -> StoreResult<()> {
     apply_script_with_column_skip(tx, step.script)
 }
 
@@ -4565,6 +4576,7 @@ mod single_writer_tests {
             owner_host: None,
             owner_process_start: None,
             bundle: None,
+            run_id: None,
         }
     }
 

@@ -114,6 +114,7 @@ fn core_code(e: &CoreError) -> ErrorCode {
         CoreError::Guard(..) => ErrorCode("guard"),
         CoreError::UnknownVariant { .. } => ErrorCode("unknown_variant"),
         CoreError::OpenBlockers { .. } => ErrorCode("open_blockers"),
+        CoreError::UndeclaredEdge { .. } => ErrorCode("process_declaration"),
     }
 }
 
@@ -142,6 +143,7 @@ fn runtime_code(e: &RuntimeError) -> ErrorCode {
         RuntimeError::MissingRole(..) => ErrorCode("missing_role"),
         RuntimeError::MissingArtifact(..) => ErrorCode("missing_artifact"),
         RuntimeError::StepLimit(..) => ErrorCode("step_limit"),
+        RuntimeError::Process(..) => ErrorCode("process_declaration"),
         RuntimeError::MissingProfile(..) => ErrorCode("missing_profile"),
         RuntimeError::MissingContract(..) => ErrorCode("missing_contract"),
         RuntimeError::Worktree(inner) => worktree_code(inner),

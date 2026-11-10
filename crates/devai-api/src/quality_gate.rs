@@ -14,6 +14,7 @@
 //! Nothing here writes and nothing is cached: the read is a pure function of
 //! rows the caller already loaded from the store.
 
+use devai_core::process::Process;
 use devai_core::types::{
     Artifact, ArtifactKind, ArtifactStatus, Decision, ExecutionStatus, RoleExecution, Task,
     TaskDependency, TaskState,
@@ -33,12 +34,15 @@ pub const OPEN_BLOCKERS: &str = "open_blockers";
 pub const DENIAL_CODES: &[&str] = &[AUDIT_RUNNING, NO_CURRENT_REPORT, OPEN_BLOCKERS];
 
 /// The roles that may run ONLY in QA are the audit roles (REQ-QG-09). The
-/// roster is DERIVED from the core's one role/stage table, never restated:
-/// a role the core confines to QA is an audit role by that very fact, so a
-/// third QA role cannot silently lose its «идёт аудит» mark (rework R4).
-pub fn is_audit_role(slug: &str) -> bool {
-    let allowed = workflow::role_allowed_states(slug);
-    allowed.len() == 1 && allowed[0] == TaskState::Qa
+/// roster is DERIVED from the declared process — the one place a role is
+/// bound to a state (REQ-AR-09 AC1, rework R1): a role the declaration
+/// confines to QA is an audit role by that very fact, so a third QA role
+/// declared there cannot silently lose its «идёт аудит» mark, and no code
+/// list decides who audits.
+pub fn is_audit_role(process: &Process, slug: &str) -> bool {
+    process
+        .roles_confined_to(TaskState::Qa.as_str())
+        .contains(&slug)
 }
 
 /// The label the active-executions view prints for a live audit (REQ-QG-09
@@ -85,16 +89,16 @@ pub struct QualityGateView {
 /// DEAD owner is «not running». `Unknown` (no owner recorded, another host,
 /// no `/proc`) still counts as running: an unanswerable question is never
 /// promoted to death, and closing a live audit's gate early would be worse.
-pub fn is_live_audit(e: &RoleExecution) -> bool {
+pub fn is_live_audit(process: &Process, e: &RoleExecution) -> bool {
     e.status == ExecutionStatus::Running
-        && is_audit_role(&e.role_slug)
+        && is_audit_role(process, &e.role_slug)
         && liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start)
             != Liveness::Dead
 }
 
 /// Whether a quality audit is live right now.
-pub fn audit_running(executions: &[RoleExecution]) -> bool {
-    executions.iter().any(is_live_audit)
+pub fn audit_running(process: &Process, executions: &[RoleExecution]) -> bool {
+    executions.iter().any(|e| is_live_audit(process, e))
 }
 
 /// The public gate read: `Some` in QA, `None` anywhere else.
@@ -102,6 +106,7 @@ pub fn audit_running(executions: &[RoleExecution]) -> bool {
 /// The two acts are judged INDEPENDENTLY (REQ-QG-08 AC4): a missing report
 /// blocks acceptance but never hides the return.
 pub fn quality_gate(
+    process: &Process,
     task: &Task,
     artifacts: &[Artifact],
     deps: &[TaskDependency],
@@ -111,7 +116,7 @@ pub fn quality_gate(
     if task.state != TaskState::Qa {
         return None;
     }
-    let audit_running = audit_running(executions);
+    let audit_running = audit_running(process, executions);
     let current_report = artifacts
         .iter()
         .find(|a| a.kind == ArtifactKind::QualityReport && a.status == ArtifactStatus::Current)
@@ -187,6 +192,11 @@ mod tests {
     use chrono::Utc;
     use devai_core::types::{DataCategory, Decision, RoleExecution, new_id};
 
+    /// The factory declaration — the role/stage authority these tests exercise.
+    fn proc() -> Process {
+        Process::factory().clone()
+    }
+
     fn qa_task() -> Task {
         let mut t = Task::new("gate", "unit", None, Utc::now());
         t.state = TaskState::Qa;
@@ -234,6 +244,7 @@ mod tests {
             owner_host: None,
             owner_process_start: None,
             bundle: None,
+            run_id: None,
         }
     }
 
@@ -259,13 +270,14 @@ mod tests {
     fn outside_qa_there_is_no_gate() {
         let mut t = qa_task();
         t.state = TaskState::Accepted;
-        assert!(quality_gate(&t, &[], &[], &[], &[]).is_none());
+        assert!(quality_gate(&proc(), &t, &[], &[], &[], &[]).is_none());
     }
 
     /// The happy path: current report, no blockers, no live audit → both acts.
     #[test]
     fn a_current_report_opens_both_acts() {
         let g = quality_gate(
+            &proc(),
             &qa_task(),
             &[report(ArtifactStatus::Current)],
             &[],
@@ -283,7 +295,7 @@ mod tests {
     #[test]
     fn a_missing_current_report_denies_acceptance_only() {
         for artifacts in [vec![], vec![report(ArtifactStatus::Stale)]] {
-            let g = quality_gate(&qa_task(), &artifacts, &[], &[], &[]).unwrap();
+            let g = quality_gate(&proc(), &qa_task(), &artifacts, &[], &[], &[]).unwrap();
             assert!(!g.may_accept);
             assert_eq!(
                 g.accept_denied.as_ref().map(|d| d.code.as_str()),
@@ -298,6 +310,7 @@ mod tests {
     #[test]
     fn a_live_audit_withholds_both_acts() {
         let g = quality_gate(
+            &proc(),
             &qa_task(),
             &[report(ArtifactStatus::Current)],
             &[],
@@ -331,6 +344,7 @@ mod tests {
         orphan.owner_pid = Some(i64::MAX);
         orphan.owner_host = Some(host);
         let g = quality_gate(
+            &proc(),
             &qa_task(),
             &[report(ArtifactStatus::Current)],
             &[],
@@ -343,20 +357,39 @@ mod tests {
         assert_eq!(g.accept_denied, None);
     }
 
-    /// Rework R4: the audit roster is the core's QA-only rule, not a second
-    /// list. The two QA roles answer «audit»; a role that may run elsewhere
-    /// does not, so the mark can never drift from the table it mirrors.
+    /// Rework R1/R4: the audit roster is the DECLARATION's QA-only rule, not
+    /// a second list in code. Under the factory declaration `quality-auditor`
+    /// is the QA-only role, so it answers «audit»; roles declared elsewhere (or
+    /// not declared at all) do not. Editing the declaration — not the code —
+    /// moves the mark: the roster follows `process.yaml`.
     #[test]
-    fn the_audit_roster_is_the_core_rule() {
-        assert!(is_audit_role("quality-auditor"));
-        assert!(is_audit_role("quality-aggregator"));
+    fn the_audit_roster_follows_the_declaration() {
+        let factory = proc();
+        assert!(is_audit_role(&factory, "quality-auditor"));
         for slug in [
             "implementation-agent",
             "requirements-analyst",
+            "quality-aggregator",
             "unknown-role",
         ] {
-            assert!(!is_audit_role(slug), "`{slug}` may run outside QA");
+            assert!(
+                !is_audit_role(&factory, slug),
+                "`{slug}` is not the declared executor of QA"
+            );
         }
+
+        // The same code, another declaration: QA's executor is the aggregator.
+        let mut edited = factory;
+        for st in &mut edited.states {
+            if st.state == TaskState::Qa.as_str() {
+                st.role = Some("quality-aggregator".into());
+            }
+        }
+        assert!(is_audit_role(&edited, "quality-aggregator"));
+        assert!(
+            !is_audit_role(&edited, "quality-auditor"),
+            "the declaration, not a code roster, decides who audits"
+        );
     }
 
     /// Open blockers hold the acceptance and are enumerated; return is
@@ -368,7 +401,7 @@ mod tests {
         let blocker_id = new_id();
         let dep = blocking_dep(&task, blocker_id);
         let arts = [report(ArtifactStatus::Current)];
-        let g = quality_gate(&task, &arts, &[dep.clone()], &[], &[]).unwrap();
+        let g = quality_gate(&proc(), &task, &arts, &[dep.clone()], &[], &[]).unwrap();
         assert!(!g.may_accept && g.may_return);
         assert_eq!(g.open_blockers, vec![blocker_id.to_string()]);
         assert!(
@@ -391,7 +424,7 @@ mod tests {
             created_at: Utc::now(),
             payload: serde_json::Value::Null,
         };
-        let g = quality_gate(&task, &arts, &[dep], &[override_decision], &[]).unwrap();
+        let g = quality_gate(&proc(), &task, &arts, &[dep], &[override_decision], &[]).unwrap();
         assert!(g.may_accept, "a covering override releases the gate");
     }
 
@@ -399,8 +432,9 @@ mod tests {
     #[test]
     fn every_returned_code_is_in_the_dictionary() {
         let cases = [
-            quality_gate(&qa_task(), &[], &[], &[], &[]),
+            quality_gate(&proc(), &qa_task(), &[], &[], &[], &[]),
             quality_gate(
+                &proc(),
                 &qa_task(),
                 &[],
                 &[],
