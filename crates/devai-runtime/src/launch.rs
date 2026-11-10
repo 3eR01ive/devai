@@ -157,6 +157,14 @@ pub fn run_evidence_dir(home: &Path, task_id: &str, run_id: &str) -> PathBuf {
     home.join("evidence").join(task_id).join(run_id)
 }
 
+/// The ONE address of the runner's exit record (exit code + transcript tail):
+/// `__supervise` writes it here and every reader (`exec get`, diagnostics)
+/// reads it here. Derived from [`run_evidence_dir`], never spelled twice —
+/// the writer and the reader must not be able to disagree about the dir.
+pub fn runner_tail_path(home: &Path, task_id: &str, run_id: &str) -> PathBuf {
+    run_evidence_dir(home, task_id, run_id).join(RUNNER_TAIL_FILE)
+}
+
 /// The rootless way out of the caller's cgroup (REQ-AR-01): `systemd-run
 /// --user --scope` registers the command as a transient USER unit, so the
 /// caller's unit can be stopped without taking the role down. Probed once per

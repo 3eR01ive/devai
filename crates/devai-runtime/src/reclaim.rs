@@ -17,9 +17,11 @@
 //! (REQ-SW-06 preserved: the check is an observation, the write is a row
 //! closure).
 //!
-//! Where it runs: the launch path (before a new run starts, so a corpse never
-//! blocks it), `devai exec reap`, and the active-work snapshot. It is not a
-//! background daemon — the platform has no daemon (ASM-5).
+//! Where it runs (grep `reclaim::reclaim`): both launch paths — `task_run`
+//! (`mutations.rs`) and the supervised admission (`launch_admission.rs`), so a
+//! corpse never blocks a new launch — and `devai exec reap` (`Api::exec_reap`,
+//! `lib.rs`). It is not a background daemon — the platform has no daemon
+//! (ASM-5).
 
 use chrono::Utc;
 use devai_core::types::{ExecutionStatus, RoleExecution, event_kind, failure_class};

@@ -242,14 +242,14 @@ pub struct RunOutcome {
     pub run_id: Option<String>,
 }
 
-/// Потолок сериализованной спеки (байты). Решение оператора 09.11: держим
-/// жёстко в публикации, а не только пожеланием в промпте роли.
 /// The typed outcome of an ASYNC launch (REQ-AR-04): the run number, the
 /// execution the caller can quote, and which of the three states happened.
 /// `--wait` is a separate caller concern; this type never waits.
 #[derive(Serialize, Clone, Debug)]
 pub struct RunStartOutcome {
-    /// The run number (the id of the chain's first execution).
+    /// The run number — an id minted by the launch itself (`task_run`,
+    /// `new_id()`), NOT the id of any execution: the row that carries it is
+    /// a different id, minted later by the store when the runner opens it.
     pub run_id: String,
     /// The execution handle: the first execution of this launch, or — for
     /// `already_running` — the execution that already owns the task

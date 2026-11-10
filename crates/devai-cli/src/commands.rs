@@ -7,7 +7,8 @@
 //! seeds it; `init`/seed are not registry operations, they are the
 //! ratified OQ-10 bootstrap pair behind the API surface.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context as _, Result, bail};
 use devai_core::types::*;
@@ -1336,40 +1337,7 @@ fn task_run(
     if json && (!wait || o.outcome == RunLaunch::Refused) {
         outln!("{}", serde_json::to_string_pretty(&o)?);
     } else if !json {
-        match o.outcome {
-            RunLaunch::Started => {
-                outln!(
-                    "run {} started: execution {} in {}",
-                    short(&Uuid::parse_str(&o.run_id).unwrap_or_else(|_| Uuid::nil())),
-                    o.execution_id
-                        .as_deref()
-                        .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
-                        .unwrap_or_else(|| "-".into()),
-                    o.state
-                );
-                outln!(
-                    "the role runs in its own session — status: `devai exec get <id>`, log tail: \
-                     $DEVAI_HOME/evidence/<task>/<run>/supervisor.log; wait: --wait"
-                );
-            }
-            RunLaunch::AlreadyRunning => {
-                outln!(
-                    "task {} already has a run: execution {} ({})",
-                    short(&Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil())),
-                    o.execution_id
-                        .as_deref()
-                        .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
-                        .unwrap_or_else(|| "-".into()),
-                    o.reason.as_deref().unwrap_or("one owner per task")
-                );
-            }
-            RunLaunch::Refused => {
-                outln!(
-                    "launch refused: {}",
-                    o.reason.as_deref().unwrap_or("no reason recorded")
-                );
-            }
-        }
+        render_launch_outcome(&o, id);
     }
     if o.outcome == RunLaunch::Refused || !wait {
         return Ok(());
@@ -1382,13 +1350,56 @@ fn task_run(
     wait_for_run(ctx, first, json)
 }
 
+/// The human rendering of the three typed launch outcomes (REQ-AR-04):
+/// «запущено» names the handle and how to watch it, «уже идёт» names the
+/// owner, «нельзя» names the reason. Extracted from `task_run` so the
+/// command's own body stays the launch + the optional wait.
+fn render_launch_outcome(o: &devai_api::RunStartOutcome, task: &str) {
+    match o.outcome {
+        RunLaunch::Started => {
+            outln!(
+                "run {} started: execution {} in {}",
+                short(&Uuid::parse_str(&o.run_id).unwrap_or_else(|_| Uuid::nil())),
+                o.execution_id
+                    .as_deref()
+                    .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
+                    .unwrap_or_else(|| "-".into()),
+                o.state
+            );
+            outln!(
+                "the role runs in its own session — status: `devai exec get <id>`, log tail: \
+                 $DEVAI_HOME/evidence/<task>/<run>/supervisor.log; wait: --wait"
+            );
+        }
+        RunLaunch::AlreadyRunning => outln!(
+            "task {} already has a run: execution {} ({})",
+            short(&Uuid::parse_str(task).unwrap_or_else(|_| Uuid::nil())),
+            o.execution_id
+                .as_deref()
+                .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
+                .unwrap_or_else(|| "-".into()),
+            o.reason.as_deref().unwrap_or("one owner per task")
+        ),
+        RunLaunch::Refused => outln!(
+            "launch refused: {}",
+            o.reason.as_deref().unwrap_or("no reason recorded")
+        ),
+    }
+}
+
 /// `--wait`: stay with the launched run until its PLATFORM-OWNED runner is
 /// gone, then render the settled outcome the runner stored. It waits on the
 /// runner PROCESS (REQ-AR-03), not on «no RUNNING row»: between two stages of
 /// one chain there is a moment with no row, and that moment is not the end.
 /// Closing this terminal does not disturb the run (REQ-AR-01/07).
+///
+/// The wait is a COURIER, not the owner: it is bounded by [`WAIT_MAX`], so a
+/// process whose liveness never becomes provable cannot pin this terminal
+/// forever (log/dead-ends). Hitting the bound says so and leaves the run
+/// untouched — the platform-owned process keeps going either way.
 fn wait_for_run(ctx: &Ctx, first_exec: &str, json: bool) -> Result<()> {
     let row = ctx.api().exec_get(first_exec).map_err(render_api_error)?;
+    let since = std::time::Instant::now();
     loop {
         let state = devai_runtime::liveness::check_owner(
             row.owner_pid,
@@ -1398,6 +1409,16 @@ fn wait_for_run(ctx: &Ctx, first_exec: &str, json: bool) -> Result<()> {
         if state != devai_runtime::liveness::Liveness::Alive {
             break;
         }
+        if since.elapsed() >= WAIT_MAX {
+            outln!(
+                "--wait stopped after {}h: execution {first_exec} is still owned by pid {:?} on \
+                 {:?} and the run is NOT affected — check it later with `devai exec get {first_exec}`",
+                WAIT_MAX.as_secs() / 3600,
+                row.owner_pid,
+                row.owner_host.as_deref().unwrap_or("-")
+            );
+            return Ok(());
+        }
         std::thread::sleep(WAIT_POLL_INTERVAL);
     }
     let task_ref = row.task_id.to_string();
@@ -1405,23 +1426,35 @@ fn wait_for_run(ctx: &Ctx, first_exec: &str, json: bool) -> Result<()> {
         .run_id
         .map(|r| r.to_string())
         .unwrap_or_else(|| row.id.to_string());
-    let outcome_path =
-        devai_runtime::launch::run_evidence_dir(&ctx.api().home(), &task_ref, &run_id)
-            .join(devai_runtime::launch::OUTCOME_FILE);
-    if let Ok(text) = std::fs::read_to_string(&outcome_path) {
-        if let Ok(view) = serde_json::from_str::<devai_api::RunOutcome>(&text) {
-            return render_run_outcome(&view, &run_id, json);
-        }
+    if let Some(view) = stored_outcome(ctx, &task_ref, &run_id) {
+        return render_run_outcome(&view, &run_id, json);
     }
     // No stored outcome: the runner stopped without finishing the chain
     // (killed, refused, engine error). The rows carry the reason — show them.
+    report_unfinished_run(ctx, &task_ref, &run_id, json)
+}
+
+/// The settled report the runner stored (`outcome.json`), when it is there and
+/// readable. A missing/unparsable file is `None` — the caller then reports
+/// from the rows instead of inventing an outcome.
+fn stored_outcome(ctx: &Ctx, task_ref: &str, run_id: &str) -> Option<devai_api::RunOutcome> {
+    let path = devai_runtime::launch::run_evidence_dir(&ctx.api().home(), task_ref, run_id)
+        .join(devai_runtime::launch::OUTCOME_FILE);
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The runner is gone and left no `outcome.json`: list the run's executions
+/// and fail with the first recorded error. A separate function so
+/// `wait_for_run` reads as «wait, then render» (short units).
+fn report_unfinished_run(ctx: &Ctx, task_ref: &str, run_id: &str, json: bool) -> Result<()> {
     let es = ctx
         .api()
-        .exec_list(Some(&task_ref))
+        .exec_list(Some(task_ref))
         .map_err(render_api_error)?;
     let of_run: Vec<&RoleExecution> = es
         .iter()
-        .filter(|e| e.run_id.map(|r| r.to_string()).as_deref() == Some(run_id.as_str()))
+        .filter(|e| e.run_id.map(|r| r.to_string()).as_deref() == Some(run_id))
         .collect();
     if json {
         outln!("{}", serde_json::to_string_pretty(&of_run)?);
@@ -1470,51 +1503,46 @@ fn render_run_outcome(o: &devai_api::RunOutcome, run_id: &str, json: bool) -> Re
             outln!("   ↳ {}", ellipsis(sum, 160));
         }
     }
+    render_gate(o);
+    if !o.allowed_operations.is_empty() {
+        outln!("next: {}", o.allowed_operations.join(" | "));
+    }
+    outln!("run: {run_id} (status: `devai exec list --run {run_id}`)");
+    Ok(())
+}
+
+/// The gate block of a settled run: the stored human paragraphs FIRST
+/// (ratified OQ-HP-1 — the operator reads them before anything else), then
+/// what the gate is and what can be done at it. A flat dispatch over the
+/// declared gate: each arm prints its own facts and shares only the two
+/// helpers below.
+fn render_gate(o: &devai_api::RunOutcome) {
+    for (label, text) in &o.gate_human_paragraphs {
+        outln!("── {label}: человеческий абзац ──");
+        outln!("{text}");
+    }
     match o.report.gate {
         Gate::WaitingApproval => {
-            for (label, text) in &o.gate_human_paragraphs {
-                outln!("── {label}: человеческий абзац ──");
-                outln!("{text}");
-            }
             outln!("⏸ APPROVAL is a human gate — approve or reject the requirements");
         }
         Gate::WaitingAccept => {
-            for (label, text) in &o.gate_human_paragraphs {
-                outln!("── {label}: человеческий абзац ──");
-                outln!("{text}");
-            }
-            if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
-                outln!("{marker}");
-            }
-            if let Some(text) = &o.gate_report_text {
-                outln!("── quality report (platform-assembled) ──");
-                outln!("{text}");
-            }
+            render_freshness(o);
+            render_quality_text(o);
             outln!("⏸ acceptance is a human gate — accept or return the result");
         }
         Gate::ReportFresh => {
-            for (label, text) in &o.gate_human_paragraphs {
-                outln!("── {label}: человеческий абзац ──");
-                outln!("{text}");
-            }
-            if let Some(a) = &o.current_quality_report {
-                outln!(
+            match &o.current_quality_report {
+                Some(a) => outln!(
                     "⏸ quality report v{} ({}) is FRESH — it is bound to exactly the recomputed workspace revision; the auditor was NOT re-run",
                     a.seq,
                     short(&a.id)
-                );
-            } else {
-                outln!(
+                ),
+                None => outln!(
                     "⏸ quality report is FRESH for the current workspace revision — the auditor was NOT re-run"
-                );
+                ),
             }
-            if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
-                outln!("{marker}");
-            }
-            if let Some(text) = &o.gate_report_text {
-                outln!("── quality report (platform-assembled) ──");
-                outln!("{text}");
-            }
+            render_freshness(o);
+            render_quality_text(o);
             outln!(
                 "   decide explicitly: accept/return this report, or re-audit an unchanged workspace with `devai task run {} --force-reaudit`",
                 short(&o.report.task_id)
@@ -1523,11 +1551,21 @@ fn render_run_outcome(o: &devai_api::RunOutcome, run_id: &str, json: bool) -> Re
         Gate::Terminal(st) => outln!("task finished: {}", st.as_str()),
         Gate::Hold(st) => outln!("task held in {} — release it first", st.as_str()),
     }
-    if !o.allowed_operations.is_empty() {
-        outln!("next: {}", o.allowed_operations.join(" | "));
+}
+
+/// The freshness marker of the quality report, when the platform computed one.
+fn render_freshness(o: &devai_api::RunOutcome) {
+    if let Some(marker) = freshness_marker(o.gate_report_freshness.as_ref()) {
+        outln!("{marker}");
     }
-    outln!("run: {run_id} (status: `devai exec list --run {run_id}`)");
-    Ok(())
+}
+
+/// The platform-assembled quality report text, when the gate carries one.
+fn render_quality_text(o: &devai_api::RunOutcome) {
+    if let Some(text) = &o.gate_report_text {
+        outln!("── quality report (platform-assembled) ──");
+        outln!("{text}");
+    }
 }
 
 /// The hidden runner arm (`__supervise`, REQ-AR-01/03): open the execution
@@ -1558,16 +1596,22 @@ fn supervise(
         .api()
         .task_run_supervised(&req)
         .map_err(render_api_error);
-    // REQ-AR-03: the platform KEEPS the outcome in evidence — the runner's own
-    // exit code and the bounded TAIL of this transcript (the ratified 4096
-    // lines), written next to `supervisor.log` and `outcome.json`. The caller
-    // may be long gone; these files are the platform's record.
     let code = if matches!(&result, Ok(Some(_)) | Ok(None)) {
         0
     } else {
         1
     };
-    let ev = devai_runtime::launch::run_evidence_dir(&ctx.api().home(), &task_ref, &run_ref);
+    record_runner_exit(&ctx.api().home(), &task_ref, &run_ref, code);
+    render_supervised_result(result, json)
+}
+
+/// REQ-AR-03: the platform KEEPS the outcome in evidence — the runner's own
+/// exit code and the bounded TAIL of this transcript (the ratified 4096
+/// lines), written next to `supervisor.log` and `outcome.json` through the
+/// SAME address `exec get` reads. The caller may be long gone; these files
+/// are the platform's record.
+fn record_runner_exit(home: &Path, task: &str, run: &str, code: i32) {
+    let ev = devai_runtime::launch::run_evidence_dir(home, task, run);
     // ONE tail rule (QA R3); an unreadable transcript is named in the file
     // instead of being written as an empty tail.
     let tail = match devai_runtime::tail::read_tail(
@@ -1580,10 +1624,19 @@ fn supervise(
     // R5: the record is best effort — the runner's exit is not cancelled by a
     // failed write — but the failure is NOT silence: it lands in this
     // process's stderr, which is the run's own `supervisor.log`.
-    let tail_path = ev.join(devai_runtime::launch::RUNNER_TAIL_FILE);
+    let tail_path = devai_runtime::launch::runner_tail_path(home, task, run);
     if let Err(e) = std::fs::write(&tail_path, format!("exit_code: {code}\n{tail}\n")) {
         devai_runtime::trace::note_failure("runner exit record", &tail_path, &e);
     }
+}
+
+/// What the runner prints to its own transcript once the chain is over: the
+/// settled report, or the fact that the refusal travelled through the
+/// handshake and there was nothing to drive.
+fn render_supervised_result(
+    result: Result<Option<devai_runtime::RunReport>>,
+    json: bool,
+) -> Result<()> {
     match result? {
         Some(report) => {
             if json {
@@ -2553,6 +2606,13 @@ const EXEC_STDERR_TAIL_LINES: usize = 10;
 /// which process it is — so this is a poll of platform data, not a pipe.
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// The ceiling of `--wait`. The observed death window is 12–59 minutes, so a
+/// working role never reaches this; the bound exists so a liveness verdict
+/// that never becomes provable (`unknown` forever, e.g. a foreign pid) cannot
+/// keep a terminal in a loop with no exit (log/dead-ends). Hitting it is not
+/// a failure of the run: the runner is detached and keeps working.
+const WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
 fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
         ExecCmd::Start {
@@ -2736,86 +2796,10 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 // REQ-AR-07: the stored tail and the last-activity time are
                 // readable without the launching terminal and survive any
                 // wrapper restart — they are evidence files, not process
-                // memory. While the role runs the LIVE transcript files
-                // (`role_stdout.txt`/`role_stderr.txt`) are written by the
-                // role's own process; after it exits `role_output.txt` adds
-                // the exit code and both bounded tails.
-                let home = ctx.api().home();
-                let ev = home
-                    .join("evidence")
-                    .join(e.task_id.to_string())
-                    .join(e.id.to_string());
-                let run_ev = e.run_id.map(|r| {
-                    home.join("evidence")
-                        .join(e.task_id.to_string())
-                        .join(r.to_string())
-                });
-                // ONE tail rule (QA R3): a missing evidence file is silence
-                // (normal before the role writes), an UNREADABLE one is said
-                // out loud — the two are different facts.
-                let tail_of = |path: &std::path::Path, label: &str, lines: usize| {
-                    match devai_runtime::tail::read_tail(path, lines) {
-                        Ok(text) if text.trim().is_empty() => {}
-                        Ok(text) => {
-                            outln!("── output tail ({label}) ──");
-                            for line in text.lines() {
-                                outln!("{line}");
-                            }
-                        }
-                        Err(devai_runtime::tail::TailError::NotFound(_)) => {}
-                        Err(e) => outln!("── output tail ({label}) unavailable: {e} ──"),
-                    }
-                };
-                tail_of(
-                    &ev.join("role_output.txt"),
-                    "role_output.txt",
-                    EXEC_TAIL_LINES,
-                );
-                // The runner's own record (exit code + transcript tail) —
-                // written by `__supervise`, readable here ever since.
-                tail_of(
-                    &ev.join(devai_runtime::launch::RUNNER_TAIL_FILE),
-                    devai_runtime::launch::RUNNER_TAIL_FILE,
-                    EXEC_TAIL_LINES,
-                );
-                tail_of(
-                    &ev.join(devai_runtime::LIVE_STDOUT_FILE),
-                    "role_stdout.txt (live)",
-                    EXEC_TAIL_LINES,
-                );
-                tail_of(
-                    &ev.join(devai_runtime::LIVE_STDERR_FILE),
-                    "role_stderr.txt (live)",
-                    EXEC_STDERR_TAIL_LINES,
-                );
-                let mut candidates = vec![
-                    ev.join("role_output.txt"),
-                    ev.join(devai_runtime::LIVE_STDOUT_FILE),
-                    ev.join(devai_runtime::LIVE_STDERR_FILE),
-                ];
-                if let Some(run_ev) = &run_ev {
-                    candidates.push(run_ev.join(devai_runtime::launch::SUPERVISOR_LOG));
-                }
-                let activity = candidates
-                    .iter()
-                    .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
-                    .max();
-                match activity {
-                    Some(t) => {
-                        let ago = std::time::SystemTime::now()
-                            .duration_since(t)
-                            .unwrap_or_default()
-                            .as_secs();
-                        outln!("activity:  {ago}s ago");
-                    }
-                    // The ratified answer to the activity question: «по
-                    // последней строке, до неё — старт». No output file yet
-                    // is not «no activity» — the start IS the last known fact.
-                    None => outln!(
-                        "activity:  no output yet; started {}",
-                        e.started_at.format("%Y-%m-%d %H:%M:%S")
-                    ),
-                }
+                // memory. The block has ONE home (`render_evidence`), and
+                // every path it reads comes from `launch::*` — the same
+                // functions the writers use.
+                render_evidence(&e, &ctx.api().home());
             }
         }
         ExecCmd::Liveness { exec_id } => {
@@ -2842,6 +2826,117 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The evidence block of `exec get` in HUMAN form (REQ-AR-07): every stored
+/// file that exists, announced with its own header and its last lines, in a
+/// fixed order — the settled `role_output.txt`, the runner's exit record, the
+/// live stdout, the live stderr — then the last-activity line. Two dirs are
+/// involved and each address comes from ONE source: the execution's own dir
+/// (`launch::run_evidence_dir` with the execution id) and the RUN's dir
+/// (`launch::run_evidence_dir`/`launch::runner_tail_path` with the run id) —
+/// exactly where `__supervise` and the adapters wrote them.
+fn render_evidence(e: &RoleExecution, home: &Path) {
+    let task_id = e.task_id.to_string();
+    let ev = devai_runtime::launch::run_evidence_dir(home, &task_id, &e.id.to_string());
+    print_tail(
+        &ev.join("role_output.txt"),
+        "role_output.txt",
+        EXEC_TAIL_LINES,
+    );
+    let mut candidates = vec![
+        ev.join("role_output.txt"),
+        ev.join(devai_runtime::LIVE_STDOUT_FILE),
+        ev.join(devai_runtime::LIVE_STDERR_FILE),
+    ];
+    // The runner's own record (exit code + transcript tail) is written by
+    // `__supervise` under the RUN's dir; the same address is read here, so
+    // the record the platform wrote is the record the operator sees.
+    if let Some(run_id) = e.run_id {
+        let run = run_id.to_string();
+        print_tail(
+            &devai_runtime::launch::runner_tail_path(home, &task_id, &run),
+            devai_runtime::launch::RUNNER_TAIL_FILE,
+            EXEC_TAIL_LINES,
+        );
+        candidates.push(
+            devai_runtime::launch::run_evidence_dir(home, &task_id, &run)
+                .join(devai_runtime::launch::SUPERVISOR_LOG),
+        );
+    }
+    print_tail(
+        &ev.join(devai_runtime::LIVE_STDOUT_FILE),
+        "role_stdout.txt (live)",
+        EXEC_TAIL_LINES,
+    );
+    print_tail(
+        &ev.join(devai_runtime::LIVE_STDERR_FILE),
+        "role_stderr.txt (live)",
+        EXEC_STDERR_TAIL_LINES,
+    );
+    report_activity(&candidates, e);
+}
+
+/// ONE tail rule (QA R3): a missing evidence file is silence (normal before
+/// the role writes), an UNREADABLE one is said out loud — the two are
+/// different facts. An empty file prints nothing either.
+fn print_tail(path: &Path, label: &str, lines: usize) {
+    match devai_runtime::tail::read_tail(path, lines) {
+        Ok(text) if text.trim().is_empty() => {}
+        Ok(text) => {
+            outln!("── output tail ({label}) ──");
+            for line in text.lines() {
+                outln!("{line}");
+            }
+        }
+        Err(devai_runtime::tail::TailError::NotFound(_)) => {}
+        Err(e) => outln!("── output tail ({label}) unavailable: {e} ──"),
+    }
+}
+
+/// The last-activity line: the newest evidence mtime, or — the ratified
+/// answer «по последней строке, до неё — старт» — the start, because no output
+/// file yet is not «no activity».
+fn report_activity(paths: &[PathBuf], e: &RoleExecution) {
+    match last_activity(paths) {
+        Some(t) => {
+            let ago = SystemTime::now()
+                .duration_since(t)
+                .unwrap_or_default()
+                .as_secs();
+            outln!("activity:  {ago}s ago");
+        }
+        None => outln!(
+            "activity:  no output yet; started {}",
+            e.started_at.format("%Y-%m-%d %H:%M:%S")
+        ),
+    }
+}
+
+/// The newest mtime over the evidence files — the «когда роль последний раз
+/// подавала голос» fact. A MISSING file is simply not a candidate; a file
+/// whose metadata/mtime cannot be read is NAMED, never folded into «no
+/// output» (same discipline as the tail rule above).
+fn last_activity(paths: &[PathBuf]) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    for p in paths {
+        let at = match std::fs::metadata(p) {
+            Ok(m) => match m.modified() {
+                Ok(t) => t,
+                Err(e) => {
+                    outln!("── activity unavailable for {}: {e} ──", p.display());
+                    continue;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                outln!("── activity unavailable for {}: {e} ──", p.display());
+                continue;
+            }
+        };
+        newest = Some(newest.map_or(at, |cur| cur.max(at)));
+    }
+    newest
 }
 
 /// `devai task active [--json]` — «что сейчас активно» in one view: a

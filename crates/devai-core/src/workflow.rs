@@ -1484,6 +1484,14 @@ pub fn check_execution_allowed(process: &Process, slug: &str, task: &Task) -> Co
 /// `Process::validate` cross-checks that every declared role state is a stage
 /// this table can drive, so a declaration the run loop cannot walk is refused
 /// at init instead of dying halfway through a run.
+///
+/// The SECOND place of a new role stage, named plainly (rework R2): adding
+/// one means a row with `executor: role` in `config/workflow/process.yaml`
+/// AND a branch here (+ the `TaskState` variant) — the declaration says who
+/// runs the stage, this table says what the stage yields. They cannot diverge
+/// silently: `Process::validate_role_stage` refuses a declared role state
+/// this table cannot drive, and `config/workflow/process.yaml` documents the
+/// pair at its `states:` section.
 pub fn stage_artifact_kind(state: TaskState) -> Option<ArtifactKind> {
     match state {
         TaskState::Analysis => Some(ArtifactKind::RequirementsSpec),

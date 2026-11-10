@@ -45,6 +45,13 @@ pub mod process_executor {
 /// report landed». A shared `role_finished` would make REWORK ambiguous (a
 /// published spec returns it to REVIEW, a report sends it to QA), and an
 /// ambiguous declaration cannot be authoritative.
+///
+/// This table is the CODE's half of the vocabulary; the other half is the
+/// declaration's `process.conditions` list (`config/workflow/process.yaml`).
+/// The two are cross-checked BOTH ways in `Process::validate`
+/// (`validate_condition_vocabulary`): a name demanded and not declared, or
+/// declared and never emitted, refuses `devai init`. Neither side is a
+/// silent source of truth for the other.
 pub mod process_condition {
     /// A human started the task (DRAFT → the first role stage).
     pub const HUMAN_START: &str = "human_start";
@@ -71,6 +78,16 @@ pub mod process_condition {
     pub const LAUNCH_FAILED: &str = "launch_failed";
     /// The execution produced no outcome at all (the vanished process,
     /// REQ-AR-05 AC2) — spelled out so «no outcome» has a transition too.
+    ///
+    /// Emission status, stated rather than implied: this build declares the
+    /// name and every role state covers it (init refuses a gap, REQ-AR-14),
+    /// but NO command walks the edge today. A provably vanished owner is
+    /// recorded as a FAILED row with `process_vanished`/`host_restarted`
+    /// (`reclaim.rs`) and the slot is freed; the task stays where the
+    /// declaration left it for the next launch, because moving it would mean
+    /// an automatic retry — forbidden by the human decision (REQ-AR-17). An
+    /// emitting command would be a BEHAVIOUR change, not a comment fix, so it
+    /// is not smuggled in here.
     pub const OUTCOME_MISSING: &str = "outcome_missing";
 
     /// Every name above — the closed list a declaration must cover.
@@ -370,9 +387,16 @@ impl Process {
         self.validate_brakes(where_)
     }
 
-    /// Version and condition vocabulary: present, unique, and covering the
-    /// names this build emits.
+    /// Version and condition vocabulary: both halves of the header, each in
+    /// its own check so a failure names ONE thing.
     fn validate_header(&self, where_: &str) -> Result<(), String> {
+        self.validate_version(where_)?;
+        self.validate_condition_vocabulary(where_)
+    }
+
+    /// The declaration version this build speaks (REQ-AR-16): a home on
+    /// another version is refused, never run silently under new rules.
+    fn validate_version(&self, where_: &str) -> Result<(), String> {
         if self.version != SUPPORTED_PROCESS_VERSION {
             return Err(format!(
                 "{where_}: process.version {} is not supported by this build (expected {}) — \
@@ -381,6 +405,12 @@ impl Process {
                 self.version, SUPPORTED_PROCESS_VERSION
             ));
         }
+        Ok(())
+    }
+
+    /// The closed condition vocabulary, checked BOTH ways: every name this
+    /// build emits is declared, and every declared name is one it emits.
+    fn validate_condition_vocabulary(&self, where_: &str) -> Result<(), String> {
         if self.conditions.is_empty() {
             return Err(format!(
                 "{where_}: process.conditions is empty — transitions need a closed vocabulary of names"
@@ -411,6 +441,13 @@ impl Process {
         // silently accepted here while no command can ever emit it — an
         // inert edge. The declaration and the build must agree exactly, and a
         // disagreement is an init refusal, never a warning.
+        self.reject_invented_conditions(&seen, where_)
+    }
+
+    /// The reverse half of the vocabulary check: every DECLARED name must be
+    /// one this build can emit. A declared name no command produces would be
+    /// an edge that can never fire.
+    fn reject_invented_conditions(&self, seen: &[&str], where_: &str) -> Result<(), String> {
         if let Some(unknown) = seen.iter().find(|c| !process_condition::ALL.contains(c)) {
             return Err(format!(
                 "{where_}: process.conditions declares `{unknown}`, which this build never emits — \

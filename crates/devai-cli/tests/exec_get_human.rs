@@ -1,21 +1,30 @@
 //! `exec get` WITHOUT `--json` (rework R7): the HUMAN rendering of a stored
 //! execution — status, the saved output tails and the last-activity line — is
 //! exactly what the operator reads when asking «а точно идёт?». Only the
-//! `--json` shape had a test, so the human form could drift unnoticed. This
-//! pins WHAT is printed and in WHICH ORDER:
+//! `--json` shape had a test, so the human form could drift unnoticed.
+//!
+//! The decisive case is the RUNNER's own record (`role_output_tail.txt`):
+//! `__supervise` writes it into the RUN's evidence dir while `exec get` used
+//! to look in the EXECUTION's dir, so the block was never printed on a real
+//! launch (R1 of the rework). A hand-made file in the read dir would hide
+//! that, so this test drives a REAL `task run --agent mock` and asserts the
+//! record is shown, physically lives under the run dir, and is not under the
+//! execution dir.
+//!
+//! Pinned for a real run:
 //!
 //! * the identity block (id, task, role, run, agent, status, attempt,
-//!   started) comes first, one label per line;
-//! * a closed row would add `finished:`/`summary:`/`error:` — an open one
-//!   prints none of them;
-//! * every evidence file that exists is announced with its own header and its
-//!   last lines, in the fixed order: role_output.txt → the runner's own exit
-//!   record → the live stdout → the live stderr;
-//! * `activity:` comes LAST and is derived from those files — the answer to
-//!   «when did it last say anything», never a guess.
+//!   started) comes first, one label per line, and `run:` carries the run
+//!   number the launch handed out;
+//! * the runner's exit record is printed after the identity block and before
+//!   `activity:` (the mock agent writes no role output of its own, so this
+//!   test pins the record — the block that used to be unreachable);
+//! * `activity:` comes LAST — the answer to «when did it last say anything»,
+//!   never a guess.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -55,8 +64,38 @@ fn at(out: &str, marker: &str) -> usize {
         .unwrap_or_else(|| panic!("`{marker}` must be printed, got:\n{out}"))
 }
 
+/// The evidence dirs the platform uses: `<home>/evidence/<task>/<run>` for the
+/// runner's records and `<home>/evidence/<task>/<execution>` for a row's own.
+fn evidence_dir(home: &Path, task: &str, id: &str) -> PathBuf {
+    home.join("evidence").join(task).join(id)
+}
+
+/// Run one real chain to the human gate and return `(run_id, execution_id)`.
+/// The runner writes its exit record last, so waiting for THAT file is
+/// waiting for the run to be settled — the artifact this test is about.
+fn launch_mock_run(home: &Path, task: &str) -> (String, String) {
+    let v = devai_json(home, &["task", "run", task, "--agent", "mock"]);
+    assert_eq!(v["outcome"].as_str(), Some("started"), "{v}");
+    let run_id = v["run_id"].as_str().expect("run number").to_string();
+    let exec_id = v["execution_id"]
+        .as_str()
+        .expect("execution handle")
+        .to_string();
+    let record = evidence_dir(home, task, &run_id).join("role_output_tail.txt");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !record.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the runner never recorded its exit ({})",
+            record.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    (run_id, exec_id)
+}
+
 #[test]
-fn exec_get_prints_status_tails_and_activity_in_the_documented_order() {
+fn exec_get_prints_the_runners_exit_record_written_under_the_run_dir() {
     let home = TempDir::new().unwrap();
     let h = home.path();
     devai(h, &["init"]);
@@ -64,7 +103,78 @@ fn exec_get_prints_status_tails_and_activity_in_the_documented_order() {
         .as_str()
         .unwrap()
         .to_string();
-    // A task in a role state can host an execution row.
+    let (run_id, exec_id) = launch_mock_run(h, &id);
+
+    let out = devai(h, &["exec", "get", &exec_id]);
+
+    // The identity block, in its fixed order, one label per line.
+    let labels = [
+        format!("id:        {exec_id}"),
+        format!("task:      {id}"),
+        "role:      ".to_string(),
+        format!("run:       {run_id}"),
+        "status:    COMPLETED".to_string(),
+        "attempt:   1".to_string(),
+        "started:   ".to_string(),
+    ];
+    let mut previous = 0usize;
+    for label in &labels {
+        let pos = at(&out, label);
+        assert!(
+            pos >= previous,
+            "`{label}` must follow the previous label:\n{out}"
+        );
+        previous = pos;
+    }
+
+    // The runner's record is PRINTED, in its own block, with the exit code
+    // the platform wrote — the read dir is the write dir.
+    let record_header = "── output tail (role_output_tail.txt) ──";
+    assert!(
+        at(&out, record_header) > previous,
+        "the runner's record follows the identity block:\n{out}"
+    );
+    assert!(
+        out.contains("exit_code:"),
+        "the block shows the stored exit code:\n{out}"
+    );
+    // Where the record physically is: under the RUN, never under the row.
+    let run_record = evidence_dir(h, &id, &run_id).join("role_output_tail.txt");
+    let exec_record = evidence_dir(h, &id, &exec_id).join("role_output_tail.txt");
+    assert!(
+        run_record.is_file(),
+        "the runner writes its record under the run dir ({})",
+        run_record.display()
+    );
+    assert!(
+        !exec_record.exists(),
+        "no runner record may exist under the execution dir ({})",
+        exec_record.display()
+    );
+
+    // Last fact: activity, derived from the files just shown.
+    assert!(
+        at(&out, "activity:  ") > at(&out, record_header),
+        "`activity:` closes the rendering:\n{out}"
+    );
+    assert!(
+        !out.contains("no output yet"),
+        "the run left evidence, so the activity is measured from it:\n{out}"
+    );
+}
+
+#[test]
+fn a_manual_execution_with_no_run_prints_no_runner_record_and_falls_back_to_start() {
+    // The other branch of the same rendering: a row started by hand has no
+    // run, so there is no runner dir to read and no record to show. The
+    // activity line then names the start — «no output» is a fact, not zero.
+    let home = TempDir::new().unwrap();
+    let h = home.path();
+    devai(h, &["init"]);
+    let id = devai_json(h, &["task", "new", "manual exec get", "--description", ""])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     devai(h, &["task", "start", &id]);
     devai(
         h,
@@ -83,91 +193,23 @@ fn exec_get_prints_status_tails_and_activity_in_the_documented_order() {
         .unwrap()
         .iter()
         .find(|e| e["status"].as_str() == Some("RUNNING"))
-        .unwrap_or_else(|| panic!("no RUNNING execution for {id}"))["id"]
+        .expect("a RUNNING execution")["id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    // The four evidence files the view reads, each with a recognisable line.
-    let ev = h.join("evidence").join(&id).join(&exec_id);
-    std::fs::create_dir_all(&ev).unwrap();
-    std::fs::write(
-        ev.join("role_output.txt"),
-        "exit: exit status: 0\nsettled-tail-line\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ev.join("role_output_tail.txt"),
-        "exit_code: 0\nrunner-record-line\n",
-    )
-    .unwrap();
-    std::fs::write(ev.join("role_stdout.txt"), "live-stdout-line\n").unwrap();
-    std::fs::write(ev.join("role_stderr.txt"), "live-stderr-line\n").unwrap();
-
     let out = devai(h, &["exec", "get", &exec_id]);
 
-    // The identity block, in its fixed order, one label per line.
-    let labels = [
-        format!("id:        {exec_id}"),
-        format!("task:      {id}"),
-        "role:      requirements-analyst@".to_string(),
-        "run:       -".to_string(),
-        "agent:     mock".to_string(),
-        "status:    RUNNING".to_string(),
-        "attempt:   1".to_string(),
-        "started:   ".to_string(),
-    ];
-    let mut previous = 0usize;
-    for label in &labels {
-        let pos = at(&out, label);
-        assert!(
-            pos >= previous,
-            "`{label}` must follow the previous label:\n{out}"
-        );
-        previous = pos;
-    }
-    // A row that is still RUNNING says nothing about finishing.
-    for absent in ["finished:", "summary:", "error:", "failure:"] {
-        assert!(
-            !out.contains(absent),
-            "an open row must not print `{absent}`:\n{out}"
-        );
-    }
-
-    // The tails: header then the file's own lines, in the fixed order.
-    let order = [
-        ("── output tail (role_output.txt) ──", "settled-tail-line"),
-        (
-            "── output tail (role_output_tail.txt) ──",
-            "runner-record-line",
-        ),
-        (
-            "── output tail (role_stdout.txt (live)) ──",
-            "live-stdout-line",
-        ),
-        (
-            "── output tail (role_stderr.txt (live)) ──",
-            "live-stderr-line",
-        ),
-    ];
-    let mut previous = 0usize;
-    for (header, body) in order {
-        let pos = at(&out, header);
-        assert!(pos >= previous, "`{header}` is out of order:\n{out}");
-        assert!(
-            at(&out, body) > pos,
-            "`{header}` prints the file's own line `{body}`:\n{out}"
-        );
-        previous = pos;
-    }
-
-    // Last fact: activity, derived from the files just shown.
     assert!(
-        at(&out, "activity:  ") > previous,
-        "`activity:` closes the rendering:\n{out}"
+        out.contains("run:       -"),
+        "no run on a manual row:\n{out}"
     );
     assert!(
-        !out.contains("no output yet"),
-        "the files exist, so the activity is measured from them:\n{out}"
+        !out.contains("role_output_tail.txt"),
+        "there is no runner record to print:\n{out}"
+    );
+    assert!(
+        out.contains("activity:  no output yet; started "),
+        "the start is the last known fact:\n{out}"
     );
 }
