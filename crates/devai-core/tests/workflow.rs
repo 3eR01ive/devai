@@ -534,9 +534,9 @@ fn first_publication_from_implementation_is_never_gated() {
 fn allowed_ops_rework_lists_the_gate_primitive() {
     // REQ-RG-05: the chosen loud mechanism is visible in the operations table.
     let t = rework_task();
-    let ops = workflow::allowed_ops(&t);
+    let ops = workflow::allowed_ops(proc(), &t);
     assert!(
-        ops.contains(&"raise-question"),
+        ops.contains(&"raise-question".to_string()),
         "Rework must surface the blocking question: {ops:?}"
     );
 }
@@ -563,7 +563,7 @@ fn implementation_cannot_start_without_approval() {
     .unwrap_err();
     assert!(err.to_string().contains("IMPLEMENTATION"), "{err}");
     // and cannot run an implementation role while awaiting review approval
-    assert!(workflow::check_execution_allowed("implementation-agent", &t).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "implementation-agent", &t).is_err());
 }
 
 #[test]
@@ -590,14 +590,63 @@ fn cannot_publish_spec_from_draft() {
 fn role_execution_stage_matrix() {
     let mut artifacts = vec![];
     let impl_task = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    assert!(workflow::check_execution_allowed("requirements-analyst", &impl_task).is_err());
-    assert!(workflow::check_execution_allowed("implementation-agent", &impl_task).is_ok());
-    assert!(workflow::check_execution_allowed("quality-auditor", &impl_task).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "requirements-analyst", &impl_task).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "implementation-agent", &impl_task).is_ok());
+    assert!(workflow::check_execution_allowed(proc(), "quality-auditor", &impl_task).is_err());
 
     let mut a2 = vec![];
     let qa_task = in_state(&draft_task(), TaskState::Qa, &mut a2);
-    assert!(workflow::check_execution_allowed("quality-auditor", &qa_task).is_ok());
-    assert!(workflow::check_execution_allowed("implementation-agent", &qa_task).is_err());
+    assert!(workflow::check_execution_allowed(proc(), "quality-auditor", &qa_task).is_ok());
+    assert!(workflow::check_execution_allowed(proc(), "implementation-agent", &qa_task).is_err());
+}
+
+/// Rework R1: the DECLARATION, not a code roster, decides who may run where.
+/// A state's declared executor is accepted; every other role is refused with a
+/// reason that names the declared one. Editing the declaration (here: making
+/// `requirements-reviewer` the executor of ANALYSIS) moves the answer without
+/// touching code — the live repro of the audit finding.
+#[test]
+fn the_declaration_is_the_only_role_stage_authority() {
+    let mut artifacts = vec![];
+    let analysis = in_state(&draft_task(), TaskState::Analysis, &mut artifacts);
+
+    // The factory declaration: ANALYSIS is the analyst's.
+    assert!(workflow::check_execution_allowed(proc(), "requirements-analyst", &analysis).is_ok());
+    let err = workflow::check_execution_allowed(proc(), "requirements-reviewer", &analysis)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("requirements-reviewer") && err.contains("requirements-analyst"),
+        "the refusal names the attempted and the declared role: {err}"
+    );
+
+    // Same code, another declaration: ANALYSIS is now the reviewer's, and the
+    // analyst is the one refused.
+    let mut edited = proc().clone();
+    for st in &mut edited.states {
+        if st.state == TaskState::Analysis.as_str() {
+            st.role = Some("requirements-reviewer".into());
+        }
+    }
+    assert!(
+        workflow::check_execution_allowed(&edited, "requirements-reviewer", &analysis).is_ok(),
+        "a declaration that names the role must admit its run"
+    );
+    assert!(
+        workflow::check_execution_allowed(&edited, "requirements-analyst", &analysis).is_err(),
+        "the same declaration now refuses the analyst"
+    );
+
+    // A state with no role executor admits no role at all, and says whose it is.
+    let mut a2 = vec![];
+    let approval = in_state(&draft_task(), TaskState::Approval, &mut a2);
+    let err = workflow::check_execution_allowed(proc(), "implementation-agent", &approval)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("human") && err.contains("APPROVAL"),
+        "a human state names its executor: {err}"
+    );
 }
 
 #[test]
@@ -618,7 +667,7 @@ fn accepted_task_accepts_no_more_operations() {
     assert!(workflow::pause(&proc(), &t, None, "u", now()).is_err());
     assert!(workflow::cancel(&proc(), &t, None, "u", now()).is_err());
     assert!(workflow::start(&proc(), &t, "u", now()).is_err());
-    assert!(workflow::allowed_ops(&t).is_empty());
+    assert!(workflow::allowed_ops(proc(), &t).is_empty());
 }
 
 // --- holds and intervention -------------------------------------------------
@@ -802,10 +851,10 @@ fn approval_reject_returns_to_analysis() {
 fn allowed_ops_projection() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Approval, &mut artifacts);
-    let ops = workflow::allowed_ops(&t);
-    assert!(ops.contains(&"approve"));
-    assert!(ops.contains(&"reject"));
-    assert!(!ops.contains(&"accept"));
+    let ops = workflow::allowed_ops(proc(), &t);
+    assert!(ops.contains(&"approve".to_string()));
+    assert!(ops.contains(&"reject".to_string()));
+    assert!(!ops.contains(&"accept".to_string()));
 }
 
 // --- REQ-007: the store already superseded at v3 — the stale closure must
@@ -1294,7 +1343,7 @@ fn pipeline_projection_maps_states_to_their_spine_position() {
     // every spine node's ops set comes from the same engine (no CLI table):
     for s in order {
         t.state = *s;
-        let _ = workflow::allowed_ops(&t);
+        let _ = workflow::allowed_ops(proc(), &t);
     }
 }
 

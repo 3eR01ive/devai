@@ -306,12 +306,14 @@ impl Api {
     /// Current state plus the operations the platform permits next.
     pub fn task_status(&self, id_prefix: &str) -> ApiResult<StatusView> {
         let t = self.store.resolve_task(id_prefix)?;
-        // allowed_ops depends only on the task row — computed before the row
-        // moves into the view (no re-derivation, one read each).
-        let ops: Vec<String> = workflow::allowed_ops(&t)
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
+        // ONE declaration load per status read: the allowed role-execution
+        // entries and the QA audit roster both ask the declared process
+        // (REQ-AR-09 AC1: the declaration is the only role/stage authority).
+        let process = self.process_policy()?;
+        // allowed_ops depends only on the task row and the declaration —
+        // computed before the row moves into the view (no re-derivation, one
+        // read each).
+        let ops: Vec<String> = workflow::allowed_ops(&process, &t);
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
         // REQ-QG-08: the QA gate's public availability travels WITH the status
@@ -321,7 +323,7 @@ impl Api {
             let deps = self.store.task_dependencies(t.id)?;
             let decisions = self.store.list_decisions(t.id)?;
             let executions = self.store.list_executions(Some(t.id))?;
-            quality_gate::quality_gate(&t, &artifacts, &deps, &decisions, &executions)
+            quality_gate::quality_gate(&process, &t, &artifacts, &deps, &decisions, &executions)
         } else {
             None
         };
@@ -355,6 +357,9 @@ impl Api {
     /// computed object, so a consumer never asks for it separately.
     pub fn task_progress(&self, id_prefix: &str) -> ApiResult<ProgressView> {
         let t = self.store.resolve_task(id_prefix)?;
+        // The operations this read offers are the declaration's role-execution
+        // entries (REQ-AR-09 AC1) — one load per read.
+        let process = self.process_policy()?;
         let now = Utc::now();
         let order = workflow::pipeline_order();
         let position = workflow::pipeline_position(&t);
@@ -386,10 +391,7 @@ impl Api {
                 off_spine: workflow::pipeline_off_spine(&t),
                 terminal: t.state.is_terminal(),
             },
-            allowed_operations: workflow::allowed_ops(&t)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            allowed_operations: workflow::allowed_ops(&process, &t),
             running_executions: running,
             convergence,
         })
@@ -402,9 +404,12 @@ impl Api {
         let now = Utc::now();
         let running = self.running_executions()?;
         let facts = self.execution_task_facts(&running)?;
+        // ONE declaration load for the whole snapshot (the audit mark is the
+        // declaration's answer, never a per-row config read).
+        let process = self.process_policy()?;
         let rows = running
             .iter()
-            .map(|e| self.active_row(e, &facts, now))
+            .map(|e| self.active_row(&process, e, &facts, now))
             .collect();
         Ok(ActiveSnapshot {
             snapshot_at: now,
@@ -452,6 +457,7 @@ impl Api {
     /// signals a process).
     fn active_row(
         &self,
+        process: &devai_store::config::ProcessPolicy,
         e: &RoleExecution,
         facts: &HashMap<Id, (Task, bool)>,
         now: DateTime<Utc>,
@@ -464,7 +470,7 @@ impl Api {
         // (REQ-QG-09 AC3): the active row carries the platform's words. The
         // SAME predicate the gate uses decides «live» (rework R1/R4), so an
         // orphaned row is never labelled as a running audit.
-        let note = (t.state == TaskState::Qa && quality_gate::is_live_audit(e))
+        let note = (t.state == TaskState::Qa && quality_gate::is_live_audit(process, e))
             .then(|| quality_gate::AUDIT_RUNNING_LABEL.to_string());
         ActiveRow {
             id: e.id.to_string(),
@@ -579,6 +585,9 @@ impl Api {
         let snapshot_at = Utc::now();
         let policy =
             devai_store::config::load_inbox_wait_policy(&self.config_dir().join("workflow"))?;
+        // ONE declared process for the whole snapshot: the audit mark of every
+        // row is the declaration's answer (REQ-AR-09 AC1), read once.
+        let process = self.process_policy()?;
         let tasks = self.store.list_tasks()?;
         // Batch-read cost: index the two child tables by task id in one
         // pass each, so the per-task loop below is O(T+Q+A), not O(T×(Q+A)).
@@ -599,6 +608,7 @@ impl Api {
             .into_iter()
             .map(|task| {
                 self.task_facts(
+                    &process,
                     task,
                     &policy,
                     &mut questions,
@@ -620,6 +630,7 @@ impl Api {
     /// click-presentation of its gate, taken out of the pre-built indexes.
     fn task_facts(
         &self,
+        process: &devai_store::config::ProcessPolicy,
         task: Task,
         policy: &devai_core::inbox::InboxWaitPolicy,
         questions: &mut TaskIndex<Question>,
@@ -632,8 +643,9 @@ impl Api {
         let owned_executions = executions.remove(&task.id).unwrap_or_default();
         let (spec, report, report_note) = self.gate_presentation(&task, &owned_artifacts)?;
         // REQ-QG-09: a live audit is a fact of the SAME execution snapshot the
-        // convergence slice already reads (no extra store call).
-        let audit_running = quality_gate::audit_running(&owned_executions);
+        // convergence slice already reads (no extra store call), and the
+        // roster it is judged against is the declaration's (REQ-AR-09 AC1).
+        let audit_running = quality_gate::audit_running(process, &owned_executions);
         // The SAME object the progress read answers (REQ-CV-12 AC1/AC5),
         // built ONLY for a row the wait section actually shows: a state the
         // declarative table puts in neither group (and every terminal task)

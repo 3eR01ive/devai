@@ -819,16 +819,16 @@ impl Api {
         // decided by the platform from the declaration, after the human act
         // is safely stored (a failed launch never undoes the decision).
         self.autostart_if_role_state(&m.task);
+        // The operations this answer lists name the DECLARED executor of the
+        // resulting state (REQ-AR-09 AC1) — read from the declaration here.
+        let process = self.process_policy()?;
         Ok(MutationResult {
             task: m.task.clone(),
             previous_state: task.state,
             event_kinds: m.events.iter().map(|e| e.kind.to_string()).collect(),
             staled,
             superseded,
-            allowed_operations: workflow::allowed_ops(&m.task)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            allowed_operations: workflow::allowed_ops(&process, &m.task),
         })
     }
 
@@ -1011,10 +1011,7 @@ impl Api {
             gate_report_text,
             gate_report_freshness,
             gate_human_paragraphs,
-            allowed_operations: workflow::allowed_ops(&t)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            allowed_operations: workflow::allowed_ops(&self.process_policy()?, &t),
             run_id,
         })
     }
@@ -1625,8 +1622,10 @@ impl Api {
 
     /// The process declaration in force (REQ-AR-09/16): one loader, the same
     /// one the engine and `devai init` use. A broken declaration is a typed
-    /// refusal here, never an implicit fallback.
-    fn process_policy(&self) -> ApiResult<ProcessPolicy> {
+    /// refusal here, never an implicit fallback. `pub(crate)`: the read doors
+    /// in `lib.rs` (the QA gate, the active snapshot) ask the SAME declaration
+    /// — the one role/stage authority (rework R1 of task 01a1b7dc).
+    pub(crate) fn process_policy(&self) -> ApiResult<ProcessPolicy> {
         devai_store::config::load_process_policy(&self.config_dir().join("workflow"))
             .map_err(ApiError::from)
     }
@@ -1694,10 +1693,7 @@ impl Api {
                 .filter(|(_, s)| *s == ArtifactStatus::Stale)
                 .map(|(i, _)| i.to_string())
                 .collect(),
-            allowed_operations: workflow::allowed_ops(&m.task)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            allowed_operations: workflow::allowed_ops(&process, &m.task),
         })
     }
 
@@ -2258,10 +2254,7 @@ impl Api {
             prev_report,
             current_report: current_id_s,
             state: m.task.state,
-            allowed_operations: workflow::allowed_ops(&m.task)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            allowed_operations: workflow::allowed_ops(&self.process_policy()?, &m.task),
         })
     }
 
@@ -2549,7 +2542,11 @@ impl Api {
     /// THAT workspace's (REQ-001/REQ-006: platform-side, not the caller's cwd).
     fn exec_start_in(&self, req: ExecStartReq, workspace: Option<&Path>) -> ApiResult<ExecStarted> {
         let task = self.store.resolve_task(&req.id)?;
-        workflow::check_execution_allowed(&req.role, &task)?;
+        // The declaration is the only role/stage authority (REQ-AR-09 AC1):
+        // the guard reads who executes the state FROM process.yaml, so a home
+        // that changes the executor changes who may start here.
+        let process = self.process_policy()?;
+        workflow::check_execution_allowed(&process, &req.role, &task)?;
         // REQ-SW-02 AC2: the labeled early refusal of a second RUNNING row
         // — before the index would reject it, in the old order (check,
         // then guard).
@@ -3949,7 +3946,7 @@ mod tests {
         api.task_start(&id).unwrap();
         api.exec_start(ExecStartReq {
             id: id.clone(),
-            role: "analyst".into(),
+            role: "requirements-analyst".into(),
             agent: None,
             inputs: vec![],
             run_id: None,
@@ -3959,7 +3956,7 @@ mod tests {
         let e = api
             .exec_start(ExecStartReq {
                 id: id.clone(),
-                role: "analyst".into(),
+                role: "requirements-analyst".into(),
                 agent: None,
                 inputs: vec![],
                 run_id: None,

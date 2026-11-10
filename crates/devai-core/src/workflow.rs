@@ -1443,51 +1443,53 @@ fn park_at(
 // role execution guards
 // ---------------------------------------------------------------------------
 
-/// States in which a role with the given slug may be executed. Central
-/// enforcement of role/stage separation: an external agent cannot run an
-/// Implementation execution while the task awaits approval, etc.
-pub fn role_allowed_states(slug: &str) -> &'static [TaskState] {
-    match slug {
-        "project-intelligence" => ACTIVE_STATES,
-        "requirements-analyst" => &[TaskState::Analysis, TaskState::Review],
-        "requirements-reviewer" | "architecture-reviewer" => &[TaskState::Review],
-        "implementation-agent" => &[TaskState::Implementation, TaskState::Rework],
-        "quality-auditor" | "quality-aggregator" => &[TaskState::Qa],
-        _ => ACTIVE_STATES, // custom/extension roles default to active stages
-    }
-}
-
-pub fn check_execution_allowed(slug: &str, task: &Task) -> CoreResult<()> {
-    let allowed = role_allowed_states(slug);
-    if allowed.contains(&task.state) {
-        Ok(())
-    } else {
-        Err(CoreError::InvalidTransition {
+/// Whether `slug` may be executed while the task stands in `task.state` — the
+/// DECLARATION's answer, never a code-side role/stage table (REQ-AR-09 AC1:
+/// «правка процесса — правка объявления, не кода»; QA rework R1 of task
+/// 01a1b7dc). The engine keeps NO role→stage map: `config/workflow/process.yaml`
+/// is the only place a role is bound to a state, so a home that declares
+/// another executor for a state really changes who may run there, and a
+/// refusal can only mean «the declaration does not name this role here».
+/// A state declared `human`/`none` admits no role at all.
+pub fn check_execution_allowed(process: &Process, slug: &str, task: &Task) -> CoreResult<()> {
+    let state = task.state.as_str();
+    match process.role_for(state) {
+        Some(declared) if declared == slug => Ok(()),
+        Some(declared) => Err(CoreError::InvalidTransition {
             op: "run-role-execution",
-            from: task.state.as_str().to_string(),
+            from: state.to_string(),
             hint: Some(format!(
-                "role `{slug}` may only run in {}",
-                allowed
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "state {state} is declared as executed by role `{declared}` \
+                 (config/workflow/process.yaml), not by `{slug}` — the declaration is the only \
+                 role/stage authority; edit the declaration to change it"
             )),
-        })
+        }),
+        None => {
+            let executor = process.executor_for(state).unwrap_or("undeclared");
+            Err(CoreError::InvalidTransition {
+                op: "run-role-execution",
+                from: state.to_string(),
+                hint: Some(format!(
+                    "state {state} is declared with executor `{executor}` \
+                     (config/workflow/process.yaml) — no role runs there"
+                )),
+            })
+        }
     }
 }
 
-/// Output artifact kinds of a role and the workflow effect they trigger.
-pub fn execution_output_effect(slug: &str, kind: ArtifactKind) -> Option<&'static str> {
-    match (slug, kind) {
-        ("requirements-analyst", ArtifactKind::RequirementsSpec) => Some("requirements_published"),
-        ("requirements-reviewer", ArtifactKind::ReviewReport) => Some("review_recorded"),
-        ("architecture-reviewer", ArtifactKind::ReviewReport) => Some("review_recorded"),
-        ("implementation-agent", ArtifactKind::ImplementationReport) => {
-            Some("implementation_reported")
-        }
-        ("quality-auditor", ArtifactKind::QualityReport)
-        | ("quality-aggregator", ArtifactKind::QualityReport) => Some("qa_report"),
+/// The artifact a stage publishes — STAGE SEMANTICS, not role authority
+/// (REQ-AR-17): the platform knows what analyst/reviewer/implementer/auditor
+/// work produces; WHO does it is the declaration's answer (`Process::role_for`).
+/// `Process::validate` cross-checks that every declared role state is a stage
+/// this table can drive, so a declaration the run loop cannot walk is refused
+/// at init instead of dying halfway through a run.
+pub fn stage_artifact_kind(state: TaskState) -> Option<ArtifactKind> {
+    match state {
+        TaskState::Analysis => Some(ArtifactKind::RequirementsSpec),
+        TaskState::Review => Some(ArtifactKind::ReviewReport),
+        TaskState::Implementation | TaskState::Rework => Some(ArtifactKind::ImplementationReport),
+        TaskState::Qa => Some(ArtifactKind::QualityReport),
         _ => None,
     }
 }
@@ -1575,46 +1577,59 @@ pub fn pipeline_off_spine(task: &Task) -> bool {
 
 /// Which operations the platform currently permits for the task — the
 /// answer to `GET /tasks/{id}/status`: the next allowed domain operations.
-pub fn allowed_ops(task: &Task) -> Vec<&'static str> {
-    let mut v: Vec<&'static str> = match task.state {
-        TaskState::Draft => vec!["start"],
-        TaskState::Analysis => vec![
-            "publish-requirements",
-            "run-role-execution(requirements-analyst)",
-            "raise-question",
-        ],
-        TaskState::Review => vec![
-            "record-review",
-            "run-role-execution(*-reviewer)",
-            "revise",
-            "raise-question",
-        ],
-        TaskState::Approval => vec!["approve", "reject", "revise"],
-        TaskState::Implementation => vec![
-            "publish-implementation-report",
-            "run-role-execution(implementation-agent)",
-            "revise",
-            "raise-question",
-        ],
-        TaskState::Qa => vec![
-            "accept",
-            "return",
-            "run-role-execution(quality-auditor)",
-            "run-role-execution(quality-aggregator)",
-            "revise",
-        ],
+///
+/// The `run-role-execution(…)` entries name the role the DECLARATION binds to
+/// the state (`Process::role_for`), so the listing cannot advertise an executor
+/// the process does not have (REQ-AR-09 AC1, rework R1 of task 01a1b7dc). A
+/// role state with no declared role gets no run entry: nothing may run there.
+pub fn allowed_ops(process: &Process, task: &Task) -> Vec<String> {
+    let run = |state: TaskState| -> Option<String> {
+        process
+            .role_for(state.as_str())
+            .map(|role| format!("run-role-execution({role})"))
+    };
+    let mut v: Vec<String> = match task.state {
+        TaskState::Draft => vec!["start".into()],
+        TaskState::Analysis => {
+            let mut v = vec!["publish-requirements".to_string()];
+            v.extend(run(TaskState::Analysis));
+            v.push("raise-question".into());
+            v
+        }
+        TaskState::Review => {
+            let mut v = vec!["record-review".to_string()];
+            v.extend(run(TaskState::Review));
+            v.push("revise".into());
+            v.push("raise-question".into());
+            v
+        }
+        TaskState::Approval => vec!["approve".into(), "reject".into(), "revise".into()],
+        TaskState::Implementation => {
+            let mut v = vec!["publish-implementation-report".to_string()];
+            v.extend(run(TaskState::Implementation));
+            v.push("revise".into());
+            v.push("raise-question".into());
+            v
+        }
+        TaskState::Qa => {
+            let mut v = vec!["accept".to_string(), "return".to_string()];
+            v.extend(run(TaskState::Qa));
+            v.push("revise".into());
+            v
+        }
         // REQ-RG-05: the empty-rework gate's loud primitive is the blocking
         // question, so the REWORK row of this table names it (the gate itself
         // raises it at publication; the listing is the operator's surface).
-        TaskState::Rework => vec![
-            "publish-implementation-report",
-            "run-role-execution(implementation-agent)",
-            "revise",
-            "raise-question",
-        ],
-        TaskState::WaitingForInput => vec!["answer"],
-        TaskState::Paused | TaskState::Failed => vec!["resume"],
-        TaskState::Blocked => vec!["resume"],
+        TaskState::Rework => {
+            let mut v = vec!["publish-implementation-report".to_string()];
+            v.extend(run(TaskState::Rework));
+            v.push("revise".into());
+            v.push("raise-question".into());
+            v
+        }
+        TaskState::WaitingForInput => vec!["answer".into()],
+        TaskState::Paused | TaskState::Failed => vec!["resume".into()],
+        TaskState::Blocked => vec!["resume".into()],
         // The merge gate (REQ-WT-07) is deliberately NOT a workflow
         // operation: merging the task's `rework/<task-id>` branch into the
         // baseline is a repository act performed by the human `devai task
@@ -1625,9 +1640,9 @@ pub fn allowed_ops(task: &Task) -> Vec<&'static str> {
         TaskState::Cancelled => vec![],
     };
     if !task.state.is_terminal() && !task.state.is_hold() {
-        v.push("pause");
-        v.push("block");
-        v.push("cancel");
+        v.push("pause".into());
+        v.push("block".into());
+        v.push("cancel".into());
     }
     v
 }

@@ -21,5 +21,5 @@ pub use types::{
 };
 pub use workflow::{
     Mutation, allowed_ops, check_execution_allowed, effective_blockers, open_blockers,
-    override_covers, role_allowed_states,
+    override_covers,
 };

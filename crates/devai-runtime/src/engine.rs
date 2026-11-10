@@ -726,16 +726,8 @@ impl<'a> Engine<'a> {
             // REQ-AR-11: «запуск производен от состояния» — WHO executes the
             // state is the declaration's answer, not a second stage map in
             // code. The artifact kind each stage publishes is stage semantics
-            // (REQ-AR-17), so it stays beside the role it belongs to.
-            let stage_kind = |s: TaskState| match s {
-                TaskState::Analysis => Some(ArtifactKind::RequirementsSpec),
-                TaskState::Review => Some(ArtifactKind::ReviewReport),
-                TaskState::Implementation | TaskState::Rework => {
-                    Some(ArtifactKind::ImplementationReport)
-                }
-                TaskState::Qa => Some(ArtifactKind::QualityReport),
-                _ => None,
-            };
+            // (REQ-AR-17), so it stays beside the role it belongs to — and the
+            // declaration is cross-checked against it at init.
             let Some(role_slug) = self.process.role_for(task.state.as_str()) else {
                 // No declared role for this state: a human gate, a hold or a
                 // terminal state — the platform launches nothing (REQ-AR-11
@@ -749,7 +741,7 @@ impl<'a> Engine<'a> {
                 });
             };
             let role_slug = role_slug.to_string();
-            let Some(kind) = stage_kind(task.state) else {
+            let Some(kind) = workflow::stage_artifact_kind(task.state) else {
                 return Err(RuntimeError::Process(format!(
                     "state {} is declared as executed by role `{role_slug}`, but the platform has \
                      no stage artifact for it — the declaration and the stage semantics disagree",
@@ -939,8 +931,10 @@ impl<'a> Engine<'a> {
         binding_warnings: Vec<String>,
         ratified_anchors: std::collections::BTreeMap<String, crate::human_view::Ratified>,
     ) -> RuntimeResult<StageResult> {
-        // Sovereignty check first: the role may only run in this stage.
-        workflow::check_execution_allowed(role_slug, task)?;
+        // Sovereignty check first: the role may only run in this stage — the
+        // DECLARATION names the executor of the state, there is no code-side
+        // role/stage table to overrule it (REQ-AR-09 AC1, rework R1).
+        workflow::check_execution_allowed(&self.process, role_slug, task)?;
 
         let role = self
             .store

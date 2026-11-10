@@ -243,6 +243,26 @@ impl Process {
             .map(|s| s.executor.as_str())
     }
 
+    /// The roles the declaration CONFINES to `state`: named by that state's
+    /// row and by no other row. This is the declaration's answer to «which
+    /// roles are the executors of this stage only?» — the QA gate and the
+    /// active-executions view ask it for the audit roster, so the roster is
+    /// derived from data instead of a second list in code (rework R1/R4 of
+    /// task 01a1b7dc).
+    pub fn roles_confined_to(&self, state: &str) -> Vec<&str> {
+        self.states
+            .iter()
+            .filter(|s| s.state == state && s.executor == process_executor::ROLE)
+            .filter_map(|s| s.role.as_deref())
+            .filter(|role| {
+                !self
+                    .states
+                    .iter()
+                    .any(|other| other.state != state && other.role.as_deref() == Some(*role))
+            })
+            .collect()
+    }
+
     /// The raw declared target of one edge (`RETURN_STATE` included).
     pub fn transition_target(&self, from: &str, on: &str) -> Option<&str> {
         self.transitions
@@ -424,12 +444,41 @@ impl Process {
         Ok(())
     }
 
-    /// One state row: executor/role agreement, closed outcome names, edges
-    /// for every outcome, and the mandatory coverage per executor kind.
+    /// One state row: executor/role agreement, a stage the platform can drive,
+    /// closed outcome names, edges for every outcome, and the mandatory
+    /// coverage per executor kind.
     fn validate_state(&self, st: &ProcessState, where_: &str) -> Result<(), String> {
         self.validate_executor(st, where_)?;
+        self.validate_role_stage(st, where_)?;
         self.validate_outcomes(st, where_)?;
         self.validate_coverage(st, where_)
+    }
+
+    /// A role state must be a stage this build can drive: the code owns what a
+    /// stage publishes, the declaration owns who runs it (REQ-AR-17). A
+    /// declaration that elects a role for a state with no stage artifact would
+    /// die MID-WALK, so it is refused here — the code⇄declaration disagreement
+    /// is an init refusal, never a surprise in battle (REQ-AR-09 AC1).
+    fn validate_role_stage(&self, st: &ProcessState, where_: &str) -> Result<(), String> {
+        if st.executor != process_executor::ROLE {
+            return Ok(());
+        }
+        let state = TaskState::parse(&st.state).map_err(|_| {
+            format!(
+                "{where_}: state {} is not a state name — cannot check its stage artifact",
+                st.state
+            )
+        })?;
+        if crate::workflow::stage_artifact_kind(state).is_none() {
+            return Err(format!(
+                "{where_}: state {} is declared as executed by role `{}`, but the platform has \
+                 no stage artifact for that state — the declaration and the stage semantics \
+                 disagree, so this process cannot be walked (REQ-AR-17)",
+                st.state,
+                st.role.as_deref().unwrap_or("")
+            ));
+        }
+        Ok(())
     }
 
     /// Every declared outcome is a CLOSED name and has an edge — a state that

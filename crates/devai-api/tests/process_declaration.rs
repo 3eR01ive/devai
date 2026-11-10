@@ -150,3 +150,87 @@ fn the_factory_declaration_is_valid() {
     .unwrap();
     assert_eq!(m.task.state, TaskState::Analysis);
 }
+
+/// Rework R1 (the live repro of the audit finding): the state's DECLARED
+/// executor is what admits a launch. The code keeps no role→stage roster, so a
+/// declaration that names `requirements-reviewer` for ANALYSIS really admits
+/// its run — init and run cannot disagree, because there is only one side.
+#[test]
+fn a_declared_role_is_admitted_by_the_run_guard() {
+    let text = factory_text().replace(
+        "      role: requirements-analyst",
+        "      role: requirements-reviewer",
+    );
+    let (_dir, api) = home_with(&text);
+    let id = task(&api, "declared executor runs");
+    api.task_start(&id).unwrap();
+    let started = api
+        .exec_start(devai_api::ExecStartReq {
+            id: id.clone(),
+            role: "requirements-reviewer".into(),
+            agent: None,
+            inputs: Vec::new(),
+            run_id: None,
+        })
+        .unwrap();
+    assert_eq!(started.execution.role_slug, "requirements-reviewer");
+    assert_eq!(started.task.state, TaskState::Analysis);
+    // The operator-facing listing follows the same declaration: it offers the
+    // role the process binds to ANALYSIS, not a table frozen in code.
+    let ops = api.task_status(&id).unwrap().allowed_operations;
+    assert!(
+        ops.contains(&"run-role-execution(requirements-reviewer)".to_string()),
+        "the listing must offer the DECLARED executor: {ops:?}"
+    );
+    assert!(
+        !ops.contains(&"run-role-execution(requirements-analyst)".to_string()),
+        "the listing must not keep a code-side roster: {ops:?}"
+    );
+}
+
+/// The other side of the same fact: a role the declaration does NOT name for
+/// the state is refused, and the refusal is human — it names the state, the
+/// attempted role and the declared one, so an operator knows what to edit.
+#[test]
+fn a_role_the_declaration_does_not_name_here_is_refused_in_words() {
+    let (_dir, api) = home_with(&factory_text());
+    let id = task(&api, "declared executor only");
+    api.task_start(&id).unwrap();
+    let err = api
+        .exec_start(devai_api::ExecStartReq {
+            id,
+            role: "requirements-reviewer".into(),
+            agent: None,
+            inputs: Vec::new(),
+            run_id: None,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("ANALYSIS"), "{err}");
+    assert!(err.contains("requirements-reviewer"), "{err}");
+    assert!(
+        err.contains("requirements-analyst"),
+        "the refusal names the role the declaration DOES bind to the state: {err}"
+    );
+}
+
+/// The reverse divergence is refused at INIT, not in battle: a declaration
+/// that elects a role for a state the platform has no stage artifact for (the
+/// human approval gate) cannot be walked, so `devai init` refuses it and names
+/// the state and the elected role.
+#[test]
+fn a_role_on_a_state_without_a_stage_is_refused_at_init() {
+    let text = factory_text().replace(
+        "    - state: APPROVAL\n      executor: human\n",
+        "    - state: APPROVAL\n      executor: role\n      role: implementation-agent\n",
+    );
+    let err = init_refusal(&text);
+    assert!(
+        err.contains("APPROVAL"),
+        "the refusal names the state: {err}"
+    );
+    assert!(
+        err.contains("implementation-agent") && err.contains("no stage artifact"),
+        "the refusal names the elected role and the missing stage: {err}"
+    );
+}
