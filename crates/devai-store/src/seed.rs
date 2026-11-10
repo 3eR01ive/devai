@@ -67,6 +67,10 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
     // the volume window of the human signboard is config, a broken or
     // inverted declaration fails the seed loudly.
     config::load_task_name_policy(&dir.join("workflow"))?;
+    // REQ-AF-05/06: the parking threshold and the anti-spam window are
+    // validated at init time — a threshold below 1 or a zero window is a
+    // LOUD seed error, never a silently disabled gate.
+    config::load_agent_failure_policy(&dir.join("workflow"))?;
     let inserted = config::seed_roles(store, &cfg, now)?;
 
     for (name, version, schema) in contracts() {

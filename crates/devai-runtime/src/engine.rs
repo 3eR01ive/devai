@@ -10,11 +10,12 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use devai_core::agent_failure::Classified;
 use devai_core::error::CoreError;
 use devai_core::types::*;
 use devai_core::workflow;
 use devai_store::config::{
-    HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
+    AgentFailurePolicy, HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
 };
 use devai_store::{ArtifactDraft, Store, StoreError};
 
@@ -296,6 +297,134 @@ impl FormLoopHost for StageAttempts<'_> {
     }
 }
 
+/// The raw evidence one adapter error carries, before classification
+/// (task 01a1b60c, REQ-AF-01/10): both streams, the exit code, the duration,
+/// the driver-journal excerpt and an honest note when the journal is absent.
+#[derive(Default)]
+struct AgentFailureEvidence {
+    message: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    hint: Option<&'static str>,
+    reported_ms: Option<u64>,
+    log_tail: Option<String>,
+    log_note: Option<String>,
+}
+
+/// Everything the platform observed at execution completion, as fields — the
+/// store takes THIS shape and never parses text for the cause.
+fn agent_failure_evidence(err: &AdapterError) -> AgentFailureEvidence {
+    match err {
+        AdapterError::AgentFailure(r) => AgentFailureEvidence {
+            message: r.message.clone(),
+            exit_code: r.exit_code,
+            stdout: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+            hint: r.hint,
+            reported_ms: Some(r.duration_ms),
+            log_tail: r.driver_log_tail.clone(),
+            log_note: r.driver_log_note.clone(),
+        },
+        AdapterError::UnknownProvider(name) => AgentFailureEvidence {
+            message: format!("unknown agent provider `{name}`"),
+            hint: Some("unknown_provider"),
+            log_note: Some("процесс не запускался: неизвестный провайдер".into()),
+            ..Default::default()
+        },
+        AdapterError::Io(e) => AgentFailureEvidence {
+            message: format!("failed to launch agent process: {e}"),
+            hint: if e.kind() == std::io::ErrorKind::NotFound {
+                Some("launch_not_found")
+            } else {
+                None
+            },
+            log_note: Some("процесс не запустился — журнала драйвера за прогон нет".into()),
+            ..Default::default()
+        },
+        other => AgentFailureEvidence {
+            message: other.to_string(),
+            log_note: Some(
+                "журнал драйвера не приложен: отказ пришёл не от процесса драйвера".into(),
+            ),
+            ..Default::default()
+        },
+    }
+}
+
+/// The detailed cause and its ground, from code first, then text (REQ-AF-02).
+fn agent_failure_class(ev: &AgentFailureEvidence) -> Classified {
+    devai_core::agent_failure::classify(
+        ev.exit_code,
+        &format!("{}\n{}\n{}", ev.message, ev.stderr, ev.stdout),
+        ev.hint,
+    )
+}
+
+/// Fold the observed evidence into the store's input row: bounded tails, the
+/// classified cause, the declared threshold/window and the failure moment
+/// (REQ-AF-01 AC3, REQ-AF-10 AC4). `tail` is EMPTY when no stream spoke
+/// (REQ-AF-01 AC2); the process message rides its own field so the cause is
+/// never hidden (REQ-AF-09 AC3). The store's `provider` column is the DRIVER,
+/// `runtime` is the LLM-provider (REQ-MS-01 vocabulary).
+fn agent_failure_record(
+    task: &Task,
+    agent: &AgentInstance,
+    execution: &RoleExecution,
+    now: Timestamp,
+    ev: &AgentFailureEvidence,
+    classified: &Classified,
+    p: &AgentFailurePolicy,
+) -> AgentFailureRecord {
+    let duration_ms = agent_failure_duration_ms(ev, execution, now);
+    AgentFailureRecord {
+        id: new_id(),
+        task_id: task.id,
+        execution_id: Some(execution.id),
+        agent_name: agent.name.clone(),
+        driver: agent.provider.clone(),
+        llm_provider: agent.runtime.clone(),
+        model: agent.model.clone(),
+        class: classified.class.to_string(),
+        exit_code: ev.exit_code,
+        duration_ms: Some(duration_ms),
+        tail: agent_failure_tail(ev, p.tail_chars),
+        output_empty: ev.stdout.trim().is_empty() && ev.stderr.trim().is_empty(),
+        driver_log_tail: ev
+            .log_tail
+            .as_deref()
+            .map(|l| crate::adapters::tail_chars(l, p.driver_log_chars)),
+        driver_log_note: ev.log_note.clone(),
+        message: crate::adapters::tail_chars(&ev.message, p.tail_chars),
+        basis: classified.basis.clone(),
+        threshold: p.park_threshold as i64,
+        window_minutes: p.window_minutes as i64,
+        at: now,
+    }
+}
+
+/// The duration the adapter observed, else the platform's own measurement of
+/// the execution (REQ-AF-01 AC3).
+fn agent_failure_duration_ms(
+    ev: &AgentFailureEvidence,
+    execution: &RoleExecution,
+    now: Timestamp,
+) -> i64 {
+    ev.reported_ms
+        .unwrap_or_else(|| (now - execution.started_at).num_milliseconds().max(0) as u64) as i64
+}
+
+/// The bounded stream excerpt: stderr when it spoke, else stdout — EMPTY when
+/// neither did (REQ-AF-01 AC2).
+fn agent_failure_tail(ev: &AgentFailureEvidence, limit: usize) -> String {
+    let stream = if !ev.stderr.trim().is_empty() {
+        ev.stderr.as_str()
+    } else {
+        ev.stdout.as_str()
+    };
+    crate::adapters::tail_chars(stream, limit)
+}
+
 pub struct Engine<'a> {
     store: &'a Store,
     max_steps: usize,
@@ -322,6 +451,13 @@ pub struct Engine<'a> {
     /// platform-owned `config/workflow/*.yaml` data, never hardcoded at a
     /// call site. `max_repair_attempts = 0` keeps today's one-shot behavior.
     response_form: ResponseFormPolicy,
+    /// Declarative agent-failure visibility (task 01a1b60c, REQ-AF-05/06/10):
+    /// parking threshold, anti-spam window and bounded tails from
+    /// `config/workflow/agent-failure.yaml`.
+    agent_failure: devai_store::config::AgentFailurePolicy,
+    /// A present-but-broken failure policy is LOUD at the next stage — the
+    /// same held-error discipline as the humanization template.
+    agent_failure_config_error: Option<String>,
     /// Declarative humanization template (task 01a1acfe, REQ-HP-04): the
     /// paragraph's volume window, explanation slots, register and detector
     /// thresholds — `config/workflow/humanize.yaml`, loaded once per run,
@@ -376,6 +512,18 @@ impl<'a> Engine<'a> {
         let response_form =
             devai_store::config::load_response_form_policy(&cfg_dir.join("workflow"))
                 .unwrap_or_default();
+        // Agent-failure policy (task 01a1b60c). Absent file/dir => factory
+        // defaults; present-but-broken => held and raised loudly at the next
+        // stage, never a silently disabled threshold/window.
+        let mut agent_failure_config_error = None;
+        let agent_failure =
+            match devai_store::config::load_agent_failure_policy(&cfg_dir.join("workflow")) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    agent_failure_config_error = Some(e.to_string());
+                    devai_store::config::AgentFailurePolicy::default()
+                }
+            };
         // Humanization template (REQ-HP-04). Absent file/dir => the embedded
         // factory bytes (`Default` — the same values `humanize.yaml`
         // declares). Present-but-broken => the error is HELD and raised
@@ -426,6 +574,8 @@ impl<'a> Engine<'a> {
             workspace,
             force_reaudit: false,
             response_form,
+            agent_failure,
+            agent_failure_config_error,
             humanize,
             humanize_config_error,
             task_name,
@@ -841,6 +991,79 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Persist ONE observed agent failure and, at the declared threshold,
+    /// park the task (task 01a1b60c, REQ-AF-01/05/06/10). The counter,
+    /// window boundary and conditional `agent.failed` event land in the
+    /// store's single transaction; the parking question is a normal
+    /// workflow mutation on top of it. A below-threshold failure leaves the
+    /// task where it is — visible in progress, not parked (REQ-AF-05 AC3).
+    fn note_agent_failure(
+        &self,
+        task: &Task,
+        agent: &AgentInstance,
+        execution: &RoleExecution,
+        err: &AdapterError,
+        actor: &str,
+    ) -> Result<(), RuntimeError> {
+        let ev = agent_failure_evidence(err);
+        let now = Utc::now();
+        let classified = agent_failure_class(&ev);
+        let rec = agent_failure_record(
+            task,
+            agent,
+            execution,
+            now,
+            &ev,
+            &classified,
+            &self.agent_failure,
+        );
+        let recorded = self.store.record_agent_failure(&rec)?;
+        if recorded.series_count < self.agent_failure.park_threshold as i64 {
+            return Ok(());
+        }
+        self.park_agent_failure(task, agent, &rec, classified.class, &recorded, actor)
+    }
+
+    /// At (or over) the threshold park the task — unless it is already in a
+    /// hold/terminal state, where no further run can be started anyway. The
+    /// question is a normal workflow mutation on top of the recorded fact: it
+    /// gives no FAILED verdict and passes no gate (REQ-AF-05 AC4/AC6).
+    fn park_agent_failure(
+        &self,
+        task: &Task,
+        agent: &AgentInstance,
+        rec: &AgentFailureRecord,
+        class: &'static str,
+        recorded: &AgentFailureRecorded,
+        actor: &str,
+    ) -> Result<(), RuntimeError> {
+        let current = self.store.get_task(&task.id.to_string())?;
+        if current.state.is_hold() || current.state.is_terminal() {
+            return Ok(());
+        }
+        let m = workflow::park_agent_failure(
+            &current,
+            new_id(),
+            workflow::AgentFailureParking {
+                agent: &agent.name,
+                class,
+                series_count: recorded.series_count,
+                threshold: self.agent_failure.park_threshold as i64,
+                first_at: recorded.first_at,
+                last_at: recorded.last_at,
+                tail: &rec.tail,
+                action: devai_core::agent_failure::action(class),
+                execution_id: rec.execution_id,
+            },
+            actor,
+            rec.at,
+        )?;
+        self.store.commit(current.lock_version, &m)?;
+        self.store
+            .mark_agent_failure_parked(task.id, &agent.name, rec.at)?;
+        Ok(())
+    }
+
     /// Run exactly one stage end-to-end: guard, execute (through the
     /// adapter-owned form loop, this engine hosting one execution row per
     /// attempt), publish, commit. `StageResult::Escalated` is returned when
@@ -949,6 +1172,9 @@ impl<'a> Engine<'a> {
         // `Ok(None)` => NO section is added (a first-run prompt stays
         // byte-identical); a broken delivery table fails loudly HERE, never
         // masquerades as "nothing to deliver".
+        if let Some(err) = &self.agent_failure_config_error {
+            return Err(RuntimeError::Store(StoreError::Config(err.clone())));
+        }
         if let Some(err) = &self.rework_config_error {
             return Err(RuntimeError::Store(StoreError::Config(err.clone())));
         }
@@ -1312,6 +1538,15 @@ impl<'a> Engine<'a> {
                 if let Some(se) = hook.store_err {
                     return Err(RuntimeError::Store(se));
                 }
+                // THE agent-failure fact (task 01a1b60c, REQ-AF-01 AC6):
+                // written by the PLATFORM here, at completion of the failed
+                // execution — never by the launching loop, so a killed or
+                // restarted driver cannot erase it. Form and platform
+                // failures are NOT agent failures and write no such event
+                // (REQ-AF-01 AC5).
+                if e.failure_class() == failure_class::PROVIDER {
+                    self.note_agent_failure(task, &agent, &hook.open, &e, actor)?;
+                }
                 // The failing attempt's row was closed by the host with its
                 // class; the task state is untouched — history says what
                 // happened, workflow says nothing moved.
@@ -1486,6 +1721,10 @@ impl<'a> Engine<'a> {
             None,
             Utc::now(),
         )?;
+        // REQ-AF-05 AC2/AC6: a successful execution of the agent ANYWHERE
+        // resets its consecutive-failure series. Answering a parked question
+        // does not — only success does.
+        self.store.reset_agent_failure_series(&agent.name)?;
 
         // Publish the result as a formal, content-addressed artifact.
         let depends: Vec<Id> = spec.iter().map(|s| s.id).collect();

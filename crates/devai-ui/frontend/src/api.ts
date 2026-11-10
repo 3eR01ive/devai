@@ -9,6 +9,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
   ActiveSnapshot,
+  AgentStatusView,
   Artifact,
   ArtifactContent,
   BundleFormInput,
@@ -163,6 +164,9 @@ export const api = {
 
   questionsList: (id_prefix: string) =>
     invoke<Question[]>("questions_list", { id_prefix }),
+  // Строки статуса агентов (задача 01a1b60c, REQ-AF-07): одна фраза платформы
+  // на агента — окно ничего не собирает и не перефразирует.
+  agentStatuses: () => invoke<AgentStatusView[]>("agent_statuses"),
   executionsList: (task_ref: string | null) =>
     invoke<RoleExecution[]>("executions_list", { task_ref }),
   executionLiveness: (exec_id: string) =>

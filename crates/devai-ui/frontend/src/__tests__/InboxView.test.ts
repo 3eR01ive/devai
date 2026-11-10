@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import InboxView from "../views/InboxView.vue";
 import { resetWaitStoreForTests } from "../inbox";
 import {
+  agentFailure,
+  agentStatus,
   artifact,
   note,
   question,
@@ -21,10 +23,15 @@ import {
 const mocks = vi.hoisted(() => ({
   inboxView: vi.fn(),
   sessionInfo: vi.fn(),
+  agentStatuses: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
-  api: { inboxView: mocks.inboxView, sessionInfo: mocks.sessionInfo },
+  api: {
+    inboxView: mocks.inboxView,
+    sessionInfo: mocks.sessionInfo,
+    agentStatuses: mocks.agentStatuses,
+  },
   toUiError: (e: unknown) => e,
 }));
 
@@ -40,6 +47,8 @@ async function mountWith(snap: unknown) {
 beforeEach(() => {
   resetWaitStoreForTests();
   mocks.inboxView.mockReset();
+  mocks.agentStatuses.mockReset();
+  mocks.agentStatuses.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -188,6 +197,33 @@ describe("InboxView branches", () => {
       snapshot({ notes: [note(task("kkkk", "IMPLEMENTATION"), question("q-10", { blocking: false }))], badge: 1 }),
     );
     expect(w.text()).not.toContain("Платформа нигде не ждёт оператора");
+    w.unmount();
+  });
+
+  it("agent status lines and a parked agent failure are printed as the platform words", async () => {
+    // REQ-AF-07/08: строка статуса приходит готовой (`line`), факт парковки —
+    // фактами строки ожидания; кнопок починки нет ни у того, ни у другого.
+    mocks.agentStatuses.mockResolvedValue([agentStatus()]);
+    const parked = row(task("llll", "WAITING_FOR_INPUT"), {
+      open_questions: [question("q-af", { blocking: true })],
+      agent_failure: agentFailure(),
+    });
+    const w = await mountWith(snapshot({ waiting: [parked], badge: 1 }));
+    const head = w.text();
+    expect(head).toContain("hermes: недоступен, модель исчезла у провайдера");
+    expect(head).toContain("5 отказов с 10.11 12:00");
+    await w.find(".panel-toggle").trigger("click");
+    const text = w.text();
+    expect(text).toContain("Отказ агента:");
+    expect(text).toContain("модель исчезла у провайдера");
+    expect(text).toContain("3 из 3");
+    expect(text).toContain("задача припаркована");
+    expect(text).toContain("Действие: перевыпустить агента");
+    expect(text).toContain("провайдера и ключ не меняет");
+    expect(text).toContain("404 Model not exist");
+    expect(text).toContain("журнал драйвера за прогон пуст");
+    // Честный статус, не починка: никакой кнопки «исправить/перезапустить».
+    expect(text.toLowerCase()).not.toContain("починить");
     w.unmount();
   });
 });

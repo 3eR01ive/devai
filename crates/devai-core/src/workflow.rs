@@ -963,6 +963,102 @@ pub fn escalate_form_rejection(
     Ok(m)
 }
 
+/// What one agent-failure parking carries into the human question
+/// (task 01a1b60c, REQ-AF-05 AC5): agent, class, counts, time span, tail and
+/// the class action. Plain data — the core owns the wording.
+pub struct AgentFailureParking<'a> {
+    pub agent: &'a str,
+    pub class: &'a str,
+    pub series_count: i64,
+    pub threshold: i64,
+    pub first_at: Timestamp,
+    pub last_at: Timestamp,
+    pub tail: &'a str,
+    pub action: &'a str,
+    /// The latest execution the platform observed failing — cited in the
+    /// question context so the operator can open its full row.
+    pub execution_id: Option<Id>,
+}
+
+/// N consecutive agent failures park the task (task 01a1b60c, REQ-AF-05):
+/// WAITING_FOR_INPUT on a blocking question in the accepted human form
+/// («что случилось / почему важно / что сделать»). The stage is remembered
+/// by `transition` and restored on answer; the SERIES is NOT reset by an
+/// answer (REQ-AF-05 AC6) — only a successful execution resets it. No gate
+/// verdict is produced, no terminal status is given, and no automatic switch
+/// is promised (REQ-AF-09).
+pub fn park_agent_failure(
+    task: &Task,
+    question_id: Id,
+    p: AgentFailureParking<'_>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "park-agent-failure",
+        CoreError::hint("only an active stage can be parked by an agent failure"),
+    )?;
+    let word = crate::agent_failure::word(p.class);
+    let tail = if p.tail.trim().is_empty() {
+        "(хвост вывода пуст — драйвер ничего не сказал; сохранённый код возврата и журнал драйвера остаются в событии agent.failed)".to_string()
+    } else {
+        p.tail.to_string()
+    };
+    let mut m = transition(
+        task,
+        TaskState::WaitingForInput,
+        event_kind::QUESTION_RAISED,
+        actor,
+        now,
+        json!({
+            (json_field::QUESTION_ID): question_id.to_string(),
+            "blocking": true,
+            (json_field::GATE): "agent-failure",
+            (json_field::AGENT): p.agent,
+            (json_field::CLASS): p.class,
+            (json_field::SERIES_COUNT): p.series_count,
+            (json_field::THRESHOLD): p.threshold,
+            "execution_id": p.execution_id.map(|e| e.to_string()),
+        }),
+    );
+    m.questions.push(QuestionDraft {
+        id: question_id,
+        text: format!(
+            "Что случилось: агент `{agent}` отказал {count} раз подряд на этой задаче (порог {threshold}); последний класс — {word} (`{class}`). Первый отказ {first}, последний {last}.\n\
+             Почему важно: задача не продвигается, а платформа ничего не чинит сама — не переключает модель, провайдера или ключ и не меняет гейты. Пока причина не устранена, следующий прогон упрётся в тот же отказ.\n\
+             Что сделать: {action}; затем ответьте на этот вопрос — стадия вернётся, и прогон можно повторить (`devai task run`).\n\
+             Последний сохранённый вывод: {tail}",
+            agent = p.agent,
+            count = p.series_count,
+            threshold = p.threshold,
+            word = word,
+            class = p.class,
+            first = p.first_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            last = p.last_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            action = p.action,
+            tail = tail,
+        ),
+        context: Some(format!(
+            "gate=agent-failure agent={} class={} count={} threshold={} execution={}",
+            p.agent,
+            p.class,
+            p.series_count,
+            p.threshold,
+            p.execution_id
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "-".into()),
+        )),
+        options: vec![
+            "устранить причину и повторить прогон".into(),
+            "ответить с указанием, что делать дальше".into(),
+        ],
+        blocking: true,
+    });
+    Ok(m)
+}
+
 /// The human retelling of a form exhaustion (ratified OQ-HP-5): simple
 /// words, what happened and what changes, BEFORE the formal violation list.
 /// Deterministic by construction — categories are classified from the

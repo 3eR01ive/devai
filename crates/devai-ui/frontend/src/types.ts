@@ -163,6 +163,53 @@ export interface ProgressView {
   running_executions: RunningExecutionView[];
   /** Срез сходимости (REQ-CV-12); null только у терминальных задач. */
   convergence: ConvergenceView | null;
+  /** Факт отказа агента (задача 01a1b60c): строка и ниже-порога, и парковки. */
+  agent_failure: AgentFailureView | null;
+}
+
+// --- отказы агента (задача 01a1b60c, REQ-AF-01..10) ---
+// Данные платформы как есть: слова причины и действие приходят полями,
+// окно их не выводит заново. Хвост ограничен; полный текст — в строке
+// выполнения и событии agent.failed.
+export interface AgentFailureView {
+  agent: string;
+  class: string;
+  class_word: string;
+  action: string;
+  series_count: number;
+  threshold: number;
+  window_count: number;
+  total_failures: number;
+  first_at: string;
+  last_at: string;
+  parked: boolean;
+  exit_code: number | null;
+  duration_ms: number | null;
+  tail: string;
+  output_empty: boolean;
+  driver_log_tail: string | null;
+  driver_log_note: string | null;
+  message: string;
+  basis: string;
+}
+
+/** Строка статуса агента — ОДНА фраза платформы (`line`), не собранная здесь. */
+export interface AgentStatusView {
+  name: string;
+  driver: string;
+  llm_provider: string;
+  model: string;
+  availability: string;
+  availability_word: string;
+  last_class: string | null;
+  last_class_word: string;
+  last_failure_at: string | null;
+  last_outcome_at: string | null;
+  last_seen_at: string;
+  failures: number;
+  series: number;
+  series_first_at: string | null;
+  line: string;
 }
 
 export interface ActiveRow {
@@ -558,6 +605,8 @@ export interface WaitRow {
    * последняя).
    */
   convergence: ConvergenceView | null;
+  /** Факт отказа агента, если он был (задача 01a1b60c, REQ-AF-08). */
+  agent_failure: AgentFailureView | null;
 }
 
 // --- сходимость стадии (REQ-CV-05/09/12) ---

@@ -140,6 +140,10 @@ pub struct WaitRow {
     /// The task's convergence slice (REQ-CV-12), identical to the object the
     /// `task.progress` read answers; the row picks the stage to draw.
     pub convergence: Option<ConvergenceView>,
+    /// The task's agent-failure fact (task 01a1b60c, REQ-AF-08): the agent,
+    /// the class in words, the count against the threshold and the stored
+    /// question. Rendered as a fact line in the row; no repair button exists.
+    pub agent_failure: Option<devai_core::types::AgentFailureView>,
 }
 
 // The spec/review parse rules are DEVAI-API's (REQ-SIGN-12): the window
@@ -323,6 +327,13 @@ pub const COMMAND_CONTRACTS: &[CommandContract] = &[
         version: 1,
         breaking: "",
     },
+    // The agent status row (task 01a1b60c, REQ-AF-07): first published
+    // shape — ONE derived line plus the counters, no stored status.
+    CommandContract {
+        command: "agent_statuses",
+        version: 1,
+        breaking: "",
+    },
     CommandContract {
         command: "task_approve",
         version: 1,
@@ -429,6 +440,9 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("artifact_content", "artifact.cat_text"),
     ("artifact_content", "artifact.cat"),
     ("questions_list", "question.list"),
+    // Agent status rows (task 01a1b60c, REQ-AF-07): derived availability,
+    // last failure class and counters — ONE read, same words as the CLI.
+    ("agent_statuses", "agent.status"),
     ("executions_list", "exec.list"),
     ("execution_liveness", "exec.liveness"),
     // The whole human-wait section is ONE batch read:
@@ -1055,6 +1069,11 @@ pub fn questions_list(state: State<AppState>, id_prefix: String) -> Result<Vec<Q
 
 /// Execution rows of one task (or all): RUNNING/COMPLETED/FAILED/
 /// CANCELLED tokens as stored (`ExecutionStatus` in `devai-core`).
+#[tauri::command]
+pub fn agent_statuses(state: State<AppState>) -> Result<Vec<devai_api::AgentStatusView>, UiError> {
+    Ok(state.api().agent_status_list()?)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub fn executions_list(
     state: State<AppState>,
@@ -1313,6 +1332,7 @@ fn wait_row_from(
         report_note,
         audit_running: _,
         convergence,
+        agent_failure,
     } = facts;
     let open_questions: Vec<Question> = questions
         .into_iter()
@@ -1342,6 +1362,7 @@ fn wait_row_from(
         report,
         report_note,
         convergence,
+        agent_failure,
     }))
 }
 
@@ -2393,6 +2414,7 @@ mod tests {
             report: None,
             report_note: None,
             convergence: None,
+            agent_failure: None,
         }
     }
 
@@ -2524,6 +2546,7 @@ mod tests {
             report: None,
             report_note: None,
             convergence: None,
+            agent_failure: None,
         };
         let snapshot = WaitSnapshot {
             waiting: vec![row],
@@ -2770,6 +2793,7 @@ mod tests {
             report_note: None,
             audit_running: false,
             convergence: None,
+            agent_failure: None,
         }
     }
 

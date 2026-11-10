@@ -3230,3 +3230,137 @@ fn a_marked_bundle_without_a_reasoning_level_refuses_the_run() {
         "the refusal happens before any execution row or driver launch"
     );
 }
+
+/// Task 01a1b60c (REQ-AF-01/05/06/10): a provider-class refusal is recorded
+/// by the PLATFORM, one event per anti-spam window; below the threshold the
+/// task keeps its stage, at the threshold it parks in WAITING_FOR_INPUT on a
+/// blocking question, and answering restores the stage WITHOUT resetting the
+/// series (only a success resets it).
+#[test]
+fn agent_failures_are_recorded_and_park_at_the_threshold() {
+    let (_d, store) = store();
+    let t = Task::new(
+        "Отказ агента",
+        "Агент падает: платформа должна записать отказ и припарковать",
+        None,
+        Utc::now(),
+    );
+    store.create_task(&t).unwrap();
+    store
+        .put_agent(&AgentInstance {
+            id: new_id(),
+            name: "broken".into(),
+            provider: "mock-agent-fail".into(),
+            model: String::new(),
+            runtime: String::new(),
+            reasoning: String::new(),
+            created_at: Utc::now(),
+            active: false,
+        })
+        .unwrap();
+    let engine = mk_engine(&store);
+    let id = t.id.to_string();
+
+    // 1st failure: below the threshold — the task is NOT parked.
+    assert!(engine.advance(&id, "broken", "tester").is_err());
+    let task = store.get_task(&id).unwrap();
+    assert_eq!(task.state, TaskState::Analysis);
+    assert!(
+        store
+            .list_questions(t.id)
+            .unwrap()
+            .iter()
+            .all(|q| q.status != QuestionStatus::Open || !q.blocking),
+        "below the threshold there is no blocking question"
+    );
+    let failed = |store: &Store| -> Vec<WorkflowEvent> {
+        store
+            .events(t.id, None)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == event_kind::AGENT_FAILED)
+            .collect()
+    };
+    assert_eq!(failed(&store).len(), 1);
+    let p = &failed(&store)[0].payload;
+    assert_eq!(p["class"], "provider_model");
+    assert_eq!(p["failure_class"], failure_class::PROVIDER);
+    assert_eq!(
+        p["output_empty"], true,
+        "the mock incident has empty streams"
+    );
+    assert_eq!(p["tail"], "", "the empty-output tail stays empty");
+    assert_eq!(p["series_count"], 1);
+    assert_eq!(p["threshold"], 3);
+    // REQ-AF-01 AC6: the execution failure stays its OWN fact beside
+    // `agent.failed` — the two are never merged.
+    assert!(
+        store
+            .events(t.id, None)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == event_kind::EXECUTION_FAILED),
+        "execution.failed must remain a separate event"
+    );
+
+    // 2nd failure: still below.
+    assert!(engine.advance(&id, "broken", "tester").is_err());
+    assert_eq!(store.get_task(&id).unwrap().state, TaskState::Analysis);
+
+    // 3rd failure: threshold reached — park, and the anti-spam window still
+    // carries ONE event (the repeats only grew the counter).
+    assert!(engine.advance(&id, "broken", "tester").is_err());
+    let parked = store.get_task(&id).unwrap();
+    assert_eq!(parked.state, TaskState::WaitingForInput);
+    assert_eq!(parked.return_state, Some(TaskState::Analysis));
+    let questions = store.list_questions(t.id).unwrap();
+    let q = questions
+        .iter()
+        .find(|q| q.status == QuestionStatus::Open && q.blocking)
+        .expect("a blocking question parks the task");
+    assert!(q.text.contains("Что случилось") && q.text.contains("Что сделать"));
+    assert!(q.text.contains("mock-agent-fail") || q.text.contains("broken"));
+    assert_eq!(failed(&store).len(), 1, "one event per window");
+    let series = store.agent_failure_series(t.id, "broken").unwrap().unwrap();
+    assert_eq!(series.consecutive_count, 3);
+    assert!(series.parked_at.is_some());
+
+    // Answering restores the stage but does NOT reset the series.
+    let m = workflow::answer_question(&parked, q.id, "tester", Utc::now()).unwrap();
+    store.commit(parked.lock_version, &m).unwrap();
+    let back = store.get_task(&id).unwrap();
+    assert_eq!(back.state, TaskState::Analysis);
+    assert_eq!(
+        store
+            .agent_failure_series(t.id, "broken")
+            .unwrap()
+            .unwrap()
+            .consecutive_count,
+        3,
+        "only a success resets the series (REQ-AF-05 AC6)"
+    );
+
+    // A SUCCESSFUL execution of the SAME agent resets the series.
+    store
+        .put_agent(&AgentInstance {
+            id: new_id(),
+            name: "broken".into(),
+            provider: "mock".into(),
+            model: String::new(),
+            runtime: String::new(),
+            reasoning: String::new(),
+            created_at: Utc::now(),
+            active: false,
+        })
+        .unwrap();
+    engine
+        .advance(&id, "broken", "tester")
+        .expect("the recovered agent carries the stage forward");
+    assert!(
+        store
+            .agent_failure_series(t.id, "broken")
+            .unwrap()
+            .is_none(),
+        "success anywhere resets the agent's series"
+    );
+}

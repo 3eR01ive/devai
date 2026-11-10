@@ -1,0 +1,22 @@
+# Agent-failure visibility (task 01a1b60c, REQ-AF-05/06/10).
+# Platform protocol data — the same idiom as `response_form:` and
+# `humanize:`: a merge-scan of `workflow/*.yaml` for the `agent_failure:`
+# section (`devai_store::config::load_agent_failure_policy`). A home without
+# this file behaves exactly like these factory bytes
+# (`AgentFailurePolicy::default()`); editing a value needs no rebuild.
+# A typo'd key or an out-of-range value is a LOUD config error at
+# `devai init` and held loudly at the next stage — never a silent default.
+agent_failure:
+  # N consecutive agent failures of ONE task park it in WAITING_FOR_INPUT
+  # with a blocking question (REQ-AF-05). Less than 1 is rejected loudly.
+  park_threshold: 3
+  # Anti-spam window: the first failure of a class per agent inside the
+  # window writes `agent.failed`; repeats grow the window counter
+  # (REQ-AF-06). Zero is rejected loudly.
+  window_minutes: 10
+  # Bounded error tail carried by the event and by compact surfaces; the
+  # full text stays on the execution row (REQ-AF-01 AC4, REQ-AF-09 AC3).
+  tail_chars: 2000
+  # Bounded tail of the DRIVER's own journal for the run, attached when the
+  # driver said nothing on stderr (REQ-AF-10; ratified R1).
+  driver_log_chars: 2000

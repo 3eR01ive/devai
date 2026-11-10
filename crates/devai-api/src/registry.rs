@@ -93,7 +93,13 @@ pub struct OpDescriptor {
 /// rows (`note`), and `inbox.snapshot` facts gain `audit_running` so a running
 /// audit is not presented as a human wait. Wire-visible additions, so the
 /// stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@10";
+///
+/// `@11` names the agent-failure increment (task 01a1b60c, REQ-AF-01..10):
+/// the surface gains `agent.status` (the derived availability/class line),
+/// `task.progress` and `inbox.snapshot` facts gain `agent_failure`, and the
+/// agent-failure vocabulary (`agent.failed` events and their payload) is
+/// published as data. Wire-visible additions, so the stamp says so.
+pub const SURFACE_VERSION: &str = "api-surface@11";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -178,7 +184,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.progress",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions, convergence}",
+            output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions, convergence, agent_failure}",
             description: "Pipeline position, re-entry note, the snapshot of RUNNING executions and the convergence slice of the task (per repeatable stage the rounds read out of stored carriers, their computed modes and honest gaps; null on terminal tasks). Drawn purely from engine data. Mirrors `task progress`.",
         },
         OpDescriptor {
@@ -476,7 +482,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "inbox.snapshot",
             class: OpClass::Read,
             input: "()",
-            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, audit_running, convergence}>}",
+            output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, audit_running, convergence, agent_failure}>}",
             description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks and on rows outside the wait section. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
         },
         // ---- questions ----
@@ -536,6 +542,13 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "()",
             output: "Vec<AgentInstance>",
             description: "List registered agents.",
+        },
+        OpDescriptor {
+            name: "agent.status",
+            class: OpClass::Read,
+            input: "()",
+            output: "Vec<AgentStatusView{name, driver, llm_provider, model, availability, availability_word, last_class, last_class_word, last_failure_at, last_outcome_at, last_seen_at, failures, series, series_first_at, line}>",
+            description: "The derived agent status row (task 01a1b60c, REQ-AF-07): availability from the latest executed outcome (available / unavailable / unknown), the last failure class in human words and the ONE rendered line, the failure counters and the time. No stored status exists — the row folds stored executions and failure windows at read time. Mirrors `devai agent list`.",
         },
         OpDescriptor {
             name: "model.snapshot",
@@ -834,7 +847,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@10");
+        assert_eq!(SURFACE_VERSION, "api-surface@11");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")
@@ -894,6 +907,25 @@ mod tests {
             .find(|o| o.name == "model.bundle_handle")
             .expect("@8 surface must publish model.bundle_handle (ASM-9)");
         assert_eq!(handle.class, OpClass::Read);
+        // @11's own increment (task 01a1b60c): the derived agent status row is
+        // a read, and the failure fact rides the two reads that already
+        // existed (progress + the wait snapshot) — no separate mutation.
+        let status = ops
+            .iter()
+            .find(|o| o.name == "agent.status")
+            .expect("@11 surface must publish agent.status (REQ-AF-07)");
+        assert_eq!(status.class, OpClass::Read);
+        for name in ["task.progress", "inbox.snapshot"] {
+            let op = ops
+                .iter()
+                .find(|o| o.name == name)
+                .unwrap_or_else(|| panic!("@11: {name} stays published"));
+            assert!(
+                op.output.contains("agent_failure"),
+                "@11: {name} must carry the agent-failure fact: {}",
+                op.output
+            );
+        }
     }
 
     #[test]
