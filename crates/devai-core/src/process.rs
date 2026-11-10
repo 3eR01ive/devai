@@ -324,6 +324,14 @@ impl Process {
     pub fn factory() -> &'static Process {
         static FACTORY: OnceLock<Process> = OnceLock::new();
         FACTORY.get_or_init(|| {
+            // invariant: the panic below is unreachable — `FACTORY_YAML` is
+            // compiled into this binary by `include_str!`, and the build
+            // refuses to ship a declaration that does not parse: the loader
+            // tests (`config.rs`) parse these very bytes through `parse()`,
+            // and `devai init` validates the same file on every home. So an
+            // invalid embedded declaration is a broken build, not a runtime
+            // state; returning a `Result` here would push that impossibility
+            // onto every caller of `factory()`.
             parse(FACTORY_YAML, "embedded config/workflow/process.yaml")
                 .unwrap_or_else(|e| panic!("the embedded process declaration is invalid: {e}"))
         })
@@ -397,6 +405,19 @@ impl Process {
                      so a transition on it must be expressible"
                 ));
             }
+        }
+        // The check runs BOTH ways (rework R10): the table above is not the
+        // source of the list, so a name the declaration invents would be
+        // silently accepted here while no command can ever emit it — an
+        // inert edge. The declaration and the build must agree exactly, and a
+        // disagreement is an init refusal, never a warning.
+        if let Some(unknown) = seen.iter().find(|c| !process_condition::ALL.contains(c)) {
+            return Err(format!(
+                "{where_}: process.conditions declares `{unknown}`, which this build never emits — \
+                 the condition vocabulary is closed on both sides (known names: {}); a declared \
+                 name no command produces is an edge that can never fire",
+                process_condition::ALL.join(", ")
+            ));
         }
         Ok(())
     }

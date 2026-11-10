@@ -1398,7 +1398,7 @@ fn wait_for_run(ctx: &Ctx, first_exec: &str, json: bool) -> Result<()> {
         if state != devai_runtime::liveness::Liveness::Alive {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(WAIT_POLL_INTERVAL);
     }
     let task_ref = row.task_id.to_string();
     let run_id = row
@@ -1577,10 +1577,13 @@ fn supervise(
         Ok(tail) => tail,
         Err(e) => format!("(transcript unreadable: {e})"),
     };
-    let _ = std::fs::write(
-        ev.join(devai_runtime::launch::RUNNER_TAIL_FILE),
-        format!("exit_code: {code}\n{tail}\n"),
-    );
+    // R5: the record is best effort — the runner's exit is not cancelled by a
+    // failed write — but the failure is NOT silence: it lands in this
+    // process's stderr, which is the run's own `supervisor.log`.
+    let tail_path = ev.join(devai_runtime::launch::RUNNER_TAIL_FILE);
+    if let Err(e) = std::fs::write(&tail_path, format!("exit_code: {code}\n{tail}\n")) {
+        devai_runtime::trace::note_failure("runner exit record", &tail_path, &e);
+    }
     match result? {
         Some(report) => {
             if json {
@@ -2544,6 +2547,11 @@ const EXEC_TAIL_LINES: usize = 20;
 /// The stderr slice is narrower than stdout's: errors are the sharp end, and
 /// the combined ordering matters more than volume.
 const EXEC_STDERR_TAIL_LINES: usize = 10;
+
+/// How often `--wait` re-observes the owner process of the launched run.
+/// The wait is on the PROCESS (REQ-AR-03), and the store is the record of
+/// which process it is — so this is a poll of platform data, not a pipe.
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {

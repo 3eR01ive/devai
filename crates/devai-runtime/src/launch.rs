@@ -32,6 +32,11 @@ pub const RUNNER_SUBCOMMAND: &str = "__supervise";
 /// budget, not a run budget.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often [`wait_for_handshake`] re-reads the ack file while it waits.
+/// A bounded poll of a FILE, never a read on a pipe: no pipe survives the
+/// caller, so no SIGPIPE can turn a launch into a phantom.
+pub const ACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// The runner's own transcript, under the run's evidence directory.
 pub const SUPERVISOR_LOG: &str = "supervisor.log";
 
@@ -370,7 +375,7 @@ fn wait_for_handshake(
                 hs.log.display()
             )));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(ACK_POLL_INTERVAL);
     }
 }
 

@@ -95,8 +95,14 @@ fn persist_output_tail(evidence: Option<&std::path::Path>, out: &std::process::O
         crate::tail::TAIL_LINES,
         crate::tail::tail_of_bytes(&out.stderr, crate::tail::TAIL_LINES),
     );
-    let _ = std::fs::create_dir_all(dir);
-    let _ = std::fs::write(dir.join("role_output.txt"), body);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        crate::trace::note_failure("role evidence dir", dir, &e);
+        return;
+    }
+    let path = dir.join("role_output.txt");
+    if let Err(e) = std::fs::write(&path, body) {
+        crate::trace::note_failure("role output tail", &path, &e);
+    }
 }
 
 /// The LIVE transcript files of one execution, in its evidence dir. The child

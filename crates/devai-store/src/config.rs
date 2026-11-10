@@ -3339,6 +3339,28 @@ mod process_declaration_tests {
         assert!(e.contains(process_condition::LAUNCH_FAILED), "{e}");
     }
 
+    /// REQ-AR-15 / rework R10: conditions are a CLOSED vocabulary on BOTH
+    /// sides. A name the declaration invents is refused by init instead of
+    /// living on as an edge no command can ever emit.
+    #[test]
+    fn a_declared_condition_this_build_never_emits_is_refused_by_init() {
+        let mut p = factory_process_policy().unwrap();
+        // The factory file covers the build's vocabulary exactly.
+        assert_eq!(p.conditions.len(), process_condition::ALL.len());
+        p.conditions.push("role_finished".into());
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains("role_finished"), "{e}");
+        assert!(e.contains("never emits"), "{e}");
+
+        // And the other direction is refused too: a build-emitted name the
+        // declaration dropped can never be expressed by a transition.
+        let mut p = factory_process_policy().unwrap();
+        p.conditions
+            .retain(|c| c != process_condition::OUTCOME_MISSING);
+        let e = p.validate("process.yaml").unwrap_err().to_string();
+        assert!(e.contains(process_condition::OUTCOME_MISSING), "{e}");
+    }
+
     /// A declaration loaded from the home's workflow directory is the one in
     /// force (data changes behavior, not code) — and a broken one fails the
     /// load loudly.

@@ -21,6 +21,9 @@
 mod error;
 mod homes;
 mod inbox;
+mod launch_admission;
+mod launch_brakes;
+mod launch_observe;
 mod models;
 mod mutations;
 mod quality_gate;
@@ -104,6 +107,81 @@ fn group_by_task<T>(rows: Vec<T>, task_id: impl Fn(&T) -> Id) -> TaskIndex<T> {
         index.entry(task_id(&row)).or_default().push(row);
     }
     index
+}
+
+/// The child tables of ONE inbox snapshot, indexed by task id. Rows are taken
+/// OUT of the index (`remove`) — `list_tasks` returns each task once, so that
+/// is safe and avoids cloning every row.
+struct SnapshotIndexes {
+    questions: TaskIndex<Question>,
+    artifacts: TaskIndex<Artifact>,
+    executions: TaskIndex<RoleExecution>,
+}
+
+/// The convergence slice of a row the wait section actually SHOWS
+/// (REQ-CV-12 AC1/AC5) — the same object the progress read answers. A state
+/// the declarative table puts in neither group, and every terminal task,
+/// answers null and its bodies are never read (REQ-CV-16 AC3).
+fn wait_convergence(
+    state: TaskState,
+    policy: &devai_core::inbox::InboxWaitPolicy,
+    artifacts: &[Artifact],
+    executions: &[RoleExecution],
+    bodies: &convergence::BodyCache<'_>,
+) -> Option<convergence::ConvergenceView> {
+    let wait_row = policy
+        .state(state)
+        .map(|s| s.group != WaitGroup::NotWait)
+        .unwrap_or(false);
+    (wait_row && !state.is_terminal()).then(|| convergence::compute(artifacts, executions, bodies))
+}
+
+/// The RUNNING rows of one task as the progress view shows them. `now` is the
+/// snapshot instant, so every row of one answer is measured against the SAME
+/// clock instead of drifting row by row.
+fn running_views(executions: &[RoleExecution], now: DateTime<Utc>) -> Vec<RunningExecutionView> {
+    executions
+        .iter()
+        .filter(|e| e.status == ExecutionStatus::Running)
+        .map(|e| RunningExecutionView {
+            id: e.id.to_string(),
+            role: format!("{}@{}", e.role_slug, e.role_version),
+            role_slug: e.role_slug.clone(),
+            role_version: e.role_version,
+            agent_name: e.agent_name.clone(),
+            started_at: e.started_at,
+            elapsed_seconds: (now - e.started_at).num_seconds().max(0),
+        })
+        .collect()
+}
+
+/// WHERE the row's work lives, as the snapshot shows it: only when the
+/// platform RECORDED that the worktree was prepared (`worktree.prepared`) —
+/// otherwise nothing at all, never an invented path.
+fn worktree_link(prepared: bool, task_id: Id, home: &Path) -> (Option<String>, Option<String>) {
+    if !prepared {
+        return (None, None);
+    }
+    (
+        Some(devai_runtime::worktree::branch_name(task_id)),
+        Some(
+            devai_runtime::worktree::path_for(home, task_id)
+                .display()
+                .to_string(),
+        ),
+    )
+}
+
+/// The platform's words for a row that is a LIVE quality audit at the QA gate
+/// (REQ-QG-09 AC3). The SAME predicate the gate uses decides «live» (rework
+/// R1/R4), so an orphaned row is never labelled as a running audit.
+fn audit_note(
+    process: &devai_store::config::ProcessPolicy,
+    task: &Task,
+    e: &RoleExecution,
+) -> Option<String> {
+    (task.state == TaskState::Qa && quality_gate::is_live_audit(process, e))
+        .then(|| quality_gate::AUDIT_RUNNING_LABEL.to_string())
 }
 
 /// WHO is calling an operation, as the DOOR declared it (RV4 AC2). A
@@ -365,19 +443,7 @@ impl Api {
         let position = workflow::pipeline_position(&t);
         let pos_idx = position.and_then(|p| order.iter().position(|s| *s == p));
         let executions = self.store.list_executions(Some(t.id))?;
-        let running: Vec<RunningExecutionView> = executions
-            .iter()
-            .filter(|e| e.status == ExecutionStatus::Running)
-            .map(|e| RunningExecutionView {
-                id: e.id.to_string(),
-                role: format!("{}@{}", e.role_slug, e.role_version),
-                role_slug: e.role_slug.clone(),
-                role_version: e.role_version,
-                agent_name: e.agent_name.clone(),
-                started_at: e.started_at,
-                elapsed_seconds: (now - e.started_at).num_seconds().max(0),
-            })
-            .collect();
+        let running = running_views(&executions, now);
         let artifacts = self.store.artifacts(t.id)?;
         let convergence = self.task_convergence(&t, &artifacts, &executions);
         Ok(ProgressView {
@@ -467,11 +533,9 @@ impl Api {
             liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
         let terminal = t.state.is_terminal();
         // A live quality audit at the QA gate is a PROCESS, not a human wait
-        // (REQ-QG-09 AC3): the active row carries the platform's words. The
-        // SAME predicate the gate uses decides «live» (rework R1/R4), so an
-        // orphaned row is never labelled as a running audit.
-        let note = (t.state == TaskState::Qa && quality_gate::is_live_audit(process, e))
-            .then(|| quality_gate::AUDIT_RUNNING_LABEL.to_string());
+        // (REQ-QG-09 AC3): the active row carries the platform's words.
+        let note = audit_note(process, t, e);
+        let (branch, worktree) = worktree_link(*prepared, e.task_id, &self.home);
         ActiveRow {
             id: e.id.to_string(),
             task_id: e.task_id.to_string(),
@@ -488,12 +552,8 @@ impl Api {
             owner_pid: e.owner_pid,
             owner_host: e.owner_host.clone(),
             owner_liveness: live.as_str().to_string(),
-            branch: prepared.then(|| devai_runtime::worktree::branch_name(e.task_id)),
-            worktree: prepared.then(|| {
-                devai_runtime::worktree::path_for(&self.home, e.task_id)
-                    .display()
-                    .to_string()
-            }),
+            branch,
+            worktree,
             note,
         }
     }
@@ -589,40 +649,30 @@ impl Api {
         // row is the declaration's answer (REQ-AR-09 AC1), read once.
         let process = self.process_policy()?;
         let tasks = self.store.list_tasks()?;
-        // Batch-read cost: index the two child tables by task id in one
-        // pass each, so the per-task loop below is O(T+Q+A), not O(T×(Q+A)).
-        // `list_tasks` returns each task once, so taking rows OUT of the
-        // index (remove) is safe and avoids cloning every row.
-        let mut questions = group_by_task(self.store.questions_all()?, |q| q.task_id);
-        let mut artifacts = group_by_task(self.store.artifacts_all()?, |a| a.task_id);
-        // ONE execution snapshot for the whole section: the convergence
-        // fact of a gate row needs the rows its carriers name, and a
-        // per-row query would put the fan-out back (REQ-CV-09 AC5).
-        let mut executions = group_by_task(self.store.list_executions(None)?, |e| e.task_id);
+        let mut indexes = self.snapshot_indexes()?;
         // ONE body cache for the whole snapshot (REQ-CV-12 AC7/AC8): a spec
         // bound to N reviews of five tasks is read once, not once per row.
         let read = |a: &Artifact| self.store.read_artifact_body(a);
         let bodies = convergence::BodyCache::from_reader(&read);
-
         let facts = tasks
             .into_iter()
-            .map(|task| {
-                self.task_facts(
-                    &process,
-                    task,
-                    &policy,
-                    &mut questions,
-                    &mut artifacts,
-                    &mut executions,
-                    &bodies,
-                )
-            })
+            .map(|task| self.task_facts(&process, task, &policy, &mut indexes, &bodies))
             .collect::<ApiResult<Vec<_>>>()?;
-
         Ok(InboxSnapshotView {
             snapshot_at,
             policy,
             tasks: facts,
+        })
+    }
+
+    /// The child tables of ONE snapshot, each read once and indexed by task id
+    /// — the batch read's cost guard: the per-task loop below is O(T+Q+A),
+    /// never O(T×(Q+A)).
+    fn snapshot_indexes(&self) -> ApiResult<SnapshotIndexes> {
+        Ok(SnapshotIndexes {
+            questions: group_by_task(self.store.questions_all()?, |q| q.task_id),
+            artifacts: group_by_task(self.store.artifacts_all()?, |a| a.task_id),
+            executions: group_by_task(self.store.list_executions(None)?, |e| e.task_id),
         })
     }
 
@@ -633,36 +683,24 @@ impl Api {
         process: &devai_store::config::ProcessPolicy,
         task: Task,
         policy: &devai_core::inbox::InboxWaitPolicy,
-        questions: &mut TaskIndex<Question>,
-        artifacts: &mut TaskIndex<Artifact>,
-        executions: &mut TaskIndex<RoleExecution>,
+        indexes: &mut SnapshotIndexes,
         bodies: &convergence::BodyCache<'_>,
     ) -> ApiResult<InboxTaskFacts> {
-        let owned_questions = questions.remove(&task.id).unwrap_or_default();
-        let owned_artifacts = artifacts.remove(&task.id).unwrap_or_default();
-        let owned_executions = executions.remove(&task.id).unwrap_or_default();
+        let owned_questions = indexes.questions.remove(&task.id).unwrap_or_default();
+        let owned_artifacts = indexes.artifacts.remove(&task.id).unwrap_or_default();
+        let owned_executions = indexes.executions.remove(&task.id).unwrap_or_default();
         let (spec, report, report_note) = self.gate_presentation(&task, &owned_artifacts)?;
         // REQ-QG-09: a live audit is a fact of the SAME execution snapshot the
         // convergence slice already reads (no extra store call), and the
         // roster it is judged against is the declaration's (REQ-AR-09 AC1).
         let audit_running = quality_gate::audit_running(process, &owned_executions);
-        // The SAME object the progress read answers (REQ-CV-12 AC1/AC5),
-        // built ONLY for a row the wait section actually shows: a state the
-        // declarative table puts in neither group (and every terminal task)
-        // answers null and its bodies are never read (REQ-CV-16 AC3).
-        let wait_row = policy
-            .state(task.state)
-            .map(|s| s.group != WaitGroup::NotWait)
-            .unwrap_or(false);
-        let convergence = if wait_row && !task.state.is_terminal() {
-            Some(convergence::compute(
-                &owned_artifacts,
-                &owned_executions,
-                bodies,
-            ))
-        } else {
-            None
-        };
+        let convergence = wait_convergence(
+            task.state,
+            policy,
+            &owned_artifacts,
+            &owned_executions,
+            bodies,
+        );
         Ok(InboxTaskFacts {
             task,
             questions: owned_questions,

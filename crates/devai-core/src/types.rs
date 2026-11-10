@@ -1428,6 +1428,12 @@ pub mod event_kind {
     /// A declared brake tripped (REQ-AR-09/13): the task is parked with the
     /// reason and the counter; nothing auto-continues from here.
     pub const PROCESS_PARKED: &str = "process.parked";
+    /// A best-effort evidence write of the run did NOT land (rework R5): the
+    /// settled outcome a `--wait` caller reads back. The role's result is not
+    /// lost — the rows still explain the run — but the failure is a FACT with
+    /// the path and the reason, never silence. Payload: `{run_id, path,
+    /// reason, what}`.
+    pub const EXECUTION_EVIDENCE_UNWRITTEN: &str = "execution.evidence_unwritten";
     /// One attempt of the response-form correction loop was rejected by the
     /// contract gate (REQ-FG-07: the loop is LOUD — attempts and the FULL
     /// violation list are events, not silent retries). Payload: execution id,
@@ -1570,6 +1576,7 @@ pub mod event_kind {
         EXECUTION_LAUNCH_FAILED,
         EXECUTION_LOST,
         PROCESS_PARKED,
+        EXECUTION_EVIDENCE_UNWRITTEN,
         EXECUTION_FORM_REJECTED,
         EXECUTION_FORM_ESCALATED,
         EXECUTION_CANCELLED,

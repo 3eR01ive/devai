@@ -956,7 +956,11 @@ impl Api {
     /// quality report, freshness, human paragraphs) plus the allowed
     /// operations. Shared by the inline drive and the `--wait` read-back of a
     /// detached run, so both paths show the operator the SAME gate view.
-    fn run_view(&self, report: RunReport, run_id: Option<String>) -> ApiResult<RunOutcome> {
+    pub(crate) fn run_view(
+        &self,
+        report: RunReport,
+        run_id: Option<String>,
+    ) -> ApiResult<RunOutcome> {
         // The gate renderings read the presented quality report — the same
         // status-aware selection (REQ-005, REQ-QH-05/06) the UI panel uses:
         // the stored human form when present, the §2.6 text otherwise, plus
@@ -969,41 +973,8 @@ impl Api {
         };
         let gate_report_text = presented.as_ref().map(|p| p.text.clone());
         let gate_report_freshness = presented.map(|p| p.freshness);
-        let current_quality_report = match report.gate {
-            Gate::ReportFresh => self.store.artifacts(report.task_id)?.into_iter().find(|x| {
-                x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current
-            }),
-            _ => None,
-        };
-        // REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
-        // presentation — approval/review reads spec + review, acceptance
-        // reads the implementation-report. Stored fields, verbatim; absence
-        // (a legacy @1/@2 CURRENT, a non-JSON body) renders as NO paragraph,
-        // never as a broken gate (REQ-HP-06 non-retroactivity in the render
-        // half too).
-        let mut gate_human_paragraphs: Vec<(String, String)> = Vec::new();
-        match report.gate {
-            Gate::WaitingApproval => {
-                for (kind, label) in [
-                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
-                    (ArtifactKind::ReviewReport, "review-report"),
-                ] {
-                    if let Some(p) = self.stored_human_paragraph(report.task_id, kind, label)? {
-                        gate_human_paragraphs.push(p);
-                    }
-                }
-            }
-            Gate::WaitingAccept | Gate::ReportFresh => {
-                if let Some(p) = self.stored_human_paragraph(
-                    report.task_id,
-                    ArtifactKind::ImplementationReport,
-                    "implementation-report",
-                )? {
-                    gate_human_paragraphs.push(p);
-                }
-            }
-            _ => {}
-        }
+        let current_quality_report = self.fresh_quality_report(&report)?;
+        let gate_human_paragraphs = self.gate_paragraphs(&report)?;
         let t = self.store.get_task(&report.task_id.to_string())?;
         Ok(RunOutcome {
             report,
@@ -1014,6 +985,51 @@ impl Api {
             allowed_operations: workflow::allowed_ops(&self.process_policy()?, &t),
             run_id,
         })
+    }
+
+    /// The CURRENT quality report the FRESH gate presents (REQ-005): the row
+    /// the gate names, read from the store — never re-derived from the report.
+    fn fresh_quality_report(&self, report: &RunReport) -> ApiResult<Option<Artifact>> {
+        if report.gate != Gate::ReportFresh {
+            return Ok(None);
+        }
+        Ok(self
+            .store
+            .artifacts(report.task_id)?
+            .into_iter()
+            .find(|x| x.kind == ArtifactKind::QualityReport && x.status == ArtifactStatus::Current))
+    }
+
+    /// The paragraph half of the gate presentation (REQ-HP-05, ratified
+    /// OQ-HP-1): approval/review reads spec + review, acceptance reads the
+    /// implementation-report. Stored fields, verbatim; absence (a legacy
+    /// @1/@2 CURRENT, a non-JSON body) renders as NO paragraph, never as a
+    /// broken gate (REQ-HP-06 non-retroactivity in the render half too).
+    fn gate_paragraphs(&self, report: &RunReport) -> ApiResult<Vec<(String, String)>> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        match report.gate {
+            Gate::WaitingApproval => {
+                for (kind, label) in [
+                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
+                    (ArtifactKind::ReviewReport, "review-report"),
+                ] {
+                    if let Some(p) = self.stored_human_paragraph(report.task_id, kind, label)? {
+                        out.push(p);
+                    }
+                }
+            }
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                if let Some(p) = self.stored_human_paragraph(
+                    report.task_id,
+                    ArtifactKind::ImplementationReport,
+                    "implementation-report",
+                )? {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+        Ok(out)
     }
 
     // ---- asynchronous launch (REQ-AR-01..08) -------------------------------
@@ -1093,33 +1109,17 @@ impl Api {
                 Ok(answer(None, RunLaunch::Refused, Some(reason)))
             }
             Err(e) => {
-                self.record_launch_failure(task, Self::launch_failure_class(&e), &e.to_string())?;
+                self.record_launch_failure(
+                    task,
+                    crate::launch_brakes::launch_failure_class(&e),
+                    &e.to_string(),
+                )?;
                 Err(ApiError::refused(
                     "launch_failed",
                     format!("launch failed: {e}"),
                 ))
             }
         }
-    }
-
-    /// «Состояние с человеком прогона не порождает» (REQ-AR-11 AC2): the
-    /// declaration says who executes the state; a human/none state is a typed
-    /// «нельзя», NOT a launch failure (nothing was tried). A DRAFT is the one
-    /// bookkeeping step the runner performs before the first role opens, so it
-    /// is launchable.
-    fn state_launch_refusal(&self, task: &Task) -> ApiResult<Option<String>> {
-        if task.state == TaskState::Draft {
-            return Ok(None);
-        }
-        let policy = self.process_policy()?;
-        let state = task.state.as_str();
-        if policy.role_for(state).is_some() {
-            return Ok(None);
-        }
-        let executor = policy.executor_for(state).unwrap_or("none");
-        Ok(Some(format!(
-            "state {state} is executed by `{executor}`, not by a role — nothing to launch"
-        )))
     }
 
     /// The one launch request this call describes: the home, the task, the run
@@ -1183,126 +1183,6 @@ impl Api {
         Ok(self.store.get_task(&task.id.to_string())?)
     }
 
-    /// ADMISSION (REQ-AR-06/11/13): does this state have a role, is there an
-    /// executable agent, is a brake tripped, is the task already owned? Every
-    /// «no» travels through the ack, so a caller that already returned still
-    /// receives it — and none of them touches a running chain.
-    fn admit_launch(
-        &self,
-        task: &Task,
-        policy: &ProcessPolicy,
-        req: &SupervisedRunReq,
-    ) -> ApiResult<Option<String>> {
-        let state = task.state.as_str().to_string();
-        let Some(role) = policy.role_for(&state).map(|r| r.to_string()) else {
-            let executor = policy.executor_for(&state).unwrap_or("none");
-            self.refuse_launch(
-                req,
-                &format!(
-                    "state {state} is executed by `{executor}`, not by a role — nothing to launch"
-                ),
-            );
-            return Ok(None);
-        };
-        if let Some(reason) = self.agent_preflight(req)? {
-            self.refuse_launch(req, &reason);
-            return Ok(None);
-        }
-        // REQ-AR-05: prove-dead rows are closed before the guard asks.
-        reclaim::reclaim(&self.store, Some(task.id))?;
-        let task = self.store.resolve_task(&req.task_id)?;
-        if let Some(reason) = self.brake_reason(&task, policy, &role)? {
-            self.refuse_launch(req, &reason);
-            return Ok(None);
-        }
-        if let Some(owner) = self.live_owner(&task)? {
-            // REQ-AR-06: the refusal NAMES the execution that holds the task.
-            let _ = launch::write_ack(&req.ack, &format!("busy {} {}", req.run_id, owner));
-            return Ok(None);
-        }
-        Ok(Some(role))
-    }
-
-    /// Hand a refusal back through the handshake (best effort: the caller may
-    /// have given up, and the supervisor log keeps the reason either way).
-    fn refuse_launch(&self, req: &SupervisedRunReq, reason: &str) {
-        let _ = launch::write_ack(&req.ack, &format!("refused {reason}"));
-    }
-
-    /// REQ-AR-08: the launch is indivisible — an execution id is handed out
-    /// only when the role can actually run. An EMPTY agent means «the marked
-    /// model bundle»; with none marked the platform refuses BEFORE opening a
-    /// RUNNING row, not leaves a doomed row holding the slot.
-    fn agent_preflight(&self, req: &SupervisedRunReq) -> ApiResult<Option<String>> {
-        if !req.agent.trim().is_empty() {
-            return Ok(None);
-        }
-        let usable = matches!(
-            self.store.active_agent()?,
-            Some(a) if !a.reasoning.trim().is_empty()
-        );
-        Ok((!usable).then(|| {
-            "no active model bundle — the platform has no executable agent for this state; pick \
-             one: `devai model switch <id>` (or run the role with an explicit --agent)"
-                .to_string()
-        }))
-    }
-
-    /// BRAKE: rounds without a shift (REQ-AR-09/13). A round is an execution of
-    /// the same stage role since the task's last NEW artifact; at the declared
-    /// count the task parks with the reason and counter, and nothing
-    /// auto-continues from a park.
-    fn brake_reason(
-        &self,
-        task: &Task,
-        policy: &ProcessPolicy,
-        role: &str,
-    ) -> ApiResult<Option<String>> {
-        let last_artifact = self
-            .store
-            .artifacts(task.id)?
-            .iter()
-            .map(|a| a.created_at)
-            .max();
-        let rounds = self
-            .store
-            .list_executions(Some(task.id))?
-            .into_iter()
-            .filter(|e| {
-                e.role_slug == role && last_artifact.map(|t| e.started_at > t).unwrap_or(true)
-            })
-            .count() as u32;
-        let limit = policy.brakes.max_rounds_without_shift;
-        if rounds < limit {
-            return Ok(None);
-        }
-        let reason =
-            format!("brake: {rounds} round(s) of `{role}` without a new artifact (limit {limit})");
-        self.park(task, "rounds_without_shift", rounds, limit, &reason)?;
-        Ok(Some(reason))
-    }
-
-    /// REQ-AR-06: «идёт прогон» is wider than «есть строка RUNNING». Between
-    /// two stages of one chain there is a moment with no RUNNING row while the
-    /// runner is very much alive — the owner PROCESS is the truth, so a row
-    /// whose owner is alive means the chain has not let go of the task.
-    fn live_owner(&self, task: &Task) -> ApiResult<Option<devai_core::types::Id>> {
-        Ok(self
-            .store
-            .list_executions(Some(task.id))?
-            .into_iter()
-            .rev()
-            .find(|e| {
-                e.status == ExecutionStatus::Running
-                    || liveness::check_owner(
-                        e.owner_pid,
-                        e.owner_host.as_deref(),
-                        e.owner_process_start,
-                    ) == liveness::Liveness::Alive
-            })
-            .map(|e| e.id))
-    }
-
     /// Open the row THIS process owns and hand the caller the handle — only
     /// now, when a live row exists (REQ-AR-08). A second chain is refused with
     /// the first execution's id and the first run is not touched (REQ-AR-06).
@@ -1347,47 +1227,6 @@ impl Api {
         }
     }
 
-    /// The handshake: `started <run> <exec>`. Failing to deliver it is a
-    /// launch failure — the caller must not be left waiting on a phantom.
-    fn hand_over_handle(&self, req: &SupervisedRunReq, started: &ExecStarted) -> ApiResult<()> {
-        launch::write_ack(
-            &req.ack,
-            &format!("started {} {}", req.run_id, started.execution.id),
-        )
-        .map_err(|e| {
-            ApiError::refused(
-                "launch_failed",
-                format!("cannot hand the execution id to the caller: {e}"),
-            )
-        })
-    }
-
-    /// The immutable record of the launch: which run, which row, which owner
-    /// process. The owner columns are what makes the absence PROVABLE later.
-    fn record_launch_event(
-        &self,
-        task: &Task,
-        role: &str,
-        req: &SupervisedRunReq,
-        started: &ExecStarted,
-    ) -> ApiResult<()> {
-        self.store.insert_event(
-            Some(task.id),
-            event_kind::EXECUTION_LAUNCHED,
-            "platform",
-            serde_json::json!({
-                "run_id": req.run_id,
-                "execution_id": started.execution.id.to_string(),
-                "role": role,
-                "agent": started.execution.agent_name,
-                "owner_pid": started.execution.owner_pid,
-                "owner_host": started.execution.owner_host,
-                "owner_process_start": started.execution.owner_process_start,
-            }),
-        )?;
-        Ok(())
-    }
-
     /// Drive the chain on the row this process opened (adoption), NOT a second
     /// one. An engine failure never leaves the row RUNNING: it is closed with
     /// the platform class and the declaration's park rule decides what follows
@@ -1411,213 +1250,6 @@ impl Api {
                 Err(e.into())
             }
         }
-    }
-
-    /// Close a failed engine run as FAILED(platform) and honour the declared
-    /// «паркующие сразу» classes. The row closure is reported, not swallowed:
-    /// a row that cannot be closed is an error the caller must see, since a
-    /// RUNNING row is exactly the incident this task exists to end.
-    fn close_failed_run(
-        &self,
-        started: &ExecStarted,
-        policy: &ProcessPolicy,
-        e: &devai_runtime::RuntimeError,
-    ) -> ApiResult<()> {
-        let id = started.execution.id.to_string();
-        let row = self.store.get_execution(&id)?;
-        if row.status == ExecutionStatus::Running {
-            self.store.finish_execution_classified(
-                &row,
-                ExecutionStatus::Failed,
-                None,
-                Some(&format!("engine failed: {e}")),
-                Some(failure_class::PLATFORM),
-                Utc::now(),
-            )?;
-        }
-        let class = self.store.get_execution(&id)?.failure_class;
-        let Some(class) = class.filter(|c| policy.parks_immediately(c)) else {
-            return Ok(());
-        };
-        let cur = self.store.get_task(&started.task.id.to_string())?;
-        let reason = format!(
-            "failure class `{class}` is declared to park immediately — another round cannot fix \
-             it; engine error: {e}"
-        );
-        // A park-immediately class fires on its FIRST occurrence, so the
-        // counter and the limit are both 1 — named so the pair reads as
-        // «сработало с первого раза при пороге 1», not as bare literals.
-        let occurrence: u32 = 1;
-        let limit: u32 = 1;
-        self.park_launch_failure(&cur, "park_immediately", occurrence, limit, &reason)
-    }
-
-    /// REQ-AR-08/05: the handle row must never be left RUNNING. The engine
-    /// adopts it for the FIRST stage — but a gate that stops the run BEFORE any
-    /// stage (a FRESH quality report, a human gate, a hold) leaves it
-    /// untouched. Close it as a completed no-work run whose summary names the
-    /// gate, so the slot is free and the row explains itself.
-    fn settle_open_row(&self, started: &ExecStarted, gate: Gate) -> ApiResult<()> {
-        let row = self
-            .store
-            .get_execution(&started.execution.id.to_string())?;
-        if row.status != ExecutionStatus::Running {
-            return Ok(());
-        }
-        self.store.finish_execution_classified(
-            &row,
-            ExecutionStatus::Completed,
-            Some(&format!(
-                "run stopped at {gate:?} before the stage started — no role work was done"
-            )),
-            None,
-            None,
-            Utc::now(),
-        )?;
-        Ok(())
-    }
-
-    /// REQ-AR-03/07: the run's OUTCOME belongs to the platform and outlives the
-    /// caller. Persist the same gate view a synchronous run rendered into the
-    /// run's evidence dir, so `--wait` (and any later reader) sees the settled
-    /// report without re-running anything.
-    fn persist_outcome(&self, report: &RunReport, req: &SupervisedRunReq) -> ApiResult<()> {
-        let view = self.run_view(report.clone(), Some(req.run_id.clone()))?;
-        let path = launch::run_evidence_dir(&self.home, &req.task_id, &req.run_id)
-            .join(launch::OUTCOME_FILE);
-        if let Ok(text) = serde_json::to_string_pretty(&view) {
-            let _ = std::fs::write(&path, text);
-        }
-        Ok(())
-    }
-
-    /// Park the task on a tripped brake: the state change, the reason with
-    /// the counter, and the dedicated event. `workflow::block` keeps every
-    /// workflow rule (a terminal task cannot be parked, the remembered stage
-    /// is kept for a human release) — a park is not a private store write.
-    fn park(
-        &self,
-        task: &Task,
-        brake: &str,
-        counter: u32,
-        limit: u32,
-        reason: &str,
-    ) -> ApiResult<()> {
-        let process = self.process_policy()?;
-        let m = workflow::park(&process, task, Some(reason), "platform", Utc::now())?;
-        self.commit_park(task, &m, brake, counter, limit, reason)
-    }
-
-    /// The same park for a FAILED LAUNCH: the declaration says where a launch
-    /// failure sends each role state (`launch_failed`), so the brake address is
-    /// only the fallback for a state the process declares no such outcome for.
-    fn park_launch_failure(
-        &self,
-        task: &Task,
-        brake: &str,
-        counter: u32,
-        limit: u32,
-        reason: &str,
-    ) -> ApiResult<()> {
-        let process = self.process_policy()?;
-        let m =
-            workflow::park_on_launch_failure(&process, task, Some(reason), "platform", Utc::now())?;
-        self.commit_park(task, &m, brake, counter, limit, reason)
-    }
-
-    /// The stored park plus its dedicated event (brake, counter, limit,
-    /// reason) — one body for both park kinds.
-    fn commit_park(
-        &self,
-        task: &Task,
-        m: &Mutation,
-        brake: &str,
-        counter: u32,
-        limit: u32,
-        reason: &str,
-    ) -> ApiResult<()> {
-        self.store.commit(task.lock_version, m)?;
-        self.store.insert_event(
-            Some(task.id),
-            event_kind::PROCESS_PARKED,
-            "platform",
-            serde_json::json!({
-                "brake": brake,
-                "counter": counter,
-                "limit": limit,
-                "reason": reason,
-            }),
-        )?;
-        Ok(())
-    }
-
-    /// The stored failure CLASS of a launch that did not happen (REQ-AR-13
-    /// AC1): the distinction the class vocabulary exists for, kept at the one
-    /// door that records it. Nothing was spawned when no runner could be
-    /// resolved or `spawn` itself failed (`spawn`); a runner that timed out,
-    /// died without a handshake, refused, or could not be placed outside the
-    /// caller's cgroup is a PLATFORM-side failure (`platform`).
-    fn launch_failure_class(e: &devai_runtime::LaunchError) -> &'static str {
-        use devai_runtime::LaunchError as L;
-        match e {
-            L::NoRunner(_) | L::Spawn(_) => failure_class::SPAWN,
-            L::Timeout(_) | L::Runner(_) | L::NoScope(_) => failure_class::PLATFORM,
-        }
-    }
-
-    /// REQ-AR-13: a launch that did not happen is recorded as an event with
-    /// its class and the CONSECUTIVE counter (derived from the append-only
-    /// log, so a restart cannot silently reset it), and parks the task at the
-    /// declared threshold. Nothing is retried automatically.
-    fn record_launch_failure(
-        &self,
-        task: &Task,
-        class: &'static str,
-        reason_text: &str,
-    ) -> ApiResult<()> {
-        let policy = self.process_policy()?;
-        let consecutive = self.consecutive_launch_failures(task.id)? + 1;
-        let limit = policy.brakes.max_consecutive_failures;
-        let mut parked = false;
-        if consecutive >= limit {
-            let reason = format!(
-                "launch failed {consecutive} time(s) in a row (limit {limit}): {reason_text}"
-            );
-            self.park_launch_failure(
-                task,
-                "consecutive_launch_failures",
-                consecutive,
-                limit,
-                &reason,
-            )?;
-            parked = true;
-        }
-        self.store.insert_event(
-            Some(task.id),
-            event_kind::EXECUTION_LAUNCH_FAILED,
-            "platform",
-            serde_json::json!({
-                "failure_class": class,
-                "consecutive": consecutive,
-                "limit": limit,
-                "parked": parked,
-                "reason": reason_text,
-            }),
-        )?;
-        Ok(())
-    }
-
-    /// The tail of the append-only log: how many launch failures sit in a row
-    /// right now. Derived, never stored separately — a counter field could
-    /// drift from the events that justify it.
-    fn consecutive_launch_failures(&self, task_id: Id) -> ApiResult<u32> {
-        let events = self.store.events(task_id, None)?;
-        let n = events
-            .iter()
-            .rev()
-            .take_while(|ev| ev.kind == event_kind::EXECUTION_LAUNCH_FAILED)
-            .count();
-        Ok(n as u32)
     }
 
     /// The process declaration in force (REQ-AR-09/16): one loader, the same
@@ -2584,39 +2216,10 @@ impl Api {
         inputs: Vec<String>,
         workspace: Option<&Path>,
     ) -> ApiResult<RoleExecution> {
-        let revision = match workspace {
-            Some(w) => Engine::new(&self.store)
-                .with_workspace(w)
-                .current_revision()?,
-            None => Engine::new(&self.store).current_revision()?,
-        };
+        let revision = self.workspace_revision(workspace)?;
         let (owner_pid, owner_host, owner_process_start) = liveness::current_owner().into_columns();
-        // REQ-AR-04/07: the run identity of this row. A detached runner hands
-        // in the number its caller minted (the whole chain shares it); a
-        // manual start IS its own run — its id is the run number.
-        let run_id = match req.run_id.as_deref() {
-            Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|_| {
-                ApiError::refused("invalid_input", format!("run_id `{raw}` is not a uuid"))
-            })?),
-            None => None,
-        };
-        // REQ-MS-05: the run stamp is taken from the agent RECORD at start —
-        // the manual path reads the same row the engine does, so a manual row
-        // answers «what did this run use?» exactly like an engine row. No
-        // record → no stamp («связка не записана»), never a guessed identity.
-        let stamp = self
-            .store
-            .list_agents()?
-            .into_iter()
-            .find(|a| Some(&a.name) == req.agent.as_ref())
-            .map(|a| {
-                devai_core::types::ExecutionBundle::new(
-                    &a.provider,
-                    &a.runtime,
-                    &a.model,
-                    &a.reasoning,
-                )
-            });
+        let run_id = Self::row_run_id(req.run_id.as_deref())?;
+        let stamp = self.bundle_stamp(req.agent.as_ref())?;
         Ok(RoleExecution {
             id: new_id(),
             task_id,
@@ -2640,6 +2243,42 @@ impl Api {
             bundle: stamp,
             run_id,
         })
+    }
+
+    /// The workspace revision the row is bound to: computed PLATFORM-side, in
+    /// the workspace the run actually evaluates (REQ-001/REQ-006) — never
+    /// supplied by the caller.
+    fn workspace_revision(&self, workspace: Option<&Path>) -> ApiResult<WorkspaceRevision> {
+        let engine = match workspace {
+            Some(w) => Engine::new(&self.store).with_workspace(w),
+            None => Engine::new(&self.store),
+        };
+        Ok(engine.current_revision()?)
+    }
+
+    /// REQ-AR-04/07: the run identity of this row. A detached runner hands in
+    /// the number its caller minted (the whole chain shares it); a manual start
+    /// IS its own run — its id is the run number.
+    fn row_run_id(raw: Option<&str>) -> ApiResult<Option<Uuid>> {
+        match raw {
+            Some(raw) => Ok(Some(Uuid::parse_str(raw).map_err(|_| {
+                ApiError::refused("invalid_input", format!("run_id `{raw}` is not a uuid"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    /// REQ-MS-05: the run stamp, taken from the agent RECORD at start — the
+    /// manual path reads the same row the engine does, so a manual row answers
+    /// «what did this run use?» exactly like an engine row. No record → no
+    /// stamp («связка не записана»), never a guessed identity.
+    fn bundle_stamp(&self, agent: Option<&String>) -> ApiResult<Option<ExecutionBundle>> {
+        Ok(self
+            .store
+            .list_agents()?
+            .into_iter()
+            .find(|a| Some(&a.name) == agent)
+            .map(|a| ExecutionBundle::new(&a.provider, &a.runtime, &a.model, &a.reasoning)))
     }
 
     pub fn exec_finish(&self, exec_id: &str, summary: Option<String>) -> ApiResult<RoleExecution> {

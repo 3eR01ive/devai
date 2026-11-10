@@ -22,6 +22,43 @@ use tempfile::TempDir;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// `DEVAI_RUNNER` is process-global: one test at a time holds the lock, and
+/// the value it FOUND is restored on drop — including on panic (rework R8).
+/// A failed assert used to leave a stub runner pointing into a temp directory
+/// for every later test of this binary.
+struct RunnerEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl RunnerEnv {
+    fn set(path: &Path) -> Self {
+        let guard = Self::lock();
+        let previous = std::env::var_os("DEVAI_RUNNER");
+        // SAFETY: `ENV_LOCK` serialises every reader/writer of this variable
+        // in the binary, and the value is put back on drop.
+        unsafe { std::env::set_var("DEVAI_RUNNER", path) };
+        Self {
+            _lock: guard,
+            previous,
+        }
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test poisons the mutex; the next test still runs.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Drop for RunnerEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => unsafe { std::env::set_var("DEVAI_RUNNER", v) },
+            None => unsafe { std::env::remove_var("DEVAI_RUNNER") },
+        }
+    }
+}
+
 fn home() -> (TempDir, Api) {
     let dir = TempDir::new().unwrap();
     let api = Api::open(dir.path(), "async-tester").unwrap();
@@ -202,12 +239,11 @@ fn stub_runner(dir: &Path, answer: &'static str) -> std::path::PathBuf {
 
 #[test]
 fn task_run_returns_the_typed_already_running_outcome_with_the_owner_id() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let (dir, api) = home();
     let id = task(&api, "already running");
     api.task_start(&id).unwrap();
     let script = stub_runner(dir.path(), "busy");
-    unsafe { std::env::set_var("DEVAI_RUNNER", &script) };
+    let _env = RunnerEnv::set(&script);
     let o = api
         .task_run(RunReq {
             id: id.clone(),
@@ -216,7 +252,6 @@ fn task_run_returns_the_typed_already_running_outcome_with_the_owner_id() {
             force_reaudit: false,
         })
         .unwrap();
-    unsafe { std::env::remove_var("DEVAI_RUNNER") };
     assert_eq!(o.outcome, RunLaunch::AlreadyRunning);
     assert_eq!(
         o.execution_id.as_deref(),
@@ -232,15 +267,13 @@ fn repeated_launch_failures_are_counted_events_and_the_threshold_parks_the_task(
     // REQ-AR-13: a launch that DID NOT happen is not «the role ran» — it is an
     // event with the class and the consecutive counter, and the declared
     // threshold parks the task instead of retrying silently.
-    let _guard = ENV_LOCK.lock().unwrap();
     let (dir, api) = home();
     let id = task(&api, "no runner");
     api.task_start(&id).unwrap();
     // `Api::open` never auto-launches, so all attempts are explicit ones.
-    unsafe { std::env::remove_var("DEVAI_RUNNER") };
     // Point the runner resolution at a path that cannot exist: a spawn-class
     // launch failure, deterministic on every host.
-    unsafe { std::env::set_var("DEVAI_RUNNER", dir.path().join("no-such-runner")) };
+    let _env = RunnerEnv::set(&dir.path().join("no-such-runner"));
     for attempt in 1..=2 {
         let e = api
             .task_run(RunReq {
@@ -271,7 +304,6 @@ fn repeated_launch_failures_are_counted_events_and_the_threshold_parks_the_task(
         workspace: None,
         force_reaudit: false,
     });
-    unsafe { std::env::remove_var("DEVAI_RUNNER") };
     let events = api.task_events(&id, None).unwrap();
     let last = events
         .iter()
@@ -293,18 +325,16 @@ fn repeated_launch_failures_are_counted_events_and_the_threshold_parks_the_task(
 
 #[test]
 fn entering_a_role_state_after_a_human_act_starts_the_run_itself() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     // A LIVE session (the CLI/window door) is allowed to launch by itself.
     let api = Api::open_session(dir.path(), "operator", SessionKind::Human).unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    unsafe { std::env::set_var("DEVAI_RUNNER", &script) };
+    let _env = RunnerEnv::set(&script);
     let id = task(&api, "autostart");
     // `task start` enters ANALYSIS, a ROLE state: the platform must start the
     // run without a second command (REQ-AR-11/12).
     api.task_start(&id).unwrap();
-    unsafe { std::env::remove_var("DEVAI_RUNNER") };
 
     let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap_or_default();
     assert!(
@@ -319,12 +349,11 @@ fn entering_a_role_state_after_a_human_act_starts_the_run_itself() {
 /// a second command is not the operator's job.
 #[test]
 fn answering_a_blocking_question_starts_the_resumed_stage_itself() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let api = Api::open_session(dir.path(), "operator", SessionKind::Human).unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    unsafe { std::env::set_var("DEVAI_RUNNER", &script) };
+    let _env = RunnerEnv::set(&script);
     let id = task(&api, "answer resumes");
     api.task_start(&id).unwrap(); // enters ANALYSIS, launches (1)
     let asked = api
@@ -343,7 +372,6 @@ fn answering_a_blocking_question_starts_the_resumed_stage_itself() {
     std::fs::write(&marker, "").unwrap();
     api.question_answer(&asked.question.id.to_string(), "this way")
         .unwrap();
-    unsafe { std::env::remove_var("DEVAI_RUNNER") };
 
     assert_eq!(api.task_get(&id).unwrap().state, TaskState::Analysis);
     let argv = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -355,12 +383,11 @@ fn answering_a_blocking_question_starts_the_resumed_stage_itself() {
 
 #[test]
 fn revising_the_spec_starts_the_reviewer_itself() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     let api = Api::open_session(dir.path(), "operator", SessionKind::Human).unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    unsafe { std::env::set_var("DEVAI_RUNNER", &script) };
+    let _env = RunnerEnv::set(&script);
     let id = task(&api, "revise launches review");
     api.task_start(&id).unwrap(); // launches (1)
     let marker = dir.path().join("argv");
@@ -372,7 +399,6 @@ fn revising_the_spec_starts_the_reviewer_itself() {
         reason: Some("operator edited".into()),
     })
     .unwrap();
-    unsafe { std::env::remove_var("DEVAI_RUNNER") };
 
     assert_eq!(api.task_get(&id).unwrap().state, TaskState::Review);
     let argv = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -389,13 +415,12 @@ fn revising_the_spec_starts_the_reviewer_itself() {
 /// IMPLEMENTATION with no run).
 #[test]
 fn signing_the_gate_from_the_window_starts_the_implementation_itself() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     // EXACTLY the door `AppState::write_api` opens for a signature.
     let api = Api::open_for_window(dir.path(), "operator").unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    unsafe { std::env::set_var("DEVAI_RUNNER", &script) };
+    let _env = RunnerEnv::set(&script);
     let id = task(&api, "window signature");
     api.task_start(&id).unwrap(); // DRAFT -> ANALYSIS (launch 1)
     api.task_revise(ReviseReq {
@@ -412,7 +437,6 @@ fn signing_the_gate_from_the_window_starts_the_implementation_itself() {
     let marker = dir.path().join("argv");
     std::fs::write(&marker, "").unwrap();
     api.task_approve(&id, Some("ok".into())).unwrap();
-    unsafe { std::env::remove_var("DEVAI_RUNNER") };
 
     assert_eq!(
         api.task_get(&id).unwrap().state,
@@ -423,5 +447,48 @@ fn signing_the_gate_from_the_window_starts_the_implementation_itself() {
     assert!(
         argv.contains("__supervise") && argv.contains(&id),
         "the window's signature started the implementation through a platform runner: {argv:?}"
+    );
+}
+
+/// R5: the settled outcome is written BEST EFFORT — a role's answer is never
+/// lost because a log could not be written — but the failure is not silence:
+/// the store carries the event with the path and the reason, so a `--wait`
+/// caller falling back to the row listing can see WHY (`supervisor.log` gets
+/// the same line, because the runner's stderr is redirected there).
+#[test]
+fn an_outcome_that_cannot_be_written_leaves_a_trace_in_the_store() {
+    let (dir, api) = home();
+    let id = task(&api, "unwritable outcome");
+    api.task_start(&id).unwrap();
+    // The run's evidence directory is deliberately never created, so the
+    // outcome file cannot land (a real runner creates it; here it cannot).
+    let run = new_id().to_string();
+    let report = api
+        .task_run_supervised(&SupervisedRunReq {
+            task_id: id.clone(),
+            agent: "mock".into(),
+            workspace: None,
+            force_reaudit: false,
+            run_id: run.clone(),
+            ack: dir.path().join("ack"),
+        })
+        .unwrap();
+    assert!(report.is_some(), "the chain itself still ran");
+
+    let events = api.task_events(&id, None).unwrap();
+    let trace = events
+        .iter()
+        .find(|ev| ev.kind == event_kind::EXECUTION_EVIDENCE_UNWRITTEN)
+        .expect("the unwritten outcome is a stored fact, not silence");
+    assert_eq!(trace.payload["run_id"], run, "the event names the run");
+    let path = trace.payload["path"].as_str().unwrap();
+    assert!(path.ends_with("outcome.json"), "the path is named: {path}");
+    assert!(
+        path.contains(&run),
+        "the path is the run's own evidence file: {path}"
+    );
+    assert!(
+        !trace.payload["reason"].as_str().unwrap().is_empty(),
+        "the reason is recorded: {trace:?}"
     );
 }
