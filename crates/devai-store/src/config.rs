@@ -2059,8 +2059,9 @@ pub fn load_task_name_policy(dir: &Path) -> StoreResult<TaskNamePolicy> {
 // and the mapping onto the store's config error type.
 
 pub use devai_core::process::{
-    HoldKind, PROCESS_RETURN_STATE, Process, ProcessBrakes, ProcessHolds, ProcessState,
-    ProcessTransition, SUPPORTED_PROCESS_VERSION, Target, process_condition, process_executor,
+    HoldKind, PROCESS_RETURN_STATE, Process, ProcessBrakes, ProcessHolds, ProcessSeries,
+    ProcessState, ProcessTransition, SUPPORTED_PROCESS_VERSION, Target, process_condition,
+    process_executor,
 };
 
 /// The declaration under its historical name — one type, two spellings that
@@ -3390,6 +3391,28 @@ mod process_declaration_tests {
                 "value {value} must name the key: {e}"
             );
         }
+    }
+
+    /// Rework R2: the stage→states catalog is DATA in the declaration, and a
+    /// bad entry (unknown state) is a loud init refusal naming it.
+    #[test]
+    fn the_series_catalog_is_data_and_an_unknown_state_is_refused() {
+        let factory = include_str!("../../../config/workflow/process.yaml");
+        let p = devai_core::process::parse(factory, "process.yaml").unwrap();
+        assert_eq!(
+            p.series_states("spec_review"),
+            ["ANALYSIS".to_string(), "REVIEW".to_string()]
+        );
+        assert_eq!(p.series_of("QA"), Some("quality"));
+
+        let broken = factory.replace(
+            "states: [ANALYSIS, REVIEW]",
+            "states: [ANALYSIS, NOT_A_STATE]",
+        );
+        let e = devai_core::process::parse(&broken, "process.yaml")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("NOT_A_STATE"), "the refusal names it: {e}");
     }
 
     /// REQ-AR-16: a declaration from another version is a TYPED refusal that

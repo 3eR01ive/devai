@@ -26,7 +26,7 @@ use devai_store::config::ProcessPolicy;
 
 use crate::attempt_limit::AttemptLimitView;
 use crate::mutations::ExecStarted;
-use crate::{Api, ApiResult};
+use crate::{Api, ApiError, ApiResult};
 
 /// The stored failure CLASS of a launch that did not happen (REQ-AR-13 AC1):
 /// the distinction the class vocabulary exists for, kept at the one door that
@@ -106,7 +106,18 @@ impl Api {
                 view.line, view.role
             ));
         }
-        let limit = view.limit.unwrap_or(0);
+        let Some(limit) = view.limit else {
+            // Unreachable from the callers (they stop only when
+            // `limit_reached`, which is false for `None`), but a missing limit
+            // must never be written as «предел 0» (rework R4).
+            return Err(ApiError::refused(
+                "corrupt_stop_fact",
+                format!(
+                    "attempt-limit stop for role `{}` has no declared limit — nothing is stopped",
+                    view.role
+                ),
+            ));
+        };
         let process = self.process_policy()?;
         let question_id = new_id();
         let m = workflow::park_attempt_limit(

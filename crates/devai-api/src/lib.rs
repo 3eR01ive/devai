@@ -396,20 +396,27 @@ impl Api {
         let ops: Vec<String> = workflow::allowed_ops(&process, &t);
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
+        // The QA gate and the attempt counter both read the launch history:
+        // load it ONCE and hand the same slices to both (rework R6).
+        let executions = self.store.list_executions(Some(t.id))?;
+        let events = self.store.events(t.id, None)?;
         // REQ-QG-08: the QA gate's public availability travels WITH the status
-        // read — the window does not derive it. The dependency/decision/
-        // execution loads happen only at the gate; other states have no gate.
+        // read — the window does not derive it. The dependency/decision loads
+        // happen only at the gate; other states have no gate.
         let quality_gate = if t.state == TaskState::Qa {
             let deps = self.store.task_dependencies(t.id)?;
             let decisions = self.store.list_decisions(t.id)?;
-            let executions = self.store.list_executions(Some(t.id))?;
             quality_gate::quality_gate(&process, &t, &artifacts, &deps, &decisions, &executions)
         } else {
             None
         };
         // REQ-AL-07: the counter is part of the status read, not a separate
-        // command — the same derivation the stop rule uses.
-        let attempt_limit = self.attempt_limit_view(&t, &process)?;
+        // command — the same derivation the stop rule uses, over the history
+        // this read already holds. No carrier report → no series, so the
+        // counter does not read bodies that cannot move it.
+        let convergence = self.attempt_convergence(&t, &artifacts, &executions);
+        let attempt_limit =
+            self.attempt_limit_view_in(&t, &process, &executions, &events, convergence.as_ref())?;
         Ok(StatusView {
             task: t,
             allowed_operations: ops,
@@ -452,9 +459,11 @@ impl Api {
         let running = running_views(&executions, now);
         let artifacts = self.store.artifacts(t.id)?;
         let convergence = self.task_convergence(&t, &artifacts, &executions);
-        // REQ-AL-07: the same triple the status read answers, on the progress
-        // read the card uses — one calculation, no second reading of the rule.
-        let attempt_limit = self.attempt_limit_view(&t, &process)?;
+        // REQ-AL-07: the same triple the status read answers, over the history
+        // this read already holds — nothing is loaded or computed twice (R6).
+        let events = self.store.events(t.id, None)?;
+        let attempt_limit =
+            self.attempt_limit_view_in(&t, &process, &executions, &events, convergence.as_ref())?;
         let agent_failure = self.task_agent_failure(&t)?;
         Ok(ProgressView {
             task: t.clone(),

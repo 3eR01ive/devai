@@ -26,6 +26,15 @@
 //!   re-enters states it has already been in, so ten such rounds add ten
 //!   attempts instead of zeroing the counter ten times.
 //!
+//! WHICH states each series judges is declared in `process.yaml` (`series:`),
+//! not in this file (rework R2): a third series is a declaration edit.
+//!
+//! The floor is the END of the launch that produced the last shift, not the
+//! shift's timestamp: the platform publishes the artifact (and the verdict)
+//! inside a run and closes the execution afterwards, so a bare timestamp would
+//! count the shifting launch itself and leave «1 из 5» right after a real
+//! advance (rework R1).
+//!
 //! A new artifact version with another text and the same verdict is NOT a
 //! shift: that is exactly how 50 spec versions and 48 review reports rode as
 //! «movement» until a human stopped the task.
@@ -38,41 +47,23 @@ use chrono::{DateTime, Utc};
 use devai_core::types::{
     ExecutionStatus, RoleExecution, Task, TaskState, WorkflowEvent, event_kind,
 };
-use devai_runtime::convergence::{self, ConvergenceView};
+use devai_runtime::convergence::{self, ConvergenceView, StageConvergence};
 use devai_store::config::ProcessPolicy;
 use serde::Serialize;
 
 use crate::{Api, ApiResult};
 
-/// The declared working states whose work ONE measured convergence stage
-/// compares: a `spec_review` round judges the spec ANALYSIS publishes and the
-/// report REVIEW answers with; a `quality` round judges the QA report over what
-/// the implementation agent produced. These two are the only measured series
-/// the platform has, so every other role leans on stage moves and verdicts.
-fn series_states(stage: &str) -> &'static [TaskState] {
-    match stage {
-        convergence::STAGE_SPEC_REVIEW => &[TaskState::Analysis, TaskState::Review],
-        convergence::STAGE_QUALITY => {
-            &[TaskState::Implementation, TaskState::Rework, TaskState::Qa]
-        }
-        _ => &[],
-    }
+/// The measured series a declared working state is judged by, if the
+/// declaration measures one (rework R2: the catalog is data, not this file).
+fn series_of<'p>(policy: &'p ProcessPolicy, state: TaskState) -> Option<&'p str> {
+    policy.series_of(state.as_str())
 }
 
-/// The measured series a declared working state is judged by, if any.
-fn series_of(state: TaskState) -> Option<&'static str> {
-    [convergence::STAGE_SPEC_REVIEW, convergence::STAGE_QUALITY]
-        .into_iter()
-        .find(|stage| series_states(stage).contains(&state))
-}
-
-/// Does this measured series speak for `role` — is any state it judges executed
-/// by `role`? ONE reading, shared by the series rounds and by the verdicts, so
-/// the two can never attribute a shift to different roles.
-fn series_judges(stage: &str, role: &str, policy: &ProcessPolicy) -> bool {
-    series_states(stage)
-        .iter()
-        .any(|state| policy.role_for(state.as_str()) == Some(role))
+/// Does the declared series `stage` speak for `role` — is any state it judges
+/// executed by `role`? ONE reading, shared by the series rounds and by the
+/// verdicts, so the two can never attribute a shift to different roles.
+fn series_judges(policy: &ProcessPolicy, stage: &str, role: &str) -> bool {
+    policy.series_judges(stage, role)
 }
 
 /// The ONE triple the stop decision, the refusal, the question and the status
@@ -148,25 +139,66 @@ impl Api {
     /// both read surfaces (REQ-AL-07 AC1): the derived count of THIS role, the
     /// declared limit and the shared line. `None` when the task has no role
     /// stage.
+    ///
+    /// This entry point loads the history itself (admission has none handy).
+    /// The status/progress reads already hold part of it and call
+    /// [`Api::attempt_limit_view_in`], so the counter never re-reads a slice
+    /// the caller just loaded (rework R6).
     pub(crate) fn attempt_limit_view(
         &self,
         task: &Task,
         policy: &ProcessPolicy,
     ) -> ApiResult<Option<AttemptLimitView>> {
-        let Some(role) = self.attempt_role(task, policy) else {
-            return Ok(None);
-        };
         let executions = self.store.list_executions(Some(task.id))?;
         let artifacts = self.store.artifacts(task.id)?;
         let events = self.store.events(task.id, None)?;
-        let converged = self.task_convergence(task, &artifacts, &executions);
+        let convergence = self.attempt_convergence(task, &artifacts, &executions);
+        self.attempt_limit_view_in(task, policy, &executions, &events, convergence.as_ref())
+    }
+
+    /// The same view over history the caller ALREADY loaded. `convergence`
+    /// comes from [`Api::attempt_convergence`] (or the progress read's own
+    /// slice) — the count is derived from stored rows, never from a field.
+    pub(crate) fn attempt_limit_view_in(
+        &self,
+        task: &Task,
+        policy: &ProcessPolicy,
+        executions: &[RoleExecution],
+        events: &[WorkflowEvent],
+        convergence: Option<&ConvergenceView>,
+    ) -> ApiResult<Option<AttemptLimitView>> {
+        let Some(role) = self.attempt_role(task, policy) else {
+            return Ok(None);
+        };
         let attempts =
-            self.attempts_without_progress(&role, &executions, &events, converged.as_ref(), policy);
+            self.attempts_without_progress(&role, executions, events, convergence, policy);
         Ok(Some(AttemptLimitView::new(
             &role,
             attempts,
             policy.brakes.attempt_limit(),
         )))
+    }
+
+    /// The convergence slice the attempt limit needs — and `None` when the
+    /// task has published no carrier at all: with no report there is no
+    /// series, so the counter skips reading and parsing artifact bodies that
+    /// cannot move it (rework R6).
+    pub(crate) fn attempt_convergence(
+        &self,
+        task: &Task,
+        artifacts: &[devai_core::types::Artifact],
+        executions: &[RoleExecution],
+    ) -> Option<ConvergenceView> {
+        let measured = artifacts.iter().any(|a| {
+            matches!(
+                a.kind,
+                devai_core::types::ArtifactKind::ReviewReport
+                    | devai_core::types::ArtifactKind::QualityReport
+            )
+        });
+        measured
+            .then(|| self.task_convergence(task, artifacts, executions))
+            .flatten()
     }
 
     /// The derived count of ONE role, from stored rows only: the last
@@ -203,87 +235,141 @@ pub fn role_progress_at(
     events: &[WorkflowEvent],
     convergence: Option<&ConvergenceView>,
 ) -> Option<DateTime<Utc>> {
-    let mut progress: Option<DateTime<Utc>> = None;
-    let mut mark = |at: DateTime<Utc>| {
-        progress = Some(progress.map_or(at, |cur| cur.max(at)));
-    };
+    max_opt(
+        convergence_shift_at(role, policy, convergence),
+        event_shift_at(role, policy, events),
+    )
+}
 
-    // Convergence rounds: a round whose stage mode is CONVERGING moved the
-    // work by the stage's OWN measure, and a verdict change between two rounds
-    // is a shift even when the volume rule says nothing. Only the series that
-    // judges THIS role's work speaks here.
-    if let Some(view) = convergence {
-        for stage in &view.stages {
-            if !series_judges(stage.stage, role, policy) {
-                continue;
-            }
-            let mut previous_verdict: Option<&str> = None;
-            for point in &stage.series {
-                let mut moved = point.mode == convergence::mode::CONVERGING;
-                if let (Some(verdict), Some(prev)) = (point.verdict.as_deref(), previous_verdict) {
-                    if verdict != prev {
-                        moved = true;
-                    }
-                }
-                if moved {
-                    mark(point.created_at);
-                }
-                if point.verdict.is_some() {
-                    previous_verdict = point.verdict.as_deref();
-                }
-            }
+/// The latest shift the measured series records for `role`: a CONVERGING round
+/// or a verdict change between two of its rounds. Only the series the
+/// DECLARATION says judges this role's work speaks here (rework R2).
+fn convergence_shift_at(
+    role: &str,
+    policy: &ProcessPolicy,
+    convergence: Option<&ConvergenceView>,
+) -> Option<DateTime<Utc>> {
+    let mut mark = None;
+    for stage in &convergence?.stages {
+        if series_judges(policy, stage.stage, role) {
+            mark = max_opt(mark, series_shift_at(stage));
         }
     }
+    mark
+}
 
-    let mut previous_verdict: Option<String> = None;
-    let mut visited: Vec<TaskState> = Vec::new();
+/// One series' own latest shift mark: a CONVERGING round, or a verdict that
+/// changed between two rounds that both carry one.
+fn series_shift_at(stage: &StageConvergence) -> Option<DateTime<Utc>> {
+    let mut mark = None;
+    let mut previous: Option<&str> = None;
+    for point in &stage.series {
+        let verdict_moved = previous.is_some_and(|prev| {
+            point
+                .verdict
+                .as_deref()
+                .is_some_and(|verdict| verdict != prev)
+        });
+        if point.mode == convergence::mode::CONVERGING || verdict_moved {
+            mark = max_opt(mark, Some(point.created_at));
+        }
+        if point.verdict.is_some() {
+            previous = point.verdict.as_deref();
+        }
+    }
+    mark
+}
+
+/// The latest shift the stored EVENTS record for `role`: a verdict change the
+/// series judges and a move of THIS role's stage into a state it had never
+/// reached before. A repeat is a round, not a shift.
+fn event_shift_at(
+    role: &str,
+    policy: &ProcessPolicy,
+    events: &[WorkflowEvent],
+) -> Option<DateTime<Utc>> {
+    let edges = ordered_edges(events);
+    max_opt(
+        verdict_shift_at(role, policy, &edges),
+        stage_move_shift_at(role, policy, &edges),
+    )
+}
+
+/// The working edges of the stored events in append order: a real
+/// `from → to` move, not a hold and not a same-state write. A hold is skipped
+/// because a human question is not progress (see the module docs).
+fn ordered_edges(events: &[WorkflowEvent]) -> Vec<(&WorkflowEvent, TaskState, TaskState)> {
     let mut ordered: Vec<&WorkflowEvent> = events.iter().collect();
     ordered.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    for ev in ordered {
-        let Some(payload) = ev.payload.as_object() else {
-            continue;
-        };
-        let Some((from, to)) = payload
-            .get("from")
-            .and_then(|v| v.as_str())
-            .zip(payload.get("to").and_then(|v| v.as_str()))
-        else {
-            continue;
-        };
-        if from == to {
+    ordered
+        .into_iter()
+        .filter_map(|ev| {
+            let payload = ev.payload.as_object()?;
+            let (from, to) = payload
+                .get("from")?
+                .as_str()
+                .zip(payload.get("to")?.as_str())?;
+            let from = TaskState::parse(from).ok()?;
+            let to = TaskState::parse(to).ok()?;
+            (from != to && !from.is_hold() && !to.is_hold()).then_some((ev, from, to))
+        })
+        .collect()
+}
+
+/// A verdict change the judge recorded while the task stood in a stage the
+/// declared series judges — the same substance the series records, read even
+/// when no series exists yet.
+fn verdict_shift_at(
+    role: &str,
+    policy: &ProcessPolicy,
+    edges: &[(&WorkflowEvent, TaskState, TaskState)],
+) -> Option<DateTime<Utc>> {
+    let mut mark = None;
+    let mut previous: Option<String> = None;
+    for (ev, from, _) in edges {
+        if ev.kind != event_kind::REVIEW_RECORDED {
             continue;
         }
-        let (Ok(from), Ok(to)) = (TaskState::parse(from), TaskState::parse(to)) else {
+        let Some(verdict) = ev.payload.get("verdict").and_then(|v| v.as_str()) else {
             continue;
         };
-        // A move into or out of a custody hold is not a shift of the work (see
-        // the module docs): a human question is not progress.
-        if from.is_hold() || to.is_hold() {
-            continue;
+        let changed = previous.as_deref().is_some_and(|prev| prev != verdict);
+        if changed && series_of(policy, *from).is_some_and(|s| series_judges(policy, s, role)) {
+            mark = max_opt(mark, Some(ev.created_at));
         }
-        let first_visit = !visited.contains(&to);
+        previous = Some(verdict.to_string());
+    }
+    mark
+}
+
+/// A move out of THIS role's stage into a state the task had never reached
+/// before: the only stage-move form that counts. A ping-pong re-enters states
+/// it has already been in, so its rounds keep raising the count.
+fn stage_move_shift_at(
+    role: &str,
+    policy: &ProcessPolicy,
+    edges: &[(&WorkflowEvent, TaskState, TaskState)],
+) -> Option<DateTime<Utc>> {
+    let mut mark = None;
+    let mut visited: Vec<TaskState> = Vec::new();
+    for (ev, from, to) in edges {
+        let first_visit = !visited.contains(to);
         if first_visit {
-            visited.push(to);
+            visited.push(*to);
         }
-        // The judge's answer to THIS role's work changed: the same substance
-        // the series records, read even when no series exists yet.
-        if ev.kind == event_kind::REVIEW_RECORDED {
-            if let Some(verdict) = payload.get("verdict").and_then(|v| v.as_str()) {
-                let changed = previous_verdict.as_deref().is_some_and(|p| p != verdict);
-                if changed && series_of(from).is_some_and(|s| series_judges(s, role, policy)) {
-                    mark(ev.created_at);
-                }
-                previous_verdict = Some(verdict.to_string());
-            }
-        }
-        // A stage move counts only when THIS role's stage moved the task into a
-        // state it had never reached before: a repeat is a round, not a shift.
         if first_visit && policy.role_for(from.as_str()) == Some(role) {
-            mark(ev.created_at);
+            mark = max_opt(mark, Some(ev.created_at));
         }
     }
+    mark
+}
 
-    progress
+/// The later of two optional marks; `None` loses to `Some`.
+fn max_opt(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// The timestamp of the last HUMAN reset of THIS role's counter — the stored
@@ -307,18 +393,19 @@ pub fn last_reset_at(events: &[WorkflowEvent], role: &str) -> Option<DateTime<Ut
 /// running rows are not attempts: a launch that did not happen (provider or
 /// platform refusal, no agent, admission refusal) spends no attempt and
 /// resets none.
+///
+/// The floor is the END of the launch that produced the last shift (see
+/// [`shift_floor`]), not the shift's own timestamp: on a live task the artifact
+/// (and the verdict event) is published INSIDE the run while `finished_at` is
+/// written after it, so a bare timestamp would count the shifting launch
+/// itself — «1 из 5» straight after a real advance (rework R1).
 pub fn attempts_without_progress(
     role: &str,
     executions: &[RoleExecution],
     progress_at: Option<DateTime<Utc>>,
     reset_at: Option<DateTime<Utc>>,
 ) -> u32 {
-    let floor = match (progress_at, reset_at) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    let floor = max_opt(shift_floor(role, executions, progress_at), reset_at);
     executions
         .iter()
         .filter(|e| e.role_slug == role)
@@ -329,6 +416,34 @@ pub fn attempts_without_progress(
             floor.is_none_or(|floor| finished > floor)
         })
         .count() as u32
+}
+
+/// The boundary of the LAST shift: the completion of the completed stage
+/// launch whose interval [started_at, finished_at] contains the shift mark.
+///
+/// A shift mark is the artifact/event time, and the platform publishes it
+/// BEFORE the engine closes the execution (engine.rs: the agent publishes, the
+/// run finishes after). Counting `finished_at > mark` would therefore count
+/// the very launch that advanced the task. When no launch of this role
+/// contains the mark (e.g. the judge's verdict belongs to another role's run),
+/// the mark itself is the boundary — no launch can straddle it.
+fn shift_floor(
+    role: &str,
+    executions: &[RoleExecution],
+    progress_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let at = progress_at?;
+    executions
+        .iter()
+        .filter(|e| e.role_slug == role)
+        .filter(|e| e.parent_execution.is_none())
+        .filter(|e| e.status == ExecutionStatus::Completed)
+        .filter_map(|e| {
+            let finished = e.finished_at.unwrap_or(e.started_at);
+            (e.started_at <= at && at <= finished).then_some(finished)
+        })
+        .max()
+        .or(Some(at))
 }
 
 #[cfg(test)]
@@ -408,13 +523,9 @@ mod tests {
         events
     }
 
-    fn point_in(
-        stage: &'static str,
-        round: u32,
-        at: i64,
-        mode: &'static str,
-        verdict: Option<&str>,
-    ) -> ConvergencePoint {
+    /// The invariant fields of a point; the two that vary per case are set by
+    /// [`point_in`]. Split out so no test helper is a wall of `None`s.
+    fn base_point(stage: &'static str, round: u32, at: i64) -> ConvergencePoint {
         ConvergencePoint {
             round,
             artifact_id: "a".into(),
@@ -432,7 +543,7 @@ mod tests {
             pending_count: None,
             closed_count: None,
             delta_score_milli: None,
-            verdict: verdict.map(|v| v.to_string()),
+            verdict: None,
             requirements_count: Some(3),
             oq_count: Some(0),
             delta_requirements: Some(0),
@@ -440,7 +551,7 @@ mod tests {
             volume_direction: Some("flat"),
             time_seconds: Some(10),
             profile: None,
-            mode,
+            mode: convergence::mode::PLATEAU,
             mode_basis: convergence::ModeBasis {
                 rule: "plateau",
                 reason: None,
@@ -448,6 +559,20 @@ mod tests {
                 check_id: None,
             },
             read_error: None,
+        }
+    }
+
+    fn point_in(
+        stage: &'static str,
+        round: u32,
+        at: i64,
+        mode: &'static str,
+        verdict: Option<&str>,
+    ) -> ConvergencePoint {
+        ConvergencePoint {
+            mode,
+            verdict: verdict.map(|v| v.to_string()),
+            ..base_point(stage, round, at)
         }
     }
 
@@ -840,6 +965,99 @@ mod tests {
         assert_eq!(
             last_reset_at(&events, "requirements-reviewer"),
             Some(ts(100))
+        );
+    }
+
+    /// The event stream of the live order: the verdicts are published INSIDE
+    /// the run's lifetime, as the engine does (see the test below).
+    fn live_order_events() -> Vec<WorkflowEvent> {
+        vec![
+            event(
+                event_kind::REQUIREMENTS_PUBLISHED,
+                11,
+                serde_json::json!({"from": "ANALYSIS", "to": "REVIEW"}),
+            ),
+            event(
+                event_kind::REVIEW_RECORDED,
+                12,
+                serde_json::json!({"verdict": "NEEDS_REVISION", "from": "REVIEW", "to": "ANALYSIS"}),
+            ),
+            event(
+                event_kind::REQUIREMENTS_PUBLISHED,
+                19,
+                serde_json::json!({"from": "ANALYSIS", "to": "REVIEW"}),
+            ),
+            event(
+                event_kind::REVIEW_RECORDED,
+                20,
+                serde_json::json!({"verdict": "APPROVED", "from": "REVIEW", "to": "APPROVAL"}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_shift_published_inside_a_run_zeroes_the_counter_on_the_live_order() {
+        // Live order (rework R1/R5): the role starts a run, publishes the
+        // artifact and records the verdict INSIDE it, and the engine closes the
+        // execution afterwards. The shifting launch must not count itself.
+        let policy = Process::factory();
+        let progress = role_progress_at("requirements-analyst", policy, &live_order_events(), None);
+        assert_eq!(progress, Some(ts(20)), "the approved verdict is the shift");
+
+        // The run that produced it started at 10 and finished at 30 — the
+        // shift at 20 lies INSIDE it, exactly as on a live task.
+        let shifting = exec(
+            "requirements-analyst",
+            10,
+            Some(30),
+            ExecutionStatus::Completed,
+        );
+        assert_eq!(
+            attempts_without_progress("requirements-analyst", &[shifting.clone()], progress, None),
+            0,
+            "the launch that DID the shift is not an attempt after it"
+        );
+
+        // Only launches completed after that one count, one per launch.
+        let next = exec(
+            "requirements-analyst",
+            40,
+            Some(50),
+            ExecutionStatus::Completed,
+        );
+        assert_eq!(
+            attempts_without_progress("requirements-analyst", &[shifting, next], progress, None),
+            1,
+            "a later immobile launch counts once"
+        );
+    }
+
+    #[test]
+    fn the_series_catalog_is_read_from_the_declaration() {
+        // Rework R2: the stage→states table is data. The shipped declaration
+        // maps both measured series; clearing it makes progress fall back to
+        // moves and verdicts instead of a code-side catalog.
+        let policy = Process::factory();
+        assert_eq!(
+            policy.series_states(convergence::STAGE_SPEC_REVIEW),
+            ["ANALYSIS".to_string(), "REVIEW".to_string()]
+        );
+        assert_eq!(policy.series_of("QA"), Some(convergence::STAGE_QUALITY));
+        assert!(policy.series_judges(convergence::STAGE_QUALITY, "quality-auditor"));
+
+        let mut without = policy.clone();
+        without.series.clear();
+        let converging = view(vec![point_in(
+            convergence::STAGE_SPEC_REVIEW,
+            2,
+            20,
+            convergence::mode::CONVERGING,
+            None,
+        )]);
+        assert_eq!(
+            role_progress_at("requirements-analyst", &without, &[], Some(&converging)),
+            None,
+            "no declared series means no measured movement"
         );
     }
 }

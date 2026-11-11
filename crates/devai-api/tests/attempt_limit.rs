@@ -790,3 +790,158 @@ fn zero_means_no_limit_and_a_broken_value_is_a_loud_declaration_error() {
         "the refusal names the key: {err}"
     );
 }
+
+/// Write ONE completed analyst run in LIVE order: the verdicts are published
+/// while the row is still RUNNING, and `finished_at` is stamped after them.
+/// That is what the engine does (engine.rs closes the execution after the
+/// artifact/event), and it is the order rework R1/R5 requires the counter to
+/// survive.
+fn live_shift_inside_run(api: &Api, home: &Path, id: &str) {
+    let store = Store::open(home).unwrap();
+    let tid = api.task_get(id).unwrap().id;
+    let started = Utc::now() - chrono::Duration::seconds(30);
+    let at = |secs: i64| started + chrono::Duration::seconds(secs);
+    let e = RoleExecution {
+        id: new_id(),
+        task_id: tid,
+        role_slug: "requirements-analyst".into(),
+        role_version: 1,
+        agent_name: Some("mock".into()),
+        status: ExecutionStatus::Running,
+        inputs: Vec::new(),
+        summary: None,
+        error: None,
+        started_at: started,
+        finished_at: None,
+        workspace_revision: None,
+        attempt: 1,
+        parent_execution: None,
+        failure_class: None,
+        owner_pid: None,
+        owner_host: None,
+        owner_process_start: None,
+        bundle: None,
+        run_id: None,
+    };
+    store.start_execution(&e).unwrap();
+    store
+        .insert_event_with(
+            new_id(),
+            Some(tid),
+            event_kind::REQUIREMENTS_PUBLISHED,
+            "mock",
+            json!({"from": "ANALYSIS", "to": "REVIEW"}),
+            at(5),
+        )
+        .unwrap();
+    store
+        .insert_event_with(
+            new_id(),
+            Some(tid),
+            event_kind::REVIEW_RECORDED,
+            "mock",
+            json!({"verdict": "NEEDS_REVISION", "from": "REVIEW", "to": "ANALYSIS"}),
+            at(10),
+        )
+        .unwrap();
+    store
+        .insert_event_with(
+            new_id(),
+            Some(tid),
+            event_kind::REQUIREMENTS_PUBLISHED,
+            "mock",
+            json!({"from": "ANALYSIS", "to": "REVIEW"}),
+            at(15),
+        )
+        .unwrap();
+    store
+        .insert_event_with(
+            new_id(),
+            Some(tid),
+            event_kind::REVIEW_RECORDED,
+            "mock",
+            json!({"verdict": "APPROVED", "from": "REVIEW", "to": "APPROVAL"}),
+            at(20),
+        )
+        .unwrap();
+    store
+        .finish_execution(
+            &e,
+            ExecutionStatus::Completed,
+            Some("the verdict moved"),
+            None,
+            at(30),
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_shift_published_inside_a_run_reads_zero_at_once_on_a_live_task() {
+    // REQ-AL-03 AC2 / REQ-AL-07: right after a real shift the role stands on
+    // «0 из 5». The shifting launch finished AFTER the verdict it produced, so
+    // a floor taken from the event time alone would count it as «1 из 5»
+    // (rework R1). The fixture reproduces the live order.
+    let (dir, api) = home();
+    let id = task(&api);
+    live_shift_inside_run(&api, dir.path(), &id);
+
+    let view = api.task_status(&id).unwrap().attempt_limit.unwrap();
+    assert_eq!(
+        view.attempts, 0,
+        "the run that DID the shift is not an attempt after it"
+    );
+    assert_eq!(view.line, "попыток без прогресса: 0 из 5");
+}
+
+#[test]
+fn a_corrupt_stop_fact_is_refused_instead_of_recorded_as_an_empty_role() {
+    // REQ-AL-06 (rework R4): the answer writes role/attempts/limit into a
+    // decision. A trip event missing one of them must refuse loudly, not
+    // record «role: "", attempts: 0» as if that were the stop fact.
+    let (dir, api) = home();
+    let id = task(&api);
+    seed(&api, dir.path(), &id, 5);
+    assert!(supervised(&api, dir.path(), &id).is_some());
+    let qid = api.task_status(&id).unwrap().open_questions[0].id;
+
+    // A later trip event for the SAME question, missing `attempt`/`limit`.
+    let store = Store::open(dir.path()).unwrap();
+    let tid = api.task_get(&id).unwrap().id;
+    store
+        .insert_event(
+            Some(tid),
+            event_kind::ATTEMPT_LIMIT_TRIPPED,
+            "mock",
+            json!({
+                (json_field::QUESTION_ID): qid.to_string(),
+                "role": "requirements-analyst",
+            }),
+        )
+        .unwrap();
+
+    let err = api
+        .question_answer(&qid.to_string(), "продолжить")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("attempt"), "the refusal names the fact: {err}");
+    assert!(
+        err.contains("corrupt") || err.contains("cannot be trusted"),
+        "the refusal says the fact is corrupt: {err}"
+    );
+
+    // Nothing was written and the question is still open.
+    let status = api.task_status(&id).unwrap();
+    assert_eq!(status.open_questions.len(), 1);
+    assert_eq!(
+        event_count(&api, &id, event_kind::ATTEMPT_LIMIT_RESET),
+        0,
+        "no reset event was written"
+    );
+    assert!(
+        !api.task_decisions(&id)
+            .unwrap()
+            .into_iter()
+            .any(|d| d.kind == decision_kind::ATTEMPT_LIMIT_ANSWER),
+        "no decision was recorded"
+    );
+}

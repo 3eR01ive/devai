@@ -205,6 +205,20 @@ pub struct ProcessBrakes {
     pub park_state: String,
 }
 
+/// One measured convergence series, declared as DATA (rework R2): the stage
+/// name the runtime's convergence slice publishes and the working states whose
+/// work that series compares. A third series is a declaration edit, not a code
+/// catalog; a state judged by two series is refused at init, so the reading is
+/// unambiguous.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSeries {
+    /// The stage token the convergence slice publishes (`spec_review`, ...).
+    pub stage: String,
+    /// The working states whose work this series measures.
+    pub states: Vec<String>,
+}
+
 /// The declared address of every custody hold.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -300,6 +314,12 @@ pub struct Process {
     pub transitions: Vec<ProcessTransition>,
     pub brakes: ProcessBrakes,
     pub holds: ProcessHolds,
+    /// The measured convergence series and the states each one judges. Empty
+    /// is legitimate (REQ-AL-03 AC4): progress then rests on state moves and
+    /// verdicts alone. `default` keeps a declaration written before the
+    /// catalog existed loadable.
+    #[serde(default)]
+    pub series: Vec<ProcessSeries>,
 }
 
 impl Process {
@@ -339,6 +359,36 @@ impl Process {
                     .any(|other| other.state != state && other.role.as_deref() == Some(*role))
             })
             .collect()
+    }
+
+    /// The states ONE declared convergence series judges (rework R2): the
+    /// declaration's answer, never a code catalog. No declared series → an
+    /// empty slice, and progress falls back to state moves and verdicts.
+    pub fn series_states(&self, stage: &str) -> &[String] {
+        self.series
+            .iter()
+            .find(|s| s.stage == stage)
+            .map(|s| s.states.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The measured series that judges `state`, if the declaration names one.
+    /// A state lives in at most one series (checked at init), so the answer is
+    /// unambiguous.
+    pub fn series_of(&self, state: &str) -> Option<&str> {
+        self.series
+            .iter()
+            .find(|s| s.states.iter().any(|st| st == state))
+            .map(|s| s.stage.as_str())
+    }
+
+    /// Does the measured series `stage` speak for `role` — is any state it
+    /// judges executed by that role? ONE reading shared by the series rounds
+    /// and the verdicts, so neither can attribute a shift to another role.
+    pub fn series_judges(&self, stage: &str, role: &str) -> bool {
+        self.series_states(stage)
+            .iter()
+            .any(|state| self.role_for(state) == Some(role))
     }
 
     /// The raw declared target of one edge (`RETURN_STATE` included).
@@ -430,7 +480,7 @@ pub fn parse(text: &str, where_: &str) -> Result<Process, String> {
     let policy: Process = serde_yaml::from_value(section.clone()).map_err(|e| {
         format!(
             "{where_}: process section is invalid (keys: version, conditions, states, \
-             transitions, holds, brakes): {e}"
+             transitions, holds, series, brakes): {e}"
         )
     })?;
     policy.validate(where_)?;
@@ -443,6 +493,7 @@ impl Process {
     pub fn validate(&self, where_: &str) -> Result<(), String> {
         self.validate_header(where_)?;
         self.validate_states(where_)?;
+        self.validate_series(where_)?;
         self.validate_transitions(where_)?;
         self.validate_holds(where_)?;
         self.validate_brakes(where_)
@@ -559,6 +610,67 @@ impl Process {
                     state.as_str()
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The measured series catalog is DATA (rework R2): every stage name is
+    /// non-blank and unique, every judged state is a declared role state, and
+    /// no state is judged by two series. An empty catalog is allowed — the
+    /// declaration then measures nothing and progress rests on moves/verdicts.
+    fn validate_series(&self, where_: &str) -> Result<(), String> {
+        let mut stages: Vec<&str> = Vec::new();
+        let mut judged: Vec<&str> = Vec::new();
+        for series in &self.series {
+            if series.stage.trim().is_empty() {
+                return Err(format!("{where_}: series contains a blank stage name"));
+            }
+            if stages.contains(&series.stage.as_str()) {
+                return Err(format!(
+                    "{where_}: series declares stage `{}` twice",
+                    series.stage
+                ));
+            }
+            stages.push(&series.stage);
+            self.validate_series_states(series, &mut judged, where_)?;
+        }
+        Ok(())
+    }
+
+    /// The states of ONE declared series: known, role-executed, not repeated.
+    fn validate_series_states<'a>(
+        &self,
+        series: &'a ProcessSeries,
+        judged: &mut Vec<&'a str>,
+        where_: &str,
+    ) -> Result<(), String> {
+        if series.states.is_empty() {
+            return Err(format!(
+                "{where_}: series stage `{}` names no state — a measure of nothing is not a series",
+                series.stage
+            ));
+        }
+        for state in &series.states {
+            TaskState::parse(state).map_err(|_| {
+                format!(
+                    "{where_}: series stage `{}` names unknown state `{state}`",
+                    series.stage
+                )
+            })?;
+            if self.role_for(state).is_none() {
+                return Err(format!(
+                    "{where_}: series stage `{}` judges state `{state}`, which no role executes — \
+                     a series measures role work",
+                    series.stage
+                ));
+            }
+            if judged.contains(&state.as_str()) {
+                return Err(format!(
+                    "{where_}: state `{state}` is judged by two series — the reading would be \
+                     ambiguous"
+                ));
+            }
+            judged.push(state);
         }
         Ok(())
     }
