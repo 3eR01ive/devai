@@ -14,6 +14,7 @@ use devai_core::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::first_layer::{self, FirstLayerView};
 use super::{
     HumanReportView, REAUDIT_NOT_RUNNING, REAUDIT_NOT_STARTED, REAUDIT_RUNNING, REAUDIT_UNFINISHED,
     STALE_CAUSE_REQUIREMENTS_REVISION, STALE_CAUSE_REWORK_RETURN, STALE_MARKER,
@@ -92,6 +93,12 @@ impl RenderSource {
 pub struct RenderedReport {
     pub text: String,
     pub source: RenderSource,
+    /// REQ-SAY-01..05: the human first layer of the SAME stored form — «что
+    /// нашёл аудит», the findings in plain words and «не проверено» kept
+    /// apart. `None` whenever the body has no readable human form (a legacy
+    /// flat text, a damaged form, a broken body): such a report is shown as
+    /// what it is, never dressed up as the new layer.
+    pub first_layer: Option<FirstLayerView>,
 }
 
 /// The text of a report whose BLOB does not parse as JSON at all (rework R4):
@@ -113,6 +120,7 @@ pub fn render_stored_report(v: &Value) -> RenderedReport {
             Ok(form) => RenderedReport {
                 text: render_text(&form),
                 source: RenderSource::HumanForm,
+                first_layer: Some(first_layer::of(&form)),
             },
             Err(_) => RenderedReport {
                 text: match flat {
@@ -122,6 +130,7 @@ pub fn render_stored_report(v: &Value) -> RenderedReport {
                     None => "⚠ форма отчёта повреждена — рендеринга нет".to_string(),
                 },
                 source: RenderSource::CorruptForm,
+                first_layer: None,
             },
         };
     }
@@ -129,10 +138,12 @@ pub fn render_stored_report(v: &Value) -> RenderedReport {
         Some(flat) => RenderedReport {
             text: flat.to_string(),
             source: RenderSource::FlatText,
+            first_layer: None,
         },
         None => RenderedReport {
             text: "(report assembled before @2 — no rendering)".to_string(),
             source: RenderSource::Absent,
+            first_layer: None,
         },
     }
 }
@@ -158,6 +169,9 @@ pub struct PresentedReport {
     pub text: String,
     pub source: RenderSource,
     pub freshness: ReportFreshness,
+    /// The human first layer of the same stored form (REQ-SAY-01..05); `None`
+    /// when the body carries no readable human form.
+    pub first_layer: Option<FirstLayerView>,
 }
 
 impl PresentedReport {
@@ -485,48 +499,50 @@ mod tests {
     }
 
     /// R2 (rework): the cause is the token the store recorded for THIS
-    /// artifact — each known cause reads as itself, an unknown one is quoted
-    /// verbatim, and with no event nothing is claimed. A different artifact's
-    /// event never leaks onto this report.
+    /// artifact — each known cause reads as itself and an unknown one is
+    /// quoted verbatim, never rounded.
     #[test]
-    fn the_stale_cause_comes_from_the_recorded_event_only() {
+    fn each_recorded_cause_reads_as_itself() {
         let now = Utc::now();
         let a = art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale);
         let task = task_in(TaskState::Rework);
         let done = exec(ExecutionStatus::Completed, now);
+        let marker = |e: WorkflowEvent| {
+            let cause = stale_cause(&[e], a.id).expect("the event names this report");
+            freshness(&task, &a, &[done.clone()], Some(&cause)).marker
+        };
 
-        let returned = staled(
+        let m = marker(staled(
             "rework: quality report returned by the human",
             "guerrero",
             a.id,
             now,
-        );
-        let cause = stale_cause(&[returned], a.id).expect("the event names this report");
-        let m = freshness(&task, &a, &[done.clone()], Some(&cause)).marker;
+        ));
         assert!(
             m.contains("отчёт возвращён человеком на реворк (guerrero)")
                 && m.contains("новый прогон аудитора не идёт"),
             "{m}"
         );
-
-        let revised = staled("requirements revision", "platform", a.id, now);
-        let cause = stale_cause(&[revised], a.id).unwrap();
-        let m = freshness(&task, &a, &[done.clone()], Some(&cause)).marker;
+        let m = marker(staled("requirements revision", "platform", a.id, now));
         assert!(
             m.contains("выпущена новая ревизия требований (platform)"),
             "{m}"
         );
-
-        let unknown = staled("something-new", "platform", a.id, now);
-        let cause = stale_cause(&[unknown], a.id).unwrap();
-        let m = freshness(&task, &a, &[done.clone()], Some(&cause)).marker;
+        let m = marker(staled("something-new", "platform", a.id, now));
         assert!(
             m.contains("причина «something-new»"),
             "an unknown token is quoted, never rounded: {m}"
         );
+    }
 
-        // The newest event for this artifact wins; another artifact's event
-        // is not this report's cause.
+    /// The newest event for this artifact wins; another artifact's event is
+    /// not this report's cause, and with no event nothing is claimed.
+    #[test]
+    fn the_newest_event_for_this_artifact_wins() {
+        let now = Utc::now();
+        let a = art(ArtifactKind::QualityReport, 1, ArtifactStatus::Stale);
+        let task = task_in(TaskState::Rework);
+        let done = exec(ExecutionStatus::Completed, now);
         let older = staled("requirements revision", "platform", a.id, now);
         let newer = staled(
             "rework: quality report returned by the human",
@@ -570,5 +586,148 @@ mod tests {
         );
         assert!(!settled.stale);
         assert!(settled.marker.is_empty());
+    }
+
+    /// One stored row of the fixture form.
+    fn stored_item(
+        id: &str,
+        kind: &str,
+        summary: &str,
+        site: &str,
+    ) -> crate::human_view::HumanItem {
+        use crate::human_view::HumanItem;
+        HumanItem {
+            id: id.into(),
+            kind: kind.into(),
+            summary: summary.into(),
+            line: format!("{id} · балл 0.400 · вес 0.200"),
+            site: site.into(),
+            score: Some(0.4),
+            weight: Some(0.2),
+            importance: Some(0.12),
+            ratified_by: None,
+            reason: None,
+            evidence: vec![],
+        }
+    }
+
+    /// The headline of the fixture form: a failed run with one point of each
+    /// presented kind.
+    fn stored_headline() -> crate::human_view::HumanHeadline {
+        use crate::human_view::{HumanCounts, HumanHeadline};
+        HumanHeadline {
+            verdict: "НЕ ПРОШЁЛ".into(),
+            machine_verdict: "FAIL".into(),
+            score: 0.6,
+            theta: 0.9,
+            basis: "красные линии".into(),
+            numbers: "S=0.600/1.00, порог 0.900".into(),
+            counts: HumanCounts {
+                blocks: 1,
+                nuances: 1,
+                anchors: 0,
+                unchecked: 1,
+                passed: 0,
+            },
+        }
+    }
+
+    /// One stored form of the shape the assembler writes: enough for the
+    /// first layer — the saved headline score, one blocking finding, one
+    /// nuance, one unchecked check.
+    fn stored_form() -> crate::human_view::HumanReportView {
+        use crate::human_view::{
+            GROUP_BLOCKS, GROUP_NUANCES, GROUP_UNCHECKED, HumanGroup, HumanItem,
+        };
+        let group = |key: &str, items: Vec<HumanItem>| HumanGroup {
+            key: key.into(),
+            title: key.to_uppercase(),
+            lead: String::new(),
+            items,
+        };
+        crate::human_view::HumanReportView {
+            version: 2,
+            lang: "ru".into(),
+            headline: stored_headline(),
+            groups: vec![
+                group(
+                    GROUP_BLOCKS,
+                    vec![stored_item(
+                        "blk/a",
+                        "floor",
+                        "дыра в проверке ветвления",
+                        "src/a.rs:10",
+                    )],
+                ),
+                group(
+                    GROUP_NUANCES,
+                    vec![stored_item("n/b", "scored", "мелкая придирка", "")],
+                ),
+                group(
+                    GROUP_UNCHECKED,
+                    vec![stored_item("brk/x", "blocked", "проверка не прошла", "")],
+                ),
+            ],
+            blocked_weight: 0.2,
+            max_blocked_weight: 0.2,
+        }
+    }
+
+    /// REQ-SAY-01..06 wiring (rework R1): the first layer is read off the SAME
+    /// stored form the text is laid out from — one read, one answer. A body
+    /// with no readable form (legacy flat text, damaged form) carries NO first
+    /// layer: it is not invented for a report that never had one.
+    #[test]
+    fn the_first_layer_is_read_from_the_stored_form_and_only_from_it() {
+        let v = stored_form();
+        let body = serde_json::json!({ "human_view": serde_json::to_value(&v).unwrap() });
+        let r = render_stored_report(&body);
+        assert_eq!(r.source, RenderSource::HumanForm);
+        let first = r
+            .first_layer
+            .as_ref()
+            .expect("a readable stored form carries its first layer");
+        assert_eq!(first.found, first_layer::found(&v.headline));
+        assert_eq!(first.score_line, "сохранённый балл работы: 0.600");
+        // Decision items first; the machine id travels only for the detail.
+        let ids: Vec<&str> = first.findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["blk/a", "n/b"]);
+        assert_eq!(first.findings[0].what, "дыра в проверке ветвления");
+        assert_eq!(first.findings[0].site, "src/a.rs:10");
+        assert_eq!(first.findings[0].stake, first_layer::STAKE_BLOCKS);
+        assert_eq!(first.unchecked.len(), 1);
+        assert_eq!(
+            first.unchecked[0].missing,
+            first_layer::MISSING_UNRECORDED,
+            "no stored reason is said in words"
+        );
+        // The text and the layer are two layouts of ONE read.
+        assert!(r.text.contains(&first.found), "{}", r.text);
+        assert!(
+            r.text.contains(first.findings[0].what.as_str()),
+            "{}",
+            r.text
+        );
+    }
+
+    /// A body with no readable form (legacy flat text, damaged form) carries
+    /// NO first layer: it is not invented for a report that never had one.
+    #[test]
+    fn a_body_without_a_readable_form_carries_no_first_layer() {
+        // A legacy body: its own flat text, no layer dressed up as the new one.
+        let flat = serde_json::json!({ "report_text": "LEGACY-FLAT-TEXT" });
+        let r = render_stored_report(&flat);
+        assert_eq!(r.source, RenderSource::FlatText);
+        assert_eq!(r.text, "LEGACY-FLAT-TEXT");
+        assert!(r.first_layer.is_none());
+
+        // A damaged form: announced, and still no layer.
+        let damaged = serde_json::json!({
+            "report_text": "FLAT",
+            "human_view": { "version": "not-a-number", "headline": 42 },
+        });
+        let r = render_stored_report(&damaged);
+        assert_eq!(r.source, RenderSource::CorruptForm);
+        assert!(r.first_layer.is_none());
     }
 }

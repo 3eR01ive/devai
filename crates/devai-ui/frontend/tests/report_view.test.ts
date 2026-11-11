@@ -6,7 +6,7 @@
 // Run: `npm test` (node --test on the TS sources; Node strips the types).
 import assert from "node:assert/strict";
 import test from "node:test";
-import { freshnessBanner, hasEvidence, isNameOnlyGroup, presentReport, showsPassedNote, validateHumanForm, visibleGroups } from "../src/report_view.ts";
+import { freshnessBanner, firstLayerGap, hasEvidence, presentReport, showsPassedNote, validateHumanForm, visibleGroups } from "../src/report_view.ts";
 import type { QualityReportView, ReportFreshness } from "../src/types.ts";
 
 function view(over: Partial<QualityReportView>): QualityReportView {
@@ -128,6 +128,55 @@ test("an absent rendering keeps an explicit fact instead of an empty panel", () 
   assert.equal(body.kind, "absent");
 });
 
+// R1 (rework): an absent human layer is NOT «there are no findings». The three
+// stored shapes that produce it each answer in their own words, and the return
+// draft comes with one honest general reason instead of arriving empty.
+test("a report without a human layer names what is unreadable, never «no findings»", () => {
+  const cases: [string, Partial<QualityReportView>][] = [
+    ["flat_text", { source: "flat_text", report_text: "ВЕРДИКТ: ПРОШЁЛ (PASS)", report: {} }],
+    ["corrupt_form", { source: "corrupt_form", report_text: "⚠ форма отчёта повреждена", report: {} }],
+    ["corrupt_body", { source: "corrupt_body", report_text: "⚠ отчёт качества 011 повреждён: тело блоба", report: {} }],
+  ];
+  const seen: string[] = [];
+  for (const [source, over] of cases) {
+    const r = view(over);
+    const gap = firstLayerGap(r, presentReport(r));
+    assert.ok(gap, `${source}: a report without a layer still says why`);
+    if (!gap) continue;
+    assert.doesNotMatch(gap.what, /недостатков нет/, `${source}: absence is not an all-clear`);
+    assert.doesNotMatch(
+      [gap.what, gap.means, gap.draft_note, gap.draft].join("\n"),
+      /недостатков в отчёте нет/,
+      `${source}: the buggy all-clear phrase is gone`,
+    );
+    assert.match(gap.means, /состав замечаний неизвестен/, `${source}: the unknown is named`);
+    assert.match(gap.draft, /^состав замечаний не прочитан/, `${source}: the draft carries the reason`);
+    assert.ok(gap.draft_note.includes("черновик не пустой"), `${source}: the draft is not empty`);
+    seen.push(gap.what);
+  }
+  assert.equal(new Set(seen).size, 3, "legacy, damaged form and broken body read differently");
+});
+
+test("a readable form whose layer was not published says exactly that", () => {
+  const r = view({ report: { human_view: form() } });
+  const body = presentReport(r);
+  assert.equal(body.kind, "form");
+  const gap = firstLayerGap(r, body);
+  assert.ok(gap);
+  if (!gap) return;
+  assert.equal(gap.kind, "not_published");
+  assert.match(gap.what, /не передан/);
+});
+
+test("an unknown source token is answered honestly, not rounded to a known case", () => {
+  const r = view({ source: "something-new", report_text: "?" });
+  const gap = firstLayerGap(r, presentReport(r));
+  assert.ok(gap);
+  if (!gap) return;
+  assert.equal(gap.kind, "unknown");
+  assert.match(gap.what, /не может сказать/);
+});
+
 function freshness(over: Partial<ReportFreshness>): ReportFreshness {
   return {
     stale: true,
@@ -165,6 +214,10 @@ test("the stale banner pins the running re-audit wording", () => {
     b.detail,
     "статус отчёта STALE · фаза REWORK · execution 01a1b29e (RUNNING)",
   );
+  // The FIRST thing a human reads is the plain sentence, not the marker.
+  assert.match(b.plain, /^Этот отчёт устарел — решать по нему уже нельзя/);
+  assert.match(b.plain, /Новый аудит уже идёт — дождись его отчёта/);
+  assert.doesNotMatch(b.plain, /STALE|REWORK|RUNNING/);
 });
 
 test("the stale banner pins the «no execution» wording without an id", () => {
@@ -180,6 +233,8 @@ test("the stale banner pins the «no execution» wording without an id", () => {
   if (!b.stale) return;
   assert.equal(b.head, "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит ещё не запущен");
   assert.equal(b.detail, "статус отчёта STALE · фаза REWORK");
+  assert.match(b.plain, /Дождись нового отчёта аудита/);
+  assert.doesNotMatch(b.plain, /аудит уже идёт/, "nothing is claimed about a run the store did not record");
 });
 
 // R6: the visible rows the panel prints ARE the stored Rust `line` strings —
@@ -228,15 +283,6 @@ test("the «пройдено без замечаний» note appears only when 
   assert.equal(showsPassedNote(f), false);
   f.headline.counts.passed = 3;
   assert.equal(showsPassedNote(f), true);
-});
-
-test("only the anchors group is a name-only row", () => {
-  const f = form() as any;
-  assert.deepEqual(
-    f.groups.map((g: any) => isNameOnlyGroup(g)),
-    [false, false, true, false],
-  );
-  assert.equal(isNameOnlyGroup({ key: "blocks", title: "t", lead: "", items: [] }), false);
 });
 
 test("the collapsed evidence layer exists exactly when evidence was stored", () => {

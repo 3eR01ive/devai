@@ -297,6 +297,51 @@ export interface HumanForm {
   max_blocked_weight: number;
 }
 
+// The FIRST LAYER of a stored report (REQ-SAY-01..06): read off the stored
+// human form by the platform, printed verbatim here. It carries the human
+// wording («что нашёл аудит», чем грозит каждое замечание, что делать с
+// непроверенным) and no figure beside the saved score; every other number
+// stays in the stored row.
+export interface FirstLayerFinding {
+  id: string;
+  what: string;
+  // Empty when the report named no site; the reader says «место не указано».
+  site: string;
+  // What accepting the work costs because of this finding.
+  stake: string;
+  // The stored machine row (id · score · weight · importance · site).
+  line: string;
+  evidence?: string[];
+}
+
+// An unchecked point is NOT a defect: it says what was missing and what to do
+// about it, in its own fields (never the finding's).
+export interface FirstLayerUnchecked {
+  id: string;
+  what: string;
+  site: string;
+  // What exactly was missing; «причина в отчёте не записана» when none was.
+  missing: string;
+  // What the human can do about it, or that nothing is required from them.
+  action: string;
+  line: string;
+  evidence?: string[];
+}
+
+export interface FirstLayer {
+  found: string;
+  // Сохранённый балл работы рядом с оценкой словами (REQ-SAY-02 v4): готовая
+  // строка платформы, печатается как есть — окно не форматирует числа.
+  score_line: string;
+  // Заголовки разделов приходят из платформы — один источник с терминалом;
+  // окно печатает их как есть и не держит своих копий.
+  findings_title: string;
+  findings: FirstLayerFinding[];
+  unchecked_title: string;
+  unchecked: FirstLayerUnchecked[];
+  unchecked_lead: string;
+}
+
 export interface ReportFreshness {
   stale: boolean;
   marker: string;
@@ -322,6 +367,9 @@ export interface QualityReportView {
   // угадывая по тексту.
   source: string;
   freshness: ReportFreshness | null;
+  // REQ-SAY-01..06: человеческий первый слой того же отчёта; null — у тела
+  // нет читаемой человеческой формы (старый плоский текст / повреждение).
+  first_layer: FirstLayer | null;
 }
 
 export interface TaskDependency {

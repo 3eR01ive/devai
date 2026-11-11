@@ -2845,6 +2845,7 @@ mod tests {
             status: "CURRENT".to_string(),
             source: "flat_text".to_string(),
             freshness: None,
+            first_layer: None,
         });
         let mut empty_qa = facts[ix].clone();
         empty_qa.task.id = devai_core::types::new_id();

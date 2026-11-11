@@ -3,17 +3,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ACCEPT_LABEL,
+  RETURN_LABEL,
   addDraftItem,
   canAccept,
   canReturn,
   composeReturnRationale,
+  decisionPrompt,
   draftItemOf,
   draftText,
   editDraftRequirement,
+  inDraft,
+  prefillDraft,
   removeDraftItem,
-  returnPreview,
   sentPoints,
   siteText,
+  toggleDraftItem,
 } from "../src/quality_gate_view.ts";
 import {
   ALL_GROUPS,
@@ -49,6 +54,7 @@ function reportView(form: unknown): QualityReportView {
     report_text: null,
     source: "human_form",
     freshness: null,
+    first_layer: null,
   };
 }
 
@@ -107,7 +113,7 @@ test("a drafted point carries the stored summary verbatim and its site", () => {
   const d = draftItemOf({ id: "cl/fmt", summary: "cargo fmt дрейф", site: "a.rs:1" });
   assert.equal(d.requirement, "cargo fmt дрейф", "prefilled with the stored summary, not a retelling");
   assert.equal(d.site, "a.rs:1");
-  assert.equal(siteText(""), "сайт не указан", "a missing site is named in words");
+  assert.equal(siteText(""), "место не указано", "a missing site is named in words");
   assert.equal(siteText("a.rs:1"), "a.rs:1");
 });
 
@@ -133,7 +139,7 @@ test("a point with an empty requirement never reaches the sent text", () => {
   assert.deepEqual(sentPoints(draft), [{ requirement: "исправить два", site: "" }]);
   const text = draftText(draft);
   assert.match(text, /1\. исправить два/);
-  assert.match(text, /сайт не указан/);
+  assert.match(text, /место не указано/);
   assert.doesNotMatch(text, /one/);
 });
 
@@ -145,7 +151,7 @@ test("the return text is the manual rationale plus the drafted points", () => {
   assert.match(text, /^общий комментарий/);
   assert.match(text, /Пункты возврата:/);
   assert.match(text, /1\. исправить a/);
-  assert.match(text, /сайт: a\.rs:1/);
+  assert.match(text, /где: a\.rs:1/);
 
   // Either half alone is enough; both empty is the only blocked case.
   assert.equal(composeReturnRationale("", draft).trim().length > 0, true);
@@ -171,13 +177,87 @@ test("return can be sent with drafted points alone; an empty text blocks it", ()
   assert.equal(canReturn(gate({ may_return: false }), "", draft), false);
 });
 
-test("the preview says what will happen, including an empty draft", () => {
-  const draft = [
-    { key: "a", item_id: "a", summary: "one", site: "a.rs:1", requirement: "исправить a" },
-  ];
-  assert.match(returnPreview(draft), /ДОРАБОТКУ/);
-  assert.match(returnPreview(draft), /исправить a — a\.rs:1/);
-  assert.match(returnPreview([]), /уходит только обоснование/);
+test("both buttons are signed by their consequence, in words — no internal state", () => {
+  // REQ-SAY-01 AC3/AC4: what becomes of the task, said plainly; a machine
+  // token (ACCEPTED / REWORK / PASS...) never appears in the first layer.
+  assert.match(ACCEPT_LABEL, /^Принять — работа считается сделанной$/);
+  assert.match(RETURN_LABEL, /^Вернуть в доработку — задача пойдёт на переделку/);
+  for (const label of [ACCEPT_LABEL, RETURN_LABEL]) {
+    assert.doesNotMatch(label, /ACCEPTED|REWORK|INCONCLUSIVE|PASS|FAIL/);
+  }
+});
+
+test("the appeal line says what the human is asked, and why when nothing is open", () => {
+  // Both acts open: the appeal names them, no reason line.
+  const both = decisionPrompt(gate());
+  assert.match(both.head, /принять эту работу или вернуть её на переделку/);
+  assert.equal(both.why, "");
+
+  // Only one act: the other one's refusal is quoted from the platform.
+  const onlyAccept = decisionPrompt(
+    gate({ may_return: false, return_denied: { code: "audit_running", text: "идёт аудит" } }),
+  );
+  assert.match(onlyAccept.head, /принять эту работу/);
+  assert.doesNotMatch(onlyAccept.head, /вернуть/);
+  assert.match(onlyAccept.why, /вернуть нельзя: идёт аудит/);
+
+  // Neither act while an audit runs: words, not a dead button.
+  const running = decisionPrompt(
+    gate({ may_accept: false, may_return: false, audit_running: true }),
+  );
+  assert.match(running.head, /аудит ещё идёт/);
+  assert.match(running.why, /принять или вернуть нельзя/);
+
+  // Neither act for a named refusal: the platform's own reason is quoted.
+  const refused = decisionPrompt(
+    gate({
+      may_accept: false,
+      may_return: false,
+      accept_denied: { code: "no_current_report", text: "нет текущего отчёта" },
+    }),
+  );
+  assert.match(refused.why, /принять нельзя: нет текущего отчёта/);
+
+  // No gate at all: nothing is invented about the future.
+  const absent = decisionPrompt(null);
+  assert.match(absent.head, /не предлагает такого выбора/);
+});
+
+// The findings the platform hands the panel: two decision items and one that
+// does not block; «не проверено» is a separate list.
+const findings = [
+  { id: "cl/fmt", what: "cargo fmt дрейф", site: "a.rs:1", stake: "без этого принять нельзя", line: "cl/fmt · балл 0.000" },
+  { id: "cl/test", what: "тест падает", site: "", stake: "без этого принять нельзя", line: "cl/test · балл 0.000" },
+  { id: "n/one", what: "мелкая придирка", site: "c.rs:3", stake: "на будущее — принять не мешает", line: "n/one · балл 0.900" },
+];
+
+test("the return draft comes filled with every visible finding, in its stored words", () => {
+  // REQ-SAY-05: nothing to assemble by hand — all findings, phrase and place.
+  const draft = prefillDraft(findings);
+  assert.equal(draft.length, 3, "every finding the human sees is in the draft");
+  assert.deepEqual(
+    draft.map((d) => d.requirement),
+    ["cargo fmt дрейф", "тест падает", "мелкая придирка"],
+    "the requirement IS the stored human phrase",
+  );
+  assert.deepEqual(
+    draft.map((d) => d.site),
+    ["a.rs:1", "", "c.rs:3"],
+    "the place travels with the point",
+  );
+  // «не проверено» is not a defect: it is added by one click, not prefilled.
+  assert.equal(inDraft(draft, "brk/x"), false);
+  const withHole = toggleDraftItem(draft, { id: "brk/x", summary: "проверка не прошла", site: "" });
+  assert.equal(inDraft(withHole, "brk/x"), true);
+  // The same click takes a prefilled point out — the operator removes extra.
+  assert.equal(inDraft(toggleDraftItem(withHole, { id: "cl/fmt", summary: "cargo fmt дрейф", site: "a.rs:1" }), "cl/fmt"), false);
+  // The sent text carries the points, each with its place.
+  const sent = composeReturnRationale("", prefillDraft(findings));
+  assert.match(sent, /cl\/fmt|Пункты возврата:/);
+  assert.match(sent, /1\. cargo fmt дрейф/);
+  assert.match(sent, /где: a\.rs:1/);
+  assert.match(sent, /где: место не указано/);
+  assert.equal(canReturn(gate(), "", prefillDraft(findings)), true, "return is available out of the box");
 });
 
 test("the importance filter offers all + every stored group and hides without rewriting", () => {

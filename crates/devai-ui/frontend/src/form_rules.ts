@@ -14,8 +14,10 @@ export function rationaleValid(rationale: string): boolean {
   return rationale.trim().length > 0;
 }
 
-/** Site wording: an absent site is named in words, never silently dropped. */
+/** Site wording: an absent site is named in words, never silently dropped.
+ * ONE wording for every surface — the first layer, the return draft and the
+ * signature card all say «место не указано» (REQ-SAY-03 AC2). */
 export function siteText(it: string | { site: string }): string {
   const site = typeof it === "string" ? it : it.site;
-  return site.trim() ? site : "сайт не указан";
+  return site.trim() ? site : "место не указано";
 }

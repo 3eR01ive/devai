@@ -1288,6 +1288,43 @@ impl Api {
         });
     }
 
+    /// The quality report a decision gate presents: the stored human form when
+    /// present, the §2.6 text otherwise — the same status-aware selection
+    /// (REQ-005, REQ-QH-05/06) the UI panel reads.
+    fn presented_for_gate(&self, report: &RunReport) -> ApiResult<Option<PresentedReport>> {
+        match report.gate {
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                self.presented_quality_report(report.task_id)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The paragraph half of the gate presentation (REQ-HP-05, ratified
+    /// OQ-HP-1): approval/review reads spec + review, acceptance reads the
+    /// implementation-report. Stored fields, verbatim; absence (a legacy @1/@2
+    /// CURRENT, a non-JSON body) renders as NO paragraph, never as a broken
+    /// gate (REQ-HP-06 non-retroactivity in the render half too).
+    fn gate_human_paragraphs(&self, task: Id, gate: Gate) -> ApiResult<Vec<(String, String)>> {
+        let mut paragraphs: Vec<(String, String)> = Vec::new();
+        let wanted: &[(ArtifactKind, &str)] = match gate {
+            Gate::WaitingApproval => &[
+                (ArtifactKind::RequirementsSpec, "requirements-specification"),
+                (ArtifactKind::ReviewReport, "review-report"),
+            ],
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                &[(ArtifactKind::ImplementationReport, "implementation-report")]
+            }
+            _ => &[],
+        };
+        for (kind, label) in wanted {
+            if let Some(p) = self.stored_human_paragraph(task, *kind, label)? {
+                paragraphs.push(p);
+            }
+        }
+        Ok(paragraphs)
+    }
+
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
         let task = self.store.resolve_task(&req.id)?;
         let _a = self.publish_row_internal(
@@ -2485,17 +2522,19 @@ impl Api {
         let events = self.store.events(task.id, None)?;
         let cause = present::stale_cause(&events, a.id);
         let freshness = present::freshness(task, a, &execs, cause.as_ref());
-        let (body, text, source) = match serde_json::from_slice::<serde_json::Value>(&blob) {
-            Ok(body) => {
-                let rendered = present::render_stored_report(&body);
-                (body, rendered.text, rendered.source)
-            }
-            Err(e) => (
-                serde_json::Value::Null,
-                present::corrupt_body_text(&short_id(&a.id), &e.to_string()),
-                devai_runtime::human_view::present::RenderSource::CorruptBody,
-            ),
-        };
+        let (body, text, source, first_layer) =
+            match serde_json::from_slice::<serde_json::Value>(&blob) {
+                Ok(body) => {
+                    let rendered = present::render_stored_report(&body);
+                    (body, rendered.text, rendered.source, rendered.first_layer)
+                }
+                Err(e) => (
+                    serde_json::Value::Null,
+                    present::corrupt_body_text(&short_id(&a.id), &e.to_string()),
+                    devai_runtime::human_view::present::RenderSource::CorruptBody,
+                    None,
+                ),
+            };
         Ok(Some(PresentedQuality {
             artifact: a.clone(),
             body,
@@ -2503,6 +2542,7 @@ impl Api {
                 text,
                 source,
                 freshness,
+                first_layer,
             },
         }))
     }
@@ -3862,10 +3902,44 @@ scoring:
         );
         assert!(!p.freshness.stale);
         assert_eq!(p.freshness.report_status, "CURRENT");
+    }
 
+    /// The UI view carries the FIRST LAYER of the same read — the panel does
+    /// not derive it, and both channels carry one and the same layer
+    /// (REQ-SAY-01..06, rework R1 wiring).
+    #[test]
+    fn the_ui_view_carries_the_first_layer_of_the_same_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "form-first-layer");
+        publish_form_report(&api, t);
+
+        let p = api.presented_quality_report(t).unwrap().unwrap();
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.report_text.as_deref(), Some(p.text.as_str()));
         assert_eq!(view.source, "human_form");
+        let first = view
+            .first_layer
+            .as_ref()
+            .expect("a readable stored form reaches the UI with its first layer");
+        assert_eq!(Some(first), p.first_layer.as_ref(), "one read, one layer");
+        assert!(
+            first.score_line.starts_with("сохранённый балл работы: 0."),
+            "the saved score travels beside the assessment: {}",
+            first.score_line
+        );
+        assert!(
+            first.findings.iter().any(|f| f.site == "src/a.rs:7"),
+            "the breached floor reaches the findings with its site: {:?}",
+            first.findings
+        );
+        assert!(
+            first
+                .findings
+                .iter()
+                .all(|f| !f.what.is_empty() && !f.stake.is_empty()),
+            "every finding is a phrase with its stake"
+        );
     }
 
     /// REQ-QH-06 fallback: a pre-@5 body still renders its own stored text,
@@ -3894,6 +3968,15 @@ scoring:
         assert_eq!(
             api.presented_quality_report(t).unwrap().unwrap().source,
             present::RenderSource::FlatText
+        );
+        // A legacy report has no human form, so it has NO first layer: the
+        // viewer is never handed an invented one (rework R1 wiring).
+        assert!(
+            api.task_report(&t.to_string())
+                .unwrap()
+                .first_layer
+                .is_none(),
+            "the new layer is not invented for a body that never had a form"
         );
     }
 
@@ -4059,13 +4142,29 @@ scoring:
         );
     }
 
-    /// QA R2 / rework R4: «no report» (Ok(None)), «damaged form» and «the blob
-    /// is not JSON at all» are three DISTINGUISHABLE outcomes. A corrupt
-    /// CURRENT blob is presented with a marker naming the artifact and a
-    /// distinct render source — never as absence of a report and never as the
-    /// generic «assembled before @2» placeholder.
+    /// Publish a plain-text quality report (the pre-@5 body shape) and return
+    /// its artifact row.
+    fn publish_text_report(api: &Api, t: Id, text: &str) -> Artifact {
+        api.artifact_publish_row(PublishReq {
+            id: t.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: serde_json::to_vec(&serde_json::json!({ "report_text": text })).unwrap(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap()
+        .artifact
+    }
+
+    /// QA R2 / rework R4: «no report» (Ok(None)) and a stored text body are
+    /// distinguishable — absence is answered as absence, never as an empty
+    /// placeholder.
     #[test]
-    fn quality_report_text_distinguishes_absence_from_corruption() {
+    fn quality_report_text_is_absent_before_a_report_and_verbatim_after() {
         let dir = tempfile::tempdir().unwrap();
         let api = api(dir.path());
         let t = fresh_task(&api, "gate-text");
@@ -4074,39 +4173,34 @@ scoring:
             None,
             "no report yet — honest absence"
         );
-
-        let row = api
-            .artifact_publish_row(PublishReq {
-                id: t.to_string(),
-                kind: ArtifactKind::QualityReport,
-                name: "qr".into(),
-                content: br#"{"report_text":"all good"}"#.to_vec(),
-                depends: vec![],
-                contract: None,
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
+        publish_text_report(&api, t, "all good");
         assert_eq!(
             api.quality_report_text(t).unwrap().as_deref(),
             Some("all good")
         );
+    }
 
+    /// QA R2 / rework R4: a corrupt CURRENT blob is presented with a marker
+    /// naming the artifact and a distinct render source — never as absence of
+    /// a report and never as the generic «assembled before @2» placeholder.
+    #[test]
+    fn a_corrupt_current_blob_is_named_not_read_as_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let t = fresh_task(&api, "gate-text-corrupt");
+        let row = publish_text_report(&api, t, "all good");
         // Corrupt the stored blob under the CURRENT row: the next read must
         // say so, not fall through to «no report» and not show the
         // pre-@2 placeholder.
-        std::fs::write(
-            api.store.blob_path(&row.artifact.sha256),
-            b"not-json-at-all",
-        )
-        .unwrap();
+        std::fs::write(api.store.blob_path(&row.sha256), b"not-json-at-all").unwrap();
         let p = api.presented_quality_report(t).unwrap().unwrap();
         assert_eq!(p.source, present::RenderSource::CorruptBody);
         assert!(p.text.contains("повреждён"), "{}", p.text);
         assert!(!p.text.contains("before @2"), "{}", p.text);
+        assert!(p.first_layer.is_none(), "a broken body has no first layer");
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.source, "corrupt_body");
+        assert!(view.first_layer.is_none(), "the UI view invents no layer");
         assert!(
             view.report_text.unwrap_or_default().contains("повреждён"),
             "the UI view carries the same marker"
@@ -4148,6 +4242,14 @@ scoring:
             "the damaged form must be announced: {text}"
         );
         assert!(text.contains("FLAT-BODY-STILL-HERE"), "{text}");
+        assert!(
+            api.presented_quality_report(t)
+                .unwrap()
+                .unwrap()
+                .first_layer
+                .is_none(),
+            "a damaged form has no first layer — the flat text stays flat"
+        );
     }
 
     /// REQ-MUT-03/04 + human Q2: `Api::open` is the only bootstrap entry —

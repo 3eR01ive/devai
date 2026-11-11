@@ -1526,9 +1526,16 @@ fn render_gate(o: &devai_api::RunOutcome) {
             outln!("⏸ APPROVAL is a human gate — approve or reject the requirements");
         }
         Gate::WaitingAccept => {
+            // Человеческий абзац того кода, который принимают, — первым
+            // (ratified OQ-HP-1: implementation-report читается на этом гейте),
+            // дальше идёт машинная половина отчёта.
+            for (label, text) in &o.gate_human_paragraphs {
+                outln!("── {label}: человеческий абзац ──");
+                outln!("{text}");
+            }
             render_freshness(o);
             render_quality_text(o);
-            outln!("⏸ acceptance is a human gate — accept or return the result");
+            outln!("⏸ решение твоё: принять работу или вернуть её на переделку");
         }
         Gate::ReportFresh => {
             match &o.current_quality_report {

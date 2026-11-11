@@ -1,16 +1,16 @@
-// The QA report panel at the component seam (rework R5): the template wiring
-// the pure modules cannot prove — counters before any expansion, the native
-// <details> rows with their evidence/site layer, the saved-group filter, and
-// addPoint → draft → the hold-action's rationale. IPC is not involved: the
-// panel renders the props it is given.
+// The QA report panel at the component seam (REQ-SAY-01..06): the first layer
+// a human reads — the appeal, the plain-words findings, «не проверено» apart
+// and the filled return draft — and the details layer where the machine ids,
+// the verdict token and every figure live. IPC is not involved: the panel
+// renders the props it is given.
 import { mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import QualityGateActions from "../components/quality/QualityGateActions.vue";
 import QualityGatePanel from "../components/quality/QualityGatePanel.vue";
-import { ALL_GROUPS } from "../report_view";
+import { ACCEPT_LABEL, RETURN_LABEL } from "../quality_gate_view";
 import { HOLD_MS } from "../signature_view";
-import type { QualityGateView, QualityReportView } from "../types";
+import type { FirstLayer, QualityGateView, QualityReportView } from "../types";
 
 let frames: FrameRequestCallback[];
 let now: number;
@@ -33,6 +33,36 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** The platform's first layer for the fixture: two blocking points, one
+ *  nuance, one unchecked check. The wording — headings included — is the
+ *  platform's, printed as is. */
+function firstLayer(): FirstLayer {
+  const it = (id: string, what: string, site: string, stake: string, evidence?: string[]) => ({
+    id, what, site, stake, line: `${id} · балл 0.000 · вес 0.100`, evidence,
+  });
+  return {
+    found: "Принять как есть нельзя: есть замечания, которые мешают.",
+    score_line: "сохранённый балл работы: 0.820",
+    findings_title: "Что нашёл аудит",
+    findings: [
+      it("cl/fmt", "cargo fmt дрейф", "a.rs:442", "без этого работу принять нельзя", ["probe: fmt отстаёт"]),
+      it("n/one", "мелкая придирка", "", "на будущее — принять не мешает"),
+    ],
+    unchecked_title: "Не проверено — чего не хватило",
+    unchecked: [
+      {
+        id: "brk/x",
+        what: "проверка не прошла",
+        site: "",
+        missing: "probe could not run",
+        action: "нужен повторный прогон: проверке не хватило условий",
+        line: "brk/x · балл — · вес 0.050",
+      },
+    ],
+    unchecked_lead: "это не недостатки работы, а проверки, которых не хватило",
+  };
+}
+
 function report(): QualityReportView {
   const one = (id: string, summary: string, site: string, evidence?: string[]) => ({
     id, kind: "scored", summary, site, evidence,
@@ -49,26 +79,36 @@ function report(): QualityReportView {
     source: "human_form",
     report_text: null,
     freshness: null,
+    first_layer: firstLayer(),
     report: {
       human_view: {
-        version: 1,
+        version: 2,
         lang: "ru",
         headline: {
           verdict: "НЕ ПРОШЁЛ", machine_verdict: "FAIL", score: 0.82, theta: 0.9,
           numbers: "S=0.820/1.00, порог 0.900", basis: "красные линии: cl/fmt",
-          counts: { blocks: 2, nuances: 1, anchors: 0, unchecked: 1 },
+          counts: { blocks: 1, nuances: 1, anchors: 0, unchecked: 1 },
         },
         groups: [
           {
             key: "blocks", title: "БЬЁТ ПО ВЕРДИКТУ", lead: "решается тобой",
-            items: [
-              one("cl/fmt", "cargo fmt дрейф", "a.rs:442", ["probe: fmt отстаёт"]),
-              { ...one("cl/nosite", "без сайта", ""), score: 0.5 },
-            ],
+            items: [one("cl/fmt", "cargo fmt дрейф", "a.rs:442", ["probe: fmt отстаёт"])],
           },
           {
             key: "nuances", title: "НЮАНСЫ", lead: "",
-            items: [one("n/one", "мелочь", "b.rs:1")],
+            items: [one("n/one", "мелкая придирка", "")],
+          },
+          {
+            key: "unchecked", title: "НЕ ПРОВЕРЕНО", lead: "",
+            items: [one("brk/x", "проверка не прошла", "")],
+          },
+          {
+            key: "anchors", title: "ЯКОРЯ", lead: "",
+            items: [{
+              id: "anch/a", kind: "anchor", summary: "ратифицированный инвариант",
+              site: "", line: "  · anch/a — закреплено: решение 01a1b1b8-dec (guerrero)",
+              score: 1, weight: 0, importance: 0, ratified_by: "решение 01a1b1b8-dec (guerrero)",
+            }],
           },
         ],
         blocked_weight: 0.1,
@@ -91,7 +131,7 @@ function gate(over: Partial<QualityGateView> = {}): QualityGateView {
   };
 }
 
-function mountPanel(g: QualityGateView = gate()) {
+function mountPanel(g: QualityGateView | null = gate()) {
   return mount(QualityGatePanel, {
     props: { report: report(), reportError: null, gate: g, busy: false, error: null },
   });
@@ -104,60 +144,93 @@ function flushFrames() {
 }
 
 describe("QualityGatePanel", () => {
-  it("prints the verdict, numbers and every saved group's counter without expanding", () => {
+  it("opens with what the human is asked, what the audit found, and both consequences", () => {
     const w = mountPanel();
-    const text = w.text();
-    expect(text).toContain("S=0.820/1.00, порог 0.900");
-    expect(text).toContain("бьёт по вердикту: 2");
-    expect(text).toContain("нюансы: 1");
-    // The rows are the stored lines; two blocks rows expand, anchors have none.
-    expect(w.findAll("details.qr-item")).toHaveLength(3);
-    expect(text).toContain("БЬЁТ ПО ВЕРДИКТУ (2)");
-    expect(text).toContain("НЮАНСЫ (1)");
+    const head = w.find(".qr-head").text();
+    expect(head).toContain("принять эту работу или вернуть её на переделку");
+    expect(head).toContain("Принять как есть нельзя");
+    // The appeal and the assessment know no machine token and no figure; the
+    // saved score stands beside them as its own element (REQ-SAY-02 v4).
+    expect(head).not.toMatch(/FAIL|INCONCLUSIVE|PASS/);
+    expect(w.find(".qr-appeal").text()).not.toMatch(/\d/);
+    expect(w.find(".qr-found").text()).not.toMatch(/\d/);
+    expect(w.find(".qr-score").text()).toBe("сохранённый балл работы: 0.820");
+    // A readable layer means no «чего не хватает» line is invented over it.
+    expect(w.find(".qr-gap").exists()).toBe(false);
+    // Both buttons are signed by their consequence.
+    expect(w.text()).toContain(ACCEPT_LABEL);
+    expect(w.text()).toContain(RETURN_LABEL);
     w.unmount();
   });
 
-  it("keeps the stored evidence and names an absent site inside the expandable row", () => {
+  it("puts the machine verdict, the numbers and the counters behind «подробности»", () => {
     const w = mountPanel();
-    const rows = w.findAll("details.qr-item");
+    const details = w.find("details.qr-details");
+    expect(details.exists()).toBe(true);
+    expect((details.element as HTMLDetailsElement).open).toBe(false);
+    expect(details.text()).toContain("ВЕРДИКТ: НЕ ПРОШЁЛ (FAIL)");
+    expect(details.text()).toContain("S=0.820/1.00, порог 0.900");
+    expect(details.text()).toContain("бьёт по вердикту: 1");
+    expect(details.text()).toContain("БЬЁТ ПО ВЕРДИКТУ (1)");
+    w.unmount();
+  });
+
+  it("reads every finding as a human phrase with its place and its weight on the verdict", () => {
+    const w = mountPanel();
+    // The section heading is the platform's own field, not a copy in the panel
+    // (rework R3: one source for the terminal and the window).
+    expect(w.find(".qr-findings h4").text()).toBe("Что нашёл аудит");
+    const rows = w.findAll(".qr-findings details.qr-item");
+    expect(rows).toHaveLength(2);
     const first = rows[0];
-    expect(first.find("summary").text()).toContain("cl/fmt");
-    expect(first.text()).toContain("доказательства (1)");
+    const summary = first.find("summary").text();
+    expect(summary).toContain("cargo fmt дрейф");
+    expect(summary).toContain("где: a.rs:442");
+    expect(summary).toContain("без этого работу принять нельзя");
+    // The machine row is in the expansion, not in the headline.
+    expect(summary).not.toContain("cl/fmt");
+    expect(first.text()).toContain("cl/fmt · балл 0.000");
+    // A point with no site says so in words.
+    expect(rows[1].find("summary").text()).toContain("место не указано");
+    expect(rows[1].find("summary").text()).toContain("принять не мешает");
+    // Evidence stays available in its own expansion.
     expect(first.text()).toContain("probe: fmt отстаёт");
-    expect(first.text()).toContain("сайт: a.rs:442");
-    expect(rows[1].text()).toContain("сайт не указан");
     w.unmount();
   });
 
-  it("hides other saved groups under a filter and restores them on «всё»", async () => {
+  it("keeps «не проверено» in its own section: what was missing and what to do", () => {
     const w = mountPanel();
-    const select = w.find("select");
-    // «всё» + each saved group, counts in the label, no invented groups.
-    expect(select.findAll("option").map((o) => o.text())).toEqual([
-      "всё (3)",
-      "БЬЁТ ПО ВЕРДИКТУ (2)",
-      "НЮАНСЫ (1)",
-    ]);
-    await select.setValue("nuances");
-    expect(w.findAll(".qr-group-title").map((h) => h.text())).toEqual(["НЮАНСЫ (1)"]);
-    expect(w.text()).toContain("бьёт по вердикту: 2"); // counters untouched
-    await select.setValue(ALL_GROUPS);
-    expect(w.findAll(".qr-group-title").map((h) => h.text())).toEqual([
-      "БЬЁТ ПО ВЕРДИКТУ (2)",
-      "НЮАНСЫ (1)",
-    ]);
+    const section = w.find(".qr-unchecked");
+    expect(section.exists()).toBe(true);
+    // The heading names the section, not a count: figures live in «подробности».
+    expect(section.find("h4").text()).toBe("Не проверено — чего не хватило");
+    expect(section.find("h4").text()).not.toMatch(/\d/);
+    expect(section.text()).toContain("не недостатки работы");
+    expect(section.text()).toContain("чего не хватило: probe could not run");
+    expect(section.text()).toContain("что делать: нужен повторный прогон");
+    // Not mixed into the findings list.
+    expect(w.find(".qr-findings").text()).not.toContain("проверка не прошла");
     w.unmount();
   });
 
-  it("folds a stored point into the draft and sends it as the return rationale", async () => {
+  it("hands the actions a draft already filled with every visible finding", () => {
     const w = mountPanel();
     const actions = w.findComponent(QualityGateActions);
-    expect(actions.props("draft")).toHaveLength(0);
-    await w.findAll("button.add")[0].trigger("click");
-    const draft = w.findComponent(QualityGateActions).props("draft") as { requirement: string; site: string }[];
-    expect(draft).toHaveLength(1);
-    expect(draft[0].requirement).toBe("cargo fmt дрейф"); // verbatim stored summary
-    expect(draft[0].site).toBe("a.rs:442");
+    const draft = actions.props("draft") as { requirement: string; site: string }[];
+    expect(draft.map((d) => d.requirement)).toEqual(["cargo fmt дрейф", "мелкая придирка"]);
+    expect(draft.map((d) => d.site)).toEqual(["a.rs:442", ""]);
+    expect(actions.props("draftNote")).toContain("сними те, что не надо возвращать");
+    // «не проверено» is offered as one click, not prefilled.
+    expect(actions.props("unchecked")).toHaveLength(1);
+    w.unmount();
+  });
+
+  it("takes a point out of the filled draft and sends the rest", async () => {
+    const w = mountPanel();
+    // The finding row's toggle removes it: the operator trims, not assembles.
+    await w.findAll(".qr-findings button.add")[1].trigger("click");
+    let draft = w.findComponent(QualityGateActions).props("draft") as { item_id: string }[];
+    expect(draft.map((d) => d.item_id)).toEqual(["cl/fmt"]);
 
     await w.find("button.hold.rework").trigger("pointerdown");
     now = HOLD_MS + 10;
@@ -167,7 +240,142 @@ describe("QualityGatePanel", () => {
     const [kind, text] = emits?.[0] as [string, string];
     expect(kind).toBe("return");
     expect(text).toContain("cargo fmt дрейф");
-    expect(text).toContain("сайт: a.rs:442");
+    expect(text).toContain("где: a.rs:442");
+    expect(text).not.toContain("мелкая придирка");
+    w.unmount();
+  });
+
+  it("says in words why there is no decision instead of offering a dead button", () => {
+    const w = mountPanel(
+      gate({
+        may_accept: false,
+        may_return: false,
+        accept_denied: { code: "no_current_report", text: "нет текущего отчёта" },
+        return_denied: { code: "not_qa", text: "задача не на шаге решения" },
+      }),
+    );
+    expect(w.find(".qr-appeal").text()).toContain("ни принять, ни вернуть нельзя");
+    expect(w.find(".qr-why").text()).toContain("нет текущего отчёта");
+    w.unmount();
+  });
+
+  it("reads the anchors like every finding: human phrase first, service row in the expansion", () => {
+    const w = mountPanel();
+    const anchors = w.find("details.qr-details");
+    // The machine id is present — in the details layer, under the row.
+    const rows = anchors.findAll(".qr-group").filter((g) => g.text().includes("anch/a"));
+    expect(rows).toHaveLength(1);
+    const row = rows[0].find("details.qr-item");
+    expect(row.find("summary").text()).toContain("ратифицированный инвариант");
+    expect(row.find("summary").text()).not.toContain("anch/a");
+    expect(row.text()).toContain("закреплено: решение 01a1b1b8-dec (guerrero)");
+    w.unmount();
+  });
+
+  it("explains an outdated report in plain words and offers no accept/return", () => {
+    const r = report();
+    r.freshness = {
+      stale: true,
+      marker: "⚠ отчёт v1 УСТАРЕЛ — задача в REWORK: ре-аудит ещё не запущен",
+      report_seq: 1,
+      report_status: "STALE",
+      task_state: "REWORK",
+      execution: null,
+      execution_status: null,
+    };
+    const w = mount(QualityGatePanel, {
+      props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
+    });
+    // What happened and what to do comes first, in human words.
+    expect(w.find(".qr-stale").text()).toContain("решать по нему уже нельзя");
+    expect(w.find(".qr-stale").text()).toContain("Дождись нового отчёта аудита");
+    // No appeal to accept or return, and no buttons at all.
+    expect(w.find(".qr-appeal").exists()).toBe(false);
+    expect(w.findComponent(QualityGateActions).exists()).toBe(false);
+    // The machine marker and the store facts stay reachable in the details.
+    const details = w.find("details.qr-details").text();
+    expect(details).toContain("УСТАРЕЛ");
+    expect(details).toContain("фаза REWORK");
+    // The report itself is still readable.
+    expect(w.find(".qr-findings").text()).toContain("cargo fmt дрейф");
+    w.unmount();
+  });
+
+  // R1 (rework): a report with no human layer does NOT mean «no findings». Each
+  // of the three stored shapes says in its own words what is unavailable, and
+  // the return draft arrives with the honest general reason — never empty.
+  function unreadable(source: string, text: string): QualityReportView {
+    const r = report();
+    r.first_layer = null;
+    r.source = source;
+    r.report = {};
+    r.report_text = text;
+    return r;
+  }
+
+  const unreadableCases: [string, string, RegExp][] = [
+    ["flat_text", "ВЕРДИКТ: ПРОШЁЛ (PASS) — S=0.950/1.00", /старом формате/],
+    ["corrupt_form", "⚠ форма отчёта повреждена, показан плоский текст", /повреждён/],
+    ["corrupt_body", "⚠ отчёт качества 01a1b2aa повреждён: тело блоба не разбирается как JSON", /не читается/],
+  ];
+
+  it("names what is unreadable instead of claiming there are no findings", () => {
+    const said: string[] = [];
+    for (const [source, text, shape] of unreadableCases) {
+      const r = unreadable(source, text);
+      const w = mount(QualityGatePanel, {
+        props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
+      });
+      const gap = w.find(".qr-gap");
+      expect(gap.exists()).toBe(true);
+      expect(gap.text()).toMatch(shape);
+      expect(w.find(".qr-head").text()).not.toContain("недостатков нет");
+      // What it means for the decision is said too, in plain words.
+      expect(w.find(".qr-gap-means").text()).toContain("состав замечаний неизвестен");
+      // The stored body stays reachable — in the details, not first.
+      expect(w.find("details.qr-details").text()).toContain(text.slice(0, 20));
+      // No finding list is invented, and no verdict is dressed up.
+      expect(w.find(".qr-findings").exists()).toBe(false);
+      const actions = w.findComponent(QualityGateActions);
+      const draft = actions.props("draft") as { requirement: string }[];
+      expect(draft).toHaveLength(1);
+      expect(draft[0].requirement).toContain("состав замечаний не прочитан");
+      expect(actions.props("draftNote")).toContain("черновик не пустой");
+      expect(actions.props("draftNote")).not.toContain("возвращать нечего");
+      said.push(gap.text());
+      w.unmount();
+    }
+    // legacy, damaged form and broken body read differently
+    expect(new Set(said).size).toBe(3);
+  });
+
+  it("sends the unread-composition reason when the human returns such a report", async () => {
+    const r = unreadable("corrupt_body", "⚠ отчёт качества 01a1b2aa повреждён: тело блоба");
+    const w = mount(QualityGatePanel, {
+      props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
+    });
+    await w.find("button.hold.rework").trigger("pointerdown");
+    now = HOLD_MS + 10;
+    flushFrames();
+    const emits = w.emitted("apply");
+    expect(emits).toHaveLength(1);
+    const [kind, text] = emits?.[0] as [string, string];
+    expect(kind).toBe("return");
+    expect(text).toContain("состав замечаний не прочитан");
+    w.unmount();
+  });
+
+  it("stops claiming the draft is filled once the human clears it", async () => {
+    const r = unreadable("flat_text", "ВЕРДИКТ: ПРОШЁЛ (PASS) — S=0.950/1.00");
+    const w = mount(QualityGatePanel, {
+      props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
+    });
+    await w.find("button.clear").trigger("click");
+    const actions = w.findComponent(QualityGateActions);
+    expect((actions.props("draft") as unknown[]).length).toBe(0);
+    // The screen keeps telling the truth about the draft it now shows.
+    expect(actions.props("draftNote")).not.toContain("черновик не пустой");
+    expect(actions.props("draftNote")).toContain("только с твоим обоснованием");
     w.unmount();
   });
 });
