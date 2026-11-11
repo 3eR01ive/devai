@@ -58,7 +58,7 @@ onUnmounted(() => {
       <thead>
         <tr>
           <th>Задача</th><th>Роль@вер</th><th>Агент</th><th>Состояние</th>
-          <th>Шёл</th><th>Owner</th><th>Live</th><th>Stale-признаки</th><th>Worktree</th>
+          <th>Шёл</th><th>Owner</th><th>Живость</th><th>Stale-признаки</th><th>Worktree</th>
         </tr>
       </thead>
       <tbody>
@@ -71,7 +71,12 @@ onUnmounted(() => {
           <td data-label="Состояние" data-mobile="head"><StateChip :token="r.state" /></td>
           <td class="mono muted" data-label="Шёл" data-mobile="head">{{ fmtElapsed(r.elapsed_seconds) }}</td>
           <td class="mono muted" data-label="Owner">{{ r.owner_pid ?? "?" }}@{{ r.owner_host ?? "?" }}</td>
-          <td data-label="Live" data-mobile="head"><StateChip :token="r.owner_liveness" /></td>
+          <td data-label="Живость" data-mobile="head">
+            <!-- Факт живости и готовая фраза платформы (REQ-LV-05/06): та же
+                 строка, что печатает `devai task active` и карточка. -->
+            <StateChip :token="r.owner_liveness" />
+            <span class="muted"> {{ r.liveness_line }}</span>
+          </td>
           <td class="mono muted" data-label="Stale-признаки">
             <template v-if="r.stale">
               {{ r.stale_terminal_task ? "task-terminal" : "" }}

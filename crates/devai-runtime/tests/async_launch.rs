@@ -10,47 +10,12 @@
 //!   host) is never guessed dead.
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use chrono::Utc;
 use devai_core::types::*;
 use devai_runtime::launch::{LaunchOutcome, LaunchRequest, ack_path, launch};
 use devai_runtime::reclaim;
 use devai_store::Store;
-
-/// `DEVAI_RUNNER` is process-global: one test at a time holds the lock, and
-/// the value it FOUND is restored on drop — a panicking assert must not leave
-/// a stub runner behind for the rest of the binary (rework R8).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// The scoped, panic-safe `DEVAI_RUNNER` write: see [`ENV_LOCK`].
-struct RunnerEnv {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl RunnerEnv {
-    fn set(path: &Path) -> Self {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os("DEVAI_RUNNER");
-        // SAFETY: `ENV_LOCK` serialises this file's only reader, and the
-        // previous value is put back on drop.
-        unsafe { std::env::set_var("DEVAI_RUNNER", path) };
-        Self {
-            _lock: guard,
-            previous,
-        }
-    }
-}
-
-impl Drop for RunnerEnv {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(v) => unsafe { std::env::set_var("DEVAI_RUNNER", v) },
-            None => unsafe { std::env::remove_var("DEVAI_RUNNER") },
-        }
-    }
-}
 
 fn session_of(pid: i64) -> i64 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
@@ -94,7 +59,6 @@ fn the_runner_gets_its_own_session_and_hands_back_a_handle() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
 
-    let _env = RunnerEnv::set(&script);
     let run_id = new_id().to_string();
     let req = LaunchRequest {
         home: home.path().to_path_buf(),
@@ -104,6 +68,7 @@ fn the_runner_gets_its_own_session_and_hands_back_a_handle() {
         force_reaudit: false,
         actor: "tester".into(),
         run_id: run_id.clone(),
+        runner: Some(script.clone()),
     };
     let out = launch(&req).expect("handshake");
 

@@ -225,6 +225,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_return_rpc,
     },
     RpcCommand {
+        name: "task_run",
+        handler: task_run_rpc,
+    },
+    RpcCommand {
         name: "task_progress",
         handler: task_progress_rpc,
     },
@@ -388,6 +392,10 @@ fn param_bool(params: &serde_json::Value, key: &str) -> Result<bool, UiError> {
             code: "ipc".into(),
             message: format!("в запросе нет булева поля `{key}`"),
         })
+}
+
+fn param_opt_bool(params: &serde_json::Value, key: &str) -> Option<bool> {
+    params.get(key).and_then(|v| v.as_bool())
 }
 
 fn param_opt_usize(params: &serde_json::Value, key: &str) -> Option<usize> {
@@ -604,6 +612,27 @@ fn task_return_rpc(
     )?)
 }
 
+/// The card's restart from the phone (REQ-LV-05 AC3): the SAME platform
+/// operation as `devai task run` — the platform reaps a proven-dead owner and
+/// launches by the ordinary rules. The request is decoded once, by the shared
+/// parameter helpers, so a malformed shape carries the same `ipc` code every
+/// neighbouring handler emits; the window's handler then records the device
+/// as the actor.
+fn task_run_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let req = RunRequest::of(params)?;
+    to_json(crate::commands::task_run_as(
+        state(app),
+        req.id_prefix,
+        req.agent,
+        req.force_reaudit,
+        Some(actor_for(app, device)),
+    )?)
+}
+
 /// The request shape both QA acts share: the task reference and the operator's
 /// rationale (REQ-QG-07). The platform — not the window — decides whether the
 /// act is legal, so no other condition is decoded here.
@@ -617,6 +646,25 @@ impl QaActRequest {
         Ok(Self {
             id_prefix: param_str(params, "id_prefix")?,
             rationale: param_opt_str(params, "rationale"),
+        })
+    }
+}
+
+/// The request shape of the card's restart: the SAME three fields the window's
+/// `task_run` takes, decoded by the shared helpers. One vocabulary for a
+/// malformed request — the `ipc` code every neighbouring handler emits.
+struct RunRequest {
+    id_prefix: String,
+    agent: Option<String>,
+    force_reaudit: Option<bool>,
+}
+
+impl RunRequest {
+    fn of(params: &serde_json::Value) -> Result<Self, UiError> {
+        Ok(Self {
+            id_prefix: param_str(params, "id_prefix")?,
+            agent: param_opt_str(params, "agent"),
+            force_reaudit: param_opt_bool(params, "force_reaudit"),
         })
     }
 }
@@ -1010,6 +1058,36 @@ mod tests {
             "the phone path names the device; the person stays the author"
         );
         assert!(QaActRequest::of(&serde_json::json!({})).is_err());
+    }
+
+    /// Rework R6: the phone's restart decodes the SAME three fields the
+    /// window's `task_run` takes, through the shared parameter helpers — a
+    /// malformed shape carries the `ipc` code every neighbouring handler
+    /// emits, never a handler-local dialect (the drift that made the phone
+    /// unable to read «кривая форма запроса» from one word).
+    #[test]
+    fn the_phone_restart_decodes_the_shared_request_shape() {
+        let params = serde_json::json!({
+            "id_prefix": "01a1",
+            "agent": "hermes",
+            "force_reaudit": true,
+        });
+        let req = RunRequest::of(&params).unwrap();
+        assert_eq!(req.id_prefix, "01a1");
+        assert_eq!(req.agent.as_deref(), Some("hermes"));
+        assert_eq!(req.force_reaudit, Some(true));
+
+        let defaults = RunRequest::of(&serde_json::json!({"id_prefix": "01a1"})).unwrap();
+        assert!(defaults.agent.is_none(), "the agent is optional");
+        assert!(defaults.force_reaudit.is_none(), "the flag is optional");
+
+        let err = RunRequest::of(&serde_json::json!({}))
+            .err()
+            .expect("a missing prefix is refused");
+        assert_eq!(
+            err.code, "ipc",
+            "a malformed request uses the shared code, not its own"
+        );
     }
 
     /// R9: the phone surface is registered, not implied. Every control names

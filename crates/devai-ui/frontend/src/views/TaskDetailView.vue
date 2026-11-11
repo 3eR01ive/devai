@@ -10,17 +10,17 @@
 // и предлагает активацию в один клик; скрытого переключения нет — оператор
 // нажимает кнопку. После активации контекст сбрасывается на список
 // проектов (без фантомных id между домами).
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, toUiError } from "../api";
 import { activateHome } from "../activation";
 import { foreignHome as foreignHomeOf } from "../homes-view";
-import { fmtElapsed, fmtTime, shortId } from "../settings";
+import { fmtTime, pollMs, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
 import SignatureSection from "../components/SignatureSection.vue";
 import SpecDiffPanel from "../components/SpecDiffPanel.vue";
 import SignatureResultPanel from "../components/SignatureResultPanel.vue";
-import { TaskStateToken } from "../states";
+import { ExecutionStatusToken, LivenessToken, TaskStateToken } from "../states";
 import ConvergenceChart from "../components/ConvergenceChart.vue";
 import QualityGatePanel from "../components/quality/QualityGatePanel.vue";
 import type { GateAct } from "../quality_gate_view";
@@ -31,10 +31,9 @@ import type {
   ConvergenceView,
   Decision,
   DependenciesView,
-  LivenessView,
+  ExecutionView,
   ProgressView,
   QualityReportView,
-  RoleExecution,
   SignatureView,
   StatusView,
   UiError,
@@ -57,9 +56,13 @@ const deps = ref<DependenciesView | null>(null);
 const artifacts = ref<Artifact[]>([]);
 const decisions = ref<Decision[]>([]);
 const events = ref<WorkflowEvent[]>([]);
-const executions = ref<RoleExecution[]>([]);
+const executions = ref<ExecutionView[]>([]);
+// Свежесть снимка живости: он считается текущим только после УСПЕШНОГО
+// чтения. Отказ периодического перечитывания не стирает последний факт, но
+// помечает его устаревшим — старый «процесс жив» нельзя выдавать за текущий.
+const livenessStale = ref(false);
+const livenessObservedAt = ref<string | null>(null);
 const activeRows = ref<ActiveRow[]>([]);
-const liveness = ref<Record<string, LivenessView>>({});
 const report = ref<QualityReportView | null>(null);
 const reportError = ref<UiError | null>(null);
 // Действия гейта качества (REQ-QG-03 AC4/AC5): отказ — РЯДОМ С КНОПКАМИ,
@@ -91,6 +94,66 @@ const showDiff = ref(false);
 // отдельной операции нет. UI не считает ни балл, ни режим: рисует готовое.
 const convergence = computed<ConvergenceView | null>(() => progress.value?.convergence ?? null);
 
+// Индикатор работы агента (REQ-LV-05): строка карточки отвечает «идёт ли
+// работа» фактом, а не догадкой. Слова — платформы (`liveness_line` строки
+// `exec.list`; ту же фразу несут task.status и task.progress), окно их не
+// перефразирует и вердикт не пересчитывает.
+//
+// ОДИН снимок факта: строка `exec.list`, перечитываемая таймером. Второй
+// снимок того же факта (progress.running_executions из loadAll) с карточки
+// убран — два чтения разной свежести давали «исполнение мертво» и «процесс
+// жив» на одном экране до ручного «Обновить» (ревью R2, corr/spec-fidelity).
+// Статус исполнения сравнивается токеном из словаря states.ts, а не
+// литералом: переименование токена в Rust ломает пин-тест, а не фильтр.
+const runningRows = computed<ExecutionView[]>(() =>
+  executions.value.filter((e) => e.status === ExecutionStatusToken.Running),
+);
+const runningLines = computed<{ key: string; text: string; dead: boolean }[]>(() =>
+  runningRows.value
+    .filter((e) => e.liveness_line)
+    .map((e) => ({
+      key: e.id,
+      text: `${e.role_slug}@${e.role_version}: ${e.liveness_line}`,
+      // «Мёртво» — только доказанная смерть (REQ-LV-02), и только у СВОЕГО
+      // чипа: оформление смерти одной роли не переходит на живую соседнюю.
+      dead: e.liveness === LivenessToken.Dead,
+    })),
+);
+const deadRun = computed<boolean>(() => runningLines.value.some((l) => l.dead));
+// Явное действие при доказанной смерти (REQ-LV-05 AC3): ТА ЖЕ операция
+// платформы, что `devai task run` — она сама снимает доказанно мёртвого
+// владельца (reclaim) и запускает по обычным правилам. Окно не собирает эту
+// очерёдность и не решает, кому можно запускать.
+const restartBusy = ref(false);
+const restartLine = ref<string | null>(null);
+const restartError = ref<UiError | null>(null);
+
+async function restartDead() {
+  if (restartBusy.value) return;
+  restartBusy.value = true;
+  restartError.value = null;
+  restartLine.value = null;
+  try {
+    // Ответ печатается словами платформы (`line`), не пересказом токена.
+    const out = await api.taskRun(props.id, null, false);
+    restartLine.value = out.line;
+    await loadAll();
+  } catch (e) {
+    restartError.value = toUiError(e);
+  } finally {
+    restartBusy.value = false;
+  }
+}
+
+// Один путь для обоих чтений живости (loadAll и периодическое): успешное
+// чтение делает снимок текущим и запоминает его время; отказ оставляет
+// прежний снимок и метит его устаревшим.
+function observeExecutions(rows: ExecutionView[]) {
+  executions.value = rows;
+  livenessStale.value = false;
+  livenessObservedAt.value = new Date().toISOString();
+}
+
 async function loadAll() {
   error.value = null;
   try {
@@ -108,20 +171,8 @@ async function loadAll() {
     deps.value = d;
     artifacts.value = arts;
     decisions.value = decs;
-    executions.value = execs;
+    observeExecutions(execs);
     activeRows.value = snap.rows.filter((r) => r.task_id === props.id || r.task_id.startsWith(props.id));
-    // Liveness — наблюдение (REQ-SW-06): только read exec.liveness по RUNNING-строкам.
-    for (const e of execs.filter((x) => x.status === "RUNNING")) {
-      try {
-        liveness.value[e.id] = await api.executionLiveness(e.id);
-      } catch (err) {
-        liveness.value[e.id] = {
-          id: e.id, task_id: e.task_id, status: e.status, owner_pid: null,
-          owner_host: null, owner_process_start: null, liveness: "unknown",
-        } satisfies LivenessView;
-        void err;
-      }
-    }
     await loadEvents();
     await loadReport();
     await loadWorkspace();
@@ -270,7 +321,45 @@ async function gateAndLoad() {
   }
   await loadAll();
 }
-onMounted(gateAndLoad);
+// Живость перечитывается ПОСТОЯННО — из нашего же окна, без системных
+// шедулеров и сторожевых скриптов (ратифицированный ответ на вопрос цикла).
+// Дешёвое чтение `exec.list` идёт на КАЖДОМ тике для любой незавершённой
+// задачи — в том числе когда RUNNING-строк сейчас нет (строка может
+// появиться). Терминальная задача без RUNNING-строк не опрашивается: новых
+// строк она не родит.
+let livenessTimer: number | undefined;
+
+async function refreshLiveness() {
+  if (foreignHome.value || !status.value) return;
+  // Терминальная задача МОЖЕТ держать RUNNING-строку — платформа
+  // классифицирует этот класс отдельно (stale = terminal || dead,
+  // devai-api/src/lib.rs:674-675). Пока такая строка в снимке есть, опрос
+  // не прекращается: иначе смерть владельца навсегда осталась бы «процесс
+  // жив» — старый факт выдавался бы за текущий. Нет RUNNING-строк —
+  // опрашивать нечего.
+  if (progress.value?.pipeline.terminal && runningRows.value.length === 0) return;
+  try {
+    observeExecutions(await api.executionsList(props.id));
+  } catch {
+    // Карточку отказ отдельного опроса не рушит, но и НЕ прячется: последний
+    // снимок остаётся на экране помеченным как устаревший (время успешного
+    // чтения рядом), иначе старый «процесс жив» читался бы как текущий факт.
+    livenessStale.value = true;
+  }
+}
+
+onMounted(async () => {
+  await gateAndLoad();
+  // Таймер заводится при монтировании и снимается onUnmounted: компонентные
+  // тесты идут в jsdom, где `window` есть, поэтому интервал там действительно
+  // ставится — его снимает размонтирование, а не окружение.
+  if (typeof window !== "undefined") {
+    livenessTimer = window.setInterval(refreshLiveness, pollMs());
+  }
+});
+onUnmounted(() => {
+  if (livenessTimer && typeof window !== "undefined") window.clearInterval(livenessTimer);
+});
 
 async function activateForeignHome() {
   if (!foreignHome.value) return;
@@ -321,6 +410,18 @@ async function activateForeignHome() {
       <h2 style="margin: 0">{{ status.task.display }}</h2>
       <StateChip :token="status.task.state" />
       <StateChip v-if="status.task.return_state" :token="status.task.return_state" />
+      <!-- Индикатор работы (REQ-LV-05): одна строка, без раскрытия деталей. -->
+      <span
+        v-for="line in runningLines"
+        :key="line.key"
+        class="chip-liveness"
+        :class="{ dead: line.dead, stale: livenessStale }"
+      >{{ line.text }}</span>
+      <!-- Перечитать живость не удалось: снимок остаётся, но говорится прямо,
+           что он устарел и когда читался последний раз успешно. -->
+      <span v-if="livenessStale" class="chip-liveness stale">
+        данные устарели · последнее успешное чтение {{ fmtTime(livenessObservedAt) }}
+      </span>
       <div class="spacer" />
       <span class="mono muted">{{ status.task.id }}</span>
       <button @click="loadAll">Обновить</button>
@@ -330,6 +431,17 @@ async function activateForeignHome() {
       class="muted mono"
       style="margin: 0 0 10px"
     >заголовок создавшего: {{ status.task.title }}</p>
+    <!-- Доказанная смерть: явное действие В ОКНЕ, а не подсказка с CLI
+         (REQ-LV-05 AC3). Ответ платформы — её собственные слова. -->
+    <div v-if="deadRun" class="rowflex" style="margin: 0 0 10px">
+      <button :disabled="restartBusy" @click="restartDead">
+        {{ restartBusy ? "Перезапуск…" : "перезапустить" }}
+      </button>
+      <span v-if="restartLine" class="muted">{{ restartLine }}</span>
+    </div>
+    <div v-if="restartError" class="errorbox" style="margin-bottom: 10px">
+      <span class="code">{{ restartError.code }}</span>{{ restartError.message }}
+    </div>
     <p class="muted" style="white-space: pre-wrap">{{ status.task.business_description }}</p>
 
     <!-- ЭКРАН ПОДПИСИ (REQ-SIGN-01): первым содержательным блоком на
@@ -588,19 +700,22 @@ async function activateForeignHome() {
     </div>
 
     <div class="panel">
-      <h3>Исполнения ролей (exec.list; живые — exec.liveness)</h3>
+      <h3>Исполнения ролей (exec.list; живость — та же проверка, что на карточке)</h3>
       <div class="body">
         <table class="data">
           <thead>
-            <tr><th>Роль@вер</th><th>Агент</th><th>Статус</th><th>Live</th><th>Старт / финиш</th><th>Класс сбоя</th></tr>
+            <tr><th>Роль@вер</th><th>Агент</th><th>Статус</th><th>Живость</th><th>Старт / финиш</th><th>Класс сбоя</th></tr>
           </thead>
           <tbody>
             <tr v-for="e in executions" :key="e.id">
               <td class="mono" data-label="Роль@вер" data-mobile="title">{{ e.role_slug }}@{{ e.role_version }} <span class="muted">·{{ e.attempt ?? 1 }}</span></td>
               <td data-label="Агент">{{ e.agent_name ?? "—" }}</td>
               <td data-label="Статус" data-mobile="head"><StateChip :token="e.status" /></td>
-              <td data-label="Live" data-mobile="head">
-                <StateChip v-if="liveness[e.id]" :token="liveness[e.id].liveness" />
+              <td data-label="Живость" data-mobile="head">
+                <template v-if="e.liveness">
+                  <StateChip :token="e.liveness" />
+                  <span class="muted"> {{ e.liveness_line }}</span>
+                </template>
                 <span v-else class="muted">—</span>
               </td>
               <td class="mono muted" data-label="Старт / финиш">{{ fmtTime(e.started_at) }} → {{ fmtTime(e.finished_at) }}</td>
@@ -608,11 +723,6 @@ async function activateForeignHome() {
             </tr>
           </tbody>
         </table>
-        <p v-if="progress && progress.running_executions.length" class="muted" style="margin: 8px 0 0">
-          <span v-for="r in progress.running_executions" :key="r.id" style="margin-right: 14px">
-            {{ r.role }} · {{ r.agent_name ?? "?" }} · {{ fmtElapsed(r.elapsed_seconds) }}
-          </span>
-        </p>
       </div>
     </div>
 
@@ -688,6 +798,28 @@ async function activateForeignHome() {
   .stage-caption {
     font-size: 12px;
   }
+}
+/* Индикатор работы агента (REQ-LV-05): живёт в строке заголовка, перенос
+   запрещён — «одна строка карточки», без раскрытия и без скролла. */
+.chip-liveness {
+  padding: 2px 8px;
+  border: 1px solid var(--slate);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--cream);
+  white-space: nowrap;
+}
+.chip-liveness.dead {
+  border-color: #b08a4f;
+  color: #e8caa0;
+  font-weight: 700;
+}
+/* Устаревший снимок: пунктир вместо сплошной рамки — факт на экране есть, но
+   он не текущий, и окно об этом говорит словом, а не цветом. */
+.chip-liveness.stale {
+  border-style: dashed;
+  font-style: italic;
+  opacity: 0.8;
 }
 .chip-stage {
   padding: 2px 8px;

@@ -22,3 +22,29 @@ export const TaskStateToken = {
 
 export type TaskStateToken =
   (typeof TaskStateToken)[keyof typeof TaskStateToken];
+
+// Зеркало ExecutionStatus (devai-core/src/types.rs, str_enum!(ExecutionStatus,
+// ...)): тот же пин-приём — фильтр по статусу исполнения сравнивает ТОКЕН из
+// словаря, а не литерал в шаблоне (иначе переименование в Rust молча даёт
+// пустой список вместо ошибки сборки).
+export const ExecutionStatusToken = {
+  Running: "RUNNING",
+  Completed: "COMPLETED",
+  Failed: "FAILED",
+  Cancelled: "CANCELLED",
+} as const;
+
+export type ExecutionStatusToken =
+  (typeof ExecutionStatusToken)[keyof typeof ExecutionStatusToken];
+
+// Ответ проверки живости (devai-runtime/src/liveness.rs, Liveness::as_str):
+// alive | dead | unknown. «Мёртво» — только доказанная смерть (REQ-LV-02);
+// «проверить нельзя» отдельное слово и никогда не death.
+export const LivenessToken = {
+  Alive: "alive",
+  Dead: "dead",
+  Unknown: "unknown",
+} as const;
+
+export type LivenessToken =
+  (typeof LivenessToken)[keyof typeof LivenessToken];

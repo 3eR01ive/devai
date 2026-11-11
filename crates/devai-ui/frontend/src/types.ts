@@ -116,6 +116,9 @@ export interface StatusView {
   open_questions: Question[];
   /** REQ-QG-08/09: per-action availability at the QA gate; null outside QA. */
   quality_gate: QualityGateView | null;
+  /** REQ-LV-05: RUNNING-исполнения задачи с фактом живости и готовой фразой
+   * платформы — карточка отвечает «идёт ли работа» прямо из этого чтения. */
+  running_executions: RunningExecutionView[];
 }
 
 /** One platform refusal of a QA-gate act: a stable code plus the sentence the
@@ -153,6 +156,35 @@ export interface RunningExecutionView {
   agent_name: string | null;
   started_at: string;
   elapsed_seconds: number;
+  /** Владелец строки, записанный платформой при старте (REQ-SW-03). */
+  owner_pid: number | null;
+  owner_host: string | null;
+  /** alive | dead | unknown — факт живости процесса-владельца (REQ-LV-02). */
+  liveness: string;
+  /** Готовая фраза платформы об этом факте: окно её печатает, не собирает. */
+  liveness_line: string;
+}
+
+/** Строка `exec.list`: сохранённая запись исполнения (поля плоские, как в
+ * JSON) плюс факт живости — он есть ТОЛЬКО у незавершённого исполнения;
+ * завершённую строку платформа не проверяет вовсе (REQ-LV-06 AC4). */
+export interface ExecutionView extends RoleExecution {
+  liveness: string | null; // alive | dead | unknown | null
+  liveness_line: string | null;
+}
+
+/** Ответ запуска роли (`task.run`, REQ-LV-05 AC3): исход — токен платформы,
+ * слова — в `line`. Окно печатает `line` как есть, а не пересказывает
+ * `started|already_running|refused` своими словами. */
+export interface RunStartOutcome {
+  run_id: string;
+  execution_id: string | null;
+  outcome: "started" | "already_running" | "refused";
+  reason: string | null;
+  /** Состояние задачи, в котором просили запуск (токен платформы). */
+  state: string;
+  /** Готовая фраза платформы об исходе запуска. */
+  line: string;
 }
 
 export interface ProgressView {
@@ -228,6 +260,8 @@ export interface ActiveRow {
   owner_pid: number | null;
   owner_host: string | null;
   owner_liveness: string; // alive | dead | unknown
+  /** Готовая фраза платформы о живости (та же, что печатает CLI). */
+  liveness_line: string;
   branch: string | null;
   worktree: string | null;
   /** REQ-QG-09 AC3: «идёт аудит» for a live quality audit, null otherwise. */
@@ -626,6 +660,8 @@ export interface LivenessView {
   owner_host: string | null;
   owner_process_start: number | null;
   liveness: string;
+  /** Готовая фраза платформы о живости (REQ-LV-02 AC3). */
+  line: string;
 }
 
 export interface UiError {

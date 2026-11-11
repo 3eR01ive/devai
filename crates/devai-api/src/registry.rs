@@ -99,7 +99,19 @@ pub struct OpDescriptor {
 /// `task.progress` and `inbox.snapshot` facts gain `agent_failure`, and the
 /// agent-failure vocabulary (`agent.failed` events and their payload) is
 /// published as data. Wire-visible additions, so the stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@11";
+///
+/// `@12` names the liveness indicator increment (task 01a1b75d, REQ-LV-01/02/
+/// 05/06): NO operation joins or leaves the table — `exec.list` rows gain
+/// `liveness`/`liveness_line` (present only on an UNFINISHED row),
+/// `task.status` gains `running_executions` (the same typed rows
+/// `task.progress` already carried, now with owner+liveness facts), and
+/// `exec.liveness` gains the platform's sentence `line`.
+///
+/// `@13` (same task, rework R2): `task.run` gains `line` — the platform's ONE
+/// sentence for its typed outcome, so the card's «перезапустить» act prints
+/// the platform's words instead of re-wording `started|already_running|
+/// refused`. A wire-visible addition, so the stamp says so.
+pub const SURFACE_VERSION: &str = "api-surface@13";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -177,15 +189,15 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.status",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate}",
-            description: "Current state plus the operations the platform permits next, the CURRENT artifacts, open questions and — at the QA gate — each action's public availability and platform refusal. Mirrors `task status`.",
+            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate, running_executions}",
+            description: "Current state plus the operations the platform permits next, the CURRENT artifacts, open questions, the RUNNING executions with their liveness fact and the platform's sentence for it (checked at every read), and — at the QA gate — each action's public availability and platform refusal. Mirrors `task status`.",
         },
         OpDescriptor {
             name: "task.progress",
             class: OpClass::Read,
             input: "id_prefix",
             output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions, convergence, agent_failure}",
-            description: "Pipeline position, re-entry note, the snapshot of RUNNING executions and the convergence slice of the task (per repeatable stage the rounds read out of stored carriers, their computed modes and honest gaps; null on terminal tasks). Drawn purely from engine data. Mirrors `task progress`.",
+            description: "Pipeline position, re-entry note, the snapshot of RUNNING executions (each with its owner, liveness fact and the platform's sentence) and the convergence slice of the task (per repeatable stage the rounds read out of stored carriers, their computed modes and honest gaps; null on terminal tasks). Drawn purely from engine data. Mirrors `task progress`.",
         },
         OpDescriptor {
             name: "task.active",
@@ -271,8 +283,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.run",
             class: OpClass::Mutation,
             input: "RunReq{id, agent, workspace, force_reaudit}",
-            output: "RunStartOutcome{run_id, execution_id, outcome(started|already_running|refused), reason, state}",
-            description: "ASYNC launch (REQ-AR-04): starts a detached platform runner in its own session, returns the run number and the execution handle as soon as the runner opened the row — never waits for a role, never leaves the role in the caller's process group. A second launch is the typed `already_running` outcome naming the execution that owns the task (REQ-AR-06); a human-executed state is `refused` with a reason. force_reaudit carries the --force-reaudit gate semantics. Mirrors `devai task run`.",
+            output: "RunStartOutcome{run_id, execution_id, outcome(started|already_running|refused), reason, state, line}",
+            description: "ASYNC launch (REQ-AR-04): starts a detached platform runner in its own session, returns the run number and the execution handle as soon as the runner opened the row — never waits for a role, never leaves the role in the caller's process group. A second launch is the typed `already_running` outcome naming the execution that owns the task (REQ-AR-06); a human-executed state is `refused` with a reason. `line` is the platform's one sentence for the outcome (a window prints it verbatim). force_reaudit carries the --force-reaudit gate semantics. Mirrors `devai task run`.",
         },
         OpDescriptor {
             name: "task.revise",
@@ -653,8 +665,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "exec.list",
             class: OpClass::Read,
             input: "Option<task_ref>",
-            output: "Vec<RoleExecution>",
-            description: "Execution rows, optionally for one task; attempt/failure_class lineage ships in the rows. Mirrors `exec list`.",
+            output: "Vec<ExecutionView{…RoleExecution, liveness, liveness_line}>",
+            description: "Execution rows, optionally for one task; attempt/failure_class lineage ships in the rows, and every UNFINISHED row carries the liveness verdict of its recorded owner plus the platform's sentence for it (a finished row is not checked and carries no mark). Mirrors `exec list`.",
         },
         OpDescriptor {
             name: "exec.get",
@@ -667,8 +679,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "exec.liveness",
             class: OpClass::Read,
             input: "exec_id_prefix",
-            output: "LivenessView{id, status, owner_pid, owner_host, liveness}",
-            description: "Liveness verdict (alive/dead/unknown) for the recorded owner of one execution — orphans distinguishable by data, not pgrep. Backs `exec liveness`.",
+            output: "LivenessView{id, status, owner_pid, owner_host, liveness, line}",
+            description: "Liveness verdict (alive/dead/unknown) for the recorded owner of one execution, plus the platform's ONE sentence for it — orphans distinguishable by data, not pgrep. Backs `exec liveness`.",
         },
         OpDescriptor {
             name: "exec.reap",
@@ -854,7 +866,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@11");
+        assert_eq!(SURFACE_VERSION, "api-surface@13");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

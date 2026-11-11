@@ -73,6 +73,7 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::task_reject,
         commands::task_accept,
         commands::task_return,
+        commands::task_run,
         commands::task_progress,
         commands::task_dependencies,
         commands::task_report,

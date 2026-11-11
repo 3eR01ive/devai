@@ -5,8 +5,11 @@
 //! action: this module reads `/proc` and the hostname file, writes nothing
 //! to the store and sends no signal to any process — the ratified boundary
 //! (REQ-SW-06: «никакого автоматического убийства чужих процессов; детект и
-//! эскалация, решение за человеком»). The only resolution of an orphan is a
-//! human closing its row via `exec fail|cancel`.
+//! эскалация, решение за человеком»). Closing the row of an owner this check
+//! proves gone is a SEPARATE, explicit platform action — `exec reap`
+//! (`Api::exec_reap`) — never a side effect of observing; a row whose owner
+//! cannot be proven absent stays open until a human closes it
+//! (`exec fail|cancel`).
 //!
 //! Liveness vocabulary is exactly the ratified OQ-3 answer:
 //! * a host OTHER than the current one is UNCHECKABLE — it renders as
