@@ -189,7 +189,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.status",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate, running_executions}",
+            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate, running_executions, stop, launch_failure}",
             description: "Current state plus the operations the platform permits next, the CURRENT artifacts, open questions, the RUNNING executions with their liveness fact and the platform's sentence for it (checked at every read), and — at the QA gate — each action's public availability and platform refusal. Mirrors `task status`.",
         },
         OpDescriptor {

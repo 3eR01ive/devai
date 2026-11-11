@@ -18,7 +18,7 @@
 //! Every «no» travels through the ack file, so a caller that has already
 //! returned still receives it, and none of them touches a running chain.
 
-use devai_core::types::{ExecutionStatus, Id, Task, TaskState};
+use devai_core::types::{ExecutionStatus, Id, Task, TaskState, stop_kind};
 use devai_store::config::ProcessPolicy;
 
 use devai_runtime::launch;

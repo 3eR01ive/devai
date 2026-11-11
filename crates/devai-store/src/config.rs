@@ -99,6 +99,10 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         include_str!("../../../config/workflow/agent-failure.yaml"),
     ),
     (
+        "workflow/park-reasons.yaml",
+        include_str!("../../../config/workflow/park-reasons.yaml"),
+    ),
+    (
         "workflow/process.yaml",
         include_str!("../../../config/workflow/process.yaml"),
     ),
@@ -1714,6 +1718,424 @@ pub fn load_agent_failure_policy(dir: &Path) -> StoreResult<AgentFailurePolicy> 
             "{}: agent_failure.tail_chars and driver_log_chars must be >= 1",
             dir.display()
         )));
+    }
+    Ok(policy)
+}
+
+// ---------------------------------------------------------------------------
+// Why a task stands still — the human words of a stop (task 01a1ca39,
+// REQ-PK-03/06) — platform protocol data.
+// ---------------------------------------------------------------------------
+
+/// Which pair of numbers a stop kind's event carries (REQ-PK-03/06): the
+/// brake's own `counter`/`limit`, the agent-failure `series_count`/`threshold`,
+/// or none at all (a question hold and every manual stop). Declared PER KIND,
+/// so the reader never matches on kind names to find the numbers — a new kind
+/// is a declaration row, not an extra match arm.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterSource {
+    /// The `counter`/`limit` pair a `process.parked` event recorded.
+    Brake,
+    /// The `series_count`/`threshold` pair of a parking agent-failure question.
+    Series,
+    /// The kind carries no counter (a question hold, a manual stop).
+    #[default]
+    None,
+}
+
+/// One declared entry of the stop surface: WHY it stands, WHAT to do next,
+/// which counter pair its event carries and — for a kind without a pair — the
+/// words that stand in for it. `why`/`action` are non-empty by validation (an
+/// empty phrase would print a blank instruction where the operator expects the
+/// way out); `counter` is REQUIRED by the parse, so a row that forgets it is a
+/// loud declaration error, never a silent «no counter».
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ParkWords {
+    pub why: String,
+    pub action: String,
+    pub counter: CounterSource,
+    /// The phrase printed instead of the pair when `counter: none`. Required
+    /// (and validated non-empty) for such a kind; unused otherwise.
+    #[serde(default)]
+    pub counter_absent: String,
+}
+
+/// One declared failure-class pair: WHY it failed and WHAT to do next. A class
+/// has no counter of its own, so it is not a [`ParkWords`] — the absence
+/// sentences and the pair source belong to kinds only.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClassWords {
+    pub why: String,
+    pub action: String,
+}
+
+/// The declared words of an ABSENT fact (ratified OQ-PK-2): a counter a brake
+/// never recorded, a counter a failed launch never recorded, and a stop that
+/// recorded no reason. Every one is required and non-empty, so the operator
+/// can reword the absence sentence without touching code — and a blank one is
+/// a loud declaration error instead of an empty line in the report.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ParkAbsence {
+    pub counter: String,
+    pub launch_counter: String,
+    pub reason: String,
+}
+
+/// The declared sentence of what a failed launch LEFT the task in
+/// (REQ-PK-02 AC3). The underlying facts (`parked` / `continues` / `finished`)
+/// stay separate fields of the answer — only their wording is data, so a held
+/// or finished task is never described as running by a hard-coded phrase.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchAftermathWords {
+    /// This failure parked the task; it stands.
+    pub parked: String,
+    /// This failure parked the task at the time; it is going again now.
+    pub parked_then_going: String,
+    /// The task keeps going; only the launch failed.
+    pub going: String,
+    /// The task is already finished.
+    pub finished: String,
+    /// The task is stopped by a DIFFERENT reason (the stop block above).
+    pub held_elsewhere: String,
+    /// The event did not record whether it parked the task.
+    pub unknown: String,
+}
+
+/// One declared actor: its human spelling and whether it is the PLATFORM
+/// writing on its own (`automatic`). The reader must not mistake the
+/// platform's own stops for a human's act — and WHICH token means «the
+/// platform» is declaration data, never a literal in code.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActorWords {
+    pub word: String,
+    #[serde(default)]
+    pub automatic: bool,
+}
+
+/// Declarative dictionary of the STOP surface (task 01a1ca39, REQ-PK-03):
+/// one phrase + one proposed action per brake kind, per failure class and
+/// per manual hold, the words of an absent fact, the aftermath sentence of a
+/// failed launch, and the human spelling of the recording actor. Lives in
+/// `config/workflow/park-reasons.yaml` (the `park_reasons:` section) — the
+/// ONLY source of these words, so editing the file changes the printed
+/// `task status` without a rebuild. The status read resolves every token
+/// through these accessors, and a token missing from the declaration is a
+/// loud config error naming it, never a machine name printed in its place.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ParkReasons {
+    /// The words of an absent fact (no counter, no reason).
+    pub absence: ParkAbsence,
+    /// Kind token (`rounds_without_shift`, `agent_failure`, `manual_block`, …)
+    /// → words.
+    pub brakes: BTreeMap<String, ParkWords>,
+    /// Failure class token (`spawn`, `platform`, `provider_model`, …) → words.
+    pub failure_classes: BTreeMap<String, ClassWords>,
+    /// What a failed launch left the task in, per fact combination.
+    pub launch_aftermath: LaunchAftermathWords,
+    /// Actor token → its declared words and role.
+    pub actors: BTreeMap<String, ActorWords>,
+}
+
+impl ParkReasons {
+    /// The factory bytes — the embedded `config/workflow/park-reasons.yaml`,
+    /// parsed ONCE. ONE source for the default (the `Process::factory`
+    /// idiom): a home without the file and a home with the untouched factory
+    /// file word every stop identically.
+    pub fn factory() -> &'static ParkReasons {
+        static FACTORY: std::sync::OnceLock<ParkReasons> = std::sync::OnceLock::new();
+        FACTORY.get_or_init(|| {
+            // invariant: unreachable panic — `FACTORY_PARK_REASONS` is
+            // compiled in and the loader tests parse these very bytes; an
+            // invalid embedded declaration is a broken build, not a runtime
+            // state.
+            parse_park_reasons(
+                FACTORY_PARK_REASONS,
+                "embedded config/workflow/park-reasons.yaml",
+            )
+            .unwrap_or_else(|e| panic!("the embedded park-reasons declaration is invalid: {e}"))
+        })
+    }
+
+    /// The words of a stop KIND (`rounds_without_shift`, `agent_failure`, …).
+    pub fn stop_words(&self, kind: &str) -> Option<&ParkWords> {
+        self.brakes.get(kind)
+    }
+
+    /// The words of a FAILURE class (`spawn`, `provider_model`, …).
+    pub fn class_words(&self, class: &str) -> Option<&ClassWords> {
+        self.failure_classes.get(class)
+    }
+
+    /// The actor as the operator reads it: a declared word (the platform),
+    /// else the actor's own name — never rewritten.
+    pub fn actor_word(&self, actor: &str) -> String {
+        self.actors
+            .get(actor)
+            .map(|a| a.word.clone())
+            .unwrap_or_else(|| actor.to_string())
+    }
+
+    /// Did the PLATFORM write this record on its own? A declared automatic
+    /// actor is the platform, not a human hand — its own stops are never
+    /// reported as a manual one. Which token that is comes from the
+    /// declaration, never from a literal in code.
+    pub fn is_automatic(&self, actor: &str) -> bool {
+        self.actors.get(actor).is_some_and(|a| a.automatic)
+    }
+}
+
+impl Default for ParkReasons {
+    fn default() -> Self {
+        Self::factory().clone()
+    }
+}
+
+const FACTORY_PARK_REASONS: &str = include_str!("../../../config/workflow/park-reasons.yaml");
+
+fn cfg_err_park(where_: &str, msg: impl std::fmt::Display) -> StoreError {
+    cfg_err(format!("{where_}: {msg}"))
+}
+
+/// The failure classes a status response can carry: the launch classes the
+/// brakes record and the agent-failure classes of the recorded failures.
+fn required_failure_classes() -> Vec<&'static str> {
+    let mut classes = vec![
+        devai_core::types::failure_class::SPAWN,
+        devai_core::types::failure_class::PLATFORM,
+    ];
+    classes.extend(devai_core::agent_failure::class::ALL);
+    classes
+}
+
+/// Parse and validate the `park_reasons:` section. LOUD by contract
+/// (REQ-PK-03 AC3/AC4): every stop kind and every failure class a response
+/// can carry must be declared, no unknown key may sit silently (a typo would
+/// otherwise be an inert row), no phrase may be empty, and every absence
+/// sentence must exist — a missing value is named, never substituted.
+fn parse_park_reasons(text: &str, where_: &str) -> StoreResult<ParkReasons> {
+    let section = park_reasons_section(text, where_)?;
+    // deny_unknown_fields: a typo'd key names itself here.
+    let reasons: ParkReasons = serde_yaml::from_value(section).map_err(|e| {
+        cfg_err_park(
+            where_,
+            format!(
+                "park_reasons section is invalid (keys: absence, brakes, failure_classes, \
+                 launch_aftermath, actors): {e}"
+            ),
+        )
+    })?;
+    check_words(
+        where_,
+        "park_reasons.brakes",
+        &reasons.brakes,
+        devai_core::types::stop_kind::ALL,
+        |w: &ParkWords| (w.why.as_str(), w.action.as_str()),
+    )?;
+    check_words(
+        where_,
+        "park_reasons.failure_classes",
+        &reasons.failure_classes,
+        &required_failure_classes(),
+        |w: &ClassWords| (w.why.as_str(), w.action.as_str()),
+    )?;
+    check_brake_counters(&reasons, where_)?;
+    check_absence(&reasons, where_)?;
+    check_aftermath(&reasons, where_)?;
+    check_actors(&reasons, where_)?;
+    Ok(reasons)
+}
+
+/// The raw `park_reasons:` value of one declaration file.
+fn park_reasons_section(text: &str, where_: &str) -> StoreResult<serde_yaml::Value> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| cfg_err_park(where_, format!("parse: {e}")))?;
+    doc.get("park_reasons").cloned().ok_or_else(|| {
+        cfg_err_park(
+            where_,
+            "no `park_reasons:` section — the stop surface has no words",
+        )
+    })
+}
+
+/// ONE validator for both closed vocabularies of the declaration (stop kinds
+/// and failure classes — the same three checks, one wording): every token a
+/// response can carry declares words, every declared token is a known one (a
+/// typo would otherwise be an inert row), and no phrase is blank. `phrase`
+/// extracts the pair from a row, so the two maps keep their own row type.
+fn check_words<T, F>(
+    where_: &str,
+    section: &str,
+    rows: &BTreeMap<String, T>,
+    known: &[&str],
+    phrase: F,
+) -> StoreResult<()>
+where
+    F: Fn(&T) -> (&str, &str),
+{
+    for token in known {
+        if !rows.contains_key(*token) {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "{section} has no phrase for `{token}` — declare it under {section}; a machine \
+                     name is never printed in its place"
+                ),
+            ));
+        }
+    }
+    for (token, row) in rows {
+        if !known.contains(&token.as_str()) {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "{section} carries an unknown `{token}` — the closed vocabulary is {known:?}"
+                ),
+            ));
+        }
+        let (why, action) = phrase(row);
+        if why.trim().is_empty() || action.trim().is_empty() {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "{section}.{token} must declare a non-empty `why` and `action` — a blank \
+                     phrase is not a reason"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A kind that declares `counter: none` must word the absence: otherwise the
+/// report would print a blank where the pair belongs.
+fn check_brake_counters(reasons: &ParkReasons, where_: &str) -> StoreResult<()> {
+    for (kind, words) in &reasons.brakes {
+        if words.counter == CounterSource::None && words.counter_absent.trim().is_empty() {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "park_reasons.brakes.{kind} declares `counter: none`, so it must word what \
+                     stands in for the pair in `counter_absent` — an empty cell is not an answer"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every declared absence sentence exists and is not blank.
+fn check_absence(reasons: &ParkReasons, where_: &str) -> StoreResult<()> {
+    let a = &reasons.absence;
+    for (key, text) in [
+        ("counter", &a.counter),
+        ("launch_counter", &a.launch_counter),
+        ("reason", &a.reason),
+    ] {
+        if text.trim().is_empty() {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "park_reasons.absence.{key} must declare the words of an absent fact — a \
+                     blank sentence would print an empty line"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every aftermath sentence exists and is not blank: the reader must be able
+/// to word each (parked, continues, finished) fact combination.
+fn check_aftermath(reasons: &ParkReasons, where_: &str) -> StoreResult<()> {
+    let a = &reasons.launch_aftermath;
+    for (key, text) in [
+        ("parked", &a.parked),
+        ("parked_then_going", &a.parked_then_going),
+        ("going", &a.going),
+        ("finished", &a.finished),
+        ("held_elsewhere", &a.held_elsewhere),
+        ("unknown", &a.unknown),
+    ] {
+        if text.trim().is_empty() {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "park_reasons.launch_aftermath.{key} must declare the sentence of that fact \
+                     combination — a blank one would print an empty line"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every declared actor has a word, and the ONE automatic actor is the
+/// platform's own token: the reader tells the platform's own stops from a
+/// human's act by that flag, and a renamed declaration key is a loud error
+/// rather than a silent reading of the platform as a person.
+fn check_actors(reasons: &ParkReasons, where_: &str) -> StoreResult<()> {
+    let platform = devai_core::types::PLATFORM_ACTOR;
+    for (token, actor) in &reasons.actors {
+        if actor.word.trim().is_empty() {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "park_reasons.actors.{token} must declare the actor's human spelling — the \
+                     raw token is not printed as a person"
+                ),
+            ));
+        }
+    }
+    let automatic: Vec<&str> = reasons
+        .actors
+        .iter()
+        .filter(|(_, a)| a.automatic)
+        .map(|(token, _)| token.as_str())
+        .collect();
+    if automatic != [platform] {
+        return Err(cfg_err_park(
+            where_,
+            format!(
+                "park_reasons.actors must declare `{platform}` as the ONE `automatic: true` \
+                 actor (it is the token the platform writes itself); marked automatic: \
+                 {automatic:?} — the platform's own stops must never read as a human's act"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Merge-scan `workflow/*.yaml` for the `park_reasons:` key, exactly the
+/// `load_humanize_policy` idiom: files without the section are inert, the
+/// LAST declared section wins, a malformed or incomplete declaration is a
+/// LOUD config error naming the file and the missing value. An absent
+/// directory/file returns the factory bytes' meaning.
+pub fn load_park_reasons(dir: &Path) -> StoreResult<ParkReasons> {
+    let mut policy = ParkReasons::default();
+    if !dir.is_dir() {
+        return Ok(policy);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    for p in &paths {
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if doc.get("park_reasons").is_some() {
+            policy = parse_park_reasons(&text, &p.display().to_string())?;
+        }
     }
     Ok(policy)
 }
@@ -3536,5 +3958,136 @@ mod process_declaration_tests {
         fs::write(wf.join("process.yaml"), "process:\n  version: 1\n").unwrap();
         let e = load_process_policy(&wf).unwrap_err().to_string();
         assert!(e.contains("process.yaml"), "{e}");
+    }
+
+    /// REQ-PK-03: the words of a stop are DECLARATION data. The factory file
+    /// materialises, an operator edit changes the phrase with no rebuild, a
+    /// home without the file words every stop from the same factory bytes, and
+    /// a missing or typo'd value is a LOUD error naming it — never a silent
+    /// machine-token fallback (REQ-PK-03 AC1/AC2/AC3/AC4).
+    #[test]
+    fn park_reasons_are_declarative_and_validated_loudly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfgdir = dir.path().join("config");
+        materialize_if_absent(&cfgdir).unwrap();
+        let wf = cfgdir.join("workflow");
+        let reasons = load_park_reasons(&wf).unwrap();
+        assert_eq!(reasons.actor_word("platform"), "платформа");
+        assert!(
+            reasons.is_automatic("platform"),
+            "the declared platform actor is the automatic one"
+        );
+        assert_eq!(
+            reasons.actor_word("guerrero"),
+            "guerrero",
+            "a human's own name is never rewritten"
+        );
+        assert!(
+            !reasons.is_automatic("guerrero"),
+            "a human's record is not the platform's own"
+        );
+        // Every stop kind and every failure class a response can carry has
+        // words — the factory file is complete by construction.
+        for kind in devai_core::types::stop_kind::ALL {
+            let w = reasons.stop_words(kind).expect(kind);
+            assert!(!w.why.trim().is_empty() && !w.action.trim().is_empty());
+        }
+        for class in devai_core::agent_failure::class::ALL {
+            let w = reasons.class_words(class).expect(class);
+            assert!(!w.why.trim().is_empty() && !w.action.trim().is_empty());
+        }
+        // The words of an ABSENT fact and of a launch aftermath are declared
+        // too (ratified OQ-PK-2) — no sentence of the report is a code literal.
+        assert!(!reasons.absence.reason.trim().is_empty());
+        assert!(!reasons.absence.counter.trim().is_empty());
+        assert!(!reasons.absence.launch_counter.trim().is_empty());
+        assert_eq!(
+            reasons.stop_words("manual_block").unwrap().counter_absent,
+            "остановлено вручную, счётчика нет"
+        );
+        assert!(!reasons.launch_aftermath.going.trim().is_empty());
+
+        // Absent directory: the factory MEANING (one source of the default).
+        fs::remove_dir_all(&wf).unwrap();
+        assert_eq!(load_park_reasons(&wf).unwrap(), *ParkReasons::factory());
+
+        // Operator edit — no rebuild, no code change (REQ-PK-03 AC2).
+        fs::create_dir_all(&wf).unwrap();
+        let factory = include_str!("../../../config/workflow/park-reasons.yaml");
+        let edited = factory.replace(
+            "сработал тормоз кругов",
+            "круги кончились без нового артефакта",
+        );
+        assert_ne!(factory, edited);
+        fs::write(wf.join("park-reasons.yaml"), &edited).unwrap();
+        assert!(
+            load_park_reasons(&wf)
+                .unwrap()
+                .stop_words("rounds_without_shift")
+                .unwrap()
+                .why
+                .contains("круги кончились")
+        );
+
+        // A typo'd key: the required phrase disappears and the error names it.
+        let typo = factory.replace("    manual_pause:", "    manual_pauze:");
+        assert_ne!(factory, typo);
+        fs::write(wf.join("park-reasons.yaml"), &typo).unwrap();
+        let e = load_park_reasons(&wf).unwrap_err().to_string();
+        assert!(e.contains("manual_pause"), "{e}");
+
+        // An unknown failure class is rejected by name as well.
+        let unknown = factory.replace(
+            "    unclassified:\n",
+            "    typo_class:\n      why: \"x\"\n      action: \"y\"\n    unclassified:\n",
+        );
+        assert_ne!(factory, unknown);
+        fs::write(wf.join("park-reasons.yaml"), &unknown).unwrap();
+        let e = load_park_reasons(&wf).unwrap_err().to_string();
+        assert!(e.contains("typo_class"), "{e}");
+
+        // A missing actors entry is loud too — the raw token is not a person.
+        let no_actor = factory.replace(
+            "  actors:\n    platform:\n      word: \"платформа\"\n      automatic: true\n",
+            "",
+        );
+        assert_ne!(factory, no_actor);
+        fs::write(wf.join("park-reasons.yaml"), &no_actor).unwrap();
+        let e = load_park_reasons(&wf).unwrap_err().to_string();
+        assert!(e.contains("actors"), "{e}");
+
+        // A blank platform word is refused by name as well.
+        let blank_actor = factory.replace("word: \"платформа\"", "word: \"\"");
+        assert_ne!(factory, blank_actor);
+        fs::write(wf.join("park-reasons.yaml"), &blank_actor).unwrap();
+        let e = load_park_reasons(&wf).unwrap_err().to_string();
+        assert!(e.contains("actors"), "{e}");
+
+        // A renamed platform key is loud: its token is the one the platform
+        // writes, and a renamed key would read the platform as a person.
+        let renamed = factory.replace("  actors:\n    platform:", "  actors:\n    sistema:");
+        assert_ne!(factory, renamed);
+        fs::write(wf.join("park-reasons.yaml"), &renamed).unwrap();
+        let e = load_park_reasons(&wf).unwrap_err().to_string();
+        assert!(e.contains("platform"), "{e}");
+
+        // A kind without its `counter` source is loud: the parse refuses the
+        // row instead of silently assuming the kind has no counter.
+        let no_counter = factory.replace("      counter: brake\n", "");
+        assert_ne!(factory, no_counter);
+        fs::write(wf.join("park-reasons.yaml"), &no_counter).unwrap();
+        let e = load_park_reasons(&wf).unwrap_err().to_string();
+        assert!(e.contains("counter"), "{e}");
+
+        // A kind that declares no counter but does not word the absence is
+        // loud as well: the report never gets a blank cell.
+        let no_absence = factory.replace(
+            "      counter: none\n      counter_absent: \"остановлено вручную, счётчика нет\"\n",
+            "      counter: none\n",
+        );
+        assert_ne!(factory, no_absence);
+        fs::write(wf.join("park-reasons.yaml"), &no_absence).unwrap();
+        let e = load_park_reasons(&wf).unwrap_err().to_string();
+        assert!(e.contains("counter_absent"), "{e}");
     }
 }

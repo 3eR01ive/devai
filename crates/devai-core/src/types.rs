@@ -1257,6 +1257,65 @@ pub mod failure_class {
     ];
 }
 
+/// The actor token the PLATFORM writes on its OWN records («platform»): a wire
+/// string, frozen like the event kinds — already-stored events carry exactly
+/// this text, so changing it would change how history reads. The stop
+/// declaration must mark THIS token automatic (`actors.platform.automatic`), so
+/// a renamed declaration key can never turn the platform's own stops into a
+/// human's act; the reader then asks the declaration, never this literal.
+pub const PLATFORM_ACTOR: &str = "platform";
+
+/// The closed vocabulary of STOP reasons the task history can yield (task
+/// 01a1ca39, REQ-PK-06): the `brake` token a `process.parked` event carries,
+/// plus the reader-side names of a parking question and of the manual holds.
+/// The brake tokens are written by the producers through these constants, so
+/// an event and the phrase that words it cannot drift apart; the question and
+/// manual names are the reader's vocabulary (derived from the event kind).
+pub mod stop_kind {
+    /// A brake tripped: rounds of the same stage role without a new artifact.
+    pub const ROUNDS_WITHOUT_SHIFT: &str = "rounds_without_shift";
+    /// A brake tripped: launches that did not happen in a row.
+    pub const CONSECUTIVE_LAUNCH_FAILURES: &str = "consecutive_launch_failures";
+    /// The failure CLASS is declared to park on its first occurrence.
+    pub const PARK_IMMEDIATELY: &str = "park_immediately";
+    /// The agent-failure threshold parked the task on a blocking question.
+    pub const AGENT_FAILURE: &str = "agent_failure";
+    /// A question hold that is not an agent failure (form loop, human ask).
+    pub const QUESTION: &str = "question";
+    /// The human blocked / paused / cancelled / failed the task by hand.
+    pub const MANUAL_BLOCK: &str = "manual_block";
+    pub const MANUAL_PAUSE: &str = "manual_pause";
+    pub const MANUAL_CANCEL: &str = "manual_cancel";
+    pub const MANUAL_FAIL: &str = "manual_fail";
+
+    /// The kinds a `process.parked` event can carry in its `brake` payload —
+    /// the PRODUCER-side vocabulary (a brake token never has its own event
+    /// kind, so a reader cannot classify it by the event alone). Split out of
+    /// [`ALL`] so the reader can name the tokens a payload may hold apart from
+    /// the kinds it derives from a hold event; the `stop_kind` vocabulary
+    /// test pins that neither list can drift from the other.
+    pub const BRAKES: &[&str] = &[
+        ROUNDS_WITHOUT_SHIFT,
+        CONSECUTIVE_LAUNCH_FAILURES,
+        PARK_IMMEDIATELY,
+    ];
+
+    /// Every kind a status read must be able to word — the declaration is
+    /// checked against this list, so a missing phrase is a loud config error
+    /// and a typo'd key never becomes an inert row (REQ-PK-03 AC3/AC4).
+    pub const ALL: &[&str] = &[
+        ROUNDS_WITHOUT_SHIFT,
+        CONSECUTIVE_LAUNCH_FAILURES,
+        PARK_IMMEDIATELY,
+        AGENT_FAILURE,
+        QUESTION,
+        MANUAL_BLOCK,
+        MANUAL_PAUSE,
+        MANUAL_CANCEL,
+        MANUAL_FAIL,
+    ];
+}
+
 /// The closed vocabulary of the `cause` token on `artifacts.staled` events —
 /// WHY an artifact stopped being CURRENT. The workflow WRITES these strings
 /// and the report presentation READS them back to word its «устарел» marker,
@@ -1929,6 +1988,18 @@ pub mod json_field {
     pub const ANSWER: &str = "answer";
     /// The observation time of the failure itself.
     pub const AT: &str = "at";
+    // The STOP surface (task 01a1ca39, REQ-PK-01/02/06): the brake token a
+    // `process.parked` event carries, the counter it tripped and the declared
+    // limit, and the failed-launch facts — the consecutive counter, its limit
+    // and whether THAT event parked the task. The producers
+    // (`launch_brakes::commit_park` / `record_launch_failure`) and the reader
+    // (`devai_api::stop`) speak these SAME consts: one re-spelled literal on
+    // either side is how a stop block silently empties.
+    pub const BRAKE: &str = "brake";
+    pub const COUNTER: &str = "counter";
+    // LIMIT уже объявлен выше (предел попыток) — здесь он тот же токен.
+    pub const PARKED: &str = "parked";
+    pub const CONSECUTIVE: &str = "consecutive";
 
     /// The COMPLETE enumerable vocabulary of payload field names the platform
     /// itself mints. Load-time policy validation checks user-authored field
@@ -1999,6 +2070,11 @@ pub mod json_field {
         REVISION,
         FAILURE_STEP,
         CLASS,
+        BRAKE,
+        COUNTER,
+        LIMIT,
+        PARKED,
+        CONSECUTIVE,
         TAIL,
         OUTPUT_EMPTY,
         DRIVER_LOG_TAIL,

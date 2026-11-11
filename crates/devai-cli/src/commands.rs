@@ -1926,6 +1926,10 @@ fn print_signature_fact(fact: Option<&devai_api::SignatureFact>) {
 fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     // (API task.status read — StatusView is the machine-complete form.)
     let v = ctx.api().task_status(id).map_err(render_api_error)?;
+    // REQ-PK-01/02: the stop facts ride the SAME read as the state — no
+    // second operation, no second counter (REQ-PK-04 AC2).
+    let stop = v.stop;
+    let launch_failure = v.launch_failure;
     let t = v.task;
     let ops: Vec<String> = v.allowed_operations;
     let current: Vec<Artifact> = v.current_artifacts;
@@ -1949,6 +1953,8 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
                 "attempt_limit": attempt_limit,
                 "quality_gate": quality_gate,
                 "running_executions": running,
+                "stop": stop,
+                "launch_failure": launch_failure,
             })
         );
     } else {
@@ -1978,6 +1984,15 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
                 if q.blocking { " [BLOCKING]" } else { "" }
             );
         }
+        // REQ-PK-05: the stop is printed in HUMAN words — never the raw
+        // event JSON. The numbers come from the same view the machine mode
+        // serializes, so the two forms cannot disagree.
+        if let Some(s) = &stop {
+            print_stop(s);
+        }
+        if let Some(f) = &launch_failure {
+            print_launch_failure(f);
+        }
         outln!(
             "allowed operations: {}",
             if ops.is_empty() {
@@ -1988,6 +2003,41 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The STOP section of `task status` (REQ-PK-05 AC1/AC2, ratified OQ-PK-6):
+/// the declared phrase, the counter pair, the time, the actor, the stored
+/// reason VERBATIM and the proposed action — the raw event is never dumped,
+/// and the human form carries the declared PHRASE ONLY (the machine token
+/// rides `--json`). The absence sentence is declared too, never a literal.
+fn print_stop(s: &devai_api::StopView) {
+    outln!("--- остановка: {}", s.why);
+    outln!("  счётчик: {}", s.counter_text);
+    outln!("  когда:   {}", s.at.format("%Y-%m-%d %H:%M:%S"));
+    outln!("  кто:     {}", s.actor_word);
+    if let Some(word) = &s.failure_class_word {
+        outln!("  класс:   {word}");
+    }
+    outln!(
+        "  причина: {}",
+        s.reason.as_deref().unwrap_or(s.reason_absent.as_str())
+    );
+    outln!("  делать:  {}", s.action);
+}
+
+/// The failed-launch section of `task status` (REQ-PK-02 AC1/AC3): class,
+/// time, counter pair, the stored reason verbatim and the action, plus the
+/// declared sentence saying whether the task kept going or was parked by it.
+/// The class PHRASE is what a human reads; its token stays in `--json`.
+fn print_launch_failure(f: &devai_api::LaunchFailureView) {
+    outln!("--- запуск не состоялся: {}", f.class_word);
+    outln!("  когда:   {}", f.at.format("%Y-%m-%d %H:%M:%S"));
+    outln!("  счётчик: {}", f.counter_text);
+    if let Some(reason) = &f.reason {
+        outln!("  причина: {reason}");
+    }
+    outln!("  делать:  {}", f.action);
+    outln!("  задача:  {}", f.aftermath);
 }
 
 /// The human gate's viewing channel: the CURRENT quality report. A verdict

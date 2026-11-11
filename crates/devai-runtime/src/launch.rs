@@ -157,6 +157,27 @@ pub fn runner_exe() -> Option<PathBuf> {
     })
 }
 
+/// The runner THIS launch hands the role to. A path the caller NAMED wins; a
+/// named path that is not a file is refused — never silently swapped for the
+/// platform's own runner, which would run the role somewhere the caller did
+/// not ask. With no path requested the platform resolution decides.
+fn requested_runner(requested: Option<&Path>) -> Result<PathBuf, LaunchError> {
+    match requested {
+        Some(p) if p.is_file() => Ok(p.to_path_buf()),
+        Some(p) => Err(LaunchError::NoRunner(format!(
+            "no platform runner at `{}` — the role is never run inside the caller",
+            p.display()
+        ))),
+        None => runner_exe().ok_or_else(|| {
+            LaunchError::NoRunner(
+                "no platform runner binary — set DEVAI_RUNNER to the `devai` executable \
+                 (the role is never run inside the caller)"
+                    .to_string(),
+            )
+        }),
+    }
+}
+
 /// The evidence directory of one run, under the home (never a checkout).
 pub fn run_evidence_dir(home: &Path, task_id: &str, run_id: &str) -> PathBuf {
     home.join("evidence").join(task_id).join(run_id)

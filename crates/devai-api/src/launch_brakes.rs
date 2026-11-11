@@ -18,7 +18,8 @@
 use chrono::Utc;
 
 use devai_core::types::{
-    ExecutionStatus, Id, QuestionStatus, Task, event_kind, failure_class, new_id,
+    ExecutionStatus, Id, PLATFORM_ACTOR, QuestionStatus, Task, event_kind, failure_class,
+    json_field, new_id, stop_kind,
 };
 use devai_core::workflow::{self, Mutation};
 use devai_runtime::RuntimeError;
@@ -79,7 +80,13 @@ impl Api {
         // «сработало с первого раза при пороге 1», not as bare literals.
         let occurrence: u32 = 1;
         let limit: u32 = 1;
-        self.park_launch_failure(&cur, "park_immediately", occurrence, limit, &reason)
+        self.park_launch_failure(
+            &cur,
+            stop_kind::PARK_IMMEDIATELY,
+            occurrence,
+            limit,
+            &reason,
+        )
     }
 
     /// REQ-AL-05: stop the task at the attempt limit with exactly ONE human
@@ -150,8 +157,13 @@ impl Api {
         reason: &str,
     ) -> ApiResult<()> {
         let process = self.process_policy()?;
-        let m =
-            workflow::park_on_launch_failure(&process, task, Some(reason), "platform", Utc::now())?;
+        let m = workflow::park_on_launch_failure(
+            &process,
+            task,
+            Some(reason),
+            PLATFORM_ACTOR,
+            Utc::now(),
+        )?;
         self.commit_park(task, &m, brake, counter, limit, reason)
     }
 
@@ -170,12 +182,12 @@ impl Api {
         self.store.insert_event(
             Some(task.id),
             event_kind::PROCESS_PARKED,
-            "platform",
+            PLATFORM_ACTOR,
             serde_json::json!({
-                "brake": brake,
-                "counter": counter,
-                "limit": limit,
-                "reason": reason,
+                json_field::BRAKE: brake,
+                json_field::COUNTER: counter,
+                json_field::LIMIT: limit,
+                json_field::REASON: reason,
             }),
         )?;
         Ok(())
@@ -201,7 +213,7 @@ impl Api {
             );
             self.park_launch_failure(
                 task,
-                "consecutive_launch_failures",
+                stop_kind::CONSECUTIVE_LAUNCH_FAILURES,
                 consecutive,
                 limit,
                 &reason,
@@ -211,13 +223,13 @@ impl Api {
         self.store.insert_event(
             Some(task.id),
             event_kind::EXECUTION_LAUNCH_FAILED,
-            "platform",
+            PLATFORM_ACTOR,
             serde_json::json!({
-                "failure_class": class,
-                "consecutive": consecutive,
-                "limit": limit,
-                "parked": parked,
-                "reason": reason_text,
+                json_field::FAILURE_CLASS: class,
+                json_field::CONSECUTIVE: consecutive,
+                json_field::LIMIT: limit,
+                json_field::PARKED: parked,
+                json_field::REASON: reason_text,
             }),
         )?;
         Ok(())

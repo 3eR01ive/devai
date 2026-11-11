@@ -76,6 +76,10 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
     // refuse init), the brake budgets and the declaration version. A broken
     // or foreign-version declaration never reaches a run.
     config::load_process_policy(&dir.join("workflow"))?;
+    // REQ-PK-03 AC4: the stop vocabulary is validated with the same loudness —
+    // a missing phrase for a brake kind or failure class, a typo'd key or an
+    // empty phrase fails `devai init`, never a silent machine-token fallback.
+    config::load_park_reasons(&dir.join("workflow"))?;
     let inserted = config::seed_roles(store, &cfg, now)?;
 
     for (name, version, schema) in contracts() {

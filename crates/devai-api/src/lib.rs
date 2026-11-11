@@ -30,6 +30,7 @@ mod mutations;
 mod quality_gate;
 mod registry;
 mod signature;
+mod stop;
 
 /// Machine codes of the homes vocabulary — one dictionary, referenced by
 /// producers here and by the UI bootstrap (R3 quality return).
@@ -87,6 +88,7 @@ pub use signature::{
     SpecView, approve_denied, diff_specs, last_review_artifact, parse_review_body, parse_spec_body,
     pick_previous_spec, reject_denied, signature_view, spec_presentation,
 };
+pub use stop::{LaunchFailureView, StopView};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -489,8 +491,7 @@ impl Api {
         // (REQ-AR-09 AC1: the declaration is the only role/stage authority).
         let process = self.process_policy()?;
         // allowed_ops depends only on the task row and the declaration —
-        // computed before the row moves into the view (no re-derivation, one
-        // read each).
+        // computed before the row moves into the view (no re-derivation).
         let ops: Vec<String> = workflow::allowed_ops(&process, &t);
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
@@ -516,6 +517,12 @@ impl Api {
         let convergence = self.attempt_convergence(&t, &artifacts, &executions);
         let attempt_limit =
             self.attempt_limit_view_in(&t, &process, &executions, &events, convergence.as_ref())?;
+        // REQ-PK-01/02: why the task stands and which launch did not happen —
+        // two facts folded from the SAME history read, their words resolved
+        // from the declaration (REQ-PK-03). Nothing is written: a status read
+        // leaves the task row and the event log untouched (REQ-PK-07 AC2).
+        let (stop, launch_failure) = self.task_stop_facts(&t, &questions, &self.park_reasons()?)?;
+        let quality_gate = self.status_quality_gate(&process, &t, &artifacts)?;
         Ok(StatusView {
             task: t,
             allowed_operations: ops,
@@ -530,7 +537,34 @@ impl Api {
             attempt_limit,
             quality_gate,
             running_executions,
+            stop,
+            launch_failure,
         })
+    }
+
+    /// REQ-QG-08: the QA gate's public availability travels WITH the status
+    /// read — the window does not derive it. The dependency/decision/execution
+    /// loads happen only at the gate; other states have no gate.
+    fn status_quality_gate(
+        &self,
+        process: &devai_core::process::Process,
+        task: &Task,
+        artifacts: &[Artifact],
+    ) -> ApiResult<Option<QualityGateView>> {
+        if task.state != TaskState::Qa {
+            return Ok(None);
+        }
+        let deps = self.store.task_dependencies(task.id)?;
+        let decisions = self.store.list_decisions(task.id)?;
+        let executions = self.store.list_executions(Some(task.id))?;
+        Ok(quality_gate::quality_gate(
+            process,
+            task,
+            artifacts,
+            &deps,
+            &decisions,
+            &executions,
+        ))
     }
 
     /// The APPROVAL signature read (REQ-SIGN-07): paragraph, requirements,
@@ -1478,6 +1512,15 @@ pub struct StatusView {
     /// the platform's sentence — the card answers «идёт ли работа» from the
     /// state read itself, checked at every read (no watcher process).
     pub running_executions: Vec<RunningExecutionView>,
+    /// REQ-PK-01: WHY the task is standing still — brake/class, counter and
+    /// limit, time, actor, the stored reason verbatim and the proposed
+    /// action, folded from the task history at read time. `None` while the
+    /// task is not held (no empty «unknown» block is ever printed).
+    pub stop: Option<StopView>,
+    /// REQ-PK-02: the latest role launch that did NOT happen — class, time,
+    /// verbatim reason and action — whether it parked the task or the task
+    /// kept going. `None` when a later launch superseded it.
+    pub launch_failure: Option<LaunchFailureView>,
 }
 
 #[derive(Serialize, Clone, Debug)]

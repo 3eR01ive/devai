@@ -60,6 +60,8 @@ fn the_runner_gets_its_own_session_and_hands_back_a_handle() {
     std::fs::set_permissions(&script, perms).unwrap();
 
     let run_id = new_id().to_string();
+    // The runner is named on the request: no process-global `DEVAI_RUNNER`
+    // write, so this test cannot order itself against the rest of the binary.
     let req = LaunchRequest {
         home: home.path().to_path_buf(),
         task_id: "task".into(),
