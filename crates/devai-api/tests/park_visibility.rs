@@ -13,7 +13,7 @@
 //! themselves against each other.
 
 use chrono::Utc;
-use devai_api::{Api, AskReq, RunReq, TaskCreateReq};
+use devai_api::{Api, AskReq, RunReq, SupervisedRunReq, TaskCreateReq};
 use devai_core::process::Process;
 use devai_core::types::*;
 use devai_core::workflow;
@@ -136,10 +136,43 @@ fn agent_failure_park_is_presented_with_counter_words_and_verbatim_reason() {
     );
 }
 
-/// REQ-PK-01/06: a task parked by the ROUNDS brake names that brake, its
-/// counter pair and the stored reason verbatim — written through the same
-/// `workflow::park` mutation and the same `process.parked` event the brake
-/// emits.
+/// One execution ROW of the stage role — the input `launch_admission` counts
+/// when it asks whether the rounds brake tripped. Written through the store
+/// door the engine opens rows with.
+fn stage_round(store: &Store, task: &Task, minutes_ago: i64) {
+    let now = Utc::now();
+    store
+        .start_execution(&RoleExecution {
+            id: new_id(),
+            task_id: task.id,
+            role_slug: "requirements-analyst".into(),
+            role_version: 1,
+            agent_name: Some("mock".into()),
+            status: ExecutionStatus::Failed,
+            inputs: Vec::new(),
+            summary: None,
+            error: Some("round without a new artifact".into()),
+            started_at: now - chrono::Duration::minutes(minutes_ago),
+            finished_at: Some(now),
+            workspace_revision: None,
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
+            owner_pid: None,
+            owner_host: None,
+            owner_process_start: None,
+            bundle: None,
+            run_id: None,
+        })
+        .unwrap();
+}
+
+/// REQ-PK-01/06 (rework R2, ts/coverage-static): a task parked by the ROUNDS
+/// brake names that brake, its counter pair and the producer's stored reason
+/// verbatim. The brake is DRIVEN, not simulated: `task_run_supervised` counts
+/// the stage's execution rows, trips `launch_admission`'s brake, parks the
+/// task and writes `process.parked` itself — a producer token that drifts
+/// from the reader's vocabulary fails here.
 #[test]
 fn rounds_brake_park_is_presented_from_the_history() {
     let (dir, api) = home();
@@ -147,25 +180,36 @@ fn rounds_brake_park_is_presented_from_the_history() {
     api.task_start(&id).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let t = store.get_task(&id).unwrap();
-    let now = Utc::now();
-    let reason = "brake: 3 round(s) of `implementation-agent` without a new artifact (limit 3)";
-    let m = workflow::park(Process::factory(), &t, Some(reason), "platform", now).unwrap();
-    store.commit(t.lock_version, &m).unwrap();
-    store
-        .insert_event(
-            Some(t.id),
-            event_kind::PROCESS_PARKED,
-            "platform",
-            serde_json::json!({
-                "brake": "rounds_without_shift",
-                "counter": 3,
-                "limit": 3,
-                "reason": reason,
-            }),
-        )
+    // Three rounds of the declared ANALYSIS role since the last artifact —
+    // the declared budget — and no artifact at all.
+    for n in 0..3 {
+        stage_round(&store, &t, 3 - n);
+    }
+
+    let ack = dir.path().join("ack");
+    let run = new_id().to_string();
+    let report = api
+        .task_run_supervised(&SupervisedRunReq {
+            task_id: id.clone(),
+            agent: "mock".into(),
+            workspace: None,
+            force_reaudit: false,
+            run_id: run.clone(),
+            ack: ack.clone(),
+        })
         .unwrap();
+    assert!(
+        report.is_none(),
+        "the brake refuses the launch — nothing ran"
+    );
+    let ack = std::fs::read_to_string(&ack).unwrap_or_default();
+    assert!(
+        ack.contains("refused") && ack.contains("round(s)"),
+        "the producer refuses through the ack and names the brake: {ack:?}"
+    );
 
     let v = api.task_status(&id).unwrap();
+    assert_eq!(v.task.state, TaskState::Blocked, "the brake parks the task");
     let s = v.stop.expect("the stop is visible");
     assert_eq!(s.kind, "rounds_without_shift");
     assert_eq!(s.counter, Some(3));
@@ -174,10 +218,13 @@ fn rounds_brake_park_is_presented_from_the_history() {
     assert!(s.why.contains("тормоз кругов"), "{}", s.why);
     assert!(!s.action.trim().is_empty());
     assert_eq!(s.actor_word, "платформа");
-    assert_eq!(
-        s.reason.as_deref(),
-        Some(reason),
-        "the stored reason is never shortened or retold"
+    assert!(
+        s.reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("round(s) of `requirements-analyst` without a new artifact"),
+        "the producer's own text is shown verbatim: {:?}",
+        s.reason
     );
     assert!(s.failure_class.is_none(), "a brake is not a class failure");
     assert!(v.launch_failure.is_none());
@@ -326,6 +373,10 @@ fn a_failed_launch_does_not_claim_a_held_task_is_running() {
     let f = v.launch_failure.expect("the failure stays visible");
     assert_eq!(f.parked, Some(false), "this failure did not park the task");
     assert!(!f.continues, "the task is held, not running");
+    assert_eq!(
+        f.aftermath, "запуск не состоялся; остановила задачу другая причина (см. выше)",
+        "the declared sentence never claims a held task is running"
+    );
 }
 
 /// REQ-PK-02 AC1/AC3: a launch that did not happen is visible WITH its class,
@@ -367,6 +418,10 @@ fn a_failed_launch_is_visible_without_parking_the_task() {
     assert_eq!(f.counter_text, "1 из 3");
     assert_eq!(f.parked, Some(false));
     assert!(f.continues, "the task keeps going; only the launch failed");
+    assert_eq!(
+        f.aftermath, "продолжает идти, запуск не состоялся",
+        "the aftermath sentence is the declaration's"
+    );
     let reason = f.reason.expect("the stored reason verbatim");
     assert!(!reason.is_empty());
 
@@ -408,6 +463,7 @@ fn the_parked_launch_failure_carries_both_facts_with_matching_counters() {
     let f = v.launch_failure.expect("the failed launch is a fact");
     assert_eq!(f.parked, Some(true), "this failure parked the task");
     assert!(!f.continues);
+    assert_eq!(f.aftermath, "запаркована этим отказом");
     assert_eq!(f.consecutive, Some(3));
     assert_eq!(f.limit, Some(3));
     let s = v.stop.expect("the stop is a fact too");
@@ -496,6 +552,7 @@ fn a_finished_task_is_not_reported_as_going() {
     assert_eq!(f.parked, Some(false));
     assert!(!f.continues, "a cancelled task is not going");
     assert!(f.finished, "the answer says the task is finished");
+    assert_eq!(f.aftermath, "задача завершена, запуск не состоялся");
 }
 
 /// REQ-PK-01 AC3 and the corruption rule: a stored `question_id` that does not
@@ -620,4 +677,101 @@ fn a_launch_failure_without_details_states_the_absence() {
     assert_eq!((f.consecutive, f.limit), (None, None));
     assert_eq!(f.counter_text, "счётчик не записан");
     assert!(f.continues, "the task itself is still going");
+    assert_eq!(
+        f.aftermath, "событие не записало, запарковал ли этот отказ задачу",
+        "the absence of `parked` is declared words, not an assumed «no»"
+    );
+}
+
+/// A payload field of the WRONG TYPE is corrupt, not absent (rework R2,
+/// rl/error-handling): `counter: "3"` must not read as «счётчик не записан»,
+/// and a `process.parked` that cannot name its brake must not disappear from
+/// the stop block — both are named events, not silent absences.
+#[test]
+fn wrong_typed_stop_payloads_are_loud_not_absent() {
+    let (dir, api) = home();
+    let store = Store::open(dir.path()).unwrap();
+
+    let typed = task(&api, "счётчик строкой");
+    api.task_start(&typed).unwrap();
+    let t = store.get_task(&typed).unwrap();
+    let m = workflow::park(
+        Process::factory(),
+        &t,
+        Some("counter as text"),
+        "platform",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(t.lock_version, &m).unwrap();
+    store
+        .insert_event(
+            Some(t.id),
+            event_kind::PROCESS_PARKED,
+            "platform",
+            serde_json::json!({
+                json_field::BRAKE: stop_kind::ROUNDS_WITHOUT_SHIFT,
+                json_field::COUNTER: "3",
+                json_field::LIMIT: 3,
+                json_field::REASON: "counter as text",
+            }),
+        )
+        .unwrap();
+    let e = api.task_status(&typed).unwrap_err();
+    assert_eq!(e.code(), devai_api::ErrorCode("corrupt"), "{e}");
+    assert!(format!("{e}").contains("counter"), "{e}");
+
+    let nameless = task(&api, "тормоз без имени");
+    api.task_start(&nameless).unwrap();
+    let t = store.get_task(&nameless).unwrap();
+    let m = workflow::park(
+        Process::factory(),
+        &t,
+        Some("no brake token"),
+        "platform",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(t.lock_version, &m).unwrap();
+    store
+        .insert_event(
+            Some(t.id),
+            event_kind::PROCESS_PARKED,
+            "platform",
+            serde_json::json!({
+                json_field::COUNTER: 3,
+                json_field::LIMIT: 3,
+                json_field::REASON: "no brake token",
+            }),
+        )
+        .unwrap();
+    let e = api.task_status(&nameless).unwrap_err();
+    assert_eq!(e.code(), devai_api::ErrorCode("corrupt"), "{e}");
+    assert!(format!("{e}").contains("brake"), "{e}");
+}
+
+/// The same rule for the launch fact: a `parked` that is written as text is a
+/// corrupt payload, never «the event did not say».
+#[test]
+fn a_wrong_typed_parked_flag_is_a_loud_error() {
+    let (_dir, api) = home();
+    let id = task(&api, "parked строкой");
+    api.task_start(&id).unwrap();
+    let store = Store::open(_dir.path()).unwrap();
+    store
+        .insert_event(
+            Some(id.parse().unwrap()),
+            event_kind::EXECUTION_LAUNCH_FAILED,
+            "platform",
+            serde_json::json!({
+                json_field::FAILURE_CLASS: "spawn",
+                json_field::PARKED: "yes",
+                json_field::REASON: "boom",
+            }),
+        )
+        .unwrap();
+
+    let e = api.task_status(&id).unwrap_err();
+    assert_eq!(e.code(), devai_api::ErrorCode("corrupt"), "{e}");
+    assert!(format!("{e}").contains("parked"), "{e}");
 }

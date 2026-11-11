@@ -18,8 +18,8 @@ use devai_core::workflow;
 use devai_store::Store;
 use tempfile::TempDir;
 
-fn devai(home: &Path, args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_devai"))
+fn devai_output(home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_devai"))
         .arg("--home")
         .arg(home)
         .arg("--actor")
@@ -28,7 +28,11 @@ fn devai(home: &Path, args: &[&str]) -> String {
         .env_remove("DEVAI_CONFIG")
         .args(args)
         .output()
-        .expect("the devai binary is runnable");
+        .expect("the devai binary is runnable")
+}
+
+fn devai(home: &Path, args: &[&str]) -> String {
+    let out = devai_output(home, args);
     assert!(
         out.status.success(),
         "devai {args:?} exited {:?}\nstdout: {}\nstderr: {}",
@@ -56,19 +60,32 @@ fn active_task(store: &Store, title: &str) -> Task {
     store.get_task(&t.id.to_string()).unwrap()
 }
 
-fn park_event(store: &Store, task: &Task, brake: &str, counter: u32, limit: u32, reason: &str) {
+/// One execution ROW of the stage role — the input the ROUNDS brake counts.
+fn stage_round(store: &Store, task: &Task, minutes_ago: i64) {
+    let now = Utc::now();
     store
-        .insert_event(
-            Some(task.id),
-            event_kind::PROCESS_PARKED,
-            "platform",
-            serde_json::json!({
-                "brake": brake,
-                "counter": counter,
-                "limit": limit,
-                "reason": reason,
-            }),
-        )
+        .start_execution(&RoleExecution {
+            id: new_id(),
+            task_id: task.id,
+            role_slug: "requirements-analyst".into(),
+            role_version: 1,
+            agent_name: Some("mock".into()),
+            status: ExecutionStatus::Failed,
+            inputs: Vec::new(),
+            summary: None,
+            error: Some("round without a new artifact".into()),
+            started_at: now - chrono::Duration::minutes(minutes_ago),
+            finished_at: Some(now),
+            workspace_revision: None,
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
+            owner_pid: None,
+            owner_host: None,
+            owner_process_start: None,
+            bundle: None,
+            run_id: None,
+        })
         .unwrap();
 }
 
@@ -120,6 +137,14 @@ fn status_words_an_agent_failure_park_in_both_forms() {
         text.contains("модель исчезла у провайдера"),
         "the class in words, not the raw token:\n{text}"
     );
+    assert!(
+        text.contains("класс:   модель исчезла у провайдера"),
+        "the class line is the declared phrase alone (ratified OQ-PK-6):\n{text}"
+    );
+    assert!(
+        !text.contains("(provider_model)"),
+        "the human form never labels with the machine token; --json carries both:\n{text}"
+    );
     assert!(text.contains("делать:"), "the way out is printed:\n{text}");
     assert!(
         text.contains("Что случилось"),
@@ -146,9 +171,11 @@ fn status_words_an_agent_failure_park_in_both_forms() {
     assert_eq!(v["launch_failure"], serde_json::Value::Null);
 }
 
-/// REQ-PK-08 case 2 (rounds brake park) + REQ-PK-03 AC2: the counter and the
-/// verbatim reason are printed, and editing the DECLARATION file changes the
-/// printed phrase with no rebuild.
+/// REQ-PK-08 case 2 (rounds brake park) + REQ-PK-03 AC2 (rework R2,
+/// ts/coverage-static): the brake itself parks the task — three stage rows
+/// without a new artifact, then a launch the admission refuses — and the CLI
+/// prints the counter and the producer's own reason. Editing the DECLARATION
+/// file changes the printed phrase with no rebuild.
 #[test]
 fn status_words_a_rounds_brake_park_and_follows_the_declaration_file() {
     let home = TempDir::new().unwrap();
@@ -156,12 +183,39 @@ fn status_words_a_rounds_brake_park_and_follows_the_declaration_file() {
     devai(h, &["init"]);
     let store = Store::open(h).unwrap();
     let t = active_task(&store, "тормоз кругов");
-    let reason = "brake: 3 round(s) of `implementation-agent` without a new artifact (limit 3)";
-    let m = workflow::park(Process::factory(), &t, Some(reason), "platform", Utc::now()).unwrap();
-    store.commit(t.lock_version, &m).unwrap();
-    park_event(&store, &t, "rounds_without_shift", 3, 3, reason);
-
     let prefix = &t.id.to_string()[..12];
+    // The rows the rounds brake counts: three rounds of the stage role, no
+    // new artifact since.
+    for n in 0..3 {
+        stage_round(&store, &t, 3 - n);
+    }
+    let out = devai_output(h, &["task", "run", prefix, "--agent", "mock"]);
+    assert!(
+        out.status.success(),
+        "the refused launch is an answer, not a crash: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("refused") && said.contains("round(s)"),
+        "the brake refuses the launch and names itself: {said}"
+    );
+
+    // The machine answer carries the producer's facts.
+    let v = devai_json(h, &["task", "status", prefix]);
+    assert_eq!(v["stop"]["kind"], "rounds_without_shift");
+    assert_eq!(v["stop"]["counter"], 3);
+    assert_eq!(v["stop"]["limit"], 3);
+    let reason = v["stop"]["reason"]
+        .as_str()
+        .expect("the producer stored its reason")
+        .to_string();
+    assert!(
+        reason.contains("round(s) of `requirements-analyst` without a new artifact"),
+        "{reason}"
+    );
+
     let text = devai(h, &["task", "status", prefix]);
     assert!(
         text.contains("тормоз кругов"),
@@ -169,16 +223,14 @@ fn status_words_a_rounds_brake_park_and_follows_the_declaration_file() {
     );
     assert!(text.contains("3 из 3"), "the counter:\n{text}");
     assert!(
-        text.contains(reason),
+        text.contains(&reason),
         "the stored reason is printed verbatim:\n{text}"
     );
     assert!(text.contains("делать:"), "{text}");
-
-    let v = devai_json(h, &["task", "status", prefix]);
-    assert_eq!(v["stop"]["kind"], "rounds_without_shift");
-    assert_eq!(v["stop"]["counter"], 3);
-    assert_eq!(v["stop"]["limit"], 3);
-    assert_eq!(v["stop"]["reason"], reason);
+    assert!(
+        !text.contains("rounds_without_shift"),
+        "the human form carries the phrase, never the machine token (OQ-PK-6):\n{text}"
+    );
 
     // The operator edits the words — no rebuild, no code change.
     let file = h.join("config").join("workflow").join("park-reasons.yaml");
@@ -190,6 +242,30 @@ fn status_words_a_rounds_brake_park_and_follows_the_declaration_file() {
     assert!(text.contains("круги кончились"), "{text}");
     assert!(!text.contains("сработал тормоз кругов"), "{text}");
 
+    // The declared absence sentence is data too: a manual stop has no counter,
+    // and the words standing in for the pair follow the file.
+    let reworded = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace("остановлено вручную, счётчика нет", "остановлено человеком");
+    assert_ne!(original, reworded);
+    std::fs::write(&file, &reworded).unwrap();
+    let manual = active_task(&store, "остановка рукой");
+    let m = workflow::block(
+        Process::factory(),
+        &manual,
+        Some("ждём подрядчика"),
+        "pk-human",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(manual.lock_version, &m).unwrap();
+    let text = devai(h, &["task", "status", &manual.id.to_string()[..12]]);
+    assert!(
+        text.contains("остановлено человеком"),
+        "the reworded absence sentence is printed:\n{text}"
+    );
+    assert!(!text.contains("остановлено вручную"), "{text}");
+
     // A kind with no declared phrase is a LOUD config error, never a machine
     // token in the phrase's place (REQ-PK-03 AC3).
     std::fs::write(
@@ -197,14 +273,7 @@ fn status_words_a_rounds_brake_park_and_follows_the_declaration_file() {
         original.replace("    manual_pause:", "    manual_pauze:"),
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_devai"))
-        .arg("--home")
-        .arg(h)
-        .args(["task", "status", prefix])
-        .env_remove("DEVAI_HOME")
-        .env_remove("DEVAI_CONFIG")
-        .output()
-        .unwrap();
+    let out = devai_output(h, &["task", "status", prefix]);
     assert!(
         !out.status.success(),
         "an incomplete declaration must refuse the read"
@@ -253,7 +322,15 @@ fn status_words_a_failed_launch_without_a_stop_block() {
         text.contains("породить процесс"),
         "the class in declared words:\n{text}"
     );
+    assert!(
+        !text.contains("(spawn)"),
+        "the human form never labels with the machine token (OQ-PK-6):\n{text}"
+    );
     assert!(text.contains("1 из 3"), "the counter pair:\n{text}");
+    assert!(
+        text.contains("продолжает идти, запуск не состоялся"),
+        "the declared aftermath sentence:\n{text}"
+    );
     assert!(
         text.contains("продолжает идти"),
         "the task is NOT stopped by it:\n{text}"

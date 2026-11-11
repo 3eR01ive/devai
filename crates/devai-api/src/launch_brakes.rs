@@ -18,7 +18,7 @@
 use chrono::Utc;
 
 use devai_core::types::{
-    ExecutionStatus, Id, Task, event_kind, failure_class, json_field, stop_kind,
+    ExecutionStatus, Id, PLATFORM_ACTOR, Task, event_kind, failure_class, json_field, stop_kind,
 };
 use devai_core::workflow::{self, Mutation};
 use devai_runtime::RuntimeError;
@@ -100,7 +100,7 @@ impl Api {
         reason: &str,
     ) -> ApiResult<()> {
         let process = self.process_policy()?;
-        let m = workflow::park(&process, task, Some(reason), "platform", Utc::now())?;
+        let m = workflow::park(&process, task, Some(reason), PLATFORM_ACTOR, Utc::now())?;
         self.commit_park(task, &m, brake, counter, limit, reason)
     }
 
@@ -116,8 +116,13 @@ impl Api {
         reason: &str,
     ) -> ApiResult<()> {
         let process = self.process_policy()?;
-        let m =
-            workflow::park_on_launch_failure(&process, task, Some(reason), "platform", Utc::now())?;
+        let m = workflow::park_on_launch_failure(
+            &process,
+            task,
+            Some(reason),
+            PLATFORM_ACTOR,
+            Utc::now(),
+        )?;
         self.commit_park(task, &m, brake, counter, limit, reason)
     }
 
@@ -136,7 +141,7 @@ impl Api {
         self.store.insert_event(
             Some(task.id),
             event_kind::PROCESS_PARKED,
-            "platform",
+            PLATFORM_ACTOR,
             serde_json::json!({
                 json_field::BRAKE: brake,
                 json_field::COUNTER: counter,
@@ -177,7 +182,7 @@ impl Api {
         self.store.insert_event(
             Some(task.id),
             event_kind::EXECUTION_LAUNCH_FAILED,
-            "platform",
+            PLATFORM_ACTOR,
             serde_json::json!({
                 json_field::FAILURE_CLASS: class,
                 json_field::CONSECUTIVE: consecutive,

@@ -1257,6 +1257,14 @@ pub mod failure_class {
     ];
 }
 
+/// The actor token the PLATFORM writes on its OWN records («platform»): a wire
+/// string, frozen like the event kinds — already-stored events carry exactly
+/// this text, so changing it would change how history reads. The stop
+/// declaration must mark THIS token automatic (`actors.platform.automatic`), so
+/// a renamed declaration key can never turn the platform's own stops into a
+/// human's act; the reader then asks the declaration, never this literal.
+pub const PLATFORM_ACTOR: &str = "platform";
+
 /// The closed vocabulary of STOP reasons the task history can yield (task
 /// 01a1ca39, REQ-PK-06): the `brake` token a `process.parked` event carries,
 /// plus the reader-side names of a parking question and of the manual holds.
@@ -1279,6 +1287,18 @@ pub mod stop_kind {
     pub const MANUAL_PAUSE: &str = "manual_pause";
     pub const MANUAL_CANCEL: &str = "manual_cancel";
     pub const MANUAL_FAIL: &str = "manual_fail";
+
+    /// The kinds a `process.parked` event can carry in its `brake` payload —
+    /// the PRODUCER-side vocabulary (a brake token never has its own event
+    /// kind, so a reader cannot classify it by the event alone). Split out of
+    /// [`ALL`] so the reader can name the tokens a payload may hold apart from
+    /// the kinds it derives from a hold event; the `stop_kind` vocabulary
+    /// test pins that neither list can drift from the other.
+    pub const BRAKES: &[&str] = &[
+        ROUNDS_WITHOUT_SHIFT,
+        CONSECUTIVE_LAUNCH_FAILURES,
+        PARK_IMMEDIATELY,
+    ];
 
     /// Every kind a status read must be able to word — the declaration is
     /// checked against this list, so a missing phrase is a loud config error

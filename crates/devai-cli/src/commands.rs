@@ -2001,56 +2001,39 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The STOP section of `task status` (REQ-PK-05 AC1/AC2): the declared phrase,
-/// the counter pair, the time, the actor, the stored reason VERBATIM and the
-/// proposed action — the raw event is never dumped.
+/// The STOP section of `task status` (REQ-PK-05 AC1/AC2, ratified OQ-PK-6):
+/// the declared phrase, the counter pair, the time, the actor, the stored
+/// reason VERBATIM and the proposed action — the raw event is never dumped,
+/// and the human form carries the declared PHRASE ONLY (the machine token
+/// rides `--json`). The absence sentence is declared too, never a literal.
 fn print_stop(s: &devai_api::StopView) {
     outln!("--- остановка: {}", s.why);
     outln!("  счётчик: {}", s.counter_text);
     outln!("  когда:   {}", s.at.format("%Y-%m-%d %H:%M:%S"));
     outln!("  кто:     {}", s.actor_word);
-    if let (Some(class), Some(word)) = (&s.failure_class, &s.failure_class_word) {
-        outln!("  класс:   {word} ({class})");
+    if let Some(word) = &s.failure_class_word {
+        outln!("  класс:   {word}");
     }
     outln!(
         "  причина: {}",
-        s.reason.as_deref().unwrap_or("причина не записана")
+        s.reason.as_deref().unwrap_or(s.reason_absent.as_str())
     );
     outln!("  делать:  {}", s.action);
 }
 
 /// The failed-launch section of `task status` (REQ-PK-02 AC1/AC3): class,
 /// time, counter pair, the stored reason verbatim and the action, plus the
-/// one sentence saying whether the task kept going or was parked by it.
+/// declared sentence saying whether the task kept going or was parked by it.
+/// The class PHRASE is what a human reads; its token stays in `--json`.
 fn print_launch_failure(f: &devai_api::LaunchFailureView) {
-    outln!(
-        "--- запуск не состоялся: {} ({})",
-        f.class_word,
-        f.failure_class
-    );
+    outln!("--- запуск не состоялся: {}", f.class_word);
     outln!("  когда:   {}", f.at.format("%Y-%m-%d %H:%M:%S"));
     outln!("  счётчик: {}", f.counter_text);
     if let Some(reason) = &f.reason {
         outln!("  причина: {reason}");
     }
     outln!("  делать:  {}", f.action);
-    outln!("  задача:  {}", launch_aftermath(f));
-}
-
-/// The one sentence about the TASK itself: what THIS event did (`parked`) and
-/// what the task is doing now (`continues` / `finished`) are separate facts, so
-/// the wording never claims a held, finished or cancelled task is running.
-fn launch_aftermath(f: &devai_api::LaunchFailureView) -> &'static str {
-    match (f.parked, f.continues, f.finished) {
-        (Some(true), false, _) => "запаркована этим отказом",
-        (Some(true), true, _) => "этот отказ запарковал задачу; сейчас она идёт дальше",
-        (Some(false), true, _) => "продолжает идти, запуск не состоялся",
-        (Some(false), false, true) => "задача завершена, запуск не состоялся",
-        (Some(false), false, false) => {
-            "запуск не состоялся; остановила задачу другая причина (см. выше)"
-        }
-        (None, ..) => "событие не записало, запарковал ли этот отказ задачу",
-    }
+    outln!("  задача:  {}", f.aftermath);
 }
 
 /// The human gate's viewing channel: the CURRENT quality report. A verdict
@@ -3337,56 +3320,6 @@ pub(crate) fn short(id: &Uuid) -> String {
 /// Display-short of an id that already arrives as a string (API views).
 pub(crate) fn short_str(id: &str) -> String {
     devai_core::types::short_id_str(id)
-}
-
-#[cfg(test)]
-mod launch_aftermath_tests {
-    //! REQ-PK-02 AC1/AC3: the one sentence about the TASK is judged on its own,
-    //! so every branch — parked / going / held / finished / unknown — is pinned
-    //! without a full launch drive.
-    use super::launch_aftermath;
-    use devai_api::LaunchFailureView;
-
-    fn view(parked: Option<bool>, continues: bool, finished: bool) -> LaunchFailureView {
-        LaunchFailureView {
-            failure_class: "spawn".into(),
-            class_word: "класс".into(),
-            at: chrono::Utc::now(),
-            reason: Some("boom".into()),
-            action: "сделать".into(),
-            consecutive: Some(1),
-            limit: Some(3),
-            counter_text: "1 из 3".into(),
-            parked,
-            continues,
-            finished,
-        }
-    }
-
-    #[test]
-    fn the_sentence_never_claims_a_stopped_or_finished_task_is_going() {
-        assert_eq!(
-            launch_aftermath(&view(Some(true), false, false)),
-            "запаркована этим отказом"
-        );
-        assert_eq!(
-            launch_aftermath(&view(Some(false), true, false)),
-            "продолжает идти, запуск не состоялся"
-        );
-        assert_eq!(
-            launch_aftermath(&view(Some(false), false, true)),
-            "задача завершена, запуск не состоялся"
-        );
-        assert_eq!(
-            launch_aftermath(&view(Some(false), false, false)),
-            "запуск не состоялся; остановила задачу другая причина (см. выше)"
-        );
-        // An event that did not record `parked` says so instead of assuming «no».
-        assert_eq!(
-            launch_aftermath(&view(None, true, false)),
-            "событие не записало, запарковал ли этот отказ задачу"
-        );
-    }
 }
 
 #[cfg(test)]
