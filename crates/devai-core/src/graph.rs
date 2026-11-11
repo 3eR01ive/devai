@@ -132,6 +132,20 @@ pub struct RoleGraph {
     /// never derived from the position or a gate (REQ-RG-05).
     pub blocking_questions: usize,
     pub notes: Vec<String>,
+    /// The contract SCHEMAS referenced by the nodes (`name@v` -> schema), so
+    /// the interface can show the rules a role reads and produces without a
+    /// second round-trip. Empty when no role names a contract.
+    pub contracts: Vec<GraphContract>,
+}
+
+/// One contract schema, verbatim as stored: the rule a role's input or output
+/// must satisfy. `key` is `name@v` — the same spelling the node carries.
+#[derive(Serialize, Clone, Debug)]
+pub struct GraphContract {
+    pub key: String,
+    pub name: String,
+    pub version: u32,
+    pub schema: serde_json::Value,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -159,6 +173,12 @@ pub struct GraphNode {
     pub display: String,
     pub role_slug: Option<String>,
     pub role_version: Option<u32>,
+    /// The role's declared INPUT rule (`name@v`): what it is allowed to read.
+    /// Filled by the caller from the role definition; `None` for gates/final
+    /// and for a role whose definition names no contract.
+    pub input_contract: Option<String>,
+    /// The role's declared OUTPUT rule (`name@v`): what its result must match.
+    pub output_contract: Option<String>,
     pub status: String,
     pub status_word: String,
     /// A stored result of this node was retracted (STALE/SUPERSEDED) — shown
@@ -464,6 +484,8 @@ impl<'a> Fold<'a> {
             display: role_display(&self.roles, slug, version),
             role_slug: Some(slug.to_string()),
             role_version: Some(version),
+            input_contract: None,
+            output_contract: None,
             status: status.to_string(),
             status_word: node_status_word(status).to_string(),
             revoked,
@@ -487,6 +509,8 @@ impl<'a> Fold<'a> {
             display: label,
             role_slug: None,
             role_version: None,
+            input_contract: None,
+            output_contract: None,
             status,
             status_word: word,
             revoked: false,
@@ -942,6 +966,8 @@ fn final_node(task: &Task) -> Option<GraphNode> {
         display: "принято".to_string(),
         role_slug: None,
         role_version: None,
+        input_contract: None,
+        output_contract: None,
         status: node_status::EXPECTED.to_string(),
         status_word: node_status_word(node_status::EXPECTED).to_string(),
         revoked: false,
@@ -1061,6 +1087,7 @@ pub fn build(f: &GraphFacts<'_>) -> RoleGraph {
         running,
         waits,
         blocking_questions: fold.blocking_count(),
+        contracts: Vec::new(),
         notes,
     }
 }

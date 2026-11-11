@@ -227,6 +227,15 @@ export interface RoleGraph {
   waits: GraphWait[];
   blocking_questions: number;
   notes: string[];
+  /** Схемы правил, на которые ссылаются узлы (`name@v`), дословно из стора. */
+  contracts: GraphContract[];
+}
+
+export interface GraphContract {
+  key: string;
+  name: string;
+  version: number;
+  schema: Record<string, unknown>;
 }
 
 export interface GraphStage {
@@ -246,6 +255,10 @@ export interface GraphNode {
   display: string;
   role_slug: string | null;
   role_version: number | null;
+  /** Правило входа роли (`name@v`): что ей позволено читать. */
+  input_contract: string | null;
+  /** Правило выхода роли (`name@v`): чему обязан соответствовать результат. */
+  output_contract: string | null;
   status: "passed" | "current" | "expected";
   status_word: string;
   revoked: boolean;

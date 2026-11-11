@@ -6,11 +6,34 @@
 // словаря подписей и цветов статусов и ничего не пересчитывает — только
 // раскладывает пришедшее. Пройдено/сейчас/дальше различаются чипом и словом
 // без наведения; списки печатаются целиком (ни «+N ещё», ни прокрутки).
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { fmtTime, shortId } from "../settings";
-import type { GraphNode, RoleGraph } from "../types";
+import type { GraphContract, GraphNode, RoleGraph } from "../types";
 
 const props = defineProps<{ graph: RoleGraph; snapshotAt?: string }>();
+
+// Правила роли (REQ-RG-07): вход и выход — ссылки `name@v` с узла, сами схемы
+// приходят тем же чтением. Окно ничего не выводит и не переписывает.
+const openRules = ref<Record<string, boolean>>({});
+function toggleRules(id: string) {
+  openRules.value = { ...openRules.value, [id]: !openRules.value[id] };
+}
+function contractByKey(key: string | null): GraphContract | null {
+  if (!key) return null;
+  return props.graph.contracts.find((c) => c.key === key) ?? null;
+}
+type RuleField = { name: string; type: string; required: boolean; text: string };
+function fieldsOf(contract: GraphContract | null): RuleField[] {
+  if (!contract) return [];
+  const schema = contract.schema as { properties?: Record<string, unknown>; required?: string[] };
+  const required = new Set(schema.required ?? []);
+  const props_ = schema.properties ?? {};
+  return Object.entries(props_).map(([name, raw]) => {
+    const def = (raw ?? {}) as { type?: string; description?: string; items?: { type?: string } };
+    const type = def.type === "array" && def.items?.type ? `${def.items.type}[]` : def.type ?? "—";
+    return { name, type, required: required.has(name), text: def.description ?? "" };
+  });
+}
 
 const nodeDisplays = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {};
@@ -74,6 +97,28 @@ const blocking = computed(() => props.graph.blocking_questions);
           <span class="chip-status" :class="n.status">{{ n.status_word }}</span>
           <span v-if="n.revoked" class="chip-att">результат отозван</span>
           <span v-if="n.kind === 'gate'" class="mono muted">гейт человека</span>
+        </div>
+
+        <!-- Правила роли: что читает и чему обязан соответствовать результат.
+             Машинные имена полей — данные контракта, не вывод окна. -->
+        <div v-if="n.kind === 'role' && (n.input_contract || n.output_contract)" class="node-block">
+          <div class="rowflex" style="cursor: pointer" @click="toggleRules(n.id)">
+            <span class="mono muted">правила роли</span>
+            <span class="mono">вход: {{ n.input_contract ?? "—" }}</span>
+            <span class="mono">выход: {{ n.output_contract ?? "—" }}</span>
+            <span class="muted">{{ openRules[n.id] ? "свернуть поля" : "показать поля" }}</span>
+          </div>
+          <div v-if="openRules[n.id]">
+            <div v-for="side in [['вход', n.input_contract], ['выход', n.output_contract]]" :key="side[0] as string">
+              <div class="mono muted" style="margin-top: 4px">{{ side[0] }}: {{ side[1] ?? "правило не объявлено" }}</div>
+              <div v-for="f in fieldsOf(contractByKey(side[1] as string | null))" :key="f.name" class="rowflex">
+                <span class="mono">{{ f.name }}</span>
+                <span class="muted">{{ f.type }}</span>
+                <span v-if="f.required" class="chip-att">обязательное</span>
+                <span class="muted">{{ f.text }}</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div v-if="n.executions.length" class="node-block">
