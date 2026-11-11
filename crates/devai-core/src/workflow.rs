@@ -1147,6 +1147,12 @@ pub struct AgentFailureParking<'a> {
     pub execution_id: Option<Id>,
 }
 
+/// The `gate` token of the parking question raised by the agent-failure
+/// threshold (task 01a1b60c) — ONE literal for the producer (the question
+/// payload) and the reader (the status surface tells this park apart from
+/// every other question hold, REQ-PK-06 AC3).
+pub const AGENT_FAILURE_GATE: &str = "agent-failure";
+
 /// N consecutive agent failures park the task (task 01a1b60c, REQ-AF-05):
 /// WAITING_FOR_INPUT on a blocking question in the accepted human form
 /// («что случилось / почему важно / что сделать»). The stage is remembered
@@ -1184,7 +1190,7 @@ pub fn park_agent_failure(
         json!({
             (json_field::QUESTION_ID): question_id.to_string(),
             "blocking": true,
-            (json_field::GATE): "agent-failure",
+            (json_field::GATE): AGENT_FAILURE_GATE,
             (json_field::AGENT): p.agent,
             (json_field::CLASS): p.class,
             (json_field::SERIES_COUNT): p.series_count,

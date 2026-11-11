@@ -1262,6 +1262,14 @@ impl Api {
             .map_err(ApiError::from)
     }
 
+    /// REQ-PK-03: the declared words of the stop surface — one load per read,
+    /// the same merge-scan the other workflow policies use. A broken or
+    /// incomplete declaration is a LOUD config error, never a silent default.
+    pub(crate) fn park_reasons(&self) -> ApiResult<devai_store::config::ParkReasons> {
+        devai_store::config::load_park_reasons(&self.config_dir().join("workflow"))
+            .map_err(ApiError::from)
+    }
+
     /// REQ-AR-11/12: a state that the declaration says a role executes REQUIRES
     /// a run — after a human decision the platform starts it itself, without a
     /// second command. Called after every committed workflow mutation; a state

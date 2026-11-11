@@ -17,7 +17,7 @@
 
 use chrono::Utc;
 
-use devai_core::types::{ExecutionStatus, Id, Task, event_kind, failure_class};
+use devai_core::types::{ExecutionStatus, Id, Task, event_kind, failure_class, stop_kind};
 use devai_core::workflow::{self, Mutation};
 use devai_runtime::RuntimeError;
 use devai_store::config::ProcessPolicy;
@@ -76,7 +76,13 @@ impl Api {
         // «сработало с первого раза при пороге 1», not as bare literals.
         let occurrence: u32 = 1;
         let limit: u32 = 1;
-        self.park_launch_failure(&cur, "park_immediately", occurrence, limit, &reason)
+        self.park_launch_failure(
+            &cur,
+            stop_kind::PARK_IMMEDIATELY,
+            occurrence,
+            limit,
+            &reason,
+        )
     }
 
     /// Park the task on a tripped brake: the state change, the reason with
@@ -159,7 +165,7 @@ impl Api {
             );
             self.park_launch_failure(
                 task,
-                "consecutive_launch_failures",
+                stop_kind::CONSECUTIVE_LAUNCH_FAILURES,
                 consecutive,
                 limit,
                 &reason,

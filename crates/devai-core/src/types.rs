@@ -1257,6 +1257,45 @@ pub mod failure_class {
     ];
 }
 
+/// The closed vocabulary of STOP reasons the task history can yield (task
+/// 01a1ca39, REQ-PK-06): the `brake` token a `process.parked` event carries,
+/// plus the reader-side names of a parking question and of the manual holds.
+/// The brake tokens are written by the producers through these constants, so
+/// an event and the phrase that words it cannot drift apart; the question and
+/// manual names are the reader's vocabulary (derived from the event kind).
+pub mod stop_kind {
+    /// A brake tripped: rounds of the same stage role without a new artifact.
+    pub const ROUNDS_WITHOUT_SHIFT: &str = "rounds_without_shift";
+    /// A brake tripped: launches that did not happen in a row.
+    pub const CONSECUTIVE_LAUNCH_FAILURES: &str = "consecutive_launch_failures";
+    /// The failure CLASS is declared to park on its first occurrence.
+    pub const PARK_IMMEDIATELY: &str = "park_immediately";
+    /// The agent-failure threshold parked the task on a blocking question.
+    pub const AGENT_FAILURE: &str = "agent_failure";
+    /// A question hold that is not an agent failure (form loop, human ask).
+    pub const QUESTION: &str = "question";
+    /// The human blocked / paused / cancelled / failed the task by hand.
+    pub const MANUAL_BLOCK: &str = "manual_block";
+    pub const MANUAL_PAUSE: &str = "manual_pause";
+    pub const MANUAL_CANCEL: &str = "manual_cancel";
+    pub const MANUAL_FAIL: &str = "manual_fail";
+
+    /// Every kind a status read must be able to word — the declaration is
+    /// checked against this list, so a missing phrase is a loud config error
+    /// and a typo'd key never becomes an inert row (REQ-PK-03 AC3/AC4).
+    pub const ALL: &[&str] = &[
+        ROUNDS_WITHOUT_SHIFT,
+        CONSECUTIVE_LAUNCH_FAILURES,
+        PARK_IMMEDIATELY,
+        AGENT_FAILURE,
+        QUESTION,
+        MANUAL_BLOCK,
+        MANUAL_PAUSE,
+        MANUAL_CANCEL,
+        MANUAL_FAIL,
+    ];
+}
+
 /// The closed vocabulary of the `cause` token on `artifacts.staled` events —
 /// WHY an artifact stopped being CURRENT. The workflow WRITES these strings
 /// and the report presentation READS them back to word its «устарел» marker,

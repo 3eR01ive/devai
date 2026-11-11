@@ -17,7 +17,7 @@
 //! Every «no» travels through the ack file, so a caller that has already
 //! returned still receives it, and none of them touches a running chain.
 
-use devai_core::types::{ExecutionStatus, Id, Task, TaskState};
+use devai_core::types::{ExecutionStatus, Id, Task, TaskState, stop_kind};
 use devai_store::config::ProcessPolicy;
 
 use devai_runtime::launch;
@@ -144,7 +144,13 @@ impl Api {
         }
         let reason =
             format!("brake: {rounds} round(s) of `{role}` without a new artifact (limit {limit})");
-        self.park(task, "rounds_without_shift", rounds, limit, &reason)?;
+        self.park(
+            task,
+            stop_kind::ROUNDS_WITHOUT_SHIFT,
+            rounds,
+            limit,
+            &reason,
+        )?;
         Ok(Some(reason))
     }
 

@@ -177,8 +177,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.status",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate}",
-            description: "Current state plus the operations the platform permits next, the CURRENT artifacts, open questions and — at the QA gate — each action's public availability and platform refusal. Mirrors `task status`.",
+            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate, stop, launch_failure}",
+            description: "Current state plus the operations the platform permits next, the CURRENT artifacts, open questions, — at the QA gate — each action's public availability and platform refusal, and the STOP facts of the task (why it stands: brake/class, counter and limit, time, actor, the stored reason verbatim, the proposed action) plus the latest launch that did not happen. Both facts are folded from the task history at read time and worded from `config/workflow/park-reasons.yaml`; `null` when the task is not stopped / a later launch superseded the failure. Mirrors `task status`.",
         },
         OpDescriptor {
             name: "task.progress",

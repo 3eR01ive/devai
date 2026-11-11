@@ -29,6 +29,7 @@ mod mutations;
 mod quality_gate;
 mod registry;
 mod signature;
+mod stop;
 
 /// Machine codes of the homes vocabulary — one dictionary, referenced by
 /// producers here and by the UI bootstrap (R3 quality return).
@@ -81,6 +82,7 @@ pub use signature::{
     SpecView, approve_denied, diff_specs, last_review_artifact, parse_review_body, parse_spec_body,
     pick_previous_spec, reject_denied, signature_view, spec_presentation,
 };
+pub use stop::{LaunchFailureView, StopView};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -394,6 +396,12 @@ impl Api {
         let ops: Vec<String> = workflow::allowed_ops(&process, &t);
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
+        // REQ-PK-01/02: why the task stands and which launch did not happen —
+        // two facts folded from the SAME history read, their words resolved
+        // from the declaration (REQ-PK-03). Nothing is written: a status read
+        // leaves the task row and the event log untouched (REQ-PK-07 AC2).
+        let reasons = self.park_reasons()?;
+        let (stop, launch_failure) = self.task_stop_facts(&t, &questions, &reasons)?;
         // REQ-QG-08: the QA gate's public availability travels WITH the status
         // read — the window does not derive it. The dependency/decision/
         // execution loads happen only at the gate; other states have no gate.
@@ -417,6 +425,8 @@ impl Api {
                 .filter(|q| q.status == QuestionStatus::Open)
                 .collect(),
             quality_gate,
+            stop,
+            launch_failure,
         })
     }
 
@@ -1341,6 +1351,15 @@ pub struct StatusView {
     /// REQ-QG-08/09: the QA gate's per-action availability and platform
     /// refusal; `None` outside QA (the actions do not exist there).
     pub quality_gate: Option<QualityGateView>,
+    /// REQ-PK-01: WHY the task is standing still — brake/class, counter and
+    /// limit, time, actor, the stored reason verbatim and the proposed
+    /// action, folded from the task history at read time. `None` while the
+    /// task is not held (no empty «unknown» block is ever printed).
+    pub stop: Option<StopView>,
+    /// REQ-PK-02: the latest role launch that did NOT happen — class, time,
+    /// verbatim reason and action — whether it parked the task or the task
+    /// kept going. `None` when a later launch superseded it.
+    pub launch_failure: Option<LaunchFailureView>,
 }
 
 #[derive(Serialize, Clone, Debug)]
