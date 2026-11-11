@@ -10,19 +10,28 @@
 // Ничего не пересчитывается: первый слой приходит готовым от платформы
 // (`quality_gate_view.ts` держит чистые правила окна), а подробности —
 // сохранённые группы отчёта.
+//
+// Отсутствие человеческого слоя — НЕ «недостатков нет» (rework R1): у старого,
+// повреждённого или нечитаемого тела состав замечаний неизвестен, экран говорит,
+// чего именно не хватает и что это значит для решения, а черновик возврата
+// приходит с одним честным общим основанием «состав замечаний не прочитан».
 import { computed, ref, watch } from "vue";
 import {
   filterOptions,
+  firstLayerGap,
   freshnessBanner,
   groupsForFilter,
   hasEvidence,
   presentReport,
   showsPassedNote,
   siteText,
+  UNREAD_DRAFT_ID,
+  type FirstLayerGap,
   type ReportBody,
 } from "../../report_view";
 import {
   decisionPrompt,
+  draftItemOf,
   inDraft,
   prefillDraft,
   toggleDraftItem,
@@ -66,6 +75,18 @@ const form = computed<HumanForm | null>(() => (body.value?.kind === "form" ? bod
 const firstLayer = computed<FirstLayer | null>(() =>
   body.value && body.value.kind === "form" ? (props.report?.first_layer ?? null) : null,
 );
+/** Почему человеческого слоя нет — и что это значит для решения. `null`,
+ * когда слой есть: экран не выдумывает нехватку поверх читаемого отчёта. */
+const gap = computed<FirstLayerGap | null>(() =>
+  !firstLayer.value && props.report ? firstLayerGap(props.report, body.value) : null,
+);
+/** Тело без человеческого слоя, как сохранено: текст и (для повреждённой
+ * формы) платформенный маркер. Показывается в подробностях, не первым. */
+const fallback = computed<{ marker: string; text: string | null } | null>(() => {
+  const b = body.value;
+  if (!b || b.kind === "form") return null;
+  return { marker: b.kind === "damaged" ? b.marker : "", text: b.text };
+});
 const prompt = computed(() => decisionPrompt(props.gate));
 const banner = computed(() =>
   freshnessBanner(props.report?.freshness, props.report?.status ?? ""),
@@ -76,23 +97,39 @@ const shownGroups = computed(() => {
 });
 const draftNote = computed(() => {
   const fl = firstLayer.value;
+  // Человеческого слоя нет: пустота черновика ничего не доказывает о
+  // замечаниях — говорим, что именно не прочитано (rework R1).
+  if (!fl) {
+    const g = gap.value;
+    if (!g) return "";
+    return draft.value.length
+      ? g.draft_note
+      : "пункты черновика сняты — возврат пойдёт только с твоим обоснованием.";
+  }
   if (draft.value.length) {
     return "все замечания ниже уже здесь — сними те, что не надо возвращать.";
   }
-  if (fl && fl.findings.length) {
+  if (fl.findings.length) {
     return "пунктов нет — возврат пойдёт с одним обоснованием.";
   }
   return "возвращать нечего: недостатков в отчёте нет.";
 });
 
+/** Черновик для отчёта без человеческого слоя: одно общее основание. */
+function unreadDraft(g: FirstLayerGap): ReturnDraftItem[] {
+  return [draftItemOf({ id: UNREAD_DRAFT_ID, summary: g.draft, site: "" })];
+}
+
 watch(
-  () => [props.report?.artifact ?? "", firstLayer.value] as const,
+  () => [props.report?.artifact ?? "", firstLayer.value ? "form" : (gap.value?.kind ?? "none")] as const,
   () => {
-    const key = props.report?.artifact ?? "";
-    const fl = firstLayer.value;
-    if (!key || !fl) return;
+    const key = `${props.report?.artifact ?? ""}:${firstLayer.value ? "form" : (gap.value?.kind ?? "none")}`;
+    if (!props.report) return;
     if (seededFor.value === key) return;
-    draft.value = prefillDraft(fl.findings);
+    const fl = firstLayer.value;
+    if (fl) draft.value = prefillDraft(fl.findings);
+    else if (gap.value) draft.value = unreadDraft(gap.value);
+    else return;
     seededFor.value = key;
   },
   { immediate: true },
@@ -131,6 +168,11 @@ function addPoint(it: HumanFormItem) {
         </template>
         <p v-if="firstLayer" class="qr-found">{{ firstLayer.found }}</p>
         <p v-if="firstLayer" class="muted qr-score">{{ firstLayer.score_line }}</p>
+        <!-- Человеческого слоя нет: что именно недоступно и что это значит для
+             решения — словами, первым делом. Состав замечаний при этом
+             НЕИЗВЕСТЕН, поэтому «недостатков нет» здесь не говорится. -->
+        <p v-if="gap" class="qr-gap">{{ gap.what }}</p>
+        <p v-if="gap" class="muted qr-gap-means">{{ gap.means }}</p>
       </div>
 
       <!-- Действия гейта — ровно тогда, когда платформа их публикует (QA) и
@@ -194,22 +236,17 @@ function addPoint(it: HumanFormItem) {
         </ul>
       </section>
 
-      <!-- Старое тело без человеческой формы: показываем честно, как есть. -->
-      <template v-if="!firstLayer">
-        <p class="muted small" style="margin: 8px 0 0">
-          человеческой подачи в этом отчёте нет — ниже сохранённый вид без изменений
-        </p>
-        <template v-if="body && body.kind === 'damaged'">
-          <div class="errorbox" style="margin-bottom: 8px">{{ body.marker }}</div>
-          <pre v-if="body.text" class="content">{{ body.text }}</pre>
-        </template>
-        <pre v-else-if="body && (body.kind === 'flat' || body.kind === 'absent')" class="content">{{ body.text }}</pre>
-      </template>
-
+      <!-- Старое/повреждённое/нечитаемое тело: показано честно, как есть, —
+           в подробностях. Что именно недоступно и что это значит для
+           решения, уже сказано обычными словами в первом слое. -->
       <!-- ПОДРОБНОСТИ И ЧИСЛА: всё, что было на экране раньше, — никуда не
            делось, только больше не первым (REQ-SAY-06 AC1/AC2). -->
       <details class="qr-details" :open="!firstLayer">
         <summary class="muted">подробности и числа</summary>
+        <template v-if="fallback">
+          <div v-if="fallback.marker" class="errorbox" style="margin: 6px 0">{{ fallback.marker }}</div>
+          <pre v-if="fallback.text" class="content">{{ fallback.text }}</pre>
+        </template>
         <!-- Устаревание: платформенный маркер и сырые факты стора — здесь, а
              не в первом слое (REQ-SAY-01 AC7). -->
         <div v-if="banner.stale" class="qr-stale-facts">
@@ -306,6 +343,13 @@ function addPoint(it: HumanFormItem) {
 }
 .qr-found {
   margin: 6px 0 0;
+}
+.qr-gap {
+  margin: 6px 0 0;
+  font-weight: 600;
+}
+.qr-gap-means {
+  margin: 2px 0 0;
 }
 .qr-section {
   margin: 12px 0 4px;

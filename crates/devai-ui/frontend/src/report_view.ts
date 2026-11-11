@@ -126,6 +126,136 @@ export function presentReport(report: QualityReportView): ReportBody {
   return { kind: "absent", text: "(отчёт без рендеринга — пустое тело)" };
 }
 
+// ---------------------------------------------------------------------------
+// The report WITHOUT a human first layer (rework R1). Such a body is not
+// evidence that the audit found nothing: the composition of its findings is
+// UNKNOWN (an old flat text, a damaged form, a body that does not parse), and
+// the panel must say so instead of printing «недостатков нет». Every branch
+// below is decided from the stored `source` token the API publishes — the
+// screen names what is missing and what that means for the decision, and hands
+// the return draft ONE honest general reason («состав замечаний не прочитан»)
+// so a return does not arrive empty.
+// ---------------------------------------------------------------------------
+
+/** Which way the human layer is unavailable — one branch per stored fact. */
+export type FirstLayerGapKind =
+  | "legacy"
+  | "damaged_form"
+  | "broken_body"
+  | "absent"
+  | "not_published"
+  | "unknown";
+
+/** Why there is no human layer, and what the human can do about it. */
+export interface FirstLayerGap {
+  kind: FirstLayerGapKind;
+  /** What exactly is unavailable — the first thing the panel says. */
+  what: string;
+  /** What that means for the decision; never «findings absent». */
+  means: string;
+  /** One line about the draft that comes WITH this report. */
+  draft_note: string;
+  /** The general reason the (non-empty) draft carries by default. */
+  draft: string;
+}
+
+/** The one wording of an unread composition — the draft's common reason. */
+export const UNREAD_COMPOSITION = "состав замечаний не прочитан";
+
+/** The stable draft key of that general reason (never a stored item id). */
+export const UNREAD_DRAFT_ID = "unread/composition";
+
+const GAP_LEGACY: FirstLayerGap = {
+  kind: "legacy",
+  what: "В этом отчёте нет человеческого разбора: он сохранён в старом формате, одной строкой текста.",
+  means:
+    "Что именно нашёл аудит и какие замечания он выставил, по такому отчёту по пунктам не прочитать — " +
+    "состав замечаний неизвестен, так что судить, всё ли чисто, по нему нельзя.",
+  draft_note:
+    "черновик не пустой: в нём одно общее основание — отчёт старого формата, пункты замечаний не прочитаны.",
+  draft: `${UNREAD_COMPOSITION}: отчёт старого формата, человеческого разбора в нём нет`,
+};
+
+const GAP_DAMAGED_FORM: FirstLayerGap = {
+  kind: "damaged_form",
+  what: "Человеческий разбор этого отчёта повреждён: сохранённая форма не читается.",
+  means:
+    "Ни вердикта по пунктам, ни замечаний из неё не достать — состав замечаний неизвестен, " +
+    "так что судить, всё ли чисто, по этому отчёту нельзя.",
+  draft_note:
+    "черновик не пустой: в нём одно общее основание — сохранённая форма отчёта повреждена.",
+  draft: `${UNREAD_COMPOSITION}: сохранённая форма отчёта повреждена`,
+};
+
+const GAP_BROKEN_BODY: FirstLayerGap = {
+  kind: "broken_body",
+  what: "Тело этого отчёта не читается: сохранённые данные повреждены и как данные не разбираются.",
+  means:
+    "Пунктов замечаний в нём нет не потому, что их не было, а потому, что прочитать их нельзя — " +
+    "состав замечаний неизвестен, так что судить, всё ли чисто, по такому отчёту нельзя.",
+  draft_note:
+    "черновик не пустой: в нём одно общее основание — тело отчёта не читается.",
+  draft: `${UNREAD_COMPOSITION}: тело отчёта повреждено и не разбирается`,
+};
+
+const GAP_ABSENT: FirstLayerGap = {
+  kind: "absent",
+  what: "Отчёт сохранён пустым: в нём нет ни человеческого разбора, ни текста.",
+  means:
+    "Что нашёл аудит, из такого отчёта не узнать — состав замечаний неизвестен, " +
+    "так что судить, всё ли чисто, по нему нельзя.",
+  draft_note:
+    "черновик не пустой: в нём одно общее основание — отчёт сохранён без разбора.",
+  draft: `${UNREAD_COMPOSITION}: отчёт сохранён без разбора`,
+};
+
+const GAP_NOT_PUBLISHED: FirstLayerGap = {
+  kind: "not_published",
+  what: "Человеческий разбор к этому отчёту не передан: экран видит только сохранённые подробности.",
+  means:
+    "Список замечаний по-человечески не собран — состав замечаний неизвестен; " +
+    "загляни в подробности ниже, но судить, всё ли чисто, по этому экрану нельзя.",
+  draft_note:
+    "черновик не пустой: в нём одно общее основание — человеческий разбор отчёта не передан.",
+  draft: `${UNREAD_COMPOSITION}: человеческий разбор отчёта не передан`,
+};
+
+const GAP_UNKNOWN: FirstLayerGap = {
+  kind: "unknown",
+  what: "Экран не может сказать, что именно в этом отчёте: формат ответа платформы ему незнаком.",
+  means: "Состав замечаний неизвестен — судить, всё ли чисто, по этому отчёту нельзя.",
+  draft_note:
+    "черновик не пустой: в нём одно общее основание — формат отчёта незнаком экрану.",
+  draft: `${UNREAD_COMPOSITION}: формат отчёта экрану незнаком`,
+};
+
+/**
+ * Why the panel has no human layer for this report, or `null` when it has one
+ * (a readable form). The branch comes from the stored `source` token — never
+ * from sniffing the text — so each outcome gets its own honest wording
+ * (rework R1: an absent layer is not «no findings»).
+ */
+export function firstLayerGap(report: QualityReportView, body: ReportBody | null): FirstLayerGap | null {
+  if (!body) return null;
+  if (body.kind === "form") {
+    // A readable form whose first layer the platform did not publish.
+    return GAP_NOT_PUBLISHED;
+  }
+  switch (report.source) {
+    case "flat_text":
+      return GAP_LEGACY;
+    case "corrupt_form":
+    case "human_form": // the stored shape failed the guard -> damaged form
+      return GAP_DAMAGED_FORM;
+    case "corrupt_body":
+      return GAP_BROKEN_BODY;
+    case "absent":
+      return GAP_ABSENT;
+    default:
+      return GAP_UNKNOWN;
+  }
+}
+
 /** Width of the short artifact label used in the panel (R4: a named
  * constant, not a literal at the slice site). The canonical task-id width
  * lives in Rust (`devai_core::types::ID_PREFIX_CHARS`); an artifact label is

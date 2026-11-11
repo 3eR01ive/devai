@@ -152,6 +152,8 @@ describe("QualityGatePanel", () => {
     expect(w.find(".qr-appeal").text()).not.toMatch(/\d/);
     expect(w.find(".qr-found").text()).not.toMatch(/\d/);
     expect(w.find(".qr-score").text()).toBe("сохранённый балл работы: 0.820");
+    // A readable layer means no «чего не хватает» line is invented over it.
+    expect(w.find(".qr-gap").exists()).toBe(false);
     // Both buttons are signed by their consequence.
     expect(w.text()).toContain(ACCEPT_LABEL);
     expect(w.text()).toContain(RETURN_LABEL);
@@ -293,20 +295,81 @@ describe("QualityGatePanel", () => {
     w.unmount();
   });
 
-  it("shows a legacy report honestly, without dressing it up as the new layer", () => {
+  // R1 (rework): a report with no human layer does NOT mean «no findings». Each
+  // of the three stored shapes says in its own words what is unavailable, and
+  // the return draft arrives with the honest general reason — never empty.
+  function unreadable(source: string, text: string): QualityReportView {
     const r = report();
     r.first_layer = null;
-    r.source = "flat_text";
+    r.source = source;
     r.report = {};
-    r.report_text = "ВЕРДИКТ: ПРОШЁЛ (PASS) — S=0.950/1.00";
+    r.report_text = text;
+    return r;
+  }
+
+  const unreadableCases: [string, string, RegExp][] = [
+    ["flat_text", "ВЕРДИКТ: ПРОШЁЛ (PASS) — S=0.950/1.00", /старом формате/],
+    ["corrupt_form", "⚠ форма отчёта повреждена, показан плоский текст", /повреждён/],
+    ["corrupt_body", "⚠ отчёт качества 01a1b2aa повреждён: тело блоба не разбирается как JSON", /не читается/],
+  ];
+
+  it("names what is unreadable instead of claiming there are no findings", () => {
+    const said: string[] = [];
+    for (const [source, text, shape] of unreadableCases) {
+      const r = unreadable(source, text);
+      const w = mount(QualityGatePanel, {
+        props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
+      });
+      const gap = w.find(".qr-gap");
+      expect(gap.exists()).toBe(true);
+      expect(gap.text()).toMatch(shape);
+      expect(w.find(".qr-head").text()).not.toContain("недостатков нет");
+      // What it means for the decision is said too, in plain words.
+      expect(w.find(".qr-gap-means").text()).toContain("состав замечаний неизвестен");
+      // The stored body stays reachable — in the details, not first.
+      expect(w.find("details.qr-details").text()).toContain(text.slice(0, 20));
+      // No finding list is invented, and no verdict is dressed up.
+      expect(w.find(".qr-findings").exists()).toBe(false);
+      const actions = w.findComponent(QualityGateActions);
+      const draft = actions.props("draft") as { requirement: string }[];
+      expect(draft).toHaveLength(1);
+      expect(draft[0].requirement).toContain("состав замечаний не прочитан");
+      expect(actions.props("draftNote")).toContain("черновик не пустой");
+      expect(actions.props("draftNote")).not.toContain("возвращать нечего");
+      said.push(gap.text());
+      w.unmount();
+    }
+    // legacy, damaged form and broken body read differently
+    expect(new Set(said).size).toBe(3);
+  });
+
+  it("sends the unread-composition reason when the human returns such a report", async () => {
+    const r = unreadable("corrupt_body", "⚠ отчёт качества 01a1b2aa повреждён: тело блоба");
     const w = mount(QualityGatePanel, {
       props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
     });
-    expect(w.text()).toContain("человеческой подачи в этом отчёте нет");
-    expect(w.text()).toContain("ВЕРДИКТ: ПРОШЁЛ (PASS)");
-    expect(w.find(".qr-findings").exists()).toBe(false);
-    // The draft is empty and the screen says there is nothing to return.
-    expect(w.findComponent(QualityGateActions).props("draftNote")).toContain("возвращать нечего");
+    await w.find("button.hold.rework").trigger("pointerdown");
+    now = HOLD_MS + 10;
+    flushFrames();
+    const emits = w.emitted("apply");
+    expect(emits).toHaveLength(1);
+    const [kind, text] = emits?.[0] as [string, string];
+    expect(kind).toBe("return");
+    expect(text).toContain("состав замечаний не прочитан");
+    w.unmount();
+  });
+
+  it("stops claiming the draft is filled once the human clears it", async () => {
+    const r = unreadable("flat_text", "ВЕРДИКТ: ПРОШЁЛ (PASS) — S=0.950/1.00");
+    const w = mount(QualityGatePanel, {
+      props: { report: r, reportError: null, gate: gate(), busy: false, error: null },
+    });
+    await w.find("button.clear").trigger("click");
+    const actions = w.findComponent(QualityGateActions);
+    expect((actions.props("draft") as unknown[]).length).toBe(0);
+    // The screen keeps telling the truth about the draft it now shows.
+    expect(actions.props("draftNote")).not.toContain("черновик не пустой");
+    expect(actions.props("draftNote")).toContain("только с твоим обоснованием");
     w.unmount();
   });
 });
