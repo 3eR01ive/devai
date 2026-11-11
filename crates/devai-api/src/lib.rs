@@ -2126,4 +2126,50 @@ mod tests {
             "a live owner is spelled as liveness, not as work: {alive}"
         );
     }
+
+    /// Rework R6: `launch_line` is the operator's ONLY feedback about a
+    /// restart (the card prints it verbatim, the terminal prints it before its
+    /// own ids). All three branches are pinned to their exact words, so a
+    /// re-wording cannot silently change what the person is told; the two
+    /// optional fallbacks (no execution id, no reason) are pinned too.
+    #[test]
+    fn the_three_launch_sentences_are_pinned() {
+        use super::launch_line;
+        use crate::mutations::RunLaunch;
+        let exec = "01890000-0000-7000-8000-000000000009";
+        assert_eq!(
+            launch_line(RunLaunch::Started, Some(exec), None),
+            "прогон запущен · исполнение 01890000-0000"
+        );
+        assert_eq!(
+            launch_line(RunLaunch::Started, None, None),
+            "прогон запущен · исполнение —",
+            "a missing handle is the platform's dash, never an empty word"
+        );
+        assert_eq!(
+            launch_line(RunLaunch::AlreadyRunning, Some(exec), Some("держит задачу")),
+            "прогон уже идёт · исполнение 01890000-0000 (держит задачу)"
+        );
+        assert_eq!(
+            launch_line(RunLaunch::AlreadyRunning, Some(exec), None),
+            "прогон уже идёт · исполнение 01890000-0000"
+        );
+        assert_eq!(
+            launch_line(RunLaunch::Refused, None, Some("стадия не позволяет запуск")),
+            "запуск невозможен: стадия не позволяет запуск"
+        );
+        assert_eq!(
+            launch_line(RunLaunch::Refused, None, None),
+            "запуск невозможен: причина не записана"
+        );
+        // The three outcomes never read alike: the person can tell them apart.
+        let outcomes = [
+            launch_line(RunLaunch::Started, Some(exec), None),
+            launch_line(RunLaunch::AlreadyRunning, Some(exec), None),
+            launch_line(RunLaunch::Refused, None, Some("нет")),
+        ];
+        assert_ne!(outcomes[0], outcomes[1]);
+        assert_ne!(outcomes[0], outcomes[2]);
+        assert_ne!(outcomes[1], outcomes[2]);
+    }
 }

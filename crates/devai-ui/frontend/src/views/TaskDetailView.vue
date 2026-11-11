@@ -325,15 +325,19 @@ async function gateAndLoad() {
 // шедулеров и сторожевых скриптов (ратифицированный ответ на вопрос цикла).
 // Дешёвое чтение `exec.list` идёт на КАЖДОМ тике для любой незавершённой
 // задачи — в том числе когда RUNNING-строк сейчас нет (строка может
-// появиться); терминальная задача не опрашивается вовсе, и её терминальность
-// приходит полем progress.pipeline.terminal.
+// появиться). Терминальная задача без RUNNING-строк не опрашивается: новых
+// строк она не родит.
 let livenessTimer: number | undefined;
 
 async function refreshLiveness() {
   if (foreignHome.value || !status.value) return;
-  // Терминальная задача RUNNING-строк не рождает: факт «терминальна» приходит
-  // полем progress.pipeline.terminal, окно своей таблицы стадий не держит.
-  if (progress.value?.pipeline.terminal) return;
+  // Терминальная задача МОЖЕТ держать RUNNING-строку — платформа
+  // классифицирует этот класс отдельно (stale = terminal || dead,
+  // devai-api/src/lib.rs:674-675). Пока такая строка в снимке есть, опрос
+  // не прекращается: иначе смерть владельца навсегда осталась бы «процесс
+  // жив» — старый факт выдавался бы за текущий. Нет RUNNING-строк —
+  // опрашивать нечего.
+  if (progress.value?.pipeline.terminal && runningRows.value.length === 0) return;
   try {
     observeExecutions(await api.executionsList(props.id));
   } catch {

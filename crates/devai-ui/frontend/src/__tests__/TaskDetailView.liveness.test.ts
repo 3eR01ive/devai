@@ -84,7 +84,7 @@ function execRows(rows: ReturnType<typeof running>[]) {
   }));
 }
 
-function wire(rows: ReturnType<typeof running>[]) {
+function wire(rows: ReturnType<typeof running>[], opts: { terminal?: boolean } = {}) {
   const theTask = task("t1", "IMPLEMENTATION", "карточка задачи");
   mocks.taskStatus.mockResolvedValue({
     task: theTask,
@@ -103,7 +103,7 @@ function wire(rows: ReturnType<typeof running>[]) {
       position: "IMPLEMENTATION",
       position_index: 1,
       off_spine: false,
-      terminal: false,
+      terminal: opts.terminal ?? false,
     },
     allowed_operations: [],
     running_executions: rows,
@@ -250,5 +250,103 @@ describe("TaskDetailView · индикатор работы агента", () =>
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Rework R6: терминальная задача МОЖЕТ держать RUNNING-строку (платформа
+  // классифицирует этот класс как stale = terminal || dead). Опрос не должен
+  // прекращаться: иначе смерть владельца навсегда осталась бы на экране как
+  // «процесс жив» — старый факт выдавался бы за текущий.
+  it("keeps polling a terminal task while its snapshot still holds a RUNNING row", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const alive = running(LivenessToken.Alive, "процесс жив");
+      const dead = running(LivenessToken.Dead, "исполнение мертво (можно перезапустить)");
+      wire([alive], { terminal: true });
+      mocks.executionsList
+        .mockResolvedValueOnce(execRows([alive]))
+        .mockResolvedValueOnce(execRows([dead]));
+
+      const w = await mountView();
+      expect(indicator(w)).toContain("процесс жив");
+
+      await vi.advanceTimersByTimeAsync(pollMs());
+      await flushPromises();
+
+      expect(mocks.executionsList).toHaveBeenCalledTimes(2);
+      expect(indicator(w)).toContain("исполнение мертво");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Обратная сторона той же границы: терминальная задача без RUNNING-строк
+  // новых строк не родит — дешёвое чтение на каждом тике ей не нужно.
+  it("stops polling a terminal task with no running row", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      wire([], { terminal: true });
+      const w = await mountView();
+      expect(mocks.executionsList).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(pollMs());
+      await flushPromises();
+
+      expect(mocks.executionsList).toHaveBeenCalledTimes(1);
+      expect(w.find(".chip-liveness").exists()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Rework R6: отказ запуска — слова платформы РЯДОМ с кнопкой, и кнопка
+  // снова доступна (ветвь restartError не была покрыта).
+  it("shows the platform's refusal beside the restart button and re-enables it", async () => {
+    wire([running(LivenessToken.Dead, "исполнение мертво (можно перезапустить)")]);
+    mocks.taskRun.mockRejectedValue({
+      code: "already_running",
+      message: "задачу держит другое исполнение",
+    });
+    const w = await mountView();
+    const button = w.findAll("button").find((b) => b.text() === "перезапустить")!;
+    await button.trigger("click");
+    await flushPromises();
+
+    expect(w.text()).toContain("already_running");
+    expect(w.text()).toContain("задачу держит другое исполнение");
+    const after = w.findAll("button").find((b) => b.text() === "перезапустить");
+    expect(after, "кнопка остаётся на месте после отказа").toBeDefined();
+    expect(after!.attributes("disabled")).toBeUndefined();
+  });
+
+  // Rework R6: пока запуск в полёте, кнопка занята и второй клик не рождает
+  // второй мутации (ветвь restartBusy не была покрыта).
+  it("holds the restart button busy while the launch is in flight", async () => {
+    wire([running(LivenessToken.Dead, "исполнение мертво (можно перезапустить)")]);
+    let finish!: (outcome: unknown) => void;
+    mocks.taskRun.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const w = await mountView();
+    const button = w.findAll("button").find((b) => b.text() === "перезапустить")!;
+    await button.trigger("click");
+    await flushPromises();
+
+    expect(button.attributes("disabled")).toBeDefined();
+    expect(button.text()).toBe("Перезапуск…");
+    await button.trigger("click");
+    expect(mocks.taskRun).toHaveBeenCalledTimes(1);
+
+    finish({
+      run_id: "r1",
+      execution_id: "e2",
+      outcome: "started",
+      reason: null,
+      state: "IMPLEMENTATION",
+      line: "прогон запущен · исполнение e2",
+    });
+    await flushPromises();
+    expect(w.text()).toContain("прогон запущен · исполнение e2");
   });
 });
