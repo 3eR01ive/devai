@@ -22,12 +22,14 @@ import SpecDiffPanel from "../components/SpecDiffPanel.vue";
 import SignatureResultPanel from "../components/SignatureResultPanel.vue";
 import { ExecutionStatusToken, LivenessToken, TaskStateToken } from "../states";
 import ConvergenceChart from "../components/ConvergenceChart.vue";
+import RoleGraphPanel from "../components/RoleGraphPanel.vue";
 import QualityGatePanel from "../components/quality/QualityGatePanel.vue";
 import type { GateAct } from "../quality_gate_view";
 import type {
   ActiveRow,
   Artifact,
   ArtifactContent,
+  ArtifactView,
   ConvergenceView,
   Decision,
   DependenciesView,
@@ -53,7 +55,7 @@ const gateBusy = ref(false);
 const status = ref<StatusView | null>(null);
 const progress = ref<ProgressView | null>(null);
 const deps = ref<DependenciesView | null>(null);
-const artifacts = ref<Artifact[]>([]);
+const artifacts = ref<ArtifactView[]>([]);
 const decisions = ref<Decision[]>([]);
 const events = ref<WorkflowEvent[]>([]);
 const executions = ref<ExecutionView[]>([]);
@@ -467,26 +469,19 @@ async function activateForeignHome() {
       :previous="signature.previous"
     />
 
-    <!-- Пайплайн: порядок отдаёт платформа (PipelineView), UI не хранит свой -->
-    <div v-if="progress" class="panel">
-      <h3>Пайплайн · снимок {{ fmtTime(progress.snapshot_at) }}</h3>
+    <!-- ПУТЬ ЗАДАЧИ (REQ-RG-06): граф ролей и этапов заменяет прежнюю
+         линейку стадий. Данные — `progress.graph` одним чтением; окно не
+         хранит порядка этапов, таблицы «состояние → узел» и подписей. -->
+    <RoleGraphPanel
+      v-if="progress?.graph"
+      :graph="progress.graph"
+      :snapshot-at="progress.snapshot_at"
+    />
+    <!-- Счётчик попыток роли без прогресса (REQ-AL-07): виден и НИЖЕ
+         предела, числа — одной строкой платформы (не собираются здесь). -->
+    <div v-if="progress?.attempt_limit" class="panel">
       <div class="body">
-        <div class="rowflex">
-          <template v-for="(stage, i) in progress.pipeline.order" :key="stage">
-            <span
-              class="chip-stage"
-              :class="{ here: progress.pipeline.position_index === i }"
-            >{{ stage }}</span>
-            <span v-if="i < progress.pipeline.order.length - 1" class="muted">→</span>
-          </template>
-        </div>
-        <p v-if="progress.pipeline.off_spine || progress.pipeline.position === null" class="muted" style="margin: 8px 0 0">
-          вне линейки стадий; текущее состояние — <b class="mono">{{ progress.pipeline.current }}</b>
-          <template v-if="progress.pipeline.terminal"> (терминальное)</template>
-        </p>
-        <!-- Счётчик попыток роли без прогресса (REQ-AL-07): виден и НИЖЕ
-             предела, числа — одной строкой платформы (не собираются здесь). -->
-        <p v-if="progress.attempt_limit" class="muted mono" style="margin: 8px 0 0">
+        <p v-if="progress.attempt_limit" class="muted mono" style="margin: 0">
           роль {{ progress.attempt_limit.role }} · {{ progress.attempt_limit.line }}
         </p>
       </div>
@@ -659,17 +654,21 @@ async function activateForeignHome() {
     </div>
 
     <div class="panel">
-      <h3>Артефакты (kind · seq · статус — статусы хранимые)</h3>
+      <h3>Артефакты (название · версия · статус — статусы хранимые)</h3>
       <div class="body">
         <table class="data">
           <thead>
-            <tr><th>Вид</th><th>Имя</th><th>Seq</th><th>Статус</th><th></th></tr>
+            <tr><th>Артефакт</th><th>Хранимое имя</th><th>Статус</th><th></th></tr>
           </thead>
           <tbody>
             <tr v-for="a in artifacts" :key="a.id">
-              <td class="mono" data-label="Вид">{{ a.kind }}</td>
-              <td data-label="Имя" data-mobile="title">{{ a.name }} <span class="muted mono">{{ shortId(a.id) }}</span></td>
-              <td data-label="Seq">{{ a.seq }}</td>
+              <!-- REQ-NM-01: первой — готовая человеческая подпись; ключ вида
+                   и id уходят в приглушённую вторую позицию. -->
+              <td data-label="Артефакт" data-mobile="title">
+                {{ a.display }}
+                <span class="muted mono">{{ a.kind }} · {{ shortId(a.id) }}</span>
+              </td>
+              <td data-label="Хранимое имя">{{ a.name }}</td>
               <td data-label="Статус" data-mobile="head"><StateChip :token="a.status" /></td>
               <td data-label="Действия"><button @click="openContent(a)">содержимое</button></td>
             </tr>
@@ -713,7 +712,10 @@ async function activateForeignHome() {
           </thead>
           <tbody>
             <tr v-for="e in executions" :key="e.id">
-              <td class="mono" data-label="Роль@вер" data-mobile="title">{{ e.role_slug }}@{{ e.role_version }} <span class="muted">·{{ e.attempt ?? 1 }}</span></td>
+              <td class="mono" data-label="Роль@вер" data-mobile="title">
+                {{ e.role_display }}
+                <span class="muted">{{ e.role_slug }}@{{ e.role_version }} · попытка {{ e.attempt ?? 1 }}</span>
+              </td>
               <td data-label="Агент">{{ e.agent_name ?? "—" }}</td>
               <td data-label="Статус" data-mobile="head"><StateChip :token="e.status" /></td>
               <td data-label="Живость" data-mobile="head">
@@ -825,20 +827,6 @@ async function activateForeignHome() {
   border-style: dashed;
   font-style: italic;
   opacity: 0.8;
-}
-.chip-stage {
-  padding: 2px 8px;
-  border: 1px solid var(--slate);
-  border-radius: 4px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--slate);
-}
-.chip-stage.here {
-  border-color: var(--orange);
-  background: var(--orange);
-  color: var(--coal-lo);
-  font-weight: 700;
 }
 .chip-op {
   padding: 1px 8px;

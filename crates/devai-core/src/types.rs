@@ -50,6 +50,14 @@ pub fn short_id_str(id: &str) -> String {
     id[..ID_PREFIX_CHARS.min(id.len())].to_string()
 }
 
+/// The ONE artifact heading rule (REQ-NM-01 AC4): «человеческое название
+/// вида · vN». The title comes from the declarative table; the caller never
+/// prints the technical kind token as a heading and never builds a second
+/// spelling of this string.
+pub fn artifact_label(title: &str, seq: u32) -> String {
+    format!("{title} · v{seq}")
+}
+
 /// Renders an entity as its JSON form (used for stable string columns).
 pub fn json_string<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|e| panic!("core json serialize failed: {e}"))
@@ -2098,6 +2106,22 @@ pub mod json_field {
 #[cfg(test)]
 mod word_tests {
     use super::*;
+
+    /// REQ-NM-01 AC4: the ONE heading rule is checked on EVERY declared kind
+    /// and versions 1..3 — a second spelling cannot creep in per kind.
+    #[test]
+    fn the_one_heading_rule_covers_every_declared_kind_and_versions_1_to_3() {
+        for kind in ArtifactKind::ALL {
+            for seq in 1..=3 {
+                let label = artifact_label(kind.as_str(), seq);
+                assert_eq!(label, format!("{} · v{seq}", kind.as_str()));
+                assert!(
+                    label.ends_with(&format!("· v{seq}")),
+                    "version tail must be pinned: {label}"
+                );
+            }
+        }
+    }
 
     /// R1 quality return: the two answers to the attempt-limit question are ONE
     /// dictionary — the question's stored `options` and the reply the answer

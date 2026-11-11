@@ -88,6 +88,8 @@ pub struct InboxTaskFacts {
 #[derive(Serialize, Clone, Debug)]
 pub struct SpecFacts {
     pub artifact: Artifact,
+    /// REQ-NM-01: `«спека · vN»` — the heading; the artifact id is secondary.
+    pub label: String,
     pub current: bool,
     pub body: SpecBodyView,
 }

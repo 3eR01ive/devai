@@ -143,6 +143,7 @@
             "task_id": "01a1b0ea-0000-4000-8000-000000000001"
           },
           "current": true,
+          "label": "спека · v3",
           "human_paragraph": "Коротко: что происходит.",
           "open_questions": [
             "OQ-GATE-1: вопрос документа?"

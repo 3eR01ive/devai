@@ -161,3 +161,63 @@ test("ProjectsView: карточка проекта показывает дом 
   assert.ok(flat.includes(`дом devai · ${DEVAI_HOME}`), text);
   assert.ok(flat.includes(`дом tripsales · ${TRIPSALES_HOME}`), text);
 });
+
+// REQ-NM-01 AC6: the lists lead with the human name — the hard id is the
+// muted second position, never the heading. These two assertions pin the
+// ORDER on the two lists whose rows carry both.
+test("TasksView: имя задачи стоит раньше её идентификатора", async () => {
+  installInvoke((cmd) => {
+    if (cmd === "tasks_all") {
+      return [
+        taskBlock(DEVAI_HOME, "devai", [
+          task("01a1ad7d-e489-7448-824b-a52df7a95bbb", "p-devai", "Задача devai"),
+        ]),
+      ];
+    }
+    throw new Error(`unexpected command in the tasks order test: ${cmd}`);
+  });
+
+  const view = await loadView(harness, "/src/views/TasksView.vue");
+  const { root } = await mount(harness, view, {}, "/tasks");
+  await flush();
+
+  const flat = textOf(root).replace(/\s+/g, " ");
+  const nameAt = flat.indexOf("Задача devai");
+  const idAt = flat.indexOf("01a1ad7d");
+  assert.ok(nameAt >= 0 && idAt >= 0, flat);
+  assert.ok(nameAt < idAt, `имя должно идти первым: ${flat}`);
+});
+
+test("ProjectsView: имя проекта стоит раньше его идентификатора", async () => {
+  installInvoke((cmd) => {
+    if (cmd === "projects_all") {
+      return [
+        {
+          ...taskBlock(DEVAI_HOME, "devai", []),
+          // Имя — «название проекта», id — техническая вывеска рядом.
+          records: [
+            {
+              id: "p-devai",
+              name: "название проекта",
+              description: "",
+              repos: [],
+              created_at: SNAPSHOT,
+              updated_at: SNAPSHOT,
+            },
+          ],
+        },
+      ];
+    }
+    throw new Error(`unexpected command in the projects order test: ${cmd}`);
+  });
+
+  const view = await loadView(harness, "/src/views/ProjectsView.vue");
+  const { root } = await mount(harness, view, {}, "/projects");
+  await flush();
+
+  const flat = textOf(root).replace(/\s+/g, " ");
+  const nameAt = flat.indexOf("название проекта");
+  const idAt = flat.indexOf("p-devai");
+  assert.ok(nameAt >= 0 && idAt >= 0, flat);
+  assert.ok(nameAt < idAt, `имя должно идти первым: ${flat}`);
+});

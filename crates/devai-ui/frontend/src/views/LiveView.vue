@@ -63,8 +63,13 @@ onUnmounted(() => {
       </thead>
       <tbody>
         <tr v-for="r in snap.rows" :key="r.id">
-          <td data-label="Задача" data-mobile="title"><RouterLink class="title-link" :to="`/task/${r.task_id}`">{{ shortId(r.task_id) }}</RouterLink></td>
-          <td class="mono" data-label="Роль@вер">{{ r.role }}
+          <td data-label="Задача" data-mobile="title">
+            <RouterLink class="title-link" :to="`/task/${r.task_id}`">{{ r.task_display }}</RouterLink>
+            <span class="mono muted"> · {{ shortId(r.task_id) }}</span>
+          </td>
+          <td class="mono" data-label="Роль@вер">
+            {{ r.role_display }}
+            <span class="muted">{{ r.role }}</span>
             <div v-if="r.note" class="chip-att">{{ r.note }}</div>
           </td>
           <td data-label="Агент">{{ r.agent_name ?? "—" }}</td>

@@ -111,7 +111,17 @@ pub struct OpDescriptor {
 /// sentence for its typed outcome, so the card's «перезапустить» act prints
 /// the platform's words instead of re-wording `started|already_running|
 /// refused`. A wire-visible addition, so the stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@13";
+///
+/// `@14` names the task-path + names-first increment (task 01a1b5e1,
+/// REQ-RG-01..06 / REQ-NM-01): NO operation joins or leaves the table —
+/// `task.progress` gains the folded `graph` (stages, role/gate nodes, edges,
+/// the ONE position, the rework loop, running roles, human waits, blocking
+/// count, notes), `task.active` rows gain `task_display`/`role_display`,
+/// `task.status` artifacts and `artifact.list` rows publish the finished
+/// `display` label, `exec.list` rows gain `role_display`, and the
+/// APPROVAL/QA presentations gain `label`. Wire-visible additions, so the
+/// stamp says so.
+pub const SURFACE_VERSION: &str = "api-surface@14";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -189,21 +199,21 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.status",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "StatusView{task, allowed_operations, current_artifacts, open_questions, quality_gate, running_executions, stop, launch_failure}",
+            output: "StatusView{task, allowed_operations, current_artifacts: Vec<ArtifactView{…Artifact, display}>, open_questions, quality_gate, running_executions, stop, launch_failure}",
             description: "Current state plus the operations the platform permits next, the CURRENT artifacts, open questions, the RUNNING executions with their liveness fact and the platform's sentence for it (checked at every read), and — at the QA gate — each action's public availability and platform refusal. Mirrors `task status`.",
         },
         OpDescriptor {
             name: "task.progress",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "ProgressView{task, snapshot_at, pipeline, allowed_operations, running_executions, convergence, agent_failure}",
-            description: "Pipeline position, re-entry note, the snapshot of RUNNING executions (each with its owner, liveness fact and the platform's sentence) and the convergence slice of the task (per repeatable stage the rounds read out of stored carriers, their computed modes and honest gaps; null on terminal tasks). Drawn purely from engine data. Mirrors `task progress`.",
+            output: "ProgressView{task, snapshot_at, pipeline, graph, allowed_operations, running_executions, convergence, agent_failure}",
+            description: "Pipeline position, re-entry note, the whole task PATH folded once from stored facts (`graph`: declared stage axis with positional statuses, role nodes only for executed roles, human gates born from the declaration, edges carrying one artifact/decision/event, the ONE position, the rework loop with round count, running roles, human waits with requirement/hint/presentation, open blocking-question count and notes), the snapshot of RUNNING executions (each with its owner, liveness fact and the platform's sentence) and the convergence slice of the task (per repeatable stage the rounds read out of stored carriers, their computed modes and honest gaps; null on terminal tasks). Drawn purely from engine data. Mirrors `task progress`.",
         },
         OpDescriptor {
             name: "task.active",
             class: OpClass::Read,
             input: "()",
-            output: "ActiveSnapshot{snapshot_at, rows: Vec<ActiveRow{…, note}>}",
+            output: "ActiveSnapshot{snapshot_at, rows: Vec<ActiveRow{…, task_display, role_display, note}>}",
             description: "Cross-task read-only snapshot of every RUNNING execution with liveness triage (alive/dead/unknown), worktree link only where the platform recorded worktree.prepared, and the platform's note for a live quality audit («идёт аудит»). Mirrors `task active`.",
         },
         OpDescriptor {
@@ -231,8 +241,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.report",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "QualityReportView",
-            description: "The quality report shown at the QA gate: the CURRENT report, or — when the task was returned to rework and no re-audit has published yet — the STALE predecessor under an explicit freshness marker (never passed off as the decision). Artifact identity, contract, machine body and the stored human rendering. Mirrors `task report`.",
+            output: "QualityReportView{task, artifact, label, seq, …}",
+            description: "The quality report shown at the QA gate: the CURRENT report, or — when the task was returned to rework and no re-audit has published yet — the STALE predecessor under an explicit freshness marker (never passed off as the decision). Artifact identity, the finished «название вида · vN» heading, contract, machine body and the stored human rendering. Mirrors `task report`.",
         },
         OpDescriptor {
             name: "task.events",
@@ -472,8 +482,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "artifact.list",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "Vec<Artifact>",
-            description: "All artifact rows of the task with versions and statuses. Mirrors `artifact list`.",
+            output: "Vec<ArtifactView{…Artifact, display}>",
+            description: "All artifact rows of the task with versions and statuses, each carrying its finished human label («название вида · vN» from the declarative table) so a consumer never builds a second heading. Mirrors `artifact list`.",
         },
         OpDescriptor {
             name: "artifact.cat",
@@ -495,7 +505,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             class: OpClass::Read,
             input: "()",
             output: "InboxSnapshotView{snapshot_at, policy, tasks: Vec<InboxTaskFacts{task, questions, spec, report, report_note, audit_running, convergence, agent_failure}>}",
-            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks and on rows outside the wait section. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
+            description: "The human-wait section in ONE batch read: the declarative demand table of the home (config/workflow/inbox-waits.yaml) plus every task's stored questions and its gate presentation (CURRENT/LAST REQUIREMENTS_SPEC body for APPROVAL, CURRENT quality report for QA — each headed by its finished «название вида · vN» label) and the task's convergence slice — the SAME object task.progress answers, null on terminal tasks and on rows outside the wait section. One snapshot per data type instead of a per-task fan-out; membership is decided by the caller on exact stored tokens.",
         },
         // ---- questions ----
         OpDescriptor {
@@ -665,8 +675,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "exec.list",
             class: OpClass::Read,
             input: "Option<task_ref>",
-            output: "Vec<ExecutionView{…RoleExecution, liveness, liveness_line}>",
-            description: "Execution rows, optionally for one task; attempt/failure_class lineage ships in the rows, and every UNFINISHED row carries the liveness verdict of its recorded owner plus the platform's sentence for it (a finished row is not checked and carries no mark). Mirrors `exec list`.",
+            output: "Vec<ExecutionView{…RoleExecution, role_display, liveness, liveness_line}>",
+            description: "Execution rows, optionally for one task; attempt/failure_class lineage ships in the rows, each row carries «имя роли · vN» as the human signboard beside the slug, and every UNFINISHED row carries the liveness verdict of its recorded owner plus the platform's sentence for it (a finished row is not checked and carries no mark). Mirrors `exec list`.",
         },
         OpDescriptor {
             name: "exec.get",
@@ -866,7 +876,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@13");
+        assert_eq!(SURFACE_VERSION, "api-surface@14");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

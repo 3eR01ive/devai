@@ -22,7 +22,10 @@ function row(liveness: string, line: string, overrides: Record<string, unknown> 
   return {
     id: "e1",
     task_id: "t1",
+    // REQ-NM-01: имя задачи и «имя роли · vN» приходят готовыми из ответа.
+    task_display: "спека на подпись",
     role: "implementation-agent@1",
+    role_display: "implementation-agent · v1",
     role_slug: "implementation-agent",
     role_version: 1,
     agent_name: "mock",
@@ -89,6 +92,36 @@ describe("LiveView · живость в «Активных»", () => {
     const cell = livenessCell(w, "implementation-agent");
     expect(cell.text()).toContain(LivenessToken.Alive);
     expect(cell.text()).toContain("процесс жив");
+    w.unmount();
+  });
+});
+
+describe("LiveView · имена первыми (REQ-NM-01)", () => {
+  it("prints the task name as the link and the short id only beside it", async () => {
+    const w = await mountWith([row(LivenessToken.Alive, "процесс жив")]);
+    const cell = w
+      .findAll("tr")[1]
+      .findAll("td")
+      .find((td) => td.attributes("data-label") === "Задача");
+    expect(cell, "ячейка задачи не отрендерилась").toBeDefined();
+    // Первым идёт человеческое имя, идентификатор — второй, приглушённой нотой.
+    expect(cell!.text().startsWith("спека на подпись")).toBe(true);
+    expect(cell!.text().indexOf("спека на подпись")).toBeLessThan(
+      cell!.text().indexOf("t1"),
+    );
+    w.unmount();
+  });
+
+  it("prints the role as «имя · vN» first and the machine slug after it", async () => {
+    const w = await mountWith([row(LivenessToken.Alive, "процесс жив")]);
+    const cell = w
+      .findAll("tr")[1]
+      .findAll("td")
+      .find((td) => td.attributes("data-label") === "Роль@вер");
+    expect(cell, "ячейка роли не отрендерилась").toBeDefined();
+    expect(cell!.text().indexOf("implementation-agent · v1")).toBeLessThan(
+      cell!.text().indexOf("implementation-agent@1"),
+    );
     w.unmount();
   });
 });

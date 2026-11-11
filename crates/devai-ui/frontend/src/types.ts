@@ -94,6 +94,13 @@ export interface Artifact {
   created_at: string;
 }
 
+/** REQ-NM-01: артефакт в ответе чтения — те же поля плюс ГОТОВАЯ подпись
+ * «человеческое название вида · vN». Окно печатает `display` и не собирает
+ * её само: таблица названий — декларативная конфигурация платформы. */
+export interface ArtifactView extends Artifact {
+  display: string;
+}
+
 export interface Question {
   id: string;
   task_id: string;
@@ -169,6 +176,8 @@ export interface RunningExecutionView {
  * JSON) плюс факт живости — он есть ТОЛЬКО у незавершённого исполнения;
  * завершённую строку платформа не проверяет вовсе (REQ-LV-06 AC4). */
 export interface ExecutionView extends RoleExecution {
+  /** REQ-NM-01: «имя роли · vN» — та же подпись, что у узла графа. */
+  role_display: string;
   liveness: string | null; // alive | dead | unknown | null
   liveness_line: string | null;
 }
@@ -191,6 +200,9 @@ export interface ProgressView {
   task: Task;
   snapshot_at: string;
   pipeline: PipelineView;
+  /** REQ-RG-01: весь путь задачи приходит этим же чтением — поле есть всегда;
+   * карточка раскладывает готовое и второго чтения не ждёт. */
+  graph: RoleGraph;
   allowed_operations: string[];
   running_executions: RunningExecutionView[];
   /** Срез сходимости (REQ-CV-12); null только у терминальных задач. */
@@ -199,6 +211,124 @@ export interface ProgressView {
   attempt_limit: AttemptLimitView | null;
   /** Факт отказа агента (задача 01a1b60c): строка и ниже-порога, и парковки. */
   agent_failure: AgentFailureView | null;
+}
+
+// --- граф ролей и этапов (REQ-RG-01..06) ------------------------------
+// Поля — готовые данные платформы: порядок этапов, узлы, рёбра, позиция,
+// человеческие слова статусов. Окно раскладывает; своей таблицы
+// «состояние → узел», порядка этапов и словаря подписей у него нет.
+export interface RoleGraph {
+  stages: GraphStage[];
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  position: GraphPosition;
+  rework: ReworkLoop;
+  running: GraphRunning[];
+  waits: GraphWait[];
+  blocking_questions: number;
+  notes: string[];
+}
+
+export interface GraphStage {
+  state: string;
+  label: string;
+  executor: string;
+  gate: boolean;
+  status: "passed" | "current" | "pending";
+  status_word: string;
+}
+
+export interface GraphNode {
+  id: string;
+  kind: "role" | "gate" | "final";
+  state: string;
+  label: string;
+  display: string;
+  role_slug: string | null;
+  role_version: number | null;
+  status: "passed" | "current" | "expected";
+  status_word: string;
+  revoked: boolean;
+  executions: GraphExecution[];
+  artifacts: GraphArtifact[];
+}
+
+export interface GraphExecution {
+  id: string;
+  role_slug: string;
+  role_display: string;
+  role_version: number;
+  agent_name: string | null;
+  status: string;
+  attempt: number;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface GraphArtifact {
+  id: string;
+  kind: string;
+  seq: number;
+  status: string;
+  name: string;
+  display: string;
+}
+
+export interface GraphCarrier {
+  kind: "artifact" | "decision" | "event";
+  id: string;
+  label: string;
+}
+
+export interface GraphEdge {
+  from: string;
+  to: string;
+  kind: string;
+  round: number | null;
+  carrier: GraphCarrier;
+}
+
+export interface GraphPosition {
+  kind: "node" | "stage" | "hold" | "off_graph";
+  anchor: "role" | "gate" | "stage" | "final";
+  stage: string | null;
+  node: string | null;
+  reason: string | null;
+  line: string;
+}
+
+export interface ReworkLoop {
+  rounds: number;
+  active: boolean;
+  note: string;
+}
+
+export interface GraphRunning {
+  execution_id: string;
+  role_slug: string;
+  role_display: string;
+  role_version: number;
+  agent_name: string | null;
+  in_path: boolean;
+  note: string | null;
+}
+
+export interface GraphWait {
+  node: string;
+  state: string;
+  requirement: string;
+  hint: string;
+  awaiting: boolean;
+  signable: boolean;
+  presentation: GraphPresentation | null;
+}
+
+export interface GraphPresentation {
+  artifact_id: string;
+  display: string;
+  status: string;
+  current: boolean;
+  note: string | null;
 }
 
 /**
@@ -261,7 +391,11 @@ export interface AgentStatusView {
 export interface ActiveRow {
   id: string;
   task_id: string;
+  /** REQ-NM-01: человеческая вывеска задачи — первая колонка списка. */
+  task_display: string;
   role: string;
+  /** REQ-NM-01: «имя роли · vN» — первая колонка роли. */
+  role_display: string;
   role_slug: string;
   role_version: number;
   agent_name: string | null;
@@ -403,6 +537,8 @@ export interface ReportFreshness {
 export interface QualityReportView {
   task: string;
   artifact: string;
+  /** REQ-NM-01: «отчёт качества · vN» — готовая подпись заголовка. */
+  label: string;
   seq: number;
   contract: string;
   created_at: string;
@@ -790,6 +926,8 @@ export interface ConvergenceView {
 // не platform-вопросы реестра (у них нет id и их не отвечают question.answer).
 export interface SpecPresentation {
   artifact: Artifact;
+  /** REQ-NM-01: «спека · vN» — готовая подпись заголовка. */
+  label: string;
   current: boolean; // false = не CURRENT, approve невозможен (OQ-GATE-3)
   human_paragraph: string | null;
   paragraph_source: "spec" | "business_description";

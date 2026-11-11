@@ -13,9 +13,14 @@ defineProps<{ task: Task; timeLabel: string }>();
 
 <template>
   <h3>
-    <RouterLink class="title-link" :to="`/task/${task.id}`" @click.stop>{{ task.title }}</RouterLink>
-    · {{ shortId(task.id) }}
+    <RouterLink class="title-link" :to="`/task/${task.id}`" @click.stop>{{ task.display }}</RouterLink>
+    <span class="mono muted">· {{ shortId(task.id) }}</span>
   </h3>
+  <p
+    v-if="task.display !== task.title"
+    class="muted mono"
+    style="margin: 0 0 4px"
+  >формальный заголовок: {{ task.title }}</p>
   <div class="rowflex" style="margin-bottom: 6px">
     <StateChip :token="task.state" />
     <StateChip v-if="task.return_state" :token="task.return_state" />

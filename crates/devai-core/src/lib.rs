@@ -5,6 +5,7 @@
 
 pub mod agent_failure;
 pub mod error;
+pub mod graph;
 pub mod inbox;
 pub mod process;
 pub mod types;
