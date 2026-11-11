@@ -35,9 +35,7 @@ use devai_api::{WorkspaceChangesView, WorkspaceDiffView};
 use devai_core::inbox::{
     InboxWaitPolicy, WHEN_NO_QUESTION, WHEN_PARKED_QUESTION, WaitGroup, WaitStatePolicy,
 };
-use devai_core::types::{
-    Artifact, Decision, Project, Question, QuestionStatus, Task, TaskState, short_id,
-};
+use devai_core::types::{Decision, Project, Question, QuestionStatus, Task, TaskState, short_id};
 
 use crate::session::{HomeFailure, SessionInfo};
 
@@ -114,6 +112,22 @@ pub enum ArtifactContent {
     Binary { artifact_id: String, size: u64 },
 }
 
+#[derive(Serialize, Clone, Debug)]
+pub struct WaitSpecPresentation {
+    #[serde(flatten)]
+    pub presentation: SpecPresentation,
+    /// REQ-NM-01: «спека · vN» — the heading the row prints first; the
+    /// artifact id and the version stay as the secondary trace.
+    pub label: String,
+}
+
+impl std::ops::Deref for WaitSpecPresentation {
+    type Target = SpecPresentation;
+    fn deref(&self) -> &Self::Target {
+        &self.presentation
+    }
+}
+
 /// One human-wait row (REQ-GATE-01..05): a task the section lists as a
 /// point where the platform — or a human decision about a stopped task —
 /// needs the operator. `demand`/`cli_hint` are presentation copy keyed by
@@ -136,7 +150,7 @@ pub struct WaitRow {
     pub open_questions: Vec<Question>,
     /// APPROVAL presentation: the spec the human is asked to sign
     /// (REQ-GATE-04/05 + ratified OQ-GATE-3/4).
-    pub spec: Option<SpecPresentation>,
+    pub spec: Option<WaitSpecPresentation>,
     /// QA presentation: the CURRENT quality report — the same view the
     /// registered `task.report` read publishes.
     pub report: Option<QualityReportView>,
@@ -1073,7 +1087,10 @@ pub fn task_workspace_diff(
 /// All artifact rows: kind, seq, stored CURRENT/STALE/SUPERSEDED status —
 /// the UI displays the status as data and never re-assigns it.
 #[tauri::command(rename_all = "snake_case")]
-pub fn artifacts_list(state: State<AppState>, id_prefix: String) -> Result<Vec<Artifact>, UiError> {
+pub fn artifacts_list(
+    state: State<AppState>,
+    id_prefix: String,
+) -> Result<Vec<devai_api::ArtifactView>, UiError> {
     Ok(state.api().artifact_list(&id_prefix)?)
 }
 
@@ -1437,8 +1454,8 @@ fn reference_notes_from(facts: InboxTaskFacts) -> Vec<WaitNote> {
 /// «not current, approve is impossible» — ratified OQ-GATE-3/4). Parsing the
 /// JSON extracts the human paragraph and the document's open_questions; the
 /// stored bytes are never rewritten.
-fn spec_of(task: &Task, facts: &SpecFacts) -> SpecPresentation {
-    match &facts.body {
+fn spec_of(task: &Task, facts: &SpecFacts) -> WaitSpecPresentation {
+    let presentation = match &facts.body {
         SpecBodyView::Text { text } => {
             spec_presentation(&facts.artifact, Ok(text.as_str()), task, facts.current)
         }
@@ -1458,6 +1475,10 @@ fn spec_of(task: &Task, facts: &SpecFacts) -> SpecPresentation {
             task,
             facts.current,
         ),
+    };
+    WaitSpecPresentation {
+        presentation,
+        label: facts.label.clone(),
     }
 }
 
@@ -1465,6 +1486,7 @@ fn spec_of(task: &Task, facts: &SpecFacts) -> SpecPresentation {
 mod tests {
     use super::*;
     use devai_api::ParagraphSource;
+    use devai_core::types::Artifact;
     use devai_core::types::ArtifactKind;
 
     /// REQ-SIGN-05 AC4 / REQ-MS-07: every data command's source is a
@@ -2591,7 +2613,10 @@ mod tests {
             demand: "Утвердить или отклонить текущую спецификацию задачи".into(),
             cli_hint: "devai task approve 01a1b0ea --rationale \"<обоснование>\"".into(),
             open_questions: vec![question.clone()],
-            spec: Some(presentation.clone()),
+            spec: Some(WaitSpecPresentation {
+                presentation: presentation.clone(),
+                label: "спека · v3".into(),
+            }),
             report: None,
             report_note: None,
             convergence: None,
@@ -2858,6 +2883,7 @@ mod tests {
         artifact.created_at = now;
         facts[ix].spec = Some(SpecFacts {
             artifact,
+            label: "спека · v3".to_string(),
             current: true,
             body: SpecBodyView::Text {
                 text: "{\"version\":3,\"human_paragraph\":\"Абзац спеки.\",\"open_questions\":[\"OQ-1: вопрос документа?\"]}".to_string(),
@@ -2879,6 +2905,7 @@ mod tests {
         facts[ix].report = Some(QualityReportView {
             task: facts[ix].task.id.to_string(),
             artifact: devai_core::types::new_id().to_string(),
+            label: "отчёт качества · v2".to_string(),
             seq: 2,
             contract: "quality-report@1".to_string(),
             created_at: now,

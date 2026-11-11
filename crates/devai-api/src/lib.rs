@@ -229,11 +229,19 @@ fn running_views(executions: &[RoleExecution], now: DateTime<Utc>) -> Vec<Runnin
 /// into the same JSON it always had) plus the liveness observation of its
 /// owner — but ONLY for an unfinished row (REQ-LV-06 AC4): a finished
 /// execution is never checked and carries no mark at all.
-pub fn execution_view(e: RoleExecution) -> ExecutionView {
+pub fn execution_view(
+    e: RoleExecution,
+    roles: &std::collections::BTreeMap<String, String>,
+) -> ExecutionView {
     let live = (e.status == ExecutionStatus::Running).then(|| observe_owner(&e));
+    let name = roles
+        .get(&e.role_slug)
+        .cloned()
+        .unwrap_or_else(|| e.role_slug.clone());
     ExecutionView {
         liveness: live.map(|l| l.as_str().to_string()),
         liveness_line: live.map(|l| liveness_line(l).to_string()),
+        role_display: format!("{name} · v{}", e.role_version),
         execution: e,
     }
 }
@@ -523,12 +531,16 @@ impl Api {
         // leaves the task row and the event log untouched (REQ-PK-07 AC2).
         let (stop, launch_failure) = self.task_stop_facts(&t, &questions, &self.park_reasons()?)?;
         let quality_gate = self.status_quality_gate(&process, &t, &artifacts)?;
+        // REQ-NM-01: the artifact rows carry their finished human label, so
+        // every consumer prints «название · vN» instead of the kind token.
+        let labels = self.artifact_labels()?;
         Ok(StatusView {
             task: t,
             allowed_operations: ops,
             current_artifacts: artifacts
                 .into_iter()
                 .filter(|a| a.status == ArtifactStatus::Current)
+                .map(|a| artifact_view(&labels, &a))
                 .collect(),
             open_questions: questions
                 .into_iter()
@@ -599,6 +611,32 @@ impl Api {
         let attempt_limit =
             self.attempt_limit_view_in(&t, &process, &executions, &events, convergence.as_ref())?;
         let agent_failure = self.task_agent_failure(&t)?;
+        // REQ-RG-01: the whole path arrives in THIS read — state, artifacts,
+        // executions, decisions, events and questions are loaded exactly once
+        // here; the fold performs no further store read (AC4).
+        let decisions = self.store.list_decisions(t.id)?;
+        let questions = self.store.list_questions(t.id)?;
+        let labels = self.artifact_labels()?;
+        let wait_policy =
+            devai_store::config::load_inbox_wait_policy(&self.config_dir().join("workflow"))?;
+        let mut role_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for r in self.store.list_roles()? {
+            role_map.insert(r.slug, r.name);
+        }
+        let roles: Vec<(String, String)> = role_map.into_iter().collect();
+        let graph = devai_core::graph::build(&devai_core::graph::GraphFacts {
+            process: &process,
+            task: &t,
+            artifacts: &artifacts,
+            executions: &executions,
+            decisions: &decisions,
+            events: &events,
+            questions: &questions,
+            roles: &roles,
+            artifact_titles: labels.titles(),
+            wait_policy: &wait_policy,
+        });
         Ok(ProgressView {
             task: t.clone(),
             snapshot_at: now,
@@ -610,6 +648,7 @@ impl Api {
                 off_spine: workflow::pipeline_off_spine(&t),
                 terminal: t.state.is_terminal(),
             },
+            graph,
             allowed_operations: workflow::allowed_ops(&process, &t),
             running_executions: running,
             convergence,
@@ -648,9 +687,17 @@ impl Api {
         // ONE declaration load for the whole snapshot (the audit mark is the
         // declaration's answer, never a per-row config read).
         let process = self.process_policy()?;
+        // REQ-NM-01 AC1: the row's task name and the role «имя и версия»
+        // come from the producer, so the active list never prints an id as
+        // its title. One role map for the whole snapshot.
+        let mut roles: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for r in self.store.list_roles()? {
+            roles.insert(r.slug, r.name);
+        }
         let rows = running
             .iter()
-            .map(|e| self.active_row(&process, e, &facts, now))
+            .map(|e| self.active_row(&process, e, &facts, &roles, now))
             .collect();
         Ok(ActiveSnapshot {
             snapshot_at: now,
@@ -701,6 +748,7 @@ impl Api {
         process: &devai_store::config::ProcessPolicy,
         e: &RoleExecution,
         facts: &HashMap<Id, (Task, bool)>,
+        roles: &std::collections::BTreeMap<String, String>,
         now: DateTime<Utc>,
     ) -> ActiveRow {
         let (t, prepared) = &facts[&e.task_id];
@@ -710,10 +758,18 @@ impl Api {
         // (REQ-QG-09 AC3): the active row carries the platform's words.
         let note = audit_note(process, t, e);
         let (branch, worktree) = worktree_link(*prepared, e.task_id, &self.home);
+        let role_name = roles
+            .get(&e.role_slug)
+            .cloned()
+            .unwrap_or_else(|| e.role_slug.clone());
         ActiveRow {
             id: e.id.to_string(),
             task_id: e.task_id.to_string(),
+            // REQ-NM-01 AC1: the human signboard is what the list prints; the
+            // short id rides beside it, muted, for reconciliation.
+            task_display: t.display_sign(),
             role: format!("{}@{}", e.role_slug, e.role_version),
+            role_display: format!("{role_name} · v{}", e.role_version),
             role_slug: e.role_slug.clone(),
             role_version: e.role_version,
             agent_name: e.agent_name.clone(),
@@ -757,6 +813,7 @@ impl Api {
             )));
         };
         let a = &p.artifact;
+        let labels = self.artifact_labels()?;
         let contract = a
             .contract
             .as_ref()
@@ -765,6 +822,7 @@ impl Api {
         Ok(QualityReportView {
             task: t.id.to_string(),
             artifact: a.id.to_string(),
+            label: artifact_label(labels.label(a.kind.as_str()), a.seq),
             seq: a.seq,
             contract,
             created_at: a.created_at,
@@ -936,6 +994,10 @@ impl Api {
             },
         };
         Ok(Some(SpecFacts {
+            label: artifact_label(
+                self.artifact_labels()?.label(artifact.kind.as_str()),
+                artifact.seq,
+            ),
             artifact: artifact.clone(),
             current,
             body,
@@ -948,6 +1010,14 @@ impl Api {
         std::env::var_os("DEVAI_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| self.store.root().join("config"))
+    }
+
+    /// REQ-NM-01: the declarative artifact-kind titles, loaded once per read.
+    /// An incomplete table is the loader's LOUD config refusal.
+    pub(crate) fn artifact_labels(&self) -> ApiResult<devai_store::config::ArtifactLabels> {
+        Ok(devai_store::config::load_artifact_labels(
+            &self.config_dir().join("workflow"),
+        )?)
     }
 
     /// The config directory as the model-bundle loader sees it. Kept
@@ -1270,9 +1340,17 @@ impl Api {
     // artifacts
     // ------------------------------------------------------------------
 
-    pub fn artifact_list(&self, id_prefix: &str) -> ApiResult<Vec<Artifact>> {
+    pub fn artifact_list(&self, id_prefix: &str) -> ApiResult<Vec<ArtifactView>> {
         let t = self.store.resolve_task(id_prefix)?;
-        Ok(self.store.artifacts(t.id)?)
+        // REQ-NM-01: every artifact response carries its finished label — the
+        // consumer never builds «вид · vN» itself and never prints the token.
+        let labels = self.artifact_labels()?;
+        Ok(self
+            .store
+            .artifacts(t.id)?
+            .iter()
+            .map(|a| artifact_view(&labels, a))
+            .collect())
     }
 
     /// Raw stored bytes — presentation is the consumer's problem (A-4).
@@ -1423,11 +1501,18 @@ impl Api {
             Some(id) => Some(self.store.resolve_task(id)?.id),
             None => None,
         };
+        // One role map for the whole list: the last column is «имя · версия»,
+        // not a bare slug (REQ-NM-01).
+        let mut roles: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for r in self.store.list_roles()? {
+            roles.insert(r.slug, r.name);
+        }
         Ok(self
             .store
             .list_executions(tid)?
             .into_iter()
-            .map(execution_view)
+            .map(|e| execution_view(e, &roles))
             .collect())
     }
 
@@ -1491,15 +1576,38 @@ fn short_hint(id: &Id) -> String {
     devai_core::types::short_id(id)
 }
 
+/// The ONE artifact label rule: `«человеческое название вида · vN»`, built
+/// from the declarative table loaded once per read (REQ-NM-01 AC4). Consumers
+/// print `display` verbatim and never build a second label.
+fn artifact_view(labels: &devai_store::config::ArtifactLabels, a: &Artifact) -> ArtifactView {
+    ArtifactView {
+        artifact: a.clone(),
+        display: artifact_label(labels.label(a.kind.as_str()), a.seq),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Typed views (machine-complete outputs; REQ-API-06 AC2)
 // ---------------------------------------------------------------------------
+
+/// One artifact as a READ response publishes it: the stored row flattened
+/// into the JSON it always carried, plus the finished human label
+/// `«название вида · vN»` produced by the platform from the declarative table
+/// (REQ-NM-01). The label is NOT stored in the artifact and never rewrites
+/// its stored `name`.
+#[derive(Serialize, Clone, Debug)]
+pub struct ArtifactView {
+    #[serde(flatten)]
+    pub artifact: Artifact,
+    pub display: String,
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct StatusView {
     pub task: Task,
     pub allowed_operations: Vec<String>,
-    pub current_artifacts: Vec<Artifact>,
+    /// CURRENT artifacts with their finished human labels (REQ-NM-01).
+    pub current_artifacts: Vec<ArtifactView>,
     pub open_questions: Vec<Question>,
     /// REQ-AL-07: the role whose counter this task carries, the derived count
     /// of attempts without progress and the declared limit — the SAME numbers
@@ -1564,6 +1672,9 @@ pub struct RunningExecutionView {
 pub struct ExecutionView {
     #[serde(flatten)]
     pub execution: RoleExecution,
+    /// REQ-NM-01 AC1: `«имя роли · vN»` — the same string the active list and
+    /// a graph node print; the slug stays in the flattened row.
+    pub role_display: String,
     /// `alive` | `dead` | `unknown`; `null` for a finished row.
     pub liveness: Option<String>,
     /// The platform's ONE sentence for `liveness`; `null` for a finished row.
@@ -1575,6 +1686,11 @@ pub struct ProgressView {
     pub task: Task,
     pub snapshot_at: DateTime<Utc>,
     pub pipeline: PipelineView,
+    /// REQ-RG-01: the whole task path (stages, role/gate nodes, edges, the
+    /// ONE position, the rework loop, running roles, human waits, blocking
+    /// questions and notes) — folded once from stored facts in this read.
+    /// Always present: the card never waits for a second read to draw it.
+    pub graph: devai_core::graph::RoleGraph,
     pub allowed_operations: Vec<String>,
     pub running_executions: Vec<RunningExecutionView>,
     /// The convergence slice (REQ-CV-12); `null` on terminal tasks and on
@@ -1789,7 +1905,12 @@ pub fn agent_failure_view(
 pub struct ActiveRow {
     pub id: String,
     pub task_id: String,
+    /// REQ-NM-01 AC1: the human signboard of the task — the list's FIRST
+    /// column; the short id rides beside it, muted.
+    pub task_display: String,
     pub role: String,
+    /// REQ-NM-01 AC1: `«имя роли · vN»`, the same string a graph node uses.
+    pub role_display: String,
     pub role_slug: String,
     pub role_version: u32,
     pub agent_name: Option<String>,
@@ -1823,6 +1944,9 @@ pub struct ActiveSnapshot {
 pub struct QualityReportView {
     pub task: String,
     pub artifact: String,
+    /// REQ-NM-01: `«отчёт качества · vN»` — the heading the card prints; the
+    /// artifact id is secondary.
+    pub label: String,
     pub seq: u32,
     pub contract: String,
     pub created_at: Timestamp,

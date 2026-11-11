@@ -170,4 +170,3 @@ fn status_words_an_agent_failure_park_in_both_forms() {
     assert!(s["action"].as_str().unwrap().len() > 3);
     assert_eq!(v["launch_failure"], serde_json::Value::Null);
 }
-

@@ -73,6 +73,9 @@ export function question(id: string, overrides: Partial<Question> = {}): Questio
 export function spec(overrides: Partial<SpecPresentation> = {}): SpecPresentation {
   return {
     artifact: artifact("a-1"),
+    // REQ-NM-01: подпись приходит готовой от платформы; фикстура не собирает
+    // её из ключа вида.
+    label: "спека · v1",
     current: true,
     human_paragraph: "человеческий абзац спеки",
     paragraph_source: "spec",
@@ -86,6 +89,7 @@ export function report(overrides: Partial<QualityReportView> = {}): QualityRepor
   return {
     task: "t1",
     artifact: "a-qa",
+    label: "отчёт качества · v1",
     seq: 1,
     contract: "quality-report@1",
     created_at: "2026-11-06T11:00:00Z",

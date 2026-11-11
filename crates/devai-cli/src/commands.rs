@@ -1932,7 +1932,7 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     let launch_failure = v.launch_failure;
     let t = v.task;
     let ops: Vec<String> = v.allowed_operations;
-    let current: Vec<Artifact> = v.current_artifacts;
+    let current: Vec<devai_api::ArtifactView> = v.current_artifacts;
     let open_q: Vec<Question> = v.open_questions;
     // REQ-AL-07: the attempt counter travels with the status read.
     let attempt_limit = v.attempt_limit;
@@ -1968,20 +1968,23 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         }
         outln!("artifacts (current): {}", current.len());
         for a in &current {
+            // REQ-NM-01: the human label leads; the id and the technical kind
+            // stay beside it, muted, for reconciliation.
             outln!(
-                "  {:<22} v{:<3} {}  {}",
-                a.kind.as_str(),
-                a.seq,
-                short(&a.id),
-                a.name
+                "  {}  ({} v{} · {})",
+                a.display,
+                a.artifact.kind.as_str(),
+                a.artifact.seq,
+                short(&a.artifact.id)
             );
         }
         for q in &open_q {
+            // REQ-NM-01: the question's own text is the line; the id closes it.
             outln!(
-                "open question {}: {}{}",
-                short(&q.id),
+                "open question: {}{}  ({})",
                 q.text,
-                if q.blocking { " [BLOCKING]" } else { "" }
+                if q.blocking { " [BLOCKING]" } else { "" },
+                short(&q.id)
             );
         }
         // REQ-PK-05: the stop is printed in HUMAN words — never the raw
@@ -2189,14 +2192,17 @@ fn artifact(ctx: &Ctx, cmd: ArtifactCmd, json: bool) -> Result<()> {
                 outln!("(no artifacts)");
             } else {
                 for a in as_ {
+                    // REQ-NM-01: «название · vN» leads; kind, status, id and
+                    // the creator follow as the machine's second position.
                     outln!(
-                        "{}  {:<22} v{:<3} {:<12} {}  {}",
-                        short(&a.id),
-                        a.kind.as_str(),
-                        a.seq,
-                        a.status.as_str(),
-                        a.created_by,
-                        a.name
+                        "{}  ({} {} · {} · {})  {}  {}",
+                        a.display,
+                        a.artifact.kind.as_str(),
+                        a.artifact.status.as_str(),
+                        short(&a.artifact.id),
+                        a.artifact.created_by,
+                        a.artifact.seq,
+                        a.artifact.name
                     );
                 }
             }

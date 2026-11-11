@@ -71,6 +71,7 @@ function report(): QualityReportView {
   return {
     task: "t1",
     artifact: "01a1b2aa-1111-700a-aaaa-111111111111",
+    label: "отчёт качества · v1",
     seq: 1,
     contract: "quality-report@5",
     created_at: "2026-11-09T10:00:00Z",

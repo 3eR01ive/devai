@@ -255,7 +255,7 @@ function addPoint(it: HumanFormItem) {
           <p class="mono muted" style="margin: 2px 0 0">{{ banner.detail }}</p>
         </div>
         <div class="rowflex" style="margin: 6px 0">
-          <span class="mono muted">artifact {{ shortId(props.report.artifact) }} · seq {{ props.report.seq }} · {{ props.report.contract }}</span>
+          <span class="mono muted">{{ props.report.label }} · {{ shortId(props.report.artifact) }} · {{ props.report.contract }}</span>
           <span class="mono muted">создан {{ fmtTime(props.report.created_at) }}</span>
           <span class="mono muted">источник: {{ props.report.source }}</span>
           <StateChip :token="props.report.status" />

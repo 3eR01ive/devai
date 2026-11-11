@@ -200,7 +200,10 @@ onUnmounted(() => unsubscribe?.());
                 спецификационный артефакт (seq {{ row.spec.artifact.seq }}) — утвердить нельзя
               </div>
               <div class="panel" style="margin: 6px 0">
-                <h3>Спека на утверждение · v{{ row.spec.artifact.seq }} ({{ shortId(row.spec.artifact.id) }})</h3>
+                <h3>
+                  {{ row.spec.label }}
+                  <span class="mono muted">· {{ shortId(row.spec.artifact.id) }}</span>
+                </h3>
                 <div class="body">
                   <p v-if="row.spec.unavailable_note" class="muted" style="margin: 0 0 6px">
                     абзац: {{ row.spec.unavailable_note }}
@@ -242,9 +245,11 @@ onUnmounted(() => unsubscribe?.());
                   <div class="rowflex">
                     <span v-if="q.blocking" class="mono" style="color: var(--orange); font-weight: 700">● блокирует</span>
                     <span v-else class="muted mono">○ не блокирует</span>
-                    <span class="muted mono">{{ shortId(q.id) }}</span>
                   </div>
-                  <p style="margin: 4px 0; white-space: pre-wrap">{{ q.text }}</p>
+                  <p style="margin: 4px 0; white-space: pre-wrap">
+                    {{ q.text }}
+                    <span class="muted mono">{{ shortId(q.id) }}</span>
+                  </p>
                   <p v-if="q.context" class="muted" style="margin: 0 0 4px; white-space: pre-wrap">{{ q.context }}</p>
                   <div class="rowflex" v-if="q.options.length">
                     <span v-for="o in q.options" :key="o" class="mono" style="border: 1px solid var(--panel-border); border-radius: 4px; padding: 1px 8px; font-size: 12px">{{ o }}</span>
@@ -260,7 +265,10 @@ onUnmounted(() => unsubscribe?.());
             <!-- QA: отчёт, который просят подписать -->
             <template v-if="row.report">
               <div class="panel" style="margin: 6px 0">
-                <h3>Quality-отчёт · seq {{ row.report.seq }} ({{ row.report.contract }})</h3>
+                <h3>
+                  {{ row.report.label }}
+                  <span class="mono muted">· {{ row.report.contract }}</span>
+                </h3>
                 <div class="body">
                   <p v-if="row.report.report_text" style="margin: 0; white-space: pre-wrap">{{ row.report.report_text }}</p>
                   <p v-else class="muted" style="margin: 0">

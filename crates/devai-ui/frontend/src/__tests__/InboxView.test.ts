@@ -176,6 +176,8 @@ describe("InboxView branches", () => {
     );
     const text = w.text();
     expect(text).toContain("Остановленные оператором");
+    // REQ-NM-01: и в справочной группе первой стоит подпись задачи.
+    expect(text.indexOf("активная задача")).toBeLessThan(text.indexOf("jjjj"));
     expect(text).toContain("остановлена мной");
     expect(text).toContain("Справочно: безответные неблокирующие вопросы");
     expect(text).toContain("не блокирует");
@@ -224,6 +226,57 @@ describe("InboxView branches", () => {
     expect(text).toContain("журнал драйвера за прогон пуст");
     // Честный статус, не починка: никакой кнопки «исправить/перезапустить».
     expect(text.toLowerCase()).not.toContain("починить");
+    w.unmount();
+  });
+
+  // REQ-NM-01: шапка ожидания печатает человеческое имя задачи, формальный
+  // заголовок — вторичной пометкой; заголовки спеки и отчёта качества — по
+  // виду и версии, а не техническим ключом вида и не id.
+  it("prints the human task name first and the formal title as a secondary note", async () => {
+    const t = { ...task("mmmm-3333", "APPROVAL"), display: "человеческое имя задачи" };
+    const w = await mountWith(snapshot({ waiting: [row(t)], badge: 1 }));
+    const text = w.text();
+    expect(text.indexOf("человеческое имя задачи")).toBeLessThan(text.indexOf("mmmm-3333"));
+    expect(text).toContain("формальный заголовок");
+    w.unmount();
+  });
+
+  it("heads the spec and the quality report by kind and version, id second", async () => {
+    const w = await mountWith(
+      snapshot({
+        waiting: [
+          row(task("nnnn-4444", "APPROVAL"), { spec: spec() }),
+          row(task("oooo-5555", "QA"), { report: report() }),
+        ],
+        badge: 2,
+      }),
+    );
+    for (const toggle of await w.findAll(".panel-toggle")) {
+      await toggle.trigger("click");
+    }
+    const headings = w.findAll("h3").map((h) => h.text());
+    const specHeading = headings.find((h) => h.includes("спека · v1"));
+    expect(specHeading, "заголовок спеки не напечатан по названию вида").toBeDefined();
+    expect(specHeading!.indexOf("спека · v1")).toBeLessThan(specHeading!.indexOf("a-1"));
+    expect(specHeading).not.toContain("Спека на утверждение");
+    const reportHeading = headings.find((h) => h.includes("отчёт качества · v1"));
+    expect(reportHeading, "заголовок отчёта качества не напечатан по названию вида").toBeDefined();
+    expect(reportHeading).not.toContain("Quality-отчёт");
+    w.unmount();
+  });
+
+  it("prints the platform question text first and its id at the end", async () => {
+    const w = await mountWith(
+      snapshot({
+        waiting: [row(task("pppp", "WAITING_FOR_INPUT"), { open_questions: [question("q-1")] })],
+        badge: 1,
+      }),
+    );
+    await w.find(".panel-toggle").trigger("click");
+    const heading = w.findAll("h3").find((h) => h.text().includes("Вопросы платформы"));
+    expect(heading, "секция вопросов не отрендерилась").toBeDefined();
+    const block = heading!.element.parentElement!.textContent ?? "";
+    expect(block.indexOf("вопрос q-1")).toBeLessThan(block.lastIndexOf("q-1"));
     w.unmount();
   });
 });

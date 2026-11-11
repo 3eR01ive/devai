@@ -2435,6 +2435,167 @@ impl TaskNamePolicy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ARTIFACT-KIND LABELS (REQ-NM-01) — the declarative human titles.
+// ---------------------------------------------------------------------------
+//
+// The card, the lists and the CLI never print a technical kind token as a
+// heading: the human title comes from THIS declarative table (`спека`,
+// `отчёт проверки`, …), merged across `workflow/*.yaml` by the
+// `artifact_kinds:` key. The table is the ONE source and it must be COMPLETE:
+// a missing declared kind, a blank title or a typo'd key is a LOUD config
+// error naming the value — never a silent fallback to the token
+// (REQ-NM-01 AC5). Editing the file changes every printed label without a
+// rebuild.
+
+/// Human titles of the declared artifact kinds, keyed by the wire token
+/// (`REQUIREMENTS_SPEC`, …).
+#[derive(Clone, Debug, Default)]
+pub struct ArtifactLabels {
+    labels: BTreeMap<String, String>,
+}
+
+impl ArtifactLabels {
+    /// The title of a declared kind. The table is validated on load, so an
+    /// unknown token here can only come from a caller handing a token that is
+    /// not an `ArtifactKind` — the caller's bug, not a config gap.
+    pub fn label<'a>(&'a self, kind: &'a str) -> &'a str {
+        self.labels.get(kind).map(String::as_str).unwrap_or(kind)
+    }
+
+    /// The map itself — the graph fold computes the finished `«title · vN»`
+    /// from it once per read.
+    pub fn titles(&self) -> &BTreeMap<String, String> {
+        &self.labels
+    }
+
+    pub fn is_complete(&self) -> bool {
+        devai_core::types::ArtifactKind::ALL
+            .iter()
+            .all(|k| self.labels.contains_key(k.as_str()))
+    }
+}
+
+/// The factory table — the embedded `config/workflow/artifact-kinds.yaml`,
+/// used only when the home has no declaration of its own.
+pub fn factory_artifact_labels() -> StoreResult<ArtifactLabels> {
+    parse_artifact_labels(
+        include_str!("../../../config/workflow/artifact-kinds.yaml"),
+        "embedded config/workflow/artifact-kinds.yaml",
+    )
+}
+
+/// Load and validate the table: every declared kind has a non-blank title, a
+/// key that is not a declared kind is refused (a typo would otherwise leave
+/// its kind unlabelled and pass unnoticed).
+pub fn load_artifact_labels(dir: &Path) -> StoreResult<ArtifactLabels> {
+    if !dir.is_dir() {
+        return factory_artifact_labels();
+    }
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    let mut found = false;
+    for p in &paths {
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        let Some(section) = doc.get("artifact_kinds") else {
+            continue;
+        };
+        found = true;
+        let labels = section
+            .get("labels")
+            .and_then(|v| v.as_mapping())
+            .ok_or_else(|| {
+                cfg_err(format!(
+                    "{}: artifact_kinds must declare a `labels:` mapping",
+                    p.display()
+                ))
+            })?;
+        for (k, v) in labels {
+            let key = k.as_str().ok_or_else(|| {
+                cfg_err(format!(
+                    "{}: artifact_kinds.labels has a non-string key",
+                    p.display()
+                ))
+            })?;
+            let title = v.as_str().ok_or_else(|| {
+                cfg_err(format!(
+                    "{}: artifact_kinds.labels.{key} must be a string title",
+                    p.display()
+                ))
+            })?;
+            merged.insert(key.to_string(), title.to_string());
+        }
+    }
+    if !found {
+        return factory_artifact_labels();
+    }
+    validate_artifact_labels(&merged, &dir.display().to_string())?;
+    Ok(ArtifactLabels { labels: merged })
+}
+
+fn parse_artifact_labels(text: &str, where_: &str) -> StoreResult<ArtifactLabels> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| cfg_err(format!("parse {where_}: {e}")))?;
+    let labels = doc
+        .get("artifact_kinds")
+        .and_then(|v| v.get("labels"))
+        .and_then(|v| v.as_mapping())
+        .ok_or_else(|| cfg_err(format!("{where_}: no artifact_kinds.labels mapping")))?;
+    let mut merged = BTreeMap::new();
+    for (k, v) in labels {
+        let key = k
+            .as_str()
+            .ok_or_else(|| cfg_err(format!("{where_}: non-string artifact kind key")))?;
+        let title = v.as_str().ok_or_else(|| {
+            cfg_err(format!(
+                "{where_}: artifact_kinds.labels.{key} is not a string"
+            ))
+        })?;
+        merged.insert(key.to_string(), title.to_string());
+    }
+    validate_artifact_labels(&merged, where_)?;
+    Ok(ArtifactLabels { labels: merged })
+}
+
+fn validate_artifact_labels(labels: &BTreeMap<String, String>, where_: &str) -> StoreResult<()> {
+    for kind in devai_core::types::ArtifactKind::ALL {
+        match labels.get(kind.as_str()) {
+            Some(t) if !t.trim().is_empty() => {}
+            Some(_) => {
+                return Err(cfg_err(format!(
+                    "{where_}: artifact_kinds.labels.{} is blank — the human title is required",
+                    kind.as_str()
+                )));
+            }
+            None => {
+                return Err(cfg_err(format!(
+                    "{where_}: artifact_kinds.labels is INCOMPLETE — no title for the declared kind `{}`",
+                    kind.as_str()
+                )));
+            }
+        }
+    }
+    for key in labels.keys() {
+        if !devai_core::types::ArtifactKind::ALL
+            .iter()
+            .any(|k| k.as_str() == key)
+        {
+            return Err(cfg_err(format!(
+                "{where_}: artifact_kinds.labels.{key} is not a declared artifact kind — a typo would leave a kind unlabelled"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Merge-scan `workflow/*.yaml` for the `task_name:` key, exactly the
 /// `load_humanize_policy` idiom: files without the section are inert, the
 /// LAST declared section wins, a malformed declaration or a typo'd key is a
@@ -4089,5 +4250,59 @@ mod process_declaration_tests {
         fs::write(wf.join("park-reasons.yaml"), &no_absence).unwrap();
         let e = load_park_reasons(&wf).unwrap_err().to_string();
         assert!(e.contains("counter_absent"), "{e}");
+    }
+
+    /// REQ-NM-01 AC4/AC5: the declarative table covers EVERY declared kind,
+    /// its titles are human (never the technical token), and a gap — a missing
+    /// kind, a blank title or a typo'd key — is a LOUD refusal naming the value
+    /// instead of a silent fallback to the token.
+    #[test]
+    fn artifact_kind_labels_cover_every_declared_kind_and_refuse_gaps() {
+        let labels = factory_artifact_labels().unwrap();
+        assert!(labels.is_complete());
+        for kind in devai_core::types::ArtifactKind::ALL {
+            let title = labels.label(kind.as_str());
+            assert!(
+                !title.trim().is_empty(),
+                "{}: пустое название",
+                kind.as_str()
+            );
+            assert_ne!(
+                title,
+                kind.as_str(),
+                "{}: технический ключ не может быть подписью",
+                kind.as_str()
+            );
+        }
+        // The ONE heading rule over versions 1..3 — no second spelling here.
+        assert_eq!(devai_core::types::artifact_label("спека", 1), "спека · v1");
+        assert_eq!(devai_core::types::artifact_label("спека", 2), "спека · v2");
+        assert_eq!(devai_core::types::artifact_label("спека", 3), "спека · v3");
+
+        let factory = include_str!("../../../config/workflow/artifact-kinds.yaml");
+        // A missing declared kind is refused by name.
+        let missing = factory.replace("    OTHER: прочее\n", "");
+        assert_ne!(factory, missing);
+        let e = parse_artifact_labels(&missing, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("OTHER"), "{e}");
+        // A blank title is refused as well: the heading would be « · vN».
+        let blank = factory.replace("REQUIREMENTS_SPEC: спека", "REQUIREMENTS_SPEC: \"  \"");
+        assert_ne!(factory, blank);
+        let e = parse_artifact_labels(&blank, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("REQUIREMENTS_SPEC"), "{e}");
+        // A typo'd key would leave its kind unlabelled — refused, not ignored.
+        let typo = factory.replace("REQUIREMENTS_SPEC:", "REQUIREMENT_SPEC:");
+        assert_ne!(factory, typo);
+        let e = parse_artifact_labels(&typo, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("REQUIREMENTS_SPEC") || e.contains("REQUIREMENT_SPEC"),
+            "{e}"
+        );
     }
 }

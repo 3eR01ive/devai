@@ -12,6 +12,7 @@ import type {
   AgentStatusView,
   Artifact,
   ArtifactContent,
+  ArtifactView,
   BundleFormInput,
   BundleHandleView,
   BundleMutationView,
@@ -159,7 +160,7 @@ export const api = {
     invoke<WorkspaceDiffView>("task_workspace_diff", { id_prefix, path }),
 
   artifactsList: (id_prefix: string) =>
-    invoke<Artifact[]>("artifacts_list", { id_prefix }),
+    invoke<ArtifactView[]>("artifacts_list", { id_prefix }),
   artifactContent: (artifact_id: string) =>
     invoke<ArtifactContent>("artifact_content", { artifact_id }),
 
