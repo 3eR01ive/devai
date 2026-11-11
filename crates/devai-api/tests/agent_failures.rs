@@ -170,7 +170,14 @@ fn parked_task_is_presented_with_the_question() {
 
     // Answering restores the stage; the series is NOT reset by the answer.
     let parked = h.store.get_task(&t.id.to_string()).unwrap();
-    let answered = workflow::answer_question(devai_core::process::Process::factory(), &parked, qid, "tester", Utc::now()).unwrap();
+    let answered = workflow::answer_question(
+        devai_core::process::Process::factory(),
+        &parked,
+        qid,
+        "tester",
+        Utc::now(),
+    )
+    .unwrap();
     h.store.commit(parked.lock_version, &answered).unwrap();
     let back = api.task_progress(&t.id.to_string()).unwrap();
     assert_eq!(back.task.state, TaskState::Analysis);

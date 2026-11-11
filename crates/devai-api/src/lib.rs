@@ -136,23 +136,73 @@ fn wait_convergence(
     (wait_row && !state.is_terminal()).then(|| convergence::compute(artifacts, executions, bodies))
 }
 
+/// The platform's ONE sentence for a liveness verdict (REQ-LV-02 AC3): the
+/// three answers must be distinguishable on the card and in the terminal, and
+/// «мертво» is reserved for a PROVEN death — «проверить нельзя» never borrows
+/// its words. Both surfaces print exactly this string, so one execution can
+/// never read «мертво» in the window and «жив» in the terminal.
+///
+/// The ALIVE wording names LIVENESS ONLY («процесс жив», the ratified increment
+/// 1 vocabulary «жив / мёртв / проверить нельзя»): the check proves the owner
+/// process exists, not that it is doing work. The activity sentence
+/// («работает · последняя активность N с назад · шаг: …») belongs to the
+/// activity increment and cannot be claimed here without activity data.
+pub fn liveness_line(state: liveness::Liveness) -> &'static str {
+    match state {
+        liveness::Liveness::Alive => "процесс жив",
+        liveness::Liveness::Dead => "исполнение мертво (можно перезапустить)",
+        liveness::Liveness::Unknown => "живость проверить нельзя",
+    }
+}
+
+/// Observe the recorded owner of one row — the ONE call every surface makes
+/// (REQ-LV-06 AC3: no surface re-derives its own verdict). Read-only, never a
+/// signal (liveness.rs header).
+fn observe_owner(e: &RoleExecution) -> liveness::Liveness {
+    liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start)
+}
+
 /// The RUNNING rows of one task as the progress view shows them. `now` is the
 /// snapshot instant, so every row of one answer is measured against the SAME
 /// clock instead of drifting row by row.
+///
+/// Every row carries its liveness observation and the platform's sentence for
+/// it (REQ-LV-05): the card answers «идёт ли работа» from this read itself,
+/// with no second call and no per-row fan-out.
 fn running_views(executions: &[RoleExecution], now: DateTime<Utc>) -> Vec<RunningExecutionView> {
     executions
         .iter()
         .filter(|e| e.status == ExecutionStatus::Running)
-        .map(|e| RunningExecutionView {
-            id: e.id.to_string(),
-            role: format!("{}@{}", e.role_slug, e.role_version),
-            role_slug: e.role_slug.clone(),
-            role_version: e.role_version,
-            agent_name: e.agent_name.clone(),
-            started_at: e.started_at,
-            elapsed_seconds: (now - e.started_at).num_seconds().max(0),
+        .map(|e| {
+            let live = observe_owner(e);
+            RunningExecutionView {
+                id: e.id.to_string(),
+                role: format!("{}@{}", e.role_slug, e.role_version),
+                role_slug: e.role_slug.clone(),
+                role_version: e.role_version,
+                agent_name: e.agent_name.clone(),
+                started_at: e.started_at,
+                elapsed_seconds: (now - e.started_at).num_seconds().max(0),
+                owner_pid: e.owner_pid,
+                owner_host: e.owner_host.clone(),
+                liveness: live.as_str().to_string(),
+                liveness_line: liveness_line(live).to_string(),
+            }
         })
         .collect()
+}
+
+/// One execution row as `exec.list` publishes it: the stored row (flattened
+/// into the same JSON it always had) plus the liveness observation of its
+/// owner — but ONLY for an unfinished row (REQ-LV-06 AC4): a finished
+/// execution is never checked and carries no mark at all.
+pub fn execution_view(e: RoleExecution) -> ExecutionView {
+    let live = (e.status == ExecutionStatus::Running).then(|| observe_owner(&e));
+    ExecutionView {
+        liveness: live.map(|l| l.as_str().to_string()),
+        liveness_line: live.map(|l| liveness_line(l).to_string()),
+        execution: e,
+    }
 }
 
 /// WHERE the row's work lives, as the snapshot shows it: only when the
@@ -394,13 +444,18 @@ impl Api {
         let ops: Vec<String> = workflow::allowed_ops(&process, &t);
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
+        // ONE execution load per status read: the QA gate's live-audit facts
+        // and the running-execution liveness slice are the SAME rows
+        // (REQ-LV-05: the card answers «идёт ли работа» from the state read,
+        // and the check happens on EVERY read — no separate watcher).
+        let executions = self.store.list_executions(Some(t.id))?;
+        let running_executions = running_views(&executions, Utc::now());
         // REQ-QG-08: the QA gate's public availability travels WITH the status
-        // read — the window does not derive it. The dependency/decision/
-        // execution loads happen only at the gate; other states have no gate.
+        // read — the window does not derive it. The dependency/decision
+        // loads happen only at the gate; other states have no gate.
         let quality_gate = if t.state == TaskState::Qa {
             let deps = self.store.task_dependencies(t.id)?;
             let decisions = self.store.list_decisions(t.id)?;
-            let executions = self.store.list_executions(Some(t.id))?;
             quality_gate::quality_gate(&process, &t, &artifacts, &deps, &decisions, &executions)
         } else {
             None
@@ -417,6 +472,7 @@ impl Api {
                 .filter(|q| q.status == QuestionStatus::Open)
                 .collect(),
             quality_gate,
+            running_executions,
         })
     }
 
@@ -551,8 +607,7 @@ impl Api {
         now: DateTime<Utc>,
     ) -> ActiveRow {
         let (t, prepared) = &facts[&e.task_id];
-        let live =
-            liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
+        let live = observe_owner(e);
         let terminal = t.state.is_terminal();
         // A live quality audit at the QA gate is a PROCESS, not a human wait
         // (REQ-QG-09 AC3): the active row carries the platform's words.
@@ -574,6 +629,7 @@ impl Api {
             owner_pid: e.owner_pid,
             owner_host: e.owner_host.clone(),
             owner_liveness: live.as_str().to_string(),
+            liveness_line: liveness_line(live).to_string(),
             branch,
             worktree,
             note,
@@ -1260,12 +1316,21 @@ impl Api {
     // consumer without the launching terminal)
     // ------------------------------------------------------------------
 
-    pub fn exec_list(&self, task_ref: Option<&str>) -> ApiResult<Vec<RoleExecution>> {
+    /// Execution rows, optionally for one task. Every UNFINISHED row carries
+    /// the liveness verdict of its recorded owner and the platform's sentence
+    /// for it (REQ-LV-06 AC1); a finished row is not checked at all and
+    /// carries no mark (AC4).
+    pub fn exec_list(&self, task_ref: Option<&str>) -> ApiResult<Vec<ExecutionView>> {
         let tid = match task_ref {
             Some(id) => Some(self.store.resolve_task(id)?.id),
             None => None,
         };
-        Ok(self.store.list_executions(tid)?)
+        Ok(self
+            .store
+            .list_executions(tid)?
+            .into_iter()
+            .map(execution_view)
+            .collect())
     }
 
     pub fn exec_get(&self, exec_id: &str) -> ApiResult<RoleExecution> {
@@ -1276,8 +1341,7 @@ impl Api {
     /// never writes, never signals (REQ-SW-06).
     pub fn exec_liveness(&self, exec_id: &str) -> ApiResult<LivenessView> {
         let e = self.store.get_execution(exec_id)?;
-        let live =
-            liveness::check_owner(e.owner_pid, e.owner_host.as_deref(), e.owner_process_start);
+        let live = observe_owner(&e);
         Ok(LivenessView {
             id: e.id.to_string(),
             task_id: e.task_id.to_string(),
@@ -1286,6 +1350,7 @@ impl Api {
             owner_host: e.owner_host.clone(),
             owner_process_start: e.owner_process_start,
             liveness: live.as_str().to_string(),
+            line: liveness_line(live).to_string(),
         })
     }
 
@@ -1341,6 +1406,10 @@ pub struct StatusView {
     /// REQ-QG-08/09: the QA gate's per-action availability and platform
     /// refusal; `None` outside QA (the actions do not exist there).
     pub quality_gate: Option<QualityGateView>,
+    /// REQ-LV-05: the task's RUNNING executions with their liveness fact and
+    /// the platform's sentence — the card answers «идёт ли работа» from the
+    /// state read itself, checked at every read (no watcher process).
+    pub running_executions: Vec<RunningExecutionView>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1362,6 +1431,32 @@ pub struct RunningExecutionView {
     pub agent_name: Option<String>,
     pub started_at: DateTime<Utc>,
     pub elapsed_seconds: i64,
+    /// The recorded owner of the row, as stamped PLATFORM-side at start
+    /// (REQ-SW-03). `null` on a pre-owner row — «не записан», never «мёртв».
+    pub owner_pid: Option<i64>,
+    pub owner_host: Option<String>,
+    /// `alive` | `dead` | `unknown` — the liveness fact of the owner process
+    /// (REQ-LV-02), observed at THIS read.
+    pub liveness: String,
+    /// The platform's ONE sentence for `liveness` (REQ-LV-05): the card, the
+    /// active list and the CLI print this string instead of describing the
+    /// token in their own words.
+    pub liveness_line: String,
+}
+
+/// One execution row as `exec.list` (and the window's executions table)
+/// publishes it: the stored row flattened into the JSON it always carried,
+/// plus the liveness observation of its owner — present ONLY for an
+/// unfinished row (REQ-LV-06 AC4: a finished execution is not checked and
+/// carries no mark).
+#[derive(Serialize, Clone, Debug)]
+pub struct ExecutionView {
+    #[serde(flatten)]
+    pub execution: RoleExecution,
+    /// `alive` | `dead` | `unknown`; `null` for a finished row.
+    pub liveness: Option<String>,
+    /// The platform's ONE sentence for `liveness`; `null` for a finished row.
+    pub liveness_line: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1593,6 +1688,10 @@ pub struct ActiveRow {
     pub owner_pid: Option<i64>,
     pub owner_host: Option<String>,
     pub owner_liveness: String,
+    /// REQ-LV-02 AC3 / REQ-LV-06 AC2: the platform's ONE sentence for
+    /// `owner_liveness` — the very string the card and `exec list` print, so
+    /// the two surfaces cannot describe the same row in different words.
+    pub liveness_line: String,
     pub branch: Option<String>,
     pub worktree: Option<String>,
     /// REQ-QG-09 AC3: the platform's word for what the live run IS. A running
@@ -1662,6 +1761,8 @@ pub struct LivenessView {
     pub owner_process_start: Option<i64>,
     /// "alive" | "dead" | "unknown" — orphan detect as data (REQ-API-07 AC3).
     pub liveness: String,
+    /// REQ-LV-02 AC3: the platform's ONE sentence for `liveness`.
+    pub line: String,
 }
 
 /// One changed file in the task's committed changeset: git's own status
@@ -1948,5 +2049,33 @@ mod tests {
             serde_json::from_value(minimal).expect("required-only freshness loads");
         assert_eq!(loaded.execution, None);
         assert_eq!(loaded.execution_status, None);
+    }
+
+    /// REQ-LV-02 AC3: the three liveness answers are DISTINGUISHABLE words.
+    /// «мертво» belongs to the one provable death only; «проверить нельзя»
+    /// must never borrow it, and a live owner must not be spelled as work
+    /// (the activity sentence needs activity data the first increment does
+    /// not collect).
+    #[test]
+    fn the_three_liveness_sentences_are_distinct() {
+        use super::liveness_line;
+        use crate::liveness::Liveness;
+        let (alive, dead, unknown) = (
+            liveness_line(Liveness::Alive),
+            liveness_line(Liveness::Dead),
+            liveness_line(Liveness::Unknown),
+        );
+        assert_ne!(alive, dead);
+        assert_ne!(alive, unknown);
+        assert_ne!(dead, unknown);
+        assert!(dead.contains("мертво"), "a proven death says so: {dead}");
+        assert!(
+            !unknown.contains("мертво"),
+            "«проверить нельзя» is not death: {unknown}"
+        );
+        assert!(
+            !alive.contains("мертво") && alive.contains("жив"),
+            "a live owner is spelled as liveness, not as work: {alive}"
+        );
     }
 }

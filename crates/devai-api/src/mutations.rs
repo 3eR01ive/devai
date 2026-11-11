@@ -3615,7 +3615,7 @@ mod tests {
             api.exec_list(Some(&id))
                 .unwrap()
                 .iter()
-                .filter(|x| x.status == ExecutionStatus::Running)
+                .filter(|x| x.execution.status == ExecutionStatus::Running)
                 .count(),
             1
         );

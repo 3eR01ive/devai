@@ -17,6 +17,7 @@ import type {
   BundleMutationView,
   Decision,
   DependenciesView,
+  ExecutionView,
   HomeRecord,
   HomeRecordsView,
   LanStatus,
@@ -30,7 +31,6 @@ import type {
   Project,
   Question,
   QualityReportView,
-  RoleExecution,
   SessionInfo,
   SignatureView,
   StatusView,
@@ -168,7 +168,7 @@ export const api = {
   // на агента — окно ничего не собирает и не перефразирует.
   agentStatuses: () => invoke<AgentStatusView[]>("agent_statuses"),
   executionsList: (task_ref: string | null) =>
-    invoke<RoleExecution[]>("executions_list", { task_ref }),
+    invoke<ExecutionView[]>("executions_list", { task_ref }),
   executionLiveness: (exec_id: string) =>
     invoke<LivenessView>("execution_liveness", { exec_id }),
 

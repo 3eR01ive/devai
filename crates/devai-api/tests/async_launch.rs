@@ -121,15 +121,18 @@ fn the_supervisor_opens_the_row_hands_a_handle_and_drives_the_chain() {
     );
     for r in &rows {
         assert_eq!(
-            r.run_id.map(|x| x.to_string()),
+            r.execution.run_id.map(|x| x.to_string()),
             Some(run.clone()),
             "execution {} must carry the run number",
-            r.id
+            r.execution.id
         );
-        assert_ne!(r.status, ExecutionStatus::Running);
+        assert_ne!(r.execution.status, ExecutionStatus::Running);
+        // REQ-LV-06 AC4: a finished row is NOT checked — no liveness mark.
+        assert_eq!(r.liveness, None, "finished rows carry no verdict");
+        assert_eq!(r.liveness_line, None);
     }
     // The first stage really was the analyst's.
-    assert_eq!(rows[0].role_slug, "requirements-analyst");
+    assert_eq!(rows[0].execution.role_slug, "requirements-analyst");
 }
 
 #[test]

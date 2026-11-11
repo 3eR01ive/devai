@@ -10,12 +10,12 @@
 // и предлагает активацию в один клик; скрытого переключения нет — оператор
 // нажимает кнопку. После активации контекст сбрасывается на список
 // проектов (без фантомных id между домами).
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, toUiError } from "../api";
 import { activateHome } from "../activation";
 import { foreignHome as foreignHomeOf } from "../homes-view";
-import { fmtElapsed, fmtTime, shortId } from "../settings";
+import { fmtElapsed, fmtTime, pollMs, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
 import SignatureSection from "../components/SignatureSection.vue";
 import SpecDiffPanel from "../components/SpecDiffPanel.vue";
@@ -31,10 +31,9 @@ import type {
   ConvergenceView,
   Decision,
   DependenciesView,
-  LivenessView,
+  ExecutionView,
   ProgressView,
   QualityReportView,
-  RoleExecution,
   SignatureView,
   StatusView,
   UiError,
@@ -57,9 +56,8 @@ const deps = ref<DependenciesView | null>(null);
 const artifacts = ref<Artifact[]>([]);
 const decisions = ref<Decision[]>([]);
 const events = ref<WorkflowEvent[]>([]);
-const executions = ref<RoleExecution[]>([]);
+const executions = ref<ExecutionView[]>([]);
 const activeRows = ref<ActiveRow[]>([]);
-const liveness = ref<Record<string, LivenessView>>({});
 const report = ref<QualityReportView | null>(null);
 const reportError = ref<UiError | null>(null);
 // Действия гейта качества (REQ-QG-03 AC4/AC5): отказ — РЯДОМ С КНОПКАМИ,
@@ -91,6 +89,27 @@ const showDiff = ref(false);
 // отдельной операции нет. UI не считает ни балл, ни режим: рисует готовое.
 const convergence = computed<ConvergenceView | null>(() => progress.value?.convergence ?? null);
 
+// Индикатор работы агента (REQ-LV-05): строка карточки отвечает «идёт ли
+// работа» фактом, а не догадкой. Слова — платформы (`liveness_line` из
+// task.progress), окно их не перефразирует и вердикт не пересчитывает.
+const runningRows = computed<ExecutionView[]>(() =>
+  executions.value.filter((e) => e.status === "RUNNING"),
+);
+const runningLines = computed<string[]>(() =>
+  runningRows.value
+    .filter((e) => e.liveness_line)
+    .map((e) => `${e.role_slug}@${e.role_version}: ${e.liveness_line}`),
+);
+// «Мёртво» — только доказанная смерть (REQ-LV-02): тогда рядом с индикатором
+// стоит явное действие, а не догадка оператора.
+const deadRun = computed<boolean>(() => runningRows.value.some((e) => e.liveness === "dead"));
+const restartHint = computed<string>(() => {
+  const id = shortId(status.value?.task.id ?? props.id);
+  // Снять мёртвую запись и только потом запустить — сам запуск остаётся за
+  // человеком (автоснятие и автозапуск — не эта задача).
+  return `devai exec reap --task ${id} → devai task run ${id}`;
+});
+
 async function loadAll() {
   error.value = null;
   try {
@@ -110,18 +129,6 @@ async function loadAll() {
     decisions.value = decs;
     executions.value = execs;
     activeRows.value = snap.rows.filter((r) => r.task_id === props.id || r.task_id.startsWith(props.id));
-    // Liveness — наблюдение (REQ-SW-06): только read exec.liveness по RUNNING-строкам.
-    for (const e of execs.filter((x) => x.status === "RUNNING")) {
-      try {
-        liveness.value[e.id] = await api.executionLiveness(e.id);
-      } catch (err) {
-        liveness.value[e.id] = {
-          id: e.id, task_id: e.task_id, status: e.status, owner_pid: null,
-          owner_host: null, owner_process_start: null, liveness: "unknown",
-        } satisfies LivenessView;
-        void err;
-      }
-    }
     await loadEvents();
     await loadReport();
     await loadWorkspace();
@@ -270,7 +277,36 @@ async function gateAndLoad() {
   }
   await loadAll();
 }
-onMounted(gateAndLoad);
+// Живость перечитывается ПОСТОЯННО — из нашего же окна, без системных
+// шедулеров и сторожевых скриптов (ратифицированный ответ на вопрос цикла).
+// Дешёвое чтение `exec.list` несёт факт живости незавершённых строк; тишина
+// задачи (нет RUNNING) и терминальные задачи не опрашиваются вовсе.
+let livenessTimer: number | undefined;
+
+async function refreshLiveness() {
+  if (foreignHome.value || !status.value) return;
+  // Терминальная задача RUNNING-строк не рождает: факт «терминальна» приходит
+  // полем progress.pipeline.terminal, окно своей таблицы стадий не держит.
+  if (progress.value?.pipeline.terminal) return;
+  try {
+    executions.value = await api.executionsList(props.id);
+  } catch {
+    // Отдельный опрос не рушит карточку: последний снимок остаётся, панель
+    // ошибок принадлежит основным чтениям (loadAll).
+  }
+}
+
+onMounted(async () => {
+  await gateAndLoad();
+  // Таймер живёт только в окне: узловые прогоны SFC (тесты представления)
+  // исполняются без `window` и не должны ни падать, ни висеть на интервале.
+  if (typeof window !== "undefined") {
+    livenessTimer = window.setInterval(refreshLiveness, pollMs());
+  }
+});
+onUnmounted(() => {
+  if (livenessTimer && typeof window !== "undefined") window.clearInterval(livenessTimer);
+});
 
 async function activateForeignHome() {
   if (!foreignHome.value) return;
@@ -321,6 +357,13 @@ async function activateForeignHome() {
       <h2 style="margin: 0">{{ status.task.display }}</h2>
       <StateChip :token="status.task.state" />
       <StateChip v-if="status.task.return_state" :token="status.task.return_state" />
+      <!-- Индикатор работы (REQ-LV-05): одна строка, без раскрытия деталей. -->
+      <span
+        v-for="line in runningLines"
+        :key="line"
+        class="chip-liveness"
+        :class="{ dead: deadRun }"
+      >{{ line }}</span>
       <div class="spacer" />
       <span class="mono muted">{{ status.task.id }}</span>
       <button @click="loadAll">Обновить</button>
@@ -330,6 +373,9 @@ async function activateForeignHome() {
       class="muted mono"
       style="margin: 0 0 10px"
     >заголовок создавшего: {{ status.task.title }}</p>
+    <p v-if="deadRun" class="muted" style="margin: 0 0 10px">
+      Действие: <span class="mono">{{ restartHint }}</span>
+    </p>
     <p class="muted" style="white-space: pre-wrap">{{ status.task.business_description }}</p>
 
     <!-- ЭКРАН ПОДПИСИ (REQ-SIGN-01): первым содержательным блоком на
@@ -588,19 +634,22 @@ async function activateForeignHome() {
     </div>
 
     <div class="panel">
-      <h3>Исполнения ролей (exec.list; живые — exec.liveness)</h3>
+      <h3>Исполнения ролей (exec.list; живость — та же проверка, что на карточке)</h3>
       <div class="body">
         <table class="data">
           <thead>
-            <tr><th>Роль@вер</th><th>Агент</th><th>Статус</th><th>Live</th><th>Старт / финиш</th><th>Класс сбоя</th></tr>
+            <tr><th>Роль@вер</th><th>Агент</th><th>Статус</th><th>Живость</th><th>Старт / финиш</th><th>Класс сбоя</th></tr>
           </thead>
           <tbody>
             <tr v-for="e in executions" :key="e.id">
               <td class="mono" data-label="Роль@вер" data-mobile="title">{{ e.role_slug }}@{{ e.role_version }} <span class="muted">·{{ e.attempt ?? 1 }}</span></td>
               <td data-label="Агент">{{ e.agent_name ?? "—" }}</td>
               <td data-label="Статус" data-mobile="head"><StateChip :token="e.status" /></td>
-              <td data-label="Live" data-mobile="head">
-                <StateChip v-if="liveness[e.id]" :token="liveness[e.id].liveness" />
+              <td data-label="Живость" data-mobile="head">
+                <template v-if="e.liveness">
+                  <StateChip :token="e.liveness" />
+                  <span class="muted"> {{ e.liveness_line }}</span>
+                </template>
                 <span v-else class="muted">—</span>
               </td>
               <td class="mono muted" data-label="Старт / финиш">{{ fmtTime(e.started_at) }} → {{ fmtTime(e.finished_at) }}</td>
@@ -610,7 +659,8 @@ async function activateForeignHome() {
         </table>
         <p v-if="progress && progress.running_executions.length" class="muted" style="margin: 8px 0 0">
           <span v-for="r in progress.running_executions" :key="r.id" style="margin-right: 14px">
-            {{ r.role }} · {{ r.agent_name ?? "?" }} · {{ fmtElapsed(r.elapsed_seconds) }}
+            {{ r.role }} · {{ r.agent_name ?? "?" }} · {{ fmtElapsed(r.elapsed_seconds) }} ·
+            {{ r.liveness_line }}
           </span>
         </p>
       </div>
@@ -688,6 +738,21 @@ async function activateForeignHome() {
   .stage-caption {
     font-size: 12px;
   }
+}
+/* Индикатор работы агента (REQ-LV-05): живёт в строке заголовка, перенос
+   запрещён — «одна строка карточки», без раскрытия и без скролла. */
+.chip-liveness {
+  padding: 2px 8px;
+  border: 1px solid var(--slate);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--cream);
+  white-space: nowrap;
+}
+.chip-liveness.dead {
+  border-color: #b08a4f;
+  color: #e8caa0;
+  font-weight: 700;
 }
 .chip-stage {
   padding: 2px 8px;

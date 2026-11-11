@@ -1452,21 +1452,22 @@ fn report_unfinished_run(ctx: &Ctx, task_ref: &str, run_id: &str, json: bool) ->
         .api()
         .exec_list(Some(task_ref))
         .map_err(render_api_error)?;
-    let of_run: Vec<&RoleExecution> = es
+    let of_run: Vec<&devai_api::ExecutionView> = es
         .iter()
-        .filter(|e| e.run_id.map(|r| r.to_string()).as_deref() == Some(run_id))
+        .filter(|e| e.execution.run_id.map(|r| r.to_string()).as_deref() == Some(run_id))
         .collect();
     if json {
         outln!("{}", serde_json::to_string_pretty(&of_run)?);
     } else {
         outln!("run {run_id} produced no outcome — the runner stopped first:");
         for e in &of_run {
+            let row = &e.execution;
             outln!(
                 "  {}  {:<22} {}{}",
-                short(&e.id),
-                e.role_slug,
-                e.status.as_str(),
-                e.error
+                short(&row.id),
+                row.role_slug,
+                row.status.as_str(),
+                row.error
                     .as_deref()
                     .map(|err| format!(" — {}", ellipsis(err, 200)))
                     .unwrap_or_default()
@@ -1474,7 +1475,7 @@ fn report_unfinished_run(ctx: &Ctx, task_ref: &str, run_id: &str, json: bool) ->
         }
     }
     if let Some(row) = of_run.first() {
-        if let Some(err) = &row.error {
+        if let Some(err) = &row.execution.error {
             bail!("the run did not finish: {err}");
         }
     }
@@ -1942,6 +1943,9 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     // REQ-QG-08: the gate's public availability is part of the status read —
     // a second console consumer reads the same fact the window sees.
     let quality_gate = v.quality_gate;
+    // REQ-LV-05: the state read itself answers «идёт ли работа» — the words
+    // are the platform's (`liveness_line`), never re-spelled here.
+    let running = v.running_executions;
     if json {
         outln!(
             "{}",
@@ -1951,10 +1955,14 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
                 "current_artifacts": current,
                 "open_questions": open_q,
                 "quality_gate": quality_gate,
+                "running_executions": running,
             })
         );
     } else {
         print_task(&t);
+        for r in &running {
+            outln!("work:  {} · {}", r.role, r.liveness_line);
+        }
         outln!("---");
         outln!("artifacts (current): {}", current.len());
         for a in &current {
@@ -2696,7 +2704,8 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 .map_err(render_api_error)?;
             if let Some(run) = &run {
                 es.retain(|e| {
-                    e.run_id
+                    e.execution
+                        .run_id
                         .map(|r| r.to_string().starts_with(&run.to_lowercase()))
                         .unwrap_or(false)
                 });
@@ -2707,26 +2716,36 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 outln!("(no executions)");
             } else {
                 for e in es {
+                    let row = &e.execution;
                     // The form loop is readable from ROW DATA (REQ-FG-07):
                     // attempt number and failure class are stored columns,
                     // not something the display reconstructs by parsing text.
                     let mut flags = String::new();
-                    if e.attempt > 1 {
-                        flags.push_str(&format!(" attempt#{}", e.attempt));
+                    if row.attempt > 1 {
+                        flags.push_str(&format!(" attempt#{}", row.attempt));
                     }
-                    if let Some(fc) = &e.failure_class {
+                    if let Some(fc) = &row.failure_class {
                         flags.push_str(&format!(" [{fc}]"));
                     }
+                    // REQ-LV-06 AC1/AC4: an UNFINISHED row carries the
+                    // platform's liveness sentence; a finished row carries
+                    // none (the platform did not check it at all).
+                    let live = e
+                        .liveness_line
+                        .as_deref()
+                        .map(|line| format!("  {line}"))
+                        .unwrap_or_default();
                     outln!(
-                        "{}  {:<22} {:<12} {:<10}{} {}",
-                        short(&e.id),
-                        e.role_slug,
-                        e.run_id.map(|r| short(&r)).unwrap_or_else(|| "-".into()),
-                        e.status.as_str(),
+                        "{}  {:<22} {:<12} {:<10}{}{} {}",
+                        short(&row.id),
+                        row.role_slug,
+                        row.run_id.map(|r| short(&r)).unwrap_or_else(|| "-".into()),
+                        row.status.as_str(),
+                        live,
                         flags,
-                        e.summary
+                        row.summary
                             .as_deref()
-                            .or(e.error.as_deref())
+                            .or(row.error.as_deref())
                             .map(|s| ellipsis(s, 60))
                             .unwrap_or_default()
                     );
@@ -2833,6 +2852,9 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                     v.owner_host,
                     v.liveness
                 );
+                // REQ-LV-02 AC3: the same sentence the card and `task active`
+                // print for the same verdict.
+                outln!("{}", v.line);
             }
         }
     }
@@ -2970,7 +2992,10 @@ fn last_activity(paths: &[PathBuf]) -> Option<SystemTime> {
 /// predating rung 007) is NOT dead: it renders `owner?` as a separate
 /// triage marker and `owner_liveness: "unknown"` in json, as-is. Detection
 /// is READ-ONLY (REQ-SW-06): this view writes nothing and kills no one —
-/// resolution belongs to a human via `exec fail|cancel`. The command
+/// resolution belongs to a human via `exec fail|cancel`. Every row also
+/// carries the platform's ONE sentence for its verdict (`liveness_line`,
+/// REQ-LV-05/06): the same words the card and `exec list` print, so the two
+/// surfaces never describe one execution differently. The command
 /// writes nothing and waits for nothing: print the snapshot, exit 0 — an
 /// empty list is the normal idle state, not an error (REQ-ACT-04). It
 /// deliberately stops short of the per-task pipeline: `task progress <id>`
@@ -3013,14 +3038,18 @@ fn active_overview(ctx: &Ctx, json: bool) -> Result<()> {
         } else {
             ""
         };
+        // REQ-LV-05/06: the row answers «идёт ли работа» in the platform's own
+        // words — the SAME string the card prints for this execution, so the
+        // two surfaces can never disagree about one row.
         outln!(
-            "  {:<12} {:<24} {:<16} {:<13} {}{}",
+            "  {:<12} {:<24} {:<16} {:<13} {}{}  {}",
             short_str(&e.task_id),
             format!("{}@{}", e.role_slug, e.role_version),
             e.state,
             format!("elapsed {}", human_elapsed(e.elapsed_seconds)),
             link,
             stale,
+            e.liveness_line,
         );
     }
     Ok(())
@@ -3218,11 +3247,14 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         outln!("  (no running executions)");
     } else {
         for e in &running {
+            // REQ-LV-05: the same liveness sentence the card shows, straight
+            // from the progress read (no second call).
             outln!(
-                "  {:<24} {:<12} elapsed {}",
+                "  {:<24} {:<12} elapsed {}  {}",
                 format!("{}@{}", e.role_slug, e.role_version),
                 short_str(&e.id),
-                human_elapsed(e.elapsed_seconds)
+                human_elapsed(e.elapsed_seconds),
+                e.liveness_line
             );
         }
     }

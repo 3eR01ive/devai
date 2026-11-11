@@ -34,7 +34,7 @@ use devai_core::inbox::{
     InboxWaitPolicy, WHEN_NO_QUESTION, WHEN_PARKED_QUESTION, WaitGroup, WaitStatePolicy,
 };
 use devai_core::types::{
-    Artifact, Decision, Project, Question, QuestionStatus, RoleExecution, Task, TaskState, short_id,
+    Artifact, Decision, Project, Question, QuestionStatus, Task, TaskState, short_id,
 };
 
 use crate::session::{HomeFailure, SessionInfo};
@@ -1082,7 +1082,7 @@ pub fn agent_statuses(state: State<AppState>) -> Result<Vec<devai_api::AgentStat
 pub fn executions_list(
     state: State<AppState>,
     task_ref: Option<String>,
-) -> Result<Vec<RoleExecution>, UiError> {
+) -> Result<Vec<devai_api::ExecutionView>, UiError> {
     Ok(state.api().exec_list(task_ref.as_deref())?)
 }
 
