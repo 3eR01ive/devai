@@ -25,7 +25,10 @@ use crate::types::TaskState;
 /// `config/workflow/process.yaml` declares another version is refused with a
 /// typed config error at `devai init` (REQ-AR-16): the platform never runs a
 /// home silently under rules it was not built for.
-pub const SUPPORTED_PROCESS_VERSION: u32 = 2;
+///
+/// Version 3 replaced the silent round brake (`max_rounds_without_shift`)
+/// with the declared attempt limit (`max_attempts_without_progress`).
+pub const SUPPORTED_PROCESS_VERSION: u32 = 3;
 
 /// The special transition address: «the remembered working stage» of a hold
 /// (`return_state`), not a fixed state name. Spelled once.
@@ -180,9 +183,16 @@ pub struct ProcessTransition {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessBrakes {
-    /// Consecutive rounds of the SAME state with no new artifact (a «круг без
-    /// сдвига»): at this count the task parks instead of launching again.
-    pub max_rounds_without_shift: u32,
+    /// The attempt limit: how many COMPLETED executions of ONE role may pass
+    /// WITHOUT a substantive shift before the platform stops the task with ONE
+    /// human question. The counter lives on the (task, role) pair and is read
+    /// from stored history: a converging round of the stage's own series (the
+    /// score rises), a stored verdict change, or a move into a state the task
+    /// had never reached — a repeated round of the same loop is NOT a shift.
+    /// `5` in the shipped declaration; `None`, empty or `0` means «без
+    /// предела». The number is DATA only — no copy lives in code.
+    #[serde(default, deserialize_with = "attempt_limit_field")]
+    pub max_attempts_without_progress: Option<u32>,
     /// Consecutive failed LAUNCHES (not role results): at this count the
     /// task parks (REQ-AR-13).
     pub max_consecutive_failures: u32,
@@ -193,6 +203,20 @@ pub struct ProcessBrakes {
     pub park_immediately: Vec<String>,
     /// Where a tripped brake parks the task — a hold state.
     pub park_state: String,
+}
+
+/// One measured convergence series, declared as DATA (rework R2): the stage
+/// name the runtime's convergence slice publishes and the working states whose
+/// work that series compares. A third series is a declaration edit, not a code
+/// catalog; a state judged by two series is refused at init, so the reading is
+/// unambiguous.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSeries {
+    /// The stage token the convergence slice publishes (`spec_review`, ...).
+    pub stage: String,
+    /// The working states whose work this series measures.
+    pub states: Vec<String>,
 }
 
 /// The declared address of every custody hold.
@@ -219,6 +243,57 @@ impl ProcessHolds {
     }
 }
 
+impl ProcessBrakes {
+    /// The EFFECTIVE attempt limit: `None` when the declaration says «без
+    /// предела» (key absent, empty, or `0`). The single reading of the number
+    /// — the admission check, the status line and the stop question all ask
+    /// this, so none of them can interpret zero on its own.
+    pub fn attempt_limit(&self) -> Option<u32> {
+        self.max_attempts_without_progress.filter(|n| *n > 0)
+    }
+}
+
+/// The attempt-limit field's ONE reader (REQ-AL-04): a non-negative integer,
+/// or empty for «без предела». Negative, fractional and non-numeric values are
+/// a LOUD declaration error naming the key — a typo must never degrade into
+/// «no limit» or into a stop on the first run.
+fn attempt_limit_field<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = serde_yaml::Value::deserialize(d)?;
+    match value {
+        serde_yaml::Value::Null => Ok(None),
+        serde_yaml::Value::Number(n) => match n.as_u64() {
+            Some(u) => u32::try_from(u).map(Some).map_err(|_| {
+                D::Error::custom(
+                    "brakes.max_attempts_without_progress is out of range — it must be a \
+                     non-negative integer (0 or empty means no limit)",
+                )
+            }),
+            None => match n.as_i64() {
+                Some(i) if i < 0 => Err(D::Error::custom(format!(
+                    "brakes.max_attempts_without_progress must be a non-negative integer (got \
+                     {i}); 0 or empty means no limit"
+                ))),
+                _ => Err(D::Error::custom(
+                    "brakes.max_attempts_without_progress must be an integer or empty; 0 or \
+                     empty means no limit",
+                )),
+            },
+        },
+        other => Err(D::Error::custom(format!(
+            "brakes.max_attempts_without_progress must be an integer or empty (0 or empty means \
+             no limit), got `{}`",
+            serde_yaml::to_string(&other)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        ))),
+    }
+}
+
 /// Where a declared edge leads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -239,6 +314,12 @@ pub struct Process {
     pub transitions: Vec<ProcessTransition>,
     pub brakes: ProcessBrakes,
     pub holds: ProcessHolds,
+    /// The measured convergence series and the states each one judges. Empty
+    /// is legitimate (REQ-AL-03 AC4): progress then rests on state moves and
+    /// verdicts alone. `default` keeps a declaration written before the
+    /// catalog existed loadable.
+    #[serde(default)]
+    pub series: Vec<ProcessSeries>,
 }
 
 impl Process {
@@ -278,6 +359,36 @@ impl Process {
                     .any(|other| other.state != state && other.role.as_deref() == Some(*role))
             })
             .collect()
+    }
+
+    /// The states ONE declared convergence series judges (rework R2): the
+    /// declaration's answer, never a code catalog. No declared series → an
+    /// empty slice, and progress falls back to state moves and verdicts.
+    pub fn series_states(&self, stage: &str) -> &[String] {
+        self.series
+            .iter()
+            .find(|s| s.stage == stage)
+            .map(|s| s.states.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The measured series that judges `state`, if the declaration names one.
+    /// A state lives in at most one series (checked at init), so the answer is
+    /// unambiguous.
+    pub fn series_of(&self, state: &str) -> Option<&str> {
+        self.series
+            .iter()
+            .find(|s| s.states.iter().any(|st| st == state))
+            .map(|s| s.stage.as_str())
+    }
+
+    /// Does the measured series `stage` speak for `role` — is any state it
+    /// judges executed by that role? ONE reading shared by the series rounds
+    /// and the verdicts, so neither can attribute a shift to another role.
+    pub fn series_judges(&self, stage: &str, role: &str) -> bool {
+        self.series_states(stage)
+            .iter()
+            .any(|state| self.role_for(state) == Some(role))
     }
 
     /// The raw declared target of one edge (`RETURN_STATE` included).
@@ -369,7 +480,7 @@ pub fn parse(text: &str, where_: &str) -> Result<Process, String> {
     let policy: Process = serde_yaml::from_value(section.clone()).map_err(|e| {
         format!(
             "{where_}: process section is invalid (keys: version, conditions, states, \
-             transitions, holds, brakes): {e}"
+             transitions, holds, series, brakes): {e}"
         )
     })?;
     policy.validate(where_)?;
@@ -382,6 +493,7 @@ impl Process {
     pub fn validate(&self, where_: &str) -> Result<(), String> {
         self.validate_header(where_)?;
         self.validate_states(where_)?;
+        self.validate_series(where_)?;
         self.validate_transitions(where_)?;
         self.validate_holds(where_)?;
         self.validate_brakes(where_)
@@ -498,6 +610,67 @@ impl Process {
                     state.as_str()
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The measured series catalog is DATA (rework R2): every stage name is
+    /// non-blank and unique, every judged state is a declared role state, and
+    /// no state is judged by two series. An empty catalog is allowed — the
+    /// declaration then measures nothing and progress rests on moves/verdicts.
+    fn validate_series(&self, where_: &str) -> Result<(), String> {
+        let mut stages: Vec<&str> = Vec::new();
+        let mut judged: Vec<&str> = Vec::new();
+        for series in &self.series {
+            if series.stage.trim().is_empty() {
+                return Err(format!("{where_}: series contains a blank stage name"));
+            }
+            if stages.contains(&series.stage.as_str()) {
+                return Err(format!(
+                    "{where_}: series declares stage `{}` twice",
+                    series.stage
+                ));
+            }
+            stages.push(&series.stage);
+            self.validate_series_states(series, &mut judged, where_)?;
+        }
+        Ok(())
+    }
+
+    /// The states of ONE declared series: known, role-executed, not repeated.
+    fn validate_series_states<'a>(
+        &self,
+        series: &'a ProcessSeries,
+        judged: &mut Vec<&'a str>,
+        where_: &str,
+    ) -> Result<(), String> {
+        if series.states.is_empty() {
+            return Err(format!(
+                "{where_}: series stage `{}` names no state — a measure of nothing is not a series",
+                series.stage
+            ));
+        }
+        for state in &series.states {
+            TaskState::parse(state).map_err(|_| {
+                format!(
+                    "{where_}: series stage `{}` names unknown state `{state}`",
+                    series.stage
+                )
+            })?;
+            if self.role_for(state).is_none() {
+                return Err(format!(
+                    "{where_}: series stage `{}` judges state `{state}`, which no role executes — \
+                     a series measures role work",
+                    series.stage
+                ));
+            }
+            if judged.contains(&state.as_str()) {
+                return Err(format!(
+                    "{where_}: state `{state}` is judged by two series — the reading would be \
+                     ambiguous"
+                ));
+            }
+            judged.push(state);
         }
         Ok(())
     }
@@ -719,15 +892,11 @@ impl Process {
         Ok(())
     }
 
-    /// The brakes: non-zero budgets, a known failure-class vocabulary and a
-    /// hold park address.
+    /// The brakes: a known failure-class vocabulary and a hold park address.
+    /// The attempt limit is NOT range-checked here: `0`/empty is the declared
+    /// «без предела», and a negative or non-numeric value never reaches this
+    /// point — the field's own reader refuses it with the key name.
     fn validate_brakes(&self, where_: &str) -> Result<(), String> {
-        if self.brakes.max_rounds_without_shift == 0 {
-            return Err(format!(
-                "{where_}: brakes.max_rounds_without_shift must be >= 1 — a zero budget parks on \
-                 the first round and the process can never run"
-            ));
-        }
         if self.brakes.max_consecutive_failures == 0 {
             return Err(format!(
                 "{where_}: brakes.max_consecutive_failures must be >= 1 — a zero budget parks on \

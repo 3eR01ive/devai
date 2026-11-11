@@ -2059,8 +2059,9 @@ pub fn load_task_name_policy(dir: &Path) -> StoreResult<TaskNamePolicy> {
 // and the mapping onto the store's config error type.
 
 pub use devai_core::process::{
-    HoldKind, PROCESS_RETURN_STATE, Process, ProcessBrakes, ProcessHolds, ProcessState,
-    ProcessTransition, SUPPORTED_PROCESS_VERSION, Target, process_condition, process_executor,
+    HoldKind, PROCESS_RETURN_STATE, Process, ProcessBrakes, ProcessHolds, ProcessSeries,
+    ProcessState, ProcessTransition, SUPPORTED_PROCESS_VERSION, Target, process_condition,
+    process_executor,
 };
 
 /// The declaration under its historical name — one type, two spellings that
@@ -3348,9 +3349,70 @@ mod process_declaration_tests {
         assert_eq!(p.role_for("APPROVAL"), None);
         assert_eq!(p.executor_for("APPROVAL"), Some(process_executor::HUMAN));
         assert_eq!(p.executor_for("ACCEPTED"), Some(process_executor::NONE));
-        // The brakes are data too.
-        assert!(p.brakes.max_rounds_without_shift >= 1);
+        // The brakes are data too: five attempts without progress in the
+        // shipped declaration, and the failure brake stays non-zero.
+        assert_eq!(p.brakes.attempt_limit(), Some(5));
         assert!(p.brakes.max_consecutive_failures >= 1);
+    }
+
+    /// REQ-AL-04: the attempt limit is a non-negative integer, `0`/empty is
+    /// «без предела», and a negative or non-numeric value is a LOUD
+    /// declaration error naming the key — never a silent «no limit» and never
+    /// a stop on the first run.
+    #[test]
+    fn the_attempt_limit_is_data_with_zero_meaning_no_limit() {
+        let factory = include_str!("../../../config/workflow/process.yaml");
+        let with = |value: &str| {
+            factory.replace(
+                "max_attempts_without_progress: 5",
+                &format!("max_attempts_without_progress: {value}"),
+            )
+        };
+
+        let zero = devai_core::process::parse(&with("0"), "process.yaml").unwrap();
+        assert_eq!(zero.brakes.attempt_limit(), None, "0 = без предела");
+
+        let empty = devai_core::process::parse(
+            &factory.replace(
+                "max_attempts_without_progress: 5",
+                "max_attempts_without_progress:",
+            ),
+            "process.yaml",
+        )
+        .unwrap();
+        assert_eq!(empty.brakes.attempt_limit(), None, "empty = без предела");
+
+        for value in ["-1", "\"пять\"", "1.5"] {
+            let e = devai_core::process::parse(&with(value), "process.yaml")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("max_attempts_without_progress"),
+                "value {value} must name the key: {e}"
+            );
+        }
+    }
+
+    /// Rework R2: the stage→states catalog is DATA in the declaration, and a
+    /// bad entry (unknown state) is a loud init refusal naming it.
+    #[test]
+    fn the_series_catalog_is_data_and_an_unknown_state_is_refused() {
+        let factory = include_str!("../../../config/workflow/process.yaml");
+        let p = devai_core::process::parse(factory, "process.yaml").unwrap();
+        assert_eq!(
+            p.series_states("spec_review"),
+            ["ANALYSIS".to_string(), "REVIEW".to_string()]
+        );
+        assert_eq!(p.series_of("QA"), Some("quality"));
+
+        let broken = factory.replace(
+            "states: [ANALYSIS, REVIEW]",
+            "states: [ANALYSIS, NOT_A_STATE]",
+        );
+        let e = devai_core::process::parse(&broken, "process.yaml")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("NOT_A_STATE"), "the refusal names it: {e}");
     }
 
     /// REQ-AR-16: a declaration from another version is a TYPED refusal that

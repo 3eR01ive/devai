@@ -1930,6 +1930,8 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
     let ops: Vec<String> = v.allowed_operations;
     let current: Vec<Artifact> = v.current_artifacts;
     let open_q: Vec<Question> = v.open_questions;
+    // REQ-AL-07: the attempt counter travels with the status read.
+    let attempt_limit = v.attempt_limit;
     // REQ-QG-08: the gate's public availability is part of the status read —
     // a second console consumer reads the same fact the window sees.
     let quality_gate = v.quality_gate;
@@ -1944,6 +1946,7 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
                 "allowed_operations": ops,
                 "current_artifacts": current,
                 "open_questions": open_q,
+                "attempt_limit": attempt_limit,
                 "quality_gate": quality_gate,
                 "running_executions": running,
             })
@@ -1954,6 +1957,9 @@ fn status(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
             outln!("work:  {} · {}", r.role, r.liveness_line);
         }
         outln!("---");
+        if let Some(a) = &attempt_limit {
+            outln!("attempts: role {} — {}", a.role, a.line);
+        }
         outln!("artifacts (current): {}", current.len());
         for a in &current {
             outln!(
@@ -3207,6 +3213,11 @@ fn progress(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
         }
     }
     outln!("---");
+    // REQ-AL-07: the counter is visible below the limit too — role, attempts,
+    // limit, in the same words the stop question uses.
+    if let Some(a) = &v.attempt_limit {
+        outln!("attempts: role {} — {}", a.role, a.line);
+    }
     // REQ-AF-05 AC3: a failure BELOW the threshold is a progress line. The
     // row is stored data (`task.progress.agent_failure`), the words come from
     // the ONE class dictionary.

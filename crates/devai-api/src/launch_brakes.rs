@@ -17,13 +17,16 @@
 
 use chrono::Utc;
 
-use devai_core::types::{ExecutionStatus, Id, Task, event_kind, failure_class};
+use devai_core::types::{
+    ExecutionStatus, Id, QuestionStatus, Task, event_kind, failure_class, new_id,
+};
 use devai_core::workflow::{self, Mutation};
 use devai_runtime::RuntimeError;
 use devai_store::config::ProcessPolicy;
 
+use crate::attempt_limit::AttemptLimitView;
 use crate::mutations::ExecStarted;
-use crate::{Api, ApiResult};
+use crate::{Api, ApiError, ApiResult};
 
 /// The stored failure CLASS of a launch that did not happen (REQ-AR-13 AC1):
 /// the distinction the class vocabulary exists for, kept at the one door that
@@ -79,21 +82,60 @@ impl Api {
         self.park_launch_failure(&cur, "park_immediately", occurrence, limit, &reason)
     }
 
-    /// Park the task on a tripped brake: the state change, the reason with
-    /// the counter, and the dedicated event. `workflow::block` keeps every
-    /// workflow rule (a terminal task cannot be parked, the remembered stage
-    /// is kept for a human release) — a park is not a private store write.
-    pub(crate) fn park(
+    /// REQ-AL-05: stop the task at the attempt limit with exactly ONE human
+    /// question. The question, the trip event and the refused launch share the
+    /// SAME numbers (`view.line`); the launched run does not start, and no
+    /// second question is asked while one is already open (REQ-AL-05 AC4).
+    /// Returns the refusal sentence the caller hands back through the ack.
+    pub(crate) fn stop_on_attempt_limit(
         &self,
         task: &Task,
-        brake: &str,
-        counter: u32,
-        limit: u32,
-        reason: &str,
-    ) -> ApiResult<()> {
+        view: &AttemptLimitView,
+    ) -> ApiResult<String> {
+        let open = self
+            .store
+            .list_questions(task.id)?
+            .into_iter()
+            .any(|q| q.status == QuestionStatus::Open);
+        if open {
+            // The task already stands on a human question; the limit waits
+            // for it instead of adding a second one. No state change either.
+            return Ok(format!(
+                "{} (роль `{}`): на задаче уже открыт вопрос человека — предел попыток ждёт его \
+                 ответа, второй вопрос не задаётся",
+                view.line, view.role
+            ));
+        }
+        let Some(limit) = view.limit else {
+            // Unreachable from the callers (they stop only when
+            // `limit_reached`, which is false for `None`), but a missing limit
+            // must never be written as «предел 0» (rework R4).
+            return Err(ApiError::refused(
+                "corrupt_stop_fact",
+                format!(
+                    "attempt-limit stop for role `{}` has no declared limit — nothing is stopped",
+                    view.role
+                ),
+            ));
+        };
         let process = self.process_policy()?;
-        let m = workflow::park(&process, task, Some(reason), "platform", Utc::now())?;
-        self.commit_park(task, &m, brake, counter, limit, reason)
+        let question_id = new_id();
+        let m = workflow::park_attempt_limit(
+            &process,
+            task,
+            question_id,
+            &view.role,
+            view.attempts,
+            limit,
+            "platform",
+            Utc::now(),
+        )?;
+        self.store.commit(task.lock_version, &m)?;
+        Ok(format!(
+            "{} (роль `{}`): предел попыток без прогресса — задача остановлена, задан один вопрос \
+             человеку",
+            view.line, view.role
+        ))
     }
 
     /// The same park for a FAILED LAUNCH: the declaration says where a launch

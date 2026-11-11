@@ -195,8 +195,22 @@ export interface ProgressView {
   running_executions: RunningExecutionView[];
   /** Срез сходимости (REQ-CV-12); null только у терминальных задач. */
   convergence: ConvergenceView | null;
+  /** Счётчик попыток роли без прогресса (REQ-AL-07): роль, число, предел. */
+  attempt_limit: AttemptLimitView | null;
   /** Факт отказа агента (задача 01a1b60c): строка и ниже-порога, и парковки. */
   agent_failure: AgentFailureView | null;
+}
+
+/**
+ * Счётчик попыток роли без прогресса (REQ-AL-07). `line` — ОДНА фраза
+ * платформы («попыток без прогресса: N из M» либо «… — без предела»); окно
+ * её не собирает, чтобы числа не разошлись с решением об остановке.
+ */
+export interface AttemptLimitView {
+  role: string;
+  attempts: number;
+  limit: number | null;
+  line: string;
 }
 
 // --- отказы агента (задача 01a1b60c, REQ-AF-01..10) ---

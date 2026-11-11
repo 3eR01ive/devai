@@ -23,7 +23,7 @@
 //! ratified exception (OQ-10) moved from "direct store access" to
 //! "encapsulated bootstrap", never into the operation surface.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
 use devai_core::types::*;
@@ -39,6 +39,50 @@ use uuid::Uuid;
 
 use crate::inbox::pick_spec_artifact;
 use crate::{Api, ApiError, ApiResult, SessionKind};
+
+/// The stored facts of ONE attempt-limit trip, parsed STRICTLY (rework R4):
+/// the answer writes them into a decision and a reset event, so a corrupt trip
+/// must refuse loudly instead of recording an empty role and zero attempts as
+/// if they were true.
+struct AttemptTrip {
+    role: String,
+    attempts: u32,
+    limit: u32,
+}
+
+impl AttemptTrip {
+    fn parse(trip: &serde_json::Value) -> ApiResult<AttemptTrip> {
+        Ok(AttemptTrip {
+            role: Self::text(trip, json_field::ROLE)?,
+            attempts: Self::count(trip, json_field::ATTEMPT)?,
+            limit: Self::count(trip, json_field::LIMIT)?,
+        })
+    }
+
+    fn text(trip: &serde_json::Value, key: &'static str) -> ApiResult<String> {
+        trip.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| corrupt_stop_fact(key))
+    }
+
+    fn count(trip: &serde_json::Value, key: &'static str) -> ApiResult<u32> {
+        trip.get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| corrupt_stop_fact(key))
+    }
+}
+
+/// A trip event missing one of its facts is refused by name: the decision and
+/// the reset event stay truthful or are not written at all.
+fn corrupt_stop_fact(key: &str) -> ApiError {
+    ApiError::refused(
+        "corrupt_stop_fact",
+        format!("attempt-limit trip event has no usable `{key}` — the stop fact cannot be trusted"),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Typed requests and results (REQ-MUT-01 AC1)
@@ -1111,6 +1155,14 @@ impl Api {
                 ),
             )),
             Ok(LaunchOutcome::Refused { reason }) => {
+                // REQ-AL-05: a refusal that came WITH a park (the attempt
+                // limit stopped the task) is the stop itself, not a failed
+                // launch — counting it here would speak a second language
+                // about one event and could reach the consecutive brake.
+                let now = self.store.get_task(&task.id.to_string())?;
+                if now.state != task.state && now.state.is_hold() {
+                    return Ok(answer(None, RunLaunch::Refused, Some(reason)));
+                }
                 self.record_launch_failure(task, failure_class::PLATFORM, &reason)?;
                 Ok(answer(None, RunLaunch::Refused, Some(reason)))
             }
@@ -2146,6 +2198,14 @@ impl Api {
             ));
         }
         let task = self.store.get_task(&q.task_id.to_string())?;
+        // REQ-AL-06: the answer to the attempt-limit question is the ONLY
+        // reset of the counter. It is read from the STORED trip event (not
+        // from the question text), resolved to one of the two stored options,
+        // recorded as a decision row and acted on — «продолжить» resumes the
+        // remembered stage, «остановить» leaves the task in human custody.
+        if let Some(trip) = self.attempt_limit_trip(&task, q.id)? {
+            return self.answer_attempt_limit(&q, &task, text, &trip);
+        }
         self.store
             .answer_question(q.id, text, &self.actor, Utc::now())?;
         let process = self.process_policy()?;
@@ -2160,6 +2220,149 @@ impl Api {
             from_state: task.state,
             to_state: m.task.state,
         })
+    }
+
+    /// The stored attempt-limit trip that raised `question_id`, if any: the
+    /// event carries role, count and limit, so the answer path needs no
+    /// parsing of free text (REQ-AL-05/06).
+    fn attempt_limit_trip(
+        &self,
+        task: &Task,
+        question_id: Id,
+    ) -> ApiResult<Option<serde_json::Value>> {
+        let qid = question_id.to_string();
+        Ok(self
+            .store
+            .events(task.id, None)?
+            .into_iter()
+            .rev()
+            .find(|ev| {
+                ev.kind == event_kind::ATTEMPT_LIMIT_TRIPPED
+                    && ev
+                        .payload
+                        .get(json_field::QUESTION_ID)
+                        .and_then(|v| v.as_str())
+                        == Some(qid.as_str())
+            })
+            .map(|ev| ev.payload))
+    }
+
+    /// Apply the human answer to the attempt-limit stop (REQ-AL-06). Both
+    /// answers write a decision row (who, when, role, attempts, limit, answer)
+    /// and an append-only event; only «продолжить» is a reset boundary.
+    fn answer_attempt_limit(
+        &self,
+        q: &Question,
+        task: &Task,
+        text: &str,
+        trip: &serde_json::Value,
+    ) -> ApiResult<AnsweredOutcome> {
+        // The accepted words and the question's stored options are ONE
+        // dictionary (`attempt_limit_answer`): the answer is data, not a
+        // sentence the operator has to phrase perfectly.
+        let Some(choice) = attempt_limit_answer::parse(text) else {
+            let stored = attempt_limit_answer::ALL
+                .iter()
+                .map(|option| format!("`{option}`"))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "question {} takes one of its stored options: {stored} (got `{}`)",
+                    q.id, text
+                ),
+            ));
+        };
+        // A corrupt trip event must NOT be read as an empty role and zero
+        // attempts: the recorded decision would then lie (rework RL/R4).
+        let trip = AttemptTrip::parse(trip)?;
+        let now = Utc::now();
+        let decision = self.attempt_limit_decision(task, q, &trip, choice, now);
+        self.store.answer_question(q.id, text, &self.actor, now)?;
+        let process = self.process_policy()?;
+        let m = self.attempt_limit_mutation(&process, task, q, &trip, choice, &decision, now)?;
+        self.store.record_decision(&decision)?;
+        self.store.commit(task.lock_version, &m)?;
+        if choice == attempt_limit_answer::CONTINUE {
+            // The human said «продолжить» — the interrupted stage starts
+            // again (REQ-AL-06 AC1: no second command).
+            self.autostart_if_role_state(&m.task);
+        }
+        Ok(AnsweredOutcome {
+            question_id: q.id,
+            from_state: task.state,
+            to_state: m.task.state,
+        })
+    }
+
+    /// The decision row the answer leaves behind: who, when, role, attempts,
+    /// limit and the answer — one stored fact, no free text.
+    fn attempt_limit_decision(
+        &self,
+        task: &Task,
+        q: &Question,
+        trip: &AttemptTrip,
+        choice: &str,
+        now: DateTime<Utc>,
+    ) -> Decision {
+        Decision {
+            id: new_id(),
+            task_id: task.id,
+            kind: decision_kind::ATTEMPT_LIMIT_ANSWER.to_string(),
+            verdict: Verdict::Approved,
+            actor: self.actor.clone(),
+            rationale: None,
+            refs: vec![q.id.to_string()],
+            created_at: now,
+            payload: serde_json::json!({
+                (json_field::ROLE): &trip.role,
+                (json_field::ATTEMPT): trip.attempts,
+                (json_field::LIMIT): trip.limit,
+                (json_field::ANSWER): choice,
+            }),
+        }
+    }
+
+    /// The state mutation ONE answer produces: «продолжить» releases the hold
+    /// and writes the append-only reset event, «остановить» moves the task to
+    /// the declared human-custody hold keeping its remembered stage.
+    fn attempt_limit_mutation(
+        &self,
+        process: &ProcessPolicy,
+        task: &Task,
+        q: &Question,
+        trip: &AttemptTrip,
+        choice: &str,
+        decision: &Decision,
+        now: DateTime<Utc>,
+    ) -> ApiResult<Mutation> {
+        if choice != attempt_limit_answer::CONTINUE {
+            return Ok(workflow::answer_attempt_limit_stop(
+                process,
+                task,
+                q.id,
+                &trip.role,
+                trip.attempts,
+                trip.limit,
+                &self.actor,
+                now,
+            )?);
+        }
+        let mut m = workflow::answer_question(process, task, q.id, &self.actor, now)?;
+        m.events.push(EventDraft {
+            kind: event_kind::ATTEMPT_LIMIT_RESET,
+            actor: self.actor.clone(),
+            payload: serde_json::json!({
+                (json_field::QUESTION_ID): q.id.to_string(),
+                (json_field::ROLE): &trip.role,
+                (json_field::ATTEMPT): trip.attempts,
+                (json_field::LIMIT): trip.limit,
+                (json_field::ANSWER): choice,
+                (json_field::DECISION): decision.id.to_string(),
+            }),
+        });
+        Ok(m)
     }
 
     // ---- roles / agents / contracts ----------------------------------------

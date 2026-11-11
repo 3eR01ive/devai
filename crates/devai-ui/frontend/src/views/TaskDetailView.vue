@@ -484,6 +484,11 @@ async function activateForeignHome() {
           вне линейки стадий; текущее состояние — <b class="mono">{{ progress.pipeline.current }}</b>
           <template v-if="progress.pipeline.terminal"> (терминальное)</template>
         </p>
+        <!-- Счётчик попыток роли без прогресса (REQ-AL-07): виден и НИЖЕ
+             предела, числа — одной строкой платформы (не собираются здесь). -->
+        <p v-if="progress.attempt_limit" class="muted mono" style="margin: 8px 0 0">
+          роль {{ progress.attempt_limit.role }} · {{ progress.attempt_limit.line }}
+        </p>
       </div>
     </div>
 

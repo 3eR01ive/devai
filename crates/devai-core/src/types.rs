@@ -1482,6 +1482,33 @@ pub mod decision_kind {
     /// QA return rationale (verdict RETURNED), same backfill provenance as
     /// `REQUIREMENTS_REJECTION`.
     pub const QUALITY_RETURN: &str = "quality_return";
+    /// The human answer to the attempt-limit stop question (REQ-AL-06): the
+    /// operator chose «продолжить» or «остановить». `payload` carries role,
+    /// attempts, limit and the answer; `refs` cite the question. It is a
+    /// stored decision because resetting the counter is a HUMAN act — no
+    /// edit of the declaration, re-run or restart may do it.
+    pub const ATTEMPT_LIMIT_ANSWER: &str = "attempt_limit_answer";
+}
+
+/// The answer vocabulary of the attempt-limit question (REQ-AL-05/06): the
+/// options STORED on the question and the reply the answer path accepts are
+/// ONE dictionary (R1 quality return: the two words lived in `workflow.rs` as
+/// the question's `options` and again in the API's answer matcher, so renaming
+/// one would have left the human reading options the platform no longer took).
+/// The meaning travels with the word: `CONTINUE` zeroes the counter,
+/// `STOP` leaves the task in human custody.
+pub mod attempt_limit_answer {
+    pub const CONTINUE: &str = "продолжить";
+    pub const STOP: &str = "остановить";
+    /// The options a question carries, in the order the human reads them.
+    pub const ALL: [&str; 2] = [CONTINUE, STOP];
+
+    /// The stored option `text` names, or `None`. Matching is on the stored
+    /// words only (trim + lowercase) — never on free phrasing.
+    pub fn parse(text: &str) -> Option<&'static str> {
+        let asked = text.trim().to_lowercase();
+        ALL.into_iter().find(|option| *option == asked)
+    }
 }
 
 pub mod event_kind {
@@ -1547,6 +1574,21 @@ pub mod event_kind {
     /// A declared brake tripped (REQ-AR-09/13): the task is parked with the
     /// reason and the counter; nothing auto-continues from here.
     pub const PROCESS_PARKED: &str = "process.parked";
+    /// The attempt limit tripped (REQ-AL-05): one role has completed N
+    /// executions without a substantive shift, so the platform stopped the
+    /// task with ONE human question. Payload: role, attempts, limit, the
+    /// question id and the reason. Nothing retries automatically.
+    pub const ATTEMPT_LIMIT_TRIPPED: &str = "attempt.limit_tripped";
+    /// The human answered «продолжить» (REQ-AL-06): the counter of that role
+    /// starts again from the answer. Payload: role, attempts, limit, answer,
+    /// question id and the stored decision id. This event IS the reset
+    /// boundary — the number is derived from history, never stored as a
+    /// field of its own.
+    pub const ATTEMPT_LIMIT_RESET: &str = "attempt.limit_reset";
+    /// The human answered «остановить» (REQ-AL-06): the task stays in human
+    /// custody (the declared block address), not cancelled and not failed.
+    /// Payload: role, attempts, limit, answer, question id, decision id.
+    pub const ATTEMPT_LIMIT_STOPPED: &str = "attempt.limit_stopped";
     /// A best-effort evidence write of the run did NOT land (rework R5): the
     /// settled outcome a `--wait` caller reads back. The role's result is not
     /// lost — the rows still explain the run — but the failure is a FACT with
@@ -1704,6 +1746,9 @@ pub mod event_kind {
         EXECUTION_LAUNCH_FAILED,
         EXECUTION_LOST,
         PROCESS_PARKED,
+        ATTEMPT_LIMIT_TRIPPED,
+        ATTEMPT_LIMIT_RESET,
+        ATTEMPT_LIMIT_STOPPED,
         EXECUTION_EVIDENCE_UNWRITTEN,
         EXECUTION_FORM_REJECTED,
         EXECUTION_FORM_ESCALATED,
@@ -1876,6 +1921,12 @@ pub mod json_field {
     pub const FIRST_AT: &str = "first_at";
     pub const LAST_AT: &str = "last_at";
     pub const THRESHOLD: &str = "threshold";
+    // Attempt limit (REQ-AL-05/06): the declared ceiling, the derived count
+    // of attempts without progress and the human answer that resets it —
+    // one vocabulary for the question, the trip event, the reset event and
+    // the stored decision.
+    pub const LIMIT: &str = "limit";
+    pub const ANSWER: &str = "answer";
     /// The observation time of the failure itself.
     pub const AT: &str = "at";
 
@@ -1962,6 +2013,8 @@ pub mod json_field {
         FIRST_AT,
         LAST_AT,
         THRESHOLD,
+        LIMIT,
+        ANSWER,
         AT,
     ];
 }
@@ -1969,6 +2022,34 @@ pub mod json_field {
 #[cfg(test)]
 mod word_tests {
     use super::*;
+
+    /// R1 quality return: the two answers to the attempt-limit question are ONE
+    /// dictionary — the question's stored `options` and the reply the answer
+    /// path accepts read these very constants, so a rename cannot leave the
+    /// human reading a word the platform no longer takes.
+    #[test]
+    fn the_attempt_limit_answers_are_one_dictionary() {
+        assert_eq!(attempt_limit_answer::CONTINUE, "продолжить");
+        assert_eq!(attempt_limit_answer::STOP, "остановить");
+        assert_eq!(
+            attempt_limit_answer::ALL,
+            [attempt_limit_answer::CONTINUE, attempt_limit_answer::STOP]
+        );
+        assert_eq!(
+            attempt_limit_answer::parse("продолжить"),
+            Some(attempt_limit_answer::CONTINUE)
+        );
+        assert_eq!(
+            attempt_limit_answer::parse("  Остановить "),
+            Some(attempt_limit_answer::STOP),
+            "the stored words are accepted with the operator's whitespace and case"
+        );
+        assert_eq!(
+            attempt_limit_answer::parse("давай ещё"),
+            None,
+            "free phrasing is not an option"
+        );
+    }
 
     /// R3 quality return: ONE dictionary backs the API, the console and the
     /// window. The stored tokens never drift; unknown input is never guessed.
