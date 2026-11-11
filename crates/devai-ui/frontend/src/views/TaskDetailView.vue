@@ -15,12 +15,12 @@ import { useRoute, useRouter } from "vue-router";
 import { api, toUiError } from "../api";
 import { activateHome } from "../activation";
 import { foreignHome as foreignHomeOf } from "../homes-view";
-import { fmtElapsed, fmtTime, pollMs, shortId } from "../settings";
+import { fmtTime, pollMs, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
 import SignatureSection from "../components/SignatureSection.vue";
 import SpecDiffPanel from "../components/SpecDiffPanel.vue";
 import SignatureResultPanel from "../components/SignatureResultPanel.vue";
-import { TaskStateToken } from "../states";
+import { ExecutionStatusToken, LivenessToken, TaskStateToken } from "../states";
 import ConvergenceChart from "../components/ConvergenceChart.vue";
 import QualityGatePanel from "../components/quality/QualityGatePanel.vue";
 import type { GateAct } from "../quality_gate_view";
@@ -98,23 +98,52 @@ const convergence = computed<ConvergenceView | null>(() => progress.value?.conve
 // работа» фактом, а не догадкой. Слова — платформы (`liveness_line` строки
 // `exec.list`; ту же фразу несут task.status и task.progress), окно их не
 // перефразирует и вердикт не пересчитывает.
+//
+// ОДИН снимок факта: строка `exec.list`, перечитываемая таймером. Второй
+// снимок того же факта (progress.running_executions из loadAll) с карточки
+// убран — два чтения разной свежести давали «исполнение мертво» и «процесс
+// жив» на одном экране до ручного «Обновить» (ревью R2, corr/spec-fidelity).
+// Статус исполнения сравнивается токеном из словаря states.ts, а не
+// литералом: переименование токена в Rust ломает пин-тест, а не фильтр.
 const runningRows = computed<ExecutionView[]>(() =>
-  executions.value.filter((e) => e.status === "RUNNING"),
+  executions.value.filter((e) => e.status === ExecutionStatusToken.Running),
 );
-const runningLines = computed<string[]>(() =>
+const runningLines = computed<{ key: string; text: string; dead: boolean }[]>(() =>
   runningRows.value
     .filter((e) => e.liveness_line)
-    .map((e) => `${e.role_slug}@${e.role_version}: ${e.liveness_line}`),
+    .map((e) => ({
+      key: e.id,
+      text: `${e.role_slug}@${e.role_version}: ${e.liveness_line}`,
+      // «Мёртво» — только доказанная смерть (REQ-LV-02), и только у СВОЕГО
+      // чипа: оформление смерти одной роли не переходит на живую соседнюю.
+      dead: e.liveness === LivenessToken.Dead,
+    })),
 );
-// «Мёртво» — только доказанная смерть (REQ-LV-02): тогда рядом с индикатором
-// стоит явное действие, а не догадка оператора.
-const deadRun = computed<boolean>(() => runningRows.value.some((e) => e.liveness === "dead"));
-const restartHint = computed<string>(() => {
-  const id = shortId(status.value?.task.id ?? props.id);
-  // Снять мёртвую запись и только потом запустить — сам запуск остаётся за
-  // человеком (автоснятие и автозапуск — не эта задача).
-  return `devai exec reap --task ${id} → devai task run ${id}`;
-});
+const deadRun = computed<boolean>(() => runningLines.value.some((l) => l.dead));
+// Явное действие при доказанной смерти (REQ-LV-05 AC3): ТА ЖЕ операция
+// платформы, что `devai task run` — она сама снимает доказанно мёртвого
+// владельца (reclaim) и запускает по обычным правилам. Окно не собирает эту
+// очерёдность и не решает, кому можно запускать.
+const restartBusy = ref(false);
+const restartLine = ref<string | null>(null);
+const restartError = ref<UiError | null>(null);
+
+async function restartDead() {
+  if (restartBusy.value) return;
+  restartBusy.value = true;
+  restartError.value = null;
+  restartLine.value = null;
+  try {
+    // Ответ печатается словами платформы (`line`), не пересказом токена.
+    const out = await api.taskRun(props.id, null, false);
+    restartLine.value = out.line;
+    await loadAll();
+  } catch (e) {
+    restartError.value = toUiError(e);
+  } finally {
+    restartBusy.value = false;
+  }
+}
 
 // Один путь для обоих чтений живости (loadAll и периодическое): успешное
 // чтение делает снимок текущим и запоминает его время; отказ оставляет
@@ -294,8 +323,10 @@ async function gateAndLoad() {
 }
 // Живость перечитывается ПОСТОЯННО — из нашего же окна, без системных
 // шедулеров и сторожевых скриптов (ратифицированный ответ на вопрос цикла).
-// Дешёвое чтение `exec.list` несёт факт живости незавершённых строк; тишина
-// задачи (нет RUNNING) и терминальные задачи не опрашиваются вовсе.
+// Дешёвое чтение `exec.list` идёт на КАЖДОМ тике для любой незавершённой
+// задачи — в том числе когда RUNNING-строк сейчас нет (строка может
+// появиться); терминальная задача не опрашивается вовсе, и её терминальность
+// приходит полем progress.pipeline.terminal.
 let livenessTimer: number | undefined;
 
 async function refreshLiveness() {
@@ -378,10 +409,10 @@ async function activateForeignHome() {
       <!-- Индикатор работы (REQ-LV-05): одна строка, без раскрытия деталей. -->
       <span
         v-for="line in runningLines"
-        :key="line"
+        :key="line.key"
         class="chip-liveness"
-        :class="{ dead: deadRun, stale: livenessStale }"
-      >{{ line }}</span>
+        :class="{ dead: line.dead, stale: livenessStale }"
+      >{{ line.text }}</span>
       <!-- Перечитать живость не удалось: снимок остаётся, но говорится прямо,
            что он устарел и когда читался последний раз успешно. -->
       <span v-if="livenessStale" class="chip-liveness stale">
@@ -396,9 +427,17 @@ async function activateForeignHome() {
       class="muted mono"
       style="margin: 0 0 10px"
     >заголовок создавшего: {{ status.task.title }}</p>
-    <p v-if="deadRun" class="muted" style="margin: 0 0 10px">
-      Действие: <span class="mono">{{ restartHint }}</span>
-    </p>
+    <!-- Доказанная смерть: явное действие В ОКНЕ, а не подсказка с CLI
+         (REQ-LV-05 AC3). Ответ платформы — её собственные слова. -->
+    <div v-if="deadRun" class="rowflex" style="margin: 0 0 10px">
+      <button :disabled="restartBusy" @click="restartDead">
+        {{ restartBusy ? "Перезапуск…" : "перезапустить" }}
+      </button>
+      <span v-if="restartLine" class="muted">{{ restartLine }}</span>
+    </div>
+    <div v-if="restartError" class="errorbox" style="margin-bottom: 10px">
+      <span class="code">{{ restartError.code }}</span>{{ restartError.message }}
+    </div>
     <p class="muted" style="white-space: pre-wrap">{{ status.task.business_description }}</p>
 
     <!-- ЭКРАН ПОДПИСИ (REQ-SIGN-01): первым содержательным блоком на
@@ -680,12 +719,6 @@ async function activateForeignHome() {
             </tr>
           </tbody>
         </table>
-        <p v-if="progress && progress.running_executions.length" class="muted" style="margin: 8px 0 0">
-          <span v-for="r in progress.running_executions" :key="r.id" style="margin-right: 14px">
-            {{ r.role }} · {{ r.agent_name ?? "?" }} · {{ fmtElapsed(r.elapsed_seconds) }} ·
-            {{ r.liveness_line }}
-          </span>
-        </p>
       </div>
     </div>
 

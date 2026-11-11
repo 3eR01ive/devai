@@ -173,6 +173,20 @@ export interface ExecutionView extends RoleExecution {
   liveness_line: string | null;
 }
 
+/** Ответ запуска роли (`task.run`, REQ-LV-05 AC3): исход — токен платформы,
+ * слова — в `line`. Окно печатает `line` как есть, а не пересказывает
+ * `started|already_running|refused` своими словами. */
+export interface RunStartOutcome {
+  run_id: string;
+  execution_id: string | null;
+  outcome: "started" | "already_running" | "refused";
+  reason: string | null;
+  /** Состояние задачи, в котором просили запуск (токен платформы). */
+  state: string;
+  /** Готовая фраза платформы об исходе запуска. */
+  line: string;
+}
+
 export interface ProgressView {
   task: Task;
   snapshot_at: string;

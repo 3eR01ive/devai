@@ -1350,40 +1350,23 @@ fn task_run(
     wait_for_run(ctx, first, json)
 }
 
-/// The human rendering of the three typed launch outcomes (REQ-AR-04):
-/// «запущено» names the handle and how to watch it, «уже идёт» names the
-/// owner, «нельзя» names the reason. Extracted from `task_run` so the
-/// command's own body stays the launch + the optional wait.
+/// The human rendering of the typed launch outcome (REQ-AR-04). The VERDICT
+/// sentence is the platform's own (`RunStartOutcome::line`, the very string the
+/// window's «перезапустить» prints) — the terminal does not re-word «что
+/// произошло при запуске», it only adds the ids and hints a terminal can act
+/// on. Extracted from `task_run` so the command's own body stays the launch +
+/// the optional wait.
 fn render_launch_outcome(o: &devai_api::RunStartOutcome, task: &str) {
-    match o.outcome {
-        RunLaunch::Started => {
-            outln!(
-                "run {} started: execution {} in {}",
-                short(&Uuid::parse_str(&o.run_id).unwrap_or_else(|_| Uuid::nil())),
-                o.execution_id
-                    .as_deref()
-                    .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
-                    .unwrap_or_else(|| "-".into()),
-                o.state
-            );
-            outln!(
-                "the role runs in its own session — status: `devai exec get <id>`, log tail: \
-                 $DEVAI_HOME/evidence/<task>/<run>/supervisor.log; wait: --wait"
-            );
-        }
-        RunLaunch::AlreadyRunning => outln!(
-            "task {} already has a run: execution {} ({})",
+    outln!("{}", o.line);
+    if o.outcome == RunLaunch::Started {
+        outln!(
+            "run {}, state {}, task {} — the role runs in its own session; status: \
+             `devai exec get <id>`, log tail: $DEVAI_HOME/evidence/<task>/<run>/supervisor.log; \
+             wait: --wait",
+            short(&Uuid::parse_str(&o.run_id).unwrap_or_else(|_| Uuid::nil())),
+            o.state,
             short(&Uuid::parse_str(task).unwrap_or_else(|_| Uuid::nil())),
-            o.execution_id
-                .as_deref()
-                .map(|s| short(&Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil())))
-                .unwrap_or_else(|| "-".into()),
-            o.reason.as_deref().unwrap_or("one owner per task")
-        ),
-        RunLaunch::Refused => outln!(
-            "launch refused: {}",
-            o.reason.as_deref().unwrap_or("no reason recorded")
-        ),
+        );
     }
 }
 

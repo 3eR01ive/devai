@@ -105,9 +105,13 @@ pub struct OpDescriptor {
 /// `liveness`/`liveness_line` (present only on an UNFINISHED row),
 /// `task.status` gains `running_executions` (the same typed rows
 /// `task.progress` already carried, now with owner+liveness facts), and
-/// `exec.liveness` gains the platform's sentence `line`. Wire-visible
-/// additions, so the stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@12";
+/// `exec.liveness` gains the platform's sentence `line`.
+///
+/// `@13` (same task, rework R2): `task.run` gains `line` — the platform's ONE
+/// sentence for its typed outcome, so the card's «перезапустить» act prints
+/// the platform's words instead of re-wording `started|already_running|
+/// refused`. A wire-visible addition, so the stamp says so.
+pub const SURFACE_VERSION: &str = "api-surface@13";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -279,8 +283,8 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.run",
             class: OpClass::Mutation,
             input: "RunReq{id, agent, workspace, force_reaudit}",
-            output: "RunStartOutcome{run_id, execution_id, outcome(started|already_running|refused), reason, state}",
-            description: "ASYNC launch (REQ-AR-04): starts a detached platform runner in its own session, returns the run number and the execution handle as soon as the runner opened the row — never waits for a role, never leaves the role in the caller's process group. A second launch is the typed `already_running` outcome naming the execution that owns the task (REQ-AR-06); a human-executed state is `refused` with a reason. force_reaudit carries the --force-reaudit gate semantics. Mirrors `devai task run`.",
+            output: "RunStartOutcome{run_id, execution_id, outcome(started|already_running|refused), reason, state, line}",
+            description: "ASYNC launch (REQ-AR-04): starts a detached platform runner in its own session, returns the run number and the execution handle as soon as the runner opened the row — never waits for a role, never leaves the role in the caller's process group. A second launch is the typed `already_running` outcome naming the execution that owns the task (REQ-AR-06); a human-executed state is `refused` with a reason. `line` is the platform's one sentence for the outcome (a window prints it verbatim). force_reaudit carries the --force-reaudit gate semantics. Mirrors `devai task run`.",
         },
         OpDescriptor {
             name: "task.revise",
@@ -862,7 +866,7 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@12");
+        assert_eq!(SURFACE_VERSION, "api-surface@13");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

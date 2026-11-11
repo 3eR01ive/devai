@@ -31,6 +31,7 @@ import type {
   Project,
   Question,
   QualityReportView,
+  RunStartOutcome,
   SessionInfo,
   SignatureView,
   StatusView,
@@ -169,6 +170,11 @@ export const api = {
   agentStatuses: () => invoke<AgentStatusView[]>("agent_statuses"),
   executionsList: (task_ref: string | null) =>
     invoke<ExecutionView[]>("executions_list", { task_ref }),
+  // Перезапуск мёртвого исполнения (REQ-LV-05 AC3): та же операция платформы,
+  // что `devai task run` — она сама снимает доказанно мёртвого владельца и
+  // запускает по обычным правилам. Ответ несёт готовую фразу `line`.
+  taskRun: (id_prefix: string, agent: string | null, force_reaudit: boolean) =>
+    invoke<RunStartOutcome>("task_run", { id_prefix, agent, force_reaudit }),
   executionLiveness: (exec_id: string) =>
     invoke<LivenessView>("execution_liveness", { exec_id }),
 

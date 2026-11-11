@@ -12,7 +12,6 @@
 //! * a human decision that lands in a role state starts the run itself.
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use devai_api::{
     Api, AskReq, ReviseReq, RunLaunch, RunReq, SessionKind, SupervisedRunReq, TaskCreateReq,
@@ -20,44 +19,10 @@ use devai_api::{
 use devai_core::types::*;
 use tempfile::TempDir;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// `DEVAI_RUNNER` is process-global: one test at a time holds the lock, and
-/// the value it FOUND is restored on drop — including on panic (rework R8).
-/// A failed assert used to leave a stub runner pointing into a temp directory
-/// for every later test of this binary.
-struct RunnerEnv {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl RunnerEnv {
-    fn set(path: &Path) -> Self {
-        let guard = Self::lock();
-        let previous = std::env::var_os("DEVAI_RUNNER");
-        // SAFETY: `ENV_LOCK` serialises every reader/writer of this variable
-        // in the binary, and the value is put back on drop.
-        unsafe { std::env::set_var("DEVAI_RUNNER", path) };
-        Self {
-            _lock: guard,
-            previous,
-        }
-    }
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        // A panicking test poisons the mutex; the next test still runs.
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-impl Drop for RunnerEnv {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(v) => unsafe { std::env::set_var("DEVAI_RUNNER", v) },
-            None => unsafe { std::env::remove_var("DEVAI_RUNNER") },
-        }
-    }
-}
+// The runner a launch uses is DATA of the handle (`Api::with_runner`), not
+// process-global state: every test points ITS OWN handle at its own stub, so
+// nothing here mutates the environment the rest of the binary runs in (rework
+// R2, ts/test-independence: isolation by structure, not by a lock).
 
 fn home() -> (TempDir, Api) {
     let dir = TempDir::new().unwrap();
@@ -246,7 +211,7 @@ fn task_run_returns_the_typed_already_running_outcome_with_the_owner_id() {
     let id = task(&api, "already running");
     api.task_start(&id).unwrap();
     let script = stub_runner(dir.path(), "busy");
-    let _env = RunnerEnv::set(&script);
+    let api = api.with_runner(Some(script));
     let o = api
         .task_run(RunReq {
             id: id.clone(),
@@ -276,7 +241,7 @@ fn repeated_launch_failures_are_counted_events_and_the_threshold_parks_the_task(
     // `Api::open` never auto-launches, so all attempts are explicit ones.
     // Point the runner resolution at a path that cannot exist: a spawn-class
     // launch failure, deterministic on every host.
-    let _env = RunnerEnv::set(&dir.path().join("no-such-runner"));
+    let api = api.with_runner(Some(dir.path().join("no-such-runner")));
     for attempt in 1..=2 {
         let e = api
             .task_run(RunReq {
@@ -333,7 +298,7 @@ fn entering_a_role_state_after_a_human_act_starts_the_run_itself() {
     let api = Api::open_session(dir.path(), "operator", SessionKind::Human).unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    let _env = RunnerEnv::set(&script);
+    let api = api.with_runner(Some(script));
     let id = task(&api, "autostart");
     // `task start` enters ANALYSIS, a ROLE state: the platform must start the
     // run without a second command (REQ-AR-11/12).
@@ -356,7 +321,7 @@ fn answering_a_blocking_question_starts_the_resumed_stage_itself() {
     let api = Api::open_session(dir.path(), "operator", SessionKind::Human).unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    let _env = RunnerEnv::set(&script);
+    let api = api.with_runner(Some(script));
     let id = task(&api, "answer resumes");
     api.task_start(&id).unwrap(); // enters ANALYSIS, launches (1)
     let asked = api
@@ -390,7 +355,7 @@ fn revising_the_spec_starts_the_reviewer_itself() {
     let api = Api::open_session(dir.path(), "operator", SessionKind::Human).unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    let _env = RunnerEnv::set(&script);
+    let api = api.with_runner(Some(script));
     let id = task(&api, "revise launches review");
     api.task_start(&id).unwrap(); // launches (1)
     let marker = dir.path().join("argv");
@@ -423,7 +388,7 @@ fn signing_the_gate_from_the_window_starts_the_implementation_itself() {
     let api = Api::open_for_window(dir.path(), "operator").unwrap();
     api.seed_config(None).unwrap();
     let script = stub_runner(dir.path(), "started");
-    let _env = RunnerEnv::set(&script);
+    let api = api.with_runner(Some(script));
     let id = task(&api, "window signature");
     api.task_start(&id).unwrap(); // DRAFT -> ANALYSIS (launch 1)
     api.task_revise(ReviseReq {

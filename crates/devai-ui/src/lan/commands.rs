@@ -225,6 +225,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_return_rpc,
     },
     RpcCommand {
+        name: "task_run",
+        handler: task_run_rpc,
+    },
+    RpcCommand {
         name: "task_progress",
         handler: task_progress_rpc,
     },
@@ -600,6 +604,37 @@ fn task_return_rpc(
         state(app),
         req.id_prefix,
         req.rationale,
+        Some(actor_for(app, device)),
+    )?)
+}
+
+/// The card's restart from the phone (REQ-LV-05 AC3): the SAME platform
+/// operation as `devai task run` — the platform reaps a proven-dead owner and
+/// launches by the ordinary rules. Only the request fields are decoded; the
+/// window's handler then records the device as the actor.
+fn task_run_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let id_prefix = params
+        .get("id_prefix")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| UiError {
+            code: "invalid_params".into(),
+            message: "`id_prefix` is required".into(),
+        })?
+        .to_string();
+    let agent = params
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let force_reaudit = params.get("force_reaudit").and_then(|v| v.as_bool());
+    to_json(crate::commands::task_run_as(
+        state(app),
+        id_prefix,
+        agent,
+        force_reaudit,
         Some(actor_for(app, device)),
     )?)
 }

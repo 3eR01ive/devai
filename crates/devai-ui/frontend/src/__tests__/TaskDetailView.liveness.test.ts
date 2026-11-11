@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import TaskDetailView from "../views/TaskDetailView.vue";
 import { pollMs } from "../settings";
+import { ExecutionStatusToken, LivenessToken } from "../states";
 import { task } from "./fixtures";
 
 const mocks = vi.hoisted(() => ({
@@ -29,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   taskReject: vi.fn(),
   taskAccept: vi.fn(),
   taskReturn: vi.fn(),
+  taskRun: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
@@ -45,11 +47,11 @@ vi.mock("../activation", () => ({ activateHome: vi.fn() }));
 
 const stubs = { RouterLink: { template: "<a><slot /></a>" } };
 
-function running(liveness: string, line: string) {
+function running(liveness: string, line: string, id = "e1", role = "implementation-agent") {
   return {
-    id: "e1",
-    role: "implementation-agent@1",
-    role_slug: "implementation-agent",
+    id,
+    role: `${role}@1`,
+    role_slug: role,
     role_version: 1,
     agent_name: "mock",
     started_at: "2026-11-08T10:00:00Z",
@@ -70,7 +72,8 @@ function execRows(rows: ReturnType<typeof running>[]) {
     role_slug: r.role_slug,
     role_version: r.role_version,
     agent_name: r.agent_name,
-    status: "RUNNING",
+    // Токен платформы как есть: карточка сравнивает его словарём states.ts.
+    status: ExecutionStatusToken.Running,
     inputs: [],
     summary: null,
     error: null,
@@ -139,7 +142,7 @@ beforeEach(() => {
 
 describe("TaskDetailView · индикатор работы агента", () => {
   it("prints the platform's own sentence for a live execution", async () => {
-    wire([running("alive", "процесс жив")]);
+    wire([running(LivenessToken.Alive, "процесс жив")]);
     const w = await mountView();
     const text = indicator(w);
     expect(text).toContain("implementation-agent@1: процесс жив");
@@ -147,17 +150,59 @@ describe("TaskDetailView · индикатор работы агента", () =>
     expect(w.text()).not.toContain("devai exec reap");
   });
 
-  it("names the death and an explicit action when the owner is gone", async () => {
-    wire([running("dead", "исполнение мертво (можно перезапустить)")]);
+  it("names the death and restarts it in the window with the platform's words", async () => {
+    wire([running(LivenessToken.Dead, "исполнение мертво (можно перезапустить)")]);
+    mocks.taskRun.mockResolvedValue({
+      run_id: "r1",
+      execution_id: "e2",
+      outcome: "started",
+      reason: null,
+      state: "IMPLEMENTATION",
+      line: "прогон запущен · исполнение e2",
+    });
     const w = await mountView();
-    const text = indicator(w);
-    expect(text).toContain("исполнение мертво");
-    expect(w.text()).toContain("devai exec reap");
-    expect(w.text()).toContain("devai task run");
+    expect(indicator(w)).toContain("исполнение мертво");
+    // AC3: действие — кнопка окна, и она зовёт ТУ ЖЕ операцию платформы, что
+    // `devai task run` (одна мутация, никакой очерёдности в окне).
+    const button = w.findAll("button").find((b) => b.text() === "перезапустить");
+    expect(button, "кнопка «перезапустить» не отрендерилась").toBeDefined();
+    await button!.trigger("click");
+    await flushPromises();
+    expect(mocks.taskRun).toHaveBeenCalledWith("t1", null, false);
+    // Ответ печатается словами платформы, а не пересказом токена исхода.
+    expect(w.text()).toContain("прогон запущен · исполнение e2");
+  });
+
+  // R2 (corr/spec-fidelity): «одно исполнение — один вердикт». Чип смерти
+  // принадлежит СВОЕМУ исполнению: живая параллельная роль не получает
+  // оформление смерти только потому, что умерла соседняя строка.
+  it("marks only the dead chip, not every chip of the card", async () => {
+    const dead = running(LivenessToken.Dead, "исполнение мертво (можно перезапустить)", "e1");
+    const alive = running(LivenessToken.Alive, "процесс жив", "e2", "requirements-analyst");
+    wire([dead, alive]);
+    const w = await mountView();
+    const chips = w.findAll(".chip-liveness");
+    expect(chips.length).toBe(2);
+    const deadChip = chips.find((c) => c.text().includes("исполнение мертво"))!;
+    const aliveChip = chips.find((c) => c.text().includes("процесс жив"))!;
+    expect(deadChip.classes()).toContain("dead");
+    expect(aliveChip.classes()).not.toContain("dead");
+  });
+
+  // R2 (ts/coverage-static): ячейка живости таблицы исполнений несёт тот же
+  // факт и ту же фразу платформы — раньше её рендер не утверждался.
+  it("prints the liveness fact and the platform's sentence in the executions table", async () => {
+    wire([running(LivenessToken.Unknown, "живость проверить нельзя")]);
+    const w = await mountView();
+    const table = w.findAll(".panel").find((p) => p.text().includes("Исполнения ролей"))!;
+    expect(table.exists()).toBe(true);
+    const cell = table.findAll("td").find((td) => td.attributes("data-label") === "Живость")!;
+    expect(cell.text()).toContain("unknown");
+    expect(cell.text()).toContain("живость проверить нельзя");
   });
 
   it("never claims «работает» for an unverifiable owner", async () => {
-    wire([running("unknown", "живость проверить нельзя")]);
+    wire([running(LivenessToken.Unknown, "живость проверить нельзя")]);
     const w = await mountView();
     const text = indicator(w);
     expect(text).toContain("живость проверить нельзя");
@@ -177,7 +222,7 @@ describe("TaskDetailView · индикатор работы агента", () =>
     // таймер на нём же подвесил бы сам тест.
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     try {
-      const rows = [running("alive", "процесс жив")];
+      const rows = [running(LivenessToken.Alive, "процесс жив")];
       wire(rows);
       // Первое чтение (loadAll) удалось, периодическое — отказ IPC/стора.
       mocks.executionsList

@@ -260,6 +260,10 @@ pub struct RunStartOutcome {
     pub reason: Option<String>,
     /// The task state the launch was asked in.
     pub state: String,
+    /// The platform's ONE sentence for this outcome (REQ-LV-05 AC3): the
+    /// window's «перезапустить» prints it verbatim and the terminal prints it
+    /// before its own ids — nobody re-words the typed outcome.
+    pub line: String,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1062,12 +1066,14 @@ impl Api {
     fn launch_now(&self, task: &Task, req: &RunReq, run_id: String) -> ApiResult<RunStartOutcome> {
         let state = task.state.as_str().to_string();
         let answer = |execution_id: Option<String>, outcome: RunLaunch, reason: Option<String>| {
+            let line = crate::launch_line(outcome, execution_id.as_deref(), reason.as_deref());
             RunStartOutcome {
                 run_id: run_id.clone(),
                 execution_id,
                 outcome,
                 reason,
                 state: state.clone(),
+                line,
             }
         };
         if let Some(reason) = self.state_launch_refusal(task)? {
@@ -1134,6 +1140,7 @@ impl Api {
             force_reaudit: req.force_reaudit,
             actor: self.actor.clone(),
             run_id: run_id.to_string(),
+            runner: self.runner.clone(),
         }
     }
 

@@ -39,6 +39,10 @@ pub use devai_runtime::convergence::{
     ConvergenceCounters, ConvergencePoint, ConvergenceView, GAP_MILLI, STAGE_QUALITY,
     STAGE_SPEC_REVIEW, StageConvergence,
 };
+/// The liveness vocabulary as a published type: `liveness_line` answers for it
+/// and consumers (the UI's token dictionary pin) name its variants instead of
+/// carrying their own copy of the three words.
+pub use devai_runtime::liveness::Liveness;
 pub use error::{ApiError, ApiResult, ErrorCode};
 pub use homes::{
     HOME_ENTRY_SCHEMA, HOME_ISSUE_SCHEMA, HOME_RECORD_SCHEMA, HOME_VIEW_SCHEMA, HOMES_FILE,
@@ -152,6 +156,31 @@ pub fn liveness_line(state: liveness::Liveness) -> &'static str {
         liveness::Liveness::Alive => "процесс жив",
         liveness::Liveness::Dead => "исполнение мертво (можно перезапустить)",
         liveness::Liveness::Unknown => "живость проверить нельзя",
+    }
+}
+
+/// The platform's ONE sentence for a launch outcome (`task.run`, REQ-LV-05
+/// AC3): the card's «перезапустить» prints this line instead of wording the
+/// typed outcome itself, and the terminal prints the same sentence before its
+/// own ids and hints — one vocabulary for «что произошло при запуске».
+pub fn launch_line(
+    outcome: mutations::RunLaunch,
+    execution_id: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let exec = execution_id
+        .map(devai_core::types::short_id_str)
+        .unwrap_or_else(|| "—".to_string());
+    match outcome {
+        mutations::RunLaunch::Started => format!("прогон запущен · исполнение {exec}"),
+        mutations::RunLaunch::AlreadyRunning => format!(
+            "прогон уже идёт · исполнение {exec}{}",
+            reason.map(|r| format!(" ({r})")).unwrap_or_default()
+        ),
+        mutations::RunLaunch::Refused => format!(
+            "запуск невозможен: {}",
+            reason.unwrap_or("причина не записана")
+        ),
     }
 }
 
@@ -269,6 +298,12 @@ pub struct Api {
     /// and test doors do not — they must not spawn processes as a side effect
     /// of opening a home.
     autolaunch: bool,
+    /// The runner executable this handle launches, as DATA (no ambient env
+    /// mutation): `None` resolves the documented order in
+    /// `devai_runtime::launch::runner_exe`. Same seam idea as
+    /// [`Api::with_probe_runner`] — a test points ONE handle at a stub instead
+    /// of rewriting process-global state.
+    runner: Option<PathBuf>,
 }
 
 /// One probe call as the surface invokes it. The default is
@@ -314,6 +349,8 @@ impl Api {
             // A live platform session is allowed to start the run a state
             // requires (REQ-AR-11/12).
             autolaunch: true,
+            // Resolved by `runner_exe` unless the handle is pointed at one.
+            runner: None,
         })
     }
 
@@ -329,6 +366,16 @@ impl Api {
     /// real driver call; nothing else about the surface changes.
     pub fn with_probe_runner(mut self, runner: ProbeRunner) -> Self {
         self.probe_runner = runner;
+        self
+    }
+
+    /// Point THIS handle's launches at an explicit runner executable — the
+    /// same seam idea as [`Api::with_probe_runner`], for the launch path: a
+    /// test (or a diagnostic door) chooses the binary as DATA instead of
+    /// rewriting `DEVAI_RUNNER` for the whole process. `None` keeps the
+    /// documented resolution order of `runner_exe`.
+    pub fn with_runner(mut self, runner: Option<PathBuf>) -> Self {
+        self.runner = runner;
         self
     }
 
@@ -351,6 +398,7 @@ impl Api {
             session: SessionKind::Human,
             probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
             autolaunch: false,
+            runner: None,
         })
     }
 

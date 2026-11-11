@@ -63,6 +63,11 @@ pub struct LaunchRequest {
     /// The run number the caller minted; every execution of this chain carries
     /// it (REQ-AR-04/07).
     pub run_id: String,
+    /// The runner executable as DATA of the request. `Some` is an explicit
+    /// choice (the window/diagnostic door and the tests — no ambient process
+    /// state is mutated to point a launch at a binary); `None` falls back to
+    /// the documented resolution order in [`runner_exe`].
+    pub runner: Option<PathBuf>,
 }
 
 /// What the caller learns. `Started` carries the id of the FIRST execution —
@@ -410,7 +415,14 @@ fn runner_died(log: &Path, status: std::process::ExitStatus) -> LaunchError {
 /// call fails the launch is refused loudly instead of falling back to a
 /// same-session child.
 pub fn launch(req: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
-    let exe = runner_exe().ok_or_else(|| {
+    // An EXPLICIT runner that is not there is NO runner: falling back to the
+    // ambient resolution would run the role in a binary the caller did not
+    // choose (a test's stub is absent → the test must see the failure).
+    let exe = match req.runner.as_ref() {
+        Some(p) => p.is_file().then(|| p.clone()),
+        None => runner_exe(),
+    }
+    .ok_or_else(|| {
         LaunchError::NoRunner(
             "no platform runner binary — set DEVAI_RUNNER to the `devai` executable \
              (the role is never run inside the caller)"

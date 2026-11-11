@@ -27,7 +27,9 @@ use tauri::State;
 use chrono::Utc;
 use devai_api::{ActiveSnapshot, DependenciesView, ProgressView, QualityReportView, StatusView};
 use devai_api::{Api, ApiError, HomeRecord, HomeRecordsView, OpDescriptor};
-use devai_api::{BodyError, SignatureView, SpecPresentation, spec_presentation};
+use devai_api::{
+    BodyError, RunReq, RunStartOutcome, SignatureView, SpecPresentation, spec_presentation,
+};
 use devai_api::{ConvergenceView, InboxSnapshotView, InboxTaskFacts, SpecBodyView, SpecFacts};
 use devai_api::{WorkspaceChangesView, WorkspaceDiffView};
 use devai_core::inbox::{
@@ -432,6 +434,10 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // them through the same catalogue.
     ("task_accept", "task.accept"),
     ("task_return", "task.return"),
+    // The card's restart act (REQ-LV-05 AC3): ONE platform mutation, the same
+    // one `devai task run` calls — the person decides to restart a proven-dead
+    // execution, the platform reaps it and launches by the ordinary rules.
+    ("task_run", "task.run"),
     ("task_progress", "task.progress"),
     ("task_dependencies", "task.dependencies"),
     ("task_report", "task.report"),
@@ -520,6 +526,7 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_reject", "task.reject"),
     ("task_accept", "task.accept"),
     ("task_return", "task.return"),
+    ("task_run", "task.run"),
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
     ("model_bundle_check", "model.bundle_check"),
@@ -945,6 +952,42 @@ pub fn task_return_as(
 ) -> Result<StatusView, UiError> {
     with_actor_write(&state, actor, |api| api.task_return(&id_prefix, rationale))?;
     Ok(state.api().task_status(&id_prefix)?)
+}
+
+/// `task.run` — the card's «перезапустить» act on a PROVEN death (REQ-LV-05
+/// AC3). The SAME platform operation as `devai task run`: the platform sweeps
+/// an owner it proved gone (`reclaim`, REQ-AR-05) and then launches by the
+/// ordinary rules — the window does not orchestrate that order and does not
+/// decide who may run. The typed outcome is returned with the platform's own
+/// sentence (`line`), which the card prints verbatim; `agent: None` = the
+/// active model bundle, exactly like the terminal's default.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_run(
+    state: State<AppState>,
+    id_prefix: String,
+    agent: Option<String>,
+    force_reaudit: Option<bool>,
+) -> Result<RunStartOutcome, UiError> {
+    task_run_as(state, id_prefix, agent, force_reaudit, None)
+}
+
+/// The SAME restart act under an explicit actor: the LAN boundary passes the
+/// device marker, so history names who asked for the restart while the person
+/// stays the author — exactly like the QA acts.
+pub fn task_run_as(
+    state: State<AppState>,
+    id_prefix: String,
+    agent: Option<String>,
+    force_reaudit: Option<bool>,
+    actor: Option<String>,
+) -> Result<RunStartOutcome, UiError> {
+    let req = RunReq {
+        id: id_prefix,
+        agent: agent.unwrap_or_default(),
+        workspace: None,
+        force_reaudit: force_reaudit.unwrap_or(false),
+    };
+    with_actor_write(&state, actor, |api| api.task_run(req))
 }
 
 /// PipelineView{order,current,position,position_index,off_spine,terminal}
@@ -2008,11 +2051,13 @@ mod tests {
             "task_approve",
             "task_reject",
             "task_return",
+            "task_run",
         ];
         expected.sort_unstable();
         assert_eq!(
             mutations, expected,
-            "the window's only mutations are the signature acts plus the model surface"
+            "the window's only mutations are the signature/QA acts, the restart act and \
+             the model surface"
         );
     }
 
@@ -3126,6 +3171,55 @@ mod tests {
             assert!(
                 !view.contains(raw),
                 "InboxView.vue carries a raw state token {raw} — use TaskStateToken"
+            );
+        }
+    }
+
+    /// The SAME pinning discipline for the two vocabularies the liveness
+    /// indicator compares (rework R2, arch/no-magic): the execution status a
+    /// card filters on and the liveness answer it flags as death live in
+    /// `states.ts` as data — a renamed Rust token fails HERE instead of
+    /// silently emptying the filter in the window (there is no compile link
+    /// between a TS string and a Rust enum).
+    #[test]
+    fn states_ts_mirrors_rust_execution_and_liveness_tokens() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let ts = std::fs::read_to_string(format!("{crate_dir}/frontend/src/states.ts"))
+            .expect("frontend/src/states.ts must exist");
+        let card =
+            std::fs::read_to_string(format!("{crate_dir}/frontend/src/views/TaskDetailView.vue"))
+                .expect("TaskDetailView.vue must exist");
+        let statuses = [
+            devai_core::types::ExecutionStatus::Running,
+            devai_core::types::ExecutionStatus::Completed,
+            devai_core::types::ExecutionStatus::Failed,
+            devai_core::types::ExecutionStatus::Cancelled,
+        ];
+        for status in statuses {
+            let token = serde_json::to_value(&status).unwrap();
+            let token = token.as_str().unwrap();
+            assert!(
+                ts.contains(&format!("\"{token}\"")),
+                "states.ts has no mirror for ExecutionStatus::{status:?} (`{token}`)"
+            );
+        }
+        for answer in [
+            devai_api::Liveness::Alive,
+            devai_api::Liveness::Dead,
+            devai_api::Liveness::Unknown,
+        ] {
+            let token = answer.as_str();
+            assert!(
+                ts.contains(&format!("\"{token}\"")),
+                "states.ts has no mirror for Liveness::{answer:?} (`{token}`)"
+            );
+        }
+        // And the card COMPARES through those dictionaries, not through
+        // literals: a raw comparison would survive a token rename untouched.
+        for raw in ["\"RUNNING\"", "'RUNNING'", "\"dead\"", "'dead'"] {
+            assert!(
+                !card.contains(raw),
+                "TaskDetailView.vue compares a raw token {raw} — use the states.ts dictionary"
             );
         }
     }
