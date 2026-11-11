@@ -226,9 +226,9 @@ test("the appeal line says what the human is asked, and why when nothing is open
 // The findings the platform hands the panel: two decision items and one that
 // does not block; «не проверено» is a separate list.
 const findings = [
-  { id: "cl/fmt", what: "cargo fmt дрейф", site: "a.rs:1", note: "без этого принять нельзя", line: "cl/fmt · балл 0.000" },
-  { id: "cl/test", what: "тест падает", site: "", note: "без этого принять нельзя", line: "cl/test · балл 0.000" },
-  { id: "n/one", what: "мелкая придирка", site: "c.rs:3", note: "на будущее — принять не мешает", line: "n/one · балл 0.900" },
+  { id: "cl/fmt", what: "cargo fmt дрейф", site: "a.rs:1", stake: "без этого принять нельзя", line: "cl/fmt · балл 0.000" },
+  { id: "cl/test", what: "тест падает", site: "", stake: "без этого принять нельзя", line: "cl/test · балл 0.000" },
+  { id: "n/one", what: "мелкая придирка", site: "c.rs:3", stake: "на будущее — принять не мешает", line: "n/one · балл 0.900" },
 ];
 
 test("the return draft comes filled with every visible finding, in its stored words", () => {

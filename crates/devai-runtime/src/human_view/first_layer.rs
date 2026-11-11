@@ -82,14 +82,23 @@ pub const MISSING_UNRECORDED: &str = "причина в отчёте не зап
 /// The honest answer when a stored point names no site at all.
 pub const SITE_UNNAMED: &str = "место не указано";
 
+/// The heading of the findings section. ONE source for both channels (rework
+/// R3): the window prints it as stored, the terminal uppercases the very same
+/// sentence, so the two surfaces cannot drift into two headings.
+pub const FINDINGS_TITLE: &str = "Что нашёл аудит";
+/// The heading of the «не проверено» section — same one source.
+pub const UNCHECKED_TITLE: &str = "Не проверено — чего не хватило";
+
 /// What the saved figure next to the assessment is, in words. The operator's
 /// decision of 10.11 (REQ-SAY-02): the human sees BOTH the meaning and the
 /// number, so the score is named for what it is instead of floating alone.
 pub const SCORE_LEAD: &str = "сохранённый балл работы";
 
-/// One row of the first layer.
+/// One finding the human decides about — a defect of the work. Its human
+/// phrase, where it was found, and what accepting it costs; the machine id and
+/// the stored row ride along for the collapsed detail of the row.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct FirstLayerRow {
+pub struct FirstLayerFinding {
     /// The stored check id — the collapsed detail of this row, never its
     /// headline.
     pub id: String,
@@ -98,12 +107,34 @@ pub struct FirstLayerRow {
     /// Where it was found; empty when the report named no site (the reader
     /// says [`SITE_UNNAMED`] instead of printing a hole).
     pub site: String,
-    /// A finding: what it costs. An unchecked point: what to do about it.
-    pub note: String,
-    /// The failed/unperformed check's own stated reason, when the report
-    /// stored one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub missing: Option<String>,
+    /// What accepting the work costs because of this finding ([`stake`]): it
+    /// decides the verdict or it is a note for later.
+    pub stake: String,
+    /// The stored machine row (id · score · weight · importance · site) for
+    /// the details layer.
+    pub line: String,
+    /// The collapsed proof layer, verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+/// One point that was NOT checked — a hole in the data, NOT a defect (the two
+/// never share a list, so a point says its own thing in its own field names).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FirstLayerUnchecked {
+    /// The stored check id — the collapsed detail of this row.
+    pub id: String,
+    /// Which check was not performed, in the stored words of the report.
+    pub what: String,
+    /// Where it was to be performed; empty when the report named no site
+    /// (the reader says [`SITE_UNNAMED`]).
+    pub site: String,
+    /// What exactly was missing: the stored reason, or [`MISSING_UNRECORDED`]
+    /// when the report stored none — never an empty string.
+    pub missing: String,
+    /// What the human can do about it ([`action`]) — or that nothing is
+    /// required from them.
+    pub action: String,
     /// The stored machine row (id · score · weight · importance · site) for
     /// the details layer.
     pub line: String,
@@ -121,11 +152,15 @@ pub struct FirstLayerView {
     /// работы: 0.975». Read from `headline.score` by the one number formatter
     /// (`fmt_num`), never recomputed from the groups (REQ-SAY-02, v4).
     pub score_line: String,
+    /// The heading of the findings section, printed by both channels.
+    pub findings_title: String,
     /// The findings the human is deciding about — decision items first, then
     /// the ones that do not block, in the stored order.
-    pub findings: Vec<FirstLayerRow>,
+    pub findings: Vec<FirstLayerFinding>,
+    /// The heading of the «не проверено» section, printed by both channels.
+    pub unchecked_title: String,
     /// Checks that were not performed: NOT defects, kept apart.
-    pub unchecked: Vec<FirstLayerRow>,
+    pub unchecked: Vec<FirstLayerUnchecked>,
     /// The plain-words lead of the «не проверено» section.
     pub unchecked_lead: String,
 }
@@ -198,13 +233,31 @@ pub fn score_line(h: &HumanHeadline) -> String {
     format!("{SCORE_LEAD}: {}", super::fmt_num(h.score))
 }
 
-fn row(it: &HumanItem, note: &str, missing: Option<String>) -> FirstLayerRow {
-    FirstLayerRow {
+fn finding(it: &HumanItem, stake: &str) -> FirstLayerFinding {
+    FirstLayerFinding {
         id: it.id.clone(),
         what: it.summary.clone(),
         site: it.site.clone(),
-        note: note.to_string(),
-        missing,
+        stake: stake.to_string(),
+        line: it.line.clone(),
+        evidence: it.evidence.clone(),
+    }
+}
+
+/// An unchecked point: what was missing (the stored reason, or the honest
+/// sentence) and what to do about its own state.
+fn unchecked_point(it: &HumanItem) -> FirstLayerUnchecked {
+    let missing = it
+        .reason
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or(MISSING_UNRECORDED);
+    FirstLayerUnchecked {
+        id: it.id.clone(),
+        what: it.summary.clone(),
+        site: it.site.clone(),
+        missing: missing.to_string(),
+        action: action(it.kind.as_str()).to_string(),
         line: it.line.clone(),
         evidence: it.evidence.clone(),
     }
@@ -225,32 +278,21 @@ pub fn of(view: &HumanReportView) -> FirstLayerView {
     for key in [GROUP_BLOCKS, GROUP_NUANCES] {
         if let Some(g) = non_empty(view, key) {
             for it in &g.items {
-                findings.push(row(it, stake(g.key.as_str()), None));
+                findings.push(finding(it, stake(g.key.as_str())));
             }
         }
     }
-    let unchecked: Vec<FirstLayerRow> = non_empty(view, GROUP_UNCHECKED)
-        .map(|g| g.items.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .map(|it| {
-            row(
-                it,
-                action(it.kind.as_str()),
-                Some(
-                    it.reason
-                        .as_deref()
-                        .filter(|r| !r.trim().is_empty())
-                        .unwrap_or(MISSING_UNRECORDED)
-                        .to_string(),
-                ),
-            )
-        })
+    let unchecked: Vec<FirstLayerUnchecked> = non_empty(view, GROUP_UNCHECKED)
+        .map(|g| g.items.iter().map(unchecked_point))
+        .into_iter()
+        .flatten()
         .collect();
     FirstLayerView {
         found: found(&view.headline),
         score_line: score_line(&view.headline),
+        findings_title: FINDINGS_TITLE.to_string(),
         findings,
+        unchecked_title: UNCHECKED_TITLE.to_string(),
         unchecked,
         unchecked_lead: UNCHECKED_LEAD.to_string(),
     }
@@ -389,8 +431,8 @@ mod tests {
         assert_eq!(ids, vec!["blk/a", "n/b"], "decision items first");
         assert_eq!(first.findings[0].what, "не проверено ветвление");
         assert_eq!(first.findings[0].site, "src/a.rs:10");
-        assert_eq!(first.findings[0].note, STAKE_BLOCKS);
-        assert_eq!(first.findings[1].note, STAKE_NUANCES);
+        assert_eq!(first.findings[0].stake, STAKE_BLOCKS);
+        assert_eq!(first.findings[1].stake, STAKE_NUANCES);
         assert_eq!(first.findings[0].evidence, vec!["цитата".to_string()]);
         assert!(
             first.findings[0].line.contains("балл 0.900"),
@@ -403,7 +445,7 @@ mod tests {
     /// Unchecked points say WHAT was missing and WHAT to do — never mixed with
     /// the defects, and an unrecorded reason is said in words.
     #[test]
-    fn unchecked_points_say_what_was_missing_and_what_to_do() {
+    fn an_unchecked_point_says_what_was_missing() {
         let mut blocked = item(
             "brk/x",
             ItemKind::Blocked.as_str(),
@@ -418,6 +460,25 @@ mod tests {
             "",
         );
         silent.reason = Some("  ".into());
+        let first = of(&view(
+            headline("INCONCLUSIVE", 0, 0, 2),
+            vec![group(GROUP_UNCHECKED, vec![blocked, silent])],
+        ));
+        assert!(first.findings.is_empty(), "no defect is invented here");
+        assert_eq!(
+            first.unchecked[0].missing, "probe could not run",
+            "the stored reason is what was missing"
+        );
+        assert_eq!(
+            first.unchecked[1].missing, MISSING_UNRECORDED,
+            "an empty reason is said in words, not printed as a hole"
+        );
+    }
+
+    /// The «что делать» half of an unchecked point is the action of ITS state,
+    /// and the section keeps its own heading and lead.
+    #[test]
+    fn an_unchecked_point_says_what_to_do() {
         let pending = item("p/p", ItemKind::Pending.as_str(), "ждёт подписи", "");
         let odd = item(
             "u/u",
@@ -425,27 +486,16 @@ mod tests {
             "неизвестное состояние",
             "",
         );
-        let v = view(
-            headline("INCONCLUSIVE", 0, 0, 4),
-            vec![group(GROUP_UNCHECKED, vec![blocked, silent, pending, odd])],
-        );
-        let first = of(&v);
-        assert!(first.findings.is_empty(), "no defect is invented here");
-        assert_eq!(first.unchecked.len(), 4);
-        assert_eq!(
-            first.unchecked[0].missing.as_deref(),
-            Some("probe could not run"),
-            "the stored reason is what was missing"
-        );
-        assert_eq!(first.unchecked[0].note, ACTION_BLOCKED);
-        assert_eq!(
-            first.unchecked[1].missing.as_deref(),
-            Some(MISSING_UNRECORDED),
-            "an empty reason is said in words, not printed as a hole"
-        );
-        assert_eq!(first.unchecked[2].note, ACTION_PENDING);
-        assert_eq!(first.unchecked[3].note, ACTION_UNKNOWN);
+        let first = of(&view(
+            headline("INCONCLUSIVE", 0, 0, 2),
+            vec![group(GROUP_UNCHECKED, vec![pending, odd])],
+        ));
+        assert_eq!(first.unchecked.len(), 2);
+        assert_eq!(first.unchecked[0].action, ACTION_PENDING);
+        assert_eq!(first.unchecked[1].action, ACTION_UNKNOWN);
         assert_eq!(first.unchecked_lead, UNCHECKED_LEAD);
+        assert_eq!(first.unchecked_title, UNCHECKED_TITLE);
+        assert_eq!(first.findings_title, FINDINGS_TITLE);
         assert!(
             first.found.contains("Часть проверок не выполнена"),
             "the found sentence names the hole: {}",
@@ -472,11 +522,11 @@ mod tests {
             );
             let first = of(&v);
             assert_eq!(
-                first.unchecked[0].note, ACTION_UNDESCRIBED,
+                first.unchecked[0].action, ACTION_UNDESCRIBED,
                 "{kind}: an unknown action is said, not answered for"
             );
             assert!(
-                !first.unchecked[0].note.contains("ничего не требуется"),
+                !first.unchecked[0].action.contains("ничего не требуется"),
                 "{kind}: the report never said nothing is required"
             );
         }

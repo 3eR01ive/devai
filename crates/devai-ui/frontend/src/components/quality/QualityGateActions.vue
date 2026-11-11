@@ -24,7 +24,7 @@ import {
   type ReturnDraftItem,
 } from "../../quality_gate_view";
 import { HOLD_MS } from "../../signature_view";
-import type { FirstLayerRow, QualityGateView, UiError } from "../../types";
+import type { FirstLayerUnchecked, QualityGateView, UiError } from "../../types";
 import { useHoldToConfirm } from "../signature/useHoldToConfirm";
 
 const props = defineProps<{
@@ -35,7 +35,7 @@ const props = defineProps<{
   /** Человеческая строка о состоянии черновика (есть ли что возвращать). */
   draftNote: string;
   /** «Не проверено»: добавляется в черновик одной кнопкой, по умолчанию — нет. */
-  unchecked: FirstLayerRow[];
+  unchecked: FirstLayerUnchecked[];
 }>();
 
 const emit = defineEmits<{
@@ -70,7 +70,7 @@ function remove(key: string) {
 function clearAll() {
   emit("update:draft", []);
 }
-function addUnchecked(it: FirstLayerRow) {
+function addUnchecked(it: FirstLayerUnchecked) {
   emit("update:draft", [
     ...props.draft,
     { key: it.id, item_id: it.id, summary: it.what, site: it.site, requirement: it.what },

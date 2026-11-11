@@ -941,29 +941,35 @@ pub fn render_text(view: &HumanReportView) -> String {
         first.found.clone(),
         first.score_line.clone(),
     ];
-    render_findings(&mut out, &first.findings);
-    render_unchecked(&mut out, &first.unchecked, &first.unchecked_lead);
+    render_findings(&mut out, &first.findings_title, &first.findings);
+    render_unchecked(
+        &mut out,
+        &first.unchecked_title,
+        &first.unchecked,
+        &first.unchecked_lead,
+    );
     render_details(&mut out, view);
     out.join("\n")
 }
 
 /// The findings of the first layer: what is wrong, where it was found and what
 /// it costs; the proof stays collapsed beneath the point it belongs to. The
-/// heading carries NO count — figures live in «подробности» (rework R1: the
-/// first layer keeps only the saved score, by the operator's decision).
-fn render_findings(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow]) {
+/// heading is the FIRST LAYER's own title (one source: the panel prints the
+/// same sentence as stored, this surface uppercases it) and carries NO count —
+/// figures live in «подробности» (rework R1).
+fn render_findings(out: &mut Vec<String>, title: &str, rows: &[first_layer::FirstLayerFinding]) {
     if rows.is_empty() {
         return;
     }
     out.push(String::new());
-    out.push("ЧТО НАШЁЛ АУДИТ".to_string());
+    out.push(title.to_uppercase());
     for (i, r) in rows.iter().enumerate() {
         out.push(format!(
             "  {}. {} — где: {} ({})",
             i + 1,
             r.what,
             first_layer::site_phrase(&r.site),
-            r.note
+            r.stake
         ));
         render_evidence(out, &r.evidence);
     }
@@ -971,24 +977,24 @@ fn render_findings(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow]) {
 
 /// «Не проверено» as its OWN section (REQ-SAY-04): it is a hole in the data,
 /// not a defect — what was missing and what to do about it, per point. Like the
-/// findings heading it carries no count (rework R1).
-fn render_unchecked(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow], lead: &str) {
+/// findings heading it is the first layer's own title and carries no count.
+fn render_unchecked(
+    out: &mut Vec<String>,
+    title: &str,
+    rows: &[first_layer::FirstLayerUnchecked],
+    lead: &str,
+) {
     if rows.is_empty() {
         return;
     }
     out.push(String::new());
-    out.push("НЕ ПРОВЕРЕНО — ЧЕГО НЕ ХВАТИЛО".to_string());
+    out.push(title.to_uppercase());
     out.push(format!("  {lead}"));
     for (i, r) in rows.iter().enumerate() {
         out.push(format!("  {}. {}", i + 1, r.what));
         out.push(format!("     где: {}", first_layer::site_phrase(&r.site)));
-        out.push(format!(
-            "     чего не хватило: {}",
-            r.missing
-                .as_deref()
-                .unwrap_or(first_layer::MISSING_UNRECORDED)
-        ));
-        out.push(format!("     что делать: {}", r.note));
+        out.push(format!("     чего не хватило: {}", r.missing));
+        out.push(format!("     что делать: {}", r.action));
         render_evidence(out, &r.evidence);
     }
 }
@@ -1103,11 +1109,11 @@ mod tests {
     use super::*;
     use devai_store::config::Profile;
 
-    /// A profile whose weights/floors make the ordering expectations exact:
-    /// `blk/floor` detects a catastrophic type (floor 0.70), the two nuance
-    /// points stay above their minor floor so they are NOT decision items.
-    fn profile() -> Profile {
-        let yaml = r#"
+    /// The profile fixture as DATA (declarative, not executable logic): the
+    /// weights/floors make the ordering expectations exact — `blk/floor`
+    /// detects a catastrophic type (floor 0.70), the two nuance points stay
+    /// above their minor floor so they are NOT decision items.
+    const PROFILE_YAML: &str = r#"
 version: 1
 project: formtest
 applies_to_roles: [quality-auditor]
@@ -1177,7 +1183,28 @@ scoring:
     brk/x: 0.05
     pend/p: 0.15
 "#;
-        serde_yaml::from_str(yaml).expect("form fixture profile parses")
+
+    fn profile() -> Profile {
+        serde_yaml::from_str(PROFILE_YAML).expect("form fixture profile parses")
+    }
+
+    /// A form built from a headline and NO checks: the fixture for the rows the
+    /// form makes up itself (the S<theta row, the blocked-weight cap).
+    fn headline_only(verdict: &str, score: f64, theta: f64, basis: &str) -> HumanReportView {
+        build(
+            &profile(),
+            verdict,
+            score,
+            theta,
+            basis,
+            &[],
+            &[],
+            &[],
+            &[],
+            0.0,
+            0.2,
+            &BTreeMap::new(),
+        )
     }
 
     fn check(id: &str, state: &str, score: Option<f64>, weight: f64) -> CheckOutcome {
@@ -1240,8 +1267,10 @@ scoring:
         )
     }
 
+    /// The four groups stand in the fixed order and the decision block is
+    /// read first: the S<theta fact, the unsigned human point, the floor.
     #[test]
-    fn every_point_carries_score_weight_and_importance_in_decision_order() {
+    fn the_form_keeps_its_four_groups_and_decision_order() {
         let v = fixture();
         assert_eq!(v.version, HUMAN_VIEW_VERSION);
         assert_eq!(v.lang, "ru");
@@ -1253,9 +1282,6 @@ scoring:
         );
         assert_eq!(v.headline.verdict, "НЕ ПРОШЁЛ");
         assert_eq!(v.headline.counts.blocks, 3);
-
-        // Blocks: the S<theta fact first (R3), then the unsigned human point
-        // and the breached floor, no noise.
         let blocks: Vec<&str> = v.groups[0].items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(blocks, vec!["score-threshold", "pend/p", "blk/floor"]);
         assert_eq!(v.groups[0].items[0].kind, "threshold");
@@ -1265,7 +1291,13 @@ scoring:
         assert_eq!(floor.weight, Some(0.20));
         // importance = (1-0.4)*0.20
         assert!((floor.importance.unwrap() - 0.12).abs() < 1e-9);
+    }
 
+    /// Every nuance is a real loss with its own figures; the fully passed
+    /// point is counted in the headline, never presented as a finding.
+    #[test]
+    fn every_nuance_is_a_real_loss_with_its_own_figures() {
+        let v = fixture();
         // Nuances: EVERY remaining point still below 1.0 (0.3 included —
         // ratified OQ-QH-1 has no 0.8-0.9 band), most lost-points×weight
         // first. A fully passed point without a decision link is NOT here
@@ -1282,7 +1314,13 @@ scoring:
             );
         }
         assert_eq!(v.headline.counts.passed, 1);
+    }
 
+    /// An anchor is a NAME with an explicit ratifier; the unchecked row keeps
+    /// its reason and weight (ratified OQ-QH-2: no link, no anchor).
+    #[test]
+    fn anchors_and_unchecked_rows_carry_their_own_facts() {
+        let v = fixture();
         // Anchors: names only, and ONLY an explicit ratified_by link — a
         // fully passed point without one is not an anchor (ratified OQ-QH-2).
         assert_eq!(v.headline.counts.anchors, 1);
@@ -1310,8 +1348,13 @@ scoring:
             v.groups[3].items[0].reason.as_deref(),
             Some("probe could not run")
         );
-        // Every presented point landed somewhere, exactly once; the fully
-        // passed `ok/full` is counted, not presented (R4).
+    }
+
+    /// Every presented point landed somewhere, exactly once; the fully passed
+    /// `ok/full` is counted, not presented (R4).
+    #[test]
+    fn every_presented_point_lands_in_exactly_one_group() {
+        let v = fixture();
         for id in [
             "score-threshold",
             "blk/floor",
@@ -1375,10 +1418,10 @@ scoring:
     /// profile) used to fall into «не проверено» as an unknown token. The
     /// parser's total coverage is asserted against the producer vocabulary
     /// itself, so adding a state without teaching the form fails here.
-    #[test]
-    fn every_emitted_state_lands_in_exactly_one_group() {
-        let p = profile();
-        let checks: Vec<CheckOutcome> = CheckState::ALL
+    /// One check per state of the producer vocabulary, with a plausible score
+    /// and weight — the input of the group-coverage test below.
+    fn one_check_per_emitted_state() -> Vec<CheckOutcome> {
+        CheckState::ALL
             .iter()
             .map(|s| {
                 let (score, weight) = match s {
@@ -1393,7 +1436,13 @@ scoring:
                 }
                 c
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn every_emitted_state_lands_in_exactly_one_group() {
+        let p = profile();
+        let checks = one_check_per_emitted_state();
         let v = build(
             &p,
             "INCONCLUSIVE",
@@ -1408,6 +1457,15 @@ scoring:
             0.2,
             &BTreeMap::new(),
         );
+        assert_each_state_landed_once(&v);
+        // The passed mechanical check is accounted for in the counts, not as
+        // a hole in the report.
+        assert_eq!(v.headline.counts.passed, 1);
+    }
+
+    /// The body of the coverage check: every state stands in exactly one
+    /// group (or is counted as the norm) and none reads as an unknown token.
+    fn assert_each_state_landed_once(v: &HumanReportView) {
         for s in CheckState::ALL {
             let id = format!("st/{s:?}");
             let hits: Vec<&HumanItem> = v
@@ -1430,30 +1488,13 @@ scoring:
                 s.as_str()
             );
         }
-        // The passed mechanical check is accounted for in the counts, not as
-        // a hole in the report.
-        assert_eq!(v.headline.counts.passed, 1);
     }
 
     /// R3 (rework): group 1 carries the verdict's own threshold breach — the
     /// S<theta fact is a decision row, not only a sentence in the headline.
     #[test]
     fn a_verdict_threshold_breach_is_a_decision_row_first() {
-        let p = profile();
-        let v = build(
-            &p,
-            "FAIL",
-            0.55,
-            0.8,
-            "S below the threshold",
-            &[],
-            &[],
-            &[],
-            &[],
-            0.0,
-            0.2,
-            &BTreeMap::new(),
-        );
+        let v = headline_only("FAIL", 0.55, 0.8, "S below the threshold");
         assert_eq!(v.groups[0].items.len(), 1);
         let row = &v.groups[0].items[0];
         assert_eq!(row.id, "score-threshold");
@@ -1471,20 +1512,7 @@ scoring:
 
         // At or above theta there is no threshold row: the fact is absent, so
         // no row is invented.
-        let ok = build(
-            &p,
-            "PASS",
-            0.8,
-            0.8,
-            "at the threshold",
-            &[],
-            &[],
-            &[],
-            &[],
-            0.0,
-            0.2,
-            &BTreeMap::new(),
-        );
+        let ok = headline_only("PASS", 0.8, 0.8, "at the threshold");
         assert!(ok.groups[0].items.is_empty());
     }
 
@@ -1551,24 +1579,24 @@ scoring:
             "cap breach sits in the decision block"
         );
         assert_eq!(v.groups[0].items[1].kind, "cap");
-        // One precision for every figure of the form (`fmt_num`), the same
-        // formatter the row's own weight/summary uses (rework R3/mt-dry).
-        assert!(
-            !v.groups[0].items[1]
-                .summary
-                .chars()
-                .any(|c| c.is_ascii_digit()),
-            "the human sentence carries no figure: {}",
-            v.groups[0].items[1].summary
-        );
-        // The figures themselves are still the row's own fact, printed in the
-        // details layer by the one formatter.
-        assert_eq!(v.groups[0].items[1].weight, Some(0.25));
-        assert!(!v.groups[0].items[1].line.is_empty());
-        assert!(render_text(&v).contains("вес 0.250"));
+        assert_row_figures_stay_in_details(&v.groups[0].items[1], &render_text(&v));
         // The blocked check itself is «не проверено», never duplicated here.
         assert_eq!(v.groups[3].items.len(), 1);
         assert_eq!(v.groups[3].items[0].id, "brk/x");
+    }
+
+    /// The figures of a row stay its own stored fact, printed by the one
+    /// formatter (`fmt_num`) in «подробности» — never folded into the human
+    /// sentence (rework R3/mt-dry; REQ-SAY-02 AC2).
+    fn assert_row_figures_stay_in_details(it: &HumanItem, text: &str) {
+        assert!(
+            !it.summary.chars().any(|c| c.is_ascii_digit()),
+            "the human sentence carries no figure: {}",
+            it.summary
+        );
+        assert_eq!(it.weight, Some(0.25));
+        assert!(!it.line.is_empty());
+        assert!(text.contains("вес 0.250"));
     }
 
     #[test]
@@ -1727,6 +1755,26 @@ scoring:
         assert!(!text.contains(TITLE_UNCHECKED), "{text}");
     }
 
+    /// The section headings have ONE source (rework R3): the first layer
+    /// carries the sentences the window prints, and the terminal uppercases
+    /// the very same sentences — no second literal that can drift away.
+    #[test]
+    fn the_section_headings_come_from_the_first_layer() {
+        let v = fixture();
+        let first = first_layer::of(&v);
+        let text = render_text(&v);
+        assert_eq!(first.findings_title, first_layer::FINDINGS_TITLE);
+        assert_eq!(first.unchecked_title, first_layer::UNCHECKED_TITLE);
+        assert!(
+            text.contains(&first.findings_title.to_uppercase()),
+            "the findings heading is the first layer's own title: {text}"
+        );
+        assert!(
+            text.contains(&first.unchecked_title.to_uppercase()),
+            "the unchecked heading is the first layer's own title: {text}"
+        );
+    }
+
     /// R6: the rendered human text of ONE fixture, byte for byte (the fixture
     /// lives in `tests/fixtures/human_view_cli_text.txt`). Every wording and
     /// precision change of the CLI form shows up in the test diff instead of
@@ -1842,6 +1890,25 @@ scoring:
         }
     }
 
+    /// The array branch of [`assert_shape`]: every element against the
+    /// declared `items` schema, one indexed step deep.
+    fn walk_array(
+        schema: &serde_json::Value,
+        arr: &[serde_json::Value],
+        path: &str,
+        steps: &mut Vec<Step>,
+        checks: &mut Vec<(Vec<Step>, bool)>,
+    ) {
+        let items = schema
+            .get("items")
+            .unwrap_or_else(|| panic!("{path}: the schema declares no array items"));
+        for (i, v) in arr.iter().enumerate() {
+            steps.push(Step::Index(i));
+            assert_shape(items, v, &format!("{path}[{i}]"), steps, checks);
+            steps.pop();
+        }
+    }
+
     /// Walk the writer's own output against the schema. Collects (for every
     /// emitted key) its path and whether the schema marks it required, so the
     /// caller can prove the split both ways on the whole document.
@@ -1853,14 +1920,7 @@ scoring:
         checks: &mut Vec<(Vec<Step>, bool)>,
     ) {
         if let Some(arr) = value.as_array() {
-            let items = schema
-                .get("items")
-                .unwrap_or_else(|| panic!("{path}: the schema declares no array items"));
-            for (i, v) in arr.iter().enumerate() {
-                steps.push(Step::Index(i));
-                assert_shape(items, v, &format!("{path}[{i}]"), steps, checks);
-                steps.pop();
-            }
+            walk_array(schema, arr, path, steps, checks);
             return;
         }
         let Some(obj) = value.as_object() else {

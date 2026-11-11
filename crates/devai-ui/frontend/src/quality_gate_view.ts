@@ -23,7 +23,7 @@
 // wording and the non-empty rationale live once in `form_rules.ts`, consumed
 // by the panel, the signature card and this module — so the surfaces can
 // never disagree.
-import type { FirstLayerRow, QualityGateView } from "./types";
+import type { FirstLayerFinding, QualityGateView } from "./types";
 import { rationaleValid, siteText } from "./form_rules.ts";
 
 export { siteText };
@@ -76,7 +76,7 @@ export function addDraftItem(
  * finding order the panel prints. Nothing is invented: the phrase IS the
  * stored one, and the row stays editable.
  */
-export function prefillDraft(findings: FirstLayerRow[]): ReturnDraftItem[] {
+export function prefillDraft(findings: FirstLayerFinding[]): ReturnDraftItem[] {
   return findings.map((f) => draftItemOf({ id: f.id, summary: f.what, site: f.site }));
 }
 

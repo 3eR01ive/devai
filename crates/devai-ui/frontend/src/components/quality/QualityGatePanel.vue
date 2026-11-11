@@ -40,7 +40,7 @@ import {
 } from "../../quality_gate_view";
 import type {
   FirstLayer,
-  FirstLayerRow,
+  FirstLayerFinding,
   HumanForm,
   HumanFormItem,
   QualityReportView,
@@ -135,7 +135,7 @@ watch(
   { immediate: true },
 );
 
-function toggle(it: FirstLayerRow) {
+function toggle(it: FirstLayerFinding) {
   draft.value = toggleDraftItem(draft.value, { id: it.id, summary: it.what, site: it.site });
 }
 
@@ -191,16 +191,17 @@ function addPoint(it: HumanFormItem) {
       />
 
       <!-- ЗАМЕЧАНИЯ: человеческая фраза первой; что не так, где и чем грозит.
-           Идентификатор и числа — в раскрытии пункта. -->
+           Заголовок и подписи приходят от платформы — один источник с
+           терминалом. Идентификатор и числа — в раскрытии пункта. -->
       <section v-if="firstLayer && firstLayer.findings.length" class="qr-findings">
-        <h4 class="qr-section">Что нашёл аудит</h4>
+        <h4 class="qr-section">{{ firstLayer.findings_title }}</h4>
         <ul class="qr-items">
           <li v-for="r in firstLayer.findings" :key="r.id" class="qr-item-row">
             <details class="qr-item">
               <summary>
                 <span class="qr-what">{{ r.what }}</span>
                 <span class="muted qr-where">где: {{ siteText(r.site) }}</span>
-                <span class="muted qr-stake">{{ r.note }}</span>
+                <span class="muted qr-stake">{{ r.stake }}</span>
               </summary>
               <p class="muted qr-machine">машинная строка: <span class="mono">{{ r.line }}</span></p>
               <details v-if="r.evidence && r.evidence.length" class="qr-evidence">
@@ -217,7 +218,7 @@ function addPoint(it: HumanFormItem) {
 
       <!-- НЕ ПРОВЕРЕНО: отдельный раздел, это нехватка данных, а не дефект. -->
       <section v-if="firstLayer && firstLayer.unchecked.length" class="qr-unchecked">
-        <h4 class="qr-section">Не проверено — чего не хватило</h4>
+        <h4 class="qr-section">{{ firstLayer.unchecked_title }}</h4>
         <p class="muted qr-lead">{{ firstLayer.unchecked_lead }}</p>
         <ul class="qr-items">
           <li v-for="r in firstLayer.unchecked" :key="r.id" class="qr-item-row">
@@ -225,7 +226,7 @@ function addPoint(it: HumanFormItem) {
               <summary><span class="qr-what">{{ r.what }}</span></summary>
               <p class="muted qr-where">где: {{ siteText(r.site) }}</p>
               <p class="muted">чего не хватило: {{ r.missing }}</p>
-              <p class="muted">что делать: {{ r.note }}</p>
+              <p class="muted">что делать: {{ r.action }}</p>
               <p class="muted qr-machine">машинная строка: <span class="mono">{{ r.line }}</span></p>
               <details v-if="r.evidence && r.evidence.length" class="qr-evidence">
                 <summary class="muted">доказательства ({{ r.evidence.length }})</summary>

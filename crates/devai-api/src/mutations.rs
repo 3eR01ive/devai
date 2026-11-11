@@ -869,16 +869,7 @@ impl Api {
             engine = engine.with_workspace(w);
         }
         let report = engine.advance(&req.id, &req.agent, &self.actor)?;
-        // The gate renderings read the presented quality report — the same
-        // status-aware selection (REQ-005, REQ-QH-05/06) the UI panel uses:
-        // the stored human form when present, the §2.6 text otherwise, plus
-        // the freshness marker when the report is no longer the last word.
-        let presented = match report.gate {
-            Gate::WaitingAccept | Gate::ReportFresh => {
-                self.presented_quality_report(report.task_id)?
-            }
-            _ => None,
-        };
+        let presented = self.presented_for_gate(&report)?;
         let gate_report_text = presented.as_ref().map(|p| p.text.clone());
         let gate_report_freshness = presented.map(|p| p.freshness);
         let current_quality_report = match report.gate {
@@ -887,35 +878,7 @@ impl Api {
             }),
             _ => None,
         };
-        // REQ-HP-05 (ratified OQ-HP-1): the paragraph half of the gate
-        // presentation — approval/review reads spec + review, acceptance
-        // reads the implementation-report. Stored fields, verbatim; absence
-        // (a legacy @1/@2 CURRENT, a non-JSON body) renders as NO paragraph,
-        // never as a broken gate (REQ-HP-06 non-retroactivity in the render
-        // half too).
-        let mut gate_human_paragraphs: Vec<(String, String)> = Vec::new();
-        match report.gate {
-            Gate::WaitingApproval => {
-                for (kind, label) in [
-                    (ArtifactKind::RequirementsSpec, "requirements-specification"),
-                    (ArtifactKind::ReviewReport, "review-report"),
-                ] {
-                    if let Some(p) = self.stored_human_paragraph(report.task_id, kind, label)? {
-                        gate_human_paragraphs.push(p);
-                    }
-                }
-            }
-            Gate::WaitingAccept | Gate::ReportFresh => {
-                if let Some(p) = self.stored_human_paragraph(
-                    report.task_id,
-                    ArtifactKind::ImplementationReport,
-                    "implementation-report",
-                )? {
-                    gate_human_paragraphs.push(p);
-                }
-            }
-            _ => {}
-        }
+        let gate_human_paragraphs = self.gate_human_paragraphs(report.task_id, report.gate)?;
         let t = self.store.get_task(&report.task_id.to_string())?;
         Ok(RunOutcome {
             report,
@@ -928,6 +891,43 @@ impl Api {
                 .map(|s| s.to_string())
                 .collect(),
         })
+    }
+
+    /// The quality report a decision gate presents: the stored human form when
+    /// present, the §2.6 text otherwise — the same status-aware selection
+    /// (REQ-005, REQ-QH-05/06) the UI panel reads.
+    fn presented_for_gate(&self, report: &RunReport) -> ApiResult<Option<PresentedReport>> {
+        match report.gate {
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                self.presented_quality_report(report.task_id)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The paragraph half of the gate presentation (REQ-HP-05, ratified
+    /// OQ-HP-1): approval/review reads spec + review, acceptance reads the
+    /// implementation-report. Stored fields, verbatim; absence (a legacy @1/@2
+    /// CURRENT, a non-JSON body) renders as NO paragraph, never as a broken
+    /// gate (REQ-HP-06 non-retroactivity in the render half too).
+    fn gate_human_paragraphs(&self, task: Id, gate: Gate) -> ApiResult<Vec<(String, String)>> {
+        let mut paragraphs: Vec<(String, String)> = Vec::new();
+        let wanted: &[(ArtifactKind, &str)] = match gate {
+            Gate::WaitingApproval => &[
+                (ArtifactKind::RequirementsSpec, "requirements-specification"),
+                (ArtifactKind::ReviewReport, "review-report"),
+            ],
+            Gate::WaitingAccept | Gate::ReportFresh => {
+                &[(ArtifactKind::ImplementationReport, "implementation-report")]
+            }
+            _ => &[],
+        };
+        for (kind, label) in wanted {
+            if let Some(p) = self.stored_human_paragraph(task, *kind, label)? {
+                paragraphs.push(p);
+            }
+        }
+        Ok(paragraphs)
     }
 
     pub fn task_revise(&self, req: ReviseReq) -> ApiResult<ReviseOutcome> {
@@ -3455,13 +3455,22 @@ scoring:
         );
         assert!(!p.freshness.stale);
         assert_eq!(p.freshness.report_status, "CURRENT");
+    }
 
+    /// The UI view carries the FIRST LAYER of the same read — the panel does
+    /// not derive it, and both channels carry one and the same layer
+    /// (REQ-SAY-01..06, rework R1 wiring).
+    #[test]
+    fn the_ui_view_carries_the_first_layer_of_the_same_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = seeded_api(dir.path());
+        let t = fresh_task(&api, "form-first-layer");
+        publish_form_report(&api, t);
+
+        let p = api.presented_quality_report(t).unwrap().unwrap();
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.report_text.as_deref(), Some(p.text.as_str()));
         assert_eq!(view.source, "human_form");
-        // The UI view carries the FIRST LAYER of the same read: the panel does
-        // not derive it, and both channels carry one and the same layer
-        // (REQ-SAY-01..06, rework R1 wiring).
         let first = view
             .first_layer
             .as_ref()
@@ -3481,7 +3490,7 @@ scoring:
             first
                 .findings
                 .iter()
-                .all(|f| !f.what.is_empty() && !f.note.is_empty()),
+                .all(|f| !f.what.is_empty() && !f.stake.is_empty()),
             "every finding is a phrase with its stake"
         );
     }
@@ -3685,13 +3694,29 @@ scoring:
         );
     }
 
-    /// QA R2 / rework R4: «no report» (Ok(None)), «damaged form» and «the blob
-    /// is not JSON at all» are three DISTINGUISHABLE outcomes. A corrupt
-    /// CURRENT blob is presented with a marker naming the artifact and a
-    /// distinct render source — never as absence of a report and never as the
-    /// generic «assembled before @2» placeholder.
+    /// Publish a plain-text quality report (the pre-@5 body shape) and return
+    /// its artifact row.
+    fn publish_text_report(api: &Api, t: Id, text: &str) -> Artifact {
+        api.artifact_publish_row(PublishReq {
+            id: t.to_string(),
+            kind: ArtifactKind::QualityReport,
+            name: "qr".into(),
+            content: serde_json::to_vec(&serde_json::json!({ "report_text": text })).unwrap(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })
+        .unwrap()
+        .artifact
+    }
+
+    /// QA R2 / rework R4: «no report» (Ok(None)) and a stored text body are
+    /// distinguishable — absence is answered as absence, never as an empty
+    /// placeholder.
     #[test]
-    fn quality_report_text_distinguishes_absence_from_corruption() {
+    fn quality_report_text_is_absent_before_a_report_and_verbatim_after() {
         let dir = tempfile::tempdir().unwrap();
         let api = api(dir.path());
         let t = fresh_task(&api, "gate-text");
@@ -3700,33 +3725,26 @@ scoring:
             None,
             "no report yet — honest absence"
         );
-
-        let row = api
-            .artifact_publish_row(PublishReq {
-                id: t.to_string(),
-                kind: ArtifactKind::QualityReport,
-                name: "qr".into(),
-                content: br#"{"report_text":"all good"}"#.to_vec(),
-                depends: vec![],
-                contract: None,
-                execution: None,
-                category: DataCategory::Artifact,
-                verdict: None,
-            })
-            .unwrap();
+        publish_text_report(&api, t, "all good");
         assert_eq!(
             api.quality_report_text(t).unwrap().as_deref(),
             Some("all good")
         );
+    }
 
+    /// QA R2 / rework R4: a corrupt CURRENT blob is presented with a marker
+    /// naming the artifact and a distinct render source — never as absence of
+    /// a report and never as the generic «assembled before @2» placeholder.
+    #[test]
+    fn a_corrupt_current_blob_is_named_not_read_as_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api(dir.path());
+        let t = fresh_task(&api, "gate-text-corrupt");
+        let row = publish_text_report(&api, t, "all good");
         // Corrupt the stored blob under the CURRENT row: the next read must
         // say so, not fall through to «no report» and not show the
         // pre-@2 placeholder.
-        std::fs::write(
-            api.store.blob_path(&row.artifact.sha256),
-            b"not-json-at-all",
-        )
-        .unwrap();
+        std::fs::write(api.store.blob_path(&row.sha256), b"not-json-at-all").unwrap();
         let p = api.presented_quality_report(t).unwrap().unwrap();
         assert_eq!(p.source, present::RenderSource::CorruptBody);
         assert!(p.text.contains("повреждён"), "{}", p.text);

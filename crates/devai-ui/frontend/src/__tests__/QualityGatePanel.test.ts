@@ -34,25 +34,28 @@ afterEach(() => {
 });
 
 /** The platform's first layer for the fixture: two blocking points, one
- *  nuance, one unchecked check. The wording is the platform's, printed as is. */
+ *  nuance, one unchecked check. The wording — headings included — is the
+ *  platform's, printed as is. */
 function firstLayer(): FirstLayer {
-  const it = (id: string, what: string, site: string, note: string, evidence?: string[]) => ({
-    id, what, site, note, line: `${id} · балл 0.000 · вес 0.100`, evidence,
+  const it = (id: string, what: string, site: string, stake: string, evidence?: string[]) => ({
+    id, what, site, stake, line: `${id} · балл 0.000 · вес 0.100`, evidence,
   });
   return {
     found: "Принять как есть нельзя: есть замечания, которые мешают.",
     score_line: "сохранённый балл работы: 0.820",
+    findings_title: "Что нашёл аудит",
     findings: [
       it("cl/fmt", "cargo fmt дрейф", "a.rs:442", "без этого работу принять нельзя", ["probe: fmt отстаёт"]),
       it("n/one", "мелкая придирка", "", "на будущее — принять не мешает"),
     ],
+    unchecked_title: "Не проверено — чего не хватило",
     unchecked: [
       {
         id: "brk/x",
         what: "проверка не прошла",
         site: "",
-        note: "нужен повторный прогон: проверке не хватило условий",
         missing: "probe could not run",
+        action: "нужен повторный прогон: проверке не хватило условий",
         line: "brk/x · балл — · вес 0.050",
       },
     ],
@@ -174,6 +177,9 @@ describe("QualityGatePanel", () => {
 
   it("reads every finding as a human phrase with its place and its weight on the verdict", () => {
     const w = mountPanel();
+    // The section heading is the platform's own field, not a copy in the panel
+    // (rework R3: one source for the terminal and the window).
+    expect(w.find(".qr-findings h4").text()).toBe("Что нашёл аудит");
     const rows = w.findAll(".qr-findings details.qr-item");
     expect(rows).toHaveLength(2);
     const first = rows[0];
