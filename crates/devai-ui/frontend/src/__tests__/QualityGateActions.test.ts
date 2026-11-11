@@ -142,7 +142,9 @@ describe("QualityGateActions", () => {
 
   it("shows the filled draft as the points that will go back, one text field each", async () => {
     const w = mountActions({ draft: [draftItem] });
-    expect(w.text()).toContain("1 пункт(ов) уйдёт вместе с возвратом");
+    // The draft head says what the points are for, with no count in the first layer.
+    expect(w.text()).toContain("пункты ниже уйдут вместе с возвратом");
+    expect(w.find(".draft-head").text()).not.toMatch(/\d/);
     expect(w.text()).toContain("сними те, что не надо возвращать");
     const input = w.find(".draft-item input");
     expect((input.element as HTMLInputElement).value).toBe("cargo fmt дрейф");

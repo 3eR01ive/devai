@@ -194,7 +194,9 @@ describe("QualityGatePanel", () => {
     const w = mountPanel();
     const section = w.find(".qr-unchecked");
     expect(section.exists()).toBe(true);
-    expect(section.text()).toContain("Не проверено — чего не хватило (1)");
+    // The heading names the section, not a count: figures live in «подробности».
+    expect(section.find("h4").text()).toBe("Не проверено — чего не хватило");
+    expect(section.find("h4").text()).not.toMatch(/\d/);
     expect(section.text()).toContain("не недостатки работы");
     expect(section.text()).toContain("чего не хватило: probe could not run");
     expect(section.text()).toContain("что делать: нужен повторный прогон");

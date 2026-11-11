@@ -69,8 +69,13 @@ pub const ACTION_NO_SCORE: &str =
 pub const ACTION_UNKNOWN: &str = "это дефект самого отчёта: платформа не знает такого состояния проверки — нужен повторный прогон аудита";
 /// The signature the platform is waiting for.
 pub const ACTION_PENDING: &str = "нужна твоя подпись — без неё итог не финализируется";
-/// Nothing is required from the human for this datum.
-pub const ACTION_NONE: &str = "здесь от тебя ничего не требуется";
+/// A point whose `kind` is not one of the «не проверено» states this build can
+/// name (a row that belongs to another group, or a token from a newer
+/// producer): the report says nothing about what it needs, so the screen must
+/// not answer for it — neither «ничего не требуется» nor a known action. It
+/// says only what it can: the action is not described (rework R1).
+pub const ACTION_UNDESCRIBED: &str =
+    "что здесь требуется от человека, в отчёте не описано — нужен повторный прогон аудита";
 
 /// The honest answer when a stored point names no reason at all.
 pub const MISSING_UNRECORDED: &str = "причина в отчёте не записана";
@@ -156,7 +161,11 @@ pub fn stake(group: &str) -> &'static str {
     }
 }
 
-/// What the human can do about a point of the «не проверено» group.
+/// What the human can do about a point of the «не проверено» group. Every
+/// branch speaks only of a state this build actually knows; a kind that is not
+/// one of them gets no invented answer (rework R1: the old catch-all claimed
+/// «здесь от тебя ничего не требуется» for any token nobody had taught the
+/// reader, which is a fact the report never stated).
 pub fn action(kind: &str) -> &'static str {
     if kind == ItemKind::Pending.as_str() {
         ACTION_PENDING
@@ -169,7 +178,7 @@ pub fn action(kind: &str) -> &'static str {
     } else if kind == ItemKind::Unknown.as_str() {
         ACTION_UNKNOWN
     } else {
-        ACTION_NONE
+        ACTION_UNDESCRIBED
     }
 }
 
@@ -442,6 +451,41 @@ mod tests {
             "the found sentence names the hole: {}",
             first.found
         );
+    }
+
+    /// A kind that is not a «не проверено» state gets no invented answer: the
+    /// screen never claims «здесь от тебя ничего не требуется» for a point the
+    /// report said nothing about (rework R1). A known kind that stands outside
+    /// this group and a token this build has never seen both read as «действие
+    /// не описано», and every known state keeps its own answer.
+    #[test]
+    fn a_point_with_no_known_action_never_claims_nothing_is_required() {
+        for kind in [
+            ItemKind::Cap.as_str(),
+            ItemKind::Gate.as_str(),
+            "a-token-of-the-future",
+        ] {
+            let row = item("x/x", kind, "пункт вне известных состояний", "");
+            let v = view(
+                headline("INCONCLUSIVE", 0, 0, 1),
+                vec![group(GROUP_UNCHECKED, vec![row])],
+            );
+            let first = of(&v);
+            assert_eq!(
+                first.unchecked[0].note, ACTION_UNDESCRIBED,
+                "{kind}: an unknown action is said, not answered for"
+            );
+            assert!(
+                !first.unchecked[0].note.contains("ничего не требуется"),
+                "{kind}: the report never said nothing is required"
+            );
+        }
+        // Every state this reader knows still answers for itself.
+        assert_eq!(action(ItemKind::Blocked.as_str()), ACTION_BLOCKED);
+        assert_eq!(action(ItemKind::GateUnperformed.as_str()), ACTION_GATE);
+        assert_eq!(action(ItemKind::NoScore.as_str()), ACTION_NO_SCORE);
+        assert_eq!(action(ItemKind::Unknown.as_str()), ACTION_UNKNOWN);
+        assert_eq!(action(ItemKind::Pending.as_str()), ACTION_PENDING);
     }
 
     /// Anchors and fully passed points are not findings: the first layer lists

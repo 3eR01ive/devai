@@ -3459,6 +3459,31 @@ scoring:
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.report_text.as_deref(), Some(p.text.as_str()));
         assert_eq!(view.source, "human_form");
+        // The UI view carries the FIRST LAYER of the same read: the panel does
+        // not derive it, and both channels carry one and the same layer
+        // (REQ-SAY-01..06, rework R1 wiring).
+        let first = view
+            .first_layer
+            .as_ref()
+            .expect("a readable stored form reaches the UI with its first layer");
+        assert_eq!(Some(first), p.first_layer.as_ref(), "one read, one layer");
+        assert!(
+            first.score_line.starts_with("сохранённый балл работы: 0."),
+            "the saved score travels beside the assessment: {}",
+            first.score_line
+        );
+        assert!(
+            first.findings.iter().any(|f| f.site == "src/a.rs:7"),
+            "the breached floor reaches the findings with its site: {:?}",
+            first.findings
+        );
+        assert!(
+            first
+                .findings
+                .iter()
+                .all(|f| !f.what.is_empty() && !f.note.is_empty()),
+            "every finding is a phrase with its stake"
+        );
     }
 
     /// REQ-QH-06 fallback: a pre-@5 body still renders its own stored text,
@@ -3487,6 +3512,15 @@ scoring:
         assert_eq!(
             api.presented_quality_report(t).unwrap().unwrap().source,
             present::RenderSource::FlatText
+        );
+        // A legacy report has no human form, so it has NO first layer: the
+        // viewer is never handed an invented one (rework R1 wiring).
+        assert!(
+            api.task_report(&t.to_string())
+                .unwrap()
+                .first_layer
+                .is_none(),
+            "the new layer is not invented for a body that never had a form"
         );
     }
 
@@ -3697,8 +3731,10 @@ scoring:
         assert_eq!(p.source, present::RenderSource::CorruptBody);
         assert!(p.text.contains("повреждён"), "{}", p.text);
         assert!(!p.text.contains("before @2"), "{}", p.text);
+        assert!(p.first_layer.is_none(), "a broken body has no first layer");
         let view = api.task_report(&t.to_string()).unwrap();
         assert_eq!(view.source, "corrupt_body");
+        assert!(view.first_layer.is_none(), "the UI view invents no layer");
         assert!(
             view.report_text.unwrap_or_default().contains("повреждён"),
             "the UI view carries the same marker"
@@ -3740,6 +3776,14 @@ scoring:
             "the damaged form must be announced: {text}"
         );
         assert!(text.contains("FLAT-BODY-STILL-HERE"), "{text}");
+        assert!(
+            api.presented_quality_report(t)
+                .unwrap()
+                .unwrap()
+                .first_layer
+                .is_none(),
+            "a damaged form has no first layer — the flat text stays flat"
+        );
     }
 
     /// REQ-MUT-03/04 + human Q2: `Api::open` is the only bootstrap entry —

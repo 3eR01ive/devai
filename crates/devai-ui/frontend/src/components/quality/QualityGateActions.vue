@@ -140,7 +140,7 @@ function addUnchecked(it: FirstLayerRow) {
       <div class="rowflex draft-head">
         <b>Черновик возврата</b>
         <span class="muted">
-          — {{ props.draft.length ? `${props.draft.length} пункт(ов) уйдёт вместе с возвратом` : "пусто" }}
+          — {{ props.draft.length ? "пункты ниже уйдут вместе с возвратом" : "пусто" }}
         </span>
         <div class="spacer" />
         <button v-if="props.draft.length" class="clear" @click="clearAll">снять все</button>

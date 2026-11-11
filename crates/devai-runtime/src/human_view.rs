@@ -948,13 +948,15 @@ pub fn render_text(view: &HumanReportView) -> String {
 }
 
 /// The findings of the first layer: what is wrong, where it was found and what
-/// it costs; the proof stays collapsed beneath the point it belongs to.
+/// it costs; the proof stays collapsed beneath the point it belongs to. The
+/// heading carries NO count — figures live in «подробности» (rework R1: the
+/// first layer keeps only the saved score, by the operator's decision).
 fn render_findings(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow]) {
     if rows.is_empty() {
         return;
     }
     out.push(String::new());
-    out.push(format!("ЧТО НАШЁЛ АУДИТ ({})", rows.len()));
+    out.push("ЧТО НАШЁЛ АУДИТ".to_string());
     for (i, r) in rows.iter().enumerate() {
         out.push(format!(
             "  {}. {} — где: {} ({})",
@@ -968,13 +970,14 @@ fn render_findings(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow]) {
 }
 
 /// «Не проверено» as its OWN section (REQ-SAY-04): it is a hole in the data,
-/// not a defect — what was missing and what to do about it, per point.
+/// not a defect — what was missing and what to do about it, per point. Like the
+/// findings heading it carries no count (rework R1).
 fn render_unchecked(out: &mut Vec<String>, rows: &[first_layer::FirstLayerRow], lead: &str) {
     if rows.is_empty() {
         return;
     }
     out.push(String::new());
-    out.push(format!("НЕ ПРОВЕРЕНО — ЧЕГО НЕ ХВАТИЛО ({})", rows.len()));
+    out.push("НЕ ПРОВЕРЕНО — ЧЕГО НЕ ХВАТИЛО".to_string());
     out.push(format!("  {lead}"));
     for (i, r) in rows.iter().enumerate() {
         out.push(format!("  {}. {}", i + 1, r.what));

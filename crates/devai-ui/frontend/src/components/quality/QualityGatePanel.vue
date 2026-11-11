@@ -175,7 +175,7 @@ function addPoint(it: HumanFormItem) {
 
       <!-- НЕ ПРОВЕРЕНО: отдельный раздел, это нехватка данных, а не дефект. -->
       <section v-if="firstLayer && firstLayer.unchecked.length" class="qr-unchecked">
-        <h4 class="qr-section">Не проверено — чего не хватило ({{ firstLayer.unchecked.length }})</h4>
+        <h4 class="qr-section">Не проверено — чего не хватило</h4>
         <p class="muted qr-lead">{{ firstLayer.unchecked_lead }}</p>
         <ul class="qr-items">
           <li v-for="r in firstLayer.unchecked" :key="r.id" class="qr-item-row">

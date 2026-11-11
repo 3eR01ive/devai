@@ -584,4 +584,126 @@ mod tests {
         assert!(!settled.stale);
         assert!(settled.marker.is_empty());
     }
+
+    /// One stored form of the shape the assembler writes: enough for the
+    /// first layer — the saved headline score, one blocking finding, one
+    /// nuance, one unchecked check.
+    fn stored_form() -> crate::human_view::HumanReportView {
+        use crate::human_view::{
+            GROUP_BLOCKS, GROUP_NUANCES, GROUP_UNCHECKED, HumanCounts, HumanGroup, HumanHeadline,
+            HumanItem,
+        };
+        let item = |id: &str, kind: &str, summary: &str, site: &str| HumanItem {
+            id: id.into(),
+            kind: kind.into(),
+            summary: summary.into(),
+            line: format!("{id} · балл 0.400 · вес 0.200"),
+            site: site.into(),
+            score: Some(0.4),
+            weight: Some(0.2),
+            importance: Some(0.12),
+            ratified_by: None,
+            reason: None,
+            evidence: vec![],
+        };
+        let group = |key: &str, items: Vec<HumanItem>| HumanGroup {
+            key: key.into(),
+            title: key.to_uppercase(),
+            lead: String::new(),
+            items,
+        };
+        crate::human_view::HumanReportView {
+            version: 2,
+            lang: "ru".into(),
+            headline: HumanHeadline {
+                verdict: "НЕ ПРОШЁЛ".into(),
+                machine_verdict: "FAIL".into(),
+                score: 0.6,
+                theta: 0.9,
+                basis: "красные линии".into(),
+                numbers: "S=0.600/1.00, порог 0.900".into(),
+                counts: HumanCounts {
+                    blocks: 1,
+                    nuances: 1,
+                    anchors: 0,
+                    unchecked: 1,
+                    passed: 0,
+                },
+            },
+            groups: vec![
+                group(
+                    GROUP_BLOCKS,
+                    vec![item(
+                        "blk/a",
+                        "floor",
+                        "дыра в проверке ветвления",
+                        "src/a.rs:10",
+                    )],
+                ),
+                group(
+                    GROUP_NUANCES,
+                    vec![item("n/b", "scored", "мелкая придирка", "")],
+                ),
+                group(
+                    GROUP_UNCHECKED,
+                    vec![item("brk/x", "blocked", "проверка не прошла", "")],
+                ),
+            ],
+            blocked_weight: 0.2,
+            max_blocked_weight: 0.2,
+        }
+    }
+
+    /// REQ-SAY-01..06 wiring (rework R1): the first layer is read off the SAME
+    /// stored form the text is laid out from — one read, one answer. A body
+    /// with no readable form (legacy flat text, damaged form) carries NO first
+    /// layer: it is not invented for a report that never had one.
+    #[test]
+    fn the_first_layer_is_read_from_the_stored_form_and_only_from_it() {
+        let v = stored_form();
+        let body = serde_json::json!({ "human_view": serde_json::to_value(&v).unwrap() });
+        let r = render_stored_report(&body);
+        assert_eq!(r.source, RenderSource::HumanForm);
+        let first = r
+            .first_layer
+            .as_ref()
+            .expect("a readable stored form carries its first layer");
+        assert_eq!(first.found, first_layer::found(&v.headline));
+        assert_eq!(first.score_line, "сохранённый балл работы: 0.600");
+        // Decision items first; the machine id travels only for the detail.
+        let ids: Vec<&str> = first.findings.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["blk/a", "n/b"]);
+        assert_eq!(first.findings[0].what, "дыра в проверке ветвления");
+        assert_eq!(first.findings[0].site, "src/a.rs:10");
+        assert_eq!(first.findings[0].note, first_layer::STAKE_BLOCKS);
+        assert_eq!(first.unchecked.len(), 1);
+        assert_eq!(
+            first.unchecked[0].missing.as_deref(),
+            Some(first_layer::MISSING_UNRECORDED),
+            "no stored reason is said in words"
+        );
+        // The text and the layer are two layouts of ONE read.
+        assert!(r.text.contains(&first.found), "{}", r.text);
+        assert!(
+            r.text.contains(first.findings[0].what.as_str()),
+            "{}",
+            r.text
+        );
+
+        // A legacy body: its own flat text, no layer dressed up as the new one.
+        let flat = serde_json::json!({ "report_text": "LEGACY-FLAT-TEXT" });
+        let r = render_stored_report(&flat);
+        assert_eq!(r.source, RenderSource::FlatText);
+        assert_eq!(r.text, "LEGACY-FLAT-TEXT");
+        assert!(r.first_layer.is_none());
+
+        // A damaged form: announced, and still no layer.
+        let damaged = serde_json::json!({
+            "report_text": "FLAT",
+            "human_view": { "version": "not-a-number", "headline": 42 },
+        });
+        let r = render_stored_report(&damaged);
+        assert_eq!(r.source, RenderSource::CorruptForm);
+        assert!(r.first_layer.is_none());
+    }
 }
