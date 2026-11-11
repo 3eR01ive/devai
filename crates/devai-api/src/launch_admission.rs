@@ -9,8 +9,9 @@
 //!   human/none state launches nothing — a typed «нельзя», not a failure);
 //! * is there an executable agent for the stage (REQ-AR-08: no id without a
 //!   live process);
-//! * is a declared brake tripped (REQ-AR-09/13: rounds without a shift park
-//!   the task instead of launching again);
+//! * is the declared attempt limit reached (REQ-AL-05: a role that stopped
+//!   moving the task is stopped BEFORE the next launch and ONE human question
+//!   is asked — the silent round-park brake is gone);
 //! * is the task already owned (REQ-AR-06: one owner per task, the refusal
 //!   names the owner and touches nothing).
 //!
@@ -46,6 +47,22 @@ impl Api {
             return Ok(None);
         }
         let policy = self.process_policy()?;
+        // REQ-AL-05 AC5: a task ALREADY stopped by the attempt limit refuses a
+        // plain launch in the SAME words and numbers as its question and its
+        // status line. The branch is limited to hold states: the first trip
+        // happens in an ACTIVE state and must go through admission, which is
+        // what raises the question.
+        if task.state.is_hold() {
+            if let Some(view) = self.attempt_limit_view(task, &policy)? {
+                if crate::attempt_limit::limit_reached(view.attempts, view.limit) {
+                    return Ok(Some(format!(
+                        "{} (роль `{}`): задача остановлена пределом попыток без прогресса — \
+                         ждёт ответа человека на вопрос",
+                        view.line, view.role
+                    )));
+                }
+            }
+        }
         let state = task.state.as_str();
         if policy.role_for(state).is_some() {
             return Ok(None);
@@ -77,14 +94,21 @@ impl Api {
         // REQ-AR-05: prove-dead rows are closed before the guard asks.
         reclaim::reclaim(&self.store, Some(task.id))?;
         let task = self.store.resolve_task(&req.task_id)?;
-        if let Some(reason) = self.brake_reason(&task, policy, &role)? {
-            self.refuse_launch(req, &reason);
-            return Ok(None);
-        }
         if let Some(owner) = self.live_owner(&task)? {
             // REQ-AR-06: the refusal NAMES the execution that holds the task.
             let _ = launch::write_ack(&req.ack, &format!("busy {} {owner}", req.run_id));
             return Ok(None);
+        }
+        // REQ-AL-05/08: the attempt limit is checked BEFORE a new run starts
+        // and never reaches into a live chain (the owner check above already
+        // refused a busy task). At the limit the task is stopped with ONE
+        // human question, and the refusal says the same numbers.
+        if let Some(view) = self.attempt_limit_view(&task, policy)? {
+            if crate::attempt_limit::limit_reached(view.attempts, view.limit) {
+                let reason = self.stop_on_attempt_limit(&task, &view)?;
+                self.refuse_launch(req, &reason);
+                return Ok(None);
+            }
         }
         Ok(Some(role))
     }
@@ -112,40 +136,6 @@ impl Api {
              one: `devai model switch <id>` (or run the role with an explicit --agent)"
                 .to_string()
         }))
-    }
-
-    /// BRAKE: rounds without a shift (REQ-AR-09/13). A round is an execution of
-    /// the same stage role since the task's last NEW artifact; at the declared
-    /// count the task parks with the reason and counter, and nothing
-    /// auto-continues from a park.
-    fn brake_reason(
-        &self,
-        task: &Task,
-        policy: &ProcessPolicy,
-        role: &str,
-    ) -> ApiResult<Option<String>> {
-        let last_artifact = self
-            .store
-            .artifacts(task.id)?
-            .iter()
-            .map(|a| a.created_at)
-            .max();
-        let rounds = self
-            .store
-            .list_executions(Some(task.id))?
-            .into_iter()
-            .filter(|e| {
-                e.role_slug == role && last_artifact.map(|t| e.started_at > t).unwrap_or(true)
-            })
-            .count() as u32;
-        let limit = policy.brakes.max_rounds_without_shift;
-        if rounds < limit {
-            return Ok(None);
-        }
-        let reason =
-            format!("brake: {rounds} round(s) of `{role}` without a new artifact (limit {limit})");
-        self.park(task, "rounds_without_shift", rounds, limit, &reason)?;
-        Ok(Some(reason))
     }
 
     /// REQ-AR-06: «идёт прогон» is wider than «есть строка RUNNING». Between

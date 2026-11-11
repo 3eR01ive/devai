@@ -18,6 +18,7 @@
 //! per the human-ratified cycle-2 answer to Q2: the prohibition on direct
 //! store access in consumers is total.
 
+mod attempt_limit;
 mod error;
 mod homes;
 mod inbox;
@@ -34,6 +35,7 @@ mod signature;
 /// producers here and by the UI bootstrap (R3 quality return).
 pub mod codes;
 
+pub use attempt_limit::AttemptLimitView;
 pub use devai_runtime::convergence;
 pub use devai_runtime::convergence::{
     ConvergenceCounters, ConvergencePoint, ConvergenceView, GAP_MILLI, STAGE_QUALITY,
@@ -405,6 +407,9 @@ impl Api {
         } else {
             None
         };
+        // REQ-AL-07: the counter is part of the status read, not a separate
+        // command — the same derivation the stop rule uses.
+        let attempt_limit = self.attempt_limit_view(&t, &process)?;
         Ok(StatusView {
             task: t,
             allowed_operations: ops,
@@ -416,6 +421,7 @@ impl Api {
                 .into_iter()
                 .filter(|q| q.status == QuestionStatus::Open)
                 .collect(),
+            attempt_limit,
             quality_gate,
         })
     }
@@ -446,6 +452,9 @@ impl Api {
         let running = running_views(&executions, now);
         let artifacts = self.store.artifacts(t.id)?;
         let convergence = self.task_convergence(&t, &artifacts, &executions);
+        // REQ-AL-07: the same triple the status read answers, on the progress
+        // read the card uses — one calculation, no second reading of the rule.
+        let attempt_limit = self.attempt_limit_view(&t, &process)?;
         let agent_failure = self.task_agent_failure(&t)?;
         Ok(ProgressView {
             task: t.clone(),
@@ -461,6 +470,7 @@ impl Api {
             allowed_operations: workflow::allowed_ops(&process, &t),
             running_executions: running,
             convergence,
+            attempt_limit,
             agent_failure,
         })
     }
@@ -629,7 +639,7 @@ impl Api {
     /// rides on `task.progress` and on `inbox.snapshot`, the two reads that
     /// existed before (REQ-CV-14: no new operations). A TERMINAL task
     /// answers `None` — the slice does not read the bodies of finished work.
-    fn task_convergence(
+    pub(crate) fn task_convergence(
         &self,
         task: &Task,
         arts: &[Artifact],
@@ -1338,6 +1348,10 @@ pub struct StatusView {
     pub allowed_operations: Vec<String>,
     pub current_artifacts: Vec<Artifact>,
     pub open_questions: Vec<Question>,
+    /// REQ-AL-07: the role whose counter this task carries, the derived count
+    /// of attempts without progress and the declared limit — the SAME numbers
+    /// the stop rule and the card use. Visible BELOW the limit too.
+    pub attempt_limit: Option<AttemptLimitView>,
     /// REQ-QG-08/09: the QA gate's per-action availability and platform
     /// refusal; `None` outside QA (the actions do not exist there).
     pub quality_gate: Option<QualityGateView>,
@@ -1374,6 +1388,9 @@ pub struct ProgressView {
     /// The convergence slice (REQ-CV-12); `null` on terminal tasks and on
     /// rows outside the wait section.
     pub convergence: Option<ConvergenceView>,
+    /// REQ-AL-07: the attempt counter of the stage (role, attempts, limit).
+    /// `null` when the task has no role stage (terminal or human-only).
+    pub attempt_limit: Option<AttemptLimitView>,
     /// The task's stored agent-failure fact (task 01a1b60c, REQ-AF-05 AC3):
     /// the latest failure, its class and the series (`k из N`). Present also
     /// BELOW the parking threshold — such a failure is a progress line, not

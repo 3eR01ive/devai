@@ -1105,6 +1105,14 @@ impl Api {
                 ),
             )),
             Ok(LaunchOutcome::Refused { reason }) => {
+                // REQ-AL-05: a refusal that came WITH a park (the attempt
+                // limit stopped the task) is the stop itself, not a failed
+                // launch — counting it here would speak a second language
+                // about one event and could reach the consecutive brake.
+                let now = self.store.get_task(&task.id.to_string())?;
+                if now.state != task.state && now.state.is_hold() {
+                    return Ok(answer(None, RunLaunch::Refused, Some(reason)));
+                }
                 self.record_launch_failure(task, failure_class::PLATFORM, &reason)?;
                 Ok(answer(None, RunLaunch::Refused, Some(reason)))
             }
@@ -2102,6 +2110,14 @@ impl Api {
             ));
         }
         let task = self.store.get_task(&q.task_id.to_string())?;
+        // REQ-AL-06: the answer to the attempt-limit question is the ONLY
+        // reset of the counter. It is read from the STORED trip event (not
+        // from the question text), resolved to one of the two stored options,
+        // recorded as a decision row and acted on — «продолжить» resumes the
+        // remembered stage, «остановить» leaves the task in human custody.
+        if let Some(trip) = self.attempt_limit_trip(&task, q.id)? {
+            return self.answer_attempt_limit(&q, &task, text, &trip);
+        }
         self.store
             .answer_question(q.id, text, &self.actor, Utc::now())?;
         let process = self.process_policy()?;
@@ -2111,6 +2127,137 @@ impl Api {
         // stage that asked — a role state, so the platform starts that run
         // itself (no second command).
         self.autostart_if_role_state(&m.task);
+        Ok(AnsweredOutcome {
+            question_id: q.id,
+            from_state: task.state,
+            to_state: m.task.state,
+        })
+    }
+
+    /// The stored attempt-limit trip that raised `question_id`, if any: the
+    /// event carries role, count and limit, so the answer path needs no
+    /// parsing of free text (REQ-AL-05/06).
+    fn attempt_limit_trip(
+        &self,
+        task: &Task,
+        question_id: Id,
+    ) -> ApiResult<Option<serde_json::Value>> {
+        let qid = question_id.to_string();
+        Ok(self
+            .store
+            .events(task.id, None)?
+            .into_iter()
+            .rev()
+            .find(|ev| {
+                ev.kind == event_kind::ATTEMPT_LIMIT_TRIPPED
+                    && ev
+                        .payload
+                        .get(json_field::QUESTION_ID)
+                        .and_then(|v| v.as_str())
+                        == Some(qid.as_str())
+            })
+            .map(|ev| ev.payload))
+    }
+
+    /// One of the two STORED options, or a typed refusal naming them: the
+    /// answer is data, not a sentence the operator has to phrase perfectly.
+    fn attempt_limit_choice(text: &str) -> Option<&'static str> {
+        match text.trim().to_lowercase().as_str() {
+            "продолжить" => Some("продолжить"),
+            "остановить" => Some("остановить"),
+            _ => None,
+        }
+    }
+
+    /// Apply the human answer to the attempt-limit stop (REQ-AL-06). Both
+    /// answers write a decision row (who, when, role, attempts, limit, answer)
+    /// and an append-only event; only «продолжить» is a reset boundary.
+    fn answer_attempt_limit(
+        &self,
+        q: &Question,
+        task: &Task,
+        text: &str,
+        trip: &serde_json::Value,
+    ) -> ApiResult<AnsweredOutcome> {
+        let Some(choice) = Self::attempt_limit_choice(text) else {
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "question {} takes one of its stored options: `продолжить` or `остановить` \
+                     (got `{}`)",
+                    q.id, text
+                ),
+            ));
+        };
+        let role = trip
+            .get(json_field::ROLE)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let attempts = trip
+            .get(json_field::ATTEMPT)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let limit = trip
+            .get(json_field::LIMIT)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let now = Utc::now();
+        let decision = Decision {
+            id: new_id(),
+            task_id: task.id,
+            kind: decision_kind::ATTEMPT_LIMIT_ANSWER.to_string(),
+            verdict: Verdict::Approved,
+            actor: self.actor.clone(),
+            rationale: None,
+            refs: vec![q.id.to_string()],
+            created_at: now,
+            payload: serde_json::json!({
+                (json_field::ROLE): role,
+                (json_field::ATTEMPT): attempts,
+                (json_field::LIMIT): limit,
+                (json_field::ANSWER): choice,
+            }),
+        };
+        self.store.answer_question(q.id, text, &self.actor, now)?;
+        let process = self.process_policy()?;
+        let m = if choice == "продолжить" {
+            let mut m = workflow::answer_question(&process, task, q.id, &self.actor, now)?;
+            m.events.push(EventDraft {
+                kind: event_kind::ATTEMPT_LIMIT_RESET,
+                actor: self.actor.clone(),
+                payload: serde_json::json!({
+                    (json_field::QUESTION_ID): q.id.to_string(),
+                    (json_field::ROLE): role,
+                    (json_field::ATTEMPT): attempts,
+                    (json_field::LIMIT): limit,
+                    (json_field::ANSWER): choice,
+                    (json_field::DECISION): decision.id.to_string(),
+                }),
+            });
+            m
+        } else {
+            // «Остановить»: the task moves to the declared human-custody hold
+            // and KEEPS the remembered stage; it is not cancelled, not
+            // failed, and nothing launches from a held state.
+            workflow::answer_attempt_limit_stop(
+                &process,
+                task,
+                q.id,
+                &role,
+                attempts,
+                limit,
+                &self.actor,
+                now,
+            )?
+        };
+        self.store.record_decision(&decision)?;
+        self.store.commit(task.lock_version, &m)?;
+        if choice == "продолжить" {
+            // The human said «продолжить» — the interrupted stage starts
+            // again (REQ-AL-06 AC1: no second command).
+            self.autostart_if_role_state(&m.task);
+        }
         Ok(AnsweredOutcome {
             question_id: q.id,
             from_state: task.state,

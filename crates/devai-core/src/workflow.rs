@@ -1056,6 +1056,139 @@ pub fn answer_question(
     Ok(m)
 }
 
+/// The attempt limit tripped (REQ-AL-05): one role completed `attempts`
+/// executions without a substantive shift, so the platform stops BEFORE the
+/// next launch and asks ONE question — role, attempts, limit, and exactly two
+/// stored options. Nothing is retried automatically and no role/model switch
+/// is promised. The question row rides in the SAME mutation as the parked
+/// state (the empty-rework / agent-failure discipline: a held task is always
+/// answerable).
+pub fn park_attempt_limit(
+    process: &Process,
+    task: &Task,
+    question_id: Id,
+    role_slug: &str,
+    attempts: u32,
+    limit: u32,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "park-attempt-limit",
+        CoreError::hint("only an active stage can be stopped by the attempt limit"),
+    )?;
+    let payload = json!({
+        (json_field::QUESTION_ID): question_id.to_string(),
+        "blocking": true,
+        (json_field::GATE): "attempt-limit",
+        (json_field::ROLE): role_slug,
+        (json_field::ATTEMPT): attempts,
+        (json_field::LIMIT): limit,
+    });
+    let mut m = hold(
+        process,
+        task,
+        HoldKind::Question,
+        event_kind::QUESTION_RAISED,
+        actor,
+        now,
+        payload,
+    )?;
+    m.events.push(EventDraft {
+        kind: event_kind::ATTEMPT_LIMIT_TRIPPED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::ROLE): role_slug,
+            (json_field::ATTEMPT): attempts,
+            (json_field::LIMIT): limit,
+            (json_field::QUESTION_ID): question_id.to_string(),
+        }),
+    });
+    m.questions.push(QuestionDraft {
+        id: question_id,
+        text: format!(
+            "Что случилось: роль `{role_slug}` отработала {attempts} попыток без прогресса \
+             (предел {limit}) — ни стадия, ни вердикт, ни сходимость не сдвинулись.\n\
+             Почему важно: платформа не продолжает сама, не меняет роль и не меняет модель; \
+             следующий запуск упрётся в тот же предел.\n\
+             Что сделать: ответьте `продолжить` — счётчик этой роли начнётся с нуля, задача \
+             вернётся в прерванную стадию и запустится; или `остановить` — задача останется в \
+             удержании у человека (не отмена и не провал; это отдельные действия)."
+        ),
+        context: Some(format!(
+            "gate=attempt-limit role={role_slug} attempts={attempts} limit={limit}"
+        )),
+        options: vec!["продолжить".into(), "остановить".into()],
+        blocking: true,
+    });
+    Ok(m)
+}
+
+/// The human answered «остановить» to the attempt-limit question (REQ-AL-06):
+/// the task leaves the question hold for the DECLARED human-custody address
+/// (`holds.block`) and keeps the remembered working stage. It is NOT cancelled
+/// and NOT failed — both stay separate human actions; nothing launches from a
+/// held state, so no automatic continuation exists.
+pub fn answer_attempt_limit_stop(
+    process: &Process,
+    task: &Task,
+    question_id: Id,
+    role_slug: &str,
+    attempts: u32,
+    limit: u32,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::WaitingForInput],
+        "stop-on-attempt-limit",
+        CoreError::hint("the task is not waiting for the attempt-limit answer"),
+    )?;
+    let to = process.hold_target(HoldKind::Block)?;
+    let from = task.state;
+    let mut next = task.clone();
+    next.state = to;
+    next.updated_at = now;
+    next.lock_version += 1;
+    // The remembered WORKING stage of the question hold carries over: a later
+    // human release returns to it, not to this hold.
+    let stage = task.return_state;
+    next.return_state = stage.or(Some(from));
+    Ok(Mutation {
+        task: next,
+        events: vec![
+            EventDraft {
+                kind: event_kind::QUESTION_ANSWERED,
+                actor: actor.to_string(),
+                payload: json!({
+                    (json_field::QUESTION_ID): question_id.to_string(),
+                    (json_field::ANSWER): "остановить",
+                    (json_field::FROM): from.as_str(),
+                    (json_field::TO): to.as_str(),
+                }),
+            },
+            EventDraft {
+                kind: event_kind::ATTEMPT_LIMIT_STOPPED,
+                actor: actor.to_string(),
+                payload: json!({
+                    (json_field::QUESTION_ID): question_id.to_string(),
+                    (json_field::ROLE): role_slug,
+                    (json_field::ATTEMPT): attempts,
+                    (json_field::LIMIT): limit,
+                    (json_field::ANSWER): "остановить",
+                    (json_field::FROM): from.as_str(),
+                    (json_field::TO): to.as_str(),
+                }),
+            },
+        ],
+        artifact_status: Vec::new(),
+        questions: Vec::new(),
+    })
+}
+
 /// The response-form correction loop exhausted its configured attempts
 /// (OQ-FG-08, ratified): the task parks in WAITING_FOR_INPUT on a blocking
 /// question carrying the FULL violation list of the last attempt — a bare

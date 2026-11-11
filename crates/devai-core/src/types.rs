@@ -1482,6 +1482,12 @@ pub mod decision_kind {
     /// QA return rationale (verdict RETURNED), same backfill provenance as
     /// `REQUIREMENTS_REJECTION`.
     pub const QUALITY_RETURN: &str = "quality_return";
+    /// The human answer to the attempt-limit stop question (REQ-AL-06): the
+    /// operator chose «продолжить» or «остановить». `payload` carries role,
+    /// attempts, limit and the answer; `refs` cite the question. It is a
+    /// stored decision because resetting the counter is a HUMAN act — no
+    /// edit of the declaration, re-run or restart may do it.
+    pub const ATTEMPT_LIMIT_ANSWER: &str = "attempt_limit_answer";
 }
 
 pub mod event_kind {
@@ -1547,6 +1553,21 @@ pub mod event_kind {
     /// A declared brake tripped (REQ-AR-09/13): the task is parked with the
     /// reason and the counter; nothing auto-continues from here.
     pub const PROCESS_PARKED: &str = "process.parked";
+    /// The attempt limit tripped (REQ-AL-05): one role has completed N
+    /// executions without a substantive shift, so the platform stopped the
+    /// task with ONE human question. Payload: role, attempts, limit, the
+    /// question id and the reason. Nothing retries automatically.
+    pub const ATTEMPT_LIMIT_TRIPPED: &str = "attempt.limit_tripped";
+    /// The human answered «продолжить» (REQ-AL-06): the counter of that role
+    /// starts again from the answer. Payload: role, attempts, limit, answer,
+    /// question id and the stored decision id. This event IS the reset
+    /// boundary — the number is derived from history, never stored as a
+    /// field of its own.
+    pub const ATTEMPT_LIMIT_RESET: &str = "attempt.limit_reset";
+    /// The human answered «остановить» (REQ-AL-06): the task stays in human
+    /// custody (the declared block address), not cancelled and not failed.
+    /// Payload: role, attempts, limit, answer, question id, decision id.
+    pub const ATTEMPT_LIMIT_STOPPED: &str = "attempt.limit_stopped";
     /// A best-effort evidence write of the run did NOT land (rework R5): the
     /// settled outcome a `--wait` caller reads back. The role's result is not
     /// lost — the rows still explain the run — but the failure is a FACT with
@@ -1704,6 +1725,9 @@ pub mod event_kind {
         EXECUTION_LAUNCH_FAILED,
         EXECUTION_LOST,
         PROCESS_PARKED,
+        ATTEMPT_LIMIT_TRIPPED,
+        ATTEMPT_LIMIT_RESET,
+        ATTEMPT_LIMIT_STOPPED,
         EXECUTION_EVIDENCE_UNWRITTEN,
         EXECUTION_FORM_REJECTED,
         EXECUTION_FORM_ESCALATED,
@@ -1876,6 +1900,12 @@ pub mod json_field {
     pub const FIRST_AT: &str = "first_at";
     pub const LAST_AT: &str = "last_at";
     pub const THRESHOLD: &str = "threshold";
+    // Attempt limit (REQ-AL-05/06): the declared ceiling, the derived count
+    // of attempts without progress and the human answer that resets it —
+    // one vocabulary for the question, the trip event, the reset event and
+    // the stored decision.
+    pub const LIMIT: &str = "limit";
+    pub const ANSWER: &str = "answer";
     /// The observation time of the failure itself.
     pub const AT: &str = "at";
 
@@ -1962,6 +1992,8 @@ pub mod json_field {
         FIRST_AT,
         LAST_AT,
         THRESHOLD,
+        LIMIT,
+        ANSWER,
         AT,
     ];
 }

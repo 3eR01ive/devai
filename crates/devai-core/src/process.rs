@@ -25,7 +25,10 @@ use crate::types::TaskState;
 /// `config/workflow/process.yaml` declares another version is refused with a
 /// typed config error at `devai init` (REQ-AR-16): the platform never runs a
 /// home silently under rules it was not built for.
-pub const SUPPORTED_PROCESS_VERSION: u32 = 2;
+///
+/// Version 3 replaced the silent round brake (`max_rounds_without_shift`)
+/// with the declared attempt limit (`max_attempts_without_progress`).
+pub const SUPPORTED_PROCESS_VERSION: u32 = 3;
 
 /// The special transition address: «the remembered working stage» of a hold
 /// (`return_state`), not a fixed state name. Spelled once.
@@ -180,9 +183,14 @@ pub struct ProcessTransition {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessBrakes {
-    /// Consecutive rounds of the SAME state with no new artifact (a «круг без
-    /// сдвига»): at this count the task parks instead of launching again.
-    pub max_rounds_without_shift: u32,
+    /// The attempt limit: how many COMPLETED executions of one role may pass
+    /// WITHOUT a substantive shift (a state change, a verdict change, or a
+    /// round the convergence stage itself calls movement) before the platform
+    /// stops the task with ONE human question. `5` in the shipped
+    /// declaration; `None`, empty or `0` means «без предела». The number is
+    /// DATA only — no copy lives in code.
+    #[serde(default, deserialize_with = "attempt_limit_field")]
+    pub max_attempts_without_progress: Option<u32>,
     /// Consecutive failed LAUNCHES (not role results): at this count the
     /// task parks (REQ-AR-13).
     pub max_consecutive_failures: u32,
@@ -216,6 +224,57 @@ impl ProcessHolds {
             HoldKind::Fail => &self.fail,
             HoldKind::Question => &self.question,
         }
+    }
+}
+
+impl ProcessBrakes {
+    /// The EFFECTIVE attempt limit: `None` when the declaration says «без
+    /// предела» (key absent, empty, or `0`). The single reading of the number
+    /// — the admission check, the status line and the stop question all ask
+    /// this, so none of them can interpret zero on its own.
+    pub fn attempt_limit(&self) -> Option<u32> {
+        self.max_attempts_without_progress.filter(|n| *n > 0)
+    }
+}
+
+/// The attempt-limit field's ONE reader (REQ-AL-04): a non-negative integer,
+/// or empty for «без предела». Negative, fractional and non-numeric values are
+/// a LOUD declaration error naming the key — a typo must never degrade into
+/// «no limit» or into a stop on the first run.
+fn attempt_limit_field<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = serde_yaml::Value::deserialize(d)?;
+    match value {
+        serde_yaml::Value::Null => Ok(None),
+        serde_yaml::Value::Number(n) => match n.as_u64() {
+            Some(u) => u32::try_from(u).map(Some).map_err(|_| {
+                D::Error::custom(
+                    "brakes.max_attempts_without_progress is out of range — it must be a \
+                     non-negative integer (0 or empty means no limit)",
+                )
+            }),
+            None => match n.as_i64() {
+                Some(i) if i < 0 => Err(D::Error::custom(format!(
+                    "brakes.max_attempts_without_progress must be a non-negative integer (got \
+                     {i}); 0 or empty means no limit"
+                ))),
+                _ => Err(D::Error::custom(
+                    "brakes.max_attempts_without_progress must be an integer or empty; 0 or \
+                     empty means no limit",
+                )),
+            },
+        },
+        other => Err(D::Error::custom(format!(
+            "brakes.max_attempts_without_progress must be an integer or empty (0 or empty means \
+             no limit), got `{}`",
+            serde_yaml::to_string(&other)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        ))),
     }
 }
 
@@ -719,15 +778,11 @@ impl Process {
         Ok(())
     }
 
-    /// The brakes: non-zero budgets, a known failure-class vocabulary and a
-    /// hold park address.
+    /// The brakes: a known failure-class vocabulary and a hold park address.
+    /// The attempt limit is NOT range-checked here: `0`/empty is the declared
+    /// «без предела», and a negative or non-numeric value never reaches this
+    /// point — the field's own reader refuses it with the key name.
     fn validate_brakes(&self, where_: &str) -> Result<(), String> {
-        if self.brakes.max_rounds_without_shift == 0 {
-            return Err(format!(
-                "{where_}: brakes.max_rounds_without_shift must be >= 1 — a zero budget parks on \
-                 the first round and the process can never run"
-            ));
-        }
         if self.brakes.max_consecutive_failures == 0 {
             return Err(format!(
                 "{where_}: brakes.max_consecutive_failures must be >= 1 — a zero budget parks on \

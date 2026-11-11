@@ -3348,9 +3348,48 @@ mod process_declaration_tests {
         assert_eq!(p.role_for("APPROVAL"), None);
         assert_eq!(p.executor_for("APPROVAL"), Some(process_executor::HUMAN));
         assert_eq!(p.executor_for("ACCEPTED"), Some(process_executor::NONE));
-        // The brakes are data too.
-        assert!(p.brakes.max_rounds_without_shift >= 1);
+        // The brakes are data too: five attempts without progress in the
+        // shipped declaration, and the failure brake stays non-zero.
+        assert_eq!(p.brakes.attempt_limit(), Some(5));
         assert!(p.brakes.max_consecutive_failures >= 1);
+    }
+
+    /// REQ-AL-04: the attempt limit is a non-negative integer, `0`/empty is
+    /// «без предела», and a negative or non-numeric value is a LOUD
+    /// declaration error naming the key — never a silent «no limit» and never
+    /// a stop on the first run.
+    #[test]
+    fn the_attempt_limit_is_data_with_zero_meaning_no_limit() {
+        let factory = include_str!("../../../config/workflow/process.yaml");
+        let with = |value: &str| {
+            factory.replace(
+                "max_attempts_without_progress: 5",
+                &format!("max_attempts_without_progress: {value}"),
+            )
+        };
+
+        let zero = devai_core::process::parse(&with("0"), "process.yaml").unwrap();
+        assert_eq!(zero.brakes.attempt_limit(), None, "0 = без предела");
+
+        let empty = devai_core::process::parse(
+            &factory.replace(
+                "max_attempts_without_progress: 5",
+                "max_attempts_without_progress:",
+            ),
+            "process.yaml",
+        )
+        .unwrap();
+        assert_eq!(empty.brakes.attempt_limit(), None, "empty = без предела");
+
+        for value in ["-1", "\"пять\"", "1.5"] {
+            let e = devai_core::process::parse(&with(value), "process.yaml")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("max_attempts_without_progress"),
+                "value {value} must name the key: {e}"
+            );
+        }
     }
 
     /// REQ-AR-16: a declaration from another version is a TYPED refusal that
