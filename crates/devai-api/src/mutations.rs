@@ -1134,6 +1134,9 @@ impl Api {
             force_reaudit: req.force_reaudit,
             actor: self.actor.clone(),
             run_id: run_id.to_string(),
+            // The runner THIS handle resolved; `None` keeps the platform's own
+            // resolution (an explicit seam, not a global env read at the door).
+            runner: self.runner.clone(),
         }
     }
 

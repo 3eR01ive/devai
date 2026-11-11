@@ -1827,37 +1827,41 @@ fn required_failure_classes() -> Vec<&'static str> {
 /// can carry must be declared, no unknown key may sit silently (a typo would
 /// otherwise be an inert row), and no phrase may be empty.
 fn parse_park_reasons(text: &str, where_: &str) -> StoreResult<ParkReasons> {
-    let doc: serde_yaml::Value =
-        serde_yaml::from_str(text).map_err(|e| cfg_err_park(where_, format!("parse: {e}")))?;
-    let section = doc.get("park_reasons").ok_or_else(|| {
-        cfg_err_park(
-            where_,
-            "no `park_reasons:` section — the stop surface has no words",
-        )
-    })?;
+    let section = park_reasons_section(text, where_)?;
     // deny_unknown_fields: a typo'd key names itself here.
-    let reasons: ParkReasons = serde_yaml::from_value(section.clone()).map_err(|e| {
+    let reasons: ParkReasons = serde_yaml::from_value(section).map_err(|e| {
         cfg_err_park(
             where_,
             format!("park_reasons section is invalid (keys: brakes, failure_classes, actors): {e}"),
         )
     })?;
+    check_brake_words(&reasons, where_)?;
+    check_class_words(&reasons, where_)?;
+    check_actor_words(&reasons, where_)?;
+    Ok(reasons)
+}
+
+/// The raw `park_reasons:` value of one declaration file.
+fn park_reasons_section(text: &str, where_: &str) -> StoreResult<serde_yaml::Value> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| cfg_err_park(where_, format!("parse: {e}")))?;
+    doc.get("park_reasons").cloned().ok_or_else(|| {
+        cfg_err_park(
+            where_,
+            "no `park_reasons:` section — the stop surface has no words",
+        )
+    })
+}
+
+/// Every stop kind a status read can print is declared, every declared kind is
+/// a known one, and no phrase is blank.
+fn check_brake_words(reasons: &ParkReasons, where_: &str) -> StoreResult<()> {
     for kind in devai_core::types::stop_kind::ALL {
         if !reasons.brakes.contains_key(*kind) {
             return Err(cfg_err_park(
                 where_,
                 format!(
                     "park_reasons.brakes has no phrase for stop kind `{kind}` — declare it under brakes: (a machine name is never printed in its place)"
-                ),
-            ));
-        }
-    }
-    for class in required_failure_classes() {
-        if !reasons.failure_classes.contains_key(class) {
-            return Err(cfg_err_park(
-                where_,
-                format!(
-                    "park_reasons.failure_classes has no phrase for failure class `{class}` — declare it under failure_classes:"
                 ),
             ));
         }
@@ -1881,7 +1885,22 @@ fn parse_park_reasons(text: &str, where_: &str) -> StoreResult<ParkReasons> {
             ));
         }
     }
+    Ok(())
+}
+
+/// The same three checks for the failure classes a response can carry.
+fn check_class_words(reasons: &ParkReasons, where_: &str) -> StoreResult<()> {
     let known_classes = required_failure_classes();
+    for class in &known_classes {
+        if !reasons.failure_classes.contains_key(*class) {
+            return Err(cfg_err_park(
+                where_,
+                format!(
+                    "park_reasons.failure_classes has no phrase for failure class `{class}` — declare it under failure_classes:"
+                ),
+            ));
+        }
+    }
     for (class, words) in &reasons.failure_classes {
         if !known_classes.contains(&class.as_str()) {
             return Err(cfg_err_park(
@@ -1900,16 +1919,18 @@ fn parse_park_reasons(text: &str, where_: &str) -> StoreResult<ParkReasons> {
             ));
         }
     }
+    Ok(())
+}
+
+/// The platform's own human spelling must exist: the raw token is not a person.
+fn check_actor_words(reasons: &ParkReasons, where_: &str) -> StoreResult<()> {
     match reasons.actors.get("platform") {
-        Some(word) if !word.trim().is_empty() => {}
-        _ => {
-            return Err(cfg_err_park(
-                where_,
-                "park_reasons.actors.platform must declare the platform's human spelling (`платформа`) — the raw token is not printed as a person",
-            ));
-        }
+        Some(word) if !word.trim().is_empty() => Ok(()),
+        _ => Err(cfg_err_park(
+            where_,
+            "park_reasons.actors.platform must declare the platform's human spelling (`платформа`) — the raw token is not printed as a person",
+        )),
     }
-    Ok(reasons)
 }
 
 /// Merge-scan `workflow/*.yaml` for the `park_reasons:` key, exactly the

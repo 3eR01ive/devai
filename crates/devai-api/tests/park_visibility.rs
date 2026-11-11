@@ -7,48 +7,18 @@
 //! `workflow::park*` mutations and the same store doors the brakes use), and
 //! the assertions judge the PUBLISHED answer — the read the CLI and the window
 //! consume — never an internal field.
-
-use std::path::Path;
-use std::sync::Mutex;
+//!
+//! The runner a launch hands the role to is the handle's OWN (`with_runner`),
+//! never the process-global `DEVAI_RUNNER`: these tests do not order
+//! themselves against each other.
 
 use chrono::Utc;
-use devai_api::{Api, RunReq, TaskCreateReq};
+use devai_api::{Api, AskReq, RunReq, TaskCreateReq};
 use devai_core::process::Process;
 use devai_core::types::*;
 use devai_core::workflow;
 use devai_store::Store;
 use tempfile::TempDir;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// `DEVAI_RUNNER` is process-global: serialise the writers and put the found
-/// value back on drop (including on panic).
-struct RunnerEnv {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl RunnerEnv {
-    fn set(path: &Path) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os("DEVAI_RUNNER");
-        // SAFETY: `ENV_LOCK` serialises every reader/writer in this binary.
-        unsafe { std::env::set_var("DEVAI_RUNNER", path) }
-        Self {
-            _lock: lock,
-            previous,
-        }
-    }
-}
-
-impl Drop for RunnerEnv {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(v) => unsafe { std::env::set_var("DEVAI_RUNNER", v) },
-            None => unsafe { std::env::remove_var("DEVAI_RUNNER") },
-        }
-    }
-}
 
 fn home() -> (TempDir, Api) {
     let dir = TempDir::new().unwrap();
@@ -354,7 +324,7 @@ fn a_failed_launch_does_not_claim_a_held_task_is_running() {
     let v = api.task_status(&id).unwrap();
     assert_eq!(v.stop.unwrap().kind, "manual_block");
     let f = v.launch_failure.expect("the failure stays visible");
-    assert!(!f.parked, "this failure did not park the task");
+    assert_eq!(f.parked, Some(false), "this failure did not park the task");
     assert!(!f.continues, "the task is held, not running");
 }
 
@@ -366,7 +336,9 @@ fn a_failed_launch_is_visible_without_parking_the_task() {
     let (dir, api) = home();
     let id = task(&api, "запуск не состоялся");
     api.task_start(&id).unwrap();
-    let _env = RunnerEnv::set(&dir.path().join("no-such-runner"));
+    // The runner THIS handle launches with: a path that cannot exist — a
+    // spawn-class launch failure, deterministic on every host.
+    let api = api.with_runner(dir.path().join("no-such-runner"));
     let e = api
         .task_run(RunReq {
             id: id.clone(),
@@ -390,15 +362,16 @@ fn a_failed_launch_is_visible_without_parking_the_task() {
         f.class_word
     );
     assert!(!f.action.trim().is_empty());
-    assert_eq!(f.consecutive, 1);
-    assert_eq!(f.limit, 3);
-    assert!(!f.parked);
+    assert_eq!(f.consecutive, Some(1));
+    assert_eq!(f.limit, Some(3));
+    assert_eq!(f.counter_text, "1 из 3");
+    assert_eq!(f.parked, Some(false));
     assert!(f.continues, "the task keeps going; only the launch failed");
     let reason = f.reason.expect("the stored reason verbatim");
     assert!(!reason.is_empty());
 
-    // A later failed launch grows the counter in the history (same runner:
-    // one env guard for the whole test — the lock is not re-entrant).
+    // A later failed launch grows the counter in the history (the same
+    // handle — one runner for the whole test, no global env to restore).
     let _ = api.task_run(RunReq {
         id: id.clone(),
         agent: "mock".into(),
@@ -406,7 +379,11 @@ fn a_failed_launch_is_visible_without_parking_the_task() {
         force_reaudit: false,
     });
     let second = api.task_status(&id).unwrap().launch_failure.unwrap();
-    assert_eq!(second.consecutive, 2, "the counter grows in the history");
+    assert_eq!(
+        second.consecutive,
+        Some(2),
+        "the counter grows in the history"
+    );
 }
 
 /// REQ-PK-02 AC2 + REQ-PK-06: when the launch threshold parks the task, BOTH
@@ -417,7 +394,7 @@ fn the_parked_launch_failure_carries_both_facts_with_matching_counters() {
     let (dir, api) = home();
     let id = task(&api, "порог запусков");
     api.task_start(&id).unwrap();
-    let _env = RunnerEnv::set(&dir.path().join("no-such-runner"));
+    let api = api.with_runner(dir.path().join("no-such-runner"));
     for _ in 0..3 {
         let _ = api.task_run(RunReq {
             id: id.clone(),
@@ -429,19 +406,218 @@ fn the_parked_launch_failure_carries_both_facts_with_matching_counters() {
     let v = api.task_status(&id).unwrap();
     assert_eq!(v.task.state, TaskState::Blocked, "the brake parks the task");
     let f = v.launch_failure.expect("the failed launch is a fact");
-    assert!(f.parked, "this failure parked the task");
+    assert_eq!(f.parked, Some(true), "this failure parked the task");
     assert!(!f.continues);
-    assert_eq!(f.consecutive, 3);
-    assert_eq!(f.limit, 3);
+    assert_eq!(f.consecutive, Some(3));
+    assert_eq!(f.limit, Some(3));
     let s = v.stop.expect("the stop is a fact too");
     assert_eq!(s.kind, "consecutive_launch_failures");
-    assert_eq!(
-        s.counter,
-        Some(f.consecutive),
-        "the counters never disagree"
-    );
-    assert_eq!(s.limit, Some(f.limit));
+    assert_eq!(s.counter, f.consecutive, "the counters never disagree");
+    assert_eq!(s.limit, f.limit);
     assert_eq!(s.counter_text, "3 из 3");
     assert!(s.why.contains("тормоз запусков"), "{}", s.why);
     assert!(s.failure_class.is_none(), "not an agent failure");
+}
+
+/// A plain BLOCKING question hold (raised by a role, no agent-failure gate) is
+/// worded as a QUESTION: the asker's stored words verbatim, no counter, no
+/// failure class — never passed off as an agent failure or a manual stop.
+#[test]
+fn a_plain_question_hold_is_worded_as_a_question() {
+    let (_dir, api) = home();
+    let id = task(&api, "вопрос ждёт ответа");
+    api.task_start(&id).unwrap();
+    let asked = api
+        .question_ask(AskReq {
+            id: id.clone(),
+            text: "Подтвердить план работ?".into(),
+            context: None,
+            options: Vec::new(),
+            blocking: true,
+            execution: None,
+        })
+        .unwrap();
+
+    let v = api.task_status(&id).unwrap();
+    assert_eq!(v.task.state, TaskState::WaitingForInput);
+    assert_eq!(asked.question.id, v.open_questions[0].id);
+    let s = v.stop.expect("a question hold is a stop");
+    assert_eq!(s.kind, "question");
+    assert!(s.why.contains("ждёт ответа"), "{}", s.why);
+    // Waiting for a human is not «остановлено вручную», and 0 из 0 is invented.
+    assert_eq!((s.counter, s.limit), (None, None));
+    assert_eq!(s.counter_text, "счётчика нет: задача ждёт ответа человека");
+    assert_eq!(s.reason.as_deref(), Some("Подтвердить план работ?"));
+    assert!(
+        s.failure_class.is_none(),
+        "a question is not a failure class"
+    );
+    assert!(v.launch_failure.is_none());
+}
+
+/// REQ-PK-02 AC3 on the OTHER end of the line: a FINISHED task is never
+/// described as going. The launch failure stays a fact, `continues` is false and
+/// `finished` says which kind of «not going» this is.
+#[test]
+fn a_finished_task_is_not_reported_as_going() {
+    let (dir, api) = home();
+    let id = task(&api, "отказ запуска, потом отмена");
+    api.task_start(&id).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let t = store.get_task(&id).unwrap();
+    store
+        .insert_event(
+            Some(t.id),
+            event_kind::EXECUTION_LAUNCH_FAILED,
+            "platform",
+            serde_json::json!({
+                json_field::FAILURE_CLASS: "spawn",
+                json_field::CONSECUTIVE: 1,
+                json_field::LIMIT: 3,
+                json_field::PARKED: false,
+                json_field::REASON: "no runner",
+            }),
+        )
+        .unwrap();
+    let m = workflow::cancel(
+        Process::factory(),
+        &t,
+        Some("передумали"),
+        "guerrero",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(t.lock_version, &m).unwrap();
+
+    let v = api.task_status(&id).unwrap();
+    assert_eq!(v.task.state, TaskState::Cancelled);
+    assert!(v.stop.is_none(), "a finished task has no stop block");
+    let f = v.launch_failure.expect("the failure stays a fact");
+    assert_eq!(f.parked, Some(false));
+    assert!(!f.continues, "a cancelled task is not going");
+    assert!(f.finished, "the answer says the task is finished");
+}
+
+/// REQ-PK-01 AC3 and the corruption rule: a stored `question_id` that does not
+/// parse is a LOUD error naming the event — a corrupt payload never renders as
+/// «причина не записана».
+#[test]
+fn a_corrupt_question_payload_is_a_loud_error_naming_the_event() {
+    let (dir, api) = home();
+    let id = task(&api, "битый вопрос");
+    api.task_start(&id).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let t = store.get_task(&id).unwrap();
+    let m = workflow::raise_question(
+        Process::factory(),
+        &t,
+        new_id(),
+        true,
+        "implementation-agent",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(t.lock_version, &m).unwrap();
+    store
+        .insert_event(
+            Some(t.id),
+            event_kind::QUESTION_RAISED,
+            "implementation-agent",
+            serde_json::json!({ json_field::QUESTION_ID: "not-a-uuid", "blocking": true }),
+        )
+        .unwrap();
+
+    let e = api.task_status(&id).unwrap_err();
+    assert_eq!(e.code(), devai_api::ErrorCode("corrupt"), "{e}");
+    assert!(format!("{e}").contains("question_id"), "{e}");
+}
+
+/// The same rule for the launch fact: without its class the event cannot be
+/// worded at all, so the read refuses loudly instead of inventing a class.
+#[test]
+fn a_failed_launch_without_a_class_is_a_loud_error() {
+    let (dir, api) = home();
+    let id = task(&api, "отказ без класса");
+    api.task_start(&id).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .insert_event(
+            Some(id.parse().unwrap()),
+            event_kind::EXECUTION_LAUNCH_FAILED,
+            "platform",
+            serde_json::json!({ json_field::REASON: "boom" }),
+        )
+        .unwrap();
+
+    let e = api.task_status(&id).unwrap_err();
+    assert_eq!(e.code(), devai_api::ErrorCode("corrupt"), "{e}");
+    assert!(format!("{e}").contains("failure_class"), "{e}");
+}
+
+/// Absence is SAID, never invented: a brake whose event recorded no counter
+/// states that — not `0 из 0`.
+#[test]
+fn a_brake_without_a_counter_states_the_absence() {
+    let (dir, api) = home();
+    let store = Store::open(dir.path()).unwrap();
+    let id = task(&api, "тормоз без счётчика");
+    api.task_start(&id).unwrap();
+    let t = store.get_task(&id).unwrap();
+    let m = workflow::park(
+        Process::factory(),
+        &t,
+        Some("parked without a counter"),
+        "platform",
+        Utc::now(),
+    )
+    .unwrap();
+    store.commit(t.lock_version, &m).unwrap();
+    store
+        .insert_event(
+            Some(t.id),
+            event_kind::PROCESS_PARKED,
+            "platform",
+            serde_json::json!({
+                json_field::BRAKE: "rounds_without_shift",
+                json_field::REASON: "parked without a counter",
+            }),
+        )
+        .unwrap();
+    let s = api
+        .task_status(&id)
+        .unwrap()
+        .stop
+        .expect("the brake is the stop");
+    assert_eq!((s.counter, s.limit), (None, None));
+    assert_eq!(s.counter_text, "счётчик в событии не записан");
+}
+
+/// The same for the launch fact: an event that does not say whether it parked
+/// says «не записано», never `parked: false`, and its missing counter is named.
+#[test]
+fn a_launch_failure_without_details_states_the_absence() {
+    let (dir, api) = home();
+    let store = Store::open(dir.path()).unwrap();
+    let id = task(&api, "отказ без подробностей");
+    api.task_start(&id).unwrap();
+    store
+        .insert_event(
+            Some(id.parse().unwrap()),
+            event_kind::EXECUTION_LAUNCH_FAILED,
+            "platform",
+            serde_json::json!({
+                json_field::FAILURE_CLASS: "spawn",
+                json_field::REASON: "boom",
+            }),
+        )
+        .unwrap();
+    let f = api
+        .task_status(&id)
+        .unwrap()
+        .launch_failure
+        .expect("the failed launch is a fact");
+    assert_eq!(f.parked, None, "the event did not say — nothing is assumed");
+    assert_eq!((f.consecutive, f.limit), (None, None));
+    assert_eq!(f.counter_text, "счётчик не записан");
+    assert!(f.continues, "the task itself is still going");
 }

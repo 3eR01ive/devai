@@ -2029,23 +2029,28 @@ fn print_launch_failure(f: &devai_api::LaunchFailureView) {
         f.failure_class
     );
     outln!("  когда:   {}", f.at.format("%Y-%m-%d %H:%M:%S"));
-    outln!("  счётчик: {} из {}", f.consecutive, f.limit);
+    outln!("  счётчик: {}", f.counter_text);
     if let Some(reason) = &f.reason {
         outln!("  причина: {reason}");
     }
     outln!("  делать:  {}", f.action);
-    // The one sentence about the task itself: what THIS event did (`parked`)
-    // and what the task is doing now (`continues`) are separate facts, and
-    // the wording never claims a held task is running.
-    outln!(
-        "  задача:  {}",
-        match (f.parked, f.continues) {
-            (true, false) => "запаркована этим отказом",
-            (true, true) => "этот отказ запарковал задачу; сейчас она идёт дальше",
-            (false, true) => "продолжает идти, запуск не состоялся",
-            (false, false) => "запуск не состоялся; остановила задачу другая причина (см. выше)",
+    outln!("  задача:  {}", launch_aftermath(f));
+}
+
+/// The one sentence about the TASK itself: what THIS event did (`parked`) and
+/// what the task is doing now (`continues` / `finished`) are separate facts, so
+/// the wording never claims a held, finished or cancelled task is running.
+fn launch_aftermath(f: &devai_api::LaunchFailureView) -> &'static str {
+    match (f.parked, f.continues, f.finished) {
+        (Some(true), false, _) => "запаркована этим отказом",
+        (Some(true), true, _) => "этот отказ запарковал задачу; сейчас она идёт дальше",
+        (Some(false), true, _) => "продолжает идти, запуск не состоялся",
+        (Some(false), false, true) => "задача завершена, запуск не состоялся",
+        (Some(false), false, false) => {
+            "запуск не состоялся; остановила задачу другая причина (см. выше)"
         }
-    );
+        (None, ..) => "событие не записало, запарковал ли этот отказ задачу",
+    }
 }
 
 /// The human gate's viewing channel: the CURRENT quality report. A verdict
@@ -3332,6 +3337,56 @@ pub(crate) fn short(id: &Uuid) -> String {
 /// Display-short of an id that already arrives as a string (API views).
 pub(crate) fn short_str(id: &str) -> String {
     devai_core::types::short_id_str(id)
+}
+
+#[cfg(test)]
+mod launch_aftermath_tests {
+    //! REQ-PK-02 AC1/AC3: the one sentence about the TASK is judged on its own,
+    //! so every branch — parked / going / held / finished / unknown — is pinned
+    //! without a full launch drive.
+    use super::launch_aftermath;
+    use devai_api::LaunchFailureView;
+
+    fn view(parked: Option<bool>, continues: bool, finished: bool) -> LaunchFailureView {
+        LaunchFailureView {
+            failure_class: "spawn".into(),
+            class_word: "класс".into(),
+            at: chrono::Utc::now(),
+            reason: Some("boom".into()),
+            action: "сделать".into(),
+            consecutive: Some(1),
+            limit: Some(3),
+            counter_text: "1 из 3".into(),
+            parked,
+            continues,
+            finished,
+        }
+    }
+
+    #[test]
+    fn the_sentence_never_claims_a_stopped_or_finished_task_is_going() {
+        assert_eq!(
+            launch_aftermath(&view(Some(true), false, false)),
+            "запаркована этим отказом"
+        );
+        assert_eq!(
+            launch_aftermath(&view(Some(false), true, false)),
+            "продолжает идти, запуск не состоялся"
+        );
+        assert_eq!(
+            launch_aftermath(&view(Some(false), false, true)),
+            "задача завершена, запуск не состоялся"
+        );
+        assert_eq!(
+            launch_aftermath(&view(Some(false), false, false)),
+            "запуск не состоялся; остановила задачу другая причина (см. выше)"
+        );
+        // An event that did not record `parked` says so instead of assuming «no».
+        assert_eq!(
+            launch_aftermath(&view(None, true, false)),
+            "событие не записало, запарковал ли этот отказ задачу"
+        );
+    }
 }
 
 #[cfg(test)]

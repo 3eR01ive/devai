@@ -17,7 +17,9 @@
 
 use chrono::Utc;
 
-use devai_core::types::{ExecutionStatus, Id, Task, event_kind, failure_class, stop_kind};
+use devai_core::types::{
+    ExecutionStatus, Id, Task, event_kind, failure_class, json_field, stop_kind,
+};
 use devai_core::workflow::{self, Mutation};
 use devai_runtime::RuntimeError;
 use devai_store::config::ProcessPolicy;
@@ -136,10 +138,10 @@ impl Api {
             event_kind::PROCESS_PARKED,
             "platform",
             serde_json::json!({
-                "brake": brake,
-                "counter": counter,
-                "limit": limit,
-                "reason": reason,
+                json_field::BRAKE: brake,
+                json_field::COUNTER: counter,
+                json_field::LIMIT: limit,
+                json_field::REASON: reason,
             }),
         )?;
         Ok(())
@@ -177,11 +179,11 @@ impl Api {
             event_kind::EXECUTION_LAUNCH_FAILED,
             "platform",
             serde_json::json!({
-                "failure_class": class,
-                "consecutive": consecutive,
-                "limit": limit,
-                "parked": parked,
-                "reason": reason_text,
+                json_field::FAILURE_CLASS: class,
+                json_field::CONSECUTIVE: consecutive,
+                json_field::LIMIT: limit,
+                json_field::PARKED: parked,
+                json_field::REASON: reason_text,
             }),
         )?;
         Ok(())

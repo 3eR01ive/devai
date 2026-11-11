@@ -1917,6 +1917,18 @@ pub mod json_field {
     pub const THRESHOLD: &str = "threshold";
     /// The observation time of the failure itself.
     pub const AT: &str = "at";
+    // The STOP surface (task 01a1ca39, REQ-PK-01/02/06): the brake token a
+    // `process.parked` event carries, the counter it tripped and the declared
+    // limit, and the failed-launch facts — the consecutive counter, its limit
+    // and whether THAT event parked the task. The producers
+    // (`launch_brakes::commit_park` / `record_launch_failure`) and the reader
+    // (`devai_api::stop`) speak these SAME consts: one re-spelled literal on
+    // either side is how a stop block silently empties.
+    pub const BRAKE: &str = "brake";
+    pub const COUNTER: &str = "counter";
+    pub const LIMIT: &str = "limit";
+    pub const PARKED: &str = "parked";
+    pub const CONSECUTIVE: &str = "consecutive";
 
     /// The COMPLETE enumerable vocabulary of payload field names the platform
     /// itself mints. Load-time policy validation checks user-authored field
@@ -1987,6 +1999,11 @@ pub mod json_field {
         REVISION,
         FAILURE_STEP,
         CLASS,
+        BRAKE,
+        COUNTER,
+        LIMIT,
+        PARKED,
+        CONSECUTIVE,
         TAIL,
         OUTPUT_EMPTY,
         DRIVER_LOG_TAIL,

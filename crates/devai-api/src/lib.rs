@@ -221,6 +221,12 @@ pub struct Api {
     /// and test doors do not — they must not spawn processes as a side effect
     /// of opening a home.
     autolaunch: bool,
+    /// The runner binary THIS handle launches roles with, when it is not the
+    /// platform's own. `None` — the platform resolution (`DEVAI_RUNNER`, the
+    /// current `devai` executable, then `devai` on PATH). Set through
+    /// [`Api::with_runner`]: an explicit seam instead of a process-global env
+    /// write, which would order the tests against each other.
+    runner: Option<PathBuf>,
 }
 
 /// One probe call as the surface invokes it. The default is
@@ -266,6 +272,7 @@ impl Api {
             // A live platform session is allowed to start the run a state
             // requires (REQ-AR-11/12).
             autolaunch: true,
+            runner: None,
         })
     }
 
@@ -281,6 +288,15 @@ impl Api {
     /// real driver call; nothing else about the surface changes.
     pub fn with_probe_runner(mut self, runner: ProbeRunner) -> Self {
         self.probe_runner = runner;
+        self
+    }
+
+    /// The runner binary THIS handle launches roles with (tests / a caller
+    /// that owns its runner). An explicit seam, so a test never writes the
+    /// process-global `DEVAI_RUNNER` and never orders itself against the other
+    /// tests of the binary. The default resolution stays the platform's.
+    pub fn with_runner(mut self, runner: impl Into<PathBuf>) -> Self {
+        self.runner = Some(runner.into());
         self
     }
 
@@ -303,6 +319,7 @@ impl Api {
             session: SessionKind::Human,
             probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
             autolaunch: false,
+            runner: None,
         })
     }
 
@@ -391,8 +408,7 @@ impl Api {
         // (REQ-AR-09 AC1: the declaration is the only role/stage authority).
         let process = self.process_policy()?;
         // allowed_ops depends only on the task row and the declaration —
-        // computed before the row moves into the view (no re-derivation, one
-        // read each).
+        // computed before the row moves into the view (no re-derivation).
         let ops: Vec<String> = workflow::allowed_ops(&process, &t);
         let artifacts = self.store.artifacts(t.id)?;
         let questions = self.store.list_questions(t.id)?;
@@ -400,19 +416,8 @@ impl Api {
         // two facts folded from the SAME history read, their words resolved
         // from the declaration (REQ-PK-03). Nothing is written: a status read
         // leaves the task row and the event log untouched (REQ-PK-07 AC2).
-        let reasons = self.park_reasons()?;
-        let (stop, launch_failure) = self.task_stop_facts(&t, &questions, &reasons)?;
-        // REQ-QG-08: the QA gate's public availability travels WITH the status
-        // read — the window does not derive it. The dependency/decision/
-        // execution loads happen only at the gate; other states have no gate.
-        let quality_gate = if t.state == TaskState::Qa {
-            let deps = self.store.task_dependencies(t.id)?;
-            let decisions = self.store.list_decisions(t.id)?;
-            let executions = self.store.list_executions(Some(t.id))?;
-            quality_gate::quality_gate(&process, &t, &artifacts, &deps, &decisions, &executions)
-        } else {
-            None
-        };
+        let (stop, launch_failure) = self.task_stop_facts(&t, &questions, &self.park_reasons()?)?;
+        let quality_gate = self.status_quality_gate(&process, &t, &artifacts)?;
         Ok(StatusView {
             task: t,
             allowed_operations: ops,
@@ -428,6 +433,31 @@ impl Api {
             stop,
             launch_failure,
         })
+    }
+
+    /// REQ-QG-08: the QA gate's public availability travels WITH the status
+    /// read — the window does not derive it. The dependency/decision/execution
+    /// loads happen only at the gate; other states have no gate.
+    fn status_quality_gate(
+        &self,
+        process: &devai_core::process::Process,
+        task: &Task,
+        artifacts: &[Artifact],
+    ) -> ApiResult<Option<QualityGateView>> {
+        if task.state != TaskState::Qa {
+            return Ok(None);
+        }
+        let deps = self.store.task_dependencies(task.id)?;
+        let decisions = self.store.list_decisions(task.id)?;
+        let executions = self.store.list_executions(Some(task.id))?;
+        Ok(quality_gate::quality_gate(
+            process,
+            task,
+            artifacts,
+            &deps,
+            &decisions,
+            &executions,
+        ))
     }
 
     /// The APPROVAL signature read (REQ-SIGN-07): paragraph, requirements,

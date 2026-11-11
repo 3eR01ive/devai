@@ -63,6 +63,11 @@ pub struct LaunchRequest {
     /// The run number the caller minted; every execution of this chain carries
     /// it (REQ-AR-04/07).
     pub run_id: String,
+    /// The runner binary THIS caller resolved, when it is not the platform's
+    /// own resolution — the explicit seam a test drives instead of writing the
+    /// process-global `DEVAI_RUNNER` (which would order the tests). `None` keeps
+    /// [`runner_exe`]'s order: `DEVAI_RUNNER`, the current `devai`, `PATH`.
+    pub runner: Option<PathBuf>,
 }
 
 /// What the caller learns. `Started` carries the id of the FIRST execution —
@@ -150,6 +155,27 @@ pub fn runner_exe() -> Option<PathBuf> {
             .map(|d| d.join("devai"))
             .find(|p| p.is_file())
     })
+}
+
+/// The runner THIS launch hands the role to. A path the caller NAMED wins; a
+/// named path that is not a file is refused — never silently swapped for the
+/// platform's own runner, which would run the role somewhere the caller did
+/// not ask. With no path requested the platform resolution decides.
+fn requested_runner(requested: Option<&Path>) -> Result<PathBuf, LaunchError> {
+    match requested {
+        Some(p) if p.is_file() => Ok(p.to_path_buf()),
+        Some(p) => Err(LaunchError::NoRunner(format!(
+            "no platform runner at `{}` — the role is never run inside the caller",
+            p.display()
+        ))),
+        None => runner_exe().ok_or_else(|| {
+            LaunchError::NoRunner(
+                "no platform runner binary — set DEVAI_RUNNER to the `devai` executable \
+                 (the role is never run inside the caller)"
+                    .to_string(),
+            )
+        }),
+    }
 }
 
 /// The evidence directory of one run, under the home (never a checkout).
@@ -410,13 +436,7 @@ fn runner_died(log: &Path, status: std::process::ExitStatus) -> LaunchError {
 /// call fails the launch is refused loudly instead of falling back to a
 /// same-session child.
 pub fn launch(req: &LaunchRequest) -> Result<LaunchOutcome, LaunchError> {
-    let exe = runner_exe().ok_or_else(|| {
-        LaunchError::NoRunner(
-            "no platform runner binary — set DEVAI_RUNNER to the `devai` executable \
-             (the role is never run inside the caller)"
-                .to_string(),
-        )
-    })?;
+    let exe = requested_runner(req.runner.as_deref())?;
     // REQ-AR-01 AC1: a session INSIDE the caller's cgroup is not a guarantee.
     let scope = scope_decision(systemd_user_scope(), caller_runs_inside_a_unit())?;
     let hs = prepare_handshake(req)?;
