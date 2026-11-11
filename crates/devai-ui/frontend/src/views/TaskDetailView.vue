@@ -57,6 +57,11 @@ const artifacts = ref<Artifact[]>([]);
 const decisions = ref<Decision[]>([]);
 const events = ref<WorkflowEvent[]>([]);
 const executions = ref<ExecutionView[]>([]);
+// Свежесть снимка живости: он считается текущим только после УСПЕШНОГО
+// чтения. Отказ периодического перечитывания не стирает последний факт, но
+// помечает его устаревшим — старый «процесс жив» нельзя выдавать за текущий.
+const livenessStale = ref(false);
+const livenessObservedAt = ref<string | null>(null);
 const activeRows = ref<ActiveRow[]>([]);
 const report = ref<QualityReportView | null>(null);
 const reportError = ref<UiError | null>(null);
@@ -90,8 +95,9 @@ const showDiff = ref(false);
 const convergence = computed<ConvergenceView | null>(() => progress.value?.convergence ?? null);
 
 // Индикатор работы агента (REQ-LV-05): строка карточки отвечает «идёт ли
-// работа» фактом, а не догадкой. Слова — платформы (`liveness_line` из
-// task.progress), окно их не перефразирует и вердикт не пересчитывает.
+// работа» фактом, а не догадкой. Слова — платформы (`liveness_line` строки
+// `exec.list`; ту же фразу несут task.status и task.progress), окно их не
+// перефразирует и вердикт не пересчитывает.
 const runningRows = computed<ExecutionView[]>(() =>
   executions.value.filter((e) => e.status === "RUNNING"),
 );
@@ -110,6 +116,15 @@ const restartHint = computed<string>(() => {
   return `devai exec reap --task ${id} → devai task run ${id}`;
 });
 
+// Один путь для обоих чтений живости (loadAll и периодическое): успешное
+// чтение делает снимок текущим и запоминает его время; отказ оставляет
+// прежний снимок и метит его устаревшим.
+function observeExecutions(rows: ExecutionView[]) {
+  executions.value = rows;
+  livenessStale.value = false;
+  livenessObservedAt.value = new Date().toISOString();
+}
+
 async function loadAll() {
   error.value = null;
   try {
@@ -127,7 +142,7 @@ async function loadAll() {
     deps.value = d;
     artifacts.value = arts;
     decisions.value = decs;
-    executions.value = execs;
+    observeExecutions(execs);
     activeRows.value = snap.rows.filter((r) => r.task_id === props.id || r.task_id.startsWith(props.id));
     await loadEvents();
     await loadReport();
@@ -289,17 +304,20 @@ async function refreshLiveness() {
   // полем progress.pipeline.terminal, окно своей таблицы стадий не держит.
   if (progress.value?.pipeline.terminal) return;
   try {
-    executions.value = await api.executionsList(props.id);
+    observeExecutions(await api.executionsList(props.id));
   } catch {
-    // Отдельный опрос не рушит карточку: последний снимок остаётся, панель
-    // ошибок принадлежит основным чтениям (loadAll).
+    // Карточку отказ отдельного опроса не рушит, но и НЕ прячется: последний
+    // снимок остаётся на экране помеченным как устаревший (время успешного
+    // чтения рядом), иначе старый «процесс жив» читался бы как текущий факт.
+    livenessStale.value = true;
   }
 }
 
 onMounted(async () => {
   await gateAndLoad();
-  // Таймер живёт только в окне: узловые прогоны SFC (тесты представления)
-  // исполняются без `window` и не должны ни падать, ни висеть на интервале.
+  // Таймер заводится при монтировании и снимается onUnmounted: компонентные
+  // тесты идут в jsdom, где `window` есть, поэтому интервал там действительно
+  // ставится — его снимает размонтирование, а не окружение.
   if (typeof window !== "undefined") {
     livenessTimer = window.setInterval(refreshLiveness, pollMs());
   }
@@ -362,8 +380,13 @@ async function activateForeignHome() {
         v-for="line in runningLines"
         :key="line"
         class="chip-liveness"
-        :class="{ dead: deadRun }"
+        :class="{ dead: deadRun, stale: livenessStale }"
       >{{ line }}</span>
+      <!-- Перечитать живость не удалось: снимок остаётся, но говорится прямо,
+           что он устарел и когда читался последний раз успешно. -->
+      <span v-if="livenessStale" class="chip-liveness stale">
+        данные устарели · последнее успешное чтение {{ fmtTime(livenessObservedAt) }}
+      </span>
       <div class="spacer" />
       <span class="mono muted">{{ status.task.id }}</span>
       <button @click="loadAll">Обновить</button>
@@ -753,6 +776,13 @@ async function activateForeignHome() {
   border-color: #b08a4f;
   color: #e8caa0;
   font-weight: 700;
+}
+/* Устаревший снимок: пунктир вместо сплошной рамки — факт на экране есть, но
+   он не текущий, и окно об этом говорит словом, а не цветом. */
+.chip-liveness.stale {
+  border-style: dashed;
+  font-style: italic;
+  opacity: 0.8;
 }
 .chip-stage {
   padding: 2px 8px;

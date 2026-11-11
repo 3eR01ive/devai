@@ -2991,8 +2991,10 @@ fn last_activity(paths: &[PathBuf]) -> Option<SystemTime> {
 /// check). An owner that cannot be checked (other host, no /proc, a row
 /// predating rung 007) is NOT dead: it renders `owner?` as a separate
 /// triage marker and `owner_liveness: "unknown"` in json, as-is. Detection
-/// is READ-ONLY (REQ-SW-06): this view writes nothing and kills no one —
-/// resolution belongs to a human via `exec fail|cancel`. Every row also
+/// is READ-ONLY (REQ-SW-06): this view writes nothing and kills no one, and
+/// it never closes a row — closing the row of an owner proven gone is the
+/// separate `exec reap` act, while a row it cannot prove gone stays open for
+/// a human (`exec fail|cancel`). Every row also
 /// carries the platform's ONE sentence for its verdict (`liveness_line`,
 /// REQ-LV-05/06): the same words the card and `exec list` print, so the two
 /// surfaces never describe one execution differently. The command
