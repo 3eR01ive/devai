@@ -508,16 +508,6 @@ impl Api {
         let executions = self.store.list_executions(Some(t.id))?;
         let running_executions = running_views(&executions, Utc::now());
         let events = self.store.events(t.id, None)?;
-        // REQ-QG-08: доступность гейта качества приходит вместе с чтением
-        // состояния — окно её не выводит. Загрузки зависимостей и решений
-        // бывают только на гейте; в прочих состояниях гейта нет.
-        let quality_gate = if t.state == TaskState::Qa {
-            let deps = self.store.task_dependencies(t.id)?;
-            let decisions = self.store.list_decisions(t.id)?;
-            quality_gate::quality_gate(&process, &t, &artifacts, &deps, &decisions, &executions)
-        } else {
-            None
-        };
         // REQ-AL-07: the counter is part of the status read, not a separate
         // command — the same derivation the stop rule uses, over the history
         // this read already holds. No carrier report → no series, so the
@@ -594,67 +584,74 @@ impl Api {
     /// computed object, so a consumer never asks for it separately.
     pub fn task_progress(&self, id_prefix: &str) -> ApiResult<ProgressView> {
         let t = self.store.resolve_task(id_prefix)?;
-        // The operations this read offers are the declaration's role-execution
-        // entries (REQ-AR-09 AC1) — one load per read.
-        let process = self.process_policy()?;
         let now = Utc::now();
-        let order = workflow::pipeline_order();
-        let position = workflow::pipeline_position(&t);
-        let pos_idx = position.and_then(|p| order.iter().position(|s| *s == p));
-        let executions = self.store.list_executions(Some(t.id))?;
-        let running = running_views(&executions, now);
-        let artifacts = self.store.artifacts(t.id)?;
-        let convergence = self.task_convergence(&t, &artifacts, &executions);
+        // REQ-RG-01 AC4: every source the graph folds is loaded ONCE, here.
+        let facts = self.progress_facts(&t)?;
+        let convergence = self.task_convergence(&t, &facts.artifacts, &facts.executions);
         // REQ-AL-07: the same triple the status read answers, over the history
         // this read already holds — nothing is loaded or computed twice (R6).
-        let events = self.store.events(t.id, None)?;
-        let attempt_limit =
-            self.attempt_limit_view_in(&t, &process, &executions, &events, convergence.as_ref())?;
-        let agent_failure = self.task_agent_failure(&t)?;
-        // REQ-RG-01: the whole path arrives in THIS read — state, artifacts,
-        // executions, decisions, events and questions are loaded exactly once
-        // here; the fold performs no further store read (AC4).
-        let decisions = self.store.list_decisions(t.id)?;
-        let questions = self.store.list_questions(t.id)?;
-        let labels = self.artifact_labels()?;
-        let wait_policy =
-            devai_store::config::load_inbox_wait_policy(&self.config_dir().join("workflow"))?;
-        let mut role_map: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        for r in self.store.list_roles()? {
-            role_map.insert(r.slug, r.name);
-        }
-        let roles: Vec<(String, String)> = role_map.into_iter().collect();
-        let graph = devai_core::graph::build(&devai_core::graph::GraphFacts {
-            process: &process,
-            task: &t,
-            artifacts: &artifacts,
-            executions: &executions,
-            decisions: &decisions,
-            events: &events,
-            questions: &questions,
-            roles: &roles,
-            artifact_titles: labels.titles(),
-            wait_policy: &wait_policy,
-        });
+        let attempt_limit = self.attempt_limit_view_in(
+            &t,
+            &facts.process,
+            &facts.executions,
+            &facts.events,
+            convergence.as_ref(),
+        )?;
         Ok(ProgressView {
             task: t.clone(),
             snapshot_at: now,
-            pipeline: PipelineView {
-                order: order.iter().map(|s| s.as_str().to_string()).collect(),
-                current: t.state.as_str().to_string(),
-                position: position.map(|s| s.as_str().to_string()),
-                position_index: pos_idx,
-                off_spine: workflow::pipeline_off_spine(&t),
-                terminal: t.state.is_terminal(),
-            },
-            graph,
-            allowed_operations: workflow::allowed_ops(&process, &t),
-            running_executions: running,
+            pipeline: pipeline_view(&t),
+            graph: self.progress_graph(&t, &facts)?,
+            allowed_operations: workflow::allowed_ops(&facts.process, &t),
+            running_executions: running_views(&facts.executions, now),
             convergence,
             attempt_limit,
-            agent_failure,
+            agent_failure: self.task_agent_failure(&t)?,
         })
+    }
+
+    /// The progress read's inputs: state, artifacts, executions, decisions,
+    /// events and questions, each loaded exactly once.
+    fn progress_facts(&self, task: &Task) -> ApiResult<ProgressFacts> {
+        Ok(ProgressFacts {
+            process: self.process_policy()?,
+            artifacts: self.store.artifacts(task.id)?,
+            executions: self.store.list_executions(Some(task.id))?,
+            decisions: self.store.list_decisions(task.id)?,
+            events: self.store.events(task.id, None)?,
+            questions: self.store.list_questions(task.id)?,
+        })
+    }
+
+    /// REQ-RG-01: the whole path folded from the SAME slices this read already
+    /// holds — the fold performs no store read of its own.
+    fn progress_graph(
+        &self,
+        task: &Task,
+        facts: &ProgressFacts,
+    ) -> ApiResult<devai_core::graph::RoleGraph> {
+        let labels = self.artifact_labels()?;
+        let wait_policy =
+            devai_store::config::load_inbox_wait_policy(&self.config_dir().join("workflow"))?;
+        let mut roles: Vec<(String, String)> = self
+            .store
+            .list_roles()?
+            .into_iter()
+            .map(|r| (r.slug, r.name))
+            .collect();
+        roles.sort();
+        Ok(devai_core::graph::build(&devai_core::graph::GraphFacts {
+            process: &facts.process,
+            task,
+            artifacts: &facts.artifacts,
+            executions: &facts.executions,
+            decisions: &facts.decisions,
+            events: &facts.events,
+            questions: &facts.questions,
+            roles: &roles,
+            artifact_titles: labels.titles(),
+            wait_policy: &wait_policy,
+        }))
     }
 
     /// The task's latest stored agent failure with its series — the ONE
@@ -1629,6 +1626,32 @@ pub struct StatusView {
     /// verbatim reason and action — whether it parked the task or the task
     /// kept going. `None` when a later launch superseded it.
     pub launch_failure: Option<LaunchFailureView>,
+}
+
+/// The progress read's inputs: each source is loaded exactly once, so the
+/// graph fold performs no store read of its own (REQ-RG-01 AC4).
+struct ProgressFacts {
+    process: devai_store::config::ProcessPolicy,
+    artifacts: Vec<Artifact>,
+    executions: Vec<RoleExecution>,
+    decisions: Vec<Decision>,
+    events: Vec<WorkflowEvent>,
+    questions: Vec<Question>,
+}
+
+/// The declared pipeline axis with the task's index on it — data the window
+/// lays out, never a state→stage table of its own (REQ-RG-06).
+fn pipeline_view(task: &Task) -> PipelineView {
+    let order = workflow::pipeline_order();
+    let position = workflow::pipeline_position(task);
+    PipelineView {
+        order: order.iter().map(|s| s.as_str().to_string()).collect(),
+        current: task.state.as_str().to_string(),
+        position: position.map(|s| s.as_str().to_string()),
+        position_index: position.and_then(|p| order.iter().position(|s| *s == p)),
+        off_spine: workflow::pipeline_off_spine(task),
+        terminal: task.state.is_terminal(),
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]

@@ -333,178 +333,136 @@ fn role_name(roles: &HashMap<String, String>, slug: &str) -> String {
     roles.get(slug).cloned().unwrap_or_else(|| slug.to_string())
 }
 
-/// Folds the stored facts into the path. Pure: no IO, no writes.
-pub fn build(f: &GraphFacts<'_>) -> RoleGraph {
-    let roles: HashMap<String, String> = f.roles.iter().cloned().collect();
-    let axis = axis_states(f.process);
-    let mut notes: Vec<String> = Vec::new();
+/// The fold's shared inputs and derived indexes: every slice was loaded ONCE
+/// by the caller, so no part below reads the store again (REQ-RG-01 AC4).
+struct Fold<'a> {
+    facts: &'a GraphFacts<'a>,
+    roles: HashMap<String, String>,
+    axis: Vec<&'a ProcessState>,
+    exec_by_role: BTreeMap<String, Vec<&'a RoleExecution>>,
+    running: Vec<&'a RoleExecution>,
+    running_version: HashMap<String, u32>,
+}
 
-    // --- executions by role, freshest version wins ---------------------
-    let mut exec_by_role: BTreeMap<String, Vec<&RoleExecution>> = BTreeMap::new();
-    for e in f.executions {
-        exec_by_role.entry(e.role_slug.clone()).or_default().push(e);
-    }
-    for list in exec_by_role.values_mut() {
-        list.sort_by_key(|e| (e.started_at, e.id));
-    }
-    let running: Vec<&RoleExecution> = f
-        .executions
-        .iter()
-        .filter(|e| e.status == ExecutionStatus::Running)
-        .collect();
-    // The running execution's version wins over the newest completed one.
-    let mut running_version: HashMap<String, u32> = HashMap::new();
-    for e in &running {
-        running_version.insert(e.role_slug.clone(), e.role_version);
-    }
+/// The axis rows plus the slug/state → id maps the edges and the position
+/// address them by.
+struct NodeSet {
+    rows: Vec<GraphNode>,
+    role: HashMap<String, String>,
+    gate: HashMap<String, String>,
+}
 
-    // --- nodes: declared order, then out-of-path executions -------------
-    let mut nodes: Vec<GraphNode> = Vec::new();
-    let mut role_nodes: HashMap<String, String> = HashMap::new();
-    let mut gate_nodes: HashMap<String, String> = HashMap::new();
+impl NodeSet {
+    /// The node of the role the DECLARATION assigns to a state, if it exists.
+    fn role_for<'s>(&'s self, process: &Process, state: &str) -> Option<&'s String> {
+        process.role_for(state).and_then(|slug| self.role.get(slug))
+    }
+}
 
-    for st in &axis {
-        if is_gate_state(st) && st.executor != process_executor::ROLE {
-            // A human-only gate (APPROVAL today). QA is role-executed and
-            // declares human acts too; its node is also a gate — the branch
-            // below covers it because a gate is a gate regardless of who
-            // works there.
-            let (label, status) =
-                gate_facts(f, &st.state, &gate_id(&st.state), &node_status::EXPECTED);
-            gate_nodes.insert(st.state.clone(), gate_id(&st.state));
-            nodes.push(GraphNode {
-                id: gate_id(&st.state),
-                kind: node_kind::GATE.to_string(),
-                state: st.state.clone(),
-                label: label.clone(),
-                display: label,
-                role_slug: None,
-                role_version: None,
-                status: status.clone(),
-                status_word: node_status_word(status.as_str()).to_string(),
-                revoked: false,
-                executions: Vec::new(),
-                artifacts: Vec::new(),
-            });
-            continue;
+/// The graph is laid out by these parts, one basis each: nodes, edges,
+/// position, stages, waits, running rows, questions. `build` only assembles
+/// their results.
+impl<'a> Fold<'a> {
+    fn new(f: &'a GraphFacts<'a>) -> Self {
+        let mut exec_by_role: BTreeMap<String, Vec<&RoleExecution>> = BTreeMap::new();
+        for e in f.executions {
+            exec_by_role.entry(e.role_slug.clone()).or_default().push(e);
         }
-        if let Some(slug) = st.role.as_deref() {
-            if let Some(list) = exec_by_role.get(slug) {
-                let version = running_version
-                    .get(slug)
-                    .copied()
-                    .or_else(|| list.last().map(|e| e.role_version))
-                    .unwrap_or(1);
-                let id = role_id(slug);
-                let (artifacts, revoked) = node_artifacts(f, slug, &exec_by_role, &roles);
-                let passed = artifacts
-                    .iter()
-                    .any(|a| a.status == ArtifactStatus::Current.as_str());
-                let status = if passed {
-                    node_status::PASSED
-                } else {
-                    node_status::EXPECTED
-                };
-                let executions = list
-                    .iter()
-                    .map(|e| GraphExecution {
-                        id: e.id.to_string(),
-                        role_slug: e.role_slug.clone(),
-                        role_display: role_display(&roles, &e.role_slug, e.role_version),
-                        role_version: e.role_version,
-                        agent_name: e.agent_name.clone(),
-                        status: e.status.as_str().to_string(),
-                        attempt: e.attempt,
-                        started_at: e.started_at,
-                        finished_at: e.finished_at,
-                    })
-                    .collect();
-                role_nodes.insert(slug.to_string(), id.clone());
-                nodes.push(GraphNode {
-                    id,
-                    kind: node_kind::ROLE.to_string(),
-                    state: st.state.clone(),
-                    label: role_name(&roles, slug),
-                    display: role_display(&roles, slug, version),
-                    role_slug: Some(slug.to_string()),
-                    role_version: Some(version),
-                    status: status.to_string(),
-                    status_word: node_status_word(status).to_string(),
-                    revoked,
-                    executions,
-                    artifacts,
-                });
-            }
-            if is_gate_state(st) {
-                // QA today: a role stage that also declares the human act.
-                // The gate keeps the affirmative-act fact (`passed` once the
-                // acceptance is stored) — the position pass promotes it to
-                // `current` while the signature is still awaited.
-                let (label, status) =
-                    gate_facts(f, &st.state, &gate_id(&st.state), &node_status::EXPECTED);
-                gate_nodes.insert(st.state.clone(), gate_id(&st.state));
-                nodes.push(GraphNode {
-                    id: gate_id(&st.state),
-                    kind: node_kind::GATE.to_string(),
-                    state: st.state.clone(),
-                    label: label.clone(),
-                    display: label,
-                    role_slug: None,
-                    role_version: None,
-                    status: status.clone(),
-                    status_word: node_status_word(status.as_str()).to_string(),
-                    revoked: false,
-                    executions: Vec::new(),
-                    artifacts: Vec::new(),
-                });
-            }
+        for list in exec_by_role.values_mut() {
+            list.sort_by_key(|e| (e.started_at, e.id));
+        }
+        let running: Vec<&RoleExecution> = f
+            .executions
+            .iter()
+            .filter(|e| e.status == ExecutionStatus::Running)
+            .collect();
+        // The running execution's version wins over the newest completed one.
+        let running_version = running
+            .iter()
+            .map(|e| (e.role_slug.clone(), e.role_version))
+            .collect();
+        Fold {
+            facts: f,
+            roles: f.roles.iter().cloned().collect(),
+            axis: axis_states(f.process),
+            exec_by_role,
+            running,
+            running_version,
         }
     }
 
-    // Executed roles outside the declared path: they exist as nodes (the
-    // fact is stored) and are named as out-of-path by a note; they never
-    // create edges to the declared path.
-    let declared: HashSet<String> = role_nodes.keys().cloned().collect();
-    for (slug, list) in &exec_by_role {
-        if declared.contains(slug) {
-            continue;
-        }
-        let version = running_version
+    /// The version a node's signboard prints: the running one, else the
+    /// freshest stored run.
+    fn role_version(&self, slug: &str) -> u32 {
+        self.running_version
             .get(slug)
             .copied()
-            .or_else(|| list.last().map(|e| e.role_version))
-            .unwrap_or(1);
-        let (artifacts, revoked) = node_artifacts(f, slug, &exec_by_role, &roles);
-        let passed = artifacts
+            .or_else(|| self.stored_version(slug))
+            .unwrap_or(1)
+    }
+
+    fn stored_version(&self, slug: &str) -> Option<u32> {
+        self.exec_by_role
+            .get(slug)
+            .and_then(|list| list.last().map(|e| e.role_version))
+    }
+
+    /// Nodes in declaration order, then the final of an accepted task. A role
+    /// outside the declaration NEVER gets a node: its run is a note and a row
+    /// in `running`, not a place on the path (REQ-RG-02 AC3).
+    fn nodes(&self) -> NodeSet {
+        let mut ns = NodeSet {
+            rows: Vec::new(),
+            role: HashMap::new(),
+            gate: HashMap::new(),
+        };
+        for st in &self.axis {
+            if is_gate_state(st) && st.executor != process_executor::ROLE {
+                self.push_gate(&mut ns, st);
+                continue;
+            }
+            let Some(slug) = st.role.as_deref() else {
+                continue;
+            };
+            if self.exec_by_role.contains_key(slug) {
+                self.push_role(&mut ns, st, slug);
+            }
+            // QA today: a role stage that also declares the human act, so it
+            // carries BOTH a role node and a gate node.
+            if is_gate_state(st) {
+                self.push_gate(&mut ns, st);
+            }
+        }
+        ns.rows.extend(final_node(self.facts.task));
+        ns
+    }
+
+    /// One role node: it exists because the role EXECUTED on this task.
+    fn push_role(&self, ns: &mut NodeSet, st: &ProcessState, slug: &str) {
+        let version = self.role_version(slug);
+        let id = role_id(slug);
+        let (artifacts, revoked) = self.node_artifacts(slug);
+        let status = if artifacts
             .iter()
-            .any(|a| a.status == ArtifactStatus::Current.as_str());
-        let status = if passed {
+            .any(|a| a.status == ArtifactStatus::Current.as_str())
+        {
             node_status::PASSED
         } else {
             node_status::EXPECTED
         };
-        let executions = list
-            .iter()
-            .map(|e| GraphExecution {
-                id: e.id.to_string(),
-                role_slug: e.role_slug.clone(),
-                role_display: role_display(&roles, &e.role_slug, e.role_version),
-                role_version: e.role_version,
-                agent_name: e.agent_name.clone(),
-                status: e.status.as_str().to_string(),
-                attempt: e.attempt,
-                started_at: e.started_at,
-                finished_at: e.finished_at,
-            })
-            .collect();
-        role_nodes.insert(slug.clone(), role_id(slug));
-        nodes.push(GraphNode {
-            id: role_id(slug),
+        let executions = self
+            .exec_by_role
+            .get(slug)
+            .map(|list| execution_rows(&self.roles, list))
+            .unwrap_or_default();
+        ns.role.insert(slug.to_string(), id.clone());
+        ns.rows.push(GraphNode {
+            id,
             kind: node_kind::ROLE.to_string(),
-            state: String::new(),
-            label: role_name(&roles, slug),
-            display: role_display(&roles, slug, version),
-            role_slug: Some(slug.clone()),
+            state: st.state.clone(),
+            label: role_name(&self.roles, slug),
+            display: role_display(&self.roles, slug, version),
+            role_slug: Some(slug.to_string()),
             role_version: Some(version),
             status: status.to_string(),
             status_word: node_status_word(status).to_string(),
@@ -514,430 +472,595 @@ pub fn build(f: &GraphFacts<'_>) -> RoleGraph {
         });
     }
 
-    // --- the final node exists only for an accepted task ----------------
-    if f.task.state == TaskState::Accepted {
-        nodes.push(GraphNode {
-            id: "final".to_string(),
-            kind: node_kind::FINAL.to_string(),
-            state: TaskState::Accepted.as_str().to_string(),
-            label: "принято".to_string(),
-            display: "принято".to_string(),
+    /// One human gate: it exists because the DECLARATION declares a human act
+    /// over a document here — the gate count is never hard-coded (REQ-RG-02).
+    fn push_gate(&self, ns: &mut NodeSet, st: &ProcessState) {
+        let id = gate_id(&st.state);
+        let (label, status) = gate_facts(self.facts, &st.state, &id, node_status::EXPECTED);
+        let word = node_status_word(status.as_str()).to_string();
+        ns.gate.insert(st.state.clone(), id.clone());
+        ns.rows.push(GraphNode {
+            id,
+            kind: node_kind::GATE.to_string(),
+            state: st.state.clone(),
+            label: label.clone(),
+            display: label,
             role_slug: None,
             role_version: None,
-            status: node_status::EXPECTED.to_string(),
-            status_word: node_status_word(node_status::EXPECTED).to_string(),
+            status,
+            status_word: word,
             revoked: false,
             executions: Vec::new(),
             artifacts: Vec::new(),
         });
     }
 
-    // --- position -------------------------------------------------------
-    // The position names a PLACE in human words: node display («имя · vN» /
-    // the gate's declared demand) or the declared stage's label — never a raw
-    // id/token as the heading (REQ-NM-01).
-    let node_labels: HashMap<String, String> = nodes
-        .iter()
-        .map(|n| (n.id.clone(), n.display.clone()))
-        .collect();
-    let mut position = position_of(f, &axis, &role_nodes, &gate_nodes, &node_labels, &roles);
-    // The position's node is `current`; passed nodes stay passed.
-    if let Some(node_id) = position.node.as_deref()
-        && let Some(n) = nodes.iter_mut().find(|n| n.id == node_id)
-    {
-        n.status = node_status::CURRENT.to_string();
-        n.status_word = node_status_word(node_status::CURRENT).to_string();
+    /// The ONE position of the task: `(kind, anchor, stage, node)` with a line
+    /// a human reads, from the state and the stored facts (REQ-RG-03).
+    fn position(&self, ns: &NodeSet) -> GraphPosition {
+        let labels: HashMap<String, String> = ns
+            .rows
+            .iter()
+            .map(|n| (n.id.clone(), n.display.clone()))
+            .collect();
+        position_of(self.facts, &self.axis, ns, &labels, &self.roles)
     }
 
-    // --- edges: only stored facts, only between existing nodes ----------
-    let mut edges: Vec<GraphEdge> = Vec::new();
-    let mut seen: HashSet<(String, String, String, String)> = HashSet::new();
-    let exec_role: HashMap<Id, &str> = f
-        .executions
-        .iter()
-        .map(|e| (e.id, e.role_slug.as_str()))
-        .collect();
-    let artifact_by_id: HashMap<Id, &Artifact> = f.artifacts.iter().map(|a| (a.id, a)).collect();
-
-    // Consumption: an execution names an artifact → producer → consumer.
-    for e in f.executions {
-        let Some(to) = role_nodes.get(&e.role_slug) else {
-            continue;
+    /// Every edge carries ONE stored fact and connects two EXISTING nodes
+    /// (REQ-RG-04). Facts whose end is not on the graph leave a note.
+    fn edges(&self, ns: &NodeSet, returns: &[&WorkflowEvent]) -> (Vec<GraphEdge>, Vec<String>) {
+        let idx = EdgeIndex {
+            exec_role: self
+                .facts
+                .executions
+                .iter()
+                .map(|e| (e.id, e.role_slug.as_str()))
+                .collect(),
+            artifacts: self.facts.artifacts.iter().map(|a| (a.id, a)).collect(),
         };
-        for input in &e.inputs {
-            let Ok(id) = input.parse::<Id>() else {
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        let mut seen: SeenEdges = HashSet::new();
+        let mut notes: Vec<String> = Vec::new();
+        self.consumption_edges(ns, &idx, &mut edges, &mut seen);
+        self.verdict_edges(ns, &mut edges, &mut seen, &mut notes);
+        self.report_edges(ns, &idx, &mut edges, &mut seen);
+        self.human_edges(ns, &mut edges, &mut seen);
+        self.return_edges(ns, returns, &mut edges, &mut seen);
+        self.acceptance_edges(ns, &mut edges, &mut seen, &mut notes);
+        (edges, notes)
+    }
+
+    /// Consumption: an execution names an artifact → producer → consumer.
+    fn consumption_edges(
+        &self,
+        ns: &NodeSet,
+        idx: &EdgeIndex<'_>,
+        edges: &mut Vec<GraphEdge>,
+        seen: &mut SeenEdges,
+    ) {
+        for e in self.facts.executions {
+            let Some(to) = ns.role.get(&e.role_slug) else {
                 continue;
             };
-            let Some(a) = artifact_by_id.get(&id) else {
-                continue;
-            };
-            let Some(producer_exec) = a.execution_id else {
-                continue;
-            };
-            let Some(producer_slug) = exec_role.get(&producer_exec) else {
-                continue;
-            };
-            let Some(from) = role_nodes.get(*producer_slug) else {
-                continue;
-            };
-            if from == to {
-                continue;
+            for input in &e.inputs {
+                let Some((from, carrier)) = self.consumed_fact(ns, idx, input) else {
+                    continue;
+                };
+                if &from == to {
+                    continue;
+                }
+                push_edge(
+                    edges,
+                    seen,
+                    GraphEdge {
+                        from,
+                        to: to.clone(),
+                        kind: edge_kind::TRANSFER.to_string(),
+                        round: None,
+                        carrier,
+                    },
+                );
             }
-            push_edge(
-                &mut edges,
-                &mut seen,
-                GraphEdge {
-                    from: from.clone(),
-                    to: to.clone(),
-                    kind: edge_kind::TRANSFER.to_string(),
-                    round: None,
-                    carrier: GraphCarrier {
-                        kind: carrier_kind::ARTIFACT.to_string(),
-                        id: a.id.to_string(),
-                        label: artifact_display(f.artifact_titles, a),
-                    },
-                },
-            );
         }
     }
 
-    // Reviewer verdicts: a go verdict goes to the requirements gate, any
-    // other verdict back to the analyst node. A verdict without its node
-    // gives a NOTE and zero edges.
-    let reviewer_node = f
-        .process
-        .role_for(TaskState::Review.as_str())
-        .and_then(|slug| role_nodes.get(slug));
-    let analyst_node = f
-        .process
-        .role_for(TaskState::Analysis.as_str())
-        .and_then(|slug| role_nodes.get(slug));
-    for ev in f
-        .events
-        .iter()
-        .filter(|e| e.kind == event_kind::REVIEW_RECORDED)
-    {
-        let verdict = ev
-            .payload
-            .get(json_field::VERDICT)
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let approved = verdict == Verdict::Approved.as_str();
-        let from = reviewer_node;
-        let to = if approved {
-            gate_nodes.get(TaskState::Approval.as_str())
-        } else {
-            analyst_node
+    /// The producer node and the artifact a consumption edge carries; `None`
+    /// while an end of the edge does not exist.
+    fn consumed_fact(
+        &self,
+        ns: &NodeSet,
+        idx: &EdgeIndex<'_>,
+        input: &str,
+    ) -> Option<(String, GraphCarrier)> {
+        let id = input.parse::<Id>().ok()?;
+        let a = idx.artifacts.get(&id)?;
+        let slug = idx.exec_role.get(&a.execution_id?)?;
+        let from = ns.role.get(*slug)?.clone();
+        Some((from, artifact_carrier(self.facts.artifact_titles, a)))
+    }
+
+    /// Reviewer verdicts: «принято» to the approval gate, any other verdict
+    /// back to the analyst. A verdict without its nodes is a NOTE.
+    fn verdict_edges(
+        &self,
+        ns: &NodeSet,
+        edges: &mut Vec<GraphEdge>,
+        seen: &mut SeenEdges,
+        notes: &mut Vec<String>,
+    ) {
+        let reviewer = ns.role_for(self.facts.process, TaskState::Review.as_str());
+        let analyst = ns.role_for(self.facts.process, TaskState::Analysis.as_str());
+        for ev in self
+            .facts
+            .events
+            .iter()
+            .filter(|e| e.kind == event_kind::REVIEW_RECORDED)
+        {
+            let approved = verdict_of(ev) == Verdict::Approved.as_str();
+            let to = if approved {
+                ns.gate.get(TaskState::Approval.as_str())
+            } else {
+                analyst
+            };
+            match (reviewer, to) {
+                (Some(from), Some(to)) => {
+                    push_edge(edges, seen, verdict_edge(from, to, ev, approved))
+                }
+                _ => notes.push(
+                    "вердикт проверки без узла на графе — ребро не рисуется, факт остаётся в истории"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+
+    /// Reports (implementation + quality): every publication gives its own
+    /// edge from its role node to the quality gate.
+    fn report_edges(
+        &self,
+        ns: &NodeSet,
+        idx: &EdgeIndex<'_>,
+        edges: &mut Vec<GraphEdge>,
+        seen: &mut SeenEdges,
+    ) {
+        let Some(gate) = ns.gate.get(TaskState::Qa.as_str()) else {
+            return;
         };
-        match (from, to) {
-            (Some(from), Some(to)) => push_edge(
-                &mut edges,
-                &mut seen,
-                GraphEdge {
-                    from: from.clone(),
-                    to: to.clone(),
-                    kind: if approved {
-                        edge_kind::SIGNATURE.to_string()
-                    } else {
-                        edge_kind::REJECTION.to_string()
-                    },
-                    round: None,
-                    carrier: GraphCarrier {
-                        kind: carrier_kind::EVENT.to_string(),
-                        id: ev.id.to_string(),
-                        label: format!("отчёт проверки: {verdict}"),
-                    },
-                },
-            ),
-            _ => notes.push(
-                "вердикт проверки без узла на графе — ребро не рисуется, факт остаётся в истории"
-                    .to_string(),
-            ),
-        }
-    }
-
-    // Reports (implementation + quality): every publication gives its own
-    // edge from its role node to the quality gate. A report without an
-    // execution gives no node and no edge.
-    let qa_gate = gate_nodes.get(TaskState::Qa.as_str()).cloned();
-    if let Some(gate) = qa_gate.as_deref() {
-        for a in f.artifacts.iter().filter(|a| {
+        let reports = self.facts.artifacts.iter().filter(|a| {
             matches!(
                 a.kind,
                 ArtifactKind::ImplementationReport | ArtifactKind::QualityReport
             )
-        }) {
-            let Some(exec_id) = a.execution_id else {
+        });
+        for a in reports {
+            let Some(slug) = a.execution_id.and_then(|id| idx.exec_role.get(&id)) else {
                 continue;
             };
-            let Some(slug) = exec_role.get(&exec_id) else {
-                continue;
-            };
-            let Some(from) = role_nodes.get(*slug) else {
+            let Some(from) = ns.role.get(*slug) else {
                 continue;
             };
             push_edge(
-                &mut edges,
-                &mut seen,
+                edges,
+                seen,
                 GraphEdge {
                     from: from.clone(),
-                    to: gate.to_string(),
+                    to: gate.clone(),
                     kind: edge_kind::SIGNATURE.to_string(),
                     round: None,
-                    carrier: GraphCarrier {
-                        kind: carrier_kind::ARTIFACT.to_string(),
-                        id: a.id.to_string(),
-                        label: artifact_display(f.artifact_titles, a),
-                    },
+                    carrier: artifact_carrier(self.facts.artifact_titles, a),
                 },
             );
         }
     }
 
-    // Human acts: signature, rejection, returns, acceptance — each from the
-    // stored decision/event and only when BOTH ends exist.
-    let implementer_node = f
-        .process
-        .role_for(TaskState::Implementation.as_str())
-        .and_then(|slug| role_nodes.get(slug));
-    let approval_gate = gate_nodes.get(TaskState::Approval.as_str());
-    for d in f.decisions {
-        match d.kind.as_str() {
-            decision_kind::REQUIREMENTS_APPROVAL if d.verdict == Verdict::Approved => {
-                if let (Some(from), Some(to)) = (approval_gate, implementer_node) {
-                    push_edge(
-                        &mut edges,
-                        &mut seen,
-                        GraphEdge {
-                            from: from.clone(),
-                            to: to.clone(),
-                            kind: edge_kind::SIGNATURE.to_string(),
-                            round: None,
-                            carrier: GraphCarrier {
-                                kind: carrier_kind::DECISION.to_string(),
-                                id: d.id.to_string(),
-                                label: "подпись требований".to_string(),
-                            },
-                        },
-                    );
+    /// Human acts carried by stored decisions: the requirements signature to
+    /// the implementer, a rejection back to the analyst — only when BOTH ends
+    /// exist (REQ-RG-04 AC3).
+    fn human_edges(&self, ns: &NodeSet, edges: &mut Vec<GraphEdge>, seen: &mut SeenEdges) {
+        let gate = ns.gate.get(TaskState::Approval.as_str());
+        let implementer = ns.role_for(self.facts.process, TaskState::Implementation.as_str());
+        let analyst = ns.role_for(self.facts.process, TaskState::Analysis.as_str());
+        for d in self.facts.decisions {
+            let (to, kind, label) = match d.kind.as_str() {
+                decision_kind::REQUIREMENTS_APPROVAL if d.verdict == Verdict::Approved => {
+                    (implementer, edge_kind::SIGNATURE, "подпись требований")
                 }
-            }
-            decision_kind::REQUIREMENTS_REJECTION => {
-                if let (Some(from), Some(to)) = (approval_gate, analyst_node) {
-                    push_edge(
-                        &mut edges,
-                        &mut seen,
-                        GraphEdge {
-                            from: from.clone(),
-                            to: to.clone(),
-                            kind: edge_kind::REJECTION.to_string(),
-                            round: None,
-                            carrier: GraphCarrier {
-                                kind: carrier_kind::DECISION.to_string(),
-                                id: d.id.to_string(),
-                                label: "отклонение требований".to_string(),
-                            },
-                        },
-                    );
+                decision_kind::REQUIREMENTS_REJECTION => {
+                    (analyst, edge_kind::REJECTION, "отклонение требований")
                 }
+                _ => continue,
+            };
+            if let Some(edge) = decision_edge(gate, to, d, kind, label) {
+                push_edge(edges, seen, edge);
             }
-            _ => {}
         }
     }
 
-    // Returns: every stored quality return is one edge and one round.
-    let mut rounds = 0u32;
-    for ev in f
-        .events
-        .iter()
-        .filter(|e| e.kind == event_kind::QUALITY_RETURNED)
-    {
-        rounds += 1;
-        if let (Some(from), Some(to)) = (qa_gate.as_deref(), implementer_node) {
+    /// Returns: every stored quality return is one edge and one round.
+    fn return_edges(
+        &self,
+        ns: &NodeSet,
+        returns: &[&WorkflowEvent],
+        edges: &mut Vec<GraphEdge>,
+        seen: &mut SeenEdges,
+    ) {
+        let (Some(gate), Some(implementer)) = (
+            ns.gate.get(TaskState::Qa.as_str()),
+            ns.role_for(self.facts.process, TaskState::Implementation.as_str()),
+        ) else {
+            return;
+        };
+        for (i, ev) in returns.iter().enumerate() {
+            let round = i as u32 + 1;
             push_edge(
-                &mut edges,
-                &mut seen,
+                edges,
+                seen,
                 GraphEdge {
-                    from: from.to_string(),
-                    to: to.clone(),
+                    from: gate.clone(),
+                    to: implementer.clone(),
                     kind: edge_kind::RETURN.to_string(),
-                    round: Some(rounds),
+                    round: Some(round),
                     carrier: GraphCarrier {
                         kind: carrier_kind::EVENT.to_string(),
                         id: ev.id.to_string(),
-                        label: format!("возврат на доработку, круг {rounds}"),
+                        label: format!("возврат на доработку, круг {round}"),
                     },
                 },
             );
         }
     }
 
-    // Acceptance into the final node.
-    let accepted_events: Vec<&WorkflowEvent> = f
-        .events
-        .iter()
-        .filter(|e| e.kind == event_kind::TASK_ACCEPTED)
-        .collect();
-    if let (Some(gate), true) = (qa_gate.as_deref(), !accepted_events.is_empty())
-        && f.task.state == TaskState::Accepted
-    {
-        if let Some(ev) = accepted_events.last() {
-            push_edge(
-                &mut edges,
-                &mut seen,
-                GraphEdge {
-                    from: gate.to_string(),
-                    to: "final".to_string(),
-                    kind: edge_kind::ACCEPTANCE.to_string(),
-                    round: None,
-                    carrier: GraphCarrier {
-                        kind: carrier_kind::EVENT.to_string(),
-                        id: ev.id.to_string(),
-                        label: "приёмка".to_string(),
-                    },
-                },
+    /// Acceptance into the final node, plus the data-mismatch note when an
+    /// accepted task has no stored acceptance act.
+    fn acceptance_edges(
+        &self,
+        ns: &NodeSet,
+        edges: &mut Vec<GraphEdge>,
+        seen: &mut SeenEdges,
+        notes: &mut Vec<String>,
+    ) {
+        let accepted = self.facts.task.state == TaskState::Accepted;
+        let act = self
+            .facts
+            .events
+            .iter()
+            .filter(|e| e.kind == event_kind::TASK_ACCEPTED)
+            .next_back();
+        if accepted && act.is_none() {
+            notes.push(
+                "у принятой задачи нет сохранённого акта приёмки — расхождение данных".to_string(),
             );
         }
-    }
-    if f.task.state == TaskState::Accepted && accepted_events.is_empty() {
-        notes.push(
-            "у принятой задачи нет сохранённого акта приёмки — расхождение данных".to_string(),
+        let (true, Some(ev), Some(gate)) = (accepted, act, ns.gate.get(TaskState::Qa.as_str()))
+        else {
+            return;
+        };
+        push_edge(
+            edges,
+            seen,
+            GraphEdge {
+                from: gate.clone(),
+                to: "final".to_string(),
+                kind: edge_kind::ACCEPTANCE.to_string(),
+                round: None,
+                carrier: GraphCarrier {
+                    kind: carrier_kind::EVENT.to_string(),
+                    id: ev.id.to_string(),
+                    label: "приёмка".to_string(),
+                },
+            },
         );
     }
 
-    // --- stages: statuses positional to the ONE position ----------------
-    let stage_idx = stage_index_for_position(&axis, &position);
-    let mut stages: Vec<GraphStage> = axis
-        .iter()
-        .enumerate()
-        .map(|(i, st)| {
-            let status = match stage_idx {
-                None => stage_status::PENDING,
-                Some(idx) if i < idx => stage_status::PASSED,
-                Some(idx) if i == idx => stage_status::CURRENT,
-                Some(_) => stage_status::PENDING,
-            };
-            let label = stage_label(f, st, &roles);
-            GraphStage {
-                state: st.state.clone(),
-                label,
-                executor: st
-                    .role
-                    .clone()
-                    .unwrap_or_else(|| process_executor::HUMAN.to_string()),
-                gate: is_gate_state(st),
-                status: status.to_string(),
-                status_word: stage_status_word(status).to_string(),
-            }
-        })
-        .collect();
-    // A task in REWORK (or a hold returning there) has passed the whole
-    // axis: the loop is drawn separately, not as «ещё одна точка».
-    let on_rework = f.task.state == TaskState::Rework
-        || (f.task.state.is_hold() && f.task.return_state == Some(TaskState::Rework));
-    if on_rework {
-        for s in &mut stages {
-            s.status = stage_status::PASSED.to_string();
-            s.status_word = stage_status_word(stage_status::PASSED).to_string();
-        }
-    }
-    // The current STAGE marker exists only when the position names a stage
-    // (kind `stage` or `hold`), never for the rework loop.
-    if position.kind == position_kind::OFF_GRAPH || on_rework {
-        for s in &mut stages {
-            if s.status == stage_status::CURRENT {
-                s.status = stage_status::PENDING.to_string();
-                s.status_word = stage_status_word(stage_status::PENDING).to_string();
+    /// Stages carry statuses positional to the ONE position; the rework stage
+    /// is the separate loop, never a point on this axis (REQ-RG-05).
+    fn stages(&self, position: &GraphPosition) -> Vec<GraphStage> {
+        let idx = stage_index_for_position(&self.axis, position);
+        let mut stages: Vec<GraphStage> = self
+            .axis
+            .iter()
+            .enumerate()
+            .map(|(i, st)| self.stage_row(st, i, idx))
+            .collect();
+        let on_rework = self.on_rework();
+        // A task in REWORK (or a hold returning there) has passed the whole
+        // axis: the loop is drawn separately, not as «ещё одна точка».
+        if on_rework {
+            for s in &mut stages {
+                s.status = stage_status::PASSED.to_string();
+                s.status_word = stage_status_word(stage_status::PASSED).to_string();
             }
         }
+        // The current STAGE marker exists only when the position names a stage.
+        if position.kind == position_kind::OFF_GRAPH || on_rework {
+            for s in &mut stages {
+                if s.status == stage_status::CURRENT {
+                    s.status = stage_status::PENDING.to_string();
+                    s.status_word = stage_status_word(stage_status::PENDING).to_string();
+                }
+            }
+        }
+        stages
     }
-    position.line = position_line(&position);
 
-    // --- waits: one row per declared gate -------------------------------
-    let parked_question = f
-        .questions
-        .iter()
-        .find(|q| q.status == QuestionStatus::Open && q.blocking);
-    let waits: Vec<GraphWait> = axis
-        .iter()
-        .filter(|st| gate_nodes.contains_key(&st.state))
-        .map(|st| {
-            let node = &gate_nodes[&st.state];
-            let state = &st.state;
-            let doc = gate_document(f, state);
-            let awaiting = position.node.as_deref() == Some(node.as_str());
-            let signable = awaiting && doc.as_ref().is_some_and(|(_, current)| *current);
-            let presentation = doc.map(|(a, current)| GraphPresentation {
-                artifact_id: a.id.to_string(),
-                display: artifact_display(f.artifact_titles, a),
-                status: a.status.as_str().to_string(),
-                current,
-                note: (!current)
-                    .then(|| "последний сохранённый документ, не действующий".to_string()),
-            });
-            let (requirement, hint) = gate_demand(f.wait_policy, f.task, state, parked_question);
-            GraphWait {
-                node: node.clone(),
-                state: state.clone(),
-                requirement,
-                hint,
-                awaiting,
-                signable,
-                presentation,
-            }
-        })
-        .collect();
-
-    // --- running roles ---------------------------------------------------
-    let mut running_views: Vec<GraphRunning> = running
-        .iter()
-        .map(|e| {
-            let in_path = f.process.states.iter().any(|s| {
-                s.executor == process_executor::ROLE && s.role.as_deref() == Some(&e.role_slug)
-            });
-            GraphRunning {
-                execution_id: e.id.to_string(),
-                role_slug: e.role_slug.clone(),
-                role_display: role_display(&roles, &e.role_slug, e.role_version),
-                role_version: e.role_version,
-                agent_name: e.agent_name.clone(),
-                in_path,
-                note: (!in_path).then(|| "прогон вне пути".to_string()),
-            }
-        })
-        .collect();
-    running_views.sort_by(|a, b| a.execution_id.cmp(&b.execution_id));
-    for r in &running_views {
-        if !r.in_path {
-            notes.push(format!("прогон вне пути: {}", r.role_display));
+    fn stage_row(&self, st: &ProcessState, i: usize, idx: Option<usize>) -> GraphStage {
+        let status = match idx {
+            None => stage_status::PENDING,
+            Some(idx) if i < idx => stage_status::PASSED,
+            Some(idx) if i == idx => stage_status::CURRENT,
+            Some(_) => stage_status::PENDING,
+        };
+        GraphStage {
+            state: st.state.clone(),
+            label: stage_label(self.facts, st, &self.roles),
+            executor: st
+                .role
+                .clone()
+                .unwrap_or_else(|| process_executor::HUMAN.to_string()),
+            gate: is_gate_state(st),
+            status: status.to_string(),
+            status_word: stage_status_word(status).to_string(),
         }
     }
 
-    let blocking_questions = f
-        .questions
-        .iter()
-        .filter(|q| q.status == QuestionStatus::Open && q.blocking)
-        .count();
+    /// A task in REWORK — or parked with REWORK as its return place — is in
+    /// the separate loop, off the axis.
+    fn on_rework(&self) -> bool {
+        self.facts.task.state == TaskState::Rework
+            || (self.facts.task.state.is_hold()
+                && self.facts.task.return_state == Some(TaskState::Rework))
+    }
 
-    let rework = ReworkLoop {
-        rounds,
-        active: on_rework,
-        note: if rounds == 0 {
-            "контура доработки не было".to_string()
-        } else {
-            format!("кругов доработки: {rounds}")
+    /// One row per DECLARED gate: requirement, hint with real ids, whether it
+    /// awaits NOW, whether it is signable NOW, what it presents (REQ-RG-02).
+    fn waits(&self, position: &GraphPosition, gates: &HashMap<String, String>) -> Vec<GraphWait> {
+        let parked = self.parked_question();
+        self.axis
+            .iter()
+            .filter(|st| gates.contains_key(&st.state))
+            .map(|st| self.wait_row(st, &gates[&st.state], position, parked))
+            .collect()
+    }
+
+    fn wait_row(
+        &self,
+        st: &ProcessState,
+        node: &str,
+        position: &GraphPosition,
+        parked: Option<&Question>,
+    ) -> GraphWait {
+        let doc = gate_document(self.facts, &st.state);
+        let awaiting = position.node.as_deref() == Some(node);
+        let signable = awaiting && doc.as_ref().is_some_and(|(_, current)| *current);
+        let presentation = doc.map(|(a, current)| GraphPresentation {
+            artifact_id: a.id.to_string(),
+            display: artifact_display(self.facts.artifact_titles, a),
+            status: a.status.as_str().to_string(),
+            current,
+            note: (!current).then(|| "последний сохранённый документ, не действующий".to_string()),
+        });
+        let (requirement, hint) =
+            gate_demand(self.facts.wait_policy, self.facts.task, &st.state, parked);
+        GraphWait {
+            node: node.to_string(),
+            state: st.state.clone(),
+            requirement,
+            hint,
+            awaiting,
+            signable,
+            presentation,
+        }
+    }
+
+    /// The blocking question a parked gate's hint refers to, if any.
+    fn parked_question(&self) -> Option<&'a Question> {
+        self.facts
+            .questions
+            .iter()
+            .find(|q| q.status == QuestionStatus::Open && q.blocking)
+    }
+
+    /// Running roles: who works NOW, plus the out-of-path mark — a run
+    /// outside the declaration is never a node (REQ-RG-02 AC3).
+    fn running_rows(&self) -> (Vec<GraphRunning>, Vec<String>) {
+        let mut rows: Vec<GraphRunning> =
+            self.running.iter().map(|e| self.running_row(e)).collect();
+        rows.sort_by(|a, b| a.execution_id.cmp(&b.execution_id));
+        let notes = rows
+            .iter()
+            .filter(|r| !r.in_path)
+            .map(|r| format!("прогон вне пути: {}", r.role_display))
+            .collect();
+        (rows, notes)
+    }
+
+    fn running_row(&self, e: &RoleExecution) -> GraphRunning {
+        let in_path = self.declares_role(&e.role_slug);
+        GraphRunning {
+            execution_id: e.id.to_string(),
+            role_slug: e.role_slug.clone(),
+            role_display: role_display(&self.roles, &e.role_slug, e.role_version),
+            role_version: e.role_version,
+            agent_name: e.agent_name.clone(),
+            in_path,
+            note: (!in_path).then(|| "прогон вне пути".to_string()),
+        }
+    }
+
+    /// A role is on the path when the DECLARATION gives it a role stage.
+    fn declares_role(&self, slug: &str) -> bool {
+        self.facts
+            .process
+            .states
+            .iter()
+            .any(|s| s.executor == process_executor::ROLE && s.role.as_deref() == Some(slug))
+    }
+
+    /// Blocking questions are a fact of the question plane, never of a gate or
+    /// of the position (REQ-RG-05).
+    fn blocking_count(&self) -> usize {
+        self.facts
+            .questions
+            .iter()
+            .filter(|q| q.status == QuestionStatus::Open && q.blocking)
+            .count()
+    }
+
+    /// The stored quality returns — each one is a rework round.
+    fn returns(&self) -> Vec<&'a WorkflowEvent> {
+        self.facts
+            .events
+            .iter()
+            .filter(|e| e.kind == event_kind::QUALITY_RETURNED)
+            .collect()
+    }
+
+    fn node_artifacts(&self, slug: &str) -> (Vec<GraphArtifact>, bool) {
+        node_artifacts(self.facts, slug, &self.exec_by_role, &self.roles)
+    }
+
+    fn rework(&self, rounds: u32) -> ReworkLoop {
+        ReworkLoop {
+            rounds,
+            active: self.on_rework(),
+            note: if rounds == 0 {
+                "контура доработки не было".to_string()
+            } else {
+                format!("кругов доработки: {rounds}")
+            },
+        }
+    }
+}
+
+/// The final node exists only for an accepted task.
+fn final_node(task: &Task) -> Option<GraphNode> {
+    (task.state == TaskState::Accepted).then(|| GraphNode {
+        id: "final".to_string(),
+        kind: node_kind::FINAL.to_string(),
+        state: TaskState::Accepted.as_str().to_string(),
+        label: "принято".to_string(),
+        display: "принято".to_string(),
+        role_slug: None,
+        role_version: None,
+        status: node_status::EXPECTED.to_string(),
+        status_word: node_status_word(node_status::EXPECTED).to_string(),
+        revoked: false,
+        executions: Vec::new(),
+        artifacts: Vec::new(),
+    })
+}
+
+/// The two lookups every carrier edge needs, built once per fold.
+struct EdgeIndex<'a> {
+    exec_role: HashMap<Id, &'a str>,
+    artifacts: HashMap<Id, &'a Artifact>,
+}
+
+type SeenEdges = HashSet<(String, String, String, String)>;
+
+/// One execution row as the card prints it (name+version, agent, attempt).
+fn execution_rows(roles: &HashMap<String, String>, list: &[&RoleExecution]) -> Vec<GraphExecution> {
+    list.iter().map(|e| execution_row(roles, e)).collect()
+}
+
+fn execution_row(roles: &HashMap<String, String>, e: &RoleExecution) -> GraphExecution {
+    GraphExecution {
+        id: e.id.to_string(),
+        role_slug: e.role_slug.clone(),
+        role_display: role_display(roles, &e.role_slug, e.role_version),
+        role_version: e.role_version,
+        agent_name: e.agent_name.clone(),
+        status: e.status.as_str().to_string(),
+        attempt: e.attempt,
+        started_at: e.started_at,
+        finished_at: e.finished_at,
+    }
+}
+
+fn artifact_carrier(titles: &BTreeMap<String, String>, a: &Artifact) -> GraphCarrier {
+    GraphCarrier {
+        kind: carrier_kind::ARTIFACT.to_string(),
+        id: a.id.to_string(),
+        label: artifact_display(titles, a),
+    }
+}
+
+fn decision_edge(
+    from: Option<&String>,
+    to: Option<&String>,
+    d: &Decision,
+    kind: &str,
+    label: &str,
+) -> Option<GraphEdge> {
+    Some(GraphEdge {
+        from: from?.clone(),
+        to: to?.clone(),
+        kind: kind.to_string(),
+        round: None,
+        carrier: GraphCarrier {
+            kind: carrier_kind::DECISION.to_string(),
+            id: d.id.to_string(),
+            label: label.to_string(),
         },
-    };
+    })
+}
 
+/// The verdict token a stored review fact carries.
+fn verdict_of(ev: &WorkflowEvent) -> &str {
+    ev.payload
+        .get(json_field::VERDICT)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// One review verdict edge: «принято» is a signature to the approval gate,
+/// any other verdict a rejection to the analyst; the verdict is the label.
+fn verdict_edge(from: &String, to: &String, ev: &WorkflowEvent, approved: bool) -> GraphEdge {
+    GraphEdge {
+        from: from.clone(),
+        to: to.clone(),
+        kind: if approved {
+            edge_kind::SIGNATURE
+        } else {
+            edge_kind::REJECTION
+        }
+        .to_string(),
+        round: None,
+        carrier: GraphCarrier {
+            kind: carrier_kind::EVENT.to_string(),
+            id: ev.id.to_string(),
+            label: format!("отчёт проверки: {}", verdict_of(ev)),
+        },
+    }
+}
+
+/// Folds the stored facts into the path. Pure: no IO, no writes.
+pub fn build(f: &GraphFacts<'_>) -> RoleGraph {
+    let fold = Fold::new(f);
+    let mut ns = fold.nodes();
+    let position = fold.position(&ns);
+    // The position's node is `current`; passed nodes stay passed.
+    if let Some(node_id) = position.node.as_deref()
+        && let Some(n) = ns.rows.iter_mut().find(|n| n.id == node_id)
+    {
+        n.status = node_status::CURRENT.to_string();
+        n.status_word = node_status_word(node_status::CURRENT).to_string();
+    }
+    let returns = fold.returns();
+    let (edges, mut notes) = fold.edges(&ns, &returns);
+    let (running, running_notes) = fold.running_rows();
+    notes.extend(running_notes);
+    let stages = fold.stages(&position);
+    let waits = fold.waits(&position, &ns.gate);
     RoleGraph {
         stages,
-        nodes,
+        nodes: ns.rows,
         edges,
         position,
-        rework,
-        running: running_views,
+        rework: fold.rework(returns.len() as u32),
+        running,
         waits,
-        blocking_questions,
+        blocking_questions: fold.blocking_count(),
         notes,
     }
 }
@@ -1072,164 +1195,169 @@ fn node_artifacts(
     (out, revoked)
 }
 
-fn position_of(
-    f: &GraphFacts<'_>,
-    axis: &[&ProcessState],
-    role_nodes: &HashMap<String, String>,
-    gate_nodes: &HashMap<String, String>,
-    node_labels: &HashMap<String, String>,
-    roles: &HashMap<String, String>,
-) -> GraphPosition {
-    // A node's human signboard; falls back to the id only when the node is
-    // somehow absent from `node_labels` (never produced by this fold).
-    let place = |id: &str| -> String {
-        node_labels
+/// Human signboards of the card: a node's display by id and a stage's
+/// declared label — a position never heads with a raw id (REQ-NM-01).
+struct Places<'a, 'b> {
+    facts: &'b GraphFacts<'a>,
+    axis: &'b [&'a ProcessState],
+    node_labels: &'b HashMap<String, String>,
+    roles: &'b HashMap<String, String>,
+}
+
+impl Places<'_, '_> {
+    fn node(&self, id: &str) -> String {
+        self.node_labels
             .get(id)
             .cloned()
             .unwrap_or_else(|| id.to_string())
-    };
-    // The declared stage's human label (a role name or the gate's demand).
-    let stage_place = |state: &str| -> String {
-        axis.iter()
-            .find(|s| s.state == state)
-            .map(|st| stage_label(f, st, roles))
-            .unwrap_or_else(|| state.to_string())
-    };
-    let off = |reason: &str, line: &str| GraphPosition {
-        kind: position_kind::OFF_GRAPH.to_string(),
-        anchor: anchor_kind::STAGE.to_string(),
-        stage: None,
-        node: None,
-        reason: Some(reason.to_string()),
-        line: line.to_string(),
-    };
-    match f.task.state {
-        TaskState::Draft => return off(off_graph_reason::DRAFT, "черновик — работа не начиналась"),
-        TaskState::Cancelled => return off(off_graph_reason::CANCELLED, "задача отменена"),
-        TaskState::Accepted => {
-            return GraphPosition {
-                kind: position_kind::NODE.to_string(),
-                anchor: anchor_kind::FINAL.to_string(),
-                stage: None,
-                node: Some("final".to_string()),
-                reason: None,
-                line: "задача принята".to_string(),
-            };
-        }
-        s if s.is_hold() => {
-            let Some(rs) = f.task.return_state else {
-                return off(
-                    off_graph_reason::NO_RETURN_STATE,
-                    "задача припаркована, сохранённого возврата нет",
-                );
-            };
-            let stage = Some(rs.as_str().to_string());
-            if let Some(slug) = f.process.role_for(rs.as_str()) {
-                if let Some(id) = role_nodes.get(slug) {
-                    return GraphPosition {
-                        kind: position_kind::HOLD.to_string(),
-                        anchor: anchor_kind::ROLE.to_string(),
-                        stage,
-                        node: Some(id.clone()),
-                        reason: None,
-                        line: format!("припаркована; место возврата — {}", place(id)),
-                    };
-                }
-            }
-            if is_gate_by_state(f.process, rs) {
-                if let Some(id) = gate_nodes.get(rs.as_str()) {
-                    return GraphPosition {
-                        kind: position_kind::HOLD.to_string(),
-                        anchor: anchor_kind::GATE.to_string(),
-                        stage,
-                        node: Some(id.clone()),
-                        reason: None,
-                        line: format!("припаркована; место возврата — гейт «{}»", place(id)),
-                    };
-                }
-            }
-            return GraphPosition {
-                kind: position_kind::STAGE.to_string(),
-                anchor: anchor_kind::STAGE.to_string(),
-                stage: Some(rs.as_str().to_string()),
-                node: None,
-                reason: None,
-                line: format!(
-                    "припаркована; место возврата — этап «{}»",
-                    stage_place(rs.as_str())
-                ),
-            };
-        }
-        _ => {}
     }
-    // Active working states. Where BOTH a role and a human work (QA today),
-    // the role is the position only while its run is going; otherwise the
-    // human signature gate is (REQ-RG-03).
-    let gate_state = is_gate_by_state(f.process, f.task.state);
-    if let Some(slug) = f.process.role_for(f.task.state.as_str()) {
-        let stage = Some(f.task.state.as_str().to_string());
-        let audit_running = f
-            .executions
+
+    fn stage(&self, state: &str) -> String {
+        self.axis
             .iter()
-            .any(|e| e.role_slug == slug && e.status == ExecutionStatus::Running);
-        let prefer_role = !gate_state || audit_running;
-        if prefer_role && let Some(id) = role_nodes.get(slug) {
-            return GraphPosition {
-                kind: position_kind::NODE.to_string(),
-                anchor: anchor_kind::ROLE.to_string(),
-                stage,
-                node: Some(id.clone()),
-                reason: None,
-                line: format!("сейчас: {}", place(id)),
-            };
+            .find(|s| s.state == state)
+            .map(|st| stage_label(self.facts, st, self.roles))
+            .unwrap_or_else(|| state.to_string())
+    }
+
+    fn at_node(
+        &self,
+        kind: &str,
+        anchor: &str,
+        stage: Option<String>,
+        id: &str,
+        line: String,
+    ) -> GraphPosition {
+        GraphPosition {
+            kind: kind.to_string(),
+            anchor: anchor.to_string(),
+            stage,
+            node: Some(id.to_string()),
+            reason: None,
+            line,
         }
-        if gate_state && let Some(id) = gate_nodes.get(f.task.state.as_str()) {
-            return GraphPosition {
-                kind: position_kind::NODE.to_string(),
-                anchor: anchor_kind::GATE.to_string(),
-                stage,
-                node: Some(id.clone()),
-                reason: None,
-                line: format!("сейчас: гейт «{}»", place(id)),
-            };
-        }
-        return GraphPosition {
+    }
+
+    fn at_stage(&self, stage: &str, line: String) -> GraphPosition {
+        GraphPosition {
             kind: position_kind::STAGE.to_string(),
             anchor: anchor_kind::STAGE.to_string(),
-            stage,
+            stage: Some(stage.to_string()),
             node: None,
             reason: None,
-            line: format!("сейчас: этап «{}»", stage_place(f.task.state.as_str())),
-        };
-    }
-    if is_gate_by_state(f.process, f.task.state) {
-        let stage = Some(f.task.state.as_str().to_string());
-        if let Some(id) = gate_nodes.get(f.task.state.as_str()) {
-            return GraphPosition {
-                kind: position_kind::NODE.to_string(),
-                anchor: anchor_kind::GATE.to_string(),
-                stage,
-                node: Some(id.clone()),
-                reason: None,
-                line: format!("сейчас: гейт «{}»", place(id)),
-            };
+            line,
         }
     }
-    // A declared state that is neither role, gate nor hold: the axis still
-    // names the place (`_ = axis` keeps the unused-parameter contract).
-    let _ = axis;
-    GraphPosition {
-        kind: position_kind::STAGE.to_string(),
-        anchor: anchor_kind::STAGE.to_string(),
-        stage: Some(f.task.state.as_str().to_string()),
-        node: None,
-        reason: None,
-        line: format!("этап «{}»", stage_place(f.task.state.as_str())),
+
+    fn off(&self, reason: &str, line: &str) -> GraphPosition {
+        GraphPosition {
+            kind: position_kind::OFF_GRAPH.to_string(),
+            anchor: anchor_kind::STAGE.to_string(),
+            stage: None,
+            node: None,
+            reason: Some(reason.to_string()),
+            line: line.to_string(),
+        }
     }
 }
 
-fn position_line(p: &GraphPosition) -> String {
-    p.line.clone()
+/// The ONE position, from the state and stored facts: a dispatch over the
+/// three cases, each named by its own unit below (REQ-RG-03).
+fn position_of(
+    f: &GraphFacts<'_>,
+    axis: &[&ProcessState],
+    ns: &NodeSet,
+    node_labels: &HashMap<String, String>,
+    roles: &HashMap<String, String>,
+) -> GraphPosition {
+    let places = Places {
+        facts: f,
+        axis,
+        node_labels,
+        roles,
+    };
+    match f.task.state {
+        TaskState::Draft => places.off(off_graph_reason::DRAFT, "черновик — работа не начиналась"),
+        TaskState::Cancelled => places.off(off_graph_reason::CANCELLED, "задача отменена"),
+        TaskState::Accepted => places.at_node(
+            position_kind::NODE,
+            anchor_kind::FINAL,
+            None,
+            "final",
+            "задача принята".to_string(),
+        ),
+        s if s.is_hold() => hold_position(f, &places, ns),
+        _ => active_position(f, &places, ns),
+    }
+}
+
+/// A parked task stands on its return place: that place's node when it HAS
+/// one, else the stage without a «сейчас» node (REQ-RG-03).
+fn hold_position(f: &GraphFacts<'_>, places: &Places<'_, '_>, ns: &NodeSet) -> GraphPosition {
+    let Some(rs) = f.task.return_state else {
+        return places.off(
+            off_graph_reason::NO_RETURN_STATE,
+            "задача припаркована, сохранённого возврата нет",
+        );
+    };
+    let stage = Some(rs.as_str().to_string());
+    if let Some(id) = f
+        .process
+        .role_for(rs.as_str())
+        .and_then(|slug| ns.role.get(slug))
+    {
+        let line = format!("припаркована; место возврата — {}", places.node(id));
+        return places.at_node(position_kind::HOLD, anchor_kind::ROLE, stage, id, line);
+    }
+    if is_gate_by_state(f.process, rs)
+        && let Some(id) = ns.gate.get(rs.as_str())
+    {
+        let line = format!("припаркована; место возврата — гейт «{}»", places.node(id));
+        return places.at_node(position_kind::HOLD, anchor_kind::GATE, stage, id, line);
+    }
+    places.at_stage(
+        rs.as_str(),
+        format!(
+            "припаркована; место возврата — этап «{}»",
+            places.stage(rs.as_str())
+        ),
+    )
+}
+
+/// An active state: the role while its run is the place; where BOTH a role and
+/// a human work (QA today), the signature gate unless the run is going; else
+/// the stage itself, with no «сейчас» node (REQ-RG-03).
+fn active_position(f: &GraphFacts<'_>, places: &Places<'_, '_>, ns: &NodeSet) -> GraphPosition {
+    let state = f.task.state;
+    let gate_state = is_gate_by_state(f.process, state);
+    if let Some(slug) = f.process.role_for(state.as_str()) {
+        let stage = Some(state.as_str().to_string());
+        let running = f
+            .executions
+            .iter()
+            .any(|e| e.role_slug == slug && e.status == ExecutionStatus::Running);
+        if let Some(id) = ns.role.get(slug).filter(|_| !gate_state || running) {
+            let line = format!("сейчас: {}", places.node(id));
+            return places.at_node(position_kind::NODE, anchor_kind::ROLE, stage, id, line);
+        }
+        if gate_state && let Some(id) = ns.gate.get(state.as_str()) {
+            let line = format!("сейчас: гейт «{}»", places.node(id));
+            return places.at_node(position_kind::NODE, anchor_kind::GATE, stage, id, line);
+        }
+        return places.at_stage(
+            state.as_str(),
+            format!("сейчас: этап «{}»", places.stage(state.as_str())),
+        );
+    }
+    if gate_state && let Some(id) = ns.gate.get(state.as_str()) {
+        let stage = Some(state.as_str().to_string());
+        let line = format!("сейчас: гейт «{}»", places.node(id));
+        return places.at_node(position_kind::NODE, anchor_kind::GATE, stage, id, line);
+    }
+    places.at_stage(
+        state.as_str(),
+        format!("этап «{}»", places.stage(state.as_str())),
+    )
 }
 
 fn is_gate_by_state(process: &Process, state: TaskState) -> bool {
@@ -1426,34 +1554,71 @@ mod tests {
         }
     }
 
-    fn build_graph(f: &GraphFacts<'_>) -> RoleGraph {
-        build(f)
+    /// The declaration-wide fixture: process, role names, artifact titles and
+    /// wait policy every test folds with, built once per test.
+    struct Fx {
+        process: &'static Process,
+        roles: Vec<(String, String)>,
+        titles: BTreeMap<String, String>,
+        policy: InboxWaitPolicy,
     }
 
-    fn facts<'a>(
-        process: &'a Process,
-        task: &'a Task,
-        artifacts: &'a [Artifact],
-        executions: &'a [RoleExecution],
-        decisions: &'a [Decision],
-        events: &'a [WorkflowEvent],
-        questions: &'a [Question],
-        roles: &'a [(String, String)],
-        titles: &'a BTreeMap<String, String>,
-        policy: &'a InboxWaitPolicy,
-    ) -> GraphFacts<'a> {
-        GraphFacts {
-            process,
-            task,
-            artifacts,
-            executions,
-            decisions,
-            events,
-            questions,
-            roles,
-            artifact_titles: titles,
-            wait_policy: policy,
+    impl Fx {
+        fn new() -> Self {
+            Fx {
+                process: Process::factory(),
+                roles: roles(),
+                titles: titles(),
+                policy: policy(),
+            }
         }
+
+        /// Folds the facts under test; the caller names only the slices it is
+        /// about, the declaration-wide ones come from the fixture.
+        fn graph(
+            &self,
+            task: &Task,
+            artifacts: &[Artifact],
+            executions: &[RoleExecution],
+            decisions: &[Decision],
+            events: &[WorkflowEvent],
+            questions: &[Question],
+        ) -> RoleGraph {
+            build(&GraphFacts {
+                process: self.process,
+                task,
+                artifacts,
+                executions,
+                decisions,
+                events,
+                questions,
+                roles: &self.roles,
+                artifact_titles: &self.titles,
+                wait_policy: &self.policy,
+            })
+        }
+    }
+
+    /// The node with this id — the tests name the node they are about.
+    fn node<'a>(g: &'a RoleGraph, id: &str) -> &'a GraphNode {
+        g.nodes.iter().find(|n| n.id == id).unwrap()
+    }
+
+    /// The node of this role.
+    fn role_node<'a>(g: &'a RoleGraph, slug: &str) -> &'a GraphNode {
+        g.nodes
+            .iter()
+            .find(|n| n.role_slug.as_deref() == Some(slug))
+            .unwrap()
+    }
+
+    /// The ids of the nodes the fold marked `current`.
+    fn current_ids(g: &RoleGraph) -> Vec<&str> {
+        g.nodes
+            .iter()
+            .filter(|n| n.status == node_status::CURRENT)
+            .map(|n| n.id.as_str())
+            .collect()
     }
 
     /// One current spec, no reviewer run: the analyst node is passed, both
@@ -1461,7 +1626,7 @@ mod tests {
     /// position is the REVIEW stage (a stage, not a node) — REQ-RG-02/03.
     #[test]
     fn current_spec_makes_only_the_analyst_node() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Review);
         let ex = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
         let spec = artifact(
@@ -1471,40 +1636,20 @@ mod tests {
             ArtifactStatus::Current,
             Some(ex.id),
         );
-        let arts = vec![spec];
-        let execs = vec![ex];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[spec], &[ex], &[], &[], &[]);
 
-        let role_nodes: Vec<&GraphNode> = g
+        let roles: Vec<&GraphNode> = g
             .nodes
             .iter()
             .filter(|n| n.kind == node_kind::ROLE)
             .collect();
-        assert_eq!(role_nodes.len(), 1);
-        assert_eq!(
-            role_nodes[0].role_slug.as_deref(),
-            Some("requirements-analyst")
-        );
-        assert_eq!(role_nodes[0].status, node_status::PASSED);
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role_slug.as_deref(), Some("requirements-analyst"));
+        assert_eq!(roles[0].status, node_status::PASSED);
         let gates: Vec<&GraphNode> = g
             .nodes
             .iter()
-            .filter(|n| matches!(n.kind.as_str(), node_kind::GATE))
+            .filter(|n| n.kind == node_kind::GATE)
             .collect();
         assert_eq!(gates.len(), 2);
         assert!(gates.iter().all(|n| n.status == node_status::EXPECTED));
@@ -1520,7 +1665,7 @@ mod tests {
     /// the execution list keeps BOTH rows (REQ-RG-02 AC2).
     #[test]
     fn two_versions_keep_both_executions_and_latest_version() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Approval);
         let analyst = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
         let mut rev1 = execution(t.id, "requirements-reviewer", 3, ExecutionStatus::Completed);
@@ -1533,43 +1678,23 @@ mod tests {
             ArtifactStatus::Current,
             Some(analyst.id),
         );
-        let review1 = artifact(
+        let r1 = artifact(
             t.id,
             ArtifactKind::ReviewReport,
             1,
             ArtifactStatus::Stale,
             Some(rev1.id),
         );
-        let review2 = artifact(
+        let r2 = artifact(
             t.id,
             ArtifactKind::ReviewReport,
             2,
             ArtifactStatus::Current,
             Some(rev2.id),
         );
-        let execs = vec![analyst, rev1, rev2];
-        let arts = vec![spec, review1, review2];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
-        let reviewer = g
-            .nodes
-            .iter()
-            .find(|n| n.role_slug.as_deref() == Some("requirements-reviewer"))
-            .unwrap();
+        let g = fx.graph(&t, &[spec, r1, r2], &[analyst, rev1, rev2], &[], &[], &[]);
+
+        let reviewer = role_node(&g, "requirements-reviewer");
         assert_eq!(reviewer.executions.len(), 2);
         assert_eq!(reviewer.role_version, Some(4));
         assert!(reviewer.revoked);
@@ -1579,51 +1704,43 @@ mod tests {
         assert!(g.waits.iter().any(|w| w.awaiting && w.signable));
     }
 
-    /// A running role outside the declared process is a node with the note
-    /// «прогон вне пути» and never an edge; an artifact without an execution
-    /// creates no node at all (REQ-RG-02 AC3).
+    /// A running role outside the declared process is ONLY a running row and
+    /// the note «прогон вне пути» — it never gets a node (REQ-RG-02 AC3: the
+    /// graph is the declared process plus confirmed facts). An artifact
+    /// without an execution creates no node and no edge either.
     #[test]
-    fn out_of_path_run_is_a_note_and_an_artifact_alone_is_no_node() {
-        let process = Process::factory();
+    fn out_of_path_run_is_a_note_and_never_a_node() {
+        let fx = Fx::new();
         let t = task(TaskState::Analysis);
         let mut out = execution(t.id, "project-intelligence", 1, ExecutionStatus::Running);
         out.inputs = vec![];
         let loose = artifact(t.id, ArtifactKind::Patch, 1, ArtifactStatus::Current, None);
-        let execs = vec![out];
-        let arts = vec![loose];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[loose], &[out], &[], &[], &[]);
+
+        // The run stays a fact of the «активные» plane with its mark…
         assert!(g.running.iter().any(|r| !r.in_path && r.note.is_some()));
         assert!(g.notes.iter().any(|n| n.contains("прогон вне пути")));
-        let out_node = g
-            .nodes
-            .iter()
-            .find(|n| n.role_slug.as_deref() == Some("project-intelligence"));
-        assert!(out_node.is_some());
+        // …but an undeclared role NEVER becomes a node and never carries an
+        // edge: the graph is the declared process (REQ-RG-02 AC3).
+        assert!(
+            !g.nodes
+                .iter()
+                .any(|n| n.role_slug.as_deref() == Some("project-intelligence"))
+        );
         assert!(
             g.edges
                 .iter()
-                .all(|e| e.from != out_node.unwrap().id && e.to != out_node.unwrap().id)
+                .all(|e| !e.from.contains("project-intelligence")
+                    && !e.to.contains("project-intelligence"))
         );
-        // The loose artifact produced no node: only the out-of-path one exists.
+        // The loose artifact produced no node either: the axis has no role
+        // node at all, so the position is the STAGE itself.
         assert_eq!(
             g.nodes.iter().filter(|n| n.kind == node_kind::ROLE).count(),
-            1
+            0
         );
+        assert_eq!(g.position.kind, position_kind::STAGE);
+        assert_eq!(g.position.node, None);
     }
 
     /// Signed requirements with no implementation run yet: the position is
@@ -1631,7 +1748,7 @@ mod tests {
     /// drawn into a role that has not started (REQ-RG-04 AC3, REQ-RG-03 AC2).
     #[test]
     fn signature_without_implementer_gives_stage_position_and_no_edge() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Implementation);
         let analyst = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
         let spec = artifact(
@@ -1646,25 +1763,8 @@ mod tests {
             decision_kind::REQUIREMENTS_APPROVAL,
             Verdict::Approved,
         );
-        let execs = vec![analyst];
-        let arts = vec![spec];
-        let decs = vec![dec];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &decs,
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[spec], &[analyst], &[dec], &[], &[]);
+
         assert_eq!(g.position.kind, position_kind::STAGE);
         assert_eq!(g.position.stage.as_deref(), Some("IMPLEMENTATION"));
         assert_eq!(g.position.node, None);
@@ -1673,64 +1773,23 @@ mod tests {
                 .iter()
                 .all(|e| e.to != role_id("implementation-agent"))
         );
-        let gate = g.nodes.iter().find(|n| n.id == "gate:APPROVAL").unwrap();
-        assert_eq!(gate.status, node_status::PASSED);
+        assert_eq!(node(&g, "gate:APPROVAL").status, node_status::PASSED);
     }
 
-    /// Two stored returns: two edges with rounds 1 and 2, the loop survives
-    /// into QA (not active there) — REQ-RG-05.
-    #[test]
-    fn rework_rounds_are_counted_from_stored_returns() {
-        let process = Process::factory();
-        let t = task(TaskState::Qa);
-        let analyst = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
-        let impl_exec = execution(t.id, "implementation-agent", 8, ExecutionStatus::Completed);
-        let audit = execution(t.id, "quality-auditor", 7, ExecutionStatus::Completed);
-        let spec = artifact(
-            t.id,
-            ArtifactKind::RequirementsSpec,
-            1,
-            ArtifactStatus::Current,
-            Some(analyst.id),
-        );
-        let report = artifact(
-            t.id,
-            ArtifactKind::ImplementationReport,
-            1,
-            ArtifactStatus::Current,
-            Some(impl_exec.id),
-        );
-        let qa = artifact(
-            t.id,
-            ArtifactKind::QualityReport,
-            1,
-            ArtifactStatus::Current,
-            Some(audit.id),
-        );
-        let events = vec![
-            event(t.id, event_kind::QUALITY_RETURNED, serde_json::json!({})),
-            event(t.id, event_kind::QUALITY_RETURNED, serde_json::json!({})),
-        ];
-        let execs = vec![analyst, impl_exec, audit];
-        let arts = vec![spec, report, qa];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &events,
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
-        assert_eq!(g.rework.rounds, 2);
-        assert!(!g.rework.active);
+    /// A completed run and the current artifact it produced at version 1.
+    fn done(
+        task_id: Id,
+        slug: &str,
+        version: u32,
+        kind: ArtifactKind,
+    ) -> (RoleExecution, Artifact) {
+        let e = execution(task_id, slug, version, ExecutionStatus::Completed);
+        let a = artifact(task_id, kind, 1, ArtifactStatus::Current, Some(e.id));
+        (e, a)
+    }
+
+    /// The rounds carried by the stored return edges, in order.
+    fn return_rounds(g: &RoleGraph) -> Vec<u32> {
         let mut rounds: Vec<u32> = g
             .edges
             .iter()
@@ -1738,7 +1797,44 @@ mod tests {
             .filter_map(|e| e.round)
             .collect();
         rounds.sort();
-        assert_eq!(rounds, vec![1, 2]);
+        rounds
+    }
+
+    /// Two stored returns: two edges with rounds 1 and 2, the loop survives
+    /// into QA (not active there) — REQ-RG-05.
+    #[test]
+    fn rework_rounds_are_counted_from_stored_returns() {
+        let fx = Fx::new();
+        let t = task(TaskState::Qa);
+        let (analyst, spec) = done(
+            t.id,
+            "requirements-analyst",
+            6,
+            ArtifactKind::RequirementsSpec,
+        );
+        let (impl_exec, report) = done(
+            t.id,
+            "implementation-agent",
+            8,
+            ArtifactKind::ImplementationReport,
+        );
+        let (audit, qa) = done(t.id, "quality-auditor", 7, ArtifactKind::QualityReport);
+        let events = vec![
+            event(t.id, event_kind::QUALITY_RETURNED, serde_json::json!({})),
+            event(t.id, event_kind::QUALITY_RETURNED, serde_json::json!({})),
+        ];
+        let g = fx.graph(
+            &t,
+            &[spec, report, qa],
+            &[analyst, impl_exec, audit],
+            &[],
+            &events,
+            &[],
+        );
+
+        assert_eq!(g.rework.rounds, 2);
+        assert!(!g.rework.active);
+        assert_eq!(return_rounds(&g), vec![1, 2]);
         assert!(g.edges.iter().any(|e| e.kind == edge_kind::RETURN
             && e.from == "gate:QA"
             && e.to == role_id("implementation-agent")));
@@ -1748,7 +1844,7 @@ mod tests {
     /// of the position; a draft has no position current and all stages pending.
     #[test]
     fn blocking_questions_are_counted_from_stored_open_rows() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Analysis);
         let analyst = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
         let spec = artifact(
@@ -1763,40 +1859,11 @@ mod tests {
             question(t.id, true, false),
             question(t.id, false, true),
         ];
-        let execs = vec![analyst];
-        let arts = vec![spec];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &[],
-            &qs,
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[spec], &[analyst], &[], &[], &qs);
         assert_eq!(g.blocking_questions, 1);
 
         let draft = task(TaskState::Draft);
-        let f = facts(
-            process,
-            &draft,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&draft, &[], &[], &[], &[], &[]);
         assert_eq!(g.position.kind, position_kind::OFF_GRAPH);
         assert_eq!(g.position.reason.as_deref(), Some(off_graph_reason::DRAFT));
         assert!(g.stages.iter().all(|s| s.status == stage_status::PENDING));
@@ -1812,7 +1879,7 @@ mod tests {
     /// and no executions.
     #[test]
     fn accepted_task_has_final_current_and_an_acceptance_edge() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Accepted);
         let audit = execution(t.id, "quality-auditor", 7, ExecutionStatus::Completed);
         let qa = artifact(
@@ -1823,37 +1890,14 @@ mod tests {
             Some(audit.id),
         );
         let accepted = event(t.id, event_kind::TASK_ACCEPTED, serde_json::json!({}));
-        let execs = vec![audit];
-        let arts = vec![qa];
-        let events = vec![accepted.clone()];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &events,
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[qa], &[audit], &[], &[accepted.clone()], &[]);
+
         assert_eq!(g.position.node.as_deref(), Some("final"));
-        let current: Vec<&str> = g
-            .nodes
-            .iter()
-            .filter(|n| n.status == node_status::CURRENT)
-            .map(|n| n.id.as_str())
-            .collect();
-        assert_eq!(current, vec!["final"]);
-        let final_node = g.nodes.iter().find(|n| n.id == "final").unwrap();
-        assert_eq!(final_node.kind, node_kind::FINAL);
-        assert!(final_node.executions.is_empty());
-        assert_eq!(final_node.role_slug, None);
+        assert_eq!(current_ids(&g), vec!["final"]);
+        let last = node(&g, "final");
+        assert_eq!(last.kind, node_kind::FINAL);
+        assert!(last.executions.is_empty());
+        assert_eq!(last.role_slug, None);
         // Gates: declaration-born, never a role carrier.
         for n in g.nodes.iter().filter(|n| n.kind == node_kind::GATE) {
             assert_eq!(n.role_slug, None);
@@ -1862,56 +1906,51 @@ mod tests {
         }
         // REQ-RG-02: acceptance is the affirmative human act that PASSES the
         // quality gate — it is not left «ожидается» on a finished task.
-        let qa_gate = g.nodes.iter().find(|n| n.id == "gate:QA").unwrap();
-        assert_eq!(qa_gate.status, node_status::PASSED);
-        let approval_gate = g.nodes.iter().find(|n| n.id == "gate:APPROVAL").unwrap();
-        assert_eq!(approval_gate.status, node_status::EXPECTED);
+        assert_eq!(node(&g, "gate:QA").status, node_status::PASSED);
+        assert_eq!(node(&g, "gate:APPROVAL").status, node_status::EXPECTED);
         // REQ-RG-01 AC1: the waits follow the DECLARED axis order (never a
         // hash-map iteration), so two reads of unchanged facts agree.
         let order: Vec<&str> = g.waits.iter().map(|w| w.state.as_str()).collect();
         assert_eq!(order, vec!["APPROVAL", "QA"]);
-        let again = build_graph(&facts(
-            f.process,
-            f.task,
-            &arts,
-            &execs,
-            &[],
-            &events,
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        ));
-        let order_again: Vec<&str> = again.waits.iter().map(|w| w.state.as_str()).collect();
-        assert_eq!(order, order_again);
         assert!(g.edges.iter().any(|e| e.kind == edge_kind::ACCEPTANCE
             && e.from == "gate:QA"
             && e.to == "final"
             && e.carrier.id == accepted.id.to_string()));
     }
 
+    /// REQ-RG-01 AC1: a second read of the SAME facts differs in nothing — the
+    /// fold is pure and every list follows the declaration, not a hash map.
+    #[test]
+    fn a_repeated_read_of_the_same_facts_is_identical() {
+        let fx = Fx::new();
+        let t = task(TaskState::Qa);
+        let audit = execution(t.id, "quality-auditor", 7, ExecutionStatus::Completed);
+        let qa = artifact(
+            t.id,
+            ArtifactKind::QualityReport,
+            1,
+            ArtifactStatus::Current,
+            Some(audit.id),
+        );
+        let returns = vec![
+            event(t.id, event_kind::QUALITY_RETURNED, serde_json::json!({})),
+            event(t.id, event_kind::QUALITY_RETURNED, serde_json::json!({})),
+        ];
+        let first = fx.graph(&t, &[qa.clone()], &[audit.clone()], &[], &returns, &[]);
+        let again = fx.graph(&t, &[qa], &[audit], &[], &returns, &[]);
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&again).unwrap()
+        );
+    }
+
     /// REQ-RG-03 AC4: an accepted task without a stored acceptance act says so
     /// in a note instead of drawing an edge to nowhere.
     #[test]
     fn accepted_task_without_stored_act_reports_a_data_mismatch() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Accepted);
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[], &[], &[], &[], &[]);
         assert!(g.notes.iter().any(|n| n.contains("расхождение данных")));
         assert!(g.edges.iter().all(|e| e.kind != edge_kind::ACCEPTANCE));
     }
@@ -1920,7 +1959,7 @@ mod tests {
     /// gate, and the gate keeps both its signature state and its presentation.
     #[test]
     fn hold_on_the_approval_gate_keeps_signature_and_presentation() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let mut t = task(TaskState::Paused);
         t.return_state = Some(TaskState::Approval);
         let analyst = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
@@ -1931,24 +1970,8 @@ mod tests {
             ArtifactStatus::Current,
             Some(analyst.id),
         );
-        let execs = vec![analyst];
-        let arts = vec![spec];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[spec], &[analyst], &[], &[], &[]);
+
         assert_eq!(g.position.kind, position_kind::HOLD);
         assert_eq!(g.position.anchor, anchor_kind::GATE);
         assert_eq!(g.position.node.as_deref(), Some("gate:APPROVAL"));
@@ -1969,25 +1992,11 @@ mod tests {
     /// position — the stage is marked current and no node is «сейчас».
     #[test]
     fn hold_returning_to_a_stage_without_a_node_is_a_stage_position() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let mut t = task(TaskState::WaitingForInput);
         t.return_state = Some(TaskState::Analysis);
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
+        let g = fx.graph(&t, &[], &[], &[], &[], &[]);
+
         assert_eq!(g.position.kind, position_kind::STAGE);
         assert_eq!(g.position.anchor, anchor_kind::STAGE);
         assert_eq!(g.position.stage.as_deref(), Some("ANALYSIS"));
@@ -2005,7 +2014,7 @@ mod tests {
     /// the node passed.
     #[test]
     fn a_revoked_result_does_not_make_the_node_passed() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Review);
         let analyst = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
         let spec = artifact(
@@ -2015,29 +2024,9 @@ mod tests {
             ArtifactStatus::Superseded,
             Some(analyst.id),
         );
-        let execs = vec![analyst];
-        let arts = vec![spec];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
-        let node = g
-            .nodes
-            .iter()
-            .find(|n| n.role_slug.as_deref() == Some("requirements-analyst"))
-            .unwrap();
+        let g = fx.graph(&t, &[spec], &[analyst], &[], &[], &[]);
+
+        let node = role_node(&g, "requirements-analyst");
         assert_eq!(node.status, node_status::EXPECTED);
         assert!(node.revoked);
         assert_eq!(node.artifacts.len(), 1);
@@ -2047,55 +2036,28 @@ mod tests {
     /// versions 1..3 of one kind; the stored name never becomes the heading.
     #[test]
     fn artifact_heading_is_the_declared_title_and_version() {
-        let process = Process::factory();
+        let fx = Fx::new();
         let t = task(TaskState::Review);
         let analyst = execution(t.id, "requirements-analyst", 6, ExecutionStatus::Completed);
-        let arts = vec![
-            artifact(
-                t.id,
-                ArtifactKind::RequirementsSpec,
-                1,
-                ArtifactStatus::Superseded,
-                Some(analyst.id),
-            ),
-            artifact(
-                t.id,
-                ArtifactKind::RequirementsSpec,
-                2,
-                ArtifactStatus::Stale,
-                Some(analyst.id),
-            ),
-            artifact(
-                t.id,
-                ArtifactKind::RequirementsSpec,
-                3,
-                ArtifactStatus::Current,
-                Some(analyst.id),
-            ),
-        ];
-        let execs = vec![analyst];
-        let roles = roles();
-        let titles = titles();
-        let policy = policy();
-        let f = facts(
-            process,
-            &t,
-            &arts,
-            &execs,
-            &[],
-            &[],
-            &[],
-            &roles,
-            &titles,
-            &policy,
-        );
-        let g = build_graph(&f);
-        let node = g
-            .nodes
+        let arts: Vec<Artifact> = [1, 2, 3]
+            .into_iter()
+            .map(|seq| {
+                artifact(
+                    t.id,
+                    ArtifactKind::RequirementsSpec,
+                    seq,
+                    ArtifactStatus::Superseded,
+                    Some(analyst.id),
+                )
+            })
+            .collect();
+        let g = fx.graph(&t, &arts, &[analyst], &[], &[], &[]);
+
+        let displays: Vec<&str> = role_node(&g, "requirements-analyst")
+            .artifacts
             .iter()
-            .find(|n| n.role_slug.as_deref() == Some("requirements-analyst"))
-            .unwrap();
-        let displays: Vec<&str> = node.artifacts.iter().map(|a| a.display.as_str()).collect();
+            .map(|a| a.display.as_str())
+            .collect();
         assert_eq!(
             displays,
             vec![
