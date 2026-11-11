@@ -2203,16 +2203,6 @@ impl Api {
             .map(|ev| ev.payload))
     }
 
-    /// One of the two STORED options, or a typed refusal naming them: the
-    /// answer is data, not a sentence the operator has to phrase perfectly.
-    fn attempt_limit_choice(text: &str) -> Option<&'static str> {
-        match text.trim().to_lowercase().as_str() {
-            "продолжить" => Some("продолжить"),
-            "остановить" => Some("остановить"),
-            _ => None,
-        }
-    }
-
     /// Apply the human answer to the attempt-limit stop (REQ-AL-06). Both
     /// answers write a decision row (who, when, role, attempts, limit, answer)
     /// and an append-only event; only «продолжить» is a reset boundary.
@@ -2223,12 +2213,19 @@ impl Api {
         text: &str,
         trip: &serde_json::Value,
     ) -> ApiResult<AnsweredOutcome> {
-        let Some(choice) = Self::attempt_limit_choice(text) else {
+        // The accepted words and the question's stored options are ONE
+        // dictionary (`attempt_limit_answer`): the answer is data, not a
+        // sentence the operator has to phrase perfectly.
+        let Some(choice) = attempt_limit_answer::parse(text) else {
+            let stored = attempt_limit_answer::ALL
+                .iter()
+                .map(|option| format!("`{option}`"))
+                .collect::<Vec<_>>()
+                .join(" or ");
             return Err(ApiError::refused(
                 "bad_request",
                 format!(
-                    "question {} takes one of its stored options: `продолжить` or `остановить` \
-                     (got `{}`)",
+                    "question {} takes one of its stored options: {stored} (got `{}`)",
                     q.id, text
                 ),
             ));
@@ -2243,7 +2240,7 @@ impl Api {
         let m = self.attempt_limit_mutation(&process, task, q, &trip, choice, &decision, now)?;
         self.store.record_decision(&decision)?;
         self.store.commit(task.lock_version, &m)?;
-        if choice == "продолжить" {
+        if choice == attempt_limit_answer::CONTINUE {
             // The human said «продолжить» — the interrupted stage starts
             // again (REQ-AL-06 AC1: no second command).
             self.autostart_if_role_state(&m.task);
@@ -2296,7 +2293,7 @@ impl Api {
         decision: &Decision,
         now: DateTime<Utc>,
     ) -> ApiResult<Mutation> {
-        if choice != "продолжить" {
+        if choice != attempt_limit_answer::CONTINUE {
             return Ok(workflow::answer_attempt_limit_stop(
                 process,
                 task,

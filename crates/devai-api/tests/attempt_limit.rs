@@ -945,3 +945,49 @@ fn a_corrupt_stop_fact_is_refused_instead_of_recorded_as_an_empty_role() {
         "no decision was recorded"
     );
 }
+
+#[test]
+fn a_damaged_transition_row_refuses_the_read_instead_of_printing_a_number() {
+    // Rework R1 quality return: the count is derived from the stored transition
+    // rows. A row carrying an unreadable `to` used to be dropped without a
+    // trace, so the status could print a number the history does not support.
+    // It must refuse loudly — on the status read AND on launch admission — and
+    // start nothing.
+    let (dir, api) = home();
+    let id = task(&api);
+    seed(&api, dir.path(), &id, 3);
+    let store = Store::open(dir.path()).unwrap();
+    let tid = api.task_get(&id).unwrap().id;
+    store
+        .insert_event(
+            Some(tid),
+            event_kind::STATE_CHANGED,
+            "mock",
+            json!({"from": "ANALYSIS", "to": "ANALYSIS_2"}),
+        )
+        .unwrap();
+
+    let err = api.task_status(&id).unwrap_err();
+    assert_eq!(err.code().0, "corrupt_transition", "{err}");
+    assert!(
+        err.to_string().contains("ANALYSIS_2"),
+        "the refusal names the value: {err}"
+    );
+
+    let err = api
+        .task_run_supervised(&SupervisedRunReq {
+            task_id: id.clone(),
+            agent: "mock".into(),
+            workspace: None,
+            force_reaudit: false,
+            run_id: new_id().to_string(),
+            ack: dir.path().join("ack-corrupt-transition"),
+        })
+        .unwrap_err();
+    assert_eq!(err.code().0, "corrupt_transition", "{err}");
+    assert_eq!(
+        api.exec_list(Some(&id)).unwrap().len(),
+        3,
+        "no run was opened on a history that cannot be read"
+    );
+}

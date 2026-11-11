@@ -1490,6 +1490,27 @@ pub mod decision_kind {
     pub const ATTEMPT_LIMIT_ANSWER: &str = "attempt_limit_answer";
 }
 
+/// The answer vocabulary of the attempt-limit question (REQ-AL-05/06): the
+/// options STORED on the question and the reply the answer path accepts are
+/// ONE dictionary (R1 quality return: the two words lived in `workflow.rs` as
+/// the question's `options` and again in the API's answer matcher, so renaming
+/// one would have left the human reading options the platform no longer took).
+/// The meaning travels with the word: `CONTINUE` zeroes the counter,
+/// `STOP` leaves the task in human custody.
+pub mod attempt_limit_answer {
+    pub const CONTINUE: &str = "продолжить";
+    pub const STOP: &str = "остановить";
+    /// The options a question carries, in the order the human reads them.
+    pub const ALL: [&str; 2] = [CONTINUE, STOP];
+
+    /// The stored option `text` names, or `None`. Matching is on the stored
+    /// words only (trim + lowercase) — never on free phrasing.
+    pub fn parse(text: &str) -> Option<&'static str> {
+        let asked = text.trim().to_lowercase();
+        ALL.into_iter().find(|option| *option == asked)
+    }
+}
+
 pub mod event_kind {
     pub const TASK_CREATED: &str = "task.created";
     /// A typed task-to-task dependency edge was registered (REQ-07): at
@@ -2001,6 +2022,34 @@ pub mod json_field {
 #[cfg(test)]
 mod word_tests {
     use super::*;
+
+    /// R1 quality return: the two answers to the attempt-limit question are ONE
+    /// dictionary — the question's stored `options` and the reply the answer
+    /// path accepts read these very constants, so a rename cannot leave the
+    /// human reading a word the platform no longer takes.
+    #[test]
+    fn the_attempt_limit_answers_are_one_dictionary() {
+        assert_eq!(attempt_limit_answer::CONTINUE, "продолжить");
+        assert_eq!(attempt_limit_answer::STOP, "остановить");
+        assert_eq!(
+            attempt_limit_answer::ALL,
+            [attempt_limit_answer::CONTINUE, attempt_limit_answer::STOP]
+        );
+        assert_eq!(
+            attempt_limit_answer::parse("продолжить"),
+            Some(attempt_limit_answer::CONTINUE)
+        );
+        assert_eq!(
+            attempt_limit_answer::parse("  Остановить "),
+            Some(attempt_limit_answer::STOP),
+            "the stored words are accepted with the operator's whitespace and case"
+        );
+        assert_eq!(
+            attempt_limit_answer::parse("давай ещё"),
+            None,
+            "free phrasing is not an option"
+        );
+    }
 
     /// R3 quality return: ONE dictionary backs the API, the console and the
     /// window. The stored tokens never drift; unknown input is never guessed.

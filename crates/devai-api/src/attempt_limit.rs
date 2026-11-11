@@ -45,13 +45,13 @@
 
 use chrono::{DateTime, Utc};
 use devai_core::types::{
-    ExecutionStatus, RoleExecution, Task, TaskState, WorkflowEvent, event_kind,
+    ExecutionStatus, RoleExecution, Task, TaskState, WorkflowEvent, event_kind, json_field,
 };
 use devai_runtime::convergence::{self, ConvergenceView, StageConvergence};
 use devai_store::config::ProcessPolicy;
 use serde::Serialize;
 
-use crate::{Api, ApiResult};
+use crate::{Api, ApiError, ApiResult};
 
 /// The measured series a declared working state is judged by, if the
 /// declaration measures one (rework R2: the catalog is data, not this file).
@@ -171,7 +171,7 @@ impl Api {
             return Ok(None);
         };
         let attempts =
-            self.attempts_without_progress(&role, executions, events, convergence, policy);
+            self.attempts_without_progress(&role, executions, events, convergence, policy)?;
         Ok(Some(AttemptLimitView::new(
             &role,
             attempts,
@@ -204,6 +204,10 @@ impl Api {
     /// The derived count of ONE role, from stored rows only: the last
     /// substantive shift of THIS role, the last human reset of THIS role, and
     /// its completed stage launches between them.
+    ///
+    /// The history is read strictly: a transition row whose `from`/`to` cannot
+    /// be understood refuses loudly here instead of being skipped, because a
+    /// skipped row silently changes the number (rework R1 quality return).
     pub(crate) fn attempts_without_progress(
         &self,
         role: &str,
@@ -211,10 +215,10 @@ impl Api {
         events: &[WorkflowEvent],
         convergence: Option<&ConvergenceView>,
         policy: &ProcessPolicy,
-    ) -> u32 {
-        let progress = role_progress_at(role, policy, events, convergence);
+    ) -> ApiResult<u32> {
+        let progress = role_progress_at(role, policy, events, convergence)?;
         let reset = last_reset_at(events, role);
-        attempts_without_progress(role, executions, progress, reset)
+        Ok(attempts_without_progress(role, executions, progress, reset))
     }
 }
 
@@ -229,16 +233,19 @@ impl Api {
 /// verdict and the converging round against the series that judges this role's
 /// work. A ping-pong that only re-enters states already reached is not a shift
 /// and therefore keeps raising the count (rework R1/R2).
+///
+/// A damaged transition row is an ERROR, not an empty history: see
+/// [`ordered_edges`].
 pub fn role_progress_at(
     role: &str,
     policy: &ProcessPolicy,
     events: &[WorkflowEvent],
     convergence: Option<&ConvergenceView>,
-) -> Option<DateTime<Utc>> {
-    max_opt(
+) -> ApiResult<Option<DateTime<Utc>>> {
+    Ok(max_opt(
         convergence_shift_at(role, policy, convergence),
-        event_shift_at(role, policy, events),
-    )
+        event_shift_at(role, policy, events)?,
+    ))
 }
 
 /// The latest shift the measured series records for `role`: a CONVERGING round
@@ -287,33 +294,68 @@ fn event_shift_at(
     role: &str,
     policy: &ProcessPolicy,
     events: &[WorkflowEvent],
-) -> Option<DateTime<Utc>> {
-    let edges = ordered_edges(events);
-    max_opt(
+) -> ApiResult<Option<DateTime<Utc>>> {
+    let edges = ordered_edges(events)?;
+    Ok(max_opt(
         verdict_shift_at(role, policy, &edges),
         stage_move_shift_at(role, policy, &edges),
-    )
+    ))
 }
 
 /// The working edges of the stored events in append order: a real
 /// `from → to` move, not a hold and not a same-state write. A hold is skipped
 /// because a human question is not progress (see the module docs).
-fn ordered_edges(events: &[WorkflowEvent]) -> Vec<(&WorkflowEvent, TaskState, TaskState)> {
+///
+/// A row that CARRIES `from`/`to` but whose values cannot be read as states is
+/// refused, never skipped (rework R1 quality return: the old `.ok()?` dropped
+/// such a row without a trace, so the counter could print a number the stored
+/// history does not support — the dropped row may be the very move that
+/// shifted the series, or a repeat that should raise it). The refusal names the
+/// event and the value, so a damaged row is repaired instead of swallowed.
+fn ordered_edges(
+    events: &[WorkflowEvent],
+) -> ApiResult<Vec<(&WorkflowEvent, TaskState, TaskState)>> {
     let mut ordered: Vec<&WorkflowEvent> = events.iter().collect();
     ordered.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    ordered
-        .into_iter()
-        .filter_map(|ev| {
-            let payload = ev.payload.as_object()?;
-            let (from, to) = payload
-                .get("from")?
-                .as_str()
-                .zip(payload.get("to")?.as_str())?;
-            let from = TaskState::parse(from).ok()?;
-            let to = TaskState::parse(to).ok()?;
-            (from != to && !from.is_hold() && !to.is_hold()).then_some((ev, from, to))
+    let mut edges = Vec::new();
+    for ev in ordered {
+        let Some(payload) = ev.payload.as_object() else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (payload.get(json_field::FROM), payload.get(json_field::TO))
+        else {
+            continue;
+        };
+        let from = transition_state(ev, json_field::FROM, from)?;
+        let to = transition_state(ev, json_field::TO, to)?;
+        if from != to && !from.is_hold() && !to.is_hold() {
+            edges.push((ev, from, to));
+        }
+    }
+    Ok(edges)
+}
+
+/// One side of a transition row, read strictly: a value that is not a state
+/// name is a refusal with the event id and the offending value, because the
+/// count is derived from these rows and a silently missing row would lie.
+fn transition_state(
+    ev: &WorkflowEvent,
+    side: &'static str,
+    value: &serde_json::Value,
+) -> ApiResult<TaskState> {
+    value
+        .as_str()
+        .and_then(|state| TaskState::parse(state).ok())
+        .ok_or_else(|| {
+            ApiError::refused(
+                "corrupt_transition",
+                format!(
+                    "workflow event {} carries an unreadable `{side}` (`{value}`) — the attempt \
+                     counter cannot be derived from a history it cannot read",
+                    ev.id
+                ),
+            )
         })
-        .collect()
 }
 
 /// A verdict change the judge recorded while the task stood in a stage the
@@ -467,6 +509,19 @@ mod tests {
             payload,
             created_at: ts(at),
         }
+    }
+
+    /// `role_progress_at` on a HEALTHY stored history. The shifts asserted
+    /// below are the subject of these cases; the strictness refusal has its own
+    /// case ([`a_damaged_transition_row_is_refused_not_silently_dropped`]).
+    fn progress_at(
+        role: &str,
+        policy: &ProcessPolicy,
+        events: &[WorkflowEvent],
+        convergence: Option<&ConvergenceView>,
+    ) -> Option<DateTime<Utc>> {
+        role_progress_at(role, policy, events, convergence)
+            .expect("a test history is readable: no transition row is damaged")
     }
 
     fn exec(
@@ -624,11 +679,11 @@ mod tests {
         let v = view(points);
         let policy = Process::factory();
         assert_eq!(
-            role_progress_at("requirements-analyst", policy, &[], Some(&v)),
+            progress_at("requirements-analyst", policy, &[], Some(&v)),
             None
         );
         assert_eq!(
-            role_progress_at("requirements-reviewer", policy, &[], Some(&v)),
+            progress_at("requirements-reviewer", policy, &[], Some(&v)),
             None
         );
     }
@@ -660,7 +715,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            role_progress_at("requirements-analyst", policy, &[], Some(&v)),
+            progress_at("requirements-analyst", policy, &[], Some(&v)),
             Some(ts(30))
         );
 
@@ -681,7 +736,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            role_progress_at("requirements-reviewer", policy, &[], Some(&v)),
+            progress_at("requirements-reviewer", policy, &[], Some(&v)),
             Some(ts(20))
         );
     }
@@ -707,12 +762,12 @@ mod tests {
         ];
         let policy = Process::factory();
         assert_eq!(
-            role_progress_at("requirements-analyst", policy, &events, None),
+            progress_at("requirements-analyst", policy, &events, None),
             Some(ts(10)),
             "only the analyst's own move into a NEW state counts; holds never do"
         );
         assert_eq!(
-            role_progress_at("requirements-reviewer", policy, &events, None),
+            progress_at("requirements-reviewer", policy, &events, None),
             None,
             "the task was never moved out of REVIEW by the reviewer"
         );
@@ -725,7 +780,7 @@ mod tests {
         // zeroed by each transition.
         let policy = Process::factory();
         let events = loop_events(10);
-        let progress = role_progress_at("requirements-analyst", policy, &events, None);
+        let progress = progress_at("requirements-analyst", policy, &events, None);
         assert_eq!(
             progress,
             Some(ts(10)),
@@ -752,7 +807,7 @@ mod tests {
         // The reviewer is counted apart: its own bounce move is its first
         // shift, then its rounds add up as well — neither role can hide behind
         // the other's counter.
-        let reviewer = role_progress_at("requirements-reviewer", policy, &events, None);
+        let reviewer = progress_at("requirements-reviewer", policy, &events, None);
         assert_eq!(reviewer, Some(ts(12)));
     }
 
@@ -780,12 +835,12 @@ mod tests {
             )],
         );
         assert_eq!(
-            role_progress_at("requirements-analyst", policy, &events, Some(&quality)),
+            progress_at("requirements-analyst", policy, &events, Some(&quality)),
             Some(ts(10)),
             "another role's move and another role's series leave the analyst's series alone"
         );
         assert_eq!(
-            role_progress_at("implementation-agent", policy, &events, Some(&quality)),
+            progress_at("implementation-agent", policy, &events, Some(&quality)),
             Some(ts(120))
         );
         let executions: Vec<RoleExecution> = (0..5)
@@ -838,7 +893,7 @@ mod tests {
                 }),
             ),
         ];
-        let progress = role_progress_at("requirements-analyst", policy, &events, None);
+        let progress = progress_at("requirements-analyst", policy, &events, None);
         assert_eq!(
             progress,
             Some(ts(16)),
@@ -889,9 +944,9 @@ mod tests {
             ));
         }
         let policy = Process::factory();
-        let qa = role_progress_at("quality-auditor", policy, &events, None);
+        let qa = progress_at("quality-auditor", policy, &events, None);
         assert_eq!(qa, Some(ts(10)), "the first return is the last QA shift");
-        let implementer = role_progress_at("implementation-agent", policy, &events, None);
+        let implementer = progress_at("implementation-agent", policy, &events, None);
         assert_eq!(
             implementer,
             Some(ts(4)),
@@ -1001,7 +1056,7 @@ mod tests {
         // artifact and records the verdict INSIDE it, and the engine closes the
         // execution afterwards. The shifting launch must not count itself.
         let policy = Process::factory();
-        let progress = role_progress_at("requirements-analyst", policy, &live_order_events(), None);
+        let progress = progress_at("requirements-analyst", policy, &live_order_events(), None);
         assert_eq!(progress, Some(ts(20)), "the approved verdict is the shift");
 
         // The run that produced it started at 10 and finished at 30 — the
@@ -1033,6 +1088,35 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_transition_row_is_refused_not_silently_dropped() {
+        // Rework R1 quality return: `ordered_edges` parsed the state names with
+        // `.ok()?`, so a row carrying an unreadable `to` vanished from the
+        // history the count is derived from — and the counter could then print
+        // a number the stored rows do not support (the dropped row may be the
+        // very move that shifted the series, or a repeat that should raise it).
+        let policy = Process::factory();
+        let mut events = loop_events(2);
+        let damaged = event(
+            event_kind::STATE_CHANGED,
+            40,
+            serde_json::json!({"from": "ANALYSIS", "to": "REVIEWED"}),
+        );
+        let damaged_id = damaged.id.to_string();
+        events.push(damaged);
+
+        let err = role_progress_at("requirements-analyst", policy, &events, None).unwrap_err();
+        assert_eq!(err.code().0, "corrupt_transition", "{err}");
+        assert!(
+            err.to_string().contains(&damaged_id),
+            "the refusal names the event: {err}"
+        );
+        assert!(
+            err.to_string().contains("REVIEWED"),
+            "the refusal names the value: {err}"
+        );
+    }
+
+    #[test]
     fn the_series_catalog_is_read_from_the_declaration() {
         // Rework R2: the stage→states table is data. The shipped declaration
         // maps both measured series; clearing it makes progress fall back to
@@ -1055,7 +1139,7 @@ mod tests {
             None,
         )]);
         assert_eq!(
-            role_progress_at("requirements-analyst", &without, &[], Some(&converging)),
+            progress_at("requirements-analyst", &without, &[], Some(&converging)),
             None,
             "no declared series means no measured movement"
         );

@@ -1113,14 +1113,19 @@ pub fn park_attempt_limit(
              (предел {limit}) — ни стадия, ни вердикт, ни сходимость не сдвинулись.\n\
              Почему важно: платформа не продолжает сама, не меняет роль и не меняет модель; \
              следующий запуск упрётся в тот же предел.\n\
-             Что сделать: ответьте `продолжить` — счётчик этой роли начнётся с нуля, задача \
-             вернётся в прерванную стадию и запустится; или `остановить` — задача останется в \
-             удержании у человека (не отмена и не провал; это отдельные действия)."
+             Что сделать: ответьте `{proceed}` — счётчик этой роли начнётся с нуля, задача \
+             вернётся в прерванную стадию и запустится; или `{halt}` — задача останется в \
+             удержании у человека (не отмена и не провал; это отдельные действия).",
+            proceed = attempt_limit_answer::CONTINUE,
+            halt = attempt_limit_answer::STOP,
         ),
         context: Some(format!(
             "gate=attempt-limit role={role_slug} attempts={attempts} limit={limit}"
         )),
-        options: vec!["продолжить".into(), "остановить".into()],
+        options: attempt_limit_answer::ALL
+            .iter()
+            .map(|option| (*option).to_string())
+            .collect(),
         blocking: true,
     });
     Ok(m)
@@ -1165,7 +1170,7 @@ pub fn answer_attempt_limit_stop(
                 actor: actor.to_string(),
                 payload: json!({
                     (json_field::QUESTION_ID): question_id.to_string(),
-                    (json_field::ANSWER): "остановить",
+                    (json_field::ANSWER): attempt_limit_answer::STOP,
                     (json_field::FROM): from.as_str(),
                     (json_field::TO): to.as_str(),
                 }),
@@ -1178,7 +1183,7 @@ pub fn answer_attempt_limit_stop(
                     (json_field::ROLE): role_slug,
                     (json_field::ATTEMPT): attempts,
                     (json_field::LIMIT): limit,
-                    (json_field::ANSWER): "остановить",
+                    (json_field::ANSWER): attempt_limit_answer::STOP,
                     (json_field::FROM): from.as_str(),
                     (json_field::TO): to.as_str(),
                 }),
