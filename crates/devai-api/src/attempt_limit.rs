@@ -1,13 +1,31 @@
 //! The attempt limit of a role (REQ-AL-01..08): how many COMPLETED executions
-//! of one role passed WITHOUT a substantive shift, and the declared ceiling.
+//! of ONE ROLE passed WITHOUT a substantive shift, and the declared ceiling.
 //!
 //! Everything here is DERIVED from stored history — executions, artifacts,
 //! workflow events and the SAME convergence slice the read surfaces publish.
 //! No counter column exists to drift from the rows that justify it (REQ-AL-02).
 //!
-//! What a shift is (REQ-AL-03, ratified): a change of the WORKING stage, a
-//! change of the stored review verdict, or a round the convergence stage
-//! itself calls movement (`CONVERGING` — the score rises / the spec shrinks).
+//! The counter lives on the (TASK, ROLE) pair (rework R1/R2). A shift of
+//! ANOTHER role never zeroes it — a stage move, a verdict and a converging
+//! round are read against the role whose work they judge. A round that
+//! changes nothing raises it, which is the whole point: `ANALYSIS ↔ REVIEW`
+//! and `QA ↔ REWORK` used to reset a task-wide counter on every transition
+//! and could therefore run forever.
+//!
+//! What a shift of one role is (REQ-AL-03, ratified — the score must RISE,
+//! «оценка растёт — сходится, не растёт — не сходится»):
+//!
+//! * a round the stage's own convergence series calls movement (`CONVERGING`)
+//!   or a verdict change between two of its rounds — read from the series that
+//!   judges THIS role's work (`spec_review` for the analyst and the reviewer,
+//!   `quality` for QA and the implementation agent);
+//! * a stored verdict change recorded while the task stood in a stage that
+//!   series judges — the same substance, read even when no series exists yet;
+//! * a stage move out of THIS role's own stage into a state the task had never
+//!   reached before. That is the only stage-move form that counts: a ping-pong
+//!   re-enters states it has already been in, so ten such rounds add ten
+//!   attempts instead of zeroing the counter ten times.
+//!
 //! A new artifact version with another text and the same verdict is NOT a
 //! shift: that is exactly how 50 spec versions and 48 review reports rode as
 //! «movement» until a human stopped the task.
@@ -25,6 +43,37 @@ use devai_store::config::ProcessPolicy;
 use serde::Serialize;
 
 use crate::{Api, ApiResult};
+
+/// The declared working states whose work ONE measured convergence stage
+/// compares: a `spec_review` round judges the spec ANALYSIS publishes and the
+/// report REVIEW answers with; a `quality` round judges the QA report over what
+/// the implementation agent produced. These two are the only measured series
+/// the platform has, so every other role leans on stage moves and verdicts.
+fn series_states(stage: &str) -> &'static [TaskState] {
+    match stage {
+        convergence::STAGE_SPEC_REVIEW => &[TaskState::Analysis, TaskState::Review],
+        convergence::STAGE_QUALITY => {
+            &[TaskState::Implementation, TaskState::Rework, TaskState::Qa]
+        }
+        _ => &[],
+    }
+}
+
+/// The measured series a declared working state is judged by, if any.
+fn series_of(state: TaskState) -> Option<&'static str> {
+    [convergence::STAGE_SPEC_REVIEW, convergence::STAGE_QUALITY]
+        .into_iter()
+        .find(|stage| series_states(stage).contains(&state))
+}
+
+/// Does this measured series speak for `role` — is any state it judges executed
+/// by `role`? ONE reading, shared by the series rounds and by the verdicts, so
+/// the two can never attribute a shift to different roles.
+fn series_judges(stage: &str, role: &str, policy: &ProcessPolicy) -> bool {
+    series_states(stage)
+        .iter()
+        .any(|state| policy.role_for(state.as_str()) == Some(role))
+}
 
 /// The ONE triple the stop decision, the refusal, the question and the status
 /// line publish: the role, the derived count and the declared limit (`None`
@@ -96,8 +145,9 @@ impl Api {
     }
 
     /// The ONE calculation behind the admission check, the stop question and
-    /// both read surfaces (REQ-AL-07 AC1): the derived count, the declared
-    /// limit and the shared line. `None` when the task has no role stage.
+    /// both read surfaces (REQ-AL-07 AC1): the derived count of THIS role, the
+    /// declared limit and the shared line. `None` when the task has no role
+    /// stage.
     pub(crate) fn attempt_limit_view(
         &self,
         task: &Task,
@@ -111,7 +161,7 @@ impl Api {
         let events = self.store.events(task.id, None)?;
         let converged = self.task_convergence(task, &artifacts, &executions);
         let attempts =
-            self.attempts_without_progress(&role, &executions, &events, converged.as_ref());
+            self.attempts_without_progress(&role, &executions, &events, converged.as_ref(), policy);
         Ok(Some(AttemptLimitView::new(
             &role,
             attempts,
@@ -119,27 +169,37 @@ impl Api {
         )))
     }
 
-    /// The derived count of one role, from stored rows only: the last
-    /// substantive shift, the last human reset of THIS role, and its completed
-    /// stage launches between them.
+    /// The derived count of ONE role, from stored rows only: the last
+    /// substantive shift of THIS role, the last human reset of THIS role, and
+    /// its completed stage launches between them.
     pub(crate) fn attempts_without_progress(
         &self,
         role: &str,
         executions: &[RoleExecution],
         events: &[WorkflowEvent],
         convergence: Option<&ConvergenceView>,
+        policy: &ProcessPolicy,
     ) -> u32 {
-        let progress = last_progress_at(events, convergence);
+        let progress = role_progress_at(role, policy, events, convergence);
         let reset = last_reset_at(events, role);
         attempts_without_progress(role, executions, progress, reset)
     }
 }
 
-/// The timestamp of the last SUBSTANTIVE shift of the task, if any. Derived
-/// from stored events (stage moves, review verdicts) and from the SAME
-/// convergence slice the read surfaces publish — one calculation, so a second
-/// read of an unchanged task yields the same value (REQ-AL-03 AC3).
-pub fn last_progress_at(
+/// The timestamp of the last SUBSTANTIVE shift of `role` in this task, if any —
+/// the per-role counter's floor. Derived from stored events (owned stage moves,
+/// review verdicts) and from the SAME convergence slice the read surfaces
+/// publish, so a second read of an unchanged task yields the same value
+/// (REQ-AL-03 AC3).
+///
+/// A shift of ANOTHER role is never this role's shift (REQ-AL-02 AC5): the
+/// stage move is read against the role that executed the stage it left, the
+/// verdict and the converging round against the series that judges this role's
+/// work. A ping-pong that only re-enters states already reached is not a shift
+/// and therefore keeps raising the count (rework R1/R2).
+pub fn role_progress_at(
+    role: &str,
+    policy: &ProcessPolicy,
     events: &[WorkflowEvent],
     convergence: Option<&ConvergenceView>,
 ) -> Option<DateTime<Utc>> {
@@ -148,43 +208,15 @@ pub fn last_progress_at(
         progress = Some(progress.map_or(at, |cur| cur.max(at)));
     };
 
-    // Stage moves: BOTH sides are working stages. A move into or out of a
-    // custody hold is not a shift of the work (see the module docs).
-    let mut previous_verdict: Option<String> = None;
-    let mut ordered: Vec<&WorkflowEvent> = events.iter().collect();
-    ordered.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    for ev in ordered {
-        let Some(payload) = ev.payload.as_object() else {
-            continue;
-        };
-        if ev.kind == event_kind::REVIEW_RECORDED {
-            if let Some(verdict) = payload.get("verdict").and_then(|v| v.as_str()) {
-                if previous_verdict.as_deref().is_some_and(|p| p != verdict) {
-                    mark(ev.created_at);
-                }
-                previous_verdict = Some(verdict.to_string());
-            }
-        }
-        let from = payload.get("from").and_then(|v| v.as_str());
-        let to = payload.get("to").and_then(|v| v.as_str());
-        if let (Some(from), Some(to)) = (from, to) {
-            if from == to {
-                continue;
-            }
-            let (Ok(from), Ok(to)) = (TaskState::parse(from), TaskState::parse(to)) else {
-                continue;
-            };
-            if !from.is_hold() && !to.is_hold() {
-                mark(ev.created_at);
-            }
-        }
-    }
-
     // Convergence rounds: a round whose stage mode is CONVERGING moved the
-    // work by the stage's OWN measure; a verdict change between two rounds is
-    // a shift even when the volume rule says nothing.
+    // work by the stage's OWN measure, and a verdict change between two rounds
+    // is a shift even when the volume rule says nothing. Only the series that
+    // judges THIS role's work speaks here.
     if let Some(view) = convergence {
         for stage in &view.stages {
+            if !series_judges(stage.stage, role, policy) {
+                continue;
+            }
             let mut previous_verdict: Option<&str> = None;
             for point in &stage.series {
                 let mut moved = point.mode == convergence::mode::CONVERGING;
@@ -200,6 +232,54 @@ pub fn last_progress_at(
                     previous_verdict = point.verdict.as_deref();
                 }
             }
+        }
+    }
+
+    let mut previous_verdict: Option<String> = None;
+    let mut visited: Vec<TaskState> = Vec::new();
+    let mut ordered: Vec<&WorkflowEvent> = events.iter().collect();
+    ordered.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    for ev in ordered {
+        let Some(payload) = ev.payload.as_object() else {
+            continue;
+        };
+        let Some((from, to)) = payload
+            .get("from")
+            .and_then(|v| v.as_str())
+            .zip(payload.get("to").and_then(|v| v.as_str()))
+        else {
+            continue;
+        };
+        if from == to {
+            continue;
+        }
+        let (Ok(from), Ok(to)) = (TaskState::parse(from), TaskState::parse(to)) else {
+            continue;
+        };
+        // A move into or out of a custody hold is not a shift of the work (see
+        // the module docs): a human question is not progress.
+        if from.is_hold() || to.is_hold() {
+            continue;
+        }
+        let first_visit = !visited.contains(&to);
+        if first_visit {
+            visited.push(to);
+        }
+        // The judge's answer to THIS role's work changed: the same substance
+        // the series records, read even when no series exists yet.
+        if ev.kind == event_kind::REVIEW_RECORDED {
+            if let Some(verdict) = payload.get("verdict").and_then(|v| v.as_str()) {
+                let changed = previous_verdict.as_deref().is_some_and(|p| p != verdict);
+                if changed && series_of(from).is_some_and(|s| series_judges(s, role, policy)) {
+                    mark(ev.created_at);
+                }
+                previous_verdict = Some(verdict.to_string());
+            }
+        }
+        // A stage move counts only when THIS role's stage moved the task into a
+        // state it had never reached before: a repeat is a round, not a shift.
+        if first_visit && policy.role_for(from.as_str()) == Some(role) {
+            mark(ev.created_at);
         }
     }
 
@@ -255,6 +335,7 @@ pub fn attempts_without_progress(
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use devai_core::process::Process;
     use devai_core::types::new_id;
     use devai_runtime::convergence::{ConvergenceCounters, ConvergencePoint, StageConvergence};
 
@@ -303,12 +384,42 @@ mod tests {
         }
     }
 
-    fn point(round: u32, at: i64, mode: &'static str, verdict: Option<&str>) -> ConvergencePoint {
+    /// One round of the burning loop: the analyst hands the spec over, the
+    /// reviewer bounces it back with the SAME verdict. Nothing shifts.
+    fn loop_events(rounds: usize) -> Vec<WorkflowEvent> {
+        let mut events = Vec::new();
+        for i in 0..rounds {
+            let at = 10 + i as i64 * 4;
+            events.push(event(
+                event_kind::REQUIREMENTS_PUBLISHED,
+                at,
+                serde_json::json!({"from": "ANALYSIS", "to": "REVIEW"}),
+            ));
+            events.push(event(
+                event_kind::REVIEW_RECORDED,
+                at + 2,
+                serde_json::json!({
+                    "verdict": "NEEDS_REVISION",
+                    "from": "REVIEW",
+                    "to": "ANALYSIS",
+                }),
+            ));
+        }
+        events
+    }
+
+    fn point_in(
+        stage: &'static str,
+        round: u32,
+        at: i64,
+        mode: &'static str,
+        verdict: Option<&str>,
+    ) -> ConvergencePoint {
         ConvergencePoint {
             round,
             artifact_id: "a".into(),
             created_at: ts(at),
-            stage: convergence::STAGE_SPEC_REVIEW,
+            stage,
             status: "CURRENT".into(),
             measured: true,
             comparable: true,
@@ -340,11 +451,11 @@ mod tests {
         }
     }
 
-    fn view(points: Vec<ConvergencePoint>) -> ConvergenceView {
+    fn view_in(stage: &'static str, points: Vec<ConvergencePoint>) -> ConvergenceView {
         ConvergenceView {
             gap_milli: 10,
             stages: vec![StageConvergence {
-                stage: convergence::STAGE_SPEC_REVIEW,
+                stage,
                 series: points,
                 counters: ConvergenceCounters::default(),
                 stage_total_seconds: None,
@@ -352,6 +463,10 @@ mod tests {
                 missing: Vec::new(),
             }],
         }
+    }
+
+    fn view(points: Vec<ConvergencePoint>) -> ConvergenceView {
+        view_in(convergence::STAGE_SPEC_REVIEW, points)
     }
 
     #[test]
@@ -372,7 +487,8 @@ mod tests {
         // gutted case («50 версий, 48 отчётов») must count as zero progress.
         let points: Vec<ConvergencePoint> = (1..=5)
             .map(|i| {
-                point(
+                point_in(
+                    convergence::STAGE_SPEC_REVIEW,
                     i,
                     i as i64 * 10,
                     convergence::mode::PLATEAU,
@@ -381,40 +497,297 @@ mod tests {
             })
             .collect();
         let v = view(points);
-        assert_eq!(last_progress_at(&[], Some(&v)), None);
+        let policy = Process::factory();
+        assert_eq!(
+            role_progress_at("requirements-analyst", policy, &[], Some(&v)),
+            None
+        );
+        assert_eq!(
+            role_progress_at("requirements-reviewer", policy, &[], Some(&v)),
+            None
+        );
     }
 
     #[test]
     fn a_verdict_change_and_a_converging_round_are_progress() {
+        let policy = Process::factory();
         let v = view(vec![
-            point(1, 10, convergence::mode::PLATEAU, Some("NEEDS_REVISION")),
-            point(2, 20, convergence::mode::PLATEAU, Some("NEEDS_REVISION")),
-            point(3, 30, convergence::mode::PLATEAU, Some("APPROVED")),
+            point_in(
+                convergence::STAGE_SPEC_REVIEW,
+                1,
+                10,
+                convergence::mode::PLATEAU,
+                Some("NEEDS_REVISION"),
+            ),
+            point_in(
+                convergence::STAGE_SPEC_REVIEW,
+                2,
+                20,
+                convergence::mode::PLATEAU,
+                Some("NEEDS_REVISION"),
+            ),
+            point_in(
+                convergence::STAGE_SPEC_REVIEW,
+                3,
+                30,
+                convergence::mode::PLATEAU,
+                Some("APPROVED"),
+            ),
         ]);
-        assert_eq!(last_progress_at(&[], Some(&v)), Some(ts(30)));
+        assert_eq!(
+            role_progress_at("requirements-analyst", policy, &[], Some(&v)),
+            Some(ts(30))
+        );
 
         let v = view(vec![
-            point(1, 10, convergence::mode::PLATEAU, None),
-            point(2, 20, convergence::mode::CONVERGING, None),
+            point_in(
+                convergence::STAGE_SPEC_REVIEW,
+                1,
+                10,
+                convergence::mode::PLATEAU,
+                None,
+            ),
+            point_in(
+                convergence::STAGE_SPEC_REVIEW,
+                2,
+                20,
+                convergence::mode::CONVERGING,
+                None,
+            ),
         ]);
-        assert_eq!(last_progress_at(&[], Some(&v)), Some(ts(20)));
+        assert_eq!(
+            role_progress_at("requirements-reviewer", policy, &[], Some(&v)),
+            Some(ts(20))
+        );
     }
 
     #[test]
-    fn a_working_stage_move_is_progress_but_entering_a_hold_is_not() {
+    fn a_hold_is_not_progress_but_a_first_move_to_a_working_stage_is() {
         let events = vec![
             event(
                 event_kind::STATE_CHANGED,
                 10,
-                serde_json::json!({"from": "REVIEW", "to": "ANALYSIS"}),
+                serde_json::json!({"from": "ANALYSIS", "to": "REVIEW"}),
             ),
             event(
                 event_kind::QUESTION_RAISED,
                 20,
-                serde_json::json!({"from": "ANALYSIS", "to": "WAITING_FOR_INPUT"}),
+                serde_json::json!({"from": "REVIEW", "to": "WAITING_FOR_INPUT"}),
+            ),
+            event(
+                event_kind::QUESTION_ANSWERED,
+                30,
+                serde_json::json!({"from": "WAITING_FOR_INPUT", "to": "REVIEW"}),
             ),
         ];
-        assert_eq!(last_progress_at(&events, None), Some(ts(10)));
+        let policy = Process::factory();
+        assert_eq!(
+            role_progress_at("requirements-analyst", policy, &events, None),
+            Some(ts(10)),
+            "only the analyst's own move into a NEW state counts; holds never do"
+        );
+        assert_eq!(
+            role_progress_at("requirements-reviewer", policy, &events, None),
+            None,
+            "the task was never moved out of REVIEW by the reviewer"
+        );
+    }
+
+    #[test]
+    fn ten_rounds_of_analysis_review_without_a_shift_raise_the_count_past_the_limit() {
+        // The burning case (rework R1): ANALYSIS ↔ REVIEW ten times, the same
+        // NEEDS_REVISION every round. The counter must CLEAR the limit, not be
+        // zeroed by each transition.
+        let policy = Process::factory();
+        let events = loop_events(10);
+        let progress = role_progress_at("requirements-analyst", policy, &events, None);
+        assert_eq!(
+            progress,
+            Some(ts(10)),
+            "the first handoff into REVIEW is the last shift; the other nine rounds are repeats"
+        );
+        let executions: Vec<RoleExecution> = (0..10)
+            .map(|i| {
+                exec(
+                    "requirements-analyst",
+                    9 + i as i64 * 4,
+                    Some(9 + i as i64 * 4),
+                    ExecutionStatus::Completed,
+                )
+            })
+            .collect();
+        let attempts =
+            attempts_without_progress("requirements-analyst", &executions, progress, None);
+        assert_eq!(attempts, 9, "every round after the first shift counts");
+        assert!(
+            limit_reached(attempts, Some(5)),
+            "ten rounds without a shift stop the task, they do not ride as movement"
+        );
+
+        // The reviewer is counted apart: its own bounce move is its first
+        // shift, then its rounds add up as well — neither role can hide behind
+        // the other's counter.
+        let reviewer = role_progress_at("requirements-reviewer", policy, &events, None);
+        assert_eq!(reviewer, Some(ts(12)));
+    }
+
+    #[test]
+    fn a_move_or_a_series_of_another_role_never_resets_this_roles_counter() {
+        let policy = Process::factory();
+        let mut events = loop_events(5);
+        // The implementation agent moves the task into a stage it had never
+        // reached: a genuine advance of ANOTHER role.
+        events.push(event(
+            event_kind::IMPLEMENTATION_REPORTED,
+            100,
+            serde_json::json!({"from": "REWORK", "to": "QA"}),
+        ));
+        // A converging QUALITY round is movement of the QA/implementation
+        // series, not of the spec-review one.
+        let quality = view_in(
+            convergence::STAGE_QUALITY,
+            vec![point_in(
+                convergence::STAGE_QUALITY,
+                2,
+                120,
+                convergence::mode::CONVERGING,
+                None,
+            )],
+        );
+        assert_eq!(
+            role_progress_at("requirements-analyst", policy, &events, Some(&quality)),
+            Some(ts(10)),
+            "another role's move and another role's series leave the analyst's series alone"
+        );
+        assert_eq!(
+            role_progress_at("implementation-agent", policy, &events, Some(&quality)),
+            Some(ts(120))
+        );
+        let executions: Vec<RoleExecution> = (0..5)
+            .map(|i| {
+                exec(
+                    "requirements-analyst",
+                    9 + i as i64 * 4,
+                    Some(9 + i as i64 * 4),
+                    ExecutionStatus::Completed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            attempts_without_progress("requirements-analyst", &executions, Some(ts(10)), None),
+            4,
+            "the count is not zeroed by somebody else's progress"
+        );
+    }
+
+    #[test]
+    fn a_genuine_verdict_change_resets_the_count_of_both_sides_of_the_series() {
+        let policy = Process::factory();
+        let events = vec![
+            event(
+                event_kind::REQUIREMENTS_PUBLISHED,
+                10,
+                serde_json::json!({"from": "ANALYSIS", "to": "REVIEW"}),
+            ),
+            event(
+                event_kind::REVIEW_RECORDED,
+                12,
+                serde_json::json!({
+                    "verdict": "NEEDS_REVISION",
+                    "from": "REVIEW",
+                    "to": "ANALYSIS",
+                }),
+            ),
+            event(
+                event_kind::REQUIREMENTS_PUBLISHED,
+                14,
+                serde_json::json!({"from": "ANALYSIS", "to": "REVIEW"}),
+            ),
+            event(
+                event_kind::REVIEW_RECORDED,
+                16,
+                serde_json::json!({
+                    "verdict": "APPROVED",
+                    "from": "REVIEW",
+                    "to": "APPROVAL",
+                }),
+            ),
+        ];
+        let progress = role_progress_at("requirements-analyst", policy, &events, None);
+        assert_eq!(
+            progress,
+            Some(ts(16)),
+            "the verdict moved: the spec judged better"
+        );
+        let executions = vec![
+            exec(
+                "requirements-analyst",
+                5,
+                Some(9),
+                ExecutionStatus::Completed,
+            ),
+            exec(
+                "requirements-analyst",
+                11,
+                Some(13),
+                ExecutionStatus::Completed,
+            ),
+        ];
+        assert_eq!(
+            attempts_without_progress("requirements-analyst", &executions, progress, None),
+            0,
+            "a real shift of the role's own work zeroes its series"
+        );
+    }
+
+    #[test]
+    fn the_qa_rework_loop_raises_the_count_of_both_roles() {
+        // The second burning loop of rework R1: QA sends the result back, the
+        // implementation agent reports again, QA sends it back — nothing
+        // shifts. Both roles must accumulate, not reset each other.
+        let mut events = vec![event(
+            event_kind::IMPLEMENTATION_REPORTED,
+            4,
+            serde_json::json!({"from": "IMPLEMENTATION", "to": "QA"}),
+        )];
+        for i in 0..5 {
+            let at = 10 + i as i64 * 10;
+            events.push(event(
+                event_kind::QUALITY_RETURNED,
+                at,
+                serde_json::json!({"from": "QA", "to": "REWORK"}),
+            ));
+            events.push(event(
+                event_kind::IMPLEMENTATION_REPORTED,
+                at + 2,
+                serde_json::json!({"from": "REWORK", "to": "QA"}),
+            ));
+        }
+        let policy = Process::factory();
+        let qa = role_progress_at("quality-auditor", policy, &events, None);
+        assert_eq!(qa, Some(ts(10)), "the first return is the last QA shift");
+        let implementer = role_progress_at("implementation-agent", policy, &events, None);
+        assert_eq!(
+            implementer,
+            Some(ts(4)),
+            "REWORK → QA repeats the state QA already saw: no shift"
+        );
+
+        let qa_runs: Vec<RoleExecution> = (0..5)
+            .map(|i| {
+                exec(
+                    "quality-auditor",
+                    11 + i as i64 * 10,
+                    Some(11 + i as i64 * 10),
+                    ExecutionStatus::Completed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            attempts_without_progress("quality-auditor", &qa_runs, qa, None),
+            5
+        );
+        assert!(limit_reached(5, Some(5)));
     }
 
     #[test]
@@ -446,34 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn a_verdict_change_resets_the_count_and_a_reset_is_scoped_to_its_role() {
-        // The reviewer's verdict moved NEEDS_REVISION -> APPROVED at t=50:
-        // that is the last shift, so only the launch finished after it counts.
-        let events = vec![
-            event(
-                event_kind::REVIEW_RECORDED,
-                10,
-                serde_json::json!({"verdict": "NEEDS_REVISION"}),
-            ),
-            event(
-                event_kind::REVIEW_RECORDED,
-                50,
-                serde_json::json!({"verdict": "APPROVED"}),
-            ),
-        ];
-        let executions = vec![
-            exec("analyst", 5, Some(20), ExecutionStatus::Completed),
-            exec("analyst", 30, Some(40), ExecutionStatus::Completed),
-            exec("analyst", 60, Some(70), ExecutionStatus::Completed),
-        ];
-        let progress = last_progress_at(&events, None);
-        assert_eq!(progress, Some(ts(50)));
-        assert_eq!(
-            attempts_without_progress("analyst", &executions, progress, None),
-            1
-        );
-
-        // A reset of ANOTHER role does not touch this role's counter.
+    fn a_reset_is_scoped_to_its_role() {
         let events = vec![
             event(
                 event_kind::ATTEMPT_LIMIT_RESET,

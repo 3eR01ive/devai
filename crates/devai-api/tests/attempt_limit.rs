@@ -12,7 +12,10 @@
 //! * the counter is visible in `task.status` / `task.progress` below the
 //!   limit too, and a human-only state carries none;
 //! * a failed launch spends no attempt, and a declaration with `0` means
-//!   «без предела».
+//!   «без предела»;
+//! * the burning loop of rework R1/R2 — `ANALYSIS ↔ REVIEW` without a shift —
+//!   is stopped at the limit with a question, another role's stage move never
+//!   resets the analyst's series, and a real shift of the role does.
 
 use std::path::Path;
 
@@ -22,6 +25,7 @@ use devai_api::{
 };
 use devai_core::types::*;
 use devai_store::Store;
+use serde_json::json;
 use tempfile::TempDir;
 
 fn home() -> (TempDir, Api) {
@@ -137,6 +141,38 @@ fn seed_failed(api: &Api, home: &Path, id: &str, n: usize) {
     let tid = api.task_get(id).unwrap().id;
     for _ in 0..n {
         failed_once(&store, tid, "requirements-analyst");
+    }
+}
+
+/// One COMPLETED round of the burning loop: the analyst hands a spec over, the
+/// reviewer bounces it back with the SAME verdict. Nothing shifts — no verdict
+/// moves, no score rises, no state is reached for the first time but REVIEW.
+fn loop_round(store: &Store, task_id: Id) {
+    run_once(store, task_id, "requirements-analyst");
+    store
+        .insert_event(
+            Some(task_id),
+            event_kind::REQUIREMENTS_PUBLISHED,
+            "mock",
+            json!({"from": "ANALYSIS", "to": "REVIEW"}),
+        )
+        .unwrap();
+    run_once(store, task_id, "requirements-reviewer");
+    store
+        .insert_event(
+            Some(task_id),
+            event_kind::REVIEW_RECORDED,
+            "mock",
+            json!({"verdict": "NEEDS_REVISION", "from": "REVIEW", "to": "ANALYSIS"}),
+        )
+        .unwrap();
+}
+
+fn loop_rounds(api: &Api, home: &Path, id: &str, n: usize) {
+    let store = Store::open(home).unwrap();
+    let tid = api.task_get(id).unwrap().id;
+    for _ in 0..n {
+        loop_round(&store, tid);
     }
 }
 
@@ -531,6 +567,171 @@ fn failed_launches_spend_no_attempt() {
     assert!(
         out.is_some(),
         "four attempts plus failed rows stay below five"
+    );
+}
+
+#[test]
+fn the_analysis_review_loop_is_stopped_at_the_limit_with_one_question() {
+    // Rework R1: the round brake is replaced, so this loop must NOT ride as
+    // «movement» any more. Five launches without a shift, the sixth round
+    // never starts — the platform stops the task and asks ONE question.
+    let (dir, api) = home();
+    let id = task(&api);
+    loop_rounds(&api, dir.path(), &id, 6);
+
+    let status = api.task_status(&id).unwrap();
+    let view = status
+        .attempt_limit
+        .expect("the counter rides on the status");
+    assert_eq!(view.role, "requirements-analyst");
+    assert_eq!(
+        view.attempts, 5,
+        "the first handoff was a shift; the five rounds after it were not"
+    );
+    assert_eq!(view.line, "попыток без прогресса: 5 из 5");
+
+    let ack = supervised(&api, dir.path(), &id).expect("the seventh round must not start");
+    assert!(ack.starts_with("refused "), "handshake: {ack:?}");
+    assert!(
+        ack.contains("5 из 5"),
+        "the refusal speaks the numbers: {ack:?}"
+    );
+
+    let status = api.task_status(&id).unwrap();
+    assert_eq!(status.task.state, TaskState::WaitingForInput);
+    assert_eq!(status.task.return_state, Some(TaskState::Analysis));
+    assert_eq!(status.open_questions.len(), 1, "ONE honest question");
+    let q = &status.open_questions[0];
+    assert!(q.blocking);
+    assert_eq!(
+        q.options,
+        vec!["продолжить".to_string(), "остановить".to_string()]
+    );
+    assert!(q.text.contains("requirements-analyst"), "{}", q.text);
+    assert_eq!(
+        api.exec_list(Some(&id)).unwrap().len(),
+        12,
+        "six rounds ran, the seventh did not"
+    );
+    assert_eq!(event_count(&api, &id, event_kind::ATTEMPT_LIMIT_TRIPPED), 1);
+    assert_eq!(
+        event_count(&api, &id, event_kind::PROCESS_PARKED),
+        0,
+        "the loop stops on a QUESTION, not on a silent park"
+    );
+
+    // The answer «продолжить» zeroes the series and a new ten-round run of the
+    // same loop stops at the limit AGAIN instead of riding forever: after the
+    // reset every launch goes into the same round and nothing new is reached.
+    let answered = api
+        .question_answer(&q.id.to_string(), "продолжить")
+        .unwrap();
+    assert_eq!(answered.to_state, TaskState::Analysis);
+    assert_eq!(
+        api.task_status(&id)
+            .unwrap()
+            .attempt_limit
+            .unwrap()
+            .attempts,
+        0
+    );
+
+    loop_rounds(&api, dir.path(), &id, 10);
+    let ack = supervised(&api, dir.path(), &id).expect("ten rounds never ride as movement");
+    assert!(
+        ack.contains("10 из 5"),
+        "the fresh series cleared the limit again: {ack:?}"
+    );
+    let status = api.task_status(&id).unwrap();
+    assert_eq!(status.task.state, TaskState::WaitingForInput);
+    assert_eq!(
+        status.open_questions.len(),
+        1,
+        "one question per trip: the answered one is closed"
+    );
+}
+
+#[test]
+fn a_stage_move_of_another_role_does_not_reset_the_series_of_this_role() {
+    // REQ-AL-02 AC5: the counter lives on (task, role). The implementation
+    // agent moving the task into a stage it had never reached — a genuine
+    // advance of ANOTHER role — leaves the analyst's series where it was.
+    let (dir, api) = home();
+    let id = task(&api);
+    loop_rounds(&api, dir.path(), &id, 5);
+    let before = api.task_status(&id).unwrap().attempt_limit.unwrap();
+    assert_eq!(before.line, "попыток без прогресса: 4 из 5");
+
+    let store = Store::open(dir.path()).unwrap();
+    let tid = api.task_get(&id).unwrap().id;
+    store
+        .insert_event(
+            Some(tid),
+            event_kind::IMPLEMENTATION_REPORTED,
+            "mock",
+            json!({"from": "REWORK", "to": "QA"}),
+        )
+        .unwrap();
+
+    let after = api.task_status(&id).unwrap().attempt_limit.unwrap();
+    assert_eq!(
+        after.attempts, 4,
+        "somebody else's progress is not this role's progress"
+    );
+    assert_eq!(after.role, "requirements-analyst");
+
+    // One more round without a shift reaches the limit: the series was never
+    // reset in between.
+    loop_rounds(&api, dir.path(), &id, 1);
+    let ack = supervised(&api, dir.path(), &id).expect("the limit is reached");
+    assert!(ack.contains("5 из 5"), "{ack:?}");
+}
+
+#[test]
+fn a_real_shift_of_the_role_resets_its_series() {
+    // The verdict moves NEEDS_REVISION -> APPROVED: the analyst's own work
+    // finally produced a better spec, which is a shift of the spec-review
+    // series both sides of it share. The next launch is admitted again.
+    let (dir, api) = home();
+    let id = task(&api);
+    loop_rounds(&api, dir.path(), &id, 6);
+    assert_eq!(
+        api.task_status(&id)
+            .unwrap()
+            .attempt_limit
+            .unwrap()
+            .attempts,
+        5
+    );
+
+    let store = Store::open(dir.path()).unwrap();
+    let tid = api.task_get(&id).unwrap().id;
+    store
+        .insert_event(
+            Some(tid),
+            event_kind::REVIEW_RECORDED,
+            "mock",
+            json!({"verdict": "APPROVED", "from": "REVIEW", "to": "APPROVAL"}),
+        )
+        .unwrap();
+
+    let view = api.task_status(&id).unwrap().attempt_limit.unwrap();
+    assert_eq!(view.attempts, 0, "a real shift zeroes the series");
+    assert_eq!(view.line, "попыток без прогресса: 0 из 5");
+
+    let out = api
+        .task_run_supervised(&SupervisedRunReq {
+            task_id: id.clone(),
+            agent: "mock".into(),
+            workspace: None,
+            force_reaudit: false,
+            run_id: new_id().to_string(),
+            ack: dir.path().join("ack-after-shift"),
+        })
+        .unwrap();
+    assert!(
+        out.is_some(),
+        "the role that shifted its series is launched again"
     );
 }
 

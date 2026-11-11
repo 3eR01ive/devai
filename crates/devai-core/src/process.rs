@@ -183,12 +183,14 @@ pub struct ProcessTransition {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessBrakes {
-    /// The attempt limit: how many COMPLETED executions of one role may pass
-    /// WITHOUT a substantive shift (a state change, a verdict change, or a
-    /// round the convergence stage itself calls movement) before the platform
-    /// stops the task with ONE human question. `5` in the shipped
-    /// declaration; `None`, empty or `0` means «без предела». The number is
-    /// DATA only — no copy lives in code.
+    /// The attempt limit: how many COMPLETED executions of ONE role may pass
+    /// WITHOUT a substantive shift before the platform stops the task with ONE
+    /// human question. The counter lives on the (task, role) pair and is read
+    /// from stored history: a converging round of the stage's own series (the
+    /// score rises), a stored verdict change, or a move into a state the task
+    /// had never reached — a repeated round of the same loop is NOT a shift.
+    /// `5` in the shipped declaration; `None`, empty or `0` means «без
+    /// предела». The number is DATA only — no copy lives in code.
     #[serde(default, deserialize_with = "attempt_limit_field")]
     pub max_attempts_without_progress: Option<u32>,
     /// Consecutive failed LAUNCHES (not role results): at this count the
