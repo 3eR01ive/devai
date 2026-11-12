@@ -8,6 +8,9 @@
 // получает отдельного набора прав и отдельной реализации чтения/записи.
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
+  RulebookView,
+  TaskUsageView,
+  SourceSliceView,
   ActiveSnapshot,
   AgentStatusView,
   Artifact,
@@ -158,6 +161,10 @@ export const api = {
     invoke<WorkspaceChangesView>("task_workspace_changes", { id_prefix }),
   taskWorkspaceDiff: (id_prefix: string, path: string) =>
     invoke<WorkspaceDiffView>("task_workspace_diff", { id_prefix, path }),
+  // тот же diff с полным контекстом файла: по нему окно разворачивает
+  // скрытые строки, не пересчитывая git
+  taskWorkspaceDiffFull: (id_prefix: string, path: string) =>
+    invoke<WorkspaceDiffView>("task_workspace_diff_full", { id_prefix, path }),
 
   artifactsList: (id_prefix: string) =>
     invoke<ArtifactView[]>("artifacts_list", { id_prefix }),
@@ -176,6 +183,17 @@ export const api = {
   // запускает по обычным правилам. Ответ несёт готовую фразу `line`.
   taskRun: (id_prefix: string, agent: string | null, force_reaudit: boolean) =>
     invoke<RunStartOutcome>("task_run", { id_prefix, agent, force_reaudit }),
+  // Остановка живого прогона: платформа закрывает исполнение (exec.cancel),
+  // статус и причина остаются в истории.
+  // Правила оценки дома: то, чем судит качество (профиль оценки как данные).
+  evaluationRules: () => invoke<RulebookView>("evaluation_rules"),
+  // Расход токенов задачи по прогонам (файлы улик драйвера).
+  taskUsage: (id_prefix: string) => invoke<TaskUsageView>("task_usage", { id_prefix }),
+  // Кусок исходника на коммите по ссылке «путь:строки».
+  sourceSlice: (id_prefix: string, rev: string, path: string, from: number, to: number) =>
+    invoke<SourceSliceView>("source_slice", { id_prefix, rev, path, from, to }),
+  execCancel: (exec_id: string) =>
+    invoke<ExecutionView>("execution_cancel", { exec_id }),
   executionLiveness: (exec_id: string) =>
     invoke<LivenessView>("execution_liveness", { exec_id }),
 

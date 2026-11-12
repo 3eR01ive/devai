@@ -1,0 +1,113 @@
+/* Новый экран (прототип → продукт): своя палитра, не тема каркаса.
+   Тёмный фон, крем-текст, зелёный «пройдено», оранжевый «сейчас»,
+   красный «стоит». Числа — табличными цифрами. */
+
+.p-root {
+  --p-bg: #0c0f13;
+  --p-card: #141a21;
+  --p-card2: #10151b;
+  --p-line: #242e39;
+  --p-ink: #e9eef4;
+  --p-dim: #8b97a6;
+  --p-dim2: #5b6673;
+  --p-pass: #3ecf8e;
+  --p-now: #f5b544;
+  --p-stop: #f0616d;
+  --p-human: #7aa7ff;
+  min-height: 100%;
+  margin: -18px -22px -40px;
+  padding: 14px 22px 60px;
+  background: var(--p-bg);
+  color: var(--p-ink);
+  font: 14px/1.35 "Inter", "Segoe UI", system-ui, sans-serif;
+}
+.p-root a { color: var(--p-ink); }
+.p-mono { font-family: var(--mono); }
+
+.p-head {
+  position: sticky; top: 0; z-index: 9;
+  background: rgba(12, 15, 19, 0.94);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--p-line);
+  margin: 0 -22px 10px; padding: 12px 24px 10px;
+}
+.p-head h1 { margin: 0; font-size: 15px; font-weight: 600; }
+.p-head h1 span { color: var(--p-dim2); font-weight: 400; }
+.p-head .p-groups { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+
+/* строка задачи */
+.p-row {
+  display: grid;
+  grid-template-columns: 300px 1fr 200px;
+  gap: 18px; align-items: center;
+  background: var(--p-card);
+  border: 1px solid var(--p-line);
+  border-radius: 10px;
+  padding: 12px 16px; margin-bottom: 6px;
+  position: relative; overflow: hidden;
+}
+.p-row::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: #37424f; }
+.p-row.s-WAITING_FOR_INPUT::before, .p-row.s-APPROVAL::before { background: var(--p-human); }
+.p-row.s-BLOCKED::before, .p-row.s-FAILED::before, .p-row.s-PAUSED::before { background: var(--p-stop); }
+.p-row.s-REWORK::before { background: var(--p-now); }
+.p-row.s-QA::before { background: var(--p-pass); }
+
+.p-name { font-size: 13.5px; font-weight: 550; line-height: 1.25;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.p-ident { font-family: var(--mono); font-size: 11px; color: var(--p-dim2); margin-top: 4px; display: flex; gap: 10px; }
+.p-side { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+.p-state { font-size: 11.5px; font-weight: 650; padding: 2px 8px; border-radius: 5px; border: 1px solid transparent; white-space: nowrap; }
+.p-state.b-mute { color: var(--p-dim); background: #1a222b; border-color: var(--p-line); }
+.p-state.b-human { color: var(--p-human); background: rgba(122,167,255,.1); border-color: rgba(122,167,255,.28); }
+.p-state.b-stop { color: var(--p-stop); background: rgba(240,97,109,.1); border-color: rgba(240,97,109,.28); }
+.p-state.b-now { color: var(--p-now); background: rgba(245,181,68,.1); border-color: rgba(245,181,68,.28); }
+.p-state.b-pass { color: var(--p-pass); background: rgba(62,207,142,.1); border-color: rgba(62,207,142,.28); }
+.p-runchip { display: flex; align-items: center; gap: 6px; font-size: 10.5px; padding: 2px 8px;
+  border-radius: 5px; border: 1px solid var(--p-line); color: var(--p-dim); font-variant-numeric: tabular-nums; }
+.p-runchip i { width: 6px; height: 6px; border-radius: 50%; background: #39434f; }
+.p-runchip.run { color: var(--p-pass); border-color: rgba(62,207,142,.35); background: rgba(62,207,142,.08); }
+.p-runchip.run i { background: var(--p-pass); }
+.p-runchip.human { color: var(--p-human); border-color: rgba(122,167,255,.32); background: rgba(122,167,255,.08); }
+.p-runchip.human i { background: var(--p-human); }
+.p-runchip.stop { color: var(--p-stop); border-color: rgba(240,97,109,.32); background: rgba(240,97,109,.07); }
+.p-runchip.stop i { background: var(--p-stop); }
+.p-runchip.warn { color: var(--p-now); border-color: rgba(245,181,68,.35); background: rgba(245,181,68,.07); }
+.p-runchip.warn i { background: var(--p-now); }
+
+/* горизонтальный путь в строке */
+.p-tl { display: flex; align-items: flex-start; padding-top: 6px; }
+.p-step { flex: 1; display: flex; flex-direction: column; align-items: center; position: relative; }
+.p-step .rail { position: absolute; top: 8px; left: 50%; width: 100%; height: 2px; background: #212a34; }
+.p-step:last-child .rail { display: none; }
+.p-step.passed .rail { background: linear-gradient(90deg, #2f9d6e, var(--p-pass)); }
+.p-node { position: relative; z-index: 2; width: 16px; height: 16px; border-radius: 50%;
+  background: #171e26; border: 2px solid #2f3a46; }
+.p-step.passed .p-node { background: var(--p-pass); border-color: var(--p-pass); }
+.p-step.current .p-node { width: 20px; height: 20px; margin-top: -3px; background: var(--p-now);
+  border-color: #ffe0a8; box-shadow: 0 0 0 4px rgba(245,181,68,.14); }
+.p-step.gate .p-node { border-radius: 2px; transform: rotate(45deg); }
+.p-step .cap { margin-top: 6px; font-size: 10px; color: var(--p-dim2); white-space: nowrap; }
+.p-step.current .cap { color: var(--p-now); font-weight: 700; }
+
+/* группы списка */
+.p-grp { position: sticky; top: 62px; z-index: 8; background: var(--p-bg);
+  padding: 12px 0 6px; display: flex; align-items: baseline; gap: 10px; }
+.p-grp .t { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--p-dim2); }
+.p-grp .n { font-size: 11px; color: var(--p-dim2); }
+.p-grp .bar { flex: 1; height: 1px; background: var(--p-line); }
+.p-grp.you .t { color: var(--p-human); }
+.p-grp.stop .t { color: var(--p-stop); }
+.p-grp.work .t { color: var(--p-now); }
+
+.p-empty { color: var(--p-dim2); padding: 18px 4px; }
+.p-err { border: 1px solid rgba(240,97,109,.4); background: rgba(240,97,109,.08);
+  color: #ffb3bb; border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 12px; }
+
+@media (max-width: 1199px) {
+  .p-row { grid-template-columns: 1fr; }
+  .p-row .p-side { align-items: flex-start; }
+  .p-tl { min-width: 0; }
+  .p-name { font-size: 14px; }
+  .p-ident, .p-runchip, .p-state { font-size: 12px; }
+  .p-step .cap { font-size: 12px; }
+}

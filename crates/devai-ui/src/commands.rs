@@ -455,11 +455,15 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("task_progress", "task.progress"),
     ("task_dependencies", "task.dependencies"),
     ("task_report", "task.report"),
+    ("evaluation_rules", "eval.rules"),
+    ("task_usage", "task.usage"),
+    ("source_slice", "source.slice"),
     ("task_events", "task.events"),
     ("task_decisions", "task.decisions"),
     ("task_active", "task.active"),
     ("task_workspace_changes", "task.workspace_changes"),
     ("task_workspace_diff", "task.workspace_diff"),
+    ("task_workspace_diff_full", "task.workspace_diff_full"),
     ("artifacts_list", "artifact.list"),
     ("artifact_content", "artifact.cat_text"),
     ("artifact_content", "artifact.cat"),
@@ -468,6 +472,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // last failure class and counters — ONE read, same words as the CLI.
     ("agent_statuses", "agent.status"),
     ("executions_list", "exec.list"),
+    ("execution_cancel", "exec.cancel"),
     ("execution_liveness", "exec.liveness"),
     // The whole human-wait section is ONE batch read:
     // `inbox.snapshot` carries the demand table, the questions and the gate
@@ -541,6 +546,10 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_accept", "task.accept"),
     ("task_return", "task.return"),
     ("task_run", "task.run"),
+    // Остановка живого прогона: тот же класс, что запуск — человек
+    // управляет работой со своего места, платформа закрывает исполнение
+    // штатным `exec.cancel` (статус и причина остаются в истории).
+    ("execution_cancel", "exec.cancel"),
     ("model_probe", "model.probe"),
     ("model_switch", "model.switch"),
     ("model_bundle_check", "model.bundle_check"),
@@ -1080,6 +1089,18 @@ pub fn task_workspace_diff(
     Ok(state.api().task_workspace_diff(&id_prefix, &path)?)
 }
 
+/// Тот же diff с ПОЛНЫМ контекстом файла: по нему окно разворачивает
+/// скрытые строки, не пересчитывая git. Диапазон, проверки и двоичный
+/// вердикт — те же, что у компактного.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_workspace_diff_full(
+    state: State<AppState>,
+    id_prefix: String,
+    path: String,
+) -> Result<WorkspaceDiffView, UiError> {
+    Ok(state.api().task_workspace_diff_full(&id_prefix, &path)?)
+}
+
 // ---------------------------------------------------------------------
 // artifacts (REQ-UI-06)
 // ---------------------------------------------------------------------
@@ -1136,6 +1157,46 @@ pub fn questions_list(state: State<AppState>, id_prefix: String) -> Result<Vec<Q
 #[tauri::command]
 pub fn agent_statuses(state: State<AppState>) -> Result<Vec<devai_api::AgentStatusView>, UiError> {
     Ok(state.api().agent_status_list()?)
+}
+
+/// Остановка живого прогона из карточки: платформа закрывает исполнение
+/// штатным `exec.cancel` — статус и причина остаются в истории, рун
+/// не «исчезает» из данных (REQ-LV, sovereignty: окно не пишет само).
+#[tauri::command(rename_all = "snake_case")]
+pub fn execution_cancel(
+    state: State<AppState>,
+    exec_id: String,
+) -> Result<devai_api::ExecutionView, UiError> {
+    // Тот же вид строки, что у exec.list — карточка не собирает свою форму.
+    Ok(state.api().exec_cancel_view(&exec_id)?)
+}
+
+/// Правила оценки дома для карточки: что именно проверяет каждый пункт.
+#[tauri::command(rename_all = "snake_case")]
+pub fn evaluation_rules(state: State<AppState>) -> Result<devai_api::RulebookView, UiError> {
+    Ok(state.api().evaluation_rules()?)
+}
+
+/// Расход токенов задачи по прогонам (файлы улик драйвера).
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_usage(
+    state: State<AppState>,
+    id_prefix: String,
+) -> Result<devai_api::TaskUsageView, UiError> {
+    Ok(state.api().task_usage(&id_prefix)?)
+}
+
+/// Кусок исходника на коммите по ссылке «путь:строки» из отчёта.
+#[tauri::command(rename_all = "snake_case")]
+pub fn source_slice(
+    state: State<AppState>,
+    id_prefix: String,
+    rev: String,
+    path: String,
+    from: u32,
+    to: u32,
+) -> Result<devai_api::SourceSliceView, UiError> {
+    Ok(state.api().source_slice(&id_prefix, &rev, &path, from, to)?)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -2063,6 +2124,7 @@ mod tests {
         // writable surface means editing the allowlist and this literal —
         // a row landing on one side only fails here.
         let mut expected = vec![
+            "execution_cancel",
             "model_bundle_check",
             "model_bundle_create",
             "model_bundle_delete",

@@ -296,6 +296,13 @@ pub enum SessionKind {
 /// ownership — the consumer reaches the home through `Api::open` and every
 /// read/write through operations. The single-writer discipline lives in
 /// the store, not here.
+pub mod ui_reads;
+
+pub use ui_reads::{
+    RuleDetectView, RuleGroupView, RuleView, RulebookView, SourceSliceView, TaskUsageView,
+    UsageRowView,
+};
+
 pub struct Api {
     store: Store,
     home: PathBuf,
@@ -326,6 +333,12 @@ pub type ProbeRunner = std::sync::Arc<
 >;
 
 impl Api {
+    /// Корень дома — для чтений, которым нужны файлы дома (профиль оценки,
+    /// улики прогонов). Наружу не отдаётся: только через операции.
+    pub(crate) fn home_dir(&self) -> &Path {
+        &self.home
+    }
+
     /// Bootstrap entry (the ratified OQ-10 exception, encapsulated per the
     /// human-ratified cycle-2 Q2): opening a home is not an operation of
     /// the registry — it happens before the domain exists — but it is also
@@ -1203,6 +1216,30 @@ impl Api {
         Ok(view)
     }
 
+    /// The same diff with the WHOLE file as context, so a reader can unfold
+    /// the lines the compact diff hides. Same changeset check, same range,
+    /// same typed verdicts — only the amount of unchanged context differs.
+    pub fn task_workspace_diff_full(
+        &self,
+        id_prefix: &str,
+        path: &str,
+    ) -> ApiResult<WorkspaceDiffView> {
+        let f = self.workspace_facts(id_prefix)?;
+        let mut view = workspace_diff_view(&f, path);
+        let (Some(repo), Some(baseline), Some(tip)) = (&f.repo, &f.bound_head, &f.tip) else {
+            return Ok(view);
+        };
+        Self::require_in_changeset(
+            repo,
+            baseline,
+            tip,
+            path,
+            &devai_core::types::short_id_str(&f.task),
+        )?;
+        Self::fill_diff_with(&mut view, repo, baseline, tip, path, true)?;
+        Ok(view)
+    }
+
     /// REQ-WV-02 AC2: a path outside the changeset is a typed `not_found`
     /// the consumer branches on by code, not by text.
     fn require_in_changeset(
@@ -1235,6 +1272,21 @@ impl Api {
         tip: &str,
         path: &str,
     ) -> ApiResult<()> {
+        Self::fill_diff_with(view, repo, baseline, tip, path, false)
+    }
+
+    /// Same facts, same range — the only difference is how much unchanged
+    /// context git prints. `full` asks for the whole file, so the consumer
+    /// can unfold what the compact diff hides; it is a presentation
+    /// choice, never a second resolution path.
+    fn fill_diff_with(
+        view: &mut WorkspaceDiffView,
+        repo: &Path,
+        baseline: &str,
+        tip: &str,
+        path: &str,
+        full: bool,
+    ) -> ApiResult<()> {
         let git_err = |e| ApiError::Runtime(RuntimeError::Worktree(e));
         if worktree::diff_is_binary(repo, baseline, tip, path).map_err(git_err)? {
             view.binary = true;
@@ -1243,7 +1295,13 @@ impl Api {
             view.note = Some("modified, binary content — raw bytes are not rendered".into());
             return Ok(());
         }
-        view.diff = Some(worktree::diff_text(repo, baseline, tip, path).map_err(git_err)?);
+        view.diff = Some(
+            if full {
+                worktree::diff_text_full(repo, baseline, tip, path).map_err(git_err)?
+            } else {
+                worktree::diff_text(repo, baseline, tip, path).map_err(git_err)?
+            },
+        );
         Ok(())
     }
 
@@ -1555,6 +1613,18 @@ impl Api {
     /// the liveness verdict of its recorded owner and the platform's sentence
     /// for it (REQ-LV-06 AC1); a finished row is not checked at all and
     /// carries no mark (AC4).
+    /// Остановить живой прогон и вернуть строку в ТОМ ЖЕ виде, что `exec.list`
+    /// (роль «имя · версия», наблюдение живости) — окно не собирает свою форму.
+    pub fn exec_cancel_view(&self, exec_id: &str) -> ApiResult<ExecutionView> {
+        let row = self.exec_cancel(exec_id)?;
+        let mut roles: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for r in self.store.list_roles()? {
+            roles.insert(r.slug, r.name);
+        }
+        Ok(execution_view(row, &roles))
+    }
+
     pub fn exec_list(&self, task_ref: Option<&str>) -> ApiResult<Vec<ExecutionView>> {
         let tid = match task_ref {
             Some(id) => Some(self.store.resolve_task(id)?.id),

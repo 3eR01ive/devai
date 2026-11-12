@@ -363,6 +363,14 @@ pub fn diff_text(repo: &Path, from: &str, to: &str, path: &str) -> WorktreeResul
     git(repo, &["diff", &format!("{from}..{to}"), "--", path])
 }
 
+/// The same range as [`diff_text`], but with the WHOLE file as context
+/// (`-U` larger than any file): the window can then unfold the lines git
+/// hides between hunks without a second read and without recomputing git.
+/// Same baseline..tip range — the diff stays consistent with the list.
+pub fn diff_text_full(repo: &Path, from: &str, to: &str, path: &str) -> WorktreeResult<String> {
+    git(repo, &["diff", "-U100000", &format!("{from}..{to}"), "--", path])
+}
+
 /// True when the range changes `path` with binary content: `git diff
 /// --numstat` reports `-\t-` instead of line counts for non-textual
 /// payloads. REQ-WV-02 AC3: the binary fact is carried as data, the raw

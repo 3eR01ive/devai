@@ -2,6 +2,9 @@ import { createApp } from "vue";
 import App from "./App.vue";
 import { router } from "./router";
 import "./styles.css";
+// Подсветка кода: тема и нумерация строк (вставки кода в карточке задачи).
+import "prismjs/themes/prism-tomorrow.css";
+import "prismjs/plugins/line-numbers/prism-line-numbers.css";
 
 // Токен приглашения живёт в адресе РОВНО один раз: сервер обменял его на
 // HttpOnly-cookie ещё при загрузке страницы (src/lan.rs). Убираем его из

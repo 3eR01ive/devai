@@ -461,7 +461,9 @@ fn task_reads(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         TaskCmd::Progress { id } => progress(ctx, &id, json)?,
         TaskCmd::Active => active_overview(ctx, json)?,
         TaskCmd::Workspace { id } => task_workspace(ctx, &id, json)?,
-        TaskCmd::WorkspaceDiff { id, path } => task_workspace_diff(ctx, &id, &path, json)?,
+        TaskCmd::WorkspaceDiff { id, path, full } => {
+            task_workspace_diff(ctx, &id, &path, full, json)?
+        }
         TaskCmd::Report { id } => show_report(ctx, &id, json)?,
         TaskCmd::Events { id, limit } => task_events(ctx, &id, limit, json)?,
         TaskCmd::Decisions { id } => task_decisions(ctx, &id, json)?,
@@ -490,11 +492,13 @@ fn task_workspace(ctx: &Ctx, id: &str, json: bool) -> Result<()> {
 /// `task workspace-diff` — API task.workspace_diff: one file's diff over
 /// exactly the range the changeset used (REQ-WV-02). A path outside the list
 /// keeps the platform's not_found refusal (code + text).
-fn task_workspace_diff(ctx: &Ctx, id: &str, path: &str, json: bool) -> Result<()> {
-    let v = ctx
-        .api()
-        .task_workspace_diff(id, path)
-        .map_err(render_api_error)?;
+fn task_workspace_diff(ctx: &Ctx, id: &str, path: &str, full: bool, json: bool) -> Result<()> {
+    let v = if full {
+        ctx.api().task_workspace_diff_full(id, path)
+    } else {
+        ctx.api().task_workspace_diff(id, path)
+    }
+    .map_err(render_api_error)?;
     if json {
         outln!("{}", serde_json::to_string_pretty(&v)?);
     } else if let Some(diff) = &v.diff {

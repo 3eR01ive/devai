@@ -229,6 +229,22 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_run_rpc,
     },
     RpcCommand {
+        name: "execution_cancel",
+        handler: execution_cancel_rpc,
+    },
+    RpcCommand {
+        name: "evaluation_rules",
+        handler: evaluation_rules_rpc,
+    },
+    RpcCommand {
+        name: "task_usage",
+        handler: task_usage_rpc,
+    },
+    RpcCommand {
+        name: "source_slice",
+        handler: source_slice_rpc,
+    },
+    RpcCommand {
         name: "task_progress",
         handler: task_progress_rpc,
     },
@@ -255,6 +271,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
     RpcCommand {
         name: "task_workspace_changes",
         handler: task_workspace_changes_rpc,
+    },
+    RpcCommand {
+        name: "task_workspace_diff_full",
+        handler: task_workspace_diff_full_rpc,
     },
     RpcCommand {
         name: "task_workspace_diff",
@@ -744,6 +764,20 @@ fn task_workspace_changes_rpc(
     )?)
 }
 
+fn task_workspace_diff_full_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let id_prefix = param_str(params, "id_prefix")?;
+    let path = param_str(params, "path")?;
+    to_json(crate::commands::task_workspace_diff_full(
+        state(app),
+        id_prefix,
+        path,
+    )?)
+}
+
 fn task_workspace_diff_rpc(
     app: &tauri::AppHandle,
     _device: &DeviceClaim,
@@ -787,6 +821,45 @@ fn questions_list_rpc(
         state(app),
         param_str(params, "id_prefix")?,
     )?)
+}
+
+fn evaluation_rules_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    _params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::evaluation_rules(state(app))?)
+}
+
+fn task_usage_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let id_prefix = param_str(params, "id_prefix")?;
+    to_json(crate::commands::task_usage(state(app), id_prefix)?)
+}
+
+fn source_slice_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let id_prefix = param_str(params, "id_prefix")?;
+    let rev = param_str(params, "rev")?;
+    let path = param_str(params, "path")?;
+    let from = params.get("from").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+    let to = params.get("to").and_then(|v| v.as_u64()).unwrap_or(from as u64 + 12) as u32;
+    to_json(crate::commands::source_slice(state(app), id_prefix, rev, path, from, to)?)
+}
+
+fn execution_cancel_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let exec_id = param_str(params, "exec_id")?;
+    to_json(crate::commands::execution_cancel(state(app), exec_id)?)
 }
 
 fn executions_list_rpc(

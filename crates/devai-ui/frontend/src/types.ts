@@ -196,6 +196,55 @@ export interface RunStartOutcome {
   line: string;
 }
 
+// --- чтения для нового экрана (правила, расход, кусок кода) ---------------
+export interface RuleView {
+  id: string;
+  weight: number | null;
+  floor: number | null;
+  verify: string | null;
+  statement: string;
+  anchors: Record<string, string>;
+  detects: { t: string; sev: string | null }[];
+}
+export interface RuleGroupView {
+  group: string;
+  weight: number;
+  items: RuleView[];
+}
+export interface RulebookView {
+  profile_version: string | null;
+  project: string | null;
+  theta: number | null;
+  floors: Record<string, number | null>;
+  blocked_max: number | null;
+  groups: RuleGroupView[];
+}
+export interface UsageRowView {
+  execution: string;
+  input: number | null;
+  output: number | null;
+  cached: number | null;
+  total: number;
+  cost: number;
+  calls: number | null;
+  model: string | null;
+}
+export interface TaskUsageView {
+  task: string;
+  total: number;
+  cost: number;
+  runs: number;
+  measured: number;
+  rows: UsageRowView[];
+}
+export interface SourceSliceView {
+  path: string;
+  rev: string;
+  from: number;
+  to: number;
+  text: string;
+}
+
 export interface ProgressView {
   task: Task;
   snapshot_at: string;

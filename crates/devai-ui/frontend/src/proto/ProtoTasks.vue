@@ -1,0 +1,185 @@
+<script setup lang="ts">
+// Новый список задач (по макету): путь ролей в строке, группы по смыслу,
+// состояние раннера и расход токенов. Старый список остаётся рядом.
+import { computed, onMounted, ref } from "vue";
+import { api, toUiError } from "../api";
+import type { ProgressView, Task, UiError } from "../types";
+import "./proto.css";
+
+const tasks = ref<Task[]>([]);
+const progress = ref<Record<string, ProgressView>>({});
+const usage = ref<Record<string, { total: number; cost: number; runs: number; measured: number }>>({});
+const error = ref<UiError | null>(null);
+const loading = ref(true);
+
+const TERMINAL = new Set(["ACCEPTED", "CANCELLED"]);
+const GROUPS: [string, string, string[]][] = [
+  ["you", "Ждут тебя", ["WAITING_FOR_INPUT", "APPROVAL"]],
+  ["work", "Идёт работа", ["STATEMENT", "ANALYSIS", "REVIEW", "IMPLEMENTATION", "QA", "REWORK"]],
+  ["stop", "Стоят", ["BLOCKED", "PAUSED", "FAILED"]],
+  ["draft", "Черновики", ["DRAFT"]],
+];
+const SHORT: Record<string, string> = {
+  STATEMENT: "постановка", ANALYSIS: "анализ", REVIEW: "ревью",
+  APPROVAL: "подпись", IMPLEMENTATION: "код", QA: "приёмка",
+};
+const STATE_WORD: Record<string, string> = {
+  DRAFT: "черновик", STATEMENT: "у постановщика", ANALYSIS: "анализ", REVIEW: "ревью",
+  APPROVAL: "ждёт подписи", IMPLEMENTATION: "код", QA: "приёмка", REWORK: "доработка",
+  WAITING_FOR_INPUT: "ждёт человека", PAUSED: "на паузе", BLOCKED: "остановлена",
+  FAILED: "упала", ACCEPTED: "принята", CANCELLED: "отменена",
+};
+const TONE: Record<string, string> = {
+  WAITING_FOR_INPUT: "b-human", APPROVAL: "b-human", BLOCKED: "b-stop", FAILED: "b-stop",
+  PAUSED: "b-stop", REWORK: "b-now", QA: "b-pass", DRAFT: "b-mute",
+};
+
+function age(iso: string): string {
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return `${s} с`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} мин`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h} ч ${m % 60} мин` : `${Math.floor(h / 24)} д ${h % 24} ч`;
+}
+
+function tok(n: number): string {
+  if (!n) return "0";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + " млрд";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " млн";
+  if (n >= 1e3) return Math.round(n / 1e3) + " тыс";
+  return String(n);
+}
+
+const rowOf = (t: Task) => {
+  const p = progress.value[t.id];
+  const stages = (p?.graph?.stages ?? []).map((s) => ({
+    short: SHORT[s.state] ?? s.label, status: s.status, gate: s.gate,
+  }));
+  const running = p?.running_executions ?? [];
+  let kind = "idle";
+  let word = "прогона нет";
+  if (running.length) {
+    kind = "run";
+    // Платформа уже посчитала прошедшее время — окно его не пересчитывает.
+    const sec = running[0].elapsed_seconds ?? 0;
+    const m = Math.max(0, Math.round(sec / 60));
+    word = `идёт · ${m < 60 ? m + " мин" : Math.floor(m / 60) + " ч " + (m % 60) + " мин"}`;
+  } else if (t.state === "APPROVAL") { kind = "human"; word = "ждёт подписи · " + age(t.updated_at); }
+  else if (t.state === "WAITING_FOR_INPUT") { kind = "human"; word = "ждёт ответа · " + age(t.updated_at); }
+  else if (["BLOCKED", "PAUSED", "FAILED"].includes(t.state)) { kind = "stop"; word = STATE_WORD[t.state] + " · " + age(t.updated_at); }
+  else if (["STATEMENT", "ANALYSIS", "REVIEW", "IMPLEMENTATION", "QA", "REWORK"].includes(t.state)) {
+    kind = "warn"; word = "прогона нет · " + age(t.updated_at);
+  } else if (t.state === "DRAFT") { kind = "idle"; word = "не запускалась"; }
+  else { word = "прогона нет · " + age(t.updated_at); }
+  return {
+    t, stages, kind, word,
+    state: STATE_WORD[t.state] ?? t.state.toLowerCase(),
+    tone: TONE[t.state] ?? "b-mute",
+    u: usage.value[t.id],
+    id: t.id.slice(0, 8),
+    link: `/proto/task/${t.id}`,
+  };
+};
+
+const groups = computed(() =>
+  GROUPS.map(([key, title, states]) => ({
+    key, title,
+    items: tasks.value.filter((t) => states.includes(t.state)).map(rowOf),
+  })).filter((g) => g.items.length),
+);
+
+const counts = computed(() => ({
+  all: tasks.value.length,
+  open: tasks.value.filter((t) => !TERMINAL.has(t.state)).length,
+}));
+
+async function load() {
+  loading.value = true;
+  error.value = null;
+  try {
+    tasks.value = await api.tasksList();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    loading.value = false;
+  }
+  const open = tasks.value.filter((t) => !TERMINAL.has(t.state));
+  const queue = open.slice();
+  const workers = Array.from({ length: 5 }, async () => {
+    while (queue.length) {
+      const t = queue.shift()!;
+      try {
+        const [p, u] = await Promise.all([api.taskProgress(t.id), api.taskUsage(t.id)]);
+        progress.value = { ...progress.value, [t.id]: p };
+        usage.value = { ...usage.value, [t.id]: u };
+      } catch {
+        /* строка останется без пути — честнее выдуманного */
+      }
+    }
+  });
+  await Promise.all(workers);
+}
+
+onMounted(load);
+</script>
+
+<template>
+  <section class="p-root">
+    <header class="p-head">
+      <h1>
+        Задачи <span>· открытых {{ counts.open }} из {{ counts.all }} · живой дом</span>
+      </h1>
+      <div class="p-groups">
+        <span v-for="g in groups" :key="g.key" class="p-runchip" :class="g.key === 'you' ? 'human' : g.key === 'stop' ? 'stop' : g.key === 'work' ? 'warn' : ''">
+          {{ g.title }} · {{ g.items.length }}
+        </span>
+      </div>
+    </header>
+
+    <div v-if="error" class="p-err">{{ error.code }} — {{ error.message }}</div>
+    <div v-else-if="loading" class="p-empty">читаю задачи…</div>
+
+    <template v-for="g in groups" :key="g.key">
+      <div class="p-grp" :class="g.key">
+        <span class="t">{{ g.title }}</span><span class="n">{{ g.items.length }}</span><span class="bar" />
+      </div>
+      <RouterLink
+        v-for="r in g.items"
+        :key="r.t.id"
+        :to="r.link"
+        class="p-row"
+        :class="'s-' + r.t.state"
+        style="text-decoration: none"
+      >
+        <div>
+          <div class="p-name">{{ r.t.display }}</div>
+          <div class="p-ident">
+            <span>{{ r.id }}</span>
+            <span v-if="r.u && r.u.measured">
+              {{ tok(r.u.total) }} токенов · ${{ r.u.cost.toFixed(2) }}
+            </span>
+          </div>
+        </div>
+        <div class="p-tl">
+          <div
+            v-for="(s, i) in r.stages"
+            :key="i"
+            class="p-step"
+            :class="[s.status, { gate: s.gate }]"
+          >
+            <div v-if="i" class="rail" />
+            <div class="p-node" />
+            <div class="cap">{{ s.short }}</div>
+          </div>
+          <div v-if="!r.stages.length" class="p-empty" style="padding: 0">путь недоступен</div>
+        </div>
+        <div class="p-side">
+          <span class="p-state" :class="r.tone">{{ r.state }}</span>
+          <span class="p-runchip" :class="r.kind"><i />{{ r.word }}</span>
+        </div>
+      </RouterLink>
+    </template>
+    <div v-if="!loading && !tasks.length && !error" class="p-empty">задач нет</div>
+  </section>
+</template>

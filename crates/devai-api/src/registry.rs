@@ -121,7 +121,7 @@ pub struct OpDescriptor {
 /// `display` label, `exec.list` rows gain `role_display`, and the
 /// APPROVAL/QA presentations gain `label`. Wire-visible additions, so the
 /// stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@14";
+pub const SURFACE_VERSION: &str = "api-surface@16";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -231,6 +231,13 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "Readable unified diff of ONE changeset-listed file of the task's rework branch between exactly the baseline and tip task.workspace_changes used (same resolution, so list and diff are consistent by construction). A path outside the changeset is a typed not_found the consumer branches on by code; binary content is a binary fact with the stored size — raw bytes are never rendered. Mirrors `task workspace-diff`.",
         },
         OpDescriptor {
+            name: "task.workspace_diff_full",
+            class: OpClass::Read,
+            input: "id_prefix, path",
+            output: "WorkspaceDiffView{task, path, state, branch, baseline, tip, binary, size_bytes, diff, note}",
+            description: "The same single-file diff as task.workspace_diff over the same baseline..tip range and changeset check, printed with the WHOLE file as unchanged context (`git diff -U<whole>`). Exists so a reader can unfold the lines the compact diff hides without a second resolution and without recomputing git: range, verdicts and binary handling are identical by construction. Mirrors `task workspace-diff --full`.",
+        },
+        OpDescriptor {
             name: "task.signature",
             class: OpClass::Read,
             input: "id_prefix",
@@ -243,6 +250,27 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "id_prefix",
             output: "QualityReportView{task, artifact, label, seq, …}",
             description: "The quality report shown at the QA gate: the CURRENT report, or — when the task was returned to rework and no re-audit has published yet — the STALE predecessor under an explicit freshness marker (never passed off as the decision). Artifact identity, the finished «название вида · vN» heading, contract, machine body and the stored human rendering. Mirrors `task report`.",
+        },
+        OpDescriptor {
+            name: "task.usage",
+            class: OpClass::Read,
+            input: "id_prefix",
+            output: "TaskUsageView{task,total,cost,runs,measured,rows}",
+            description: "Расход токенов задачи по прогонам: драйвер пишет usage.json в каталог улик каждого прогона, операция читает эти файлы и агрегирует. Честно отдаёт runs/measured — прогоны без отчёта считаются, но в сумму не входят.",
+        },
+        OpDescriptor {
+            name: "eval.rules",
+            class: OpClass::Read,
+            input: "—",
+            output: "RulebookView{profile_version,project,theta,floors,blocked_max,groups}",
+            description: "Правила оценки дома как данные: группы, вес каждого пункта, шкала 1.0/0.7/0.4/0.0, полы и типы ошибок — из профиля оценки (config/evaluation). Это то, чем судит качество-аудитор; окно показывает правила рядом с результатом, ничего не пересчитывая.",
+        },
+        OpDescriptor {
+            name: "source.slice",
+            class: OpClass::Read,
+            input: "id_prefix, rev, path, from, to",
+            output: "SourceSliceView{path,rev,from,to,text}",
+            description: "Кусок исходника на зафиксированном коммите (git show <rev>:<path>) по ссылке «путь:строки» из отчёта: окно показывает ровно тот код, о котором говорит проверка.",
         },
         OpDescriptor {
             name: "task.events",
@@ -876,7 +904,12 @@ mod tests {
         // constant is an author's decision documented at the declaration
         // (see the bump mechanics comment there), and this test forces
         // that decision to be taken consciously, twice, in one change.
-        assert_eq!(SURFACE_VERSION, "api-surface@14");
+        // @15 (окно нового экрана): три ЧТЕНИЯ — правила оценки дома,
+        // расход токенов по прогонам и кусок исходника по ссылке отчёта.
+        // @16: ещё одно ЧТЕНИЕ — diff того же диапазона с полным контекстом
+        // файла, чтобы окно разворачивало скрытые строки без второго чтения.
+        // Ни одна версия не пишет: мутации @14 остаются как были.
+        assert_eq!(SURFACE_VERSION, "api-surface@16");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

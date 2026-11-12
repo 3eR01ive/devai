@@ -93,6 +93,7 @@ onUnmounted(() => {
       <nav class="modes">
         <RouterLink to="/projects">Проекты</RouterLink>
         <RouterLink to="/tasks">Задачи</RouterLink>
+        <RouterLink to="/proto/tasks">Задачи (новый)</RouterLink>
         <RouterLink to="/live">Активные</RouterLink>
         <RouterLink to="/inbox">
           Ожидание<template v-if="waitBadge > 0">&nbsp;·&nbsp;<b class="badge">{{ waitBadge }}</b></template>

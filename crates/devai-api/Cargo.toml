@@ -12,6 +12,8 @@ devai-runtime.workspace = true
 devai-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Чтения для окна: профиль оценки дома приходит YAML-файлом (правила приёмки).
+serde_yaml.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 # rl/idempotency (report v1 gap): flock serializes the homes-registry

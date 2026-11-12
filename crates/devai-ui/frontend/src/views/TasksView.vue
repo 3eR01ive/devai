@@ -22,11 +22,17 @@ import {
 } from "../homes-view";
 import { fmtTime, shortId } from "../settings";
 import StateChip from "../components/StateChip.vue";
+import RoleTimeline from "../components/RoleTimeline.vue";
+import type { GraphStage } from "../types";
 import type { HomeRecordsView, Task, UiError } from "../types";
 
 const route = useRoute();
 const router = useRouter();
 const blocks = ref<HomeRecordsView<Task>[]>([]);
+/** Путь задачи для строки списка: один `task.progress` на незакрытую
+ *  задачу, ограниченной очередью — приходит готовым полем graph.stages. */
+const stages = ref<Record<string, GraphStage[]>>({});
+const TERMINAL = new Set(["ACCEPTED", "CANCELLED"]);
 const error = ref<UiError | null>(null);
 const loading = ref(true);
 
@@ -67,7 +73,31 @@ async function load() {
   } finally {
     loading.value = false;
   }
+  await loadPaths();
 }
+
+/** Пять параллельных чтений: список должен показать путь, а не ждать по
+ *  одной задаче. Ошибка одной строки путь не рисует, но список не валит. */
+async function loadPaths() {
+  const tasks = visible.value.flatMap((b) => rows(b));
+  const want = tasks.filter((t) => !TERMINAL.has(t.state)).map((t) => t.id);
+  const next: Record<string, GraphStage[]> = {};
+  const queue = want.slice();
+  const workers = Array.from({ length: 5 }, async () => {
+    while (queue.length) {
+      const id = queue.shift()!;
+      try {
+        const p = await api.taskProgress(id);
+        next[id] = p.graph?.stages ?? [];
+      } catch {
+        /* строка останется без пути — это честнее выдуманного */
+      }
+    }
+  });
+  await Promise.all(workers);
+  stages.value = next;
+}
+
 onMounted(load);
 
 function taskLink(b: HomeRecordsView<Task>, t: Task) {
@@ -125,6 +155,7 @@ function taskLink(b: HomeRecordsView<Task>, t: Task) {
         <thead>
           <tr>
             <th>Задача</th>
+            <th>Путь</th>
             <th>id</th>
             <th>Дом</th>
             <th>Состояние</th>
@@ -135,6 +166,16 @@ function taskLink(b: HomeRecordsView<Task>, t: Task) {
           <tr v-for="t in rows(b)" :key="b.home_path + ':' + t.id">
             <td data-label="Задача" data-mobile="title">
               <RouterLink class="title-link" :to="taskLink(b, t)">{{ t.display }}</RouterLink>
+            </td>
+            <td data-label="Путь">
+              <RoleTimeline
+                v-if="stages[t.id]?.length"
+                :stages="stages[t.id]"
+                :state="t.state"
+              />
+              <span v-else class="muted" style="font-size: 11px">
+                {{ TERMINAL.has(t.state) ? "закрыта" : "…" }}
+              </span>
             </td>
             <td class="mono muted" data-label="id">{{ shortId(t.id) }}</td>
             <td class="muted" :title="b.home_path" data-label="Дом">

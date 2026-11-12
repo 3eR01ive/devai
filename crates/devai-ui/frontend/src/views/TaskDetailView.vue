@@ -22,7 +22,7 @@ import SpecDiffPanel from "../components/SpecDiffPanel.vue";
 import SignatureResultPanel from "../components/SignatureResultPanel.vue";
 import { ExecutionStatusToken, LivenessToken, TaskStateToken } from "../states";
 import ConvergenceChart from "../components/ConvergenceChart.vue";
-import RoleGraphPanel from "../components/RoleGraphPanel.vue";
+import RoleSteps from "../components/RoleSteps.vue";
 import QualityGatePanel from "../components/quality/QualityGatePanel.vue";
 import type { GateAct } from "../quality_gate_view";
 import type {
@@ -129,6 +129,29 @@ const deadRun = computed<boolean>(() => runningLines.value.some((l) => l.dead));
 const restartBusy = ref(false);
 const restartLine = ref<string | null>(null);
 const restartError = ref<UiError | null>(null);
+
+// Кнопки шага: запуск и остановка идут штатными операциями платформы,
+// ответ печатается её же словами; после — перечитываем карточку.
+async function onStepRun(_slug: string) {
+  restartError.value = null;
+  try {
+    const out = await api.taskRun(props.id, null, false);
+    restartLine.value = out.line;
+    await loadAll();
+  } catch (e) {
+    restartError.value = toUiError(e);
+  }
+}
+
+async function onStepStop(execId: string) {
+  restartError.value = null;
+  try {
+    await api.execCancel(execId);
+    await loadAll();
+  } catch (e) {
+    restartError.value = toUiError(e);
+  }
+}
 
 async function restartDead() {
   if (restartBusy.value) return;
@@ -472,10 +495,14 @@ async function activateForeignHome() {
     <!-- ПУТЬ ЗАДАЧИ (REQ-RG-06): граф ролей и этапов заменяет прежнюю
          линейку стадий. Данные — `progress.graph` одним чтением; окно не
          хранит порядка этапов, таблицы «состояние → узел» и подписей. -->
-    <RoleGraphPanel
+    <RoleSteps
       v-if="progress?.graph"
       :graph="progress.graph"
+      :allowed="progress.allowed_operations"
+      :report="report"
       :snapshot-at="progress.snapshot_at"
+      @run="onStepRun"
+      @stop="onStepStop"
     />
     <!-- Счётчик попыток роли без прогресса (REQ-AL-07): виден и НИЖЕ
          предела, числа — одной строкой платформы (не собираются здесь). -->

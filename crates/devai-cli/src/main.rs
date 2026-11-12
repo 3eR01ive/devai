@@ -233,6 +233,10 @@ enum TaskCmd {
     WorkspaceDiff {
         id: String,
         path: String,
+        /// Print the whole file as context instead of three lines around
+        /// each hunk — the window unfolds hidden lines from this view.
+        #[arg(long)]
+        full: bool,
     },
     /// Show the CURRENT quality report — the rendering a human signs at the
     /// QA gate (with --json: the full machine report).
