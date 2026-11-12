@@ -78,13 +78,12 @@ fn task(api: &Api, title: &str) -> String {
 #[test]
 fn editing_the_declaration_moves_the_task_where_the_data_says() {
     let text = factory_text().replace(
-        "{ from: DRAFT, on: human_start, to: ANALYSIS }",
+        "{ from: DRAFT, on: human_start, to: STATEMENT }",
         "{ from: DRAFT, on: human_start, to: REVIEW }",
     );
     let (_dir, api) = home_with(&text);
     let id = task(&api, "declaration drives start");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
     assert_eq!(
         api.task_get(&id).unwrap().state,
         TaskState::Review,
@@ -141,7 +140,7 @@ fn a_state_without_a_declared_row_is_refused_at_init() {
 fn the_factory_declaration_is_valid() {
     assert!(devai_store::config::factory_process_policy().is_ok());
     // And its names are the ones the code emits: the operator-facing walk is
-    // DRAFT -> ANALYSIS with the shipped bytes.
+    // DRAFT -> STATEMENT (the statement checker) with the shipped bytes.
     let id_task = Task::new("t", "need", None, chrono::Utc::now());
     let m = devai_core::workflow::start(
         devai_store::config::ProcessPolicy::factory(),
@@ -150,7 +149,7 @@ fn the_factory_declaration_is_valid() {
         chrono::Utc::now(),
     )
     .unwrap();
-    assert_eq!(m.task.state, TaskState::Analysis);
+    assert_eq!(m.task.state, TaskState::Statement);
 }
 
 /// Rework R1 (the live repro of the audit finding): the state's DECLARED

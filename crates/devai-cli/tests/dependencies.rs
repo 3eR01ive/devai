@@ -360,6 +360,7 @@ fn acceptance_gate_reads_the_graph_and_write_time_integrity_is_loud_via_cli() {
     // implementation report, quality report — so the ONLY thing stopping
     // acceptance is the open dependency (the refusal text proves it).
     devai(h, &["task", "start", &e_id]);
+    statement_ok(h, &e_id);
     let spec = write(h, "spec.json", "{\"requirements\": []}");
     devai(
         h,
@@ -487,4 +488,25 @@ fn cli_depend_lands_in_the_event_history() {
     assert_eq!(linked["payload"]["depends_on_id"], a_id.as_str());
     assert_eq!(linked["payload"]["dependency_kind"], "parent");
     assert_eq!(linked["actor"], "dep-human");
+}
+
+/// Process v4: a fresh task stops on the statement checker. The checker's
+/// verdict is a published artifact — the same command a role's reply takes —
+/// so every CLI fixture walks the real edge instead of a test hook.
+fn statement_ok(home: &std::path::Path, id: &str) {
+    let body = r#"{"verdict":"APPROVED","human_paragraph":"Сейчас постановка проверена: названы пользователь, наблюдаемый результат, границы и объём работы, поэтому аналитику не придётся ничего домысливать по дороге. После этой проверки задача переходит к анализу, где появится первая версия требований с вопросами к человеку.","checklist":[{"item":"user","ok":true},{"item":"observable","ok":true},{"item":"boundaries","ok":true},{"item":"volume","ok":true},{"item":"acceptance","ok":true},{"item":"single_milestone","ok":true}]}"#;
+    let p = home.join("statement-review.json");
+    std::fs::write(&p, body).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_devai"))
+        .arg("--home")
+        .arg(home)
+        .args(["artifact", "publish", id, "--kind", "STATEMENT_REVIEW", "--file"])
+        .arg(&p)
+        .output()
+        .expect("the devai binary is runnable");
+    assert!(
+        out.status.success(),
+        "statement review publish for {id} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

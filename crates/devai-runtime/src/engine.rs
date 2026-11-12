@@ -1865,6 +1865,38 @@ impl<'a> Engine<'a> {
         let json: serde_json::Value =
             serde_json::from_slice(&content).unwrap_or(serde_json::Value::Null);
         let m = match kind {
+            // Постановщик: годный вердикт открывает анализ; вердикт с
+            // вопросами держит задачу и отдаёт вопросы человеку — анализу
+            // нечего делать с постановкой, которую нельзя проверить.
+            ArtifactKind::StatementReview => {
+                let verdict = json
+                    .get("verdict")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if verdict.eq_ignore_ascii_case("QUESTIONS") {
+                    let q = Question {
+                        id: new_id(),
+                        task_id: task.id,
+                        execution_id: Some(execution.id),
+                        text: workflow::statement_questions_text(&json),
+                        context: json
+                            .get("human_paragraph")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        options: vec![],
+                        blocking: true,
+                        status: QuestionStatus::Open,
+                        answer: None,
+                        answered_by: None,
+                        answered_at: None,
+                        created_at: Utc::now(),
+                    };
+                    self.store.create_question(&q)?;
+                    workflow::raise_question(&self.process, task, q.id, true, actor, Utc::now())?
+                } else {
+                    workflow::statement_approved(&self.process, task, actor, Utc::now())?
+                }
+            }
             ArtifactKind::RequirementsSpec => workflow::requirements_published(
                 &self.process,
                 task,

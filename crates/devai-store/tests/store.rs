@@ -54,6 +54,13 @@ fn to_implementation(store: &Store) -> (Task, Artifact, Artifact) {
     let mut t = draft(store);
     commit(store, &t, workflow::start(&proc(), &t, "u", now()).unwrap());
     t = store.get_task(&t.id.to_string()).unwrap();
+    // process v4: the statement checker's verdict opens the analysis.
+    commit(
+        store,
+        &t,
+        workflow::statement_approved(&proc(), &t, "checker", now()).unwrap(),
+    );
+    t = store.get_task(&t.id.to_string()).unwrap();
 
     let spec = publish(
         store,
@@ -94,9 +101,14 @@ fn create_resolve_commit_and_locking() {
 
     let m = workflow::start(&proc(), &by_prefix, "u", now()).unwrap();
     commit(&store, &by_prefix, m);
+    let after_start = store.get_task(&t.id.to_string()).unwrap();
+    assert_eq!(after_start.state, TaskState::Statement, "the checker goes first");
+    let m = workflow::statement_approved(&proc(), &after_start, "checker", now()).unwrap();
+    commit(&store, &after_start, m);
     let reloaded = store.get_task(&t.id.to_string()).unwrap();
     assert_eq!(reloaded.state, TaskState::Analysis);
-    assert_eq!(reloaded.lock_version, by_prefix.lock_version + 1);
+    // start + the checker's verdict — two commits past the draft.
+    assert_eq!(reloaded.lock_version, by_prefix.lock_version + 2);
 
     // stale optimistic write must fail, not silently overwrite
     let stale = by_prefix.clone(); // lock 1, task is now lock 2
@@ -1005,6 +1017,12 @@ fn read_plane_hands_finished_signboards_on_edges_and_graph() {
         &store,
         &c,
         workflow::start(&proc(), &c, "u", now()).unwrap(),
+    );
+    c = store.get_task(&c.id.to_string()).unwrap();
+    commit(
+        &store,
+        &c,
+        workflow::statement_approved(&proc(), &c, "checker", now()).unwrap(),
     );
     c = store.get_task(&c.id.to_string()).unwrap();
     publish(

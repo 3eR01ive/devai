@@ -1007,6 +1007,14 @@ impl AgentRuntime {
             .map(|c| c.name.as_str())
             .unwrap_or("other");
         let json: Value = match name {
+            // У постановщика нет своего дела кроме чек-листа: mock всегда
+            // признаёт постановку годной, чтобы фикстуры шли дальше.
+            "statement-review" => serde_json::json!({
+                "verdict": "APPROVED",
+                "human_paragraph": "Сейчас постановка проверена офлайн-заглушкой: названы пользователь, наблюдаемый результат, границы и объём работы, поэтому аналитику не придётся ничего домысливать. После этой проверки задача переходит к анализу, где появится первая версия требований с вопросами к человеку.",
+                "checklist": [],
+                "questions": [],
+            }),
             "requirements-specification" => serde_json::json!({
                 "task_id": req.task_id.to_string(),
                 "version": 1,

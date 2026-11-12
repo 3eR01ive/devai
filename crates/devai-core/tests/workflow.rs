@@ -46,6 +46,14 @@ fn in_state(task: &Task, target: TaskState, artifacts: &mut Vec<Artifact>) -> Ta
         return t;
     }
     t = workflow::start(&proc(), &t, actor, now()).unwrap().task;
+    if target == TaskState::Statement {
+        return t;
+    }
+    // process v4: DRAFT → STATEMENT → ANALYSIS. The checker's verdict is what
+    // opens the analysis, so every fixture walks the same edge the platform does.
+    t = workflow::statement_approved(&proc(), &t, actor, now())
+        .unwrap()
+        .task;
     if target == TaskState::Analysis {
         return t;
     }
@@ -98,6 +106,10 @@ fn full_happy_lifecycle() {
     let mut t = draft_task();
 
     t = workflow::start(&proc(), &t, "u", now()).unwrap().task;
+    assert_eq!(t.state, TaskState::Statement, "the checker goes first");
+    t = workflow::statement_approved(&proc(), &t, "checker", now())
+        .unwrap()
+        .task;
     assert_eq!(t.state, TaskState::Analysis);
 
     let spec = artifact(
@@ -1450,6 +1462,9 @@ fn publication_stamps_and_replaces_the_human_name() {
         vec![],
     );
     artifacts.push(spec1);
+    let mut t = workflow::statement_approved(&proc(), &t, "checker", now())
+        .unwrap()
+        .task;
     let m = workflow::requirements_published(
         &proc(),
         &t,

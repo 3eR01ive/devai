@@ -1683,9 +1683,12 @@ mod tests {
         assert_eq!(g.position.kind, position_kind::STAGE);
         assert_eq!(g.position.stage.as_deref(), Some("REVIEW"));
         assert_eq!(g.position.node, None);
-        assert_eq!(g.stages[0].status, stage_status::PASSED); // ANALYSIS
-        assert_eq!(g.stages[1].status, stage_status::CURRENT); // REVIEW
-        assert_eq!(g.stages[2].status, stage_status::PENDING); // APPROVAL
+        // Ось начинается с постановщика (process v4): он пройден, анализ
+        // пройден, позиция — на проверке.
+        assert_eq!(g.stages[0].status, stage_status::PASSED); // STATEMENT
+        assert_eq!(g.stages[1].status, stage_status::PASSED); // ANALYSIS
+        assert_eq!(g.stages[2].status, stage_status::CURRENT); // REVIEW
+        assert_eq!(g.stages[3].status, stage_status::PENDING); // APPROVAL
     }
 
     /// Two completed reviewer versions: the node's version is the freshest and

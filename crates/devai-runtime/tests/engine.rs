@@ -160,9 +160,14 @@ fn full_cycle_through_both_human_gates() {
     // 1) DRAFT → ... → APPROVAL, stopping exactly at the first human gate.
     let r1 = engine.advance(&t.id.to_string(), "mock", "tester").unwrap();
     assert_eq!(r1.gate, Gate::WaitingApproval);
-    assert_eq!(r1.steps.len(), 2, "analyst + reviewer run autonomously");
-    assert_eq!(r1.steps[0].role, "requirements-analyst");
-    assert_eq!(r1.steps[1].role, "requirements-reviewer");
+    assert_eq!(
+        r1.steps.len(),
+        3,
+        "statement checker + analyst + reviewer run autonomously"
+    );
+    assert_eq!(r1.steps[0].role, "statement-reviewer");
+    assert_eq!(r1.steps[1].role, "requirements-analyst");
+    assert_eq!(r1.steps[2].role, "requirements-reviewer");
     assert_eq!(r1.now, TaskState::Approval);
 
     // Sovereignty: running again changes nothing — the engine cannot approve.
@@ -215,7 +220,11 @@ fn full_cycle_through_both_human_gates() {
     {
         use devai_runtime::revision;
         let execs = store.list_executions(Some(t.id)).unwrap();
-        assert_eq!(execs.len(), 4, "analyst, reviewer, implementer, auditor");
+        assert_eq!(
+            execs.len(),
+            5,
+            "statement checker, analyst, reviewer, implementer, auditor"
+        );
         for e in &execs {
             let r = e.workspace_revision.as_ref().unwrap_or_else(|| {
                 panic!("{} execution must record a workspace_revision", e.role_slug)
@@ -355,10 +364,13 @@ fn full_cycle_through_both_human_gates() {
         .iter()
         .find(|a| a.kind == ArtifactKind::RequirementsSpec)
         .unwrap();
-    for a in arts
-        .iter()
-        .filter(|a| a.kind != ArtifactKind::RequirementsSpec)
-    {
+    for a in arts.iter().filter(|a| {
+        // The statement checker goes BEFORE the spec: nothing to depend on yet.
+        !matches!(
+            a.kind,
+            ArtifactKind::RequirementsSpec | ArtifactKind::StatementReview
+        )
+    }) {
         assert!(
             a.depends_on.contains(&spec.id),
             "{:?} must depend on the spec",
@@ -382,8 +394,8 @@ fn full_cycle_through_both_human_gates() {
     ] {
         assert!(kinds.contains(&expected), "event log lacks {expected}");
     }
-    // Executions were recorded for all four role runs.
-    assert_eq!(store.list_executions(Some(t.id)).unwrap().len(), 4);
+    // Executions were recorded for every role run (checker + four).
+    assert_eq!(store.list_executions(Some(t.id)).unwrap().len(), 5);
 }
 
 #[test]
@@ -525,9 +537,9 @@ fn failed_adapter_leaves_workflow_untouched() {
     assert!(err.to_string().contains("telepathy"), "{err}");
 
     let after = store.get_task(&t.id.to_string()).unwrap();
-    // Only the automatic DRAFT→ANALYSIS happened; the failed execution did
+    // Only the automatic DRAFT→STATEMENT happened; the failed execution did
     // not change state any further, and no artifact was published.
-    assert_eq!(after.state, TaskState::Analysis);
+    assert_eq!(after.state, TaskState::Statement);
     assert!(store.artifacts(t.id).unwrap().is_empty());
     let execs = store.list_executions(Some(t.id)).unwrap();
     assert_eq!(execs.len(), 1);
@@ -578,6 +590,10 @@ fn form_agent(store: &Store, name: &str) {
 fn to_analysis(store: &Store, t: &Task) {
     let cur = store.get_task(&t.id.to_string()).unwrap();
     let m = workflow::start(&proc(), &cur, "tester", Utc::now()).unwrap();
+    store.commit(cur.lock_version, &m).unwrap();
+    // process v4: the statement checker's verdict opens the analysis.
+    let cur = store.get_task(&t.id.to_string()).unwrap();
+    let m = workflow::statement_approved(&proc(), &cur, "checker", Utc::now()).unwrap();
     store.commit(cur.lock_version, &m).unwrap();
 }
 
@@ -3361,7 +3377,8 @@ fn agent_failures_are_recorded_and_park_at_the_threshold() {
     // 1st failure: below the threshold — the task is NOT parked.
     assert!(engine.advance(&id, "broken", "tester").is_err());
     let task = store.get_task(&id).unwrap();
-    assert_eq!(task.state, TaskState::Analysis);
+    // process v4: the first role of a fresh task is the statement checker.
+    assert_eq!(task.state, TaskState::Statement);
     assert!(
         store
             .list_questions(t.id)
@@ -3402,14 +3419,14 @@ fn agent_failures_are_recorded_and_park_at_the_threshold() {
 
     // 2nd failure: still below.
     assert!(engine.advance(&id, "broken", "tester").is_err());
-    assert_eq!(store.get_task(&id).unwrap().state, TaskState::Analysis);
+    assert_eq!(store.get_task(&id).unwrap().state, TaskState::Statement);
 
     // 3rd failure: threshold reached — park, and the anti-spam window still
     // carries ONE event (the repeats only grew the counter).
     assert!(engine.advance(&id, "broken", "tester").is_err());
     let parked = store.get_task(&id).unwrap();
     assert_eq!(parked.state, TaskState::WaitingForInput);
-    assert_eq!(parked.return_state, Some(TaskState::Analysis));
+    assert_eq!(parked.return_state, Some(TaskState::Statement));
     let questions = store.list_questions(t.id).unwrap();
     let q = questions
         .iter()
@@ -3426,7 +3443,8 @@ fn agent_failures_are_recorded_and_park_at_the_threshold() {
     let m = workflow::answer_question(&proc(), &parked, q.id, "tester", Utc::now()).unwrap();
     store.commit(parked.lock_version, &m).unwrap();
     let back = store.get_task(&id).unwrap();
-    assert_eq!(back.state, TaskState::Analysis);
+    // The stage the checker held is the stage answering returns to.
+    assert_eq!(back.state, TaskState::Statement);
     assert_eq!(
         store
             .agent_failure_series(t.id, "broken")

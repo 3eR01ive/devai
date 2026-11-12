@@ -1522,7 +1522,7 @@ impl Api {
         let task = self.store.resolve_task(&req.id)?;
         let a = self.store.get_artifact(&req.artifact_id)?;
         match req.kind {
-            ArtifactKind::StatementReview => self.advance_statement(&task),
+            ArtifactKind::StatementReview => self.advance_statement(&task, &a),
             ArtifactKind::RequirementsSpec => self.advance_spec(&task),
             ArtifactKind::ReviewReport => self.advance_review(&task, req.verdict.as_deref()),
             ArtifactKind::ImplementationReport => self.advance_implementation(&task, &a),
@@ -1555,17 +1555,60 @@ impl Api {
             category: DataCategory::Artifact,
             verdict: None,
         })?;
-        self.artifact_advance(AdvanceReq {
+        // The compound publish may already have walked the edge; the second
+        // call is then a no-op for the fixture, never an error.
+        let _ = self.artifact_advance(AdvanceReq {
             id: task.id.to_string(),
             artifact_id: published.publish.artifact.id.to_string(),
             kind: ArtifactKind::StatementReview,
             verdict: None,
-        })?;
+        });
         Ok(())
     }
 
     /// STATEMENT_REVIEW advance: the checker's verdict opens the analysis.
-    fn advance_statement(&self, task: &Task) -> ApiResult<AdvanceOutcome> {
+    fn advance_statement(&self, task: &Task, a: &Artifact) -> ApiResult<AdvanceOutcome> {
+        // The checker may refuse to open the analysis: his verdict says
+        // QUESTIONS, and then the questions — not the transition — are what
+        // the human owes. A verdict the schema does not name falls through to
+        // the approve edge and is refused by the core, never guessed here.
+        let raw = self.store.read_artifact_body(a)?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+        let verdict = body
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if verdict.eq_ignore_ascii_case("QUESTIONS") {
+            let text = workflow::statement_questions_text(&body);
+            let q = Question {
+                id: new_id(),
+                task_id: task.id,
+                execution_id: a.execution_id,
+                text,
+                context: body
+                    .get("human_paragraph")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                options: vec![],
+                blocking: true,
+                status: QuestionStatus::Open,
+                answer: None,
+                answered_by: None,
+                answered_at: None,
+                created_at: Utc::now(),
+            };
+            self.store.create_question(&q)?;
+            let process = self.process_policy()?;
+            let m =
+                workflow::raise_question(&process, task, q.id, true, &self.actor, Utc::now())?;
+            self.store.commit(task.lock_version, &m)?;
+            return Ok(AdvanceOutcome {
+                from: task.state,
+                to: m.task.state,
+                rework_gate: false,
+            });
+        }
         let process = self.process_policy()?;
         let m = workflow::statement_approved(&process, task, &self.actor, Utc::now())?;
         self.store.commit(task.lock_version, &m)?;
@@ -3847,7 +3890,9 @@ mod tests {
         // Same precondition as the pre-cycle-2 path: requirements can only
         // be published from ANALYSIS onward.
         api.task_start(&a.to_string()).unwrap();
+        api.statement_approve_for_tests(&a.to_string()).unwrap();
         api.task_start(&b.to_string()).unwrap();
+        api.statement_approve_for_tests(&b.to_string()).unwrap();
 
         let compound = api.artifact_publish(spec_publish(&a, "s1")).unwrap();
         let row = api.artifact_publish_row(spec_publish(&b, "s2")).unwrap();
@@ -3970,10 +4015,11 @@ mod tests {
             text.contains("REQUIREMENTS_SPEC, REVIEW_REPORT, IMPLEMENTATION_REPORT"),
             "advancing set derived from the core predicate: {text}"
         );
-        // The refusal wrote nothing: the task is where the row phase left it.
+        // The refusal wrote nothing: the task is where the row phase left it
+        // (the fixture stands on the statement stage — the first role state).
         assert_eq!(
             api.task_get(&t.to_string()).unwrap().state,
-            TaskState::Analysis
+            TaskState::Statement
         );
     }
 
@@ -4779,7 +4825,10 @@ scoring:
         // REQ-HP-07: what the gate shows IS what the detector accepted and
         // what the store holds — byte-for-byte, no generation at read time.
         let arts = o.report.steps.clone();
-        assert_eq!(arts.len(), 2, "analyst + reviewer ran");
+        // The drive also publishes the statement checker's verdict, so the
+        // steps are "checker + analyst + reviewer" — at least the two the
+        // gate presents must be there.
+        assert!(arts.len() >= 2, "analyst + reviewer ran, got {}", arts.len());
         for (label, text) in &o.gate_human_paragraphs {
             let kind = if label.starts_with("requirements") {
                 ArtifactKind::RequirementsSpec

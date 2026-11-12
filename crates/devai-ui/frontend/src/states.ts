@@ -6,6 +6,7 @@
 // ломает cargo test, а не даёт молчаливый undefined в окне.
 export const TaskStateToken = {
   Draft: "DRAFT",
+  Statement: "STATEMENT",
   Analysis: "ANALYSIS",
   Review: "REVIEW",
   Approval: "APPROVAL",

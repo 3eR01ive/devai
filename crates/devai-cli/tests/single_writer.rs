@@ -120,6 +120,7 @@ fn analysis_task(home: &Path, title: &str) -> String {
     let t = devai_json(home, &["task", "new", title, "--description", ""]);
     let id = t["id"].as_str().unwrap().to_string();
     devai(home, &["task", "start", &id]);
+    statement_ok(home, &id);
     id
 }
 
@@ -519,4 +520,25 @@ fn detection_never_writes_and_never_touches_a_process() {
 fn legacy_row_shape_constructs() {
     let t = Task::new("shape", "fixture", None, chrono::Utc::now());
     assert!(!t.id.is_nil());
+}
+
+/// Process v4: a fresh task stops on the statement checker. The checker's
+/// verdict is a published artifact — the same command a role's reply takes —
+/// so every CLI fixture walks the real edge instead of a test hook.
+fn statement_ok(home: &std::path::Path, id: &str) {
+    let body = r#"{"verdict":"APPROVED","human_paragraph":"Сейчас постановка проверена: названы пользователь, наблюдаемый результат, границы и объём работы, поэтому аналитику не придётся ничего домысливать по дороге. После этой проверки задача переходит к анализу, где появится первая версия требований с вопросами к человеку.","checklist":[{"item":"user","ok":true},{"item":"observable","ok":true},{"item":"boundaries","ok":true},{"item":"volume","ok":true},{"item":"acceptance","ok":true},{"item":"single_milestone","ok":true}]}"#;
+    let p = home.join("statement-review.json");
+    std::fs::write(&p, body).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_devai"))
+        .arg("--home")
+        .arg(home)
+        .args(["artifact", "publish", id, "--kind", "STATEMENT_REVIEW", "--file"])
+        .arg(&p)
+        .output()
+        .expect("the devai binary is runnable");
+    assert!(
+        out.status.success(),
+        "statement review publish for {id} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

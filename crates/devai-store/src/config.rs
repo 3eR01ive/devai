@@ -55,6 +55,10 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         include_str!("../../../config/evaluation/base.yaml"),
     ),
     (
+        "roles/statement-reviewer.yaml",
+        include_str!("../../../config/roles/statement-reviewer.yaml"),
+    ),
+    (
         "roles/project-intelligence.yaml",
         include_str!("../../../config/roles/project-intelligence.yaml"),
     ),
@@ -3282,7 +3286,8 @@ mod tests {
         let cfg = load(&dir.path().join("config")).unwrap();
         let store = Store::open(dir.path()).unwrap();
         let now = Utc::now();
-        assert_eq!(seed_roles(&store, &cfg, now).unwrap(), 6);
+        // v4 adds the statement checker (statement-reviewer) to the factory set.
+        assert_eq!(seed_roles(&store, &cfg, now).unwrap(), 7);
         assert_eq!(
             seed_roles(&store, &cfg, now).unwrap(),
             0,

@@ -111,11 +111,13 @@ fn task_active_lifecycle_through_the_real_binary() {
     // UUIDv7 prefixes collide inside one millisecond window — full ids do
     // not).
     devai(h, &["task", "start", &id_a]); // DRAFT → ANALYSIS
+    statement_ok(h, &id_a);
     let b = devai_json(h, &["task", "new", "Beta active", "--description", ""]);
     let id_b = b["id"].as_str().unwrap().to_string();
     let display_a = devai_core::types::short_id_str(&id_a);
     let display_b = devai_core::types::short_id_str(&id_b);
     devai(h, &["task", "start", &id_b]);
+    statement_ok(h, &id_b);
     let spec = write(h, "spec.json", "{\"requirements\": []}");
     devai(
         h,
@@ -449,6 +451,7 @@ fn task_active_lifecycle_through_the_real_binary() {
     let g = devai_json(h, &["task", "new", "Gamma ownerless", "--description", ""]);
     let id_g = g["id"].as_str().unwrap().to_string();
     devai(h, &["task", "start", &id_g]);
+    statement_ok(h, &id_g);
     {
         let store = Store::open(h).unwrap();
         store
@@ -560,4 +563,25 @@ fn task_snapshot_path() -> std::path::PathBuf {
 
 fn exec_snapshot_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli-snapshot/help_exec.txt")
+}
+
+/// Process v4: a fresh task stops on the statement checker. The checker's
+/// verdict is a published artifact — the same command a role's reply takes —
+/// so every CLI fixture walks the real edge instead of a test hook.
+fn statement_ok(home: &std::path::Path, id: &str) {
+    let body = r#"{"verdict":"APPROVED","human_paragraph":"Сейчас постановка проверена: названы пользователь, наблюдаемый результат, границы и объём работы, поэтому аналитику не придётся ничего домысливать по дороге. После этой проверки задача переходит к анализу, где появится первая версия требований с вопросами к человеку.","checklist":[{"item":"user","ok":true},{"item":"observable","ok":true},{"item":"boundaries","ok":true},{"item":"volume","ok":true},{"item":"acceptance","ok":true},{"item":"single_milestone","ok":true}]}"#;
+    let p = home.join("statement-review.json");
+    std::fs::write(&p, body).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_devai"))
+        .arg("--home")
+        .arg(home)
+        .args(["artifact", "publish", id, "--kind", "STATEMENT_REVIEW", "--file"])
+        .arg(&p)
+        .output()
+        .expect("the devai binary is runnable");
+    assert!(
+        out.status.success(),
+        "statement review publish for {id} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

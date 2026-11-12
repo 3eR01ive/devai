@@ -105,6 +105,7 @@ fn progress_lifecycle_through_the_real_binary() {
 
     // Drive DRAFT → … → IMPLEMENTATION.
     devai(h, &["task", "start", &id]);
+    statement_ok(h, &id);
     let spec = write(h, "spec.json", "{\"requirements\": []}");
     devai(
         h,
@@ -347,4 +348,25 @@ fn update_help_task_snapshot() {
 
 fn snapshot_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli-snapshot/help_task.txt")
+}
+
+/// Process v4: a fresh task stops on the statement checker. The checker's
+/// verdict is a published artifact — the same command a role's reply takes —
+/// so every CLI fixture walks the real edge instead of a test hook.
+fn statement_ok(home: &std::path::Path, id: &str) {
+    let body = r#"{"verdict":"APPROVED","human_paragraph":"Сейчас постановка проверена: названы пользователь, наблюдаемый результат, границы и объём работы, поэтому аналитику не придётся ничего домысливать по дороге. После этой проверки задача переходит к анализу, где появится первая версия требований с вопросами к человеку.","checklist":[{"item":"user","ok":true},{"item":"observable","ok":true},{"item":"boundaries","ok":true},{"item":"volume","ok":true},{"item":"acceptance","ok":true},{"item":"single_milestone","ok":true}]}"#;
+    let p = home.join("statement-review.json");
+    std::fs::write(&p, body).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_devai"))
+        .arg("--home")
+        .arg(home)
+        .args(["artifact", "publish", id, "--kind", "STATEMENT_REVIEW", "--file"])
+        .arg(&p)
+        .output()
+        .expect("the devai binary is runnable");
+    assert!(
+        out.status.success(),
+        "statement review publish for {id} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

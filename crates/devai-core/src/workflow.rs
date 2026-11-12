@@ -1028,6 +1028,31 @@ fn stale_rejected_report(m: &mut Mutation, artifacts: &[Artifact], actor: &str) 
 
 /// A role raises a question. Blocking questions move the task to
 /// WAITING_FOR_INPUT; the stage is remembered for restoration on answer.
+/// The statement checker's open questions as one human-readable text: the
+/// paragraph first, then each named question — the person reads a list, not a
+/// JSON blob. Shared by the API command path and the engine so both tell the
+/// human the same thing.
+pub fn statement_questions_text(body: &serde_json::Value) -> String {
+    let paragraph = body
+        .get("human_paragraph")
+        .and_then(|v| v.as_str())
+        .unwrap_or("постановка не готова: у постановщика есть вопросы");
+    let mut lines = vec![paragraph.to_string()];
+    if let Some(items) = body.get("questions").and_then(|v| v.as_array()) {
+        for (i, q) in items.iter().enumerate() {
+            let text = q
+                .get("text")
+                .or_else(|| q.get("question"))
+                .and_then(|v| v.as_str())
+                .or_else(|| q.as_str());
+            if let Some(t) = text {
+                lines.push(format!("{}. {}", i + 1, t));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 pub fn raise_question(
     process: &Process,
     task: &Task,

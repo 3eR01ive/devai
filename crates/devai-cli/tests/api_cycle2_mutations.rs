@@ -97,8 +97,11 @@ fn workflow_mutation_render_parity() {
     let id = full_id_of(home, "parity task");
 
     let out = ok(home, &["task", "start", &id]);
-    assert!(out.contains("state: DRAFT → ANALYSIS\n"), "{out}");
+    assert!(out.contains("state: DRAFT → STATEMENT\n"), "{out}");
     assert!(out.contains("next: "), "{out}");
+    // The checker's verdict opens the analysis: same command a role's reply
+    // takes, so pause/resume below keep the ANALYSIS form.
+    statement_ok(home, &id);
 
     // Pause/resume keep the transition form; a wrong-state review keeps
     // the core guard refusal text — now an API error with the same Display.
@@ -216,6 +219,7 @@ fn gate_refusal_texts_survive_the_move_to_api_errors() {
     // …with the declared executor it starts; double-close then refuses with
     // the exact old sentence (full ids in text, as the pre-API handler had).
     ok(home, &["task", "start", &aid]);
+    statement_ok(home, &aid);
     ok(
         home,
         &["exec", "start", &aid, "--role", "requirements-analyst"],
@@ -653,4 +657,25 @@ fn task_new_empty_idempotency_key_refused_and_store_untouched() {
             );
         }
     }
+}
+
+/// Process v4: a fresh task stops on the statement checker. The checker's
+/// verdict is a published artifact — the same command a role's reply takes —
+/// so every CLI fixture walks the real edge instead of a test hook.
+fn statement_ok(home: &std::path::Path, id: &str) {
+    let body = r#"{"verdict":"APPROVED","human_paragraph":"Сейчас постановка проверена: названы пользователь, наблюдаемый результат, границы и объём работы, поэтому аналитику не придётся ничего домысливать по дороге. После этой проверки задача переходит к анализу, где появится первая версия требований с вопросами к человеку.","checklist":[{"item":"user","ok":true},{"item":"observable","ok":true},{"item":"boundaries","ok":true},{"item":"volume","ok":true},{"item":"acceptance","ok":true},{"item":"single_milestone","ok":true}]}"#;
+    let p = home.join("statement-review.json");
+    std::fs::write(&p, body).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_devai"))
+        .arg("--home")
+        .arg(home)
+        .args(["artifact", "publish", id, "--kind", "STATEMENT_REVIEW", "--file"])
+        .arg(&p)
+        .output()
+        .expect("the devai binary is runnable");
+    assert!(
+        out.status.success(),
+        "statement review publish for {id} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
