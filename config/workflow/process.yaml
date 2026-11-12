@@ -24,13 +24,15 @@
 # кода и объявления не решается в пользу одной из сторон молча.
 
 process:
-  version: 3
+  # Версия 4: стадия STATEMENT — постановщик проверяет саму постановку до анализа.
+  version: 4
 
   # Закрытый перечень имён условий. Неизвестное имя в transitions отвергается
   # при инициализации — опечатка не становится «новым» переходом. Имя,
   # которое платформа эмитит сама, обязано здесь присутствовать.
   conditions:
-    - human_start             # человек запустил дело (DRAFT → первая роль)
+    - human_start             # человек запустил дело (DRAFT → постановщик)
+    - statement_approved      # постановка проверена и годна (→ анализ)
     - spec_published          # опубликована версия требований (роль или `revise`)
     - review_finished         # проверяющий закончил с вердиктом «да»
     - review_rejected         # проверяющий вернул требования на доработку
@@ -59,6 +61,11 @@ process:
     - state: DRAFT
       executor: none
       outcomes: [human_start]
+    # Постановщик проверяет ПОСТАНОВКУ, а не проектирует решение.
+    - state: STATEMENT
+      executor: role
+      role: statement-reviewer
+      outcomes: [statement_approved, launch_failed, outcome_missing]
     - state: ANALYSIS
       executor: role
       role: requirements-analyst
@@ -104,7 +111,10 @@ process:
   # «условие → состояние». RETURN_STATE — особый адрес: вернуть запомненную
   # рабочую стадию (return_state удержания), а не фиксированное состояние.
   transitions:
-    - { from: DRAFT, on: human_start, to: ANALYSIS }
+    - { from: DRAFT, on: human_start, to: STATEMENT }
+    - { from: STATEMENT, on: statement_approved, to: ANALYSIS }
+    - { from: STATEMENT, on: launch_failed, to: BLOCKED }
+    - { from: STATEMENT, on: outcome_missing, to: BLOCKED }
     - { from: ANALYSIS, on: spec_published, to: REVIEW }
     - { from: ANALYSIS, on: launch_failed, to: BLOCKED }
     - { from: ANALYSIS, on: outcome_missing, to: BLOCKED }

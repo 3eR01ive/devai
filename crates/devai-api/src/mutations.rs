@@ -1522,6 +1522,7 @@ impl Api {
         let task = self.store.resolve_task(&req.id)?;
         let a = self.store.get_artifact(&req.artifact_id)?;
         match req.kind {
+            ArtifactKind::StatementReview => self.advance_statement(&task),
             ArtifactKind::RequirementsSpec => self.advance_spec(&task),
             ArtifactKind::ReviewReport => self.advance_review(&task, req.verdict.as_deref()),
             ArtifactKind::ImplementationReport => self.advance_implementation(&task, &a),
@@ -1530,6 +1531,50 @@ impl Api {
             // never a hand-copied set that could drift (QA R4).
             other => Err(not_advancing_refusal(other)),
         }
+    }
+
+    /// Test support (doc-hidden): a statement-review VERDICT recorded and
+    /// advanced, so a fixture can reach ANALYSIS without running the checker
+    /// role. Production publishes the same artifact from the role's reply —
+    /// this is the same command path, not a shortcut around a gate.
+    #[doc(hidden)]
+    pub fn statement_approve_for_tests(&self, id: &str) -> ApiResult<()> {
+        let task = self.store.resolve_task(id)?;
+        if task.state != TaskState::Statement {
+            return Ok(());
+        }
+        let body = r#"{"verdict":"APPROVED","human_paragraph":"statement checked (test fixture)"}"#.as_bytes();
+        let published = self.artifact_publish(PublishReq {
+            id: task.id.to_string(),
+            kind: ArtifactKind::StatementReview,
+            name: "statement-review.json".into(),
+            content: body.to_vec(),
+            depends: vec![],
+            contract: None,
+            execution: None,
+            category: DataCategory::Artifact,
+            verdict: None,
+        })?;
+        self.artifact_advance(AdvanceReq {
+            id: task.id.to_string(),
+            artifact_id: published.publish.artifact.id.to_string(),
+            kind: ArtifactKind::StatementReview,
+            verdict: None,
+        })?;
+        Ok(())
+    }
+
+    /// STATEMENT_REVIEW advance: the checker's verdict opens the analysis.
+    fn advance_statement(&self, task: &Task) -> ApiResult<AdvanceOutcome> {
+        let process = self.process_policy()?;
+        let m = workflow::statement_approved(&process, task, &self.actor, Utc::now())?;
+        self.store.commit(task.lock_version, &m)?;
+        self.autostart_if_role_state(&m.task);
+        Ok(AdvanceOutcome {
+            from: task.state,
+            to: m.task.state,
+            rework_gate: false,
+        })
     }
 
     /// REQUIREMENTS_SPEC advance: the core `requirements_published` command
@@ -3576,6 +3621,7 @@ mod tests {
         let t = fresh_task(&api, "approve-me");
         let id = t.to_string();
         api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
 
         // No spec yet → the guard refuses with the old text, no decision.
         let e = api.task_approve(&id, Some("early".into())).unwrap_err();
@@ -3621,6 +3667,7 @@ mod tests {
         let t = fresh_task(api, title);
         let id = t.to_string();
         api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
         let published = api.artifact_publish(spec_publish(&t, "s1")).unwrap();
         api.task_review(&id, Verdict::Approved, None).unwrap();
         assert_eq!(
@@ -3843,6 +3890,7 @@ mod tests {
         let t = fresh_task(&api, "writer");
         let id = t.to_string();
         api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
         api.exec_start(ExecStartReq {
             id: id.clone(),
             role: "requirements-analyst".into(),
@@ -4514,6 +4562,7 @@ scoring:
         let t = fresh_task(&api, "no-paragraph");
         let id = t.to_string();
         api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
         let e = api
             .artifact_publish_row(PublishReq {
                 id: id.clone(),
@@ -4559,6 +4608,7 @@ scoring:
         let t = fresh_task(&api, "chatter");
         let id = t.to_string();
         api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
         let chatter = serde_json::json!({
             "version": 1,
             "requirements": [{"id": "R1", "statement": "Требование."}],
@@ -4610,6 +4660,7 @@ scoring:
         let t = fresh_task(&api, "qa-exempt");
         let id = t.to_string();
         api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
         // A report_text that would FAIL the detector as a role field —
         // publish must accept it untouched.
         let body = serde_json::json!({
@@ -4647,6 +4698,7 @@ scoring:
         let t = fresh_task(&api, "config-window");
         let id = t.to_string();
         api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
         let body = serde_json::json!({
             "version": 1,
             "requirements": [{"id": "R1", "statement": "Требование."}],

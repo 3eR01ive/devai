@@ -103,6 +103,8 @@ macro_rules! str_enum {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskState {
     Draft,
+    /// Постановщик: проверяет саму постановку до анализа.
+    Statement,
     Analysis,
     Review,
     Approval,
@@ -119,6 +121,7 @@ pub enum TaskState {
 
 str_enum!(TaskState,
     Draft => "DRAFT",
+    Statement => "STATEMENT",
     Analysis => "ANALYSIS",
     Review => "REVIEW",
     Approval => "APPROVAL",
@@ -439,6 +442,7 @@ pub struct EpicVertex {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ArtifactKind {
+    StatementReview,
     ProjectProfile,
     RequirementsSpec,
     ReviewReport,
@@ -452,6 +456,7 @@ pub enum ArtifactKind {
 }
 
 str_enum!(ArtifactKind,
+    StatementReview => "STATEMENT_REVIEW",
     ProjectProfile => "PROJECT_PROFILE",
     RequirementsSpec => "REQUIREMENTS_SPEC",
     ReviewReport => "REVIEW_REPORT",
@@ -474,7 +479,10 @@ impl ArtifactKind {
     pub fn advances_state(self) -> bool {
         matches!(
             self,
-            Self::RequirementsSpec | Self::ReviewReport | Self::ImplementationReport
+            Self::StatementReview
+                | Self::RequirementsSpec
+                | Self::ReviewReport
+                | Self::ImplementationReport
         )
     }
 
@@ -1603,6 +1611,7 @@ pub mod event_kind {
     /// event is the manual half — one append-only event per EFFECTIVE
     /// change. Payload: the new `human_name`.
     pub const TASK_HUMAN_NAME_SET: &str = "task.human_name.set";
+    pub const STATEMENT_REVIEWED: &str = "statement.reviewed";
     pub const WORKFLOW_STARTED: &str = "workflow.started";
     pub const STATE_CHANGED: &str = "workflow.state_changed";
     pub const REQUIREMENTS_PUBLISHED: &str = "requirements.published";

@@ -12,6 +12,7 @@
 # токена. Технический ключ вида не печатается заголовком нигде.
 artifact_kinds:
   labels:
+    STATEMENT_REVIEW: вердикт постановщика
     PROJECT_PROFILE: профиль проекта
     REQUIREMENTS_SPEC: спека
     REVIEW_REPORT: отчёт проверки

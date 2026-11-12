@@ -34,6 +34,7 @@ pub struct Mutation {
 
 const ACTIVE_STATES: &[TaskState] = &[
     TaskState::Draft,
+    TaskState::Statement,
     TaskState::Analysis,
     TaskState::Review,
     TaskState::Approval,
@@ -388,6 +389,32 @@ pub fn start(process: &Process, task: &Task, actor: &str, now: Timestamp) -> Cor
 /// (a spec published under @1..@3, no name in the body) keeps the previous
 /// name untouched — the obligation is not retroactive (REQ-TN-02 AC3). The
 /// title is never touched (REQ-TN-01 AC2). The name lands on the task row
+/// The statement checker's verdict: the task's OWN statement names the user,
+/// the observable result, the boundaries and the volume, so analysis may
+/// start. It designs nothing.
+pub fn statement_approved(
+    process: &Process,
+    task: &Task,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::Statement],
+        "publish-statement-review",
+        CoreError::hint("the statement is checked only while the task is in STATEMENT"),
+    )?;
+    transition(
+        process,
+        task,
+        process_condition::STATEMENT_APPROVED,
+        event_kind::STATEMENT_REVIEWED,
+        actor,
+        now,
+        json!({}),
+    )
+}
+
 /// inside the SAME commit as the transition and its event.
 pub fn requirements_published(
     process: &Process,
@@ -1736,6 +1763,7 @@ pub fn check_execution_allowed(process: &Process, slug: &str, task: &Task) -> Co
 /// pair at its `states:` section.
 pub fn stage_artifact_kind(state: TaskState) -> Option<ArtifactKind> {
     match state {
+        TaskState::Statement => Some(ArtifactKind::StatementReview),
         TaskState::Analysis => Some(ArtifactKind::RequirementsSpec),
         TaskState::Review => Some(ArtifactKind::ReviewReport),
         TaskState::Implementation | TaskState::Rework => Some(ArtifactKind::ImplementationReport),
@@ -1840,6 +1868,12 @@ pub fn allowed_ops(process: &Process, task: &Task) -> Vec<String> {
     };
     let mut v: Vec<String> = match task.state {
         TaskState::Draft => vec!["start".into()],
+        TaskState::Statement => {
+            let mut v = vec!["publish-statement-review".to_string()];
+            v.extend(run(TaskState::Statement));
+            v.push("raise-question".into());
+            v
+        }
         TaskState::Analysis => {
             let mut v = vec!["publish-requirements".to_string()];
             v.extend(run(TaskState::Analysis));

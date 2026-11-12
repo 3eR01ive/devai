@@ -24,6 +24,8 @@ inbox_waits:
   states:
     DRAFT:
       group: none
+    STATEMENT:
+      group: none
     ANALYSIS:
       group: none
     REVIEW:

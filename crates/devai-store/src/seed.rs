@@ -336,6 +336,34 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
         (
+            "statement-review",
+            1,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Statement Review v1 — verdict on the task's own statement",
+  "description": "Проверка постановки ДО анализа: пользователь, наблюдаемый результат, границы, объём, критерий приёмки, одна веха. APPROVED открывает анализ; QUESTIONS отдаёт вопросы человеку. Схема не переписывает постановку и не проектирует решение.",
+  "type": "object",
+  "required": ["verdict", "human_paragraph"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["APPROVED", "QUESTIONS"] },
+    "human_paragraph": { "type": "string", "description": "простыми словами: что проверено и чего достаточно или не хватает" },
+    "checklist": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["item", "ok"],
+        "properties": {
+          "item": { "type": "string", "enum": ["user", "observable", "boundaries", "volume", "acceptance", "single_milestone"] },
+          "ok": { "type": "boolean" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "questions": { "type": "array", "items": { "type": "string" } }
+  }
+}"#,
+        ),
+        (
             "review-report",
             1,
             r#"{

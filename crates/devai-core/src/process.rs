@@ -28,7 +28,7 @@ use crate::types::TaskState;
 ///
 /// Version 3 replaced the silent round brake (`max_rounds_without_shift`)
 /// with the declared attempt limit (`max_attempts_without_progress`).
-pub const SUPPORTED_PROCESS_VERSION: u32 = 3;
+pub const SUPPORTED_PROCESS_VERSION: u32 = 4;
 
 /// The special transition address: «the remembered working stage» of a hold
 /// (`return_state`), not a fixed state name. Spelled once.
@@ -58,6 +58,8 @@ pub mod process_executor {
 pub mod process_condition {
     /// A human started the task (DRAFT → the first role stage).
     pub const HUMAN_START: &str = "human_start";
+    /// The statement checker accepted the task's OWN statement.
+    pub const STATEMENT_APPROVED: &str = "statement_approved";
     /// A requirements version was published (role publication or `revise`).
     pub const SPEC_PUBLISHED: &str = "spec_published";
     /// The reviewer finished its report with a go verdict.
@@ -96,6 +98,7 @@ pub mod process_condition {
     /// Every name above — the closed list a declaration must cover.
     pub const ALL: &[&str] = &[
         HUMAN_START,
+        STATEMENT_APPROVED,
         SPEC_PUBLISHED,
         REVIEW_FINISHED,
         REVIEW_REJECTED,
@@ -111,7 +114,12 @@ pub mod process_condition {
 
     /// The names that END a role's work normally. A role state must cover at
     /// least one of them, otherwise it can never leave on success.
-    pub const ROLE_FINISHES: &[&str] = &[SPEC_PUBLISHED, REVIEW_FINISHED, IMPLEMENTATION_REPORTED];
+    pub const ROLE_FINISHES: &[&str] = &[
+        STATEMENT_APPROVED,
+        SPEC_PUBLISHED,
+        REVIEW_FINISHED,
+        IMPLEMENTATION_REPORTED,
+    ];
     /// Names a role state MUST cover (REQ-AR-14): a role can always fail to
     /// launch or vanish, and a state that cannot express those strands.
     pub const ROLE_REQUIRED: &[&str] = &[LAUNCH_FAILED, OUTCOME_MISSING];

@@ -84,6 +84,7 @@ fn editing_the_declaration_moves_the_task_where_the_data_says() {
     let (_dir, api) = home_with(&text);
     let id = task(&api, "declaration drives start");
     api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
     assert_eq!(
         api.task_get(&id).unwrap().state,
         TaskState::Review,
@@ -98,6 +99,7 @@ fn editing_the_declared_hold_address_changes_where_a_block_lands() {
     let (_dir, api) = home_with(&text);
     let id = task(&api, "declared hold");
     api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
     api.task_block(&id, Some("hold".into())).unwrap();
     assert_eq!(
         api.task_get(&id).unwrap().state,
@@ -164,6 +166,7 @@ fn a_declared_role_is_admitted_by_the_run_guard() {
     let (_dir, api) = home_with(&text);
     let id = task(&api, "declared executor runs");
     api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
     let started = api
         .exec_start(devai_api::ExecStartReq {
             id: id.clone(),
@@ -196,6 +199,7 @@ fn a_role_the_declaration_does_not_name_here_is_refused_in_words() {
     let (_dir, api) = home_with(&factory_text());
     let id = task(&api, "declared executor only");
     api.task_start(&id).unwrap();
+        api.statement_approve_for_tests(&id).unwrap();
     let err = api
         .exec_start(devai_api::ExecStartReq {
             id,
