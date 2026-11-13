@@ -319,12 +319,62 @@ function specCompare(s: any): { prevSeq: number | null; items: ReqDiff[] } | nul
   return { prevSeq: prev.art.seq, items };
 }
 
+type FindDiff = { t: "add" | "del" | "same"; severity?: string; text: string; req?: string };
+
+/** Что изменилось в проверке выбранного прогона против предыдущей проверки. */
+function reviewCompare(s: any): {
+  prevSeq: number | null;
+  verdictOld: string;
+  verdictNew: string;
+  verdictChanged: boolean;
+  paragraph: DiffLine[] | null;
+  findings: FindDiff[];
+} | null {
+  const art = artOf(s);
+  const cur = bodyOf(s);
+  if (!art || art.kind !== "REVIEW_REPORT" || !cur) return null;
+  const prev = prevRunWithArt(s, "REVIEW_REPORT");
+  if (!prev) return null;
+  const old = bodyOfArt(prev.art.id);
+  if (!old) return null;
+
+  const key = (f: any) => String(f.description ?? "").trim();
+  const oldF: any[] = old.findings ?? [];
+  const newF: any[] = cur.findings ?? [];
+  const findings: FindDiff[] = [];
+  for (const f of newF) {
+    const hit = oldF.find((o) => key(o) === key(f));
+    findings.push({
+      t: hit ? "same" : "add",
+      severity: f.severity,
+      text: key(f),
+      req: f.requirement_ref,
+    });
+  }
+  for (const o of oldF) {
+    if (!newF.some((f) => key(f) === key(o))) {
+      findings.push({ t: "del", severity: o.severity, text: key(o), req: o.requirement_ref });
+    }
+  }
+  const op = String(old.human_paragraph ?? "");
+  const np = String(cur.human_paragraph ?? "");
+  return {
+    prevSeq: prev.art.seq,
+    verdictOld: String(old.verdict ?? ""),
+    verdictNew: String(cur.verdict ?? ""),
+    verdictChanged: String(old.verdict ?? "") !== String(cur.verdict ?? ""),
+    paragraph: op !== np ? diffLines(op, np) : null,
+    findings,
+  };
+}
+
 /** Догружаем тело артефакта, когда шаг раскрыт: вкладкам нужны данные. */
 async function toggleCompare(s: any) {
   const on = !comparePrev.value[s.state];
   comparePrev.value = { ...comparePrev.value, [s.state]: on };
   if (on) {
-    const prev = prevRunWithArt(s, "REQUIREMENTS_SPEC");
+    const kind = s.state === "REVIEW" ? "REVIEW_REPORT" : "REQUIREMENTS_SPEC";
+    const prev = prevRunWithArt(s, kind);
     if (prev) await ensureBody(prev.art);
   }
 }
@@ -951,6 +1001,56 @@ onMounted(load);
                   у этого прогона отчёта проверки нет
                 </div>
                 <template v-else>
+                  <label v-if="prevRunWithArt(s, 'REVIEW_REPORT')" class="p-cmp">
+                    <input type="checkbox" :checked="!!comparePrev[s.state]" @change="toggleCompare(s)" />
+                    <span>что изменилось к предыдущей проверке</span>
+                    <span class="p-cmpv mono">
+                      v{{ prevRunWithArt(s, 'REVIEW_REPORT')!.art.seq }} → v{{ artOf(s)!.seq }}
+                    </span>
+                  </label>
+
+                  <template v-if="comparePrev[s.state] && reviewCompare(s)">
+                    <div class="p-kv">
+                      <span class="k">вердикт</span>
+                      <span class="v">
+                        <template v-if="reviewCompare(s)!.verdictChanged">
+                          <span class="vold">{{ reviewCompare(s)!.verdictOld || "—" }}</span>
+                          →
+                          <b>{{ reviewCompare(s)!.verdictNew || "—" }}</b>
+                        </template>
+                        <template v-else>{{ reviewCompare(s)!.verdictNew || "—" }} <span class="p-dim2">(не менялся)</span></template>
+                      </span>
+                      <span v-if="reviewBody(s)!.spec_seq" class="k">проверялась спека</span>
+                      <span v-if="reviewBody(s)!.spec_seq" class="v">v{{ reviewBody(s)!.spec_seq }}</span>
+                    </div>
+
+                    <template v-if="reviewCompare(s)!.paragraph">
+                      <div class="p-sec">формулировка проверки изменилась</div>
+                      <div class="p-difftext">
+                        <div v-for="(l, k) in reviewCompare(s)!.paragraph!" :key="k" class="dl" :class="l.t">{{ l.v || " " }}</div>
+                      </div>
+                    </template>
+
+                    <div class="p-sec">
+                      замечания · было {{ reviewCompare(s)!.findings.filter((f) => f.t !== 'add').length }},
+                      стало {{ reviewCompare(s)!.findings.filter((f) => f.t !== 'del').length }}
+                      (новых {{ reviewCompare(s)!.findings.filter((f) => f.t === 'add').length }},
+                      снято {{ reviewCompare(s)!.findings.filter((f) => f.t === 'del').length }})
+                    </div>
+                    <div
+                      v-for="(f, k) in reviewCompare(s)!.findings"
+                      :key="k"
+                      class="p-find p-findd"
+                      :class="f.t"
+                    >
+                      <span class="p-mark">{{ f.t === 'add' ? '+' : f.t === 'del' ? '−' : '·' }}</span>
+                      <span class="p-sev" :class="f.severity">{{ f.severity }}</span>
+                      <span class="p-findt">{{ f.text }}</span>
+                      <span v-if="f.req" class="p-dim2 mono">{{ f.req }}</span>
+                    </div>
+                  </template>
+
+                  <template v-else>
                   <div class="p-kv">
                     <span class="k">вердикт</span><span class="v">{{ reviewBody(s)!.verdict ?? "—" }}</span>
                     <span v-if="reviewBody(s)!.spec_seq" class="k">проверялась спека</span>
@@ -965,6 +1065,7 @@ onMounted(load);
                       <span class="p-sev" :class="f.severity">{{ f.severity }}</span>
                       <span>{{ f.description }}</span>
                     </div>
+                  </template>
                   </template>
                 </template>
               </div>
@@ -1172,6 +1273,14 @@ onMounted(load);
 .p-difftext .dl.del{background:rgba(240,97,109,.10);color:#f2bcc2;text-decoration:line-through}
 .p-difftext .dl.same{color:var(--p-dim)}
 .p-ac .acadd{color:#b8e8cd} .p-ac .acdel{color:#f2bcc2;text-decoration:line-through}
+.p-dim2{color:var(--p-dim2)} .mono{font-family:var(--mono)}
+.vold{color:var(--p-stop);text-decoration:line-through;margin-right:6px}
+.p-findd{align-items:baseline}
+.p-findd.add{background:rgba(62,207,142,.07);border-left:2px solid rgba(62,207,142,.5);padding-left:8px}
+.p-findd.del{background:rgba(240,97,109,.07);border-left:2px solid rgba(240,97,109,.5);padding-left:8px}
+.p-findd.del .p-findt{color:#f2bcc2;text-decoration:line-through}
+.p-findd.same .p-findt{color:var(--p-dim)}
+.p-findt{flex:1}
 .p-find{display:flex;gap:8px;font-size:12px;color:#dbe3ec;margin-bottom:6px;line-height:1.45}
 .p-sev{font-family:var(--mono);font-size:10px;text-transform:uppercase;padding:1px 6px;border-radius:4px;
   border:1px solid var(--p-line);color:var(--p-dim);height:16px}
