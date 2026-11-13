@@ -304,18 +304,30 @@ pub struct SourceSliceView {
     /// остальное, не угадывая конец файла запросами наугад.
     pub total_lines: u32,
     pub text: String,
+    /// Файл с таким хвостом есть в нескольких местах дерева: вместо догадки
+    /// отдаём варианты, и человек выбирает сам.
+    #[serde(default)]
+    pub candidates: Vec<String>,
+}
+
+/// Чем кончилось разрешение сокращённого пути.
+enum Resolved {
+    Hit(String),
+    /// Несколько файлов заканчиваются так же — гадать запрещено.
+    Ambiguous(Vec<String>),
+    Missing,
 }
 
 /// Путь файла в коммите: точный или единственный по хвосту.
 /// Отчёты пишут ссылки сокращённо, а `git show` требует полный путь.
-fn resolve_path(repo: &Path, rev: &str, path: &str) -> Result<String, crate::ApiError> {
+fn resolve_path(repo: &Path, rev: &str, path: &str) -> Result<Resolved, crate::ApiError> {
     let exact = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["cat-file", "-e", &format!("{rev}:{path}")])
         .status();
     if matches!(exact, Ok(s) if s.success()) {
-        return Ok(path.to_string());
+        return Ok(Resolved::Hit(path.to_string()));
     }
     let listing = std::process::Command::new("git")
         .arg("-C")
@@ -332,17 +344,10 @@ fn resolve_path(repo: &Path, rev: &str, path: &str) -> Result<String, crate::Api
         .filter(|f| *f == path || f.ends_with(&tail))
         .collect();
     match hits.len() {
-        1 => Ok(hits[0].to_string()),
-        0 => Err(crate::ApiError::refused(
-            "no_source",
-            format!("в коммите {rev} нет файла {path}"),
-        )),
-        _ => Err(crate::ApiError::refused(
-            "ambiguous_path",
-            format!(
-                "файл {path} в коммите {rev} неоднозначен: {}",
-                hits.iter().take(5).copied().collect::<Vec<_>>().join(", ")
-            ),
+        1 => Ok(Resolved::Hit(hits[0].to_string())),
+        0 => Ok(Resolved::Missing),
+        _ => Ok(Resolved::Ambiguous(
+            hits.iter().take(20).map(|s| s.to_string()).collect(),
         )),
     }
 }
@@ -371,7 +376,26 @@ impl Api {
         // «crates/devai-api/src/signature/types.rs»). Путь разрешаем по дереву
         // коммита: точное совпадение, иначе единственное совпадение по хвосту.
         // Неоднозначность — отказ со списком, а не догадка.
-        let path = resolve_path(&repo, rev, path)?;
+        let path = match resolve_path(&repo, rev, path)? {
+            Resolved::Hit(p) => p,
+            Resolved::Ambiguous(candidates) => {
+                return Ok(SourceSliceView {
+                    path: path.to_string(),
+                    rev: rev.to_string(),
+                    from,
+                    to,
+                    total_lines: 0,
+                    text: String::new(),
+                    candidates,
+                })
+            }
+            Resolved::Missing => {
+                return Err(crate::ApiError::refused(
+                    "no_source",
+                    format!("в коммите {rev} нет файла {path}"),
+                ))
+            }
+        };
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -406,6 +430,7 @@ impl Api {
             to: end as u32,
             total_lines: total as u32,
             text: lines[start..end].join("\n"),
+            candidates: Vec::new(),
         })
     }
 }
@@ -424,7 +449,7 @@ impl HomePath for Api {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_path;
+    use super::{resolve_path, Resolved};
     use std::path::Path;
     use std::process::Command;
 
@@ -459,8 +484,10 @@ mod tests {
     fn exact_path_wins() {
         let dir = repo();
         let rev = head(dir.path());
-        let got = resolve_path(dir.path(), &rev, "crates/api/src/lib.rs").unwrap();
-        assert_eq!(got, "crates/api/src/lib.rs");
+        match resolve_path(dir.path(), &rev, "crates/api/src/lib.rs").unwrap() {
+            Resolved::Hit(p) => assert_eq!(p, "crates/api/src/lib.rs"),
+            _ => panic!("должно быть точное совпадение"),
+        }
     }
 
     #[test]
@@ -468,16 +495,41 @@ mod tests {
         // Отчёт писал «signature/types.rs» — полный путь ищется по хвосту.
         let dir = repo();
         let rev = head(dir.path());
-        let got = resolve_path(dir.path(), &rev, "signature/types.rs").unwrap();
-        assert_eq!(got, "crates/api/src/signature/types.rs");
+        match resolve_path(dir.path(), &rev, "signature/types.rs").unwrap() {
+            Resolved::Hit(p) => assert_eq!(p, "crates/api/src/signature/types.rs"),
+            _ => panic!("должен найтись единственный хвост"),
+        }
+    }
+
+    #[test]
+    fn same_tail_in_two_places_gives_candidates_not_a_guess() {
+        // «types.rs» встречается и в api, и в core — выбрать за человека нельзя.
+        let dir = repo();
+        std::fs::create_dir_all(dir.path().join("crates/core/src")).unwrap();
+        std::fs::write(dir.path().join("crates/core/src/types.rs"), "fn c() {}\n").unwrap();
+        let sh = |args: &[&str]| {
+            assert!(Command::new("git").arg("-C").arg(dir.path()).args(args).status().unwrap().success());
+        };
+        sh(&["add", "-A"]);
+        sh(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "two"]);
+        let rev = head(dir.path());
+        match resolve_path(dir.path(), &rev, "types.rs").unwrap() {
+            Resolved::Ambiguous(c) => {
+                assert_eq!(c.len(), 2, "{c:?}");
+                assert!(c.iter().any(|p| p.ends_with("signature/types.rs")), "{c:?}");
+                assert!(c.iter().any(|p| p.ends_with("core/src/types.rs")), "{c:?}");
+            }
+            _ => panic!("ожидались варианты"),
+        }
     }
 
     #[test]
     fn missing_file_is_a_typed_refusal_not_a_guess() {
         let dir = repo();
         let rev = head(dir.path());
-        let err = resolve_path(dir.path(), &rev, "nope/absent.rs").unwrap_err();
-        let text = format!("{err:?}");
-        assert!(text.contains("no_source"), "{text}");
+        assert!(matches!(
+            resolve_path(dir.path(), &rev, "nope/absent.rs").unwrap(),
+            Resolved::Missing
+        ));
     }
 }

@@ -245,6 +245,8 @@ export interface SourceSliceView {
   /** сколько строк в файле на этом коммите: по нему окно разворачивает остальное */
   total_lines: number;
   text: string;
+  /** сокращённый путь совпал с несколькими файлами: выбор человека, не догадка */
+  candidates: string[];
 }
 
 export interface ProgressView {

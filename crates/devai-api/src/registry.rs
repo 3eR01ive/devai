@@ -121,7 +121,9 @@ pub struct OpDescriptor {
 /// `display` label, `exec.list` rows gain `role_display`, and the
 /// APPROVAL/QA presentations gain `label`. Wire-visible additions, so the
 /// stamp says so.
-pub const SURFACE_VERSION: &str = "api-surface@16";
+/// @17: `source.slice` отдаёт `candidates`, когда сокращённый путь совпал с
+/// несколькими файлами — выбор вместо догадки. Только чтение.
+pub const SURFACE_VERSION: &str = "api-surface@17";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -909,7 +911,7 @@ mod tests {
         // @16: ещё одно ЧТЕНИЕ — diff того же диапазона с полным контекстом
         // файла, чтобы окно разворачивало скрытые строки без второго чтения.
         // Ни одна версия не пишет: мутации @14 остаются как были.
-        assert_eq!(SURFACE_VERSION, "api-surface@16");
+        assert_eq!(SURFACE_VERSION, "api-surface@17");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

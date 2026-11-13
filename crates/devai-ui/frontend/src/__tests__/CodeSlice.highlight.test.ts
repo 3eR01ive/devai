@@ -22,6 +22,7 @@ const slice = (from: number, to: number, total: number) => ({
   to,
   total_lines: total,
   text: Array.from({ length: to - from + 1 }, (_, i) => `line ${from + i}`).join("\n"),
+  candidates: [] as string[],
 });
 
 describe("CodeSlice", () => {
@@ -81,5 +82,44 @@ describe("CodeSlice", () => {
 
     (w.vm as any).centerOnLinked();
     expect(pre.scrollTop).toBe(1840);
+  });
+
+  it("отказ платформы печатается причиной, а не [object Object]", async () => {
+    sourceSlice.mockRejectedValue({ kind: "no_source", message: "в коммите abc нет файла crates/x.rs" });
+    const w = mount(CodeSlice, {
+      props: { taskId: "t", rev: "abc", path: "crates/x.rs", from: 100, to: 110 },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    await nextTick();
+    const cap = w.find(".cap").text();
+    expect(cap).not.toContain("[object Object]");
+    expect(cap).toContain("нет файла");
+  });
+
+  it("неоднозначный путь: варианты файлов, выбор человека, без догадки", async () => {
+    sourceSlice.mockResolvedValueOnce({
+      path: "types.rs", rev: "abc", from: 27, to: 38, total_lines: 0, text: "",
+      candidates: ["crates/devai-api/src/signature/types.rs", "crates/devai-core/src/types.rs"],
+    });
+    const w = mount(CodeSlice, {
+      props: { taskId: "t", rev: "abc", path: "types.rs", from: 27, to: 38 },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    await nextTick();
+
+    const cands = w.findAll("button.cand");
+    expect(cands.map((b) => b.text())).toEqual([
+      "crates/devai-api/src/signature/types.rs",
+      "crates/devai-core/src/types.rs",
+    ]);
+    expect(w.find("pre").exists()).toBe(false);
+
+    sourceSlice.mockResolvedValueOnce(slice(27, 38, 700));
+    await cands[1].trigger("click");
+    await flushPromises();
+    expect(sourceSlice).toHaveBeenLastCalledWith("t", "abc", "crates/devai-core/src/types.rs", 27, 38);
+    expect(w.find("pre").exists()).toBe(true);
   });
 });

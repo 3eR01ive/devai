@@ -32,8 +32,24 @@ const props = defineProps<{
 
 const slice = ref<SourceSliceView | null>(null);
 const failed = ref<string | null>(null);
+
+// Отказ приходит с платформы структурой ({kind, message, ...}), а не Error:
+// String(объект) даёт «[object Object]» и прячет настоящую причину.
+function reasonOf(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object") {
+    const o = e as Record<string, unknown>;
+    for (const k of ["message", "error", "text"]) if (typeof o[k] === "string") return o[k] as string;
+    try { return JSON.stringify(e); } catch { return "не удалось прочитать код"; }
+  }
+  return String(e);
+}
 const code = ref<HTMLElement | null>(null);
 const preEl = ref<HTMLElement | null>(null);
+// Если хвост пути неоднозначен, человек выбирает файл сам — выбор живёт здесь.
+const chosen = ref<string | null>(null);
+const usePath = computed(() => chosen.value ?? props.path);
 const step = 40; // сколько строк добавляет одно нажатие
 
 // Грамматика — по расширению файла; неизвестное расширение просто без подсветки.
@@ -80,10 +96,17 @@ function centerOnLinked() {
 
 defineExpose({ centerOnLinked });
 
+function pickCandidate(p: string) {
+  chosen.value = p;
+  const from = slice.value?.from ?? props.from;
+  const to = slice.value?.to ?? props.to;
+  void load(from, to);
+}
+
 async function load(from: number, to: number, keepCentered = false) {
   failed.value = null;
   try {
-    slice.value = await api.sourceSlice(props.taskId, props.rev, props.path, from, to);
+    slice.value = await api.sourceSlice(props.taskId, props.rev, usePath.value, from, to);
     // ждём, пока Vue вставит <code>, и подсвечиваем; nextTick — детерминированно
     // (requestAnimationFrame в фоновой вкладке может не прийти вовсе)
     await nextTick();
@@ -93,7 +116,7 @@ async function load(from: number, to: number, keepCentered = false) {
       centerOnLinked();
     }
   } catch (e) {
-    failed.value = e instanceof Error ? e.message : String(e);
+    failed.value = reasonOf(e);
   }
 }
 
@@ -111,7 +134,10 @@ function whole() {
 }
 
 onMounted(loadLinked);
-watch(() => [props.path, props.from, props.to], loadLinked);
+watch(() => [props.path, props.from, props.to], () => {
+  chosen.value = null;
+  void loadLinked();
+});
 
 const lineCount = () => (slice.value?.text ?? "").split("\n").length;
 
@@ -128,12 +154,16 @@ const linkedRange = computed(() => {
   <div class="codeblock">
     <div class="cap">
       <span>{{ path }}:{{ slice?.from ?? from }}{{ (slice?.to ?? to) > (slice?.from ?? from) ? `–${slice?.to ?? to}` : "" }}</span>
-      <span v-if="slice" class="n">{{ lineCount() }} стр<template v-if="total"> из {{ total }}</template></span>
+      <span v-if="slice && (slice.candidates ?? []).length" class="pick">
+        файл неоднозначен:
+        <button v-for="c in slice.candidates" :key="c" class="cand" @click="pickCandidate(c)">{{ c }}</button>
+      </span>
+      <span v-else-if="slice" class="n">{{ lineCount() }} стр<template v-if="total"> из {{ total }}</template></span>
       <span v-else-if="failed" class="n err" :title="failed">{{ failed }}</span>
       <span v-else class="n">читаю…</span>
     </div>
     <pre
-      v-if="slice"
+      v-if="slice && !(slice.candidates ?? []).length"
       ref="preEl"
       class="line-numbers"
       :data-start="slice.from"
@@ -163,6 +193,10 @@ pre{margin:0;padding:9px 12px;overflow:auto;font-family:var(--mono);font-size:11
   padding:2px 8px;font-size:11px;cursor:pointer}
 .more button:hover{background:rgba(122,167,255,.1)}
 .muted{font-size:11px;color:var(--p-stop)}
+.cap .pick{display:flex;flex-wrap:wrap;gap:5px;align-items:center;color:var(--p-dim)}
+.cap .cand{border:1px solid var(--p-line);border-radius:5px;background:#121820;
+  color:var(--p-ink);font-family:var(--mono);font-size:10.5px;padding:1px 6px;cursor:pointer}
+.cap .cand:hover{border-color:#3ecf8e;color:#3ecf8e}
 /* Строки из ссылки: зелёный из палитры, чтобы видеть, ради чего открывали. */
 .codeblock :deep(.line-highlight){background:rgba(62,207,142,.16);
   box-shadow:inset 3px 0 0 #3ecf8e}
