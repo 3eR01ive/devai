@@ -3,7 +3,7 @@
 // зафиксированном коммите. Читает платформа (source.slice), окно только
 // раскладывает и подсвечивает. Контекст файла разворачивается вверх и вниз
 // отдельными запросами того же чтения — вплоть до всего файла.
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import Prism from "prismjs";
 import "prismjs/components/prism-rust";
 import "prismjs/components/prism-typescript";
@@ -16,6 +16,9 @@ import "prismjs/components/prism-markup-templating";
 import "prismjs/components/prism-sql";
 import "prismjs/components/prism-ini";
 import "prismjs/plugins/line-numbers/prism-line-numbers";
+// Подсветка строк, на которые ссылался отчёт: видно и после разворота файла.
+import "prismjs/plugins/line-highlight/prism-line-highlight";
+import "prismjs/plugins/line-highlight/prism-line-highlight.css";
 import { api } from "../api";
 import type { SourceSliceView } from "../types";
 
@@ -67,8 +70,10 @@ async function load(from: number, to: number) {
   failed.value = null;
   try {
     slice.value = await api.sourceSlice(props.taskId, props.rev, props.path, from, to);
-    // ждём, пока Vue вставит <code>, и подсвечиваем
-    requestAnimationFrame(paint);
+    // ждём, пока Vue вставит <code>, и подсвечиваем; nextTick — детерминированно
+    // (requestAnimationFrame в фоновой вкладке может не прийти вовсе)
+    await nextTick();
+    paint();
   } catch (e) {
     failed.value = e instanceof Error ? e.message : String(e);
   }
@@ -91,6 +96,14 @@ onMounted(loadLinked);
 watch(() => [props.path, props.from, props.to], loadLinked);
 
 const lineCount = () => (slice.value?.text ?? "").split("\n").length;
+
+// Строки из ссылки: с них начинается вставка и они же подсвечены, когда файл
+// развёрнут целиком — иначе непонятно, ради чего открывали.
+const linkedRange = computed(() => {
+  const from = props.from;
+  const to = props.to > props.from ? props.to : props.from;
+  return `${from}-${to}`;
+});
 </script>
 
 <template>
@@ -101,7 +114,13 @@ const lineCount = () => (slice.value?.text ?? "").split("\n").length;
       <span v-else-if="failed" class="n err" :title="failed">{{ failed }}</span>
       <span v-else class="n">читаю…</span>
     </div>
-    <pre v-if="slice" class="line-numbers" :data-start="slice.from"><code
+    <pre
+      v-if="slice"
+      class="line-numbers"
+      :data-start="slice.from"
+      :data-line="linkedRange"
+      :data-line-offset="slice.from - 1"
+    ><code
       ref="code" :class="'language-' + (GRAMMAR[path.split('.').pop()?.toLowerCase() ?? ''] ?? 'none')"
     /></pre>
     <div v-if="slice && (canUp || canDown || !isWhole)" class="more">

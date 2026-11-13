@@ -675,9 +675,25 @@ type Piece =
   | { t: "text"; v: string }
   | { t: "code"; path: string; from: number; to: number };
 
+// Любое поле, которое должно быть текстом, печатаем текстом: объект с
+// формулировкой берём по смыслу, всё прочее — JSON, но никогда «[object Object]».
+function txt(v: any): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return v.map(txt).join(" ");
+  if (typeof v === "object") {
+    for (const k of ["text", "description", "statement", "claim", "value", "v"]) {
+      if (typeof v[k] === "string") return v[k];
+    }
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+  return String(v);
+}
+
 function evidenceOf(c: any): string {
-  const e = (c.violations?.[0] ?? c.evidence?.[0] ?? "") as string;
-  return String(e).slice(0, 1200);
+  const e = c.violations?.[0] ?? c.evidence?.[0] ?? "";
+  return txt(e).slice(0, 1200);
 }
 
 // ── данные ──────────────────────────────────────────────────────────────
@@ -1158,11 +1174,11 @@ onMounted(load);
                         <span>вес {{ (ruleFor(c.id)!.weight ?? 0).toFixed(3) }}</span>
                         <span v-if="ruleFor(c.id)!.floor != null" class="floor">пол {{ ruleFor(c.id)!.floor }}</span>
                       </div>
-                      <div class="rs">{{ ruleFor(c.id)!.statement }}</div>
+                      <div class="rs">{{ txt(ruleFor(c.id)!.statement) }}</div>
                       <div class="anchors">
                         <div v-for="k in ['1.0','0.7','0.4','0.0'].filter(k => ruleFor(c.id)!.anchors[k] != null)" :key="k"
                              class="anchor" :class="{ on: c.score !== null && Number(k) === Number(c.score) }">
-                          <span class="v">{{ k }}</span><span class="t">{{ ruleFor(c.id)!.anchors[k] }}</span>
+                          <span class="v">{{ k }}</span><span class="t">{{ txt(ruleFor(c.id)!.anchors[k]) }}</span>
                         </div>
                       </div>
                     </div>

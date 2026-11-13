@@ -18,7 +18,10 @@ type Piece =
   | { t: "text"; v: string }
   | { t: "code"; path: string; from: number; to: number };
 
-function pieces(text: string): Piece[] {
+function pieces(raw: unknown): Piece[] {
+  // Компонент принимает ТЕКСТ: объект на входе — ошибка вызывающего, но
+  // печатать «[object Object]» вместо формулировки нельзя.
+  const text = typeof raw === "string" ? raw : raw == null ? "" : String((raw as any).text ?? JSON.stringify(raw));
   const out: Piece[] = [];
   let last = 0;
   for (const m of text.matchAll(REF)) {
