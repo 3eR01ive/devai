@@ -144,6 +144,11 @@ pre{margin:0;padding:9px 12px;overflow:auto;font-family:var(--mono);font-size:11
   padding:2px 8px;font-size:11px;cursor:pointer}
 .more button:hover{background:rgba(122,167,255,.1)}
 .muted{font-size:11px;color:var(--p-stop)}
+/* Строки из ссылки: зелёный из палитры, чтобы видеть, ради чего открывали. */
+.codeblock :deep(.line-highlight){background:rgba(62,207,142,.16);
+  box-shadow:inset 3px 0 0 #3ecf8e}
+.codeblock :deep(.line-highlight::before),
+.codeblock :deep(.line-highlight::after){display:none}
 code{font-family:inherit;font-size:inherit;color:#c5d0dc;background:none}
 @media (max-width: 1199px){.cap{font-size:12px}pre{font-size:12px}}
 </style>
