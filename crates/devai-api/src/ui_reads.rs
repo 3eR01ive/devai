@@ -306,6 +306,47 @@ pub struct SourceSliceView {
     pub text: String,
 }
 
+/// Путь файла в коммите: точный или единственный по хвосту.
+/// Отчёты пишут ссылки сокращённо, а `git show` требует полный путь.
+fn resolve_path(repo: &Path, rev: &str, path: &str) -> Result<String, crate::ApiError> {
+    let exact = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &format!("{rev}:{path}")])
+        .status();
+    if matches!(exact, Ok(s) if s.success()) {
+        return Ok(path.to_string());
+    }
+    let listing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-r", "--name-only", rev])
+        .output()
+        .map_err(|e| crate::ApiError::refused("no_source", format!("git недоступен: {e}")))?;
+    let listed = String::from_utf8_lossy(&listing.stdout).to_string();
+    let files: Vec<&str> = listed.lines().collect();
+    let tail = format!("/{path}");
+    let hits: Vec<&str> = files
+        .iter()
+        .copied()
+        .filter(|f| *f == path || f.ends_with(&tail))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0].to_string()),
+        0 => Err(crate::ApiError::refused(
+            "no_source",
+            format!("в коммите {rev} нет файла {path}"),
+        )),
+        _ => Err(crate::ApiError::refused(
+            "ambiguous_path",
+            format!(
+                "файл {path} в коммите {rev} неоднозначен: {}",
+                hits.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}
+
 fn repo_of(facts_repo: Option<PathBuf>) -> Option<PathBuf> {
     facts_repo
 }
@@ -326,10 +367,15 @@ impl Api {
         let repo = repo_of(f.repo).ok_or_else(|| {
             crate::ApiError::refused("no_workspace", "у задачи нет известного репозитория")
         })?;
+        // Отчёты ссылаются на файлы сокращённо («signature/types.rs» вместо
+        // «crates/devai-api/src/signature/types.rs»). Путь разрешаем по дереву
+        // коммита: точное совпадение, иначе единственное совпадение по хвосту.
+        // Неоднозначность — отказ со списком, а не догадка.
+        let path = resolve_path(&repo, rev, path)?;
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["show", &format!("{rev}:{path}")])
+            .args(["show", &format!("{rev}:{}", path)])
             .output();
         let text = match out {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -373,5 +419,65 @@ trait HomePath {
 impl HomePath for Api {
     fn home_path(&self) -> &Path {
         self.home_dir()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_path;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Временный git-репозиторий: два уровня каталогов, чтобы проверять хвост.
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sh = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        sh(&["init", "-q"]);
+        std::fs::create_dir_all(dir.path().join("crates/api/src/signature")).unwrap();
+        std::fs::write(dir.path().join("crates/api/src/signature/types.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("crates/api/src/lib.rs"), "fn b() {}\n").unwrap();
+        sh(&["add", "-A"]);
+        sh(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+        dir
+    }
+
+    fn head(dir: &Path) -> String {
+        let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn exact_path_wins() {
+        let dir = repo();
+        let rev = head(dir.path());
+        let got = resolve_path(dir.path(), &rev, "crates/api/src/lib.rs").unwrap();
+        assert_eq!(got, "crates/api/src/lib.rs");
+    }
+
+    #[test]
+    fn short_path_resolves_to_the_only_tail_match() {
+        // Отчёт писал «signature/types.rs» — полный путь ищется по хвосту.
+        let dir = repo();
+        let rev = head(dir.path());
+        let got = resolve_path(dir.path(), &rev, "signature/types.rs").unwrap();
+        assert_eq!(got, "crates/api/src/signature/types.rs");
+    }
+
+    #[test]
+    fn missing_file_is_a_typed_refusal_not_a_guess() {
+        let dir = repo();
+        let rev = head(dir.path());
+        let err = resolve_path(dir.path(), &rev, "nope/absent.rs").unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("no_source"), "{text}");
     }
 }

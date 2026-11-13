@@ -98,7 +98,7 @@ const lineCount = () => (slice.value?.text ?? "").split("\n").length;
     <div class="cap">
       <span>{{ path }}:{{ slice?.from ?? from }}{{ (slice?.to ?? to) > (slice?.from ?? from) ? `–${slice?.to ?? to}` : "" }}</span>
       <span v-if="slice" class="n">{{ lineCount() }} стр<template v-if="total"> из {{ total }}</template></span>
-      <span v-else-if="failed" class="n">код недоступен</span>
+      <span v-else-if="failed" class="n err" :title="failed">{{ failed }}</span>
       <span v-else class="n">читаю…</span>
     </div>
     <pre v-if="slice" class="line-numbers" :data-start="slice.from"><code
@@ -118,6 +118,7 @@ const lineCount = () => (slice.value?.text ?? "").split("\n").length;
 .cap{display:flex;justify-content:space-between;gap:10px;padding:5px 10px;border-bottom:1px solid var(--p-line);
   background:#0f1318;font-family:var(--mono);font-size:11px;color:var(--p-dim2)}
 .cap .n{white-space:nowrap}
+.cap .n.err{color:var(--p-stop);max-width:70%;overflow:hidden;text-overflow:ellipsis}
 pre{margin:0;padding:9px 12px;overflow:auto;font-family:var(--mono);font-size:11.5px;line-height:1.55;max-height:520px}
 .more{display:flex;gap:8px;align-items:center;padding:6px 10px;border-top:1px solid var(--p-line);background:#0e141a}
 .more button{background:transparent;border:1px solid var(--p-line);color:var(--p-human);border-radius:6px;

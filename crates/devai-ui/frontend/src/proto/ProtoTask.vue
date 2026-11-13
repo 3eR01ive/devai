@@ -79,7 +79,13 @@ const theta = computed<number | null>(
   () => (typeof headline.value.theta === "number" ? headline.value.theta : null),
 );
 const verdict = computed<string>(() => String(headline.value.verdict ?? ""));
-const rev = computed<string>(() => qaBody.value.workspace_revision?.git_head ?? "");
+// Коммит, на котором читается код по ссылкам из отчётов. Приоритет — тот,
+// что платформа проштамповала в отчёте реализации (это и есть коммит задачи);
+// запасной — голова из отчёта качества.
+const implCommit = ref<string>("");
+const rev = computed<string>(
+  () => implCommit.value || String(qaBody.value.workspace_revision?.git_head ?? ""),
+);
 
 const scoreTone = computed(() => {
   if (score.value === null) return "wait";
@@ -692,6 +698,15 @@ async function load() {
     rules.value = rb;
     signature.value = sig;
     artifacts.value = arts as ArtifactView[];
+    // Отчёт реализации (последний) называет коммит задачи — по нему и читаем код.
+    const impl = (arts as ArtifactView[])
+      .filter((a) => a.kind === "IMPLEMENTATION_REPORT")
+      .sort((a, b) => b.seq - a.seq)[0];
+    if (impl) {
+      await ensureBody(impl);
+      const b = (runBodies.value as Record<string, any>)[impl.id];
+      if (b?.commit) implCommit.value = String(b.commit);
+    }
   } catch (e) {
     error.value = toUiError(e);
   }
