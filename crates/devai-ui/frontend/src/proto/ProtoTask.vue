@@ -9,7 +9,7 @@ import type {
   ArtifactView, ProgressView, QualityReportView, RulebookView, SignatureView,
   TaskUsageView, UiError, WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
-import CodeSlice from "./CodeSlice.vue";
+import CodeRefText from "./CodeRefText.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -669,36 +669,6 @@ type Piece =
   | { t: "text"; v: string }
   | { t: "code"; path: string; from: number; to: number };
 
-function pieces(text: string): Piece[] {
-  const out: Piece[] = [];
-  let last = 0;
-  for (const m of text.matchAll(REF)) {
-    const [raw, path, a, b] = m;
-    const start = m.index ?? 0;
-    if (start < last) continue;
-    if (start > last) out.push({ t: "text", v: text.slice(last, start) });
-    out.push({
-      t: "code",
-      path: String(path ?? ""),
-      from: a ? Number(a) : 1,
-      to: b ? Number(b) : a ? Number(a) + 11 : 12,
-    });
-    last = start + raw.length;
-  }
-  if (last < text.length) out.push({ t: "text", v: text.slice(last) });
-  return out;
-}
-
-// Ссылки на код в тексте: по умолчанию вставка СВЁРНУТА, раскрывается
-// кликом по самой ссылке — как просил оператор.
-const openRefs = ref<Record<string, boolean>>({});
-function refKey(s: any, i: number, k: number) {
-  return `${s.state}:${runOf(s)?.id ?? ""}:${i}:${k}`;
-}
-function toggleRef(key: string) {
-  openRefs.value = { ...openRefs.value, [key]: !openRefs.value[key] };
-}
-
 function evidenceOf(c: any): string {
   const e = (c.violations?.[0] ?? c.evidence?.[0] ?? "") as string;
   return String(e).slice(0, 1200);
@@ -1056,27 +1026,7 @@ onMounted(load);
                       <span class="p-mark">{{ f.t === 'add' ? '+' : f.t === 'del' ? '−' : '·' }}</span>
                       <span class="p-sev" :class="f.severity">{{ f.severity }}</span>
                       <div class="p-findt">
-                        <template v-for="(pc, kk) in pieces(f.text)" :key="kk">
-                          <template v-if="pc.t === 'text'">{{ pc.v }}</template>
-                          <template v-else>
-                            <button class="p-coderef" :class="{ on: openRefs[refKey(s, k, kk)] }" @click.stop="toggleRef(refKey(s, k, kk))">
-                              {{ pc.path }}:{{ pc.from }}{{ pc.to > pc.from ? "–" + pc.to : "" }}
-                            </button>
-                            <template v-if="openRefs[refKey(s, k, kk)]">
-                              <CodeSlice
-                                v-if="rev"
-                                :task-id="id"
-                                :rev="rev"
-                                :path="pc.path"
-                                :from="pc.from"
-                                :to="pc.to"
-                              />
-                              <div v-else class="p-empty" style="padding: 4px 0">
-                                код недоступен: у задачи нет зафиксированного коммита
-                              </div>
-                            </template>
-                          </template>
-                        </template>
+                        <CodeRefText :text="f.text" :task-id="id" :rev="rev" />
                       </div>
                       <span v-if="f.req" class="p-dim2 mono">{{ f.req }}</span>
                     </div>
@@ -1096,27 +1046,7 @@ onMounted(load);
                     <div v-for="(f, k) in reviewBody(s)!.findings" :key="k" class="p-find">
                       <span class="p-sev" :class="f.severity">{{ f.severity }}</span>
                       <div class="p-findt">
-                        <template v-for="(pc, kk) in pieces(String(f.description ?? ''))" :key="kk">
-                          <template v-if="pc.t === 'text'">{{ pc.v }}</template>
-                          <template v-else>
-                            <button class="p-coderef" :class="{ on: openRefs[refKey(s, k, kk)] }" @click.stop="toggleRef(refKey(s, k, kk))">
-                              {{ pc.path }}:{{ pc.from }}{{ pc.to > pc.from ? "–" + pc.to : "" }}
-                            </button>
-                            <template v-if="openRefs[refKey(s, k, kk)]">
-                              <CodeSlice
-                                v-if="rev"
-                                :task-id="id"
-                                :rev="rev"
-                                :path="pc.path"
-                                :from="pc.from"
-                                :to="pc.to"
-                              />
-                              <div v-else class="p-empty" style="padding: 4px 0">
-                                код недоступен: у задачи нет зафиксированного коммита
-                              </div>
-                            </template>
-                          </template>
-                        </template>
+                        <CodeRefText :text="String(f.description ?? '')" :task-id="id" :rev="rev" />
                       </div>
                     </div>
                   </template>
@@ -1222,10 +1152,7 @@ onMounted(load);
                       </div>
                     </div>
                     <div class="p-ev">
-                      <template v-for="(p, i) in pieces(evidenceOf(c))" :key="i">
-                        <span v-if="p.t === 'text'">{{ p.v }}</span>
-                        <CodeSlice v-else :task-id="id" :rev="rev" :path="p.path" :from="p.from" :to="p.to" />
-                      </template>
+                      <CodeRefText :text="evidenceOf(c)" :task-id="id" :rev="rev" />
                     </div>
                   </div>
                 </div>
