@@ -61,4 +61,25 @@ describe("CodeSlice", () => {
     expect(pre.attributes("data-line-offset")).toBe("0");
     expect(document.querySelector(".line-highlight")).not.toBeNull();
   });
+
+  it("при развороте держит подсвеченный кусок по центру окна кода", async () => {
+    sourceSlice.mockResolvedValue(slice(1, 500, 500));
+    const w = mount(CodeSlice, {
+      props: { taskId: "t", rev: "abc", path: "crates/x.rs", from: 100, to: 110 },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    await nextTick();
+
+    const pre = w.find("pre").element as HTMLElement;
+    const hl = document.querySelector(".line-highlight") as HTMLElement;
+    expect(hl).not.toBeNull();
+    // Теснота вёрстки: 520px окна, строка ссылки на 2000-й позиции, высотой 200.
+    Object.defineProperty(hl, "offsetTop", { value: 2000, configurable: true });
+    Object.defineProperty(hl, "offsetHeight", { value: 200, configurable: true });
+    Object.defineProperty(pre, "clientHeight", { value: 520, configurable: true });
+
+    (w.vm as any).centerOnLinked();
+    expect(pre.scrollTop).toBe(1840);
+  });
 });

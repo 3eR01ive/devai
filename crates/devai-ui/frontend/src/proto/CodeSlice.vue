@@ -33,6 +33,7 @@ const props = defineProps<{
 const slice = ref<SourceSliceView | null>(null);
 const failed = ref<string | null>(null);
 const code = ref<HTMLElement | null>(null);
+const preEl = ref<HTMLElement | null>(null);
 const step = 40; // сколько строк добавляет одно нажатие
 
 // Грамматика — по расширению файла; неизвестное расширение просто без подсветки.
@@ -66,7 +67,20 @@ const isWhole = computed(
   () => !!slice.value && slice.value.from <= 1 && total.value > 0 && slice.value.to >= total.value,
 );
 
-async function load(from: number, to: number) {
+// Держим подсвеченный кусок в центре окна кода: при развороте строки
+// добавляются сверху или снизу, и ссылка иначе уезжает из виду.
+function centerOnLinked() {
+  const pre = preEl.value;
+  if (!pre) return;
+  const hl = pre.querySelector(".line-highlight") as HTMLElement | null;
+  if (!hl) return;
+  const target = hl.offsetTop - (pre.clientHeight - hl.offsetHeight) / 2;
+  pre.scrollTop = Math.max(0, target);
+}
+
+defineExpose({ centerOnLinked });
+
+async function load(from: number, to: number, keepCentered = false) {
   failed.value = null;
   try {
     slice.value = await api.sourceSlice(props.taskId, props.rev, props.path, from, to);
@@ -74,6 +88,10 @@ async function load(from: number, to: number) {
     // (requestAnimationFrame в фоновой вкладке может не прийти вовсе)
     await nextTick();
     paint();
+    if (keepCentered) {
+      await nextTick();
+      centerOnLinked();
+    }
   } catch (e) {
     failed.value = e instanceof Error ? e.message : String(e);
   }
@@ -83,13 +101,13 @@ function loadLinked() {
   void load(props.from, props.to);
 }
 function moreUp() {
-  if (slice.value) void load(Math.max(1, slice.value.from - step), slice.value.to);
+  if (slice.value) void load(Math.max(1, slice.value.from - step), slice.value.to, true);
 }
 function moreDown() {
-  if (slice.value) void load(slice.value.from, slice.value.to + step);
+  if (slice.value) void load(slice.value.from, slice.value.to + step, true);
 }
 function whole() {
-  if (slice.value) void load(1, Math.max(slice.value.to, total.value));
+  if (slice.value) void load(1, Math.max(slice.value.to, total.value), true);
 }
 
 onMounted(loadLinked);
@@ -116,6 +134,7 @@ const linkedRange = computed(() => {
     </div>
     <pre
       v-if="slice"
+      ref="preEl"
       class="line-numbers"
       :data-start="slice.from"
       :data-line="linkedRange"
