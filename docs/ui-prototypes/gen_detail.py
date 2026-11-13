@@ -159,6 +159,12 @@ for s in ST:
         'execs': [{'id': e['id'][:8], 'status': e['status'], 'attempt': e.get('attempt'),
                    'summary': e.get('summary'), 'error': (e.get('error') or '')[:400],
                    'usage': e.get('usage')} for e in ex[-6:]],
+        # ВСЕ прогоны шага: по ним рисуется полоса засечек и детали выбранного
+        'executions': s.get('runs') or [{'id': e['id'], 'status': e['status'],
+                        'attempt': e.get('attempt'), 'started': e.get('started'),
+                        'finished': e.get('finished'), 'summary': e.get('summary'),
+                        'error': (e.get('error') or '')[:400], 'usage': e.get('usage')}
+                        for e in ex],
         'kind': 'gate' if s['gate'] else 'role',
         'body': {},
     }
@@ -438,6 +444,38 @@ main{padding:16px 26px 80px;max-width:1400px}
 .spark i.ok{background:var(--pass)} .spark i.bad{background:var(--stop)}
 .spark i.mid{background:#4a6b86} .spark i.un{background:#2b3440}
 .spark.up{filter:saturate(1)} .spark.down i.ok,.spark.down i.mid{background:#7a5a3a}
+/* путь шагов: круги с баллом и соединения */
+.path{display:flex;align-items:flex-start;padding:14px 26px 4px;max-width:1400px}
+.pstep{display:flex;flex-direction:column;align-items:center;gap:5px;cursor:pointer;min-width:76px}
+.pc{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:13px;background:var(--card);border:2px solid #2b3a4a;color:var(--dim)}
+.pc.ok{border-color:rgba(62,207,142,.65);color:var(--pass);background:rgba(62,207,142,.08)}
+.pc.warn{border-color:rgba(245,181,68,.65);color:var(--now);background:rgba(245,181,68,.08)}
+.pc.none{border-color:#2b3a4a;color:var(--dim2)}
+.pstep.cur .pc{box-shadow:0 0 0 4px rgba(122,167,255,.16);border-color:var(--human)}
+.pstep.todo .pl{color:var(--dim2)}
+.pl{font-size:11.5px;color:var(--ink);text-align:center;white-space:nowrap}
+.pm{font-size:10px;color:var(--dim2);font-family:var(--mono)}
+.conn{flex:1;height:2px;background:#222c37;margin-top:21px;min-width:18px}
+.conn.done{background:linear-gradient(90deg,#2f9d6e,#2b6b52)}
+/* прогоны шага */
+.runmemo{font-size:10.5px;color:var(--dim2);font-family:var(--mono);padding:7px 14px 0}
+.runs{padding:10px 14px 0}
+.rstrip{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+.rlab{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim2);margin-right:6px}
+.rd{width:7px;height:14px;border-radius:2px;background:#2b3440;cursor:pointer;display:inline-block}
+.rd.ok{background:var(--pass)} .rd.bad{background:var(--stop)} .rd.run{background:var(--now)}
+.rd.sel{outline:2px solid var(--human);outline-offset:1px}
+.rsel{font-family:var(--mono);font-size:10.5px;color:var(--dim2);margin-left:8px}
+.rdet{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;
+  font-size:11.5px;margin:8px 0 2px;padding:7px 11px;background:var(--card2);border:1px solid var(--line);border-radius:8px}
+.rdet .kv{font-family:var(--mono);color:#cfd8e2;display:inline-flex;gap:6px;align-items:baseline;white-space:nowrap}
+.rdet .kv i{font-style:normal;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim2);font-family:var(--sans,inherit)}
+.rdet .kv.err{color:var(--stop);white-space:normal;flex-basis:100%}
+.badge-status{font-size:10.5px;padding:2px 8px;border-radius:999px;border:1px solid var(--line)}
+.b-pass{color:var(--pass);border-color:rgba(62,207,142,.35);background:rgba(62,207,142,.07)}
+.b-stop{color:var(--stop);border-color:rgba(240,97,109,.35);background:rgba(240,97,109,.07)}
+.b-now{color:var(--now);border-color:rgba(245,181,68,.35);background:rgba(245,181,68,.07)}
 .mstats{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--dim2)}
 .mstats b{color:var(--dim);font-weight:500}
 .mstats .lim{color:#5a6877}
@@ -1172,7 +1210,7 @@ function stageHTML(s, i){
     return `<span class="spark ${mode[1]}" title="${esc(tip)}">${bars}</span>`;
   }
   const cls = ['step', s.status === 'passed' ? 'done' : s.status === 'current' ? 'now' : 'todo',
-               s.gate ? 'gate' : '', i === CUR ? 'open' : ''].join(' ');
+               s.gate ? 'gate' : '', i === CUR ? 'open' : '', 'by-' + s.state].join(' ');
   const hot = s.status === 'current';
   // показатель качества в шапке шага: виден и когда шаг свёрнут
   let scoreChip = '';
@@ -1199,7 +1237,21 @@ function stageHTML(s, i){
     s.cost ? `<span><b>$${s.cost.toFixed(2)}</b></span>` : '',
     s.limit ? `<span class="lim">лимит ${s.limit}</span>` : '',
   ].filter(Boolean).join('<i class="dot"></i>');
-  const bodyKinds = Object.keys(s.body);
+  // Данные вкладок берём у ВЫБРАННОГО прогона: у каждого свой артефакт.
+  // Нет артефакта у прогона — вкладка честно говорит, что он ничего не отдал.
+  const selRun = (s.executions || [])[selOf(s)] || null;
+  const art = selRun && selRun.art ? selRun.art : null;
+  const eff = Object.assign({}, s.body);
+  if (art) {
+    if (art.spec) eff.spec = art.spec;
+    if (art.review) eff.review = art.review;
+    if (art.impl) eff.impl = art.impl;
+    if (art.checks) eff.qa = Object.assign({}, s.body.qa || {}, {checks: art.checks, totals: art.qa_totals});
+  }
+  // У прогона есть засечка, но артефакта он не отдал — вкладок нет вовсе:
+  // показывать чужие данные под выбранным прогоном было бы враньём.
+  const noData = (s.executions || []).length > 0 && !art;
+  const bodyKinds = noData ? [] : Object.keys(eff);
   const isGate = s.kind === 'gate';
   const tabs = [];
   // «вход/выход» убраны: служебные контракты роли ничего не объясняют человеку.
@@ -1219,12 +1271,12 @@ function stageHTML(s, i){
   if (bodyKinds.includes('brief'))
     panels.push(`<div class="panel ${'brief'===firstTab?'on':''}" data-p="brief">${briefPanel(s.body.brief)}</div>`);
 
-  if (bodyKinds.includes('qa')) panels.push(`<div class="panel ${'qa'===firstTab?'on':''}" data-p="qa">${qaPanel(s.body)}</div>`);
+  if (bodyKinds.includes('qa')) panels.push(`<div class="panel ${'qa'===firstTab?'on':''}" data-p="qa">${qaPanel(eff)}</div>`);
   if (bodyKinds.includes('spec') || bodyKinds.includes('rulebook'))
     panels.push(`<div class="panel ${'spec'===firstTab?'on':''}" data-p="spec">${
-      bodyKinds.includes('rulebook') ? rulebookHTML(s.body.rulebook, s.body.profile) : specPanel(s.body)}</div>`);
-  if (bodyKinds.includes('review')) panels.push(`<div class="panel ${'review'===firstTab?'on':''}" data-p="review">${reviewPanel(s.body)}</div>`);
-  if (bodyKinds.includes('impl')) panels.push(`<div class="panel ${'impl'===firstTab?'on':''}" data-p="impl">${implPanel(s.body)}</div>`);
+      bodyKinds.includes('rulebook') ? rulebookHTML(eff.rulebook, eff.profile) : specPanel(eff)}</div>`);
+  if (bodyKinds.includes('review')) panels.push(`<div class="panel ${'review'===firstTab?'on':''}" data-p="review">${reviewPanel(eff)}</div>`);
+  if (bodyKinds.includes('impl')) panels.push(`<div class="panel ${'impl'===firstTab?'on':''}" data-p="impl">${implPanel(eff)}</div>`);
   if (bodyKinds.includes('worktree')) panels.push(`<div class="panel ${'worktree'===firstTab?'on':''}" data-p="worktree">${worktreePanel(s.body.worktree)}</div>`);
   return `<div class="${cls}" data-i="${i}">
     <div class="nodebox" title="${esc(s.statusWord||s.status)}"><div class="node"><span>${s.status==='passed'?'✓':''}</span></div>
@@ -1236,6 +1288,10 @@ function stageHTML(s, i){
           <div class="t2"><span class="mstats">${stats}</span>${btn(s)}<span class="caret">▶</span></div>
         </div>
         <div class="body">
+          ${runsHTML(s)}
+          <div class="runmemo">${art
+            ? 'вкладки ниже — данные прогона ' + (selOf(s) + 1) + ' из ' + (s.executions || []).length + ' · ' + esc(art.display || art.kind)
+            : 'прогон ' + (selOf(s) + 1) + ' из ' + (s.executions || []).length + ' ничего не отдал — вкладки недоступны'}</div>
           ${s.role ? `<div class="rolememo">роль <b>${esc(s.role)}</b>${s.version ? ' v' + s.version : ''}${s.in_contract ? ' · вход ' + esc(s.in_contract) : ''}${s.out_contract ? ' · выход ' + esc(s.out_contract) : ''}</div>` : ''}
           <div class="tabs">${tabs.map(([k,w])=>
             `<div class="tab ${k===firstTab?'on':''}" data-p="${k}" onclick="tab(event, ${i}, '${k}')">${w}</div>`).join('')}</div>
@@ -1334,6 +1390,114 @@ function renderConv(){
   el.style.display = h ? '' : 'none';
 }
 
+// ── путь шагов и прогоны ───────────────────────────────────────────────────
+// Круги — шаги, внутри балл качества (или «—», если отчёта нет), цвет от балла
+// против порога. Под кругами — сколько прогонов. Клик открывает шаг.
+function scoreOfStage(s){
+  if (s.body && s.body.qa){
+    const hl = ((s.body.qa.totals||{}).headline)||{};
+    if (hl.score != null) return {score: hl.score, theta: (hl.theta != null ? hl.theta : 0.8)};
+  }
+  return null;
+}
+
+function nodeCls(q){
+  if (!q) return 'none';
+  return q.score < q.theta ? 'warn' : 'ok';
+}
+
+function pathHTML(){
+  return S.map(function(s, i){
+    const q = scoreOfStage(s);
+    const cls = !q ? 'none' : (q.score < q.theta ? 'warn' : 'ok');
+    const num = q ? (q.score * 100).toFixed(0) : '—';
+    const conn = i ? '<div class="conn ' + (S[i-1].status === 'passed' ? 'done' : '') + '"></div>' : '';
+    return conn +
+      '<div class="pstep ' + s.status + (s.state === CUR ? ' cur' : '') + '" onclick="gotoStep(' + i + ')">' +
+        '<div class="pc ' + cls + '" title="' + esc(s.title) + (q ? ' · качество ' + (q.score*100).toFixed(1) + '% · порог ' + (q.theta*100).toFixed(0) + '%' : ' · оценки нет') + '">' + num + '</div>' +
+        '<div class="pl">' + esc(s.title) + '</div>' +
+        '<div class="pm">' + (s.attempts ? s.attempts + ' прогонов' : '—') + '</div>' +
+      '</div>';
+  }).join('');
+}
+
+function renderPath(){
+  const el = document.getElementById('path');
+  if (el) el.innerHTML = pathHTML();
+}
+
+function gotoStep(i){
+  document.querySelectorAll('.step').forEach(function(el){
+    el.classList.toggle('open', +el.dataset.i === i);
+  });
+  const el = document.querySelector('.step[data-i="' + i + '"]');
+  if (el) el.scrollIntoView({block: 'center', behavior: 'smooth'});
+}
+
+// Выбранный прогон шага: по умолчанию ПОСЛЕДНИЙ.
+const SEL = {};
+function selOf(s){
+  const n = (s.executions || []).length;
+  if (!(s.state in SEL)) SEL[s.state] = n ? n - 1 : -1;
+  return SEL[s.state];
+}
+function pick(state, k){
+  SEL[state] = k;
+  document.getElementById('s').innerHTML = S.map(stageHTML).join('');
+  initQa(document.getElementById('s'));
+  if (window.Prism) Prism.highlightAllUnder(document.getElementById('s'));
+  const el = document.querySelector('.step.by-' + state);
+  if (el) el.classList.add('open');
+}
+
+function dur(e){
+  if (!e.started) return '—';
+  const a = new Date(e.started).getTime();
+  const b = e.finished ? new Date(e.finished).getTime() : Date.now();
+  const m = Math.max(0, Math.round((b - a) / 60000));
+  return m < 60 ? m + ' мин' : Math.floor(m / 60) + ' ч ' + (m % 60) + ' мин';
+}
+function when(e){
+  return e.started ? new Date(e.started).toLocaleString('ru-RU', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'}) : '—';
+}
+function fmtTok(n){
+  if (n == null) return '—';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + ' млн';
+  if (n >= 1e3) return Math.round(n/1e3) + ' тыс';
+  return String(n);
+}
+
+function runsHTML(s){
+  const ex = s.executions || [];
+  if (!ex.length) return '<div class="empty" style="padding:2px 0">прогонов не было</div>';
+  const sel = selOf(s);
+  const dots = ex.map(function(e, k){
+    const cls = e.status === 'COMPLETED' ? 'ok' : (e.status === 'FAILED' ? 'bad' : 'run');
+    return '<span class="rd ' + cls + (k === sel ? ' sel' : '') +
+      '" data-state="' + s.state + '" data-k="' + k + '"' +
+      ' title="прогон #' + e.attempt + ' · ' + e.status + ' · ' + when(e) + '"></span>';
+  }).join('');
+  const e = ex[sel] || {};
+  const u = e.usage || null;
+  const arts = (s.produced || []).filter(function(a){ return a.execution_id === e.id; });
+  const word = e.status === 'COMPLETED' ? 'дошёл до результата' : e.status === 'FAILED' ? 'упал' : 'идёт';
+  let d = '<div class="runs">' +
+    '<div class="rstrip"><span class="rlab">прогоны</span>' + dots +
+      '<span class="rsel">выбран ' + (sel + 1) + ' из ' + ex.length + '</span></div>' +
+    '<div class="rdet">' +
+      '<span class="badge-status ' + (e.status === 'FAILED' ? 'b-stop' : e.status === 'RUNNING' ? 'b-now' : 'b-pass') + '">' + word + '</span>' +
+      '<span class="kv"><i>попытка</i>№' + (e.attempt ?? '—') + '</span>' +
+      '<span class="kv"><i>начат</i>' + when(e) + '</span>' +
+      '<span class="kv"><i>длился</i>' + dur(e) + '</span>' +
+      (u ? '<span class="kv"><i>токены</i>' + fmtTok(u.in) + ' вход · ' + fmtTok(u.out) + ' выход · <b>' + fmtTok(u.total) + '</b> · ' + u.calls + ' вызовов</span>' : '') +
+      (u ? '<span class="kv"><i>цена</i>$' + (u.cost || 0).toFixed(3) + ' · ' + (u.model || '—') + '</span>' : '') +
+      (arts.length ? '<span class="kv"><i>отдал</i>' + arts.map(function(a){ return esc(a.display || a.kind); }).join(', ') + '</span>' : '') +
+      (e.error ? '<span class="kv err"><i>ошибка</i>' + esc(e.error) + '</span>' : '') +
+      (e.summary ? '<span class="kv"><i>итог</i>' + esc(e.summary) + '</span>' : '') +
+        '</div></div>';
+  return d;
+}
+
 function toggle(i){
   document.querySelectorAll('.step').forEach(el=>{
     el.classList.toggle('open', +el.dataset.i === i ? !el.classList.contains('open') : false);
@@ -1352,6 +1516,14 @@ function tab(ev, i, p){
 }
 try{
   document.getElementById('s').innerHTML = S.map(stageHTML).join('');
+  // Клик по засечке прогона: обработчик живёт на контейнере и переживает
+  // перерисовку содержимого, поэтому регистрируется один раз.
+  document.getElementById('s').addEventListener('click', function(ev){
+    const dot = ev.target.closest('.rd');
+    if (!dot) return;
+    ev.stopPropagation();
+    pick(dot.dataset.state, Number(dot.dataset.k));
+  });
   initQa(document.getElementById('s'));
   if (window.Prism) Prism.highlightAllUnder(document.getElementById('s'));
   // #qa / #spec / #review — открыть нужный шаг и вкладку сразу (удобно для снимков)

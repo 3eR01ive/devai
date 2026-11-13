@@ -33,6 +33,8 @@ def jcli(*args):
     return json.loads(out, strict=False) if out.strip() else None
 
 
+head_ref = ['']  # реальный head известен позже; runs_of читает его на лету
+
 prog = jcli('task', 'progress', TASK)
 task = prog['task']
 arts = jcli('artifact', 'list', TASK) or []
@@ -149,6 +151,7 @@ for kind, a in latest.items():
 
 head = (out_arts.get('IMPLEMENTATION_REPORT', {}).get('body') or {}).get('commit') \
     or (out_arts.get('QUALITY_REPORT', {}).get('body') or {}).get('workspace_revision', {}).get('git_head')
+head_ref[0] = head or ''
 
 # ── сходимость: раунды по стадиям ──────────────────────────────────────────
 def convergence_state():
@@ -247,6 +250,122 @@ for st in stages:
 for st in stages:
     ids = {e['id'] for e in st['executions']}
     st['produced'] = [a for a in arts if a.get('execution_id') in ids]
+
+# ── данные ВЫБРАННОГО прогона: тело артефакта, который он отдал ────────────
+# Вкладки шага раньше всегда показывали последний артефакт. Здесь готовим
+# тела по прогонам, чтобы клик по засечке менял и данные, а не только статус.
+def req_oq(spec):
+    """Вопросы, привязанные к пунктам требования (по коду REQ-… в тексте)."""
+    reqs = spec.get('requirements') or []
+    oqs = spec.get('open_questions') or []
+    by_req, common = {}, []
+    ids = [r.get('id') for r in reqs]
+    for q in oqs:
+        hit = [i for i in ids if i and i in q]
+        if hit:
+            by_req.setdefault(hit[0], []).append(q)
+        else:
+            common.append(q)
+    return by_req, common
+
+
+def _trim(kind, body):
+    """Срезаем служебное, что не рисуется: адреса кода, историю правок,
+    счётчики. Оставляем то, что видно во вкладках."""
+    if not isinstance(body, dict):
+        return body
+    if kind == 'REQUIREMENTS_SPEC':
+        return {
+            'task_name': body.get('task_name'), 'version': body.get('version'),
+            'human_paragraph': body.get('human_paragraph'),
+            'requirements': [{'id': r.get('id'), 'statement': r.get('statement'),
+                              'acceptance_criteria': r.get('acceptance_criteria') or []}
+                             for r in body.get('requirements') or []],
+            'open_questions': body.get('open_questions') or [],
+        }
+    if kind == 'REVIEW_REPORT':
+        return {
+            'verdict': body.get('verdict'), 'summary': body.get('summary'),
+            'human_paragraph': body.get('human_paragraph'),
+            'spec_seq': body.get('spec_seq'),
+            'findings': [{'severity': f.get('severity'), 'description': f.get('description'),
+                          'requirement_ref': f.get('requirement_ref')}
+                         for f in body.get('findings') or []],
+        }
+    if kind == 'IMPLEMENTATION_REPORT':
+        return {'branch': body.get('branch'), 'commit': body.get('commit'),
+                'human_paragraph': body.get('human_paragraph'), 'notes': body.get('notes')}
+    return body  # QUALITY_REPORT — целиком: по нему строится вкладка качества
+
+
+_BODY_CACHE = {}
+
+
+def artifact_body(aid):
+    if aid not in _BODY_CACHE:
+        raw = cli('artifact', 'cat', aid)
+        try:
+            _BODY_CACHE[aid] = json.loads(raw, strict=False)
+        except Exception:
+            _BODY_CACHE[aid] = None
+    return _BODY_CACHE[aid]
+
+
+BY_EXEC = {}
+for a in arts:
+    if a.get('execution_id'):
+        BY_EXEC.setdefault(a['execution_id'], []).append(a)
+
+
+def runs_of(stage):
+    """Прогоны шага с артефактом каждого: засечка → её данные."""
+    out = []
+    for e in stage.get('executions') or []:
+        items = BY_EXEC.get(e['id']) or []
+        art = None
+        if items:
+            a = items[-1]
+            bod = artifact_body(a['id'])
+            art = {'kind': a['kind'], 'seq': a['seq'], 'display': a.get('display'),
+                   'status': a['status'], 'body': _trim(a['kind'], bod)}
+            if a['kind'] == 'QUALITY_REPORT' and isinstance(bod, dict):
+                rows, totals = qa_pack(bod, head_ref[0])
+                art['checks'] = rows
+                art['qa_totals'] = totals
+            if a['kind'] == 'REQUIREMENTS_SPEC' and isinstance(bod, dict):
+                by_req, common = req_oq(bod)
+                art['spec'] = {
+                    'paragraph': bod.get('human_paragraph') or '',
+                    'requirements': [{'id': r.get('id'), 'statement': r.get('statement') or '',
+                                      'ac': r.get('acceptance_criteria') or [],
+                                      'oq': [{'text': q} for q in by_req.get(r.get('id'), [])]}
+                                     for r in bod.get('requirements') or []],
+                    'common': common,
+                    'assumptions': bod.get('assumptions') or [],
+                    'unknowns': bod.get('unknowns') or [],
+                }
+            if a['kind'] == 'REVIEW_REPORT' and isinstance(bod, dict):
+                art['review'] = {
+                    'verdict': bod.get('verdict'),
+                    'paragraph': bod.get('human_paragraph') or '',
+                    'spec_seq': bod.get('spec_seq'),
+                    'findings': [{'req': f.get('requirement_ref'), 'severity': f.get('severity'),
+                                  'text': f.get('description') or ''}
+                                 for f in (bod.get('findings') or [])][:14],
+                }
+            if a['kind'] == 'IMPLEMENTATION_REPORT' and isinstance(bod, dict):
+                art['impl'] = {'paragraph': bod.get('human_paragraph') or '',
+                               'branch': bod.get('branch'),
+                               'commit': (bod.get('commit') or '')[:10],
+                               'notes': (bod.get('notes') or '')[:1200]}
+        out.append({
+            'id': e['id'], 'status': e['status'], 'attempt': e.get('attempt'),
+            'started': e.get('started'), 'finished': e.get('finished'),
+            'summary': e.get('summary'), 'error': (e.get('error') or '')[:400],
+            'usage': e.get('usage'), 'art': art,
+        })
+    return out
+
 
 # вопросы платформы и вопросы спеки
 for q in questions:
@@ -404,47 +523,51 @@ def rulebook():
 
 RULEBOOK = rulebook()
 
-if qual:
-    ev = qual.get('evaluation') or {}
+def qa_pack(body, head):
+    """Человеческая раскладка отчёта качества: пункты с весом/баллом/вкладом.
+    Одна функция и для последнего отчёта, и для отчёта конкретного прогона."""
+    ev = (body or {}).get('evaluation') or {}
     checks = ev.get('checks') or []
     total_w = sum((c.get('weight') or 0) for c in checks) or 1.0
     scored_w = sum((c.get('weight') or 0) for c in checks if c.get('score') is not None)
+    rows = []
+    for c in checks:
+        w = c.get('weight') or 0.0
+        sc = c.get('score')
+        rule = (RULES.get('rules') or {}).get(c.get('id')) or None
+        text = (c.get('violations') or c.get('evidence') or [''])[0][:700]
+        rows.append({'id': c.get('id'), 'weight': w, 'score': sc, 'rule': rule,
+                     'state': c.get('state'),
+                     'share': round(100.0 * w / total_w, 2),
+                     'contrib': None if sc is None else round(sc * w, 4),
+                     'loss': None if sc is None else round((1.0 - sc) * w, 4),
+                     'evidence': text, 'pieces': inline_pieces(text, head)})
+    rows.sort(key=lambda r: (-r['weight'], r['id'] or ''))
+    totals = {'weight': round(total_w, 4), 'scored_weight': round(scored_w, 4),
+              'contrib_sum': round(sum((r['contrib'] or 0) for r in rows), 4),
+              'loss_sum': round(sum((r['loss'] or 0) for r in rows), 4),
+              'checks': len(checks),
+              'unscored': sum(1 for c in checks if c.get('score') is None),
+              'thirds': {'perfect': sum(1 for c in checks if c.get('score') == 1.0),
+                         'mid': sum(1 for c in checks if c.get('score') not in (None, 1.0) and (c.get('score') or 0) >= 0.6),
+                         'low': sum(1 for c in checks if c.get('score') is not None and c.get('score') < 0.6)},
+              'headline': (body.get('human_view') or {}).get('headline') or {},
+              'verdict': (body or {}).get('verdict'),
+              'blocked_weight': ev.get('blocked_weight'),
+              'max_blocked': ev.get('max_blocked_weight')}
+    return rows, totals
+
+
+if qual:
     for st in stages:
         if st['state'] == 'QA':
-            rows = []
-            for c in checks:
-                w = c.get('weight') or 0.0
-                sc = c.get('score')
-                refs = []
-                for e in (c.get('evidence') or []):
-                    refs += refs_of(e)
-                rule = (RULES.get('rules') or {}).get(c.get('id')) or None
-                rows.append({'id': c.get('id'), 'weight': w, 'score': sc, 'rule': rule,
-                             'state': c.get('state'),
-                             'share': round(100.0 * w / total_w, 2),
-                             'contrib': None if sc is None else round(sc * w, 4),
-                             'loss': None if sc is None else round((1.0 - sc) * w, 4),
-                             'evidence': (c.get('violations') or c.get('evidence') or [''])[0][:700],
-                             'pieces': inline_pieces(
-                                 (c.get('violations') or c.get('evidence') or [''])[0][:700], head)})
-            rows.sort(key=lambda r: (-r['weight'], r['id'] or ''))
+            rows, totals = qa_pack(qual, head)
             st['checks'] = rows
             st['rulebook'] = RULEBOOK
             st['profile'] = {'version': RULES.get('version'), 'theta': RULES.get('theta'),
                              'floors': RULES.get('floors'),
                              'blocked_max': RULES.get('blocked_max')}
-            st['qa_totals'] = {'weight': round(total_w, 4), 'scored_weight': round(scored_w, 4),
-                               'contrib_sum': round(sum((r['contrib'] or 0) for r in rows), 4),
-                               'loss_sum': round(sum((r['loss'] or 0) for r in rows), 4),
-                               'checks': len(checks),
-                               'unscored': sum(1 for c in checks if c.get('score') is None),
-                               'thirds': {'perfect': sum(1 for c in checks if c.get('score') == 1.0),
-                                          'mid': sum(1 for c in checks if c.get('score') not in (None, 1.0) and (c.get('score') or 0) >= 0.6),
-                                          'low': sum(1 for c in checks if c.get('score') is not None and c.get('score') < 0.6)},
-                               'headline': (qual.get('human_view') or {}).get('headline') or {},
-                               'verdict': qual.get('verdict'),
-                               'blocked_weight': ev.get('blocked_weight'),
-                               'max_blocked': ev.get('max_blocked_weight')}
+            st['qa_totals'] = totals
 if rev:
     for st in stages:
         if st['state'] == 'REVIEW':
@@ -460,6 +583,10 @@ for st in stages:
         u = e.get('usage') or {}
         total_tokens += u.get('total') or 0
         total_cost += u.get('cost') or 0.0
+
+# Прогоны с их артефактами — по ним вкладки показывают ВЫБРАННЫЙ прогон.
+for st in stages:
+    st['runs'] = runs_of(st)
 
 data = {
     'task': {'id': TASK, 'name': task.get('display'),

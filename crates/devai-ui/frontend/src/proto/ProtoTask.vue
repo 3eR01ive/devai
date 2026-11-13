@@ -6,8 +6,8 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { api, toUiError } from "../api";
 import type {
-  ProgressView, QualityReportView, RulebookView, SignatureView, TaskUsageView,
-  UiError, WorkspaceChangesView, WorkspaceDiffView,
+  ArtifactView, ProgressView, QualityReportView, RulebookView, SignatureView,
+  TaskUsageView, UiError, WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
 import CodeSlice from "./CodeSlice.vue";
 import "./proto.css";
@@ -35,6 +35,11 @@ const openFile = ref<string | null>(null);
 // Отчёт исполнителя — его собственные слова о работе. Человек читает их как
 // рассказ, а не как доказательство: доказательство — во вкладке worktree.
 const implWords = ref<{ paragraph: string | null; notes: string | null } | null>(null);
+// Артефакты задачи: по ним вкладки шага показывают данные ВЫБРАННОГО прогона,
+// а не всегда последнего. Тела читаются лениво и кешируются.
+const artifacts = ref<ArtifactView[]>([]);
+const selRunId = ref<Record<string, string>>({});
+const runBodies = ref<Record<string, any> | "loading">({});
 const error = ref<UiError | null>(null);
 const busy = ref(false);
 
@@ -52,16 +57,19 @@ const STATE_WORD: Record<string, string> = {
 const body = computed<Record<string, any>>(
   () => (report.value?.report as Record<string, any>) ?? {},
 );
+// Отчёт качества ВЫБРАННОГО прогона: когда он выбран, приёмка считает по нему.
+const qaRaw = ref<any | null>(null);
+const qaBody = computed<Record<string, any>>(() => qaRaw.value ?? body.value);
 // Проверки нормализуем один раз: у непроверенного пункта балла может не быть
 // вовсе (undefined), а не только null — иначе сумма потерь даёт NaN.
 const checks = computed<any[]>(() =>
-  (body.value.evaluation?.checks ?? []).map((c: any) => ({
+  (qaBody.value.evaluation?.checks ?? []).map((c: any) => ({
     ...c,
     score: typeof c.score === "number" ? c.score : null,
     weight: typeof c.weight === "number" ? c.weight : 0,
   })),
 );
-const headline = computed<Record<string, any>>(() => body.value.human_view?.headline ?? {});
+const headline = computed<Record<string, any>>(() => qaBody.value.human_view?.headline ?? {});
 const score = computed<number | null>(
   () => (typeof headline.value.score === "number" ? headline.value.score : null),
 );
@@ -69,7 +77,7 @@ const theta = computed<number | null>(
   () => (typeof headline.value.theta === "number" ? headline.value.theta : null),
 );
 const verdict = computed<string>(() => String(headline.value.verdict ?? ""));
-const rev = computed<string>(() => body.value.workspace_revision?.git_head ?? "");
+const rev = computed<string>(() => qaBody.value.workspace_revision?.git_head ?? "");
 
 const scoreTone = computed(() => {
   if (score.value === null) return "wait";
@@ -82,6 +90,39 @@ const tokensByExec = computed(() => {
   for (const r of usage.value?.rows ?? []) m.set(r.execution, r.total);
   return m;
 });
+const costByExec = computed(() => {
+  const m = new Map<string, number>();
+  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.cost);
+  return m;
+});
+/** Сходимость стадии из прогресса: у ревью — объём, у приёмки — балл. */
+function convOf(state: string) {
+  const c: any = (prog.value as any)?.convergence;
+  const key = state === "REVIEW" ? "spec_review" : state === "QA" ? "quality" : null;
+  if (!key || !c?.stages) return null;
+  return (c.stages as any[]).find((x) => x.stage === key) ?? null;
+}
+function convSpark(state: string): { cls: string; h: number }[] {
+  const st = convOf(state);
+  if (!st?.series?.length) return [];
+  const isSpec = st.stage === "spec_review";
+  const tail = st.series.slice(-22);
+  const vals = st.series.map((r: any) => (isSpec ? r.requirements_count : r.score_milli)).filter((v: any) => v != null) as number[];
+  const max = vals.length ? Math.max(...vals) : 1;
+  const theta = (st.series.find((r: any) => r.theta_milli != null) ?? {}).theta_milli ?? null;
+  return tail.map((r: any) => {
+    const v = isSpec ? r.requirements_count : r.score_milli;
+    if (v == null) return { cls: "un", h: 4 };
+    if (isSpec) return { cls: "mid", h: 4 + Math.round((v / (max || 1)) * 10) };
+    return { cls: theta != null && v < theta ? "bad" : "ok", h: 4 + Math.round((v / 1000) * 10) };
+  });
+}
+function convMode(state: string): string {
+  const st = convOf(state);
+  const last = st?.series?.[st.series.length - 1];
+  const map: Record<string, string> = { CONVERGING: "рост", DIVERGING: "расхождение", PLATEAU: "застой", STUCK: "стоит", UNKNOWN: "нет данных" };
+  return last ? map[last.mode] ?? "нет данных" : "";
+}
 
 function tok(n: number | undefined) {
   if (!n) return "";
@@ -100,7 +141,116 @@ function age(iso: string) {
   return h < 24 ? `${h} ч ${m % 60} мин` : `${Math.floor(h / 24)} д ${h % 24} ч`;
 }
 
+// ── прогоны и их артефакты ──────────────────────────────────────────────
+const artByExec = computed(() => {
+  const m = new Map<string, ArtifactView>();
+  for (const a of artifacts.value) {
+    if (a.execution_id) m.set(a.execution_id, a); // последний по порядку побеждает
+  }
+  return m;
+});
+
+/** Выбранный прогон шага; по умолчанию — ПОСЛЕДНИЙ. */
+function runOf(s: any): any | null {
+  const execs = s?.execs ?? [];
+  if (!execs.length) return null;
+  const want = selRunId.value[s.state];
+  return (want ? execs.find((e: any) => e.id === want) : null) ?? execs[execs.length - 1];
+}
+
+/** Артефакт выбранного прогона шага (null — прогон ничего не отдал). */
+function artOf(s: any): ArtifactView | null {
+  const e = runOf(s);
+  return e ? artByExec.value.get(e.id) ?? null : null;
+}
+
+async function pickRun(s: any, execId: string) {
+  selRunId.value = { ...selRunId.value, [s.state]: execId };
+  const art = artByExec.value.get(execId);
+  if (!art) { if (s.state === "QA") qaRaw.value = null; return; }
+  await ensureBody(art);
+}
+
+async function ensureBody(art: ArtifactView) {
+  if (typeof runBodies.value === "object" && runBodies.value[art.id]) return;
+  if (runBodies.value === "loading") return;
+  try {
+    const c = await api.artifactContent(art.id);
+    if (c.shape !== "text") return;
+    const parsed = JSON.parse(c.text);
+    runBodies.value = { ...(runBodies.value as Record<string, any>), [art.id]: parsed };
+    if (art.kind === "QUALITY_REPORT") qaRaw.value = parsed;
+  } catch {
+    /* тело не прочиталось — вкладка честно скажет, что данных нет */
+  }
+}
+
+/** Тело артефакта выбранного прогона (или null). */
+function bodyOf(s: any): any | null {
+  const art = artOf(s);
+  if (!art) return null;
+  const b = runBodies.value as Record<string, any>;
+  return b[art.id] ?? null;
+}
+
+/** Спецификация выбранного прогона; если прогонов нет — документ из подписи. */
+function specBody(s: any): any | null {
+  if ((s.execs ?? []).length) {
+    const b = bodyOf(s);
+    const art = artOf(s);
+    return art?.kind === "REQUIREMENTS_SPEC" && b ? b : null;
+  }
+  return signature.value?.spec ?? null;
+}
+
+/** Отчёт проверки выбранного прогона (или документ из подписи у шага без прогонов). */
+function reviewBody(s: any): any | null {
+  if ((s.execs ?? []).length) {
+    const b = bodyOf(s);
+    const art = artOf(s);
+    return art?.kind === "REVIEW_REPORT" && b ? b : null;
+  }
+  return signature.value?.review ?? null;
+}
+
+/** Отчёт реализации выбранного прогона (branch/commit/абзац). */
+function implBody(s: any): any | null {
+  if ((s.execs ?? []).length) {
+    const b = bodyOf(s);
+    const art = artOf(s);
+    return art?.kind === "IMPLEMENTATION_REPORT" && b ? b : null;
+  }
+  return implWords.value;
+}
+
+/** Догружаем тело артефакта, когда шаг раскрыт: вкладкам нужны данные. */
+function ensureLoaded(s: any) {
+  const art = artOf(s);
+  if (art) void ensureBody(art);
+}
+
+function durationOf(execs: any[]): string {
+  let ms = 0;
+  for (const e of execs) {
+    if (!e.started_at) continue;
+    const a = new Date(e.started_at).getTime();
+    const b = e.finished_at ? new Date(e.finished_at).getTime() : Date.now();
+    ms += Math.max(0, b - a);
+  }
+  if (!ms) return "";
+  const m = Math.round(ms / 60000);
+  return m < 60 ? `${m} мин` : `${Math.floor(m / 60)} ч ${m % 60} мин`;
+}
+
 // ── шаги ────────────────────────────────────────────────────────────────
+// В графе бывает ДВА узла на состояние: роль и гейт (QA: аудитор + подпись).
+// Ключ «только состояние» склеивал их и терял прогоны роли — держим оба.
+const roleNodes = computed(
+  () => new Map((prog.value?.graph.nodes ?? []).filter((n) => n.kind !== "gate").map((n) => [n.state, n])),
+);
+const gateNodes = computed(
+  () => new Map((prog.value?.graph.nodes ?? []).filter((n) => n.kind === "gate").map((n) => [n.state, n])),
+);
 const nodes = computed(() => new Map((prog.value?.graph.nodes ?? []).map((n) => [n.state, n])));
 
 const steps = computed(() => {
@@ -108,7 +258,9 @@ const steps = computed(() => {
   if (!g) return [];
   const allowed = prog.value?.allowed_operations ?? [];
   return g.stages.map((s) => {
-    const n = nodes.value.get(s.state);
+    // прогоны и роль берём у УЗЛА РОЛИ: у гейта прогонов нет вовсе.
+    // Чип «решает человек» живёт на этапе (s.gate), а не на узле.
+    const n = roleNodes.value.get(s.state) ?? gateNodes.value.get(s.state);
     const execs = n?.executions ?? [];
     const running = execs.filter((e) => String(e.status) === "RUNNING");
     const tokens = execs.reduce((acc, e) => acc + (tokensByExec.value.get(e.id) ?? 0), 0);
@@ -132,6 +284,10 @@ const steps = computed(() => {
       runOp,
       why: s.gate ? "решает человек" : s.status === "passed" ? "шаг пройден" : "платформа пока не разрешает запуск",
       tokens,
+      cost: execs.reduce((acc, e) => acc + (costByExec.value.get(e.id) ?? 0), 0),
+      duration: durationOf(execs),
+      limit: (prog.value?.attempt_limit as any)?.role === n?.role_slug
+        ? (prog.value?.attempt_limit as any)?.limit ?? null : null,
       score: isQa ? score.value : null,
     };
   });
@@ -260,30 +416,35 @@ function foldAll(path: string, open: boolean) {
 }
 
 const tabsFor = (s: any) => {
-  // Постановка показывает сам текст постановки — вкладки ей не нужны.
+  // Постановка показывает текст постановки, подпись — документ.
   if (s.state === "STATEMENT") return [] as [string, string][];
-  // Подпись показывает документ, который подписывают.
   if (s.state === "APPROVAL") return [["sign", "что подписываешь"]] as [string, string][];
-  if (s.gate) {
-    const t: [string, string][] = [];
+
+  const execs = s.execs ?? [];
+  const art = artOf(s);
+  // Прогоны есть, но выбранный ничего не отдал — вкладок нет: подсовывать
+  // данные соседнего прогона было бы враньём.
+  if (execs.length && !art) return [] as [string, string][];
+
+  const t: [string, string][] = [];
+  if (art?.kind === "REQUIREMENTS_SPEC") t.push(["spec", "спецификация"]);
+  if (art?.kind === "REVIEW_REPORT") t.push(["review", "проверка"]);
+  if (art?.kind === "IMPLEMENTATION_REPORT") t.push(["impl", "реализация"]);
+  if (s.state === "IMPLEMENTATION") t.push(["wt", "worktree"]);
+  if (art?.kind === "QUALITY_REPORT") {
+    t.push(["qa", "качество"]);
+    t.push(["rules", "правила приёмки"]);
+  }
+  // Шаг без прогонов (гейт или ещё не запускался) — по документам из подписи.
+  if (!execs.length) {
+    if (s.state === "ANALYSIS" && signature.value?.spec) t.push(["spec", "спецификация"]);
+    if (s.state === "REVIEW" && signature.value?.review) t.push(["review", "проверка"]);
     if (s.state === "QA" && report.value) {
       t.push(["qa", "качество"]);
       t.push(["rules", "правила приёмки"]);
     }
-    return t;
   }
-  // «вход/выход» убраны: служебные контракты роли человеку ничего не объясняют.
-  // У шага — что произведено (прогоны, артефакты) и что этот шаг решает.
-  if (s.state === "ANALYSIS" && signature.value?.spec) {
-    return [["spec", "спецификация"], ["runs", "прогоны"]] as [string, string][];
-  }
-  if (s.state === "REVIEW" && signature.value?.review) {
-    return [["review", "проверка"], ["runs", "прогоны"]] as [string, string][];
-  }
-  if (s.state === "IMPLEMENTATION") {
-    return [["impl", "реализация"], ["wt", "worktree"], ["runs", "прогоны"]] as [string, string][];
-  }
-  return [["runs", "прогоны"]] as [string, string][];
+  return t;
 };
 
 function openStep(s: any) {
@@ -293,6 +454,7 @@ function openStep(s: any) {
     void loadChanges();
     void loadImplReport();
   }
+  ensureLoaded(s);
   const t = tabsFor(s);
   openTab.value = t.length ? t[0][0] : "";
 }
@@ -381,18 +543,20 @@ function evidenceOf(c: any): string {
 async function load() {
   error.value = null;
   try {
-    const [p, r, u, rb, sig] = await Promise.all([
+    const [p, r, u, rb, sig, arts] = await Promise.all([
       api.taskProgress(id.value),
       api.taskReport(id.value).catch(() => null),
       api.taskUsage(id.value).catch(() => null),
       api.evaluationRules().catch(() => null),
       api.taskSignature(id.value).catch(() => null),
+      api.artifactsList(id.value).catch(() => [] as ArtifactView[]),
     ]);
     prog.value = p;
     report.value = r;
     usage.value = u;
     rules.value = rb;
     signature.value = sig;
+    artifacts.value = arts as ArtifactView[];
   } catch (e) {
     error.value = toUiError(e);
   }
@@ -464,16 +628,27 @@ onMounted(load);
             <div class="p-vhead" @click="openStep(s)">
               <div class="t1">
                 <span class="role">{{ s.title }}</span>
-                <span v-if="s.slug" class="ver">{{ s.slug }}@v{{ s.version }}</span>
+                <span v-if="convSpark(s.state).length" class="p-spark" :title="'сходимость: ' + convMode(s.state)">
+                  <i v-for="(b, k) in convSpark(s.state)" :key="k" :class="b.cls" :style="{ height: b.h + 'px' }" />
+                </span>
                 <span v-if="s.score !== null" class="p-scorechip" :class="scoreTone">
                   {{ (s.score * 100).toFixed(1) }}%<i>качество</i>
                 </span>
-                <span class="p-chip" :class="s.status === 'passed' ? 'good' : s.status === 'current' ? 'hot' : ''">{{ s.word }}</span>
-                <span v-if="s.execs.length" class="p-chip">прогонов {{ s.execs.length }}</span>
-                <span v-if="s.tokens" class="p-chip">{{ tok(s.tokens) }} ток</span>
-                <span v-if="s.gate" class="p-chip hot">решает человек</span>
+                <span v-if="s.gate" class="p-human" title="решает человек: шаг ждёт подписи или ответа, а не прогона">
+                  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                    <circle cx="8" cy="4.4" r="2.6" fill="currentColor" />
+                    <path d="M8 8.2c-2.9 0-5 1.7-5 4.2V15h10v-2.6c0-2.5-2.1-4.2-5-4.2Z" fill="currentColor" />
+                  </svg>
+                </span>
               </div>
               <div class="t2">
+                <span class="p-mstats">
+                  <span v-if="s.duration">{{ s.duration }}</span>
+                  <span v-if="s.execs.length">прогонов <b>{{ s.execs.length }}</b></span>
+                  <span v-if="s.tokens"><b>{{ tok(s.tokens) }}</b> ток</span>
+                  <span v-if="s.cost"><b>${{ s.cost.toFixed(2) }}</b></span>
+                  <span v-if="s.limit" class="lim">лимит {{ s.limit }}</span>
+                </span>
                 <button v-if="s.running" class="p-act stop" :disabled="busy" @click.stop="doStop(s.runningId!)">■ остановить</button>
                 <button v-else-if="s.canRun" class="p-act run" :disabled="busy" :title="s.runOp" @click.stop="doRun()">▶ запустить</button>
                 <span v-else-if="s.status === 'current'" class="p-why">{{ s.why }}</span>
@@ -482,6 +657,25 @@ onMounted(load);
             </div>
 
             <div v-if="openState === s.state" class="p-vbody">
+              <!-- прогоны шага: засечка = прогон, по умолчанию выбран последний -->
+              <div v-if="s.execs.length" class="p-runs">
+                <span class="p-rlabel">прогоны</span>
+                <span
+                  v-for="(e, k) in s.execs"
+                  :key="e.id"
+                  class="p-rd"
+                  :class="[String(e.status) === 'COMPLETED' ? 'ok' : String(e.status) === 'FAILED' ? 'bad' : 'run',
+                           runOf(s)?.id === e.id ? 'sel' : '']"
+                  :title="'прогон ' + (k + 1) + ' · ' + e.status"
+                  @click.stop="pickRun(s, e.id)"
+                />
+                <span class="p-rsel">выбран {{ s.execs.findIndex((e: any) => e.id === runOf(s)?.id) + 1 }} из {{ s.execs.length }}</span>
+              </div>
+              <div v-if="s.execs.length" class="p-runmemo">
+                <template v-if="artOf(s)">вкладки ниже — данные этого прогона · {{ artOf(s)!.display }}</template>
+                <template v-else>этот прогон ничего не отдал — вкладок нет</template>
+              </div>
+
               <!-- постановка: исходный текст задачи, без служебных вкладок -->
               <div v-if="s.state === 'STATEMENT'" class="p-panel">
                 <div class="p-briefh">
@@ -511,11 +705,11 @@ onMounted(load);
                     <span class="k">файлов</span><span class="v">{{ changes.files.length }}</span>
                   </div>
                   <div class="p-sec">что говорит исполнитель о своей работе</div>
-                  <div v-if="implWords?.paragraph" class="p-lead">{{ implWords.paragraph }}</div>
-                  <div v-else class="p-empty" style="padding: 4px 0">отчёта с объяснением нет</div>
-                  <details v-if="implWords?.notes" class="p-implrep">
+                  <div v-if="implBody(s)?.human_paragraph" class="p-lead">{{ implBody(s)!.human_paragraph }}</div>
+                  <div v-else class="p-empty" style="padding: 4px 0">у этого прогона отчёта с объяснением нет</div>
+                  <details v-if="implBody(s)?.notes" class="p-implrep">
                     <summary>служебные заметки исполнителя</summary>
-                    <div class="p-lead mono" style="margin-top:6px;font-size:11px">{{ implWords.notes }}</div>
+                    <div class="p-lead mono" style="margin-top:6px;font-size:11px">{{ implBody(s)!.notes }}</div>
                   </details>
                 </template>
               </div>
@@ -573,16 +767,18 @@ onMounted(load);
 
               <!-- спецификация (шаг анализа) -->
               <div v-if="openTab === 'spec' && s.state === 'ANALYSIS'" class="p-panel">
-                <div v-if="!signature?.spec" class="p-empty" style="padding: 4px 0">спеки нет</div>
+                <div v-if="!specBody(s)" class="p-empty" style="padding: 4px 0">
+                  {{ runBodies === 'loading' ? 'читаю…' : 'у этого прогона спеки нет' }}
+                </div>
                 <template v-else>
-                  <div v-if="signature.spec.human_paragraph" class="p-lead">
-                    {{ signature.spec.human_paragraph }}
+                  <div v-if="specBody(s)!.human_paragraph" class="p-lead">
+                    {{ specBody(s)!.human_paragraph }}
                   </div>
-                  <div class="p-sec">требований · {{ signature.spec.requirements.length }}</div>
-                  <div v-for="r in signature.spec.requirements" :key="r.id" class="p-req">
+                  <div class="p-sec">требований · {{ (specBody(s)!.requirements ?? []).length }}</div>
+                  <div v-for="r in specBody(s)!.requirements ?? []" :key="r.id" class="p-req">
                     <div class="rid">{{ r.id }}</div>
                     <div class="rst">{{ r.statement }}</div>
-                    <ul v-if="r.acceptance_criteria.length" class="p-ac">
+                    <ul v-if="(r.acceptance_criteria ?? []).length" class="p-ac">
                       <li v-for="(a, k) in r.acceptance_criteria" :key="k">{{ a }}</li>
                     </ul>
                   </div>
@@ -591,14 +787,25 @@ onMounted(load);
 
               <!-- проверка (шаг ревью) -->
               <div v-if="openTab === 'review'" class="p-panel">
-                <div v-if="!signature?.review" class="p-empty" style="padding: 4px 0">отчёта ревью нет</div>
+                <div v-if="!reviewBody(s)" class="p-empty" style="padding: 4px 0">
+                  у этого прогона отчёта проверки нет
+                </div>
                 <template v-else>
                   <div class="p-kv">
-                    <span class="k">вердикт</span><span class="v">{{ signature.review.verdict ?? "—" }}</span>
+                    <span class="k">вердикт</span><span class="v">{{ reviewBody(s)!.verdict ?? "—" }}</span>
+                    <span v-if="reviewBody(s)!.spec_seq" class="k">проверялась спека</span>
+                    <span v-if="reviewBody(s)!.spec_seq" class="v">v{{ reviewBody(s)!.spec_seq }}</span>
                   </div>
-                  <div v-if="signature.review.human_paragraph" class="p-lead" style="margin-top:8px">
-                    {{ signature.review.human_paragraph }}
+                  <div v-if="reviewBody(s)!.human_paragraph" class="p-lead" style="margin-top:8px">
+                    {{ reviewBody(s)!.human_paragraph }}
                   </div>
+                  <template v-if="(reviewBody(s)!.findings ?? []).length">
+                    <div class="p-sec">замечания · {{ (reviewBody(s)!.findings ?? []).length }}</div>
+                    <div v-for="(f, k) in reviewBody(s)!.findings" :key="k" class="p-find">
+                      <span class="p-sev" :class="f.severity">{{ f.severity }}</span>
+                      <span>{{ f.description }}</span>
+                    </div>
+                  </template>
                 </template>
               </div>
 
@@ -773,6 +980,26 @@ onMounted(load);
 .p-vhead .t1{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .p-vhead .role{font-size:13.5px;font-weight:600}
 .p-vhead .ver{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2)}
+.p-spark{display:inline-flex;align-items:flex-end;gap:1px;height:14px;cursor:help}
+.p-spark i{width:3px;border-radius:1px 1px 0 0;background:#2b3a4a}
+.p-spark i.ok{background:var(--p-pass)} .p-spark i.bad{background:var(--p-stop)}
+.p-spark i.mid{background:#4a6b86} .p-spark i.un{background:#2b3440}
+.p-human{display:inline-flex;align-items:center;color:var(--p-human);opacity:.85;cursor:help}
+.p-mstats{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--p-dim2)}
+.p-mstats b{color:var(--p-dim);font-weight:500}
+.p-mstats .lim{color:#5a6877}
+.p-runs{display:flex;align-items:center;gap:3px;flex-wrap:wrap;padding:9px 14px 0}
+.p-rlabel{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--p-dim2);margin-right:6px}
+.p-rd{width:7px;height:14px;border-radius:2px;background:#2b3440;cursor:pointer}
+.p-rd.ok{background:var(--p-pass)} .p-rd.bad{background:var(--p-stop)} .p-rd.run{background:var(--p-now)}
+.p-rd.sel{outline:2px solid var(--p-human);outline-offset:1px}
+.p-rsel{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2);margin-left:8px}
+.p-runmemo{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2);padding:6px 14px 0}
+.p-find{display:flex;gap:8px;font-size:12px;color:#dbe3ec;margin-bottom:6px;line-height:1.45}
+.p-sev{font-family:var(--mono);font-size:10px;text-transform:uppercase;padding:1px 6px;border-radius:4px;
+  border:1px solid var(--p-line);color:var(--p-dim);height:16px}
+.p-sev.blocker{color:var(--p-stop);border-color:rgba(240,97,109,.4)}
+.p-sev.major{color:var(--p-now);border-color:rgba(245,181,68,.4)}
 .p-vhead .t2{display:flex;align-items:center;gap:10px}
 .p-chip{font-size:10.5px;color:var(--p-dim);border:1px solid var(--p-line);border-radius:5px;padding:1px 7px;white-space:nowrap}
 .p-chip.good{color:var(--p-pass);border-color:rgba(62,207,142,.3)}
