@@ -269,7 +269,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "source.slice",
             class: OpClass::Read,
             input: "id_prefix, rev, path, from, to",
-            output: "SourceSliceView{path,rev,from,to,text}",
+            output: "SourceSliceView{path,rev,from,to,total_lines,text}",
             description: "Кусок исходника на зафиксированном коммите (git show <rev>:<path>) по ссылке «путь:строки» из отчёта: окно показывает ровно тот код, о котором говорит проверка.",
         },
         OpDescriptor {

@@ -300,6 +300,9 @@ pub struct SourceSliceView {
     pub rev: String,
     pub from: u32,
     pub to: u32,
+    /// Сколько строк в файле на этом коммите — чтобы окно могло развернуть
+    /// остальное, не угадывая конец файла запросами наугад.
+    pub total_lines: u32,
     pub text: String,
 }
 
@@ -347,11 +350,15 @@ impl Api {
                 format!("в {path} меньше {from} строк"),
             ));
         }
+        // Разбор по переводу строки даёт пустой хвост у файла, который
+        // заканчивается переводом строки: строкой он не считается.
+        let total = if text.ends_with('\n') { lines.len().saturating_sub(1) } else { lines.len() };
         Ok(SourceSliceView {
             path: path.to_string(),
             rev: rev.to_string(),
             from: (start + 1) as u32,
             to: end as u32,
+            total_lines: total as u32,
             text: lines[start..end].join("\n"),
         })
     }

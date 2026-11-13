@@ -242,6 +242,8 @@ export interface SourceSliceView {
   rev: string;
   from: number;
   to: number;
+  /** сколько строк в файле на этом коммите: по нему окно разворачивает остальное */
+  total_lines: number;
   text: string;
 }
 

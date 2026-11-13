@@ -689,6 +689,16 @@ function pieces(text: string): Piece[] {
   return out;
 }
 
+// Ссылки на код в тексте: по умолчанию вставка СВЁРНУТА, раскрывается
+// кликом по самой ссылке — как просил оператор.
+const openRefs = ref<Record<string, boolean>>({});
+function refKey(s: any, i: number, k: number) {
+  return `${s.state}:${runOf(s)?.id ?? ""}:${i}:${k}`;
+}
+function toggleRef(key: string) {
+  openRefs.value = { ...openRefs.value, [key]: !openRefs.value[key] };
+}
+
 function evidenceOf(c: any): string {
   const e = (c.violations?.[0] ?? c.evidence?.[0] ?? "") as string;
   return String(e).slice(0, 1200);
@@ -1045,7 +1055,29 @@ onMounted(load);
                     >
                       <span class="p-mark">{{ f.t === 'add' ? '+' : f.t === 'del' ? '−' : '·' }}</span>
                       <span class="p-sev" :class="f.severity">{{ f.severity }}</span>
-                      <span class="p-findt">{{ f.text }}</span>
+                      <div class="p-findt">
+                        <template v-for="(pc, kk) in pieces(f.text)" :key="kk">
+                          <template v-if="pc.t === 'text'">{{ pc.v }}</template>
+                          <template v-else>
+                            <button class="p-coderef" :class="{ on: openRefs[refKey(s, k, kk)] }" @click.stop="toggleRef(refKey(s, k, kk))">
+                              {{ pc.path }}:{{ pc.from }}{{ pc.to > pc.from ? "–" + pc.to : "" }}
+                            </button>
+                            <template v-if="openRefs[refKey(s, k, kk)]">
+                              <CodeSlice
+                                v-if="rev"
+                                :task-id="id"
+                                :rev="rev"
+                                :path="pc.path"
+                                :from="pc.from"
+                                :to="pc.to"
+                              />
+                              <div v-else class="p-empty" style="padding: 4px 0">
+                                код недоступен: у задачи нет зафиксированного коммита
+                              </div>
+                            </template>
+                          </template>
+                        </template>
+                      </div>
                       <span v-if="f.req" class="p-dim2 mono">{{ f.req }}</span>
                     </div>
                   </template>
@@ -1063,7 +1095,29 @@ onMounted(load);
                     <div class="p-sec">замечания · {{ (reviewBody(s)!.findings ?? []).length }}</div>
                     <div v-for="(f, k) in reviewBody(s)!.findings" :key="k" class="p-find">
                       <span class="p-sev" :class="f.severity">{{ f.severity }}</span>
-                      <span>{{ f.description }}</span>
+                      <div class="p-findt">
+                        <template v-for="(pc, kk) in pieces(String(f.description ?? ''))" :key="kk">
+                          <template v-if="pc.t === 'text'">{{ pc.v }}</template>
+                          <template v-else>
+                            <button class="p-coderef" :class="{ on: openRefs[refKey(s, k, kk)] }" @click.stop="toggleRef(refKey(s, k, kk))">
+                              {{ pc.path }}:{{ pc.from }}{{ pc.to > pc.from ? "–" + pc.to : "" }}
+                            </button>
+                            <template v-if="openRefs[refKey(s, k, kk)]">
+                              <CodeSlice
+                                v-if="rev"
+                                :task-id="id"
+                                :rev="rev"
+                                :path="pc.path"
+                                :from="pc.from"
+                                :to="pc.to"
+                              />
+                              <div v-else class="p-empty" style="padding: 4px 0">
+                                код недоступен: у задачи нет зафиксированного коммита
+                              </div>
+                            </template>
+                          </template>
+                        </template>
+                      </div>
                     </div>
                   </template>
                   </template>
@@ -1281,6 +1335,11 @@ onMounted(load);
 .p-findd.del .p-findt{color:#f2bcc2;text-decoration:line-through}
 .p-findd.same .p-findt{color:var(--p-dim)}
 .p-findt{flex:1}
+.p-coderef{background:rgba(122,167,255,.10);border:1px solid rgba(122,167,255,.35);
+  color:var(--p-human);border-radius:4px;padding:0 5px;font-family:var(--mono);
+  font-size:11px;cursor:pointer;margin:0 2px}
+.p-coderef:hover{background:rgba(122,167,255,.22)}
+.p-coderef.on{background:rgba(62,207,142,.2);border-color:rgba(62,207,142,.6);color:#8fe0b7}
 .p-find{display:flex;gap:8px;font-size:12px;color:#dbe3ec;margin-bottom:6px;line-height:1.45}
 .p-sev{font-family:var(--mono);font-size:10px;text-transform:uppercase;padding:1px 6px;border-radius:4px;
   border:1px solid var(--p-line);color:var(--p-dim);height:16px}
