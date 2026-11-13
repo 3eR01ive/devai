@@ -150,6 +150,33 @@ for kind, a in latest.items():
 head = (out_arts.get('IMPLEMENTATION_REPORT', {}).get('body') or {}).get('commit') \
     or (out_arts.get('QUALITY_REPORT', {}).get('body') or {}).get('workspace_revision', {}).get('git_head')
 
+# ── сходимость: раунды по стадиям ──────────────────────────────────────────
+def convergence_state():
+    """Сходимость как её отдаёт платформа: раунды стадии с баллом, порогом,
+    дельтой, объёмом требований и режимом. Неизмеренный раунд остаётся
+    неизмеренным — окно не дорисовывает ему балл."""
+    c = prog.get('convergence') or {}
+    out = []
+    for st in c.get('stages') or []:
+        rounds = []
+        for r in st.get('series') or []:
+            rounds.append({
+                'round': r.get('round'),
+                'score': (r['score_milli'] / 1000) if r.get('score_milli') is not None else None,
+                'theta': (r['theta_milli'] / 1000) if r.get('theta_milli') is not None else None,
+                'delta': (r['delta_score_milli'] / 1000) if r.get('delta_score_milli') is not None else None,
+                'reqs': r.get('requirements_count'),
+                'oq': r.get('oq_count'),
+                'verdict': r.get('verdict'),
+                'mode': r.get('mode'),
+                'measured': bool(r.get('measured')),
+            })
+        out.append({'stage': st.get('stage'), 'rounds': rounds})
+    return out
+
+
+CONV = convergence_state()
+
 # ── worktree: файлы изменения и их diff (шаг «реализация») ─────────────────
 def full_diff(worktree, base, tip, path):
     """Diff ВСЕГО файла: весь контекст, чтобы окно могло развернуть скрытые
@@ -445,6 +472,7 @@ data = {
     # Исходная постановка — то, что человек написал при заведении задачи:
     # шаг «постановка» показывает её, а не служебные входы/выходы роли.
     'brief': task.get('business_description') or '',
+    'convergence': CONV,
     'created': task.get('created_at'),
     'agent_failure': prog.get('agent_failure'),
     'attempt_limit': prog.get('attempt_limit'),

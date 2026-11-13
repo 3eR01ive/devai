@@ -30,4 +30,4 @@ instructions: >-
 done_criteria: Review Report опубликован с вердиктом APPROVED или NEEDS_REVISION
 tools: ["filesystem:read", "api:project-knowledge"]
 input_contract: requirements-specification@4
-output_contract: review-report@2
+output_contract: review-report@4

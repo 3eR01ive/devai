@@ -424,6 +424,42 @@ fn contracts_raw() -> Vec<(&'static str, u32, &'static str)> {
 }"#,
         ),
         (
+            // @4 — отчёт проверки называет ПРОВЕРЕННУЮ версию спеки.
+            // До этого ревью и спека жили двумя независимыми лентами: 82
+            // проверки на 79 версий, и по телу нельзя было сказать, что именно
+            // проверяли. Поля ставит ПЛАТФОРМА при публикации (роль не может
+            // знать будущий seq), поэтому они необязательны в форме ответа и
+            // обязательны по смыслу: текущая спека на момент публикации.
+            "review-report",
+            4,
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Review Report v4 — the reviewed specification is named",
+  "description": "Same required set as @2/@3 plus two platform-stamped fields: `spec_seq` (the seq of the CURRENT requirements specification the reviewer judged) and `spec_artifact` (its id). They close the pairing gap: a review round is now (spec vN -> review -> verdict) by stored data, not by guessing from timestamps. Stamped by the platform at publication from the task's CURRENT spec; omitted when the task has no current spec. Role-owned fields keep their @2 obligations (verdict, summary, findings, human_paragraph).",
+  "type": "object",
+  "required": ["verdict", "summary", "findings", "human_paragraph"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["APPROVED", "NEEDS_REVISION", "REJECTED"] },
+    "summary": { "type": "string" },
+    "human_paragraph": { "type": "string", "description": "the human explanation of the verdict in plain words: what the review checked, what it found, what happens next" },
+    "spec_seq": { "type": "integer", "description": "seq of the reviewed REQUIREMENTS_SPEC (platform-stamped)" },
+    "spec_artifact": { "type": "string", "description": "id of the reviewed REQUIREMENTS_SPEC (platform-stamped)" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "description"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["blocker", "major", "minor", "info"] },
+          "description": { "type": "string" },
+          "requirement_ref": { "type": "string" }
+        }
+      }
+    }
+  }
+}"#,
+        ),
+        (
             "implementation-report",
             1,
             r#"{

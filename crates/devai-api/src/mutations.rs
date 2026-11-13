@@ -755,14 +755,27 @@ impl Api {
                 self.run_op(id, |t, _a| workflow::start(p, t, &self.actor, Utc::now()))
             }
             WorkflowOp::Review { verdict, summary } => self.run_op(id, move |t, _a| {
-                workflow::review_recorded(
-                    p,
-                    t,
-                    verdict,
-                    summary.as_deref(),
-                    &self.actor,
-                    Utc::now(),
-                )
+                if verdict == Verdict::Approved {
+                    workflow::review_recorded(
+                        p,
+                        t,
+                        verdict,
+                        summary.as_deref(),
+                        &self.actor,
+                        Utc::now(),
+                    )
+                } else {
+                    // Отказ ревью — вопрос человеку, а не следующий круг.
+                    workflow::park_review_rejection(
+                        p,
+                        t,
+                        new_id(),
+                        verdict,
+                        summary.as_deref(),
+                        &self.actor,
+                        Utc::now(),
+                    )
+                }
             }),
             WorkflowOp::Approve { rationale } => self.op_approve(id, rationale),
             WorkflowOp::Reject { rationale } => self.run_op(id, move |t, _a| {
@@ -1452,11 +1465,19 @@ impl Api {
             Some(c) => Some(ContractRef::parse(c).map_err(devai_core::CoreError::from)?),
             None => None,
         };
+        // Отчёт проверки называет ПРОВЕРЕННУЮ версию спеки: пара
+        // «спека vN → проверка → вердикт» иначе не восстановима (review-report@4).
+        // Ставит платформа: роль не может знать seq будущего артефакта.
+        let content = if req.kind == ArtifactKind::ReviewReport {
+            self.stamp_review_spec(task.id, req.content)?
+        } else {
+            req.content
+        };
         let artifact = self.publish_row_internal(
             task.id,
             req.kind,
             &req.name,
-            req.content,
+            content,
             contract,
             execution_id,
             depends_ids,
@@ -1464,6 +1485,46 @@ impl Api {
             req.category,
         )?;
         Ok(PublishedRow { artifact, task })
+    }
+
+    /// Put the reviewed specification into a REVIEW_REPORT body: `spec_seq`
+    /// and `spec_artifact` of the task's CURRENT spec. Absent spec → the body
+    /// is published exactly as written (nothing is invented). A body that is
+    /// not one JSON object is refused rather than silently left unstamped.
+    fn stamp_review_spec(&self, task_id: Id, content: Vec<u8>) -> ApiResult<Vec<u8>> {
+        let spec = self
+            .store
+            .artifacts(task_id)?
+            .into_iter()
+            .find(|a| {
+                a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
+            });
+        let Some(spec) = spec else {
+            return Ok(content);
+        };
+        let mut body: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
+            ApiError::refused(
+                "malformed_body",
+                format!("review report is not valid JSON, cannot name the spec: {e}"),
+            )
+        })?;
+        let Some(obj) = body.as_object_mut() else {
+            return Err(ApiError::refused(
+                "malformed_body",
+                "review report must be one JSON object — nothing to stamp".to_string(),
+            ));
+        };
+        obj.insert("spec_seq".to_string(), serde_json::json!(spec.seq));
+        obj.insert(
+            "spec_artifact".to_string(),
+            serde_json::json!(spec.id.to_string()),
+        );
+        serde_json::to_vec_pretty(&body).map_err(|e| {
+            ApiError::refused(
+                "malformed_body",
+                format!("cannot serialize stamped review report: {e}"),
+            )
+        })
     }
 
     /// The explicit dependencies of a publication, plus the implicit one:
@@ -1654,7 +1715,21 @@ impl Api {
         };
         let v = Self::parse_verdict(s)?;
         let process = self.process_policy()?;
-        let m = workflow::review_recorded(&process, task, v, None, &self.actor, Utc::now())?;
+        // Отказ ревью не запускает следующий круг сам: задача паркуется с
+        // вопросом человеку (решение оператора 12.11).
+        let m = if v == Verdict::Approved {
+            workflow::review_recorded(&process, task, v, None, &self.actor, Utc::now())?
+        } else {
+            workflow::park_review_rejection(
+                &process,
+                task,
+                new_id(),
+                v,
+                None,
+                &self.actor,
+                Utc::now(),
+            )?
+        };
         self.store.commit(task.lock_version, &m)?;
         Ok(AdvanceOutcome {
             from: task.state,
@@ -2304,6 +2379,28 @@ impl Api {
         if let Some(trip) = self.attempt_limit_trip(&task, q.id)? {
             return self.answer_attempt_limit(&q, &task, text, &trip);
         }
+        // Вопрос «начинать ли новый круг после отказа ревью»: «остановить»
+        // уводит дело в удержание у человека, «продолжить» идёт обычным путём
+        // (снять удержание, вернуть в ANALYSIS, автозапуск).
+        if self.review_return_gate(&task, q.id)? {
+            if attempt_limit_answer::parse(text) == Some(attempt_limit_answer::STOP) {
+                let process = self.process_policy()?;
+                let m = workflow::answer_review_return_stop(
+                    &process,
+                    &task,
+                    q.id,
+                    &self.actor,
+                    Utc::now(),
+                )?;
+                self.store.answer_question(q.id, text, &self.actor, Utc::now())?;
+                self.store.commit(task.lock_version, &m)?;
+                return Ok(AnsweredOutcome {
+                    question_id: q.id,
+                    from_state: task.state,
+                    to_state: m.task.state,
+                });
+            }
+        }
         self.store
             .answer_question(q.id, text, &self.actor, Utc::now())?;
         let process = self.process_policy()?;
@@ -2318,6 +2415,30 @@ impl Api {
             from_state: task.state,
             to_state: m.task.state,
         })
+    }
+
+    /// Поднят ли `question_id` гейтом «ревью вернуло спеку» — по СОБЫТИЮ, а не
+    /// по тексту вопроса: ответ читается из данных, не из формулировки.
+    fn review_return_gate(&self, task: &Task, question_id: Id) -> ApiResult<bool> {
+        let qid = question_id.to_string();
+        Ok(self
+            .store
+            .events(task.id, None)?
+            .into_iter()
+            .rev()
+            .any(|ev| {
+                ev.kind == event_kind::QUESTION_RAISED
+                    && ev
+                        .payload
+                        .get(json_field::GATE)
+                        .and_then(|v| v.as_str())
+                        == Some(workflow::GATE_REVIEW_RETURN)
+                    && ev
+                        .payload
+                        .get(json_field::QUESTION_ID)
+                        .and_then(|v| v.as_str())
+                        == Some(qid.as_str())
+            }))
     }
 
     /// The stored attempt-limit trip that raised `question_id`, if any: the

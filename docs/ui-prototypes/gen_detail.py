@@ -52,7 +52,31 @@ def dur(a, b):
     return f'{s} с' if s < 90 else (f'{s // 60} мин' if s < 5400 else f'{s // 3600} ч {s % 3600 // 60:02d} м')
 
 
-def human(n):
+def conv_model():
+    """Сходимость для окна: стадии и их круги. score/theta/delta — доли,
+    None остаётся None: неизмеренный круг честно остаётся неизмеренным."""
+    raw = (d.get('convergence') or {})
+    out = []
+    for st in raw.get('stages') or []:
+        rounds = []
+        for r in st.get('series') or []:
+            def m(key):
+                v = r.get(key)
+                return None if v is None else v / 1000.0
+            rounds.append({
+                'r': r.get('round'),
+                's': m('score_milli'),
+                'th': m('theta_milli'),
+                'd': m('delta_score_milli'),
+                'reqs': r.get('requirements_count'),
+                'oq': r.get('oq_count'),
+                'mode': r.get('mode'),
+            })
+        out.append({'stage': st.get('stage'), 'rounds': rounds})
+    return out
+
+
+def main():
     if not n:
         return '0'
     if n >= 1e9:
@@ -384,6 +408,47 @@ main{padding:16px 26px 80px;max-width:1400px}
 
 /* ── приёмка: вклад каждого пункта ─────────────────────────── */
 /* главный показатель: шапка и тело */
+.conv{padding:0 26px;margin:0 0 6px;max-width:1400px}
+.cvtitle{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim2);margin:10px 0 8px}
+.cvtitle span{letter-spacing:0;text-transform:none;color:var(--dim2);opacity:.75;margin-left:6px}
+.cvrow{display:flex;align-items:center;gap:14px;padding:6px 12px;border:1px solid var(--line);
+  border-radius:8px;background:var(--card);margin-bottom:6px}
+.cvleft{display:flex;flex-direction:column;gap:2px;min-width:250px}
+.cvlab{font-size:12px;color:var(--ink)}
+.cvmeta{font-size:10.5px;color:var(--dim2);font-family:var(--mono)}
+.cvbar{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+.cvtrack{display:flex;align-items:flex-end;gap:2px;flex:1;min-width:0;height:22px;overflow:hidden}
+.cvtrack{position:relative}
+.cvline{position:absolute;left:0;right:0;height:0;border-top:1px dashed rgba(233,238,244,.35);pointer-events:none}
+.cvtrack.dense .tk{flex:0 0 3px}
+.tk{flex:0 0 5px;border-radius:1px 1px 0 0;height:22px;background:#2b3a4a}
+.tk.ok{background:var(--pass)}
+.tk.bad{background:var(--stop)}
+.tk.un{height:9px;background:#2b3440}
+.cvlast{font-family:var(--mono);font-size:13px;min-width:56px;text-align:right}
+.cvlast.ok{color:var(--pass)} .cvlast.bad{color:var(--stop)} .cvlast.none{color:var(--dim2);font-size:11px}
+.cvdelta{font-family:var(--mono);font-size:11px;min-width:56px;text-align:right}
+.cvdelta.up{color:var(--pass)} .cvdelta.down{color:var(--stop)} .cvdelta.flat{color:var(--dim2)}
+.cvmode{font-size:10.5px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+.cvmode.up{color:var(--pass);border-color:rgba(62,207,142,.35);background:rgba(62,207,142,.07)}
+.cvmode.down{color:var(--stop);border-color:rgba(240,97,109,.35);background:rgba(240,97,109,.07)}
+.humanmark{display:inline-flex;align-items:center;color:var(--human);opacity:.85;cursor:help}
+.spark{display:inline-flex;align-items:flex-end;gap:1px;height:14px;margin-left:2px;cursor:help}
+.spark i{width:3px;border-radius:1px 1px 0 0;background:#2b3a4a}
+.spark i.ok{background:var(--pass)} .spark i.bad{background:var(--stop)}
+.spark i.mid{background:#4a6b86} .spark i.un{background:#2b3440}
+.spark.up{filter:saturate(1)} .spark.down i.ok,.spark.down i.mid{background:#7a5a3a}
+.mstats{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--dim2)}
+.mstats b{color:var(--dim);font-weight:500}
+.mstats .lim{color:#5a6877}
+.mstats .dot{width:3px;height:3px;border-radius:50%;background:#39424e;display:inline-block}
+.rolememo{font-family:var(--mono);font-size:10.5px;color:var(--dim2);padding:8px 14px 0}
+.rolememo b{color:var(--dim);font-weight:500}
+.cvvol{font-family:var(--mono);font-size:11.5px;color:var(--ink);white-space:nowrap}
+.cvvol small{color:var(--dim2);font-size:10px}
+.tk.mid{background:#4a6b86}
+.tk.flat{background:#3a4a5a}
+.cvtheta{font-size:10.5px;color:var(--dim2);font-family:var(--mono)}
 .hero-score{text-align:right;min-width:150px;padding-left:6px;border-left:1px solid var(--line);margin-left:4px}
 .hs-n{font-size:34px;font-weight:700;line-height:1;letter-spacing:-1px;color:var(--pass);font-variant-numeric:tabular-nums}
 .hs-n.wait{color:var(--now)}
@@ -607,6 +672,7 @@ code[class*=language-]{font-family:var(--mono);font-size:11.5px;line-height:1.55
 </header>
 <main><div class="steps" id="s"></div></main>
 <script>
+const CONV = __CONV__;
 const S = __DATA__;
 const CUR = __CUR__;
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -720,42 +786,19 @@ function reviewPanel(b){
 
 function implPanel(b){
   const i = b.impl;
-  // Порядок — по полезности человеку: что проверено (факты), чем закрыто каждое
-  // требование (со ссылками в код), и только потом пересказ исполнителя —
-  // свёрнутый, потому что это его собственный рассказ, а не доказательство.
+  // Здесь только то, что платформа действительно знает: ветка и коммит,
+  // проштампованные при публикации. «Что проверено», «чем закрыто требование»
+  // и файлы улик убраны — их никто не читает и не сверяет, а рядом со словами
+  // они выглядели как доказательство. Код смотри во вкладке worktree.
   let h = `<div class="wthead">
     <span class="wtbranch">${esc(i.branch || '—')}</span>
     <span class="wtbase">${esc((i.commit || '').slice(0, 8))}</span>
   </div>`;
-  const t = Object.entries(i.tests || {});
-  if (t.length) h += `<div class="sec">что проверено · ${t.length}</div><div class="kv">${
-    t.map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v ${/^(exit 0|ok|OK)/.test(String(v).trim()) ? 'okv' : 'bad'}` +
-      `" >${esc(String(v)).slice(0, 200)}</div>`).join('')}</div>`;
-  h += `<div class="sec">чем закрыто каждое требование · ${i.coverage.length}</div>`;
-  i.coverage.forEach(c => {
-    h += `<div class="req"><div class="rid">${esc(c.req)}${c.status ? ' · ' + esc(c.status) : ''}</div>
-      <div class="st">${piecesHTML(c.pieces) || esc(c.text)}</div></div>`;
-  });
-  // УЛИКИ: чем отчёт подтверждён на самом деле. Пустой файл честно подписан
-  // «пусто» — он ничего не доказывает, даже если в отчёте написано «exit 0».
-  const ev = (b.evidence || []);
-  if (ev.length){
-    h += `<div class="sec">улики прогона · ${ev.length} — сырые файлы рядом с отчётом</div>`;
-    ev.forEach(function(e, k){
-      const empty = !e.size;
-      h += `<details class="ev"><summary>
-        <span class="evn">${esc(e.name)}</span>
-        <span class="evm ${empty ? 'zero' : ''}">${empty ? 'пусто · 0 байт' : (e.size > 1024 ? Math.round(e.size/1024) + ' КБ' : e.size + ' Б') + ' · ' + e.lines + ' стр'}</span>
-        <span class="evt">${esc(e.at)}</span>
-      </summary>${empty ? '<div class="empty">файл пустой</div>' :
-        `<pre class="evlog">${esc(e.tail)}</pre>`}</details>`;
-    });
-  }
   if (i.paragraph)
-    h += `<details class="implrep"><summary>отчёт исполнителя — его пересказ, не доказательство</summary>
+    h += `<details class="implrep"><summary>что исполнитель говорит о своей работе — его пересказ</summary>
       <div class="lead" style="margin-top:8px">${esc(i.paragraph)}</div></details>`;
   if (i.notes)
-    h += `<details class="implrep"><summary>служебные заметки</summary>
+    h += `<details class="implrep"><summary>служебные заметки исполнителя</summary>
       <div class="lead" style="margin-top:8px;font-family:var(--mono);font-size:11px">${esc(i.notes)}</div></details>`;
   return h;
 }
@@ -1093,6 +1136,41 @@ function act(el, kind){
 }
 
 function stageHTML(s, i){
+  // Сходимость стадии — прямо в строке шага: последние круги как засечки.
+  // У ревью мерится объём (требования/вопросы), у приёмки — балл.
+  const conv = (function(){
+    const key = s.state === 'REVIEW' ? 'spec_review' : s.state === 'QA' ? 'quality' : null;
+    return key ? ((CONV || []).find(function(c){ return c.stage === key; }) || null) : null;
+  })();
+  function convSpark(){
+    if (!conv || !conv.rounds.length) return '';
+    const isSpec = conv.stage === 'spec_review';
+    const all = conv.rounds;
+    const shown = all.slice(-20);
+    const vals = all.map(function(r){ return isSpec ? r.reqs : r.s; }).filter(function(v){ return v !== null && v !== undefined; });
+    const max = vals.length ? Math.max.apply(null, vals) : 1;
+    const theta = isSpec ? null : ((all.find(function(r){ var v = r.th; return v !== null && v !== undefined; }) || {}).th ?? null);
+    const mode = MODE_WORD[all[all.length - 1].mode] || MODE_WORD.UNKNOWN;
+    let bars = '';
+    shown.forEach(function(r){
+      const v = isSpec ? r.reqs : r.s;
+      let cls = 'un', hgt = 4;
+      if (v !== null && v !== undefined){
+        if (isSpec) { cls = 'mid'; hgt = 4 + Math.round((v / (max || 1)) * 10); }
+        else { cls = (theta !== null && v < theta) ? 'bad' : 'ok'; hgt = 4 + Math.round(v * 10); }
+      }
+      bars += '<i class="' + cls + '" style="height:' + hgt + 'px"></i>';
+    });
+    const r0 = all[0], rN = all[all.length - 1];
+    const tip = isSpec
+      ? 'сходимость по объёму: кругов ' + all.length + ', требований ' + (r0.reqs ?? '—') + ' → ' + (rN.reqs ?? '—') +
+        ', вопросов ' + (r0.oq ?? '—') + ' → ' + (rN.oq ?? '—') + ' · ' + mode[0] +
+        (all.length > 20 ? ' · показаны последние 20' : '')
+      : 'сходимость по баллу: кругов ' + all.length + ', измерено ' + vals.length +
+        (rN.s !== null && rN.s !== undefined ? ', последний ' + (rN.s * 100).toFixed(1) + '%' : '') +
+        ' · ' + mode[0] + (all.length > 20 ? ' · показаны последние 20' : '');
+    return `<span class="spark ${mode[1]}" title="${esc(tip)}">${bars}</span>`;
+  }
   const cls = ['step', s.status === 'passed' ? 'done' : s.status === 'current' ? 'now' : 'todo',
                s.gate ? 'gate' : '', i === CUR ? 'open' : ''].join(' ');
   const hot = s.status === 'current';
@@ -1107,14 +1185,20 @@ function stageHTML(s, i){
       scoreChip = `<span class="chip-score ${c}">${(hl.score*100).toFixed(1)}%<i>качество</i></span>`;
     }
   }
-  const chips = [
-    scoreChip,
-    `<span class="chip ${s.status==='passed'?'good':hot?'hot':''}">${esc(s.statusWord||s.status)}</span>`,
-    s.attempts ? `<span class="chip">прогонов ${s.attempts}${s.limit ? ' · лимит ' + s.limit : ''}</span>` : '',
-    s.tokens ? `<span class="chip">${fmtT(s.tokens)} ток</span>` : '',
-    s.cost ? `<span class="chip">$${s.cost.toFixed(2)}</span>` : '',
-    s.gate ? `<span class="chip hot">решает человек</span>` : '',
+  // Слева — что решает человек: оценка и «решает человек». Статус словами не
+  // пишем: он уже в иконке слева, слова ушли в её подсказку. Всё измеримое —
+  // справа одной группой: время, прогоны, токены, цена.
+  const MAN = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="8" cy="4.4" r="2.6" fill="currentColor"/><path d="M8 8.2c-2.9 0-5 1.7-5 4.2V15h10v-2.6c0-2.5-2.1-4.2-5-4.2Z" fill="currentColor"/></svg>';
+  const chips = [scoreChip,
+    s.gate ? `<span class="humanmark" title="решает человек: шаг ждёт подписи или ответа, а не прогона">${MAN}</span>` : ''
   ].join('');
+  const stats = [
+    s.duration ? `<span>${esc(s.duration)}</span>` : '',
+    s.attempts ? `<span>прогонов <b>${s.attempts}</b></span>` : '',
+    s.tokens ? `<span><b>${fmtT(s.tokens)}</b> ток</span>` : '',
+    s.cost ? `<span><b>$${s.cost.toFixed(2)}</b></span>` : '',
+    s.limit ? `<span class="lim">лимит ${s.limit}</span>` : '',
+  ].filter(Boolean).join('<i class="dot"></i>');
   const bodyKinds = Object.keys(s.body);
   const isGate = s.kind === 'gate';
   const tabs = [];
@@ -1143,17 +1227,16 @@ function stageHTML(s, i){
   if (bodyKinds.includes('impl')) panels.push(`<div class="panel ${'impl'===firstTab?'on':''}" data-p="impl">${implPanel(s.body)}</div>`);
   if (bodyKinds.includes('worktree')) panels.push(`<div class="panel ${'worktree'===firstTab?'on':''}" data-p="worktree">${worktreePanel(s.body.worktree)}</div>`);
   return `<div class="${cls}" data-i="${i}">
-    <div class="nodebox"><div class="node"><span>${s.status==='passed'?'✓':''}</span></div>
+    <div class="nodebox" title="${esc(s.statusWord||s.status)}"><div class="node"><span>${s.status==='passed'?'✓':''}</span></div>
       <div class="rail"></div></div>
     <div>
       <div class="card">
         <div class="head" onclick="toggle(${i})">
-          <div class="t1"><span class="role">${esc(s.title)}</span>
-            <span class="ver">${esc(s.role||'')}${s.version?'@v'+s.version:''}</span>
-            ${chips}</div>
-          <div class="t2">${btn(s)}<span>${esc(s.duration||'')}</span><span class="caret">▶</span></div>
+          <div class="t1"><span class="role">${esc(s.title)}</span>${convSpark()}${chips}</div>
+          <div class="t2"><span class="mstats">${stats}</span>${btn(s)}<span class="caret">▶</span></div>
         </div>
         <div class="body">
+          ${s.role ? `<div class="rolememo">роль <b>${esc(s.role)}</b>${s.version ? ' v' + s.version : ''}${s.in_contract ? ' · вход ' + esc(s.in_contract) : ''}${s.out_contract ? ' · выход ' + esc(s.out_contract) : ''}</div>` : ''}
           <div class="tabs">${tabs.map(([k,w])=>
             `<div class="tab ${k===firstTab?'on':''}" data-p="${k}" onclick="tab(event, ${i}, '${k}')">${w}</div>`).join('')}</div>
           ${panels.join('')}
@@ -1161,6 +1244,94 @@ function stageHTML(s, i){
       </div>
     </div>
   </div>`;
+}
+
+// ── сходимость ────────────────────────────────────────────────────────────
+// Одна строка на стадию: все раунды подряд, как они шли. Измеренный раунд —
+// столбик выше порога (зелёный) или ниже (красный); неизмеренный — тонкая
+// серая засечка: платформа балла не давала, и мы его не рисуем.
+const STAGE_WORD = {spec_review: 'спека', quality: 'приёмка', rework: 'доработка'};
+const MODE_WORD = {CONVERGING: ['рост', 'up'], DIVERGING: ['расхождение', 'down'],
+                   PLATEAU: ['застой', 'flat'], UNKNOWN: ['нет данных', 'flat']};
+
+function convHTML(){
+  if (!CONV || !CONV.length) return '';
+  let h = '<div class="cvtitle">сходимость <span>круги работы, слева направо</span></div>';
+  CONV.forEach(function(st){
+    const rounds = st.rounds || [];
+    if (!rounds.length) return;
+    const isSpec = st.stage === 'spec_review';
+    // «Спека» сходится ОБЪЁМОМ: балла в отчёте ревью нет и контрактом он не
+    // требуется — считаем, тянет ли спека к стабильности (требования и вопросы).
+    // «Приёмка» сходится БАЛЛОМ: evaluation.score против порога theta.
+    if (isSpec){
+      const reqs = rounds.map(function(r){ return r.reqs; }).filter(function(v){ return v !== null && v !== undefined; });
+      const maxReq = reqs.length ? Math.max.apply(null, reqs) : 1;
+      let ticks = '';
+      let prev = null;
+      rounds.forEach(function(r){
+        const v = (r.reqs === null || r.reqs === undefined) ? null : r.reqs;
+        let cls = 'flat', hgt = 6;
+        if (v !== null){
+          hgt = 6 + Math.round((v / (maxReq || 1)) * 16);
+          if (prev !== null && v < prev) cls = 'ok';
+          else if (prev !== null && v > prev) cls = 'bad';
+          else cls = 'mid';
+        }
+        const tip = 'круг ' + r.r + (v === null ? ' · требований нет данных' : ' · требований ' + v) +
+          (r.oq !== null && r.oq !== undefined ? ' · вопросов ' + r.oq : '');
+        ticks += '<span class="tk ' + (v === null ? 'un' : cls) + '" style="height:' + (v === null ? 9 : hgt) + 'px" title="' + esc(tip) + '"></span>';
+        prev = v;
+      });
+      const r0 = rounds[0], rN = rounds[rounds.length - 1];
+      const mode = MODE_WORD[rounds[rounds.length - 1].mode] || MODE_WORD.UNKNOWN;
+      h += '<div class="cvrow">' +
+        '<div class="cvleft"><span class="cvlab">спека</span>' +
+          '<span class="cvmeta">кругов ' + rounds.length + ' · балла нет по контракту — смотрим объём</span></div>' +
+        '<div class="cvbar"><div class="cvtrack' + (rounds.length > 50 ? ' dense' : '') + '">' + ticks + '</div>' +
+          '<span class="cvvol">' + (r0.reqs ?? '—') + ' → ' + (rN.reqs ?? '—') + ' <small>требований</small></span>' +
+          '<span class="cvvol">' + (r0.oq ?? '—') + ' → ' + (rN.oq ?? '—') + ' <small>вопросов</small></span>' +
+          '<span class="cvmode ' + mode[1] + '">' + mode[0] + '</span>' +
+        '</div></div>';
+      return;
+    }
+
+    const measured = rounds.filter(function(r){ return r.s !== null; });
+    const theta = (measured.find(function(r){ return r.th !== null; }) || {}).th ?? null;
+    const last = measured[measured.length - 1] || null;
+    const prevM = measured[measured.length - 2] || null;
+    const delta = last && prevM ? last.s - prevM.s : null;
+    const mode = MODE_WORD[rounds[rounds.length - 1].mode] || MODE_WORD.UNKNOWN;
+    let ticks = '';
+    rounds.forEach(function(r){
+      const cls = r.s === null ? 'un' : (theta !== null && r.s < theta ? 'bad' : 'ok');
+      const tip = 'круг ' + r.r + (r.s === null ? ' · не измерено' : ' · ' + (r.s * 100).toFixed(1) + '%');
+      ticks += '<span class="tk ' + cls + '" title="' + esc(tip) + '"></span>';
+    });
+    h += '<div class="cvrow">' +
+      '<div class="cvleft"><span class="cvlab">приёмка</span>' +
+        '<span class="cvmeta">кругов ' + rounds.length + ' · измерено ' + measured.length + '</span></div>' +
+      '<div class="cvbar"><div class="cvtrack' + (rounds.length > 50 ? ' dense' : '') + '">' +
+        (theta !== null ? '<span class="cvline" style="bottom:' + (theta * 22).toFixed(1) + 'px"></span>' : '') +
+        ticks + '</div>' +
+        (last ? '<span class="cvlast ' + (theta !== null && last.s < theta ? 'bad' : 'ok') + '">' + (last.s * 100).toFixed(1) + '%</span>'
+              : '<span class="cvlast none">балл не записан</span>') +
+        (delta !== null
+          ? '<span class="cvdelta ' + (delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat') + '">' +
+            (delta > 0 ? '↑ +' : delta < 0 ? '↓ ' : '→ ') + Math.abs(delta).toFixed(3) + '</span>'
+          : '') +
+        '<span class="cvmode ' + mode[1] + '">' + mode[0] + '</span>' +
+        (theta !== null ? '<span class="cvtheta">порог ' + (theta * 100).toFixed(0) + '%</span>' : '') +
+      '</div></div>';
+  });
+  return h;
+}
+
+function renderConv(){
+  const el = document.getElementById('conv');
+  const h = convHTML();
+  el.innerHTML = h;
+  el.style.display = h ? '' : 'none';
 }
 
 function toggle(i){
@@ -1214,6 +1385,16 @@ try{
 }
 </script></body></html>"""
 
+def human(n):
+    """Токены по-человечески: 45.3 млн, 228 тыс, 812."""
+    n = n or 0
+    if n >= 1_000_000:
+        return f'{n / 1_000_000:.1f} млн'
+    if n >= 1_000:
+        return f'{n / 1_000:.0f} тыс'
+    return str(n)
+
+
 STATE_CLS = {'APPROVAL': 'b-human', 'WAITING_FOR_INPUT': 'b-human', 'BLOCKED': 'b-stop',
              'FAILED': 'b-stop', 'PAUSED': 'b-stop', 'REWORK': 'b-now', 'QA': 'b-pass',
              'DRAFT': 'b-mute'}
@@ -1240,6 +1421,7 @@ html = (html
         # '</script' внутри данных (тексты отчётов, куски кода) обязан быть экранирован,
         # иначе HTML-парсер закрывает тег раньше времени
         .replace('__DATA__', json.dumps(model, ensure_ascii=False).replace('</', '<\\/'))
+        .replace('__CONV__', json.dumps(conv_model(), ensure_ascii=False).replace('</', '<\\/'))
         .replace('__CUR__', str(cur))
         .replace('__H1__', (T.get('display') or T['title']).replace('<', '&lt;'))
         .replace('__ID__', T['id'])

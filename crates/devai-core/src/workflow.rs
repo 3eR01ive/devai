@@ -1183,6 +1183,137 @@ pub fn park_attempt_limit(
     Ok(m)
 }
 
+/// Имя гейта в событиях/вопросах: ревью не устроило спеку, и управление уходит
+/// человеку, а не в следующий молчаливый круг.
+pub const GATE_REVIEW_RETURN: &str = "review-return";
+
+/// Ревьюер вернул спеку — спрашиваем ЧЕЛОВЕКА, а не запускаем следующий круг
+/// сами (решение оператора 12.11: каждый новый круг проходит через него).
+///
+/// Задача паркуется в объявленном состоянии вопроса, запомненная стадия —
+/// ANALYSIS: ответ «продолжить» вернёт спеку аналитику на новый круг,
+/// «остановить» оставит дело у человека. Вопрос и парковка — в одной мутации,
+/// чтобы припаркованное дело всегда было отвечаемым.
+pub fn park_review_rejection(
+    process: &Process,
+    task: &Task,
+    question_id: Id,
+    verdict: Verdict,
+    summary: Option<&str>,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::Review],
+        "park-review-rejection",
+        CoreError::hint("only a finished review can hand control back to the human"),
+    )?;
+    let to = process.hold_target(HoldKind::Question)?;
+    let from = task.state;
+    let mut next = task.clone();
+    next.state = to;
+    next.updated_at = now;
+    next.lock_version += 1;
+    // Возврат после ответа — в АНАЛИЗ, а не в РЕВЬЮ: проверять заново нечего,
+    // пока аналитик не выпустил новую версию спеки.
+    next.return_state = Some(TaskState::Analysis);
+    let payload = json!({
+        (json_field::VERDICT): verdict.as_str(),
+        (json_field::SUMMARY): summary,
+        (json_field::QUESTION_ID): question_id.to_string(),
+        (json_field::GATE): GATE_REVIEW_RETURN,
+        (json_field::FROM): from.as_str(),
+        (json_field::TO): to.as_str(),
+    });
+    Ok(Mutation {
+        task: next,
+        events: vec![
+            EventDraft {
+                kind: event_kind::REVIEW_RECORDED,
+                actor: actor.to_string(),
+                payload: payload.clone(),
+            },
+            EventDraft {
+                kind: event_kind::QUESTION_RAISED,
+                actor: actor.to_string(),
+                payload: json!({
+                    (json_field::QUESTION_ID): question_id.to_string(),
+                    (json_field::GATE): GATE_REVIEW_RETURN,
+                    "blocking": true,
+                    (json_field::FROM): from.as_str(),
+                    (json_field::TO): to.as_str(),
+                }),
+            },
+        ],
+        artifact_status: Vec::new(),
+        questions: vec![QuestionDraft {
+            id: question_id,
+            text: format!(
+                "Что случилось: независимая проверка не приняла текущую версию требований \
+                 (вердикт `{verdict}`).\n\
+                 Почему спрашиваю: платформа больше не запускает следующий круг аналитика \
+                 сама — каждый круг начинается с вашего слова.\n\
+                 Что сделать: ответьте `{proceed}` — аналитик получит спеку на новый круг; \
+                 или `{halt}` — задача останется у вас (это не отмена и не провал).",
+                verdict = verdict.as_str(),
+                proceed = attempt_limit_answer::CONTINUE,
+                halt = attempt_limit_answer::STOP,
+            ),
+            context: Some(format!(
+                "gate={GATE_REVIEW_RETURN} verdict={}",
+                verdict.as_str()
+            )),
+            options: attempt_limit_answer::ALL
+                .iter()
+                .map(|option| (*option).to_string())
+                .collect(),
+            blocking: true,
+        }],
+    })
+}
+
+/// Человек ответил «остановить» на вопрос о новом круге: дело уходит в
+/// объявленное удержание у человека, запомненная стадия (ANALYSIS) остаётся.
+pub fn answer_review_return_stop(
+    process: &Process,
+    task: &Task,
+    question_id: Id,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::WaitingForInput],
+        "stop-on-review-return",
+        CoreError::hint("the task is not waiting for the review-return answer"),
+    )?;
+    let to = process.hold_target(HoldKind::Block)?;
+    let from = task.state;
+    let mut next = task.clone();
+    next.state = to;
+    next.updated_at = now;
+    next.lock_version += 1;
+    let stage = task.return_state;
+    next.return_state = stage.or(Some(TaskState::Analysis));
+    Ok(Mutation {
+        task: next,
+        events: vec![EventDraft {
+            kind: event_kind::QUESTION_ANSWERED,
+            actor: actor.to_string(),
+            payload: json!({
+                (json_field::QUESTION_ID): question_id.to_string(),
+                (json_field::ANSWER): attempt_limit_answer::STOP,
+                (json_field::GATE): GATE_REVIEW_RETURN,
+                (json_field::FROM): from.as_str(),
+                (json_field::TO): to.as_str(),
+            }),
+        }],
+        artifact_status: Vec::new(),
+        questions: Vec::new(),
+    })
+}
+
 /// The human answered «остановить» to the attempt-limit question (REQ-AL-06):
 /// the task leaves the question hold for the DECLARED human-custody address
 /// (`holds.block`) and keeps the remembered working stage. It is NOT cancelled

@@ -24,8 +24,9 @@
 # кода и объявления не решается в пользу одной из сторон молча.
 
 process:
+  # Версия 5: отказ ревью уходит ЧЕЛОВЕКУ, а не в следующий круг анализа.
   # Версия 4: стадия STATEMENT — постановщик проверяет саму постановку до анализа.
-  version: 4
+  version: 5
 
   # Закрытый перечень имён условий. Неизвестное имя в transitions отвергается
   # при инициализации — опечатка не становится «новым» переходом. Имя,
@@ -120,7 +121,11 @@ process:
     - { from: ANALYSIS, on: outcome_missing, to: BLOCKED }
     - { from: REVIEW, on: spec_published, to: REVIEW }
     - { from: REVIEW, on: review_finished, to: APPROVAL }
-    - { from: REVIEW, on: review_rejected, to: ANALYSIS }
+    # Решение оператора 12.11: каждый новый круг, когда ревьюера что-то не
+    # устроило, начинается со слова человека. Задача паркуется в состоянии
+    # вопроса (запомненная стадия — ANALYSIS): «продолжить» вернёт спеку
+    # аналитику, «остановить» оставит дело у человека.
+    - { from: REVIEW, on: review_rejected, to: WAITING_FOR_INPUT }
     - { from: REVIEW, on: launch_failed, to: BLOCKED }
     - { from: REVIEW, on: outcome_missing, to: BLOCKED }
     - { from: APPROVAL, on: spec_published, to: REVIEW }

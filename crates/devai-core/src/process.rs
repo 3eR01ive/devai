@@ -28,7 +28,9 @@ use crate::types::TaskState;
 ///
 /// Version 3 replaced the silent round brake (`max_rounds_without_shift`)
 /// with the declared attempt limit (`max_attempts_without_progress`).
-pub const SUPPORTED_PROCESS_VERSION: u32 = 4;
+/// 5: отказ ревью уводит задачу к человеку (WAITING_FOR_INPUT) вместо
+/// автоматического следующего круга анализа.
+pub const SUPPORTED_PROCESS_VERSION: u32 = 5;
 
 /// The special transition address: «the remembered working stage» of a hold
 /// (`return_state`), not a fixed state name. Spelled once.

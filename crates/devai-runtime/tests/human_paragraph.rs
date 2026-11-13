@@ -118,7 +118,9 @@ fn role_contracts_point_at_the_paragraph_versions() {
     // human_paragraph), so "points at the paragraph version" holds at the
     // current version; the name bump must not silently unpin this check.
     assert_eq!(out("requirements-analyst"), "requirements-specification@4");
-    assert_eq!(out("requirements-reviewer"), "review-report@2");
+    // @4 добавляет платформенную ссылку на проверенную спеку (spec_seq /
+    // spec_artifact) поверх обязательств @2 — параграф по-прежнему обязателен.
+    assert_eq!(out("requirements-reviewer"), "review-report@4");
     assert_eq!(out("implementation-agent"), "implementation-report@3");
     assert_eq!(
         inp("requirements-reviewer").as_deref(),

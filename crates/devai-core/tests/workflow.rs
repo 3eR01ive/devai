@@ -167,19 +167,42 @@ fn full_happy_lifecycle() {
 }
 
 #[test]
-fn review_can_send_back_to_analysis() {
+fn review_rejection_asks_the_human_before_another_round() {
+    // Отказ ревью не запускает новый круг сам (решение оператора 12.11):
+    // задача паркуется с вопросом, запомненная стадия — ANALYSIS, и только
+    // ответ «продолжить» возвращает спеку аналитику.
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);
-    let t = workflow::review_recorded(
+    let q = new_id();
+    let m = workflow::park_review_rejection(
         &proc(),
         &t,
+        q,
         Verdict::NeedsRevision,
         Some("gaps"),
         "reviewer",
         now(),
     )
     .unwrap();
-    assert_eq!(t.task.state, TaskState::Analysis);
+    assert_eq!(m.task.state, TaskState::WaitingForInput);
+    assert_eq!(m.task.return_state, Some(TaskState::Analysis));
+    assert_eq!(m.questions.len(), 1);
+    assert!(m.questions[0].blocking);
+    assert_eq!(
+        m.questions[0].options,
+        vec![
+            attempt_limit_answer::CONTINUE.to_string(),
+            attempt_limit_answer::STOP.to_string()
+        ]
+    );
+    // «продолжить» — обычный путь ответа: удержание снято, стадия возврата
+    // ANALYSIS, и роль снова может работать.
+    let back = workflow::answer_question(&proc(), &m.task, q, "human", now()).unwrap();
+    assert_eq!(back.task.state, TaskState::Analysis);
+    // «остановить» — дело остаётся у человека, стадия возврата сохранена.
+    let stopped = workflow::answer_review_return_stop(&proc(), &m.task, q, "human", now()).unwrap();
+    assert_eq!(stopped.task.state, TaskState::Blocked);
+    assert_eq!(stopped.task.return_state, Some(TaskState::Analysis));
 }
 
 #[test]
