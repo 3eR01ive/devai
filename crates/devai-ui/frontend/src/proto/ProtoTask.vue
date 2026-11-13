@@ -39,7 +39,9 @@ const implWords = ref<{ paragraph: string | null; notes: string | null } | null>
 // а не всегда последнего. Тела читаются лениво и кешируются.
 const artifacts = ref<ArtifactView[]>([]);
 const selRunId = ref<Record<string, string>>({});
-const runBodies = ref<Record<string, any> | "loading">({});
+const runBodies = ref<Record<string, any>>({});
+// Сравнение с ПРЕДЫДУЩЕЙ версией: галочка в шаге анализа, без отдельной вкладки.
+const comparePrev = ref<Record<string, boolean>>({});
 const error = ref<UiError | null>(null);
 const busy = ref(false);
 
@@ -172,8 +174,7 @@ async function pickRun(s: any, execId: string) {
 }
 
 async function ensureBody(art: ArtifactView) {
-  if (typeof runBodies.value === "object" && runBodies.value[art.id]) return;
-  if (runBodies.value === "loading") return;
+  if (runBodies.value[art.id]) return;
   try {
     const c = await api.artifactContent(art.id);
     if (c.shape !== "text") return;
@@ -223,7 +224,111 @@ function implBody(s: any): any | null {
   return implWords.value;
 }
 
+// ── сравнение версий спеки ──────────────────────────────────────────────
+/** Предыдущий прогон шага, который отдал артефакт нужного вида. */
+function prevRunWithArt(s: any, kind: string): { run: any; art: ArtifactView } | null {
+  const execs: any[] = s.execs ?? [];
+  const cur = runOf(s);
+  if (!cur) return null;
+  const idx = execs.findIndex((e) => e.id === cur.id);
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    const a = artByExec.value.get(execs[i].id);
+    if (a && a.kind === kind) return { run: execs[i], art: a };
+  }
+  return null;
+}
+
+function bodyOfArt(artId: string): any | null {
+  const b = runBodies.value as Record<string, any>;
+  return b[artId] ?? null;
+}
+
+/** Построчный diff: одинаковые строки — контекст, разные — с минусом и плюсом. */
+type DiffLine = { t: "same" | "add" | "del"; v: string };
+function diffLines(a: string, b: string): DiffLine[] {
+  const A = (a || "").split("\n");
+  const B = (b || "").split("\n");
+  // LCS-таблица: строк в абзацах немного, квадрат допустим.
+  const n = A.length;
+  const m = B.length;
+  const L: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    }
+  }
+  const out: DiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (A[i] === B[j]) { out.push({ t: "same", v: A[i] }); i += 1; j += 1; }
+    else if (L[i + 1][j] >= L[i][j + 1]) { out.push({ t: "del", v: A[i] }); i += 1; }
+    else { out.push({ t: "add", v: B[j] }); j += 1; }
+  }
+  while (i < n) { out.push({ t: "del", v: A[i] }); i += 1; }
+  while (j < m) { out.push({ t: "add", v: B[j] }); j += 1; }
+  return out;
+}
+
+type ReqDiff = {
+  id: string;
+  kind: "added" | "removed" | "changed" | "same";
+  statement?: DiffLine[];
+  ac?: { t: "add" | "del"; v: string }[];
+  oldStatement?: string;
+  newStatement?: string;
+};
+
+/** Что изменилось в спеке выбранного прогона против предыдущей версии. */
+function specCompare(s: any): { prevSeq: number | null; items: ReqDiff[] } | null {
+  const art = artOf(s);
+  const cur = bodyOf(s);
+  if (!art || art.kind !== "REQUIREMENTS_SPEC" || !cur) return null;
+  const prev = prevRunWithArt(s, "REQUIREMENTS_SPEC");
+  if (!prev) return null;
+  const old = bodyOfArt(prev.art.id);
+  if (!old) return null;
+
+  const oldReqs: any[] = old.requirements ?? [];
+  const newReqs: any[] = cur.requirements ?? [];
+  const ids = Array.from(new Set([...oldReqs.map((r) => r.id), ...newReqs.map((r) => r.id)]));
+  const items: ReqDiff[] = [];
+  for (const id of ids) {
+    const o = oldReqs.find((r) => r.id === id);
+    const nw = newReqs.find((r) => r.id === id);
+    if (!o) { items.push({ id, kind: "added", newStatement: nw?.statement ?? "" }); continue; }
+    if (!nw) { items.push({ id, kind: "removed", oldStatement: o.statement ?? "" }); continue; }
+    const os = String(o.statement ?? "");
+    const ns = String(nw.statement ?? "");
+    const oldAc: string[] = o.acceptance_criteria ?? [];
+    const newAc: string[] = nw.acceptance_criteria ?? [];
+    const acDiff = [
+      ...oldAc.filter((x) => !newAc.includes(x)).map((v) => ({ t: "del" as const, v })),
+      ...newAc.filter((x) => !oldAc.includes(x)).map((v) => ({ t: "add" as const, v })),
+    ];
+    const changed = os !== ns || acDiff.length > 0;
+    items.push({
+      id,
+      kind: changed ? "changed" : "same",
+      statement: changed && os !== ns ? diffLines(os, ns) : undefined,
+      oldStatement: os,
+      newStatement: ns,
+      ac: acDiff,
+    });
+  }
+  return { prevSeq: prev.art.seq, items };
+}
+
 /** Догружаем тело артефакта, когда шаг раскрыт: вкладкам нужны данные. */
+async function toggleCompare(s: any) {
+  const on = !comparePrev.value[s.state];
+  comparePrev.value = { ...comparePrev.value, [s.state]: on };
+  if (on) {
+    const prev = prevRunWithArt(s, "REQUIREMENTS_SPEC");
+    if (prev) await ensureBody(prev.art);
+  }
+}
+
 function ensureLoaded(s: any) {
   const art = artOf(s);
   if (art) void ensureBody(art);
@@ -768,20 +873,75 @@ onMounted(load);
               <!-- спецификация (шаг анализа) -->
               <div v-if="openTab === 'spec' && s.state === 'ANALYSIS'" class="p-panel">
                 <div v-if="!specBody(s)" class="p-empty" style="padding: 4px 0">
-                  {{ runBodies === 'loading' ? 'читаю…' : 'у этого прогона спеки нет' }}
+                  у этого прогона спеки нет
                 </div>
                 <template v-else>
                   <div v-if="specBody(s)!.human_paragraph" class="p-lead">
                     {{ specBody(s)!.human_paragraph }}
                   </div>
-                  <div class="p-sec">требований · {{ (specBody(s)!.requirements ?? []).length }}</div>
-                  <div v-for="r in specBody(s)!.requirements ?? []" :key="r.id" class="p-req">
-                    <div class="rid">{{ r.id }}</div>
-                    <div class="rst">{{ r.statement }}</div>
-                    <ul v-if="(r.acceptance_criteria ?? []).length" class="p-ac">
-                      <li v-for="(a, k) in r.acceptance_criteria" :key="k">{{ a }}</li>
-                    </ul>
-                  </div>
+
+                  <!-- изменения к предыдущей версии: галочка, инлайн -->
+                  <label v-if="prevRunWithArt(s, 'REQUIREMENTS_SPEC')" class="p-cmp">
+                    <input type="checkbox" :checked="!!comparePrev[s.state]" @change="toggleCompare(s)" />
+                    <span>что изменилось к предыдущей версии</span>
+                    <span class="p-cmpv mono">
+                      v{{ prevRunWithArt(s, 'REQUIREMENTS_SPEC')!.art.seq }} → v{{ artOf(s)!.seq }}
+                    </span>
+                  </label>
+
+                  <template v-if="comparePrev[s.state]">
+                    <div v-if="!specCompare(s)" class="p-empty" style="padding: 4px 0">
+                      предыдущая версия не прочитана
+                    </div>
+                    <template v-else>
+                      <div class="p-sec">
+                        изменено · {{ specCompare(s)!.items.filter((i) => i.kind !== 'same').length }}
+                        из {{ specCompare(s)!.items.length }}
+                      </div>
+                      <div
+                        v-for="it in specCompare(s)!.items.filter((i) => i.kind !== 'same')"
+                        :key="'d' + it.id"
+                        class="p-req p-reqd"
+                        :class="it.kind"
+                      >
+                        <div class="rid"><span class="p-mark">{{ it.kind === 'added' ? '+' : it.kind === 'removed' ? '−' : '~' }}</span>{{ it.id }}</div>
+                        <template v-if="it.kind === 'added'">
+                          <div class="rst">{{ it.newStatement }}</div>
+                        </template>
+                        <template v-else-if="it.kind === 'removed'">
+                          <div class="rst del">{{ it.oldStatement }}</div>
+                        </template>
+                        <template v-else>
+                          <div v-if="it.statement" class="p-difftext">
+                            <div v-for="(l, k) in it.statement" :key="k" class="dl" :class="l.t">{{ l.v || " " }}</div>
+                          </div>
+                          <ul v-if="(it.ac ?? []).length" class="p-ac">
+                            <li v-for="(a, k) in it.ac" :key="k" :class="a.t === 'del' ? 'acdel' : 'acadd'">{{ a.v }}</li>
+                          </ul>
+                        </template>
+                      </div>
+                      <template v-if="specCompare(s)!.items.filter((i) => i.kind === 'same').length">
+                        <div class="p-sec">
+                          без изменений · {{ specCompare(s)!.items.filter((i) => i.kind === 'same').length }}
+                        </div>
+                        <div v-for="it in specCompare(s)!.items.filter((i) => i.kind === 'same')" :key="'s' + it.id" class="p-req p-same">
+                          <div class="rid">{{ it.id }}</div>
+                          <div class="rst">{{ it.newStatement }}</div>
+                        </div>
+                      </template>
+                    </template>
+                  </template>
+
+                  <template v-else>
+                    <div class="p-sec">требований · {{ (specBody(s)!.requirements ?? []).length }}</div>
+                    <div v-for="r in specBody(s)!.requirements ?? []" :key="r.id" class="p-req">
+                      <div class="rid">{{ r.id }}</div>
+                      <div class="rst">{{ r.statement }}</div>
+                      <ul v-if="(r.acceptance_criteria ?? []).length" class="p-ac">
+                        <li v-for="(a, k) in r.acceptance_criteria" :key="k">{{ a }}</li>
+                      </ul>
+                    </div>
+                  </template>
                 </template>
               </div>
 
@@ -995,6 +1155,23 @@ onMounted(load);
 .p-rd.sel{outline:2px solid var(--p-human);outline-offset:1px}
 .p-rsel{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2);margin-left:8px}
 .p-runmemo{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2);padding:6px 14px 0}
+/* сравнение версий спеки */
+.p-cmp{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--p-dim);
+  border:1px solid var(--p-line);border-radius:8px;padding:7px 11px;background:var(--p-card2);margin:8px 0;cursor:pointer}
+.p-cmp input{accent-color:#7aa7ff}
+.p-cmpv{margin-left:auto;font-size:11px;color:var(--p-dim2)}
+.p-reqd{border-color:rgba(245,181,68,.35)}
+.p-reqd.added{border-color:rgba(62,207,142,.4)}
+.p-reqd.removed{border-color:rgba(240,97,109,.4)}
+.p-same{opacity:.55}
+.p-mark{display:inline-block;width:12px;color:var(--p-now);font-weight:600}
+.p-reqd.added .p-mark{color:var(--p-pass)} .p-reqd.removed .p-mark{color:var(--p-stop)}
+.p-difftext{font-family:var(--mono);font-size:11.5px;line-height:1.5;margin-top:4px}
+.p-difftext .dl{padding:1px 8px;border-radius:3px;white-space:pre-wrap}
+.p-difftext .dl.add{background:rgba(62,207,142,.10);color:#b8e8cd}
+.p-difftext .dl.del{background:rgba(240,97,109,.10);color:#f2bcc2;text-decoration:line-through}
+.p-difftext .dl.same{color:var(--p-dim)}
+.p-ac .acadd{color:#b8e8cd} .p-ac .acdel{color:#f2bcc2;text-decoration:line-through}
 .p-find{display:flex;gap:8px;font-size:12px;color:#dbe3ec;margin-bottom:6px;line-height:1.45}
 .p-sev{font-family:var(--mono);font-size:10px;text-transform:uppercase;padding:1px 6px;border-radius:4px;
   border:1px solid var(--p-line);color:var(--p-dim);height:16px}
