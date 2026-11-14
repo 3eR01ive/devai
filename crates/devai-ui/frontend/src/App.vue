@@ -38,6 +38,7 @@ const degraded = computed(() => degradedBanner(session.value));
 // без единого слова — худший вид поломки, человек не знает даже, что случилось.
 const renderError = ref<string | null>(null);
 onErrorCaptured((e: unknown) => {
+  // ВРЕМЕННО (отладка): показываем стек, чтобы поймать источник поломки.
   renderError.value = e instanceof Error ? e.message : String((e as { message?: string })?.message ?? e);
   return false;
 });

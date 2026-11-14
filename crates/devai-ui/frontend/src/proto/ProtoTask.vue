@@ -905,7 +905,7 @@ onMounted(load);
           class="p-cancel"
           :class="{ holding: holding === 'cancel', done: !canCancel }"
           :disabled="!canCancel || cancelBusy"
-          :title="canCancel ? 'удерживай, чтобы отменить задачу' : 'задача уже закрыта'""
+          :title="canCancel ? 'удерживай, чтобы отменить задачу' : 'задача уже закрыта'"
           @pointerdown="start('cancel', $event)"
           @pointermove="move($event)"
           @pointerup="release"
