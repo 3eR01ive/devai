@@ -14,7 +14,7 @@ import { holdMoveCancels, holdPoint, type HoldPoint } from "../../hold_gesture";
 // The four human gate acts share ONE hold machine: the spec signature's
 // approve/reject and the QA gate's accept/return (REQ-QG-02 AC5 — the same
 // threshold and the same disabled look as the signature).
-export type HoldKind = "approve" | "reject" | "accept" | "return";
+export type HoldKind = "approve" | "reject" | "accept" | "return" | "cancel";
 
 export interface HoldToConfirm {
   /** Какая кнопка удерживается сейчас (null — никакая). */

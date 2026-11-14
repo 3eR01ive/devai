@@ -3,7 +3,8 @@
 // «вход/выход» у ролей, «качество» и «правила приёмки» у гейтов; расход
 // токенов по шагам, вклад каждого пункта приёмки и вставки кода.
 import { computed, onMounted, ref, watch } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
+import { useHoldToConfirm } from "../components/signature/useHoldToConfirm";
 import { api, toUiError } from "../api";
 import type {
   ArtifactView, ProgressView, QualityReportView, Question, RulebookView,
@@ -16,6 +17,7 @@ import QuestionsBlock from "./QuestionsBlock.vue";
 import "./proto.css";
 
 const route = useRoute();
+const router = useRouter();
 const id = computed(() => String(route.params.id ?? ""));
 
 const prog = ref<ProgressView | null>(null);
@@ -786,6 +788,36 @@ async function doRun() {
   catch (e) { error.value = toUiError(e); }
   finally { busy.value = false; }
 }
+// ── закрытие дела человеком и возврат к списку ───────────────────────────
+// Отмена — удержание самой кнопки, без модального подтверждения: одиночный и
+// двойной клик ничего не применяют, мутация идёт тем же актом, что
+// `devai task cancel` (причина и автор остаются в истории).
+const CLOSED = new Set(["ACCEPTED", "CANCELLED", "REJECTED"]);
+const canCancel = computed(() => !!prog.value && !CLOSED.has(prog.value.task.state));
+const cancelBusy = ref(false);
+
+async function doCancel() {
+  cancelBusy.value = true;
+  error.value = null;
+  try {
+    await api.taskCancel(id.value, "закрыто человеком из карточки задачи");
+    await load();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    cancelBusy.value = false;
+  }
+}
+
+const { holding, progress, start, move, release } = useHoldToConfirm(
+  () => canCancel.value && !cancelBusy.value,
+  () => void doCancel(),
+);
+
+function backToList() {
+  void router.push("/proto/tasks");
+}
+
 async function doStop(execId: string) {
   busy.value = true;
   try { await api.execCancel(execId); await load(); }
@@ -802,6 +834,26 @@ onMounted(load);
     <div v-else-if="!prog" class="p-empty">читаю задачу…</div>
 
     <template v-else>
+      <!-- возврат и закрытие дела: обе кнопки — про навигацию и слово
+           человека, а не про шаги роли -->
+      <div class="p-dnav">
+        <button class="p-back" @click="backToList">← к списку</button>
+        <button
+          class="p-cancel"
+          :class="{ holding: holding === 'cancel', done: !canCancel }"
+          :disabled="!canCancel || cancelBusy"
+          :title="canCancel ? 'удерживай, чтобы отменить задачу' : 'задача уже закрыта'"
+          @pointerdown="start('cancel', $event)"
+          @pointermove="move($event)"
+          @pointerup="release"
+          @pointerleave="release"
+          @pointercancel="release"
+        >
+          <i class="fill" :style="{ width: (holding === 'cancel' ? progress * 100 : 0) + '%' }" />
+          <span>{{ cancelBusy ? 'отменяю…' : canCancel ? 'Отменить задачу' : 'закрыта' }}</span>
+        </button>
+      </div>
+
       <header class="p-dhead">
         <div class="p-dtitle">
           <h1>{{ prog.task.display }}</h1>
@@ -1487,4 +1539,18 @@ onMounted(load);
   .p-sec,.p-cells .k,.p-cells .n,.p-pickbar,.p-rule .rh,.anchor,.p-ritem .rmeta{font-size:12px}
   .p-vhead .ver,.qid,.p-exec,.p-ev,.p-rule .rs,.p-ritem .rst{font-size:12px}
 }
+/* ── навигация карточки: возврат к списку и закрытие дела ──────────────── */
+.p-dnav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.p-back{border:1px solid var(--p-line);border-radius:7px;background:#131a22;color:var(--p-dim);
+  font-family:var(--sans);font-size:12px;padding:5px 11px;cursor:pointer}
+.p-back:hover{color:var(--p-ink);border-color:#3a4753}
+.p-cancel{position:relative;overflow:hidden;display:inline-flex;align-items:center;gap:6px;
+  border:1px solid rgba(240,97,109,.55);border-radius:7px;background:rgba(240,97,109,.08);
+  color:#f0a3ab;font-family:var(--sans);font-size:12px;padding:5px 13px;cursor:pointer;
+  user-select:none;touch-action:none}
+.p-cancel .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(240,97,109,.45);
+  transition:width .04s linear;pointer-events:none}
+.p-cancel span{position:relative}
+.p-cancel:hover:not(:disabled){border-color:rgba(240,97,109,.9);color:#ffc2c8}
+.p-cancel:disabled{opacity:.4;cursor:not-allowed}
 </style>

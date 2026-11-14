@@ -177,6 +177,10 @@ export const api = {
   // Возвращается ПЕРЕЧИТАННЫЙ статус: карточка не собирает состояние сама.
   questionAnswer: (id_prefix: string, question_id: string, text: string) =>
     invoke<StatusView>("question_answer", { id_prefix, question_id, text }),
+  // Отмена задачи — тот же акт, что `devai task cancel`: причина и автор
+  // остаются в истории, строка не исчезает.
+  taskCancel: (id_prefix: string, reason: string | null) =>
+    invoke<StatusView>("task_cancel", { id_prefix, reason }),
   // Строки статуса агентов (задача 01a1b60c, REQ-AF-07): одна фраза платформы
   // на агента — окно ничего не собирает и не перефразирует.
   agentStatuses: () => invoke<AgentStatusView[]>("agent_statuses"),

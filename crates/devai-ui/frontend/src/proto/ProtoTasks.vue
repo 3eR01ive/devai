@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Новый список задач (по макету): путь ролей в строке, группы по смыслу,
 // состояние раннера и расход токенов. Старый список остаётся рядом.
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import type { ProgressView, Task, UiError } from "../types";
 import "./proto.css";
@@ -11,6 +11,8 @@ const progress = ref<Record<string, ProgressView>>({});
 const usage = ref<Record<string, { total: number; cost: number; runs: number; measured: number }>>({});
 const error = ref<UiError | null>(null);
 const loading = ref(true);
+// Закрытые показываются по требованию: по умолчанию свернуты, не выброшены.
+const showClosed = ref(false);
 
 const TERMINAL = new Set(["ACCEPTED", "CANCELLED"]);
 const GROUPS: [string, string, string[]][] = [
@@ -18,7 +20,11 @@ const GROUPS: [string, string, string[]][] = [
   ["work", "Идёт работа", ["STATEMENT", "ANALYSIS", "REVIEW", "IMPLEMENTATION", "QA", "REWORK"]],
   ["stop", "Стоят", ["BLOCKED", "PAUSED", "FAILED"]],
   ["draft", "Черновики", ["DRAFT"]],
+  // Закрытые дела никуда не деваются: они есть в списке, но по умолчанию
+  // свернуты одной группой — не мешают, пока не нужны.
+  ["done", "Закрытые", ["ACCEPTED", "CANCELLED", "REJECTED"]],
 ];
+const CLOSED_GROUP = "done";
 const SHORT: Record<string, string> = {
   STATEMENT: "постановка", ANALYSIS: "анализ", REVIEW: "ревью",
   APPROVAL: "подпись", IMPLEMENTATION: "код", QA: "приёмка",
@@ -71,6 +77,9 @@ const rowOf = (t: Task) => {
   else if (["STATEMENT", "ANALYSIS", "REVIEW", "IMPLEMENTATION", "QA", "REWORK"].includes(t.state)) {
     kind = "warn"; word = "прогона нет · " + age(t.updated_at);
   } else if (t.state === "DRAFT") { kind = "idle"; word = "не запускалась"; }
+  else if (t.state === "ACCEPTED") { kind = "done"; word = "принята · " + age(t.updated_at); }
+  else if (t.state === "REJECTED") { kind = "done"; word = "отклонена · " + age(t.updated_at); }
+  else if (t.state === "CANCELLED") { kind = "done"; word = "отменена · " + age(t.updated_at); }
   else { word = "прогона нет · " + age(t.updated_at); }
   return {
     t, stages, kind, word,
@@ -86,13 +95,46 @@ const groups = computed(() =>
   GROUPS.map(([key, title, states]) => ({
     key, title,
     items: tasks.value.filter((t) => states.includes(t.state)).map(rowOf),
-  })).filter((g) => g.items.length),
+  }))
+    .filter((g) => g.items.length)
+    .filter((g) => showClosed.value || g.key !== CLOSED_GROUP),
 );
+
+const closedCount = computed(
+  () => tasks.value.filter((t) => GROUPS.find(([k]) => k === CLOSED_GROUP)![2].includes(t.state)).length,
+);
+
+async function toggleClosed() {
+  showClosed.value = !showClosed.value;
+  // Провал закрытых дел читается только когда их открыли: список не платит
+  // за десятки закрытых задач на каждом входе.
+  if (showClosed.value) await loadDetail(tasks.value.filter((t) => TERMINAL.has(t.state)));
+  if (showClosed.value) await nextTick();
+}
 
 const counts = computed(() => ({
   all: tasks.value.length,
   open: tasks.value.filter((t) => !TERMINAL.has(t.state)).length,
 }));
+
+/// Ход и расход пачкой, пятью параллельными потоками: строка без пути честнее
+/// выдуманного, поэтому отказ отдельной задачи не валит весь список.
+async function loadDetail(list: Task[]) {
+  const queue = list.filter((t) => !progress.value[t.id]).slice();
+  const workers = Array.from({ length: 5 }, async () => {
+    while (queue.length) {
+      const t = queue.shift()!;
+      try {
+        const [p, u] = await Promise.all([api.taskProgress(t.id), api.taskUsage(t.id)]);
+        progress.value = { ...progress.value, [t.id]: p };
+        usage.value = { ...usage.value, [t.id]: u };
+      } catch {
+        /* строка останется без пути */
+      }
+    }
+  });
+  await Promise.all(workers);
+}
 
 async function load() {
   loading.value = true;
@@ -104,21 +146,9 @@ async function load() {
   } finally {
     loading.value = false;
   }
+  // Закрытые читаются только когда их открыли.
   const open = tasks.value.filter((t) => !TERMINAL.has(t.state));
-  const queue = open.slice();
-  const workers = Array.from({ length: 5 }, async () => {
-    while (queue.length) {
-      const t = queue.shift()!;
-      try {
-        const [p, u] = await Promise.all([api.taskProgress(t.id), api.taskUsage(t.id)]);
-        progress.value = { ...progress.value, [t.id]: p };
-        usage.value = { ...usage.value, [t.id]: u };
-      } catch {
-        /* строка останется без пути — честнее выдуманного */
-      }
-    }
-  });
-  await Promise.all(workers);
+  await loadDetail(showClosed.value ? tasks.value : open);
 }
 
 onMounted(load);
@@ -134,6 +164,10 @@ onMounted(load);
         <span v-for="g in groups" :key="g.key" class="p-runchip" :class="g.key === 'you' ? 'human' : g.key === 'stop' ? 'stop' : g.key === 'work' ? 'warn' : ''">
           {{ g.title }} · {{ g.items.length }}
         </span>
+        <!-- закрытые дела не выброшены: они здесь, одной кнопкой -->
+        <button class="p-runchip p-toggle" :class="{ on: showClosed }" @click="toggleClosed">
+          {{ showClosed ? 'скрыть закрытые' : 'закрытые' }} · {{ closedCount }}
+        </button>
       </div>
     </header>
 

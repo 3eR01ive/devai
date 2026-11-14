@@ -87,6 +87,7 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::artifact_content,
         commands::questions_list,
         commands::question_answer,
+        commands::task_cancel,
         commands::agent_statuses,
         commands::executions_list,
         commands::execution_cancel,

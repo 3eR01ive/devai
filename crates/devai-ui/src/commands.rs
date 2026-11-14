@@ -472,6 +472,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // слово человека снимает удержание и возвращает задачу в стадию, которая
     // спросила. Окно не решает, куда идти, — оно отправляет ответ.
     ("question_answer", "question.answer"),
+    ("task_cancel", "task.cancel"),
     // Agent status rows (task 01a1b60c, REQ-AF-07): derived availability,
     // last failure class and counters — ONE read, same words as the CLI.
     ("agent_statuses", "agent.status"),
@@ -554,6 +555,9 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     // слова работа стоит. Это тот же человеческий акт, что подпись и приёмка,
     // и он открыт окну именно поэтому — `question.answer` снимает удержание.
     ("question_answer", "question.answer"),
+    // Отмена задачи: человек закрывает дело со своего места. Тот же акт, что
+    // `devai task cancel` — причина и автор остаются в истории.
+    ("task_cancel", "task.cancel"),
     // Остановка живого прогона: тот же класс, что запуск — человек
     // управляет работой со своего места, платформа закрывает исполнение
     // штатным `exec.cancel` (статус и причина остаются в истории).
@@ -974,6 +978,27 @@ pub fn question_answer(
     text: String,
 ) -> Result<StatusView, UiError> {
     question_answer_as(state, id_prefix, question_id, text, None)
+}
+
+/// `task.cancel` — человек закрывает дело. Тот же акт, что `devai task cancel`:
+/// парковка в отменённое с причиной и автором в истории, а не удаление строки.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_cancel(
+    state: State<AppState>,
+    id_prefix: String,
+    reason: Option<String>,
+) -> Result<StatusView, UiError> {
+    task_cancel_as(state, id_prefix, reason, None)
+}
+
+pub fn task_cancel_as(
+    state: State<AppState>,
+    id_prefix: String,
+    reason: Option<String>,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_cancel(&id_prefix, reason))?;
+    Ok(state.api().task_status(&id_prefix)?)
 }
 
 pub fn question_answer_as(
@@ -2170,6 +2195,7 @@ mod tests {
             "task_return",
             "task_run",
             "question_answer",
+            "task_cancel",
         ];
         expected.sort_unstable();
         assert_eq!(
