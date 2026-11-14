@@ -14,7 +14,6 @@ import type {
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
-import RewindPanel from "./RewindPanel.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -834,35 +833,76 @@ const { holding, progress, start, move, release } = useHoldToConfirm(
   () => void doCancel(),
 );
 
-// «Ошиблись на шаге» — панель открывается по требованию и не занимает шапку.
-const rewindOpen = ref(false);
-const rewindBusy = ref(false);
+// ── перепройти шаг и переписать постановку ───────────────────────────────
+// Оба хода живут ТАМ, ГДЕ ОНИ НУЖНЫ: перезапуск — кнопкой в самом шаге,
+// новая редакция постановки — правкой текста в шаге постановки. Отдельной
+// «панели ошибок» нет: интерфейс не спрашивает «вы ошиблись?», а даёт действие
+// на том шаге, где ошибка видна.
+const replayBusy = ref<string | null>(null);
+const editTitle = ref("");
+const editBody = ref("");
 
-async function doRewind(to: string, reason: string) {
-  rewindBusy.value = true;
+// Правка постановки начинается с той, что есть: человек правит текст, а не
+// пишет заново в пустом поле.
+watch(
+  () => prog.value?.task,
+  (t) => {
+    if (!t) return;
+    editTitle.value = t.title;
+    editBody.value = t.business_description;
+  },
+  { immediate: true },
+);
+
+const CLOSED_STATES = new Set(["ACCEPTED", "CANCELLED", "REJECTED"]);
+const REWINDABLE = new Set(["STATEMENT", "ANALYSIS", "REVIEW", "APPROVAL", "IMPLEMENTATION", "QA"]);
+const currentState = computed(() => prog.value?.task.state ?? "");
+const canReplay = (state: string) =>
+  REWINDABLE.has(state) && state !== currentState.value && !CLOSED_STATES.has(currentState.value);
+
+async function replay(s: { state: string; title: string }) {
+  if (!canReplay(s.state)) return;
+  replayBusy.value = s.state;
   error.value = null;
   try {
-    await api.taskRewind(id.value, to, reason);
-    rewindOpen.value = false;
+    await api.taskRewind(
+      id.value,
+      s.state,
+      `шаг «${s.title}» перезапущен человеком — пройти этот шаг заново`,
+    );
     await load();
   } catch (e) {
     error.value = toUiError(e);
   } finally {
-    rewindBusy.value = false;
+    replayBusy.value = null;
   }
 }
 
-async function doRestate(title: string, description: string, reason: string) {
-  rewindBusy.value = true;
+const editChanged = computed(() => {
+  const t = prog.value?.task;
+  if (!t) return false;
+  return editTitle.value.trim() !== t.title.trim() || editBody.value !== t.business_description;
+});
+const canAcceptEdit = computed(
+  () => editChanged.value && editTitle.value.trim().length > 0 && !CLOSED_STATES.has(currentState.value),
+);
+
+async function acceptEdit() {
+  if (!canAcceptEdit.value) return;
+  busy.value = true;
   error.value = null;
   try {
-    await api.taskRestate(id.value, title, description, reason);
-    rewindOpen.value = false;
+    await api.taskRestate(
+      id.value,
+      editTitle.value.trim(),
+      editBody.value,
+      "постановка переписана человеком: новая редакция принята из карточки",
+    );
     await load();
   } catch (e) {
     error.value = toUiError(e);
   } finally {
-    rewindBusy.value = false;
+    busy.value = false;
   }
 }
 
@@ -891,8 +931,6 @@ onMounted(load);
       <div class="p-dnav">
         <button class="p-back" @click="backToList">← к списку</button>
         <div class="p-dright">
-        <button class="p-rewind" :class="{ on: rewindOpen }" @click="rewindOpen = !rewindOpen"
-                title="ошиблись на шаге — вернуться и пройти заново">↺ Ошиблись?</button>
         <button
           v-if="canResume"
           class="p-resume"
@@ -947,16 +985,6 @@ onMounted(load);
         </div>
       </header>
 
-      <RewindPanel
-        v-if="rewindOpen"
-        :state="prog.task.state"
-        :title="prog.task.title"
-        :description="prog.task.business_description"
-        :busy="rewindBusy"
-        @rewind="doRewind"
-        @restate="doRestate"
-      />
-
       <QuestionsBlock
         :questions="questions"
         :events="events"
@@ -1002,6 +1030,15 @@ onMounted(load);
                 </span>
                 <button v-if="s.running" class="p-act stop" :disabled="busy" @click.stop="doStop(s.runningId!)">■ остановить</button>
                 <button v-else-if="s.canRun" class="p-act run" :disabled="busy" :title="s.runOp" @click.stop="doRun()">▶ запустить</button>
+                <!-- перепройти этот шаг: своё действие у каждого шага, без
+                     отдельной панели «вы ошиблись?» -->
+                <button
+                  v-if="canReplay(s.state)"
+                  class="p-act replay"
+                  :disabled="replayBusy !== null"
+                  :title="'пройти путь заново с шага «' + s.title + '»: результаты этого шага и следующих станут несвежими, история останется'"
+                  @click.stop="replay(s)"
+                >{{ replayBusy === s.state ? '…' : '↻ отсюда' }}</button>
                 <span v-else-if="s.status === 'current'" class="p-why">{{ s.why }}</span>
                 <span class="caret">▶</span>
               </div>
@@ -1030,9 +1067,20 @@ onMounted(load);
               <!-- постановка: исходный текст задачи, без служебных вкладок -->
               <div v-if="s.state === 'STATEMENT'" class="p-panel">
                 <div class="p-briefh">
-                  исходная постановка · создана {{ new Date(prog.task.created_at).toLocaleDateString("ru-RU") }}
+                  постановка задачи · создана {{ new Date(prog.task.created_at).toLocaleDateString("ru-RU") }}
+                  <span class="p-briefnote">правишь текст — это новая редакция</span>
                 </div>
-                <div class="p-brief">{{ prog.task.business_description || "постановки нет" }}</div>
+                <input v-model="editTitle" class="p-brieftitle" spellcheck="false" placeholder="название задачи" />
+                <textarea v-model="editBody" class="p-briefedit" rows="7" spellcheck="false"
+                          placeholder="как задача поставлена" />
+                <div class="p-briefacts">
+                  <button class="p-act go" :disabled="!canAcceptEdit || busy" @click.stop="acceptEdit">
+                    {{ busy ? 'принимаю…' : 'Принять новую редакцию' }}
+                  </button>
+                  <span class="p-why">
+                    принятие вернёт путь к постановщику; результаты ниже станут несвежими, история останется
+                  </span>
+                </div>
               </div>
 
               <div v-if="tabsFor(s).length" class="p-tabs">
@@ -1630,8 +1678,19 @@ onMounted(load);
 .p-cancel:disabled{opacity:.4;cursor:not-allowed}.p-resume{border:1px solid rgba(62,207,142,.55);border-radius:7px;background:rgba(62,207,142,.12);
   color:#8ee7bc;font-family:var(--sans);font-size:12px;padding:5px 13px;cursor:pointer}
 .p-resume:hover:not(:disabled){background:rgba(62,207,142,.22)}
-.p-resume:disabled{opacity:.45;cursor:not-allowed}.p-rewind{border:1px solid var(--p-line);border-radius:7px;background:#131a22;color:var(--p-dim);
-  font-family:var(--sans);font-size:12px;padding:5px 11px;cursor:pointer}
-.p-rewind:hover{color:var(--p-ink);border-color:#3a4753}
-.p-rewind.on{color:#ffc09a;border-color:rgba(243,106,22,.7);background:rgba(243,106,22,.14)}
+.p-resume:disabled{opacity:.45;cursor:not-allowed}
+/* ── перепройти шаг / новая редакция постановки ─────────────────────────── */
+.p-act.replay{border-color:rgba(243,106,22,.55);color:#ffc09a;background:rgba(243,106,22,.1)}
+.p-act.replay:hover:not(:disabled){background:rgba(243,106,22,.2)}
+.p-briefnote{margin-left:8px;color:var(--p-dim2);text-transform:none;letter-spacing:0}
+.p-brieftitle{display:block;width:100%;box-sizing:border-box;border:1px solid var(--p-line);
+  border-radius:7px;background:#0b0e12;color:var(--p-ink);font-family:var(--sans);
+  font-size:13.5px;font-weight:600;padding:7px 10px;margin-bottom:7px}
+.p-briefedit{display:block;width:100%;box-sizing:border-box;resize:vertical;
+  border:1px solid var(--p-line);border-radius:7px;background:#0b0e12;color:#dbe3ec;
+  font-family:var(--sans);font-size:12.5px;line-height:1.5;padding:8px 10px}
+.p-brieftitle:focus,.p-briefedit:focus{outline:none;border-color:var(--p-human)}
+.p-briefacts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px}
+.p-act.go{border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.13);color:#8ee7bc;font-weight:600}
+.p-act.go:hover:not(:disabled){background:rgba(62,207,142,.22)}
 </style>
