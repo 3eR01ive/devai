@@ -839,6 +839,8 @@ const { holding, progress, start, move, release } = useHoldToConfirm(
 // «панели ошибок» нет: интерфейс не спрашивает «вы ошиблись?», а даёт действие
 // на том шаге, где ошибка видна.
 const replayBusy = ref<string | null>(null);
+// Постановка по умолчанию — ЧТЕНИЕ, как и было; правка включается кнопкой.
+const editOpen = ref(false);
 const editTitle = ref("");
 const editBody = ref("");
 
@@ -878,6 +880,17 @@ async function replay(s: { state: string; title: string }) {
   }
 }
 
+function startEdit() {
+  const t = prog.value?.task;
+  if (!t) return;
+  editTitle.value = t.title;
+  editBody.value = t.business_description;
+  editOpen.value = true;
+}
+function cancelEdit() {
+  editOpen.value = false;
+}
+
 const editChanged = computed(() => {
   const t = prog.value?.task;
   if (!t) return false;
@@ -898,6 +911,7 @@ async function acceptEdit() {
       editBody.value,
       "постановка переписана человеком: новая редакция принята из карточки",
     );
+    editOpen.value = false;
     await load();
   } catch (e) {
     error.value = toUiError(e);
@@ -1067,20 +1081,33 @@ onMounted(load);
               <!-- постановка: исходный текст задачи, без служебных вкладок -->
               <div v-if="s.state === 'STATEMENT'" class="p-panel">
                 <div class="p-briefh">
-                  постановка задачи · создана {{ new Date(prog.task.created_at).toLocaleDateString("ru-RU") }}
-                  <span class="p-briefnote">правишь текст — это новая редакция</span>
+                  {{ editOpen ? "новая редакция постановки" : "постановка задачи" }}
+                  · создана {{ new Date(prog.task.created_at).toLocaleDateString("ru-RU") }}
                 </div>
-                <input v-model="editTitle" class="p-brieftitle" spellcheck="false" placeholder="название задачи" />
-                <textarea v-model="editBody" class="p-briefedit" rows="7" spellcheck="false"
-                          placeholder="как задача поставлена" />
-                <div class="p-briefacts">
-                  <button class="p-act go" :disabled="!canAcceptEdit || busy" @click.stop="acceptEdit">
-                    {{ busy ? 'принимаю…' : 'Принять новую редакцию' }}
-                  </button>
-                  <span class="p-why">
-                    принятие вернёт путь к постановщику; результаты ниже станут несвежими, история останется
-                  </span>
-                </div>
+
+                <!-- по умолчанию — как было: просто текст -->
+                <template v-if="!editOpen">
+                  <div class="p-brief">{{ prog.task.business_description || "постановки нет" }}</div>
+                  <div v-if="!CLOSED_STATES.has(currentState)" class="p-briefacts">
+                    <button class="p-act" @click.stop="startEdit">Править постановку</button>
+                    <span class="p-why">правка — новая редакция: путь вернётся к постановщику</span>
+                  </div>
+                </template>
+
+                <template v-else>
+                  <input v-model="editTitle" class="p-brieftitle" spellcheck="false" placeholder="название задачи" />
+                  <textarea v-model="editBody" class="p-briefedit" rows="16" spellcheck="false"
+                            placeholder="как задача поставлена" />
+                  <div class="p-briefacts">
+                    <button class="p-act go" :disabled="!canAcceptEdit || busy" @click.stop="acceptEdit">
+                      {{ busy ? 'принимаю…' : 'Принять новую редакцию' }}
+                    </button>
+                    <button class="p-act" @click.stop="cancelEdit">Отмена</button>
+                    <span class="p-why">
+                      принятие вернёт путь к постановщику; результаты ниже станут несвежими, история останется
+                    </span>
+                  </div>
+                </template>
               </div>
 
               <div v-if="tabsFor(s).length" class="p-tabs">
@@ -1686,9 +1713,9 @@ onMounted(load);
 .p-brieftitle{display:block;width:100%;box-sizing:border-box;border:1px solid var(--p-line);
   border-radius:7px;background:#0b0e12;color:var(--p-ink);font-family:var(--sans);
   font-size:13.5px;font-weight:600;padding:7px 10px;margin-bottom:7px}
-.p-briefedit{display:block;width:100%;box-sizing:border-box;resize:vertical;
+.p-briefedit{display:block;width:100%;box-sizing:border-box;resize:vertical;min-height:340px;
   border:1px solid var(--p-line);border-radius:7px;background:#0b0e12;color:#dbe3ec;
-  font-family:var(--sans);font-size:12.5px;line-height:1.5;padding:8px 10px}
+  font-family:var(--sans);font-size:13px;line-height:1.55;padding:10px 12px}
 .p-brieftitle:focus,.p-briefedit:focus{outline:none;border-color:var(--p-human)}
 .p-briefacts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px}
 .p-act.go{border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.13);color:#8ee7bc;font-weight:600}
