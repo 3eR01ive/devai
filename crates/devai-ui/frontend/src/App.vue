@@ -10,7 +10,7 @@
 // ничего не пересчитывает и не кэширует между load. Опрос — ОДИН на всё
 // приложение: шапка читает общий стор секции (inbox.ts),
 // собственного таймера и второго вызова `inbox_view` здесь нет.
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onErrorCaptured, onMounted, onUnmounted, ref } from "vue";
 import { pairingShell, toUiError } from "./api";
 import { degradedBanner } from "./homes-view";
 import { subscribeWait, waitError, waitSnapshot } from "./inbox";
@@ -34,6 +34,16 @@ const shownError = computed(() => error.value ?? waitError.value);
 const runningCount = computed(() => activeSnapshot.value?.rows?.length ?? 0);
 const waitingCount = computed(() => waitSnapshot.value?.waiting?.length ?? 0);
 const degraded = computed(() => degradedBanner(session.value));
+// Ошибка отрисовки экрана не должна оставлять пустое окно: белый (тёмный) экран
+// без единого слова — худший вид поломки, человек не знает даже, что случилось.
+const renderError = ref<string | null>(null);
+onErrorCaptured((e: unknown) => {
+  renderError.value = e instanceof Error ? e.message : String((e as { message?: string })?.message ?? e);
+  return false;
+});
+function clearRenderError() {
+  renderError.value = null;
+}
 // Заметка о том, что доступ есть, но что-то не сохранилось (адрес дома):
 // код приехал в адресе открытой страницы, слова — из единственной декларации.
 const notice = computed(() => pairNotice(pairingNotice.value));
@@ -82,7 +92,10 @@ onMounted(async () => {
     run();
   }
 });
+// Смена адреса снимает прошлую ошибку: экран новый, ошибка старая.
+window.addEventListener("hashchange", clearRenderError);
 onUnmounted(() => {
+  window.removeEventListener("hashchange", clearRenderError);
   unsubscribe?.();
   unsubscribeActive?.();
   stopPairing?.();
@@ -139,6 +152,10 @@ onUnmounted(() => {
            (качество: R1 — проглоченная ошибка записи). -->
       <div v-if="notice" class="errorbox" data-testid="pair-notice">
         <span class="code">{{ pairingNotice }}</span>{{ notice.title }}. {{ notice.hint }}
+      </div>
+      <div v-if="renderError" class="render-error">
+        <b>экран не отрисовался:</b> {{ renderError }}
+        <button @click="$router.go(0)">перезагрузить</button>
       </div>
       <RouterView />
     </main>
