@@ -143,13 +143,13 @@ function sign(approve: boolean) {
    вопрос на янтарной черте читают, решение на синей правят. */
 .oqcard{border:1px solid var(--p-line);border-radius:9px;margin-bottom:9px;background:var(--p-card2);overflow:hidden}
 .oqcard .qq{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;
-  border-left:3px solid var(--p-now);background:rgba(245,181,68,.045)}
+  border-left:3px solid var(--p-now);background:rgba(243,106,22,.045)}
 .oqcard .qa{display:flex;flex-direction:column;gap:7px;padding:10px 12px 11px;
   border-left:3px solid var(--p-human);border-top:1px solid var(--p-line);
   background:rgba(122,167,255,.075)}
 .pill{flex:none;border-radius:4px;padding:2px 7px;font-size:9.5px;letter-spacing:.09em;
   text-transform:uppercase;white-space:nowrap;line-height:1.5}
-.pill.q{background:rgba(245,181,68,.16);border:1px solid rgba(245,181,68,.45);color:#f7c877}
+.pill.q{background:rgba(243,106,22,.16);border:1px solid rgba(243,106,22,.45);color:#ffa972}
 .pill.a{background:rgba(122,167,255,.18);border:1px solid rgba(122,167,255,.5);color:#a9c6ff}
 .oqcard .qt{font-size:13.5px;line-height:1.55;color:#e2e9f1}
 .oqcard .qahead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -157,8 +157,8 @@ function sign(approve: boolean) {
 .oqcard .src::before{content:"";width:6px;height:6px;border-radius:50%;background:#7aa7ff}
 .oqcard .src.edited{color:#8ee7bc}
 .oqcard .src.edited::before{background:#3ecf8e}
-.oqcard .src.empty{color:#f7c877}
-.oqcard .src.empty::before{background:#f5b544}
+.oqcard .src.empty{color:#ffa972}
+.oqcard .src.empty::before{background:#f36a16}
 .oqcard textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:50px;
   border:1px solid rgba(122,167,255,.35);border-radius:6px;background:#16202b;color:#f0f5fa;
   font-family:var(--sans);font-size:13px;line-height:1.5;padding:8px 10px}

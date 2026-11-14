@@ -11,7 +11,7 @@
   --p-dim: #8b97a6;
   --p-dim2: #5b6673;
   --p-pass: #3ecf8e;
-  --p-now: #f5b544;
+  --p-now: #f36a16;
   --p-stop: #f0616d;
   --p-human: #7aa7ff;
   min-height: 100%;
@@ -60,7 +60,7 @@
 .p-state.b-mute { color: var(--p-dim); background: #1a222b; border-color: var(--p-line); }
 .p-state.b-human { color: var(--p-human); background: rgba(122,167,255,.1); border-color: rgba(122,167,255,.28); }
 .p-state.b-stop { color: var(--p-stop); background: rgba(240,97,109,.1); border-color: rgba(240,97,109,.28); }
-.p-state.b-now { color: var(--p-now); background: rgba(245,181,68,.1); border-color: rgba(245,181,68,.28); }
+.p-state.b-now { color: var(--p-now); background: rgba(243,106,22,.1); border-color: rgba(243,106,22,.28); }
 .p-state.b-pass { color: var(--p-pass); background: rgba(62,207,142,.1); border-color: rgba(62,207,142,.28); }
 .p-runchip { display: flex; align-items: center; gap: 6px; font-size: 10.5px; padding: 2px 8px;
   border-radius: 5px; border: 1px solid var(--p-line); color: var(--p-dim); font-variant-numeric: tabular-nums; }
@@ -71,7 +71,7 @@
 .p-runchip.human i { background: var(--p-human); }
 .p-runchip.stop { color: var(--p-stop); border-color: rgba(240,97,109,.32); background: rgba(240,97,109,.07); }
 .p-runchip.stop i { background: var(--p-stop); }
-.p-runchip.warn { color: var(--p-now); border-color: rgba(245,181,68,.35); background: rgba(245,181,68,.07); }
+.p-runchip.warn { color: var(--p-now); border-color: rgba(243,106,22,.35); background: rgba(243,106,22,.07); }
 .p-runchip.warn i { background: var(--p-now); }
 
 /* горизонтальный путь в строке */
@@ -84,7 +84,7 @@
   background: #171e26; border: 2px solid #2f3a46; }
 .p-step.passed .p-node { background: var(--p-pass); border-color: var(--p-pass); }
 .p-step.current .p-node { width: 20px; height: 20px; margin-top: -3px; background: var(--p-now);
-  border-color: #ffe0a8; box-shadow: 0 0 0 4px rgba(245,181,68,.14); }
+  border-color: #ffb98c; box-shadow: 0 0 0 4px rgba(243,106,22,.14); }
 .p-step.gate .p-node { border-radius: 2px; transform: rotate(45deg); }
 .p-step .cap { margin-top: 6px; font-size: 10px; color: var(--p-dim2); white-space: nowrap; }
 .p-step.current .cap { color: var(--p-now); font-weight: 700; }
