@@ -89,7 +89,11 @@ describe("SignPanel", () => {
     const ta1 = cards[1].find(".qa textarea").element as HTMLTextAreaElement;
     expect(ta1.value).toBe("");
     expect(ta0.value).toBe("останавливать сразу.");
-    expect(cards[0].find(".qa .hint").text()).toContain("предложено аналитиком");
+    // вопрос и решение помечены разными метками, а не сливаются в текст
+    expect(cards[0].find(".qq .pill").text()).toBe("вопрос 1");
+    expect(cards[0].find(".qa .pill").text()).toBe("твоё решение");
+    expect(cards[0].find(".qa .src").text()).toContain("предложено аналитиком");
+    expect(cards[1].find(".qa .src").text()).toContain("решения нет");
   });
 
   it("правка уходит в rationale подписи", async () => {

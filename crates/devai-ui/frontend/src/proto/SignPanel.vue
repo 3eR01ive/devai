@@ -80,21 +80,24 @@ function sign(approve: boolean) {
         <div class="sec">вопросы, которые решаешь ты · {{ oqList.length }}</div>
         <div v-for="q in oqList" :key="'oq' + q.k" class="oqcard">
           <div class="qq">
-            <span class="mark">вопрос {{ q.k + 1 }}</span>
+            <span class="pill q">вопрос {{ q.k + 1 }}</span>
             <span class="qt">{{ q.question }}</span>
           </div>
           <div class="qa">
-            <span class="mark">твоё решение</span>
+            <div class="qahead">
+              <span class="pill a">твоё решение</span>
+              <span v-if="!touched[q.k] && q.proposal" class="src">предложено аналитиком</span>
+              <span v-else-if="touched[q.k]" class="src edited">твоя редакция</span>
+              <span v-else class="src empty">решения нет — впиши своё</span>
+            </div>
             <textarea
               v-model="rulings[q.k]"
               rows="2"
               spellcheck="false"
-              placeholder="аналитик решения не предложил — впиши своё"
+              placeholder="напиши решение по этому вопросу"
               @input="touched[q.k] = true"
               @keydown.ctrl.enter="sign(true)"
             />
-            <span v-if="!touched[q.k] && q.proposal" class="hint">предложено аналитиком — правь как хочешь</span>
-            <span v-else-if="touched[q.k]" class="hint edited">твоя редакция</span>
           </div>
         </div>
       </template>
@@ -126,40 +129,53 @@ function sign(approve: boolean) {
   border-radius:10px;background:var(--p-card2);margin-bottom:12px;overflow:hidden}
 .sigsum .cell{padding:9px 12px;border-right:1px solid var(--p-line)}
 .sigsum .cell:last-child{border-right:0}
-.sigsum .k{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--p-dim2)}
-.sigsum .v{font-family:var(--mono);font-size:17px;color:var(--p-ink);margin-top:2px}
-.sigsum .n{font-size:10.5px;color:var(--p-dim);margin-top:1px}
+.sigsum .k{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:#93a1b1}
+.sigsum .v{font-family:var(--mono);font-size:18px;color:var(--p-ink);margin-top:3px}
+.sigsum .n{font-size:11px;color:#9fb0c2;margin-top:2px}
 .lead{font-size:13px;line-height:1.55;color:#d3dce6;max-width:120ch}
-.sec{margin-top:12px;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--p-dim2)}
+.sec{margin:16px 0 8px;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#93a1b1;
+  padding-bottom:5px;border-bottom:1px solid var(--p-line)}
 .req{border:1px solid var(--p-line);border-radius:8px;padding:10px 12px;margin-bottom:8px;background:var(--p-card2)}
 .req .rid{font-family:var(--mono);font-size:11px;color:var(--p-human)}
 .req .rst{margin-top:4px;font-size:12.5px;color:#dbe3ec;line-height:1.45}
 .ac{margin:6px 0 0;padding-left:16px;font-size:11.5px;color:var(--p-dim);line-height:1.5}
-.oqcard{border:1px solid var(--p-line);border-radius:9px;margin-bottom:8px;background:var(--p-card2);overflow:hidden}
-.oqcard .qq{display:flex;gap:9px;padding:9px 11px 8px;border-bottom:1px dashed var(--p-line)}
-.oqcard .qa{display:flex;flex-direction:column;gap:5px;padding:8px 11px 9px;
-  border-left:3px solid var(--p-human);background:rgba(122,167,255,.055)}
-.oqcard .mark{flex:none;font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;padding-top:2px}
-.oqcard .qq .mark{color:var(--p-now)}
-.oqcard .qa .mark{color:var(--p-human)}
-.oqcard .qt{font-size:12.5px;line-height:1.5;color:#cfd9e4}
-.oqcard textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:38px;
-  border:1px solid var(--p-line);border-radius:6px;background:#0b0e12;color:var(--p-ink);
-  font-family:var(--sans);font-size:12.5px;line-height:1.45;padding:6px 8px}
-.oqcard textarea:focus{outline:none;border-color:var(--p-human);box-shadow:0 0 0 2px rgba(122,167,255,.14)}
-.oqcard .hint{font-size:10px;color:var(--p-dim2)}
-.oqcard .hint.edited{color:var(--p-pass)}
+/* Вопрос и решение — разные поверхности, а не два абзаца одного текста:
+   вопрос на янтарной черте читают, решение на синей правят. */
+.oqcard{border:1px solid var(--p-line);border-radius:9px;margin-bottom:9px;background:var(--p-card2);overflow:hidden}
+.oqcard .qq{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;
+  border-left:3px solid var(--p-now);background:rgba(245,181,68,.045)}
+.oqcard .qa{display:flex;flex-direction:column;gap:7px;padding:10px 12px 11px;
+  border-left:3px solid var(--p-human);border-top:1px solid var(--p-line);
+  background:rgba(122,167,255,.075)}
+.pill{flex:none;border-radius:4px;padding:2px 7px;font-size:9.5px;letter-spacing:.09em;
+  text-transform:uppercase;white-space:nowrap;line-height:1.5}
+.pill.q{background:rgba(245,181,68,.16);border:1px solid rgba(245,181,68,.45);color:#f7c877}
+.pill.a{background:rgba(122,167,255,.18);border:1px solid rgba(122,167,255,.5);color:#a9c6ff}
+.oqcard .qt{font-size:13.5px;line-height:1.55;color:#e2e9f1}
+.oqcard .qahead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.oqcard .src{font-size:11px;color:#a9bccd;display:inline-flex;align-items:center;gap:5px}
+.oqcard .src::before{content:"";width:6px;height:6px;border-radius:50%;background:#7aa7ff}
+.oqcard .src.edited{color:#8ee7bc}
+.oqcard .src.edited::before{background:#3ecf8e}
+.oqcard .src.empty{color:#f7c877}
+.oqcard .src.empty::before{background:#f5b544}
+.oqcard textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:50px;
+  border:1px solid rgba(122,167,255,.35);border-radius:6px;background:#16202b;color:#f0f5fa;
+  font-family:var(--sans);font-size:13px;line-height:1.5;padding:8px 10px}
+.oqcard textarea::placeholder{color:#63707f}
+.oqcard textarea:focus{outline:none;border-color:var(--p-human);box-shadow:0 0 0 2px rgba(122,167,255,.18);
+  background:#18242f}
 .signnote{margin:12px 0 0}
 .signnote input{width:100%;box-sizing:border-box;border:1px solid var(--p-line);border-radius:7px;
   background:#0b0e12;color:var(--p-ink);font-family:var(--sans);font-size:12.5px;padding:7px 9px}
 .signnote input:focus{outline:none;border-color:var(--p-human)}
 .signacts{display:flex;align-items:center;gap:9px;margin-top:10px;padding-top:10px;border-top:1px solid var(--p-line)}
 .act{border-radius:7px;border:1px solid var(--p-line);background:#131a22;color:var(--p-ink);
-  font-family:var(--sans);font-size:12.5px;padding:7px 16px;cursor:pointer}
-.act.go{border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.13);color:#8ee7bc;font-weight:600}
-.act.go:hover:not(:disabled){background:rgba(62,207,142,.22)}
-.act.no{border-color:rgba(240,97,109,.5);background:rgba(240,97,109,.1);color:#f4a3ab}
-.act.no:hover:not(:disabled){background:rgba(240,97,109,.2)}
-.act:disabled{opacity:.42;cursor:not-allowed}
-.why{font-size:10.5px;color:var(--p-dim2)}
+  font-family:var(--sans);font-size:13px;padding:8px 20px;cursor:pointer}
+.act.go{border-color:#3ecf8e;background:rgba(62,207,142,.2);color:#b6f2d5;font-weight:600}
+.act.go:hover:not(:disabled){background:rgba(62,207,142,.32)}
+.act.no{border-color:rgba(240,97,109,.75);background:rgba(240,97,109,.16);color:#f6bcc2}
+.act.no:hover:not(:disabled){background:rgba(240,97,109,.26)}
+.act:disabled{opacity:.45;cursor:not-allowed}
+.why{font-size:11px;color:#93a1b1}
 </style>
