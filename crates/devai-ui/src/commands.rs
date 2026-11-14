@@ -473,6 +473,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // спросила. Окно не решает, куда идти, — оно отправляет ответ.
     ("question_answer", "question.answer"),
     ("task_cancel", "task.cancel"),
+    ("task_resume", "task.resume"),
     // Agent status rows (task 01a1b60c, REQ-AF-07): derived availability,
     // last failure class and counters — ONE read, same words as the CLI.
     ("agent_statuses", "agent.status"),
@@ -558,6 +559,9 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     // Отмена задачи: человек закрывает дело со своего места. Тот же акт, что
     // `devai task cancel` — причина и автор остаются в истории.
     ("task_cancel", "task.cancel"),
+    // Возврат в работу: отменённое, приостановленное и заблокированное дело
+    // человек вправе продолжить — платформа помнит, откуда его взяли.
+    ("task_resume", "task.resume"),
     // Остановка живого прогона: тот же класс, что запуск — человек
     // управляет работой со своего места, платформа закрывает исполнение
     // штатным `exec.cancel` (статус и причина остаются в истории).
@@ -978,6 +982,22 @@ pub fn question_answer(
     text: String,
 ) -> Result<StatusView, UiError> {
     question_answer_as(state, id_prefix, question_id, text, None)
+}
+
+/// `task.resume` — человек возвращает дело в работу: снятая пауза, снятая
+/// блокировка, отменённое дело. Тот же акт, что `devai task resume`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_resume(state: State<AppState>, id_prefix: String) -> Result<StatusView, UiError> {
+    task_resume_as(state, id_prefix, None)
+}
+
+pub fn task_resume_as(
+    state: State<AppState>,
+    id_prefix: String,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_resume(&id_prefix))?;
+    Ok(state.api().task_status(&id_prefix)?)
 }
 
 /// `task.cancel` — человек закрывает дело. Тот же акт, что `devai task cancel`:
@@ -2196,6 +2216,7 @@ mod tests {
             "task_run",
             "question_answer",
             "task_cancel",
+            "task_resume",
         ];
         expected.sort_unstable();
         assert_eq!(

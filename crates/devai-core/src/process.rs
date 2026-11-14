@@ -30,7 +30,9 @@ use crate::types::TaskState;
 /// with the declared attempt limit (`max_attempts_without_progress`).
 /// 5: отказ ревью уводит задачу к человеку (WAITING_FOR_INPUT) вместо
 /// автоматического следующего круга анализа.
-pub const SUPPORTED_PROCESS_VERSION: u32 = 5;
+/// 6: отмена помнит стадию, на которой случилась, и `resume` возвращает задачу
+/// туда — отменённое дело можно продолжить, а не только начать заново.
+pub const SUPPORTED_PROCESS_VERSION: u32 = 6;
 
 /// The special transition address: «the remembered working stage» of a hold
 /// (`return_state`), not a fixed state name. Spelled once.

@@ -24,9 +24,11 @@
 # кода и объявления не решается в пользу одной из сторон молча.
 
 process:
+  # Версия 6: отменённую задачу можно вернуть в работу — отмена помнит, откуда
+  # её сделали, и «продолжить» возвращает туда, а не начинает путь заново.
   # Версия 5: отказ ревью уходит ЧЕЛОВЕКУ, а не в следующий круг анализа.
   # Версия 4: стадия STATEMENT — постановщик проверяет саму постановку до анализа.
-  version: 5
+  version: 6
 
   # Закрытый перечень имён условий. Неизвестное имя в transitions отвергается
   # при инициализации — опечатка не становится «новым» переходом. Имя,
@@ -145,6 +147,9 @@ process:
     - { from: QA, on: launch_failed, to: BLOCKED }
     - { from: QA, on: outcome_missing, to: BLOCKED }
     - { from: WAITING_FOR_INPUT, on: human_resumed, to: RETURN_STATE }
+    # Отмена не приговор: человек передумал — дело возвращается в стадию,
+    # на которой его закрыли (адрес помнит сама отмена, а не догадка окна).
+    - { from: CANCELLED, on: human_resumed, to: RETURN_STATE }
     - { from: PAUSED, on: human_resumed, to: RETURN_STATE }
     - { from: BLOCKED, on: human_resumed, to: RETURN_STATE }
     - { from: FAILED, on: human_resumed, to: RETURN_STATE }

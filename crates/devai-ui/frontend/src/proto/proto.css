@@ -118,3 +118,6 @@
   font-family:var(--sans)}
 .p-runchip.p-toggle:hover{color:var(--p-ink);border-color:#3a4753}
 .p-runchip.p-toggle.on{color:var(--p-ink);border-style:solid;border-color:#3a4753;background:#18212b}
+
+/* Группа «идёт сейчас»: тот же зелёный, что у живого прогона. */
+.p-grp.run .t { color: var(--p-pass); }

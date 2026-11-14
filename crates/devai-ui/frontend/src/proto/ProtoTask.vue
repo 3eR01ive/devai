@@ -809,6 +809,25 @@ async function doCancel() {
   }
 }
 
+// Вернуть в работу можно отменённое, приостановленное, заблокированное и
+// упавшее дело: платформа помнит стадию, на которой его остановили.
+const RESUMABLE = new Set(["CANCELLED", "PAUSED", "BLOCKED", "FAILED"]);
+const canResume = computed(() => !!prog.value && RESUMABLE.has(prog.value.task.state));
+const resumeBusy = ref(false);
+
+async function doResume() {
+  resumeBusy.value = true;
+  error.value = null;
+  try {
+    await api.taskResume(id.value);
+    await load();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    resumeBusy.value = false;
+  }
+}
+
 const { holding, progress, start, move, release } = useHoldToConfirm(
   () => canCancel.value && !cancelBusy.value,
   () => void doCancel(),
@@ -839,10 +858,18 @@ onMounted(load);
       <div class="p-dnav">
         <button class="p-back" @click="backToList">← к списку</button>
         <button
+          v-if="canResume"
+          class="p-resume"
+          :disabled="resumeBusy"
+          :title="'вернуть в работу: дело продолжится с той стадии, где его остановили'"
+          @click="doResume"
+        >{{ resumeBusy ? 'возвращаю…' : '↩ Вернуть в работу' }}</button>
+        <button
+          v-else
           class="p-cancel"
           :class="{ holding: holding === 'cancel', done: !canCancel }"
           :disabled="!canCancel || cancelBusy"
-          :title="canCancel ? 'удерживай, чтобы отменить задачу' : 'задача уже закрыта'"
+          :title="canCancel ? 'удерживай, чтобы отменить задачу' : 'задача уже закрыта'""
           @pointerdown="start('cancel', $event)"
           @pointermove="move($event)"
           @pointerup="release"
@@ -1552,5 +1579,8 @@ onMounted(load);
   transition:width .04s linear;pointer-events:none}
 .p-cancel span{position:relative}
 .p-cancel:hover:not(:disabled){border-color:rgba(240,97,109,.9);color:#ffc2c8}
-.p-cancel:disabled{opacity:.4;cursor:not-allowed}
+.p-cancel:disabled{opacity:.4;cursor:not-allowed}.p-resume{border:1px solid rgba(62,207,142,.55);border-radius:7px;background:rgba(62,207,142,.12);
+  color:#8ee7bc;font-family:var(--sans);font-size:12px;padding:5px 13px;cursor:pointer}
+.p-resume:hover:not(:disabled){background:rgba(62,207,142,.22)}
+.p-resume:disabled{opacity:.45;cursor:not-allowed}
 </style>

@@ -10,11 +10,12 @@ import { snapshot } from "./fixtures";
 
 const mocks = vi.hoisted(() => ({
   inboxView: vi.fn(),
+  taskActive: vi.fn(async () => ({ snapshot_at: "", rows: [] })),
   sessionInfo: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
-  api: { inboxView: mocks.inboxView, sessionInfo: mocks.sessionInfo },
+  api: { inboxView: mocks.inboxView, sessionInfo: mocks.sessionInfo, taskActive: mocks.taskActive },
   toUiError: (e: unknown) => e,
   // Окно приложения в тестах шапки не проводит приглашение и не поднимает
   // свой опрос: pairingShell=false, pageWatchesPairing=false (task 01a1bf78).

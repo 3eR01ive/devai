@@ -14,6 +14,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { pairingShell, toUiError } from "./api";
 import { degradedBanner } from "./homes-view";
 import { subscribeWait, waitError, waitSnapshot } from "./inbox";
+import { activeSnapshot, subscribeActive } from "./active";
 import { pairFailure, pairingNotice, readNotice, subscribePairing } from "./pairing";
 import { windowBridge } from "./pairingNative";
 import type { PairTask } from "./pairingNative";
@@ -29,12 +30,15 @@ import type { SessionInfo, UiError } from "./types";
 const session = ref<SessionInfo | null>(sessionStore.get());
 const error = ref<UiError | null>(null);
 const shownError = computed(() => error.value ?? waitError.value);
-const waitBadge = computed(() => waitSnapshot.value?.badge ?? 0);
+// Цифры на вкладке задач: сколько идёт прямо сейчас и сколько ждёт человека.
+const runningCount = computed(() => activeSnapshot.value?.rows?.length ?? 0);
+const waitingCount = computed(() => waitSnapshot.value?.waiting?.length ?? 0);
 const degraded = computed(() => degradedBanner(session.value));
 // Заметка о том, что доступ есть, но что-то не сохранилось (адрес дома):
 // код приехал в адресе открытой страницы, слова — из единственной декларации.
 const notice = computed(() => pairNotice(pairingNotice.value));
 let unsubscribe: (() => void) | undefined;
+let unsubscribeActive: (() => void) | undefined;
 let stopPairing: (() => void) | undefined;
 let stopScans: (() => void) | undefined;
 const stopWatching = sessionStore.subscribe((s) => {
@@ -48,6 +52,7 @@ onMounted(async () => {
     error.value = toUiError(e);
   }
   unsubscribe = subscribeWait();
+  unsubscribeActive = subscribeActive();
   // Отзыв доступа замечает сама страница, которую отдала машина — и в
   // браузере, и в окне приложения это один и тот же опрос `/pair`
   // (REQ-QRAPP-05; сеть в Rust запрещена гейтом `no-network`).
@@ -79,6 +84,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   unsubscribe?.();
+  unsubscribeActive?.();
   stopPairing?.();
   stopScans?.();
   setPairingRunner(null);
@@ -92,11 +98,11 @@ onUnmounted(() => {
       <span class="brand">dev<em>ai</em>-ui</span>
       <nav class="modes">
         <RouterLink to="/projects">Проекты</RouterLink>
-        <RouterLink to="/tasks">Задачи</RouterLink>
-        <RouterLink to="/proto/tasks">Задачи (новый)</RouterLink>
-        <RouterLink to="/live">Активные</RouterLink>
-        <RouterLink to="/inbox">
-          Ожидание<template v-if="waitBadge > 0">&nbsp;·&nbsp;<b class="badge">{{ waitBadge }}</b></template>
+        <RouterLink to="/proto/tasks">
+          Задачи<template v-if="runningCount > 0 || waitingCount > 0">
+            &nbsp;·&nbsp;<b class="badge">{{ runningCount }} идёт</b>
+            <template v-if="waitingCount > 0">&nbsp;·&nbsp;<b class="badge badge-human">{{ waitingCount }} ждёт</b></template>
+          </template>
         </RouterLink>
         <RouterLink to="/homes">Дома</RouterLink>
         <RouterLink to="/models">Связка модели</RouterLink>

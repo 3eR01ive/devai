@@ -1,9 +1,5 @@
 import { createRouter, createWebHashHistory } from "vue-router";
 import ProjectsView from "./views/ProjectsView.vue";
-import TasksView from "./views/TasksView.vue";
-import TaskDetailView from "./views/TaskDetailView.vue";
-import LiveView from "./views/LiveView.vue";
-import InboxView from "./views/InboxView.vue";
 import OpsView from "./views/OpsView.vue";
 import HomesView from "./views/HomesView.vue";
 import ModelsView from "./views/ModelsView.vue";
@@ -19,14 +15,15 @@ export const router = createRouter({
   routes: [
     { path: "/", redirect: "/projects" },
     { path: "/projects", name: "projects", component: ProjectsView },
-    { path: "/tasks", name: "tasks", component: TasksView },
-    // Новый экран по макету: список и карточка. Старые экраны остаются,
-    // пока человек не скажет, что из них забрать.
+    // Новый экран по макету — единственный список задач и карточка.
+    // Старые экраны (список, ожидание, активные) из интерфейса убраны
+    // решением оператора 14.11: активные — группой в списке, остальное не нужно.
     { path: "/proto/tasks", name: "proto-tasks", component: ProtoTasks },
     { path: "/proto/task/:id", name: "proto-task", component: ProtoTask, props: true },
-    { path: "/task/:id", name: "task", component: TaskDetailView, props: true },
-    { path: "/live", name: "live", component: LiveView },
-    { path: "/inbox", name: "inbox", component: InboxView },
+    { path: "/tasks", redirect: "/proto/tasks" },
+    { path: "/task/:id", redirect: (to: any) => `/proto/task/${to.params.id}` },
+    { path: "/live", redirect: "/proto/tasks" },
+    { path: "/inbox", redirect: "/proto/tasks" },
     { path: "/homes", name: "homes", component: HomesView },
     { path: "/models", name: "models", component: ModelsView },
     { path: "/lan", name: "lan", component: LanView },

@@ -181,6 +181,10 @@ export const api = {
   // остаются в истории, строка не исчезает.
   taskCancel: (id_prefix: string, reason: string | null) =>
     invoke<StatusView>("task_cancel", { id_prefix, reason }),
+  // Возврат в работу: тот же акт, что `devai task resume` — платформа помнит
+  // стадию, на которой дело закрыли.
+  taskResume: (id_prefix: string) =>
+    invoke<StatusView>("task_resume", { id_prefix }),
   // Строки статуса агентов (задача 01a1b60c, REQ-AF-07): одна фраза платформы
   // на агента — окно ничего не собирает и не перефразирует.
   agentStatuses: () => invoke<AgentStatusView[]>("agent_statuses"),

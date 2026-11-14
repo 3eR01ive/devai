@@ -86,6 +86,8 @@ nav.modes a .badge {
   font-family: var(--mono);
   font-weight: 800;
 }
+/* Две цифры на вкладке задач: идёт работой — зелёным, ждёт человека — синим. */
+nav.modes a .badge-human { color: #7aa7ff; }
 
 .statusbar {
   margin-left: auto;

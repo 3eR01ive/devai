@@ -27,10 +27,11 @@ const mocks = vi.hoisted(() => ({
   report: vi.fn(),
   sessionInfo: vi.fn(),
   inboxView: vi.fn(),
+  taskActive: vi.fn(async () => ({ snapshot_at: "", rows: [] })),
 }));
 
 vi.mock("../api", () => ({
-  api: { sessionInfo: mocks.sessionInfo, inboxView: mocks.inboxView },
+  api: { sessionInfo: mocks.sessionInfo, inboxView: mocks.inboxView, taskActive: mocks.taskActive },
   toUiError: (e: unknown) => e,
   // Это СВОЯ страница приложения: мост в Rust есть, сторож дома не нужен.
   pageWatchesPairing: false,

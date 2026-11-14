@@ -1688,7 +1688,9 @@ pub fn cancel(
         "cancel",
         CoreError::hint("cannot cancel a terminal or already-held task"),
     )?;
-    hold(
+    // Отмена запоминает стадию, на которой случилась, хотя CANCELLED и не
+    // входит в `is_hold()`: иначе «вернуть в работу» не знало бы, куда.
+    let mut m = hold(
         process,
         task,
         HoldKind::Cancel,
@@ -1696,7 +1698,9 @@ pub fn cancel(
         actor,
         now,
         json!({ "reason": reason }),
-    )
+    )?;
+    m.task.return_state = Some(task.state);
+    Ok(m)
 }
 
 /// Releases a hold state (PAUSED / BLOCKED / FAILED → remembered stage).
@@ -1718,9 +1722,15 @@ pub fn resume(
 ) -> CoreResult<Mutation> {
     require_state(
         task,
-        &[TaskState::Paused, TaskState::Blocked, TaskState::Failed],
+        &[
+            TaskState::Paused,
+            TaskState::Blocked,
+            TaskState::Failed,
+            // Отмена не приговор: человек вправе вернуть дело в работу.
+            TaskState::Cancelled,
+        ],
         "resume",
-        CoreError::hint("nothing to resume: task is not PAUSED/BLOCKED/FAILED"),
+        CoreError::hint("nothing to resume: task is not PAUSED/BLOCKED/FAILED/CANCELLED"),
     )?;
     let blockers = effective_blockers(task, deps, decisions);
     if !blockers.is_empty() {

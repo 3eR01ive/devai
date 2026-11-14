@@ -768,6 +768,23 @@ fn block_and_fail_releases() {
 }
 
 #[test]
+fn cancelled_task_keeps_its_stage_and_can_be_brought_back() {
+    // Отмена не приговор: стадия запоминается, а «продолжить» возвращает туда,
+    // где человек закрыл дело, — путь заново не начинается.
+    let mut artifacts = vec![];
+    let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);
+    let cancelled = workflow::cancel(&proc(), &t, Some("передумал"), "u", now())
+        .unwrap()
+        .task;
+    assert_eq!(cancelled.state, TaskState::Cancelled);
+    assert_eq!(cancelled.return_state, Some(TaskState::Review));
+
+    let back = workflow::resume(&proc(), &cancelled, &[], &[], "u", now()).unwrap();
+    assert_eq!(back.task.state, TaskState::Review);
+    assert_eq!(back.task.return_state, None);
+}
+
+#[test]
 fn cancel_from_active_and_not_from_hold_twice() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);

@@ -91,14 +91,34 @@ const rowOf = (t: Task) => {
   };
 };
 
-const groups = computed(() =>
-  GROUPS.map(([key, title, states]) => ({
+// Кто идёт ПРЯМО СЕЙЧАС — отдельной группой сверху: это вопрос «что работает»,
+// а не «в какой стадии». Из стадийных групп такие строки убраны, иначе одно
+// дело стояло бы дважды.
+const runningIds = computed(
+  () =>
+    new Set(
+      Object.entries(progress.value)
+        .filter(([, p]) => (p.running_executions ?? []).length > 0)
+        .map(([id]) => id),
+    ),
+);
+
+const groups = computed(() => {
+  const run = {
+    key: "run",
+    title: "Идёт сейчас",
+    items: tasks.value.filter((t) => runningIds.value.has(t.id)).map(rowOf),
+  };
+  const rest = GROUPS.map(([key, title, states]) => ({
     key, title,
     items: tasks.value.filter((t) => states.includes(t.state)).map(rowOf),
   }))
     .filter((g) => g.items.length)
-    .filter((g) => showClosed.value || g.key !== CLOSED_GROUP),
-);
+    .filter((g) => showClosed.value || g.key !== CLOSED_GROUP)
+    .map((g) => ({ ...g, items: g.items.filter((r) => !runningIds.value.has(r.t.id)) }))
+    .filter((g) => g.items.length);
+  return run.items.length ? [run, ...rest] : rest;
+});
 
 const closedCount = computed(
   () => tasks.value.filter((t) => GROUPS.find(([k]) => k === CLOSED_GROUP)![2].includes(t.state)).length,
