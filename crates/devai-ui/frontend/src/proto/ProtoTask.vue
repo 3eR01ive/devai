@@ -10,6 +10,7 @@ import type {
   TaskUsageView, UiError, WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
 import CodeRefText from "./CodeRefText.vue";
+import SignPanel from "./SignPanel.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -696,6 +697,26 @@ function evidenceOf(c: any): string {
   return txt(e).slice(0, 1200);
 }
 
+// ── подпись спеки: два акта гейта ─────────────────────────────────────────
+// Разбор вопросов и сборка решения живут в SignPanel/signText; карточка только
+// отправляет акт платформы и перечитывает себя.
+const signBusy = ref(false);
+
+async function doSign(approve: boolean, rationale: string | null) {
+  signBusy.value = true;
+  error.value = null;
+  try {
+    signature.value = approve
+      ? await api.taskApprove(id.value, rationale)
+      : await api.taskReject(id.value, rationale);
+    await load();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    signBusy.value = false;
+  }
+}
+
 // ── данные ──────────────────────────────────────────────────────────────
 async function load() {
   error.value = null;
@@ -1086,28 +1107,12 @@ onMounted(load);
               </div>
 
               <!-- что подписываешь -->
-              <div v-if="openTab === 'sign'" class="p-panel">
-                <div v-if="!signature?.spec" class="p-empty" style="padding: 4px 0">
-                  спеки нет — подписывать нечего
-                </div>
-                <template v-else>
-                  <div v-if="signature.spec.human_paragraph" class="p-lead">
-                    {{ signature.spec.human_paragraph }}
-                  </div>
-                  <div class="p-sec">требований · {{ signature.spec.requirements.length }}</div>
-                  <div v-for="r in signature.spec.requirements" :key="r.id" class="p-req">
-                    <div class="rid">{{ r.id }}</div>
-                    <div class="rst">{{ r.statement }}</div>
-                    <ul v-if="r.acceptance_criteria.length" class="p-ac">
-                      <li v-for="(a, k) in r.acceptance_criteria" :key="k">{{ a }}</li>
-                    </ul>
-                  </div>
-                  <div v-if="signature.spec.open_questions.length" class="p-sec">
-                    вопросы в документе · {{ signature.spec.open_questions.length }}
-                  </div>
-                  <div v-for="(q, k) in signature.spec.open_questions" :key="'oq' + k" class="p-oq">{{ q }}</div>
-                </template>
-              </div>
+              <SignPanel
+                v-if="openTab === 'sign'"
+                :signature="signature"
+                :busy="signBusy"
+                @sign="doSign"
+              />
 
               <!-- качество -->
               <div v-if="openTab === 'qa'" class="p-panel">
