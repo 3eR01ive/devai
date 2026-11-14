@@ -1749,6 +1749,185 @@ pub fn resume(
     Ok(m)
 }
 
+/// Порядок стадий пути: по нему считается, что «после» цели перепройти —
+/// и потому перестаёт быть свежим. Один ряд и для стадий, и для видов
+/// артефактов, чтобы STALE ставился по СМЫСЛУ стадии.
+fn stage_rank(state: TaskState) -> Option<u8> {
+    match state {
+        TaskState::Draft => Some(0),
+        TaskState::Statement => Some(1),
+        TaskState::Analysis => Some(2),
+        TaskState::Review => Some(3),
+        TaskState::Approval => Some(4),
+        TaskState::Implementation | TaskState::Rework => Some(5),
+        TaskState::Qa => Some(6),
+        _ => None,
+    }
+}
+
+fn artifact_rank(kind: ArtifactKind) -> Option<u8> {
+    match kind {
+        ArtifactKind::StatementReview => Some(1),
+        ArtifactKind::RequirementsSpec => Some(2),
+        ArtifactKind::ReviewReport => Some(3),
+        ArtifactKind::ImplementationReport => Some(5),
+        ArtifactKind::QualityReport => Some(6),
+        _ => None,
+    }
+}
+
+/// Адрес перехода для каждой цели откатa: имя условия — ДАННЫЕ объявления,
+/// код не вычисляет адрес сам.
+fn rewind_condition(target: TaskState) -> Option<&'static str> {
+    match target {
+        TaskState::Statement => Some(process_condition::REWIND_TO_STATEMENT),
+        TaskState::Analysis => Some(process_condition::REWIND_TO_ANALYSIS),
+        TaskState::Review => Some(process_condition::REWIND_TO_REVIEW),
+        TaskState::Approval => Some(process_condition::REWIND_TO_APPROVAL),
+        TaskState::Implementation => Some(process_condition::REWIND_TO_IMPLEMENTATION),
+        TaskState::Qa => Some(process_condition::REWIND_TO_QA),
+        _ => None,
+    }
+}
+
+/// Человек велел пройти путь заново с названной стадии. Стадия — адрес
+/// объявления; результаты этой стадии и всех следующих помечаются STALE
+/// (ничего не удаляется: история остаётся читаемой). Причина обязательна —
+/// иначе в журнале непонятно, зачем шли дважды.
+pub fn rewind(
+    process: &Process,
+    task: &Task,
+    target: TaskState,
+    reason: &str,
+    artifacts: &[Artifact],
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    if task.state == TaskState::Accepted {
+        return Err(CoreError::guard(
+            "a finished task is history: start a new one instead of replaying it",
+        ));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(CoreError::guard(
+            "rewind needs a reason: the journal must say why the path is walked twice",
+        ));
+    }
+    if task.state == target {
+        return Err(CoreError::guard(format!(
+            "task is already at {}",
+            target.as_str()
+        )));
+    }
+    let condition = rewind_condition(target).ok_or_else(|| {
+        CoreError::guard(format!(
+            "{} cannot be replayed: it is not a stage of the path",
+            target.as_str()
+        ))
+    })?;
+    let from = task.state;
+    let mut m = transition(
+        process,
+        task,
+        condition,
+        event_kind::TASK_REWOUND,
+        actor,
+        now,
+        json!({
+            (json_field::FROM): from.as_str(),
+            (json_field::TO): target.as_str(),
+            (json_field::REASON): reason,
+        }),
+    )?;
+    m.task.return_state = None;
+
+    let target_rank = stage_rank(target).unwrap_or(0);
+    let staled: Vec<Id> = artifacts
+        .iter()
+        .filter(|a| a.status != ArtifactStatus::Superseded)
+        .filter(|a| a.status != ArtifactStatus::Stale)
+        .filter(|a| artifact_rank(a.kind).is_some_and(|r| r >= target_rank))
+        .map(|a| a.id)
+        .collect();
+    if !staled.is_empty() {
+        m.artifact_status
+            .extend(staled.iter().map(|id| (*id, ArtifactStatus::Stale)));
+        m.events.push(EventDraft {
+            kind: event_kind::ARTIFACTS_STALED,
+            actor: actor.to_string(),
+            payload: json!({
+                (json_field::STALED): staled.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                (json_field::CAUSE): stale_cause::REWIND,
+            }),
+        });
+    }
+    Ok(m)
+}
+
+/// Правка изначальной постановки человеком. Если путь ещё не начат — просто
+/// новые поля; если начат — постановка переписана и путь идёт заново со
+/// стадии STATEMENT (результаты ниже помечаются STALE тем же механизмом).
+pub fn restate(
+    process: &Process,
+    task: &Task,
+    title: Option<&str>,
+    description: Option<&str>,
+    reason: &str,
+    artifacts: &[Artifact],
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    if task.state == TaskState::Accepted {
+        return Err(CoreError::guard(
+            "a finished task is history: restate a new one instead",
+        ));
+    }
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(CoreError::guard(
+            "restate needs a reason: the journal must say why the statement changed",
+        ));
+    }
+    let new_title = title.map(str::trim).filter(|t| !t.is_empty());
+    if new_title.is_none() && description.is_none() {
+        return Err(CoreError::guard(
+            "nothing to restate: give a new title or a new description",
+        ));
+    }
+
+    let replay = !matches!(task.state, TaskState::Draft | TaskState::Statement);
+    let mut m = if replay {
+        rewind(process, task, TaskState::Statement, reason, artifacts, actor, now)?
+    } else {
+        note(
+            task,
+            event_kind::TASK_RESTATED,
+            actor,
+            now,
+            json!({ (json_field::REASON): reason }),
+        )
+    };
+
+    if let Some(t) = new_title {
+        m.task.title = t.to_string();
+    }
+    if let Some(d) = description {
+        m.task.business_description = d.to_string();
+    }
+    m.events.push(EventDraft {
+        kind: event_kind::TASK_RESTATED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::REASON): reason,
+            "title": title.map(str::trim),
+            "description": description,
+            "replayed": replay,
+        }),
+    });
+    Ok(m)
+}
+
 pub fn fail(
     process: &Process,
     task: &Task,

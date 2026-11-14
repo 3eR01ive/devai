@@ -24,11 +24,14 @@
 # кода и объявления не решается в пользу одной из сторон молча.
 
 process:
+  # Версия 7: человек может пройти путь заново с названной стадии (`rewind`):
+  # у каждой цели своё условие, следующие результаты помечаются STALE, а не
+  # удаляются. Правка постановки — частный случай (rewind в STATEMENT).
   # Версия 6: отменённую задачу можно вернуть в работу — отмена помнит, откуда
   # её сделали, и «продолжить» возвращает туда, а не начинает путь заново.
   # Версия 5: отказ ревью уходит ЧЕЛОВЕКУ, а не в следующий круг анализа.
   # Версия 4: стадия STATEMENT — постановщик проверяет саму постановку до анализа.
-  version: 6
+  version: 7
 
   # Закрытый перечень имён условий. Неизвестное имя в transitions отвергается
   # при инициализации — опечатка не становится «новым» переходом. Имя,
@@ -47,6 +50,12 @@ process:
     - human_resumed           # человек снял парковку/удержание
     - launch_failed           # запуск роли не состоялся (ошибка порождения)
     - outcome_missing         # у исполнения не пришло исхода (иначе — вечное RUNNING)
+    - rewind_to_statement     # человек велел начать заново с постановки
+    - rewind_to_analysis      # ... с анализа
+    - rewind_to_review        # ... с ревью
+    - rewind_to_approval      # ... с подписи
+    - rewind_to_implementation # ... с реализации
+    - rewind_to_qa            # ... с приёмки
 
   # Рабочие состояния и их исполнители. Для role обязательны launch_failed и
   # outcome_missing (иначе состояние не умеет выразить провал запуска), плюс
@@ -153,6 +162,75 @@ process:
     - { from: PAUSED, on: human_resumed, to: RETURN_STATE }
     - { from: BLOCKED, on: human_resumed, to: RETURN_STATE }
     - { from: FAILED, on: human_resumed, to: RETURN_STATE }
+
+    # Перепройти путь заново с названной стадии: только человек, только вперёд
+    # по смыслу (результаты после цели помечаются STALE, история остаётся).
+    - { from: ANALYSIS, on: rewind_to_statement, to: STATEMENT }
+    - { from: REVIEW, on: rewind_to_statement, to: STATEMENT }
+    - { from: APPROVAL, on: rewind_to_statement, to: STATEMENT }
+    - { from: IMPLEMENTATION, on: rewind_to_statement, to: STATEMENT }
+    - { from: REWORK, on: rewind_to_statement, to: STATEMENT }
+    - { from: QA, on: rewind_to_statement, to: STATEMENT }
+    - { from: WAITING_FOR_INPUT, on: rewind_to_statement, to: STATEMENT }
+    - { from: PAUSED, on: rewind_to_statement, to: STATEMENT }
+    - { from: BLOCKED, on: rewind_to_statement, to: STATEMENT }
+    - { from: FAILED, on: rewind_to_statement, to: STATEMENT }
+    - { from: CANCELLED, on: rewind_to_statement, to: STATEMENT }
+    - { from: STATEMENT, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: REVIEW, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: APPROVAL, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: IMPLEMENTATION, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: REWORK, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: QA, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: WAITING_FOR_INPUT, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: PAUSED, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: BLOCKED, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: FAILED, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: CANCELLED, on: rewind_to_analysis, to: ANALYSIS }
+    - { from: STATEMENT, on: rewind_to_review, to: REVIEW }
+    - { from: ANALYSIS, on: rewind_to_review, to: REVIEW }
+    - { from: APPROVAL, on: rewind_to_review, to: REVIEW }
+    - { from: IMPLEMENTATION, on: rewind_to_review, to: REVIEW }
+    - { from: REWORK, on: rewind_to_review, to: REVIEW }
+    - { from: QA, on: rewind_to_review, to: REVIEW }
+    - { from: WAITING_FOR_INPUT, on: rewind_to_review, to: REVIEW }
+    - { from: PAUSED, on: rewind_to_review, to: REVIEW }
+    - { from: BLOCKED, on: rewind_to_review, to: REVIEW }
+    - { from: FAILED, on: rewind_to_review, to: REVIEW }
+    - { from: CANCELLED, on: rewind_to_review, to: REVIEW }
+    - { from: STATEMENT, on: rewind_to_approval, to: APPROVAL }
+    - { from: ANALYSIS, on: rewind_to_approval, to: APPROVAL }
+    - { from: REVIEW, on: rewind_to_approval, to: APPROVAL }
+    - { from: IMPLEMENTATION, on: rewind_to_approval, to: APPROVAL }
+    - { from: REWORK, on: rewind_to_approval, to: APPROVAL }
+    - { from: QA, on: rewind_to_approval, to: APPROVAL }
+    - { from: WAITING_FOR_INPUT, on: rewind_to_approval, to: APPROVAL }
+    - { from: PAUSED, on: rewind_to_approval, to: APPROVAL }
+    - { from: BLOCKED, on: rewind_to_approval, to: APPROVAL }
+    - { from: FAILED, on: rewind_to_approval, to: APPROVAL }
+    - { from: CANCELLED, on: rewind_to_approval, to: APPROVAL }
+    - { from: STATEMENT, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: ANALYSIS, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: REVIEW, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: APPROVAL, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: REWORK, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: QA, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: WAITING_FOR_INPUT, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: PAUSED, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: BLOCKED, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: FAILED, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: CANCELLED, on: rewind_to_implementation, to: IMPLEMENTATION }
+    - { from: STATEMENT, on: rewind_to_qa, to: QA }
+    - { from: ANALYSIS, on: rewind_to_qa, to: QA }
+    - { from: REVIEW, on: rewind_to_qa, to: QA }
+    - { from: APPROVAL, on: rewind_to_qa, to: QA }
+    - { from: IMPLEMENTATION, on: rewind_to_qa, to: QA }
+    - { from: REWORK, on: rewind_to_qa, to: QA }
+    - { from: WAITING_FOR_INPUT, on: rewind_to_qa, to: QA }
+    - { from: PAUSED, on: rewind_to_qa, to: QA }
+    - { from: BLOCKED, on: rewind_to_qa, to: QA }
+    - { from: FAILED, on: rewind_to_qa, to: QA }
+    - { from: CANCELLED, on: rewind_to_qa, to: QA }
 
   # Куда уводит удержание — тоже данные, а не адрес в коде: пауза, блокировка,
   # отмена, провал и вопрос паркуют задачу в объявленное состояние. Все адреса

@@ -1347,6 +1347,9 @@ pub mod stale_cause {
     /// A requirements revision superseded the spec the result was built on;
     /// the stale closure retired its downstream artifacts.
     pub const REQUIREMENTS_REVISION: &str = "requirements revision";
+    /// Человек велел пройти путь заново с названной стадии: результаты этой
+    /// стадии и всех следующих перестали быть свежими.
+    pub const REWIND: &str = "rewind: stage replayed by the human";
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,6 +1630,10 @@ pub mod event_kind {
     pub const QUESTION_ANSWERED: &str = "question.answered";
     pub const TASK_PAUSED: &str = "task.paused";
     pub const TASK_RESUMED: &str = "task.resumed";
+    /// Человек перепрогоняет путь с названной стадии (`task rewind`).
+    pub const TASK_REWOUND: &str = "task.rewound";
+    /// Человек переписал постановку задачи (`task restate`).
+    pub const TASK_RESTATED: &str = "task.restated";
     pub const TASK_BLOCKED: &str = "task.blocked";
     pub const TASK_UNBLOCKED: &str = "task.unblocked";
     pub const TASK_CANCELLED: &str = "task.cancelled";
@@ -1796,6 +1803,8 @@ pub mod event_kind {
         TASK_DEPENDENCY_OVERRIDDEN,
         TASK_PROJECT_SET,
         TASK_HUMAN_NAME_SET,
+        TASK_REWOUND,
+        TASK_RESTATED,
         WORKFLOW_STARTED,
         STATE_CHANGED,
         STATEMENT_REVIEWED,

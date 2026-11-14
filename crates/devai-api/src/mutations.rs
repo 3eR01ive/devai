@@ -220,6 +220,17 @@ pub enum WorkflowOp {
     Fail {
         reason: Option<String>,
     },
+    /// Человек проходит путь заново с названной стадии.
+    Rewind {
+        to: String,
+        reason: String,
+    },
+    /// Человек переписал изначальную постановку задачи.
+    Restate {
+        title: Option<String>,
+        description: Option<String>,
+        reason: String,
+    },
 }
 
 /// The committed outcome of one workflow mutation — the facts the CLI's
@@ -785,6 +796,26 @@ impl Api {
             WorkflowOp::Return { rationale } => self.run_op(id, move |t, a| {
                 workflow::return_to_rework(p, t, a, rationale.as_deref(), &self.actor, Utc::now())
             }),
+            WorkflowOp::Rewind { to, reason } => self.run_op(id, move |t, a| {
+                let target = TaskState::parse(&to).map_err(|_| {
+                    devai_core::CoreError::guard(format!("unknown stage `{to}`"))
+                })?;
+                workflow::rewind(p, t, target, &reason, a, &self.actor, Utc::now())
+            }),
+            WorkflowOp::Restate { title, description, reason } => {
+                self.run_op(id, move |t, a| {
+                    workflow::restate(
+                        p,
+                        t,
+                        title.as_deref(),
+                        description.as_deref(),
+                        &reason,
+                        a,
+                        &self.actor,
+                        Utc::now(),
+                    )
+                })
+            }
             WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| {
                 workflow::pause(p, t, reason.as_deref(), &self.actor, Utc::now())
             }),
@@ -959,6 +990,35 @@ impl Api {
     }
     pub fn task_cancel(&self, id: &str, reason: Option<String>) -> ApiResult<MutationResult> {
         self.task_op(id, WorkflowOp::Cancel { reason })
+    }
+    /// Пройти путь заново с названной стадии (только человек): результаты этой
+    /// стадии и всех следующих помечаются STALE, причина ложится в журнал.
+    pub fn task_rewind(&self, id: &str, to: &str, reason: &str) -> ApiResult<MutationResult> {
+        self.task_op(
+            id,
+            WorkflowOp::Rewind {
+                to: to.to_string(),
+                reason: reason.to_string(),
+            },
+        )
+    }
+    /// Переписать изначальную постановку задачи (только человек). Правка
+    /// начатого пути возвращает его в STATEMENT.
+    pub fn task_restate(
+        &self,
+        id: &str,
+        title: Option<String>,
+        description: Option<String>,
+        reason: &str,
+    ) -> ApiResult<MutationResult> {
+        self.task_op(
+            id,
+            WorkflowOp::Restate {
+                title,
+                description,
+                reason: reason.to_string(),
+            },
+        )
     }
     pub fn task_fail(&self, id: &str, reason: Option<String>) -> ApiResult<MutationResult> {
         self.task_op(id, WorkflowOp::Fail { reason })

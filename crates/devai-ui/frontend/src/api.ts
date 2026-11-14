@@ -185,6 +185,12 @@ export const api = {
   // стадию, на которой дело закрыли.
   taskResume: (id_prefix: string) =>
     invoke<StatusView>("task_resume", { id_prefix }),
+  // Пройти путь заново с шага и переписать постановку: акты человека, причина
+  // обязательна — журнал должен объяснять, зачем путь пройден дважды.
+  taskRewind: (id_prefix: string, to: string, reason: string) =>
+    invoke<StatusView>("task_rewind", { id_prefix, to, reason }),
+  taskRestate: (id_prefix: string, title: string | null, description: string | null, reason: string) =>
+    invoke<StatusView>("task_restate", { id_prefix, title, description, reason }),
   // Строки статуса агентов (задача 01a1b60c, REQ-AF-07): одна фраза платформы
   // на агента — окно ничего не собирает и не перефразирует.
   agentStatuses: () => invoke<AgentStatusView[]>("agent_statuses"),

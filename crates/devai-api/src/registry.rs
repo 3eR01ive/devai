@@ -355,6 +355,20 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "APPROVAL → ANALYSIS: persists the workflow event AND a requirements_rejection decision row (REJECTED, actor, rationale, refs to the CURRENT REQUIREMENTS_SPEC when one exists; refs empty otherwise). Rights are the state alone — a missing or non-CURRENT spec does not narrow reject. Mirrors `task reject`; the window's `task_reject` calls this same operation.",
         },
         OpDescriptor {
+            name: "task.rewind",
+            class: OpClass::Mutation,
+            input: "id_prefix, to, reason",
+            output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
+            description: "Человек проходит путь заново с названной стадии: адрес перехода берётся из объявления процесса (rewind_to_*), результаты этой стадии и всех следующих помечаются STALE (ничего не удаляется), причина обязательна и ложится в журнал. Только человек; принятую задачу перепройти нельзя. Mirrors `task rewind`.",
+        },
+        OpDescriptor {
+            name: "task.restate",
+            class: OpClass::Mutation,
+            input: "id_prefix, title?, description?, reason",
+            output: "MutationResult{task, previous_state, event_kinds, staled, superseded, allowed_operations}",
+            description: "Человек переписывает изначальную постановку задачи. В DRAFT/STATEMENT меняются только поля; на начатом пути это rewind в STATEMENT (результаты ниже → STALE), чтобы постановщик проверил новую постановку. Причина обязательна. Mirrors `task restate`.",
+        },
+        OpDescriptor {
             name: "task.accept",
             class: OpClass::Mutation,
             input: "id_prefix, rationale",

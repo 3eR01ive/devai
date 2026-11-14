@@ -32,7 +32,9 @@ use crate::types::TaskState;
 /// автоматического следующего круга анализа.
 /// 6: отмена помнит стадию, на которой случилась, и `resume` возвращает задачу
 /// туда — отменённое дело можно продолжить, а не только начать заново.
-pub const SUPPORTED_PROCESS_VERSION: u32 = 6;
+/// 7: человек может пройти путь заново с названной стадии (`rewind`); правка
+/// постановки — частный случай (rewind в STATEMENT).
+pub const SUPPORTED_PROCESS_VERSION: u32 = 7;
 
 /// The special transition address: «the remembered working stage» of a hold
 /// (`return_state`), not a fixed state name. Spelled once.
@@ -98,6 +100,15 @@ pub mod process_condition {
     /// emitting command would be a BEHAVIOUR change, not a comment fix, so it
     /// is not smuggled in here.
     pub const OUTCOME_MISSING: &str = "outcome_missing";
+    /// Человек велел пройти путь заново с названной стадии (`task rewind`).
+    /// Условие у каждой цели своё: адрес перехода — данные объявления, а не
+    /// вычисление в коде.
+    pub const REWIND_TO_STATEMENT: &str = "rewind_to_statement";
+    pub const REWIND_TO_ANALYSIS: &str = "rewind_to_analysis";
+    pub const REWIND_TO_REVIEW: &str = "rewind_to_review";
+    pub const REWIND_TO_APPROVAL: &str = "rewind_to_approval";
+    pub const REWIND_TO_IMPLEMENTATION: &str = "rewind_to_implementation";
+    pub const REWIND_TO_QA: &str = "rewind_to_qa";
 
     /// Every name above — the closed list a declaration must cover.
     pub const ALL: &[&str] = &[
@@ -114,6 +125,12 @@ pub mod process_condition {
         HUMAN_RESUMED,
         LAUNCH_FAILED,
         OUTCOME_MISSING,
+        REWIND_TO_STATEMENT,
+        REWIND_TO_ANALYSIS,
+        REWIND_TO_REVIEW,
+        REWIND_TO_APPROVAL,
+        REWIND_TO_IMPLEMENTATION,
+        REWIND_TO_QA,
     ];
 
     /// The names that END a role's work normally. A role state must cover at

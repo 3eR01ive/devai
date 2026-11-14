@@ -437,6 +437,8 @@ fn task_verbs(ctx: &Ctx, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Resume { .. }
         | TaskCmd::Block { .. }
         | TaskCmd::Cancel { .. }
+        | TaskCmd::Rewind { .. }
+        | TaskCmd::Restate { .. }
         | TaskCmd::Fail { .. }) => task_state_ops(ctx, cmd)?,
         cmd @ (TaskCmd::Depend { .. }
         | TaskCmd::Dependencies { .. }
@@ -826,6 +828,23 @@ fn task_state_ops(ctx: &Ctx, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Block { id, reason } => render_mutation(&op(ctx.api().task_block(&id, reason))?)?,
         TaskCmd::Cancel { id, reason } => {
             render_mutation(&op(ctx.api().task_cancel(&id, reason))?)?
+        }
+        TaskCmd::Rewind { id, to, reason } => {
+            render_mutation(&op(ctx.api().task_rewind(&id, &to, &reason))?)? 
+        }
+        TaskCmd::Restate { id, title, description, reason } => {
+            // «-» = постановка целиком из stdin: длинный текст не должен
+            // зависеть от экранирования кавычек в оболочке.
+            let description = match description.as_deref() {
+                Some("-") => {
+                    use std::io::Read;
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    Some(s)
+                }
+                other => other.map(str::to_string),
+            };
+            render_mutation(&op(ctx.api().task_restate(&id, title, description, &reason))?)?
         }
         TaskCmd::Fail { id, reason } => render_mutation(&op(ctx.api().task_fail(&id, reason))?)?,
         _ => unreachable!("the dispatcher routes only state arms here"),

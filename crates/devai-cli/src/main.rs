@@ -357,6 +357,29 @@ enum TaskCmd {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Пройти путь заново с названной стадии (только человек): результаты
+    /// этой стадии и всех следующих помечаются STALE, причина ложится в журнал
+    Rewind {
+        id: String,
+        /// Куда вернуться: STATEMENT, ANALYSIS, REVIEW, APPROVAL,
+        /// IMPLEMENTATION или QA
+        #[arg(long = "to")]
+        to: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Переписать изначальную постановку задачи (только человек). На начатом
+    /// пути это перепройти с STATEMENT: результаты ниже помечаются STALE
+    Restate {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        /// Постановка целиком; `-` читать из stdin
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
     /// Record a runtime failure (task parks in FAILED; `resume` retries)
     Fail {
         id: String,

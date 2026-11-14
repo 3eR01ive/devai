@@ -25,6 +25,8 @@ Commands:
   resume               Resume a PAUSED/BLOCKED/FAILED task, or answer-driven restore
   block                
   cancel               
+  rewind               Пройти путь заново с названной стадии (только человек): результаты этой стадии и всех следующих помечаются STALE, причина ложится в журнал
+  restate              Переписать изначальную постановку задачи (только человек). На начатом пути это перепройти с STATEMENT: результаты ниже помечаются STALE
   fail                 Record a runtime failure (task parks in FAILED; `resume` retries)
   set-project          Assign or REPLACE the owning project of an existing task (REQ-BIND-02, C5 D1): refs resolve first, an unknown task or project refuses, a re-apply of the already-bound project is a documented no-op. One append-only `task.project.set` event per effective change; workflow state is not touched
   backfill-project     Backfill the project binding (REQ-BIND-03 under the ratified OQ-BIND-2 rule): bind the given project to every task that lives UNBOUND and NON-TERMINAL in this store. Terminal history keeps the address it lived and judged at; tasks of another project are never re-bound. Every binding goes through the `task.project.set` operation; running it twice changes nothing the second time

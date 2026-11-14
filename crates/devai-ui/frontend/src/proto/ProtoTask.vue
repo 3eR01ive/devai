@@ -14,6 +14,7 @@ import type {
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
+import RewindPanel from "./RewindPanel.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -833,6 +834,38 @@ const { holding, progress, start, move, release } = useHoldToConfirm(
   () => void doCancel(),
 );
 
+// «Ошиблись на шаге» — панель открывается по требованию и не занимает шапку.
+const rewindOpen = ref(false);
+const rewindBusy = ref(false);
+
+async function doRewind(to: string, reason: string) {
+  rewindBusy.value = true;
+  error.value = null;
+  try {
+    await api.taskRewind(id.value, to, reason);
+    rewindOpen.value = false;
+    await load();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    rewindBusy.value = false;
+  }
+}
+
+async function doRestate(title: string, description: string, reason: string) {
+  rewindBusy.value = true;
+  error.value = null;
+  try {
+    await api.taskRestate(id.value, title, description, reason);
+    rewindOpen.value = false;
+    await load();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    rewindBusy.value = false;
+  }
+}
+
 function backToList() {
   void router.push("/proto/tasks");
 }
@@ -857,6 +890,9 @@ onMounted(load);
            человека, а не про шаги роли -->
       <div class="p-dnav">
         <button class="p-back" @click="backToList">← к списку</button>
+        <div class="p-dright">
+        <button class="p-rewind" :class="{ on: rewindOpen }" @click="rewindOpen = !rewindOpen"
+                title="ошиблись на шаге — вернуться и пройти заново">↺ Ошиблись?</button>
         <button
           v-if="canResume"
           class="p-resume"
@@ -879,6 +915,7 @@ onMounted(load);
           <i class="fill" :style="{ width: (holding === 'cancel' ? progress * 100 : 0) + '%' }" />
           <span>{{ cancelBusy ? 'отменяю…' : canCancel ? 'Отменить задачу' : 'закрыта' }}</span>
         </button>
+        </div>
       </div>
 
       <header class="p-dhead">
@@ -909,6 +946,16 @@ onMounted(load);
           <div class="s">${{ usage.cost.toFixed(2) }} · {{ usage.measured }} из {{ usage.runs }} прогонов</div>
         </div>
       </header>
+
+      <RewindPanel
+        v-if="rewindOpen"
+        :state="prog.task.state"
+        :title="prog.task.title"
+        :description="prog.task.business_description"
+        :busy="rewindBusy"
+        @rewind="doRewind"
+        @restate="doRestate"
+      />
 
       <QuestionsBlock
         :questions="questions"
@@ -1568,6 +1615,7 @@ onMounted(load);
 }
 /* ── навигация карточки: возврат к списку и закрытие дела ──────────────── */
 .p-dnav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.p-dright{display:flex;align-items:center;gap:8px}
 .p-back{border:1px solid var(--p-line);border-radius:7px;background:#131a22;color:var(--p-dim);
   font-family:var(--sans);font-size:12px;padding:5px 11px;cursor:pointer}
 .p-back:hover{color:var(--p-ink);border-color:#3a4753}
@@ -1582,5 +1630,8 @@ onMounted(load);
 .p-cancel:disabled{opacity:.4;cursor:not-allowed}.p-resume{border:1px solid rgba(62,207,142,.55);border-radius:7px;background:rgba(62,207,142,.12);
   color:#8ee7bc;font-family:var(--sans);font-size:12px;padding:5px 13px;cursor:pointer}
 .p-resume:hover:not(:disabled){background:rgba(62,207,142,.22)}
-.p-resume:disabled{opacity:.45;cursor:not-allowed}
+.p-resume:disabled{opacity:.45;cursor:not-allowed}.p-rewind{border:1px solid var(--p-line);border-radius:7px;background:#131a22;color:var(--p-dim);
+  font-family:var(--sans);font-size:12px;padding:5px 11px;cursor:pointer}
+.p-rewind:hover{color:var(--p-ink);border-color:#3a4753}
+.p-rewind.on{color:#ffc09a;border-color:rgba(243,106,22,.7);background:rgba(243,106,22,.14)}
 </style>

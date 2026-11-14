@@ -237,6 +237,14 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_resume_rpc,
     },
     RpcCommand {
+        name: "task_rewind",
+        handler: task_rewind_rpc,
+    },
+    RpcCommand {
+        name: "task_restate",
+        handler: task_restate_rpc,
+    },
+    RpcCommand {
         name: "task_run",
         handler: task_run_rpc,
     },
@@ -630,6 +638,37 @@ fn task_accept_rpc(
 }
 
 /// The QA gate's return from the phone: same operation, same one-event record.
+/// Перепройти с шага с телефона: тот же акт, что в окне и в консоли.
+fn task_rewind_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::task_rewind_as(
+        state(app),
+        param_str(params, "id_prefix")?,
+        param_str(params, "to")?,
+        param_str(params, "reason")?,
+        Some(actor_for(app, device)),
+    )?)
+}
+
+/// Переписать постановку с телефона: тот же акт.
+fn task_restate_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::task_restate_as(
+        state(app),
+        param_str(params, "id_prefix")?,
+        param_opt_str(params, "title"),
+        param_opt_str(params, "description"),
+        param_str(params, "reason")?,
+        Some(actor_for(app, device)),
+    )?)
+}
+
 /// Возврат в работу с телефона: тот же акт, что в окне и в консоли.
 fn task_resume_rpc(
     app: &tauri::AppHandle,

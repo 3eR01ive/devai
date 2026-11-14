@@ -474,6 +474,8 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("question_answer", "question.answer"),
     ("task_cancel", "task.cancel"),
     ("task_resume", "task.resume"),
+    ("task_rewind", "task.rewind"),
+    ("task_restate", "task.restate"),
     // Agent status rows (task 01a1b60c, REQ-AF-07): derived availability,
     // last failure class and counters — ONE read, same words as the CLI.
     ("agent_statuses", "agent.status"),
@@ -562,6 +564,10 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     // Возврат в работу: отменённое, приостановленное и заблокированное дело
     // человек вправе продолжить — платформа помнит, откуда его взяли.
     ("task_resume", "task.resume"),
+    // Пройти путь заново с шага и переписать постановку: слово человека о том,
+    // что шаг был пройден по ошибке. Причина обязательна, результаты — STALE.
+    ("task_rewind", "task.rewind"),
+    ("task_restate", "task.restate"),
     // Остановка живого прогона: тот же класс, что запуск — человек
     // управляет работой со своего места, платформа закрывает исполнение
     // штатным `exec.cancel` (статус и причина остаются в истории).
@@ -982,6 +988,55 @@ pub fn question_answer(
     text: String,
 ) -> Result<StatusView, UiError> {
     question_answer_as(state, id_prefix, question_id, text, None)
+}
+
+/// `task.rewind` — человек проходит путь заново с названной стадии.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_rewind(
+    state: State<AppState>,
+    id_prefix: String,
+    to: String,
+    reason: String,
+) -> Result<StatusView, UiError> {
+    task_rewind_as(state, id_prefix, to, reason, None)
+}
+
+pub fn task_rewind_as(
+    state: State<AppState>,
+    id_prefix: String,
+    to: String,
+    reason: String,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_rewind(&id_prefix, &to, &reason))?;
+    Ok(state.api().task_status(&id_prefix)?)
+}
+
+/// `task.restate` — человек переписывает изначальную постановку задачи.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_restate(
+    state: State<AppState>,
+    id_prefix: String,
+    title: Option<String>,
+    description: Option<String>,
+    reason: String,
+) -> Result<StatusView, UiError> {
+    task_restate_as(state, id_prefix, title, description, reason, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn task_restate_as(
+    state: State<AppState>,
+    id_prefix: String,
+    title: Option<String>,
+    description: Option<String>,
+    reason: String,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| {
+        api.task_restate(&id_prefix, title, description, &reason)
+    })?;
+    Ok(state.api().task_status(&id_prefix)?)
 }
 
 /// `task.resume` — человек возвращает дело в работу: снятая пауза, снятая
@@ -2217,6 +2272,8 @@ mod tests {
             "question_answer",
             "task_cancel",
             "task_resume",
+            "task_rewind",
+            "task_restate",
         ];
         expected.sort_unstable();
         assert_eq!(
