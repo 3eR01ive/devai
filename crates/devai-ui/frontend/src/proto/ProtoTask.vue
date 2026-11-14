@@ -6,11 +6,13 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 import { api, toUiError } from "../api";
 import type {
-  ArtifactView, ProgressView, QualityReportView, RulebookView, SignatureView,
-  TaskUsageView, UiError, WorkspaceChangesView, WorkspaceDiffView,
+  ArtifactView, ProgressView, QualityReportView, Question, RulebookView,
+  SignatureView, TaskUsageView, UiError, WorkflowEvent,
+  WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
+import QuestionsBlock from "./QuestionsBlock.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -702,6 +704,31 @@ function evidenceOf(c: any): string {
 // отправляет акт платформы и перечитывает себя.
 const signBusy = ref(false);
 
+// ── вопросы платформы: слово человека снимает удержание ──────────────────
+// Вопрос и гейт берутся из ДАННЫХ: текст вопроса — из чтения вопросов, гейт —
+// из события `question.raised` по этому question_id. Гадать по формулировке
+// нельзя: слово в тексте — это текст, а не адрес перехода.
+const questions = ref<Question[]>([]);
+const events = ref<WorkflowEvent[]>([]);
+const answerBusy = ref<string | null>(null);
+
+const openQs = computed(() => questions.value.filter((q) => q.status === "OPEN"));
+
+async function doAnswer(q: Question, text: string) {
+  const value = text.trim();
+  if (!value) return;
+  answerBusy.value = q.id;
+  error.value = null;
+  try {
+    await api.questionAnswer(id.value, q.id, value);
+    await load();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    answerBusy.value = null;
+  }
+}
+
 async function doSign(approve: boolean, rationale: string | null) {
   signBusy.value = true;
   error.value = null;
@@ -721,13 +748,15 @@ async function doSign(approve: boolean, rationale: string | null) {
 async function load() {
   error.value = null;
   try {
-    const [p, r, u, rb, sig, arts] = await Promise.all([
+    const [p, r, u, rb, sig, arts, qs, evs] = await Promise.all([
       api.taskProgress(id.value),
       api.taskReport(id.value).catch(() => null),
       api.taskUsage(id.value).catch(() => null),
       api.evaluationRules().catch(() => null),
       api.taskSignature(id.value).catch(() => null),
       api.artifactsList(id.value).catch(() => [] as ArtifactView[]),
+      api.questionsList(id.value).catch(() => [] as Question[]),
+      api.taskEvents(id.value, 200).catch(() => [] as WorkflowEvent[]),
     ]);
     prog.value = p;
     report.value = r;
@@ -735,6 +764,8 @@ async function load() {
     rules.value = rb;
     signature.value = sig;
     artifacts.value = arts as ArtifactView[];
+    questions.value = qs as Question[];
+    events.value = evs as WorkflowEvent[];
     // Отчёт реализации (последний) называет коммит задачи — по нему и читаем код.
     const impl = (arts as ArtifactView[])
       .filter((a) => a.kind === "IMPLEMENTATION_REPORT")
@@ -799,6 +830,13 @@ onMounted(load);
           <div class="s">${{ usage.cost.toFixed(2) }} · {{ usage.measured }} из {{ usage.runs }} прогонов</div>
         </div>
       </header>
+
+      <QuestionsBlock
+        :questions="questions"
+        :events="events"
+        :busy="answerBusy"
+        @answer="doAnswer"
+      />
 
       <div class="p-steps">
         <div

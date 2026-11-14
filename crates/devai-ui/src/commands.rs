@@ -468,6 +468,10 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("artifact_content", "artifact.cat_text"),
     ("artifact_content", "artifact.cat"),
     ("questions_list", "question.list"),
+    // Ответ на вопрос платформы — тот же акт, что `devai question answer`:
+    // слово человека снимает удержание и возвращает задачу в стадию, которая
+    // спросила. Окно не решает, куда идти, — оно отправляет ответ.
+    ("question_answer", "question.answer"),
     // Agent status rows (task 01a1b60c, REQ-AF-07): derived availability,
     // last failure class and counters — ONE read, same words as the CLI.
     ("agent_statuses", "agent.status"),
@@ -546,6 +550,10 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_accept", "task.accept"),
     ("task_return", "task.return"),
     ("task_run", "task.run"),
+    // Ответ человека на вопрос платформы: вопрос поднят ЗА ЧЕЛОВЕКОМ и без его
+    // слова работа стоит. Это тот же человеческий акт, что подпись и приёмка,
+    // и он открыт окну именно поэтому — `question.answer` снимает удержание.
+    ("question_answer", "question.answer"),
     // Остановка живого прогона: тот же класс, что запуск — человек
     // управляет работой со своего места, платформа закрывает исполнение
     // штатным `exec.cancel` (статус и причина остаются в истории).
@@ -951,6 +959,31 @@ pub fn task_accept_as(
     actor: Option<String>,
 ) -> Result<StatusView, UiError> {
     with_actor_write(&state, actor, |api| api.task_accept(&id_prefix, rationale))?;
+    Ok(state.api().task_status(&id_prefix)?)
+}
+
+/// `question.answer` — ответ человека на вопрос платформы. Тот же акт, что
+/// `devai question answer`: удержание снимается, задача возвращается в стадию,
+/// которая спросила (её запускает платформа, не окно). Возвращаем ПЕРЕЧИТАННЫЙ
+/// статус, чтобы карточка не собирала новое состояние из догадок.
+#[tauri::command(rename_all = "snake_case")]
+pub fn question_answer(
+    state: State<AppState>,
+    id_prefix: String,
+    question_id: String,
+    text: String,
+) -> Result<StatusView, UiError> {
+    question_answer_as(state, id_prefix, question_id, text, None)
+}
+
+pub fn question_answer_as(
+    state: State<AppState>,
+    id_prefix: String,
+    question_id: String,
+    text: String,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| api.question_answer(&question_id, &text))?;
     Ok(state.api().task_status(&id_prefix)?)
 }
 
@@ -2136,6 +2169,7 @@ mod tests {
             "task_reject",
             "task_return",
             "task_run",
+            "question_answer",
         ];
         expected.sort_unstable();
         assert_eq!(

@@ -225,6 +225,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_return_rpc,
     },
     RpcCommand {
+        name: "question_answer",
+        handler: question_answer_rpc,
+    },
+    RpcCommand {
         name: "task_run",
         handler: task_run_rpc,
     },
@@ -618,6 +622,39 @@ fn task_accept_rpc(
 }
 
 /// The QA gate's return from the phone: same operation, same one-event record.
+/// Ответ на вопрос с телефона: тот же акт платформы, что в окне и в консоли.
+fn question_answer_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let req = AnswerRequest::of(params)?;
+    to_json(crate::commands::question_answer_as(
+        state(app),
+        req.id_prefix,
+        req.question_id,
+        req.text,
+        Some(actor_for(app, device)),
+    )?)
+}
+
+/// Форма ответа на вопрос: те же три поля, что у оконной команды.
+struct AnswerRequest {
+    id_prefix: String,
+    question_id: String,
+    text: String,
+}
+
+impl AnswerRequest {
+    fn of(params: &serde_json::Value) -> Result<Self, UiError> {
+        Ok(Self {
+            id_prefix: param_str(params, "id_prefix")?,
+            question_id: param_str(params, "question_id")?,
+            text: param_str(params, "text")?,
+        })
+    }
+}
+
 fn task_return_rpc(
     app: &tauri::AppHandle,
     device: &DeviceClaim,
