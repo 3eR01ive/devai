@@ -308,6 +308,12 @@ pub struct SourceSliceView {
     /// отдаём варианты, и человек выбирает сам.
     #[serde(default)]
     pub candidates: Vec<String>,
+    /// Чем кончилось разрешение ревизии: ссылка из отчёта может указывать на
+    /// коммит, которого в этом репозитории уже нет (ветку убрали, ворктри
+    /// удалили). Тогда честно читаем ближайшую доступную ревизию и говорим,
+    /// какую — вместо «код недоступен» на каждой ссылке.
+    #[serde(default)]
+    pub rev_note: Option<String>,
 }
 
 /// Чем кончилось разрешение сокращённого пути.
@@ -352,6 +358,36 @@ fn resolve_path(repo: &Path, rev: &str, path: &str) -> Result<Resolved, crate::A
     }
 }
 
+/// Ревизия, которую реально можно прочитать: названная, иначе её полный
+/// коммит, иначе текущая HEAD. Возвращает пару (ревизия, объяснение подмены).
+fn resolve_rev(repo: &Path, rev: &str) -> (String, Option<String>) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    if git(&["cat-file", "-e", &format!("{rev}^{{commit}}")]).is_some() {
+        return (rev.to_string(), None);
+    }
+    if let Some(sha) = git(&["rev-parse", "--verify", &format!("{rev}^{{commit}}")]) {
+        return (sha, None);
+    }
+    if let Some(head) = git(&["rev-parse", "HEAD"]) {
+        return (
+            head,
+            Some(format!(
+                "ревизии {rev} в этом репозитории нет — код читается с текущей HEAD"
+            )),
+        );
+    }
+    (rev.to_string(), None)
+}
+
 fn repo_of(facts_repo: Option<PathBuf>) -> Option<PathBuf> {
     facts_repo
 }
@@ -376,6 +412,10 @@ impl Api {
         // «crates/devai-api/src/signature/types.rs»). Путь разрешаем по дереву
         // коммита: точное совпадение, иначе единственное совпадение по хвосту.
         // Неоднозначность — отказ со списком, а не догадка.
+        // Ссылка из отчёта может называть коммит, которого уже нет: читаем
+        // ближайшую доступную ревизию и говорим, какую именно.
+        let (rev_owned, rev_note) = resolve_rev(&repo, rev);
+        let rev = rev_owned.as_str();
         let path = match resolve_path(&repo, rev, path)? {
             Resolved::Hit(p) => p,
             Resolved::Ambiguous(candidates) => {
@@ -387,6 +427,7 @@ impl Api {
                     total_lines: 0,
                     text: String::new(),
                     candidates,
+                    rev_note,
                 })
             }
             Resolved::Missing => {
@@ -431,6 +472,7 @@ impl Api {
             total_lines: total as u32,
             text: lines[start..end].join("\n"),
             candidates: Vec::new(),
+            rev_note,
         })
     }
 }
@@ -499,6 +541,25 @@ mod tests {
             Resolved::Hit(p) => assert_eq!(p, "crates/api/src/signature/types.rs"),
             _ => panic!("должен найтись единственный хвост"),
         }
+    }
+
+    #[test]
+    fn unknown_rev_reads_head_and_says_so() {
+        // Ссылка может называть коммит, которого в репозитории уже нет
+        // (ветку убрали, ворктри удалили): читаем HEAD и объясняем подмену.
+        let dir = repo();
+        let (rev, note) = super::resolve_rev(dir.path(), "2519218");
+        assert_eq!(rev, head(dir.path()));
+        assert!(note.is_some(), "подмена должна быть объяснена");
+    }
+
+    #[test]
+    fn known_rev_is_used_as_named() {
+        let dir = repo();
+        let h = head(dir.path());
+        let (rev, note) = super::resolve_rev(dir.path(), &h);
+        assert_eq!(rev, h);
+        assert!(note.is_none());
     }
 
     #[test]

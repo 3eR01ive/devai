@@ -88,8 +88,16 @@ const verdict = computed<string>(() => String(headline.value.verdict ?? ""));
 // что платформа проштамповала в отчёте реализации (это и есть коммит задачи);
 // запасной — голова из отчёта качества.
 const implCommit = ref<string>("");
+// Ревизия для чтения кода: коммит задачи, иначе голова из отчёта качества,
+// иначе коммит, от которого задача началась (база воркспейса). Последнее
+// важно для ссылок, сделанных до реализации: кода задачи ещё нет, а база —
+// то состояние, которое автор видел. Совсем без ревизии — HEAD репозитория
+// (это решает платформа, когда названного коммита уже нет).
 const rev = computed<string>(
-  () => implCommit.value || String(qaBody.value.workspace_revision?.git_head ?? ""),
+  () =>
+    implCommit.value ||
+    String(qaBody.value.workspace_revision?.git_head ?? "") ||
+    String(changes.value?.bound_head ?? changes.value?.head_before ?? ""),
 );
 
 const scoreTone = computed(() => {

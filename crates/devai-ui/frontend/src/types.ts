@@ -247,6 +247,8 @@ export interface SourceSliceView {
   text: string;
   /** сокращённый путь совпал с несколькими файлами: выбор человека, не догадка */
   candidates: string[];
+  /** почему читается не та ревизия, что в ссылке (коммита уже нет) */
+  rev_note: string | null;
 }
 
 export interface ProgressView {

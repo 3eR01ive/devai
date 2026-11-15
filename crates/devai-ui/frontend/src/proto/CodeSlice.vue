@@ -153,12 +153,17 @@ const linkedRange = computed(() => {
 <template>
   <div class="codeblock">
     <div class="cap">
-      <span>{{ path }}:{{ slice?.from ?? from }}{{ (slice?.to ?? to) > (slice?.from ?? from) ? `–${slice?.to ?? to}` : "" }}</span>
+      <span class="where">{{ path }}:{{ slice?.from ?? from }}{{ (slice?.to ?? to) > (slice?.from ?? from) ? `–${slice?.to ?? to}` : "" }}</span>
+      <!-- неоднозначный хвост: человек выбирает файл сам -->
       <span v-if="slice && (slice.candidates ?? []).length" class="pick">
         файл неоднозначен:
         <button v-for="c in slice.candidates" :key="c" class="cand" @click="pickCandidate(c)">{{ c }}</button>
       </span>
-      <span v-else-if="slice" class="n">{{ lineCount() }} стр<template v-if="total"> из {{ total }}</template></span>
+      <!-- какая ревизия прочитана: ссылка может называть коммит, которого уже нет -->
+      <span v-if="slice && slice.rev" class="rev" :title="slice.rev_note ?? 'коммит, на который ссылается отчёт'">
+        с {{ slice.rev.slice(0, 7) }}<template v-if="slice.rev_note"> · подменена</template>
+      </span>
+      <span v-if="slice" class="n">{{ lineCount() }} стр<template v-if="total"> из {{ total }}</template></span>
       <span v-else-if="failed" class="n err" :title="failed">{{ failed }}</span>
       <span v-else class="n">читаю…</span>
     </div>
@@ -193,6 +198,8 @@ pre{margin:0;padding:9px 12px;overflow:auto;font-family:var(--mono);font-size:11
   padding:2px 8px;font-size:11px;cursor:pointer}
 .more button:hover{background:rgba(122,167,255,.1)}
 .muted{font-size:11px;color:var(--p-stop)}
+.cap .rev{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2)}
+.cap .rev:hover{color:var(--p-dim)}
 .cap .pick{display:flex;flex-wrap:wrap;gap:5px;align-items:center;color:var(--p-dim)}
 .cap .cand{border:1px solid var(--p-line);border-radius:5px;background:#121820;
   color:var(--p-ink);font-family:var(--mono);font-size:10.5px;padding:1px 6px;cursor:pointer}
