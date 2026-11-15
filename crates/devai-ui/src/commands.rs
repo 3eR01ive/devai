@@ -475,6 +475,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("task_cancel", "task.cancel"),
     ("task_resume", "task.resume"),
     ("task_new", "task.create"),
+    ("task_start", "task.start"),
     ("task_rewind", "task.rewind"),
     ("task_restate", "task.restate"),
     // Agent status rows (task 01a1b60c, REQ-AF-07): derived availability,
@@ -568,6 +569,8 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     // Постановка задачи человеком: новый черновик из окна — та же операция,
     // что `devai task new`.
     ("task_new", "task.create"),
+    // Запуск поставленной задачи: DRAFT → STATEMENT, тот же акт, что `task start`.
+    ("task_start", "task.start"),
     // Пройти путь заново с шага и переписать постановку: слово человека о том,
     // что шаг был пройден по ошибке. Причина обязательна, результаты — STALE.
     ("task_rewind", "task.rewind"),
@@ -1035,6 +1038,23 @@ pub fn task_new_as(
     };
     let created = with_actor_write(&state, actor, |api| api.task_create(req))?;
     Ok(created.task)
+}
+
+/// `task.start` — человек запускает поставленную задачу: DRAFT → STATEMENT.
+/// Тот же акт, что `devai task start`; дальше роль постановщика поднимает
+/// платформа (`task.run`).
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_start(state: State<AppState>, id_prefix: String) -> Result<StatusView, UiError> {
+    task_start_as(state, id_prefix, None)
+}
+
+pub fn task_start_as(
+    state: State<AppState>,
+    id_prefix: String,
+    actor: Option<String>,
+) -> Result<StatusView, UiError> {
+    with_actor_write(&state, actor, |api| api.task_start(&id_prefix))?;
+    Ok(state.api().task_status(&id_prefix)?)
 }
 
 /// `task.rewind` — человек проходит путь заново с названной стадии.
@@ -2322,6 +2342,7 @@ mod tests {
             "task_rewind",
             "task_restate",
             "task_new",
+            "task_start",
         ];
         expected.sort_unstable();
         assert_eq!(

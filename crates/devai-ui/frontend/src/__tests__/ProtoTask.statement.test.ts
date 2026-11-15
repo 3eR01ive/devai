@@ -15,6 +15,9 @@ const mocks = vi.hoisted(() => ({
   taskEvents: vi.fn(async () => []),
   taskRestate: vi.fn(async () => ({})),
   taskRewind: vi.fn(async () => ({})),
+  taskStart: vi.fn(async () => ({})),
+  taskRun: vi.fn(async () => ({})),
+  execCancel: vi.fn(async () => ({})),
 }));
 
 vi.mock("vue-router", () => ({
@@ -55,6 +58,22 @@ async function mountCard() {
   await flushPromises();
   return w;
 }
+
+describe("ProtoTask / запуск черновика", () => {
+  it("у черновика есть «Начать работу», и он запускает постановщика", async () => {
+    mocks.taskProgress.mockResolvedValue({ ...progress, task: { ...task, state: "DRAFT" } });
+    const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
+    await flushPromises();
+    await flushPromises();
+
+    const btn = w.find(".p-start");
+    expect(btn.exists()).toBe(true);
+    await btn.trigger("click");
+    await flushPromises();
+    expect(mocks.taskStart).toHaveBeenCalledWith(task.id);
+    expect(mocks.taskRun).toHaveBeenCalledWith(task.id, null, false);
+  });
+});
 
 describe("ProtoTask / постановка", () => {
   it("по умолчанию показывает текст и кнопку «Править постановку»", async () => {

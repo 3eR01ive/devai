@@ -132,6 +132,8 @@ export const api = {
   // задача рождается в DRAFT, платформа владеет ею с рождения.
   taskNew: (title: string, description: string, project_id: string | null) =>
     invoke<Task>("task_new", { title, description, project_id }),
+  // Запуск поставленной задачи: DRAFT → STATEMENT, тот же акт `task start`.
+  taskStart: (id_prefix: string) => invoke<StatusView>("task_start", { id_prefix }),
   taskGet: (id_prefix: string) => invoke<Task>("task_get", { id_prefix }),
   taskStatus: (id_prefix: string) =>
     invoke<StatusView>("task_status", { id_prefix }),

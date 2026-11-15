@@ -865,6 +865,25 @@ watch(
 );
 
 const CLOSED_STATES = new Set(["ACCEPTED", "CANCELLED", "REJECTED"]);
+// Поставленная, но не начатая задача: единственный ход — начать работу.
+const isDraft = computed(() => prog.value?.task.state === "DRAFT");
+const startBusy = ref(false);
+
+async function doStart() {
+  startBusy.value = true;
+  error.value = null;
+  try {
+    // Два акта платформы подряд и без самодеятельности: DRAFT → STATEMENT
+    // (`task start`), затем порождение роли постановщика (`task run`).
+    await api.taskStart(id.value);
+    await api.taskRun(id.value, null, false);
+    await load();
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    startBusy.value = false;
+  }
+}
 const REWINDABLE = new Set(["STATEMENT", "ANALYSIS", "REVIEW", "APPROVAL", "IMPLEMENTATION", "QA"]);
 const currentState = computed(() => prog.value?.task.state ?? "");
 const canReplay = (state: string) =>
@@ -953,6 +972,10 @@ onMounted(load);
       <div class="p-dnav">
         <button class="p-back" @click="backToList">← к списку</button>
         <div class="p-dright">
+        <button v-if="isDraft" class="p-start" :disabled="startBusy" @click="doStart"
+                title="начать работу: DRAFT → постановщик">
+          {{ startBusy ? 'запускаю…' : '▶ Начать работу' }}
+        </button>
         <button
           v-if="canResume"
           class="p-resume"
@@ -1728,4 +1751,9 @@ onMounted(load);
 .p-briefacts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px}
 .p-act.go{border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.13);color:#8ee7bc;font-weight:600}
 .p-act.go:hover:not(:disabled){background:rgba(62,207,142,.22)}
+.p-start{border:1px solid #3ecf8e;border-radius:7px;background:rgba(62,207,142,.2);
+  color:#b6f2d5;font-family:var(--sans);font-size:12.5px;font-weight:600;
+  padding:6px 15px;cursor:pointer}
+.p-start:hover:not(:disabled){background:rgba(62,207,142,.32)}
+.p-start:disabled{opacity:.5;cursor:not-allowed}
 </style>
