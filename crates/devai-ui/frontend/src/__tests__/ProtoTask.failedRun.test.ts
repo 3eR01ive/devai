@@ -131,4 +131,39 @@ describe("упавший прогон виден", () => {
     expect(memo.text()).toContain("прогон упал");
     expect(memo.text()).not.toContain("ничего не отдал");
   });
+
+  it("строка отказа пуста, но поток есть — показываем поток, а не «только статус»", async () => {
+    mocks.execGet.mockResolvedValue({ ...row, error: null });
+    mocks.execTranscript.mockResolvedValue({
+      execution: failedExec.id, task: task.id, role: "implementation-agent", status: "FAILED",
+      running: false, started_at: row.started_at, finished_at: row.finished_at,
+      stdout: "I've run out of iteration budget mid-implementation", stderr: "",
+      stdout_bytes: 49, stderr_bytes: 0, truncated: false, note: null,
+    });
+    const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
+    await flushPromises();
+    await flushPromises();
+    const step = w.findAll(".p-vstep")[4];
+    if (!step.classes().includes("open")) await step.find(".p-vhead").trigger("click");
+    await flushPromises();
+    await flushPromises();
+
+    expect(w.find(".rf-note").text()).toContain("поток прогона");
+    expect(w.find(".rf-t").text()).toContain("out of iteration budget");
+  });
+
+  it("остановленный прогон метится как «остановлен», а не «упал»", async () => {
+    mocks.taskProgress.mockResolvedValue({
+      ...progress,
+      graph: { ...progress.graph, nodes: [{ ...progress.graph.nodes[0], executions: [{ ...failedExec, status: "CANCELLED" }] }] },
+    });
+    const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
+    await flushPromises();
+    await flushPromises();
+    const step = w.findAll(".p-vstep")[4];
+    if (!step.classes().includes("open")) await step.find(".p-vhead").trigger("click");
+    await flushPromises();
+    await flushPromises();
+    expect(w.find(".p-failchip").text()).toBe("остановлен");
+  });
 });

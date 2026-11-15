@@ -420,15 +420,30 @@ function ensureLoaded(s: any) {
 // правда без причины. Причина записана платформой (exec.get): статус, класс
 // отказа, текст отказа. Показываем её, а не пустоту.
 const runRow = ref<ExecRow | null>(null);
+/** Поток упавшего прогона: платформа не всегда пишет текст отказа в строку
+ *  (например, прогон прибит извне), но поток роли на диске есть — читаем его. */
+const runTail = ref<string>("");
 
 async function loadRunRow(s: any) {
   const e = runOf(s);
-  if (!e) { runRow.value = null; return; }
+  if (!e) { runRow.value = null; runTail.value = ""; return; }
   if (runRow.value?.id === e.id) return;
   try {
     runRow.value = await api.execGet(e.id);
   } catch {
     runRow.value = null;
+  }
+  runTail.value = "";
+  // Поток читаем только у НЕ дошедшего до отчёта прогона: у живого и у
+  // успешного за отказом идти незачем.
+  const broken = ["FAILED", "CANCELLED"].includes(String(runRow.value?.status ?? ""));
+  if (broken && !runRow.value?.error) {
+    try {
+      const t = await api.execTranscript(id.value, e.id);
+      runTail.value = [t.stdout, t.stderr].filter((x) => x && x.trim()).join("\n— stderr —\n");
+    } catch {
+      runTail.value = "";
+    }
   }
 }
 
@@ -436,7 +451,15 @@ async function loadRunRow(s: any) {
  *  вкладка внутри шага, и баннеров поверх карточки он не заводит. */
 function isFailed(s: any): boolean {
   const e = runOf(s);
-  return !!e && String(e.status) === "FAILED";
+  if (!e) return false;
+  const st = String(e.status);
+  return st === "FAILED" || st === "CANCELLED";
+}
+
+/** Слово для метки шага: прогон упал или его остановили — это разные факты. */
+function failChipWord(s: any): string {
+  const e = runOf(s);
+  return e && String(e.status) === "CANCELLED" ? "остановлен" : "упал";
 }
 
 /** Класс отказа человеческими словами (платформа называет его машинно). */
@@ -1400,7 +1423,7 @@ onMounted(load);
                 <span v-if="convSpark(s.state).length" class="p-spark" :title="'сходимость: ' + convMode(s.state)">
                   <i v-for="(b, k) in convSpark(s.state)" :key="k" :class="b.cls" :style="{ height: b.h + 'px' }" />
                 </span>
-                <span v-if="isFailed(s)" class="p-failchip" title="выбранный прогон шага упал — причина во вкладке «отказ»">упал</span>
+                <span v-if="isFailed(s)" class="p-failchip" title="выбранный прогон шага не дошёл до отчёта — причина во вкладке «отказ»">{{ failChipWord(s) }}</span>
                 <span v-if="s.score !== null" class="p-scorechip" :class="scoreTone">
                   {{ (s.score * 100).toFixed(1) }}%<i>качество</i>
                 </span>
@@ -1472,8 +1495,14 @@ onMounted(load);
                     <span v-if="runRow.attempt && runRow.attempt > 1" class="rf-att">попытка {{ runRow.attempt }}</span>
                   </div>
                   <div v-if="runRow.error" class="rf-t">{{ runRow.error }}</div>
+                  <template v-else-if="runTail">
+                    <div class="rf-note">
+                      строку отказа платформа не заполнила — ниже поток прогона, как он записан на диске
+                    </div>
+                    <div class="rf-t">{{ runTail }}</div>
+                  </template>
                   <div v-else class="p-empty" style="padding:4px 0">
-                    платформа не записала текст отказа — есть только статус
+                    ни строки отказа, ни потока: прогон не оставил ни того, ни другого
                   </div>
                   <div class="rf-acts">
                     <button class="p-act" @click="selectTab(s, 'term')">открыть консоль прогона</button>
@@ -2025,6 +2054,7 @@ onMounted(load);
 .rf-t{font-family:var(--mono);font-size:11px;line-height:1.5;color:#cfd9e4;background:#080b0e;
   border:1px solid var(--p-line);border-radius:7px;padding:9px 11px;max-height:320px;overflow:auto;
   white-space:pre-wrap;word-break:break-word}
+.rf-note{font-size:11px;color:var(--p-dim);margin-bottom:6px}
 .rf-acts{display:flex;gap:8px;margin-top:9px}
 
 /* ── консоль прогона ─────────────────────────────────────────────────────── */
