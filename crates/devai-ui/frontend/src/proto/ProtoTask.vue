@@ -194,6 +194,12 @@ async function pickRun(s: any, execId: string) {
   const art = artByExec.value.get(execId);
   if (!art) { if (s.state === "QA") qaRaw.value = null; return; }
   await ensureBody(art);
+  // Тело могло быть УЖЕ прочитано (кэш), и тогда ensureBody ничего не делает —
+  // раньше из-за этого приёмка продолжала показывать прошлый отчёт: засечка
+  // переключалась, а число нет. Привязываем отчёт к ВЫБРАННОМУ прогону явно.
+  if (art.kind === "QUALITY_REPORT") {
+    qaRaw.value = (runBodies.value as Record<string, any>)[art.id] ?? null;
+  }
 }
 
 async function ensureBody(art: ArtifactView) {
@@ -1308,15 +1314,17 @@ onMounted(load);
               <!-- прогоны шага: засечка = прогон, по умолчанию выбран последний -->
               <div v-if="s.execs.length" class="p-runs">
                 <span class="p-rlabel">прогоны</span>
-                <span
+                <button
                   v-for="(e, k) in s.execs"
                   :key="e.id"
+                  class="p-rdhit"
+                  :title="'прогон ' + (k + 1) + ' · ' + e.status"
+                  @click.stop="pickRun(s, e.id)"
+                ><i
                   class="p-rd"
                   :class="[String(e.status) === 'COMPLETED' ? 'ok' : String(e.status) === 'FAILED' ? 'bad' : 'run',
                            runOf(s)?.id === e.id ? 'sel' : '']"
-                  :title="'прогон ' + (k + 1) + ' · ' + e.status"
-                  @click.stop="pickRun(s, e.id)"
-                />
+                /></button>
                 <span class="p-rsel">выбран {{ s.execs.findIndex((e: any) => e.id === runOf(s)?.id) + 1 }} из {{ s.execs.length }}</span>
               </div>
               <div v-if="s.execs.length" class="p-runmemo">
@@ -1836,7 +1844,13 @@ onMounted(load);
 
 .p-runs{display:flex;align-items:center;gap:3px;flex-wrap:wrap;padding:9px 14px 0}
 .p-rlabel{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--p-dim2);margin-right:6px}
-.p-rd{width:7px;height:14px;border-radius:2px;background:#2b3440;cursor:pointer}
+/* Засечка — кнопка с НАСТОЯЩЕЙ областью нажатия: сам штрих узкий (7×14), но
+   `padding` даёт палец-размер целиком, иначе по прогонам не попасть. */
+.p-rdhit{display:inline-flex;align-items:center;padding:5px 3px;margin:0;background:none;
+  border:0;cursor:pointer;line-height:0}
+.p-rdhit:hover .p-rd{filter:brightness(1.35)}
+.p-rd{display:block;width:7px;height:14px;border-radius:2px;background:#2b3440;
+  transition:filter .1s,outline-color .1s}
 .p-rd.ok{background:var(--p-pass)} .p-rd.bad{background:var(--p-stop)} .p-rd.run{background:var(--p-now)}
 .p-rd.sel{outline:2px solid var(--p-human);outline-offset:1px}
 .p-rsel{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2);margin-left:8px}
