@@ -2,7 +2,7 @@
 // Новая карточка задачи (по макету): вертикальный путь, один открытый шаг,
 // «вход/выход» у ролей, «качество» и «правила приёмки» у гейтов; расход
 // токенов по шагам, вклад каждого пункта приёмки и вставки кода.
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useHoldToConfirm } from "../components/signature/useHoldToConfirm";
 import { api, toUiError } from "../api";
@@ -968,6 +968,51 @@ async function doStop(execId: string) {
   catch (e) { error.value = toUiError(e); }
   finally { busy.value = false; }
 }
+
+// ── живое обновление карточки ────────────────────────────────────────────
+// Карточка не должна требовать «выйти в список и вернуться»: пока она открыта,
+// один дешёвый опрос спрашивает ход задачи, и ТОЛЬКО при изменении (стадия,
+// время изменения, число живых прогонов) перечитывает всё остальное. Так
+// завершившийся прогон видно сам, а IPC не молотит полный набор чтений вхолостую.
+let pollTimer: number | undefined;
+let pollBusy = false;
+
+async function pollOnce() {
+  if (pollBusy || document.hidden) return;
+  pollBusy = true;
+  try {
+    const p = await api.taskProgress(id.value);
+    const changed =
+      !prog.value ||
+      p.task.updated_at !== prog.value.task.updated_at ||
+      p.task.state !== prog.value.task.state ||
+      (p.running_executions?.length ?? 0) !== (prog.value.running_executions?.length ?? 0);
+    if (changed) {
+      prog.value = p;
+      await load();
+    }
+  } catch {
+    /* следующий тик попробует снова: карточка не должна падать из-за опроса */
+  } finally {
+    pollBusy = false;
+  }
+}
+
+// Для тестов: сам опрос без ожидания интервала.
+defineExpose({ pollOnce });
+
+function onFocus() {
+  void pollOnce();
+}
+
+onMounted(() => {
+  pollTimer = window.setInterval(() => void pollOnce(), 4000);
+  window.addEventListener("focus", onFocus);
+});
+onUnmounted(() => {
+  if (pollTimer) window.clearInterval(pollTimer);
+  window.removeEventListener("focus", onFocus);
+});
 
 onMounted(load);
 </script>

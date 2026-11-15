@@ -113,3 +113,39 @@ describe("ProtoTask / постановка", () => {
     );
   });
 });
+
+describe("ProtoTask / живое обновление", () => {
+  it("карточка сама перечитывается, когда состояние задачи изменилось", async () => {
+    mocks.taskProgress.mockResolvedValue({
+      ...progress,
+      task: { ...task, state: "ANALYSIS", updated_at: "2026-11-14T10:00:00Z" },
+    });
+    const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
+    await flushPromises();
+    await flushPromises();
+    expect(w.text()).toContain("анализ");
+
+    // прогон завершился: стадия и время изменения другие
+    mocks.taskProgress.mockResolvedValue({
+      ...progress,
+      task: { ...task, state: "REVIEW", updated_at: "2026-11-14T10:05:00Z" },
+    });
+    await (w.vm as any).pollOnce();
+    await flushPromises();
+    await flushPromises();
+    expect(w.text()).toContain("ревью");
+  });
+
+  it("без изменений полная перечитка не запускается", async () => {
+    mocks.taskProgress.mockResolvedValue({ ...progress, task: { ...task, state: "ANALYSIS" } });
+    const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
+    await flushPromises();
+    const before = mocks.taskProgress.mock.calls.length;
+    const artsBefore = mocks.artifactsList.mock.calls.length;
+    await (w.vm as any).pollOnce();
+    await flushPromises();
+    // один опрос — одно чтение хода, без полного набора чтений
+    expect(mocks.taskProgress.mock.calls.length).toBe(before + 1);
+    expect(mocks.artifactsList.mock.calls.length).toBe(artsBefore);
+  });
+});
