@@ -688,8 +688,14 @@ const contribSum = computed(() => checks.value.reduce((s, c) => s + (c.score ?? 
 const lossSum = computed(() => checks.value.reduce((s, c) => s + (c.score === null ? 0 : (1 - c.score) * (c.weight ?? 0)), 0));
 const losses = computed(() => checks.value.filter((c) => c.score === null || c.score < 1).length);
 
+// По умолчанию «на доработку» отмечено то, что НЕ дотягивает до 1.0 (и то,
+// что вовсе не оценено): пункт с полным баллом чинить нечего, и держать его в
+// списке возврата — шум, из-за которого причина обрастает лишними строками.
+// Слово оператора: всё ниже 1.0 правится без исключений, «якорей» нет.
 watch(checks, (list) => {
-  if (list.length && picked.value.size === 0) picked.value = new Set(list.map((c) => c.id));
+  if (!list.length || picked.value.size > 0) return;
+  const weak = list.filter((c: any) => c.score === null || c.score < 1);
+  picked.value = new Set(weak.map((c: any) => c.id));
 }, { immediate: true });
 
 function togglePick(c: any, ev: Event) {

@@ -124,7 +124,8 @@ describe("ходы приёмки", () => {
     await nextTick();
 
     const btn = w.find(".p-qacts .p-qa.back");
-    expect(btn.text()).toContain("На доработку ·");
+    // по умолчанию отмечено только то, что ниже 1.0: полный балл чинить нечего
+    expect(btn.text()).toContain("На доработку · 2");
     await btn.trigger("pointerdown");
     now = HOLD_MS + 10;
     flushFrames();
@@ -136,7 +137,8 @@ describe("ходы приёмки", () => {
     // причины — слова человека, потом перечень пунктов, которые он оставил
     // «на доработку» (по умолчанию все: снятие с контроля это личный выбор)
     expect(rationale.split("\n")[0]).toBe("не чинится край списка");
-    expect(rationale).toContain("пункты: cl/style-consistency, cl/short-units, ts/coverage-static");
+    expect(rationale).toContain("пункты: cl/style-consistency, cl/short-units");
+    expect(rationale).not.toContain("ts/coverage-static");
     w.unmount();
   });
 
