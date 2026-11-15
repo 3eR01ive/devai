@@ -656,6 +656,13 @@ enum ExecCmd {
         #[arg(long)]
         summary: Option<String>,
     },
+    /// Консоль прогона: что роль пишет в свои потоки (хвост с потолком).
+    /// Тот же поток, что показывает окно: улики прогона, без пересказа.
+    Transcript {
+        id: String,
+        #[arg(long)]
+        execution: String,
+    },
     Fail {
         exec_id: String,
         #[arg(long)]

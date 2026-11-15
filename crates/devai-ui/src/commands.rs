@@ -457,6 +457,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("task_report", "task.report"),
     ("evaluation_rules", "eval.rules"),
     ("task_usage", "task.usage"),
+    ("exec_transcript", "exec.transcript"),
     ("source_slice", "source.slice"),
     ("task_events", "task.events"),
     ("task_decisions", "task.decisions"),
@@ -1384,6 +1385,16 @@ pub fn task_usage(
     id_prefix: String,
 ) -> Result<devai_api::TaskUsageView, UiError> {
     Ok(state.api().task_usage(&id_prefix)?)
+}
+
+/// Консоль прогона: потоки роли как они есть на диске, хвостом.
+#[tauri::command(rename_all = "snake_case")]
+pub fn exec_transcript(
+    state: State<AppState>,
+    id_prefix: String,
+    execution: String,
+) -> Result<devai_api::ExecTranscriptView, UiError> {
+    Ok(state.api().exec_transcript(&id_prefix, &execution)?)
 }
 
 /// Кусок исходника на коммите по ссылке «путь:строки» из отчёта.

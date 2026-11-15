@@ -269,6 +269,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_usage_rpc,
     },
     RpcCommand {
+        name: "exec_transcript",
+        handler: exec_transcript_rpc,
+    },
+    RpcCommand {
         name: "source_slice",
         handler: source_slice_rpc,
     },
@@ -987,6 +991,20 @@ fn task_usage_rpc(
 ) -> Result<serde_json::Value, UiError> {
     let id_prefix = param_str(params, "id_prefix")?;
     to_json(crate::commands::task_usage(state(app), id_prefix)?)
+}
+
+fn exec_transcript_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let id_prefix = param_str(params, "id_prefix")?;
+    let execution = param_str(params, "execution")?;
+    to_json(crate::commands::exec_transcript(
+        state(app),
+        id_prefix,
+        execution,
+    )?)
 }
 
 fn source_slice_rpc(

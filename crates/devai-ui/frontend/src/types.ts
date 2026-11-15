@@ -101,6 +101,26 @@ export interface ArtifactView extends Artifact {
   display: string;
 }
 
+/**
+ * Консоль прогона: потоки роли как они лежат в уликах прогона.
+ * `running` — прогон ещё идёт, поток растёт; окно досматривает его повторно.
+ */
+export interface ExecTranscriptView {
+  execution: string;
+  task: string;
+  role: string;
+  status: string;
+  running: boolean;
+  started_at: string;
+  finished_at: string | null;
+  stdout: string;
+  stderr: string;
+  stdout_bytes: number;
+  stderr_bytes: number;
+  truncated: boolean;
+  note: string | null;
+}
+
 export interface Question {
   id: string;
   task_id: string;

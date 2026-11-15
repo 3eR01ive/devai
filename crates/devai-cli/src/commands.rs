@@ -2753,6 +2753,28 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 .map_err(render_api_error)?;
             outln!("execution {} completed", short(&e.id));
         }
+        ExecCmd::Transcript { id, execution } => {
+            let t = ctx
+                .api()
+                .exec_transcript(&id, &execution)
+                .map_err(render_api_error)?;
+            outln!(
+                "execution {} · {} · {} · {}{}",
+                short_str(&t.execution),
+                t.role,
+                t.status,
+                if t.running { "идёт" } else { "завершён" },
+                t.note.as_deref().map(|n| format!(" · {n}")).unwrap_or_default()
+            );
+            let both = if t.stderr.is_empty() {
+                t.stdout.clone()
+            } else {
+                format!("{}\n— stderr —\n{}", t.stdout, t.stderr)
+            };
+            // Поток печатается как есть, байт в байт: это текст роли, а не
+            // наша выжимка. JSON-режим печатает всю структуру отдельно.
+            print!("{both}");
+        }
         ExecCmd::Fail { exec_id, error } => {
             let e = ctx
                 .api()

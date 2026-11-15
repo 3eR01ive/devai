@@ -8,6 +8,7 @@
 // получает отдельного набора прав и отдельной реализации чтения/записи.
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
+  ExecTranscriptView,
   RulebookView,
   TaskUsageView,
   SourceSliceView,
@@ -212,6 +213,9 @@ export const api = {
   // Правила оценки дома: то, чем судит качество (профиль оценки как данные).
   evaluationRules: () => invoke<RulebookView>("evaluation_rules"),
   // Расход токенов задачи по прогонам (файлы улик драйвера).
+  /** Консоль прогона: то, что роль пишет в свои потоки. */
+  execTranscript: (id_prefix: string, execution: string) =>
+    invoke<ExecTranscriptView>("exec_transcript", { id_prefix, execution }),
   taskUsage: (id_prefix: string) => invoke<TaskUsageView>("task_usage", { id_prefix }),
   // Кусок исходника на коммите по ссылке «путь:строки».
   sourceSlice: (id_prefix: string, rev: string, path: string, from: number, to: number) =>

@@ -2,7 +2,7 @@
 // Новая карточка задачи (по макету): вертикальный путь, один открытый шаг,
 // «вход/выход» у ролей, «качество» и «правила приёмки» у гейтов; расход
 // токенов по шагам, вклад каждого пункта приёмки и вставки кода.
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useHoldToConfirm } from "../components/signature/useHoldToConfirm";
 import { api, toUiError } from "../api";
@@ -11,6 +11,7 @@ import type {
   SignatureView, TaskUsageView, UiError, WorkflowEvent,
   WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
+import type { ExecTranscriptView } from "../types";
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
@@ -602,18 +603,22 @@ function foldAll(path: string, open: boolean) {
 const tabsFor = (s: any) => {
   // Постановка: сам текст и отдельной вкладкой — выводы проверяющего
   // (вердикт, чек-лист, его вопросы), а не только текст.
-  if (s.state === "STATEMENT")
-    return [
+  const execs0: any[] = s.execs ?? [];
+  if (s.state === "STATEMENT") {
+    const t: [string, string][] = [
       ["stmt", "постановка"],
       ["verdict", "оценка проверяющего"],
-    ] as [string, string][];
+    ];
+    if (execs0.length) t.push(["term", "консоль"]);
+    return t;
+  }
   if (s.state === "APPROVAL") return [["sign", "что подписываешь"]] as [string, string][];
 
-  const execs = s.execs ?? [];
+  const execs = execs0;
   const art = artOf(s);
   // Прогоны есть, но выбранный ничего не отдал — вкладок нет: подсовывать
   // данные соседнего прогона было бы враньём.
-  if (execs.length && !art) return [] as [string, string][];
+  if (execs.length && !art) return [["term", "консоль"]] as [string, string][];
 
   const t: [string, string][] = [];
   if (art?.kind === "REQUIREMENTS_SPEC") t.push(["spec", "спецификация"]);
@@ -633,6 +638,9 @@ const tabsFor = (s: any) => {
       t.push(["rules", "правила приёмки"]);
     }
   }
+  // Консоль есть у любого шага с прогонами: человек видит, что агент делает
+  // ПРЯМО СЕЙЧАС, а не догадывается по артефактам.
+  if (execs.length) t.push(["term", "консоль"]);
   return t;
 };
 
@@ -645,6 +653,8 @@ function openStep(s: any) {
   }
   ensureLoaded(s);
   const t = tabsFor(s);
+  stopTerm();
+  term.value = null;
   openTab.value = t.length ? t[0][0] : "";
 }
 
@@ -722,6 +732,69 @@ function txt(v: any): string {
 function evidenceOf(c: any): string {
   const e = c.violations?.[0] ?? c.evidence?.[0] ?? "";
   return txt(e).slice(0, 1200);
+}
+
+// ── консоль прогона: тот же поток, что пишет роль ─────────────────────────
+// Читаем улики прогона (`role_stdout.txt`/`role_stderr.txt`) хвостом: пока роль
+// работает, поток растёт и окно перечитывает его раз в секунду. Ничего не
+// пересказываем и не буферизуем «своё» — на экране ровно то, что на диске.
+const term = ref<ExecTranscriptView | null>(null);
+const termErr = ref<string | null>(null);
+const termFollow = ref(true);
+const termEl = ref<HTMLElement | null>(null);
+let termTimer: number | null = null;
+let termExec = "";
+
+const termText = computed(() => {
+  const t = term.value;
+  if (!t) return "";
+  return t.stderr ? `${t.stdout}\n— stderr —\n${t.stderr}` : t.stdout;
+});
+
+function termStep(): any | null {
+  return steps.value.find((s: any) => s.state === openState.value) ?? null;
+}
+
+async function termOnce() {
+  const s = termStep();
+  if (!s) return;
+  const e = runOf(s);
+  if (!e) { term.value = null; return; }
+  if (e.id !== termExec) { term.value = null; termExec = e.id; }
+  try {
+    const t = await api.execTranscript(id.value, e.id);
+    term.value = t;
+    termErr.value = null;
+    if (termFollow.value) {
+      await nextTick();
+      const el = termEl.value;
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+    // Прогон закончился — досматривать нечего: опрос прекращается сам, а не
+    // молотит улики вечно.
+    if (!t.running) stopTerm();
+  } catch (err) {
+    termErr.value = toUiError(err).message;
+    stopTerm();
+  }
+}
+
+function startTerm() {
+  if (termTimer !== null) return;
+  void termOnce();
+  termTimer = window.setInterval(() => void termOnce(), 1200);
+}
+
+function stopTerm() {
+  if (termTimer !== null) { window.clearInterval(termTimer); termTimer = null; }
+}
+
+/** Смена вкладки включает и выключает наблюдение: консоль живёт, только пока
+ *  она открыта. */
+function selectTab(_s: any, key: string) {
+  openTab.value = key;
+  if (key === "term") startTerm();
+  else stopTerm();
 }
 
 // ── подпись спеки: два акта гейта ─────────────────────────────────────────
@@ -1033,6 +1106,7 @@ onMounted(() => {
   window.addEventListener("focus", onFocus);
 });
 onUnmounted(() => {
+  stopTerm();
   if (pollTimer) window.clearInterval(pollTimer);
   window.removeEventListener("focus", onFocus);
 });
@@ -1196,8 +1270,29 @@ onMounted(load);
                   :key="t[0]"
                   class="p-tab"
                   :class="{ on: openTab === t[0] }"
-                  @click="openTab = t[0]"
+                  @click="selectTab(s, t[0])"
                 >{{ t[1] }}</button>
+              </div>
+
+              <!-- консоль прогона: терминал как он есть -->
+              <div v-if="openTab === 'term'" class="p-panel">
+                <div v-if="termErr" class="p-empty" style="color:#ffa972">
+                  консоль не прочиталась: {{ termErr }}
+                </div>
+                <template v-else-if="term">
+                  <div class="p-termhead">
+                    <span class="tdot" :class="term.running ? 'run' : 'done'"></span>
+                    <b>{{ term.role }}</b>
+                    <span class="mono">{{ term.status }}</span>
+                    <span class="mono">{{ term.stdout_bytes }} Б</span>
+                    <span v-if="term.note" class="tnote">{{ term.note }}</span>
+                    <button class="p-act" :class="{ on: termFollow }" @click="termFollow = !termFollow">
+                      {{ termFollow ? "следовать" : "не следовать" }}
+                    </button>
+                  </div>
+                  <pre ref="termEl" class="p-term">{{ termText }}</pre>
+                </template>
+                <div v-else class="p-empty" style="padding:4px 0">у этого прогона нет консоли</div>
               </div>
 
               <div v-if="s.state === 'STATEMENT' && openTab === 'verdict'" class="p-panel">
@@ -1625,6 +1720,20 @@ onMounted(load);
 .p-mstats{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--p-dim2)}
 .p-mstats b{color:var(--p-dim);font-weight:500}
 .p-mstats .lim{color:#5a6877}
+
+/* ── консоль прогона ─────────────────────────────────────────────────────── */
+.p-termhead{display:flex;align-items:center;gap:9px;font-size:11.5px;color:var(--p-dim);margin-bottom:6px;flex-wrap:wrap}
+.p-termhead b{color:#e6edf5;font-weight:600;font-size:12px}
+.p-termhead .mono{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2)}
+.p-termhead .tdot{width:7px;height:7px;border-radius:50%;background:#3a4654}
+.p-termhead .tdot.run{background:var(--p-now);box-shadow:0 0 6px rgba(243,106,22,.7)}
+.p-termhead .tdot.done{background:var(--p-pass)}
+.p-termhead .tnote{font-size:10.5px;color:#8b97a6}
+.p-termhead .p-act{margin-left:auto}
+.p-term{font-family:var(--mono);font-size:11.5px;line-height:1.5;color:#cfd9e4;background:#080b0e;
+  border:1px solid var(--p-line);border-radius:7px;padding:9px 11px;margin:0;
+  max-height:380px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+
 .p-runs{display:flex;align-items:center;gap:3px;flex-wrap:wrap;padding:9px 14px 0}
 .p-rlabel{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--p-dim2);margin-right:6px}
 .p-rd{width:7px;height:14px;border-radius:2px;background:#2b3440;cursor:pointer}
