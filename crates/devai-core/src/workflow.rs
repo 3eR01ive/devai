@@ -1682,12 +1682,14 @@ pub fn cancel(
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
-    require_state(
-        task,
-        &ACTIVE_STATES,
-        "cancel",
-        CoreError::hint("cannot cancel a terminal or already-held task"),
-    )?;
+    // Отменить можно и стоящее дело: PAUSED/BLOCKED/FAILED/WAITING_FOR_INPUT —
+    // это удержание, а не приговор. Раньше человек не мог закрыть задачу,
+    // которую платформа сама остановила, и должен был сначала «вернуть в
+    // работу» — а возврат запускал новый прогон. Терминальные (CANCELLED,
+    // ACCEPTED, REJECTED) по-прежнему не отменяются.
+    if !ACTIVE_STATES.contains(&task.state) && !task.state.is_hold() {
+        return Err(CoreError::Guard("cannot cancel a terminal task".into()));
+    }
     // Отмена запоминает стадию, на которой случилась, хотя CANCELLED и не
     // входит в `is_hold()`: иначе «вернуть в работу» не знало бы, куда.
     let mut m = hold(
@@ -1699,7 +1701,9 @@ pub fn cancel(
         now,
         json!({ "reason": reason }),
     )?;
-    m.task.return_state = Some(task.state);
+    // Из удержания возвращаемся на САМУ стадию, а не в удержание: иначе
+    // «вернуть в работу» вернуло бы в PAUSED/BLOCKED, и дело застряло бы.
+    m.task.return_state = Some(task.return_state.unwrap_or(task.state));
     Ok(m)
 }
 

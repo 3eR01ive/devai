@@ -390,9 +390,9 @@ fn task_active_lifecycle_through_the_real_binary() {
             .as_str()
     );
 
-    // OQ-5 (ratified): the terminal-task mark must NOT regress under the new
-    // orphan detect — it keeps its exact meaning and stays separately named
-    // (`stale_terminal_task`) beside the dead-owner signal.
+    // Отмена задачи закрывает её живые прогоны: дело и прогон уходят вместе.
+    // (Раньше здесь оставалась RUNNING-строка у CANCELLED-задачи, и человек
+    // видел «живой прогон у закрытого дела» — а процесс продолжал работать.)
     devai(
         h,
         &[
@@ -405,31 +405,28 @@ fn task_active_lifecycle_through_the_real_binary() {
     );
     let v = devai(h, &["task", "active"]);
     assert!(
-        v.contains("stale?") && v.contains("CANCELLED"),
-        "terminal task with a RUNNING row is marked:\n{v}"
+        !v.contains(&exec_b),
+        "прогон закрытого дела остановлен и не висит в активных:\n{v}"
     );
+    let got = devai(h, &["exec", "get", &exec_b]);
+    assert!(
+        got.contains("CANCELLED"),
+        "строка прогона закрыта отменой дела:\n{got}"
+    );
+    assert!(
+        got.contains("дело отменено"),
+        "и причина названа:\n{got}"
+    );
+    // Отмена задачи закрыла и её прогон — активных строк у закрытого дела нет.
     let j = devai_json(h, &["task", "active"]);
     let rows = j["rows"].as_array().unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "the cancelled task's execution is still RUNNING in the store: {rows:?}"
+    assert!(
+        rows.iter().all(|r| r["id"] != exec_b.as_str()),
+        "закрытое дело не висит в активных: {rows:?}"
     );
-    assert_eq!(
-        rows[0]["stale"],
-        serde_json::Value::Bool(true),
-        "json carries the same mark: {rows:?}"
-    );
-    assert_eq!(
-        rows[0]["stale_terminal_task"],
-        serde_json::Value::Bool(true),
-        "the terminal-task signal survives the additive detect: {rows:?}"
-    );
-    assert_eq!(rows[0]["state"], "CANCELLED");
 
     // REQ-ACT-04: empty activity is the idle state, not an error — exit 0,
     // empty marker, json with an empty row list.
-    devai(h, &["exec", "cancel", &exec_b]);
     let v = devai(h, &["task", "active"]);
     assert_eq!(
         v.trim(),

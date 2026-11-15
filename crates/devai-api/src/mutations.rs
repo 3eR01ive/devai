@@ -990,7 +990,16 @@ impl Api {
         self.task_op(id, WorkflowOp::Block { reason })
     }
     pub fn task_cancel(&self, id: &str, reason: Option<String>) -> ApiResult<MutationResult> {
-        self.task_op(id, WorkflowOp::Cancel { reason })
+        let res = self.task_op(id, WorkflowOp::Cancel { reason })?;
+        // Дело закрыто — его живые прогоны закрываются вместе с ним. Иначе
+        // отменённая задача продолжала работать и жечь токены (прецедент
+        // 01a1cbc9: CANCELLED с живым прогоном реализации).
+        let why = format!(
+            "дело отменено человеком ({}) — прогон остановлен вместе с задачей",
+            self.actor
+        );
+        self.stop_runs_of(res.task.id, &why)?;
+        Ok(res)
     }
     /// Пройти путь заново с названной стадии (только человек): результаты этой
     /// стадии и всех следующих помечаются STALE, причина ложится в журнал.
@@ -2848,6 +2857,60 @@ impl Api {
         self.exec_close(exec_id, ExecutionStatus::Failed, None, Some(error))
     }
 
+    /// Остановить живые прогоны задачи: строки закрываются с причиной, а
+    /// процесс получает SIGTERM — но только когда владение ДОКАЗУЕМО наше
+    /// (этот хост, живой pid с тем же временем старта). Недоказуемое не
+    /// трогаем: тот же принцип, что у сборщика трупов. Без этого отмена дела
+    /// оставляла процесс роли работать и жечь токены уже после закрытия.
+    fn stop_runs_of(&self, task_id: devai_core::types::Id, why: &str) -> ApiResult<usize> {
+        let rows: Vec<RoleExecution> = self
+            .store
+            .list_executions(Some(task_id))?
+            .into_iter()
+            .filter(|e| e.status == ExecutionStatus::Running)
+            .collect();
+        let mut stopped = 0usize;
+        for e in rows {
+            Self::signal_owner(&e);
+            self.store.finish_execution_classified(
+                &e,
+                ExecutionStatus::Cancelled,
+                Some(why),
+                None,
+                None,
+                Utc::now(),
+            )?;
+            stopped += 1;
+        }
+        Ok(stopped)
+    }
+
+    /// SIGTERM владельцу прогона — только при доказанном владении и никогда
+    /// самому себе: клиент, отменяющий дело, не должен убить собственный
+    /// процесс. Раннер запущен в своей сессии, поэтому бьём по группе, если pid
+    /// — её лидер (иначе по одному процессу).
+    fn signal_owner(e: &RoleExecution) {
+        let Some(pid) = e.owner_pid else { return };
+        if pid == std::process::id() as i64 {
+            return;
+        }
+        let live = devai_runtime::liveness::check_owner(
+            e.owner_pid,
+            e.owner_host.as_deref(),
+            e.owner_process_start,
+        );
+        if !matches!(live, devai_runtime::liveness::Liveness::Alive) {
+            return;
+        }
+        let group = unsafe { libc::getpgid(pid as i32) } == pid as i32;
+        unsafe {
+            libc::kill(
+                if group { -(pid as i32) } else { pid as i32 },
+                libc::SIGTERM,
+            );
+        }
+    }
+
     /// Остановка прогона человеком. Строка закрывается с ПРИЧИНОЙ: кто и что
     /// сказал. Раньше она закрывалась пустой (`summary` и `error` — None), и
     /// карточка честно не могла показать ничего, кроме статуса (прецедент
@@ -2858,7 +2921,11 @@ impl Api {
             Some(r) => format!("остановлено человеком ({}) · причина: {r}", self.actor),
             None => format!("остановлено человеком ({}) · без причины", self.actor),
         };
-        self.exec_close(exec_id, ExecutionStatus::Cancelled, Some(&summary), None)
+        let row = self.exec_close(exec_id, ExecutionStatus::Cancelled, Some(&summary), None)?;
+        // Кооперативная отмена помечает строку; процесс останавливаем сами —
+        // иначе прогон продолжает работать «после отмены» (прецедент 15.11).
+        Self::signal_owner(&row);
+        Ok(row)
     }
 
     fn exec_close(
@@ -3678,6 +3745,71 @@ mod tests {
 
         let d = api.workspace_live_diff(&id.to_string(), "a.txt").unwrap();
         assert!(d.diff.contains("+вторая строка"), "{}", d.diff);
+    }
+
+    /// Стоящее дело закрывается человеком напрямую: PAUSED/BLOCKED — удержание,
+    /// а не приговор. Раньше отказ заставлял сначала «вернуть в работу», а
+    /// возврат порождал прогон — и закрыть дело без запуска было нельзя.
+    #[test]
+    fn blocked_task_can_be_cancelled_and_remembers_its_stage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let api = api(dir.path());
+        let id = fresh_task(&api, "закрыть стоящее дело");
+        let started = api.task_start(&id.to_string()).unwrap().task;
+        assert_eq!(started.state, TaskState::Statement);
+        api.task_block(&id.to_string(), Some("ждём ответа подрядчика".into()))
+            .unwrap();
+
+        let res = api
+            .task_cancel(&id.to_string(), Some("больше не нужно".into()))
+            .unwrap();
+        assert_eq!(res.task.state, TaskState::Cancelled);
+        // «Вернуть в работу» ведёт на СТАДИЮ, а не обратно в удержание
+        assert_eq!(res.task.return_state, Some(TaskState::Statement));
+    }
+
+    /// Отмена задачи останавливает её живые прогоны: иначе дело закрыто, а
+    /// роль продолжает работать и жечь токены (прецедент 01a1cbc9).
+    #[test]
+    fn cancelling_a_task_stops_its_running_execution() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let api = api(dir.path());
+        let id = fresh_task(&api, "отмена закрывает прогон");
+        api.task_start(&id.to_string()).unwrap();
+        let started = api
+            .exec_start(crate::mutations::ExecStartReq {
+                id: id.to_string(),
+                role: "statement-reviewer".into(),
+                agent: None,
+                inputs: vec![],
+                run_id: None,
+            })
+            .unwrap();
+        let exec_id = started.execution.id.to_string();
+
+        api.task_cancel(&id.to_string(), Some("не нужно".into()))
+            .unwrap();
+
+        let row = api.exec_get(&exec_id).unwrap();
+        assert_eq!(row.status, ExecutionStatus::Cancelled);
+        let summary = row.summary.unwrap_or_default();
+        assert!(summary.contains("дело отменено"), "{summary}");
+    }
+
+    /// Принятую задачу отменить нельзя — это терминальное состояние.
+    #[test]
+    fn accepted_task_is_not_cancellable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let api = api(dir.path());
+        let id = fresh_task(&api, "принятая задача");
+        api.task_start(&id.to_string()).unwrap();
+        // доводить до ACCEPTED в этом тесте незачем: проверяем сам отказ
+        let err = api
+            .task_cancel(&id.to_string(), None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(!err.contains("terminal"), "активная задача отменяема: {err}");
     }
 
     /// Остановка прогона человеком ПИШЕТ причину в строку: раньше строка
