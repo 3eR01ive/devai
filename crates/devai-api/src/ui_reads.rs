@@ -5,8 +5,8 @@
 //!   · правила приёмки — они лежат в ПРОФИЛЕ оценки дома (YAML), а отчёт
 //!     качества хранит только результаты; читаем профиль и отдаём его как
 //!     данные, ничего не пересчитывая;
-//!   · расход токенов — драйвер пишет `usage.json` в каталог улик прогона;
-//!     читаем эти файлы и агрегируем по задаче;
+//!   · (расход токенов ушёл в `usage.rs`: он читается из СТОРА, а не из
+//!     файлов улик — REQ-USG-03);
 //!   · кусок исходника по ссылке «путь:строки» — читаем на зафиксированном
 //!     коммите через git, чтобы показать ровно тот код, о котором говорит
 //!     отчёт.
@@ -220,30 +220,6 @@ impl Api {
 
 // ── расход токенов ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageRowView {
-    pub execution: String,
-    pub input: Option<i64>,
-    pub output: Option<i64>,
-    pub cached: Option<i64>,
-    pub total: i64,
-    pub cost: f64,
-    pub calls: Option<i64>,
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskUsageView {
-    pub task: String,
-    pub total: i64,
-    pub cost: f64,
-    /// Сколько прогонов задачи вообще было и у скольких есть отчёт о расходе:
-    /// честная доля «неизвестно» вместо тихого нуля.
-    pub runs: usize,
-    pub measured: usize,
-    pub rows: Vec<UsageRowView>,
-}
-
 /// Поток прогона как он есть: то, что роль пишет в свои потоки, пока работает.
 /// Улики платформы лежат в `<home>/evidence/<task>/<execution>/role_stdout.txt`;
 /// читаем ХВОСТ с потолком байт, поэтому окно показывает тот же текст, что на
@@ -301,59 +277,7 @@ fn tail_text(p: &std::path::Path) -> (String, u64, bool) {
     (text, size, skip > 0)
 }
 
-fn num(v: &serde_json::Value, key: &str) -> Option<i64> {
-    v.get(key).and_then(|x| x.as_i64())
-}
-
 impl Api {
-    /// Расход токенов по задаче: файлы `usage.json` в каталоге улик прогонов.
-    /// Прогоны без отчёта считаются, но в сумму не входят — «неизвестно»
-    /// остаётся видимым (measured из runs).
-    pub fn task_usage(&self, id_prefix: &str) -> ApiResult<TaskUsageView> {
-        let task = self.store.resolve_task(id_prefix)?;
-        let runs = self.store.list_executions(Some(task.id))?;
-        let dir = self.home_path().join("evidence").join(task.id.to_string());
-        let mut rows = Vec::new();
-        let mut total = 0i64;
-        let mut cost = 0.0f64;
-        let mut measured = 0usize;
-        for e in &runs {
-            let p = dir.join(e.id.to_string()).join("usage.json");
-            let Ok(text) = std::fs::read_to_string(&p) else {
-                continue;
-            };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
-            };
-            let t = num(&v, "total_tokens").unwrap_or(0);
-            let c = v
-                .get("estimated_cost_usd")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            total += t;
-            cost += c;
-            measured += 1;
-            rows.push(UsageRowView {
-                execution: e.id.to_string(),
-                input: num(&v, "input_tokens"),
-                output: num(&v, "output_tokens"),
-                cached: num(&v, "cache_read_tokens"),
-                total: t,
-                cost: c,
-                calls: num(&v, "api_calls"),
-                model: v.get("model").and_then(|x| x.as_str()).map(str::to_string),
-            });
-        }
-        Ok(TaskUsageView {
-            task: task.id.to_string(),
-            total,
-            cost,
-            runs: runs.len(),
-            measured,
-            rows,
-        })
-    }
-
     /// Консоль прогона: потоки роли прямо сейчас. Читаются те же улики, что
     /// пишет исполнение (`role_stdout.txt` / `role_stderr.txt` в каталоге
     /// прогона), поэтому живой прогон виден по мере записи, а завершённый —
@@ -383,8 +307,7 @@ impl Api {
         let (stderr, stderr_bytes, se_cut) = tail_text(&dir.join("role_stderr.txt"));
         let note = if stdout_bytes == 0 && stderr_bytes == 0 {
             Some(
-                "роль ничего не написала в свои потоки (или прогон шёл без файла улик)"
-                    .to_string(),
+                "роль ничего не написала в свои потоки (или прогон шёл без файла улик)".to_string(),
             )
         } else if so_cut || se_cut {
             Some(format!(

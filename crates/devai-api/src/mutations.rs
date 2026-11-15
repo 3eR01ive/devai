@@ -2436,6 +2436,13 @@ impl Api {
         if let Some(trip) = self.attempt_limit_trip(&task, q.id)? {
             return self.answer_attempt_limit(&q, &task, text, &trip);
         }
+        // REQ-USG-06: the answer to a TOKEN-BUDGET stop. «Поднять до N» is a
+        // stored decision that raises the task budget (the only way a budget
+        // ever rises) and resumes the task; «остановиться» leaves the task in
+        // human custody with the decision recorded.
+        if let Some(trip) = self.usage_budget_trip(&task, q.id)? {
+            return self.answer_usage_budget(&q, &task, text, &trip);
+        }
         // Вопрос «начинать ли новый круг после отказа ревью»: «остановить»
         // уводит дело в удержание у человека, «продолжить» идёт обычным путём
         // (снять удержание, вернуть в ANALYSIS, автозапуск).
@@ -2670,6 +2677,111 @@ impl Api {
             }),
         });
         Ok(m)
+    }
+
+    /// The stored trip fact of a TOKEN-BUDGET question (`usage.budget_refused`
+    /// carrying this question id) — the numbers the answer path acts on, read
+    /// from the append-only record rather than guessed from the question text.
+    fn usage_budget_trip(
+        &self,
+        task: &Task,
+        question_id: Id,
+    ) -> ApiResult<Option<serde_json::Value>> {
+        let qid = question_id.to_string();
+        Ok(self
+            .store
+            .events(task.id, None)?
+            .into_iter()
+            .rev()
+            .find(|ev| {
+                ev.kind == event_kind::USAGE_BUDGET_REFUSED
+                    && ev
+                        .payload
+                        .get(json_field::QUESTION_ID)
+                        .and_then(|v| v.as_str())
+                        == Some(qid.as_str())
+            })
+            .map(|ev| ev.payload))
+    }
+
+    /// Apply the human answer to the token-budget stop (REQ-USG-06 AC3/AC4/AC5).
+    /// Both answers leave a DECISION row (who, when, to how much, the numbers
+    /// of the refusal, the human's own words); only «поднять до N» raises the
+    /// budget, and only it resumes the task. Nothing here retries by itself.
+    fn answer_usage_budget(
+        &self,
+        q: &Question,
+        task: &Task,
+        text: &str,
+        trip: &serde_json::Value,
+    ) -> ApiResult<AnsweredOutcome> {
+        let Some(choice) = usage_budget_answer::parse(text) else {
+            let stored = q.options.join("` or `");
+            return Err(ApiError::refused(
+                "bad_request",
+                format!(
+                    "question {} takes one of its stored options: `{stored}` (got `{}`)",
+                    q.id, text
+                ),
+            ));
+        };
+        let role = trip.get(json_field::ROLE).and_then(|v| v.as_str());
+        let spent = trip.get(json_field::SPENT).and_then(|v| v.as_i64());
+        let limit = trip.get(json_field::LIMIT).and_then(|v| v.as_u64());
+        let expected = trip.get(json_field::EXPECTED).and_then(|v| v.as_i64());
+        let now = Utc::now();
+        let (verdict, raised_to, word) = match choice {
+            usage_budget_answer::Answer::Raise(n) => (Verdict::Approved, Some(n), "raise"),
+            usage_budget_answer::Answer::Stop => (Verdict::Rejected, None, "stop"),
+        };
+        let decision = Decision {
+            id: new_id(),
+            task_id: task.id,
+            kind: decision_kind::USAGE_BUDGET.to_string(),
+            verdict,
+            actor: self.actor.clone(),
+            // The human's words verbatim — «почему» is theirs, not the
+            // platform's invention.
+            rationale: Some(text.to_string()),
+            refs: vec![q.id.to_string()],
+            created_at: now,
+            payload: serde_json::json!({
+                (json_field::QUESTION_ID): q.id.to_string(),
+                (json_field::ROLE): role,
+                (json_field::SPENT): spent,
+                (json_field::LIMIT): limit,
+                (json_field::EXPECTED): expected,
+                (json_field::TOKEN_BUDGET): raised_to,
+                (json_field::ANSWER): word,
+            }),
+        };
+        self.store.answer_question(q.id, text, &self.actor, now)?;
+        self.store.record_decision(&decision)?;
+        match choice {
+            usage_budget_answer::Answer::Stop => {
+                // «Остановиться»: the task stays exactly where the human
+                // stopped it — no transition, no resume, no retry.
+                Ok(AnsweredOutcome {
+                    question_id: q.id,
+                    from_state: task.state,
+                    to_state: task.state,
+                })
+            }
+            usage_budget_answer::Answer::Raise(_) => {
+                let process = self.process_policy()?;
+                let m = workflow::answer_question(&process, task, q.id, &self.actor, now)?;
+                self.store.commit(task.lock_version, &m)?;
+                // The raised budget is in force from the NEXT check on (the
+                // decision row is read by `effective_task_budget`), so the
+                // resumed stage passes admission and the task moves again.
+                self.autostart_if_role_state(&m.task);
+                Ok(AnsweredOutcome {
+                    question_id: q.id,
+                    from_state: task.state,
+                    to_state: m.task.state,
+                })
+            }
+        }
     }
 
     // ---- roles / agents / contracts ----------------------------------------

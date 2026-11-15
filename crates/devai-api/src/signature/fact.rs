@@ -34,6 +34,11 @@ const NON_SIGNATURE_DECISION_KINDS: &[&str] = &[
     // и гейт APPROVAL показывал «спеки нет — подписывать нечего» (прецедент
     // 01a1df87: задача стояла на подписи с целой спекой).
     decision_kind::ATTEMPT_LIMIT_ANSWER,
+    // Ответ на вопрос ТОКЕН-БЮДЖЕТА («поднять до N» / «остановиться»): слово
+    // человека о деньгах прогонов, а не акт подписи спеки. Без этой строки
+    // отбор подписи падал бы `signature_unknown_kind` и гейт APPROVAL
+    // показывал «спеки нет» — тот же прецедент 01a1df87, что и выше.
+    decision_kind::USAGE_BUDGET,
 ];
 
 /// Каждый вид решения обязан быть либо актом подписи, либо ЯВНО перечислен
@@ -161,5 +166,13 @@ mod tests {
     #[test]
     fn attempt_limit_answer_is_not_a_signature_act() {
         assert!(NON_SIGNATURE_DECISION_KINDS.contains(&decision_kind::ATTEMPT_LIMIT_ANSWER));
+    }
+
+    /// Ответ на вопрос токен-бюджета — тоже не подпись: иначе отбор подписи
+    /// падал бы на каждой задаче, где человек поднимал бюджет (тот же
+    /// прецедент, что у предела попыток).
+    #[test]
+    fn usage_budget_answer_is_not_a_signature_act() {
+        assert!(NON_SIGNATURE_DECISION_KINDS.contains(&decision_kind::USAGE_BUDGET));
     }
 }

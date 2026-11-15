@@ -18,7 +18,7 @@ pub fn parse_ts(s: String) -> StoreResult<Timestamp> {
         .map_err(|e| StoreError::Corrupt(format!("bad timestamp: {e}")))
 }
 
-fn parse_id(s: String) -> StoreResult<Id> {
+pub(crate) fn parse_id(s: String) -> StoreResult<Id> {
     Uuid::parse_str(&s).map_err(|e| StoreError::Corrupt(format!("bad uuid `{s}`: {e}")))
 }
 
@@ -30,7 +30,7 @@ fn opt_ts(s: Option<String>) -> StoreResult<Option<Timestamp>> {
     s.map(parse_ts).transpose()
 }
 
-fn get<'a, T: rusqlite::types::FromSql>(r: &'a Row, i: usize) -> StoreResult<T> {
+pub(crate) fn get<'a, T: rusqlite::types::FromSql>(r: &'a Row, i: usize) -> StoreResult<T> {
     r.get::<usize, T>(i).map_err(|e| match e {
         rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::InvalidQuery => {
             StoreError::Corrupt(format!("column {i}: {e}"))

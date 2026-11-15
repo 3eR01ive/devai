@@ -110,6 +110,16 @@ impl Api {
                 return Ok(None);
             }
         }
+        // REQ-USG-05 — THE STOP BEFORE THE SPEND, early half: the declared
+        // token budgets are compared with the expected cost of this run BEFORE
+        // any runner exists. The engine asks the same question again before
+        // the stage, so a budget edited mid-chain is honoured too; the refusal
+        // text is one and the same (`usage::BudgetRefusal`), and an exhausted
+        // TASK budget parks the task with its human question (REQ-USG-06).
+        if let Some(reason) = self.usage_gate(&task, &role)? {
+            self.refuse_launch(req, &reason);
+            return Ok(None);
+        }
         Ok(Some(role))
     }
 

@@ -113,9 +113,137 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
             force_reaudit,
         } => supervise(ctx, task, run, ack, agent, workspace, force_reaudit, json),
         Cmd::Api(c) => api_registry(ctx, c, json),
+        Cmd::Usage {
+            task,
+            day,
+            week,
+            month,
+            by,
+        } => usage(ctx, task.as_deref(), day, week, month, by.as_deref(), json),
         Cmd::Export { task, out } => export(ctx, &task, &out, json),
         Cmd::Import { dir } => import(ctx, &dir, json),
     }
+}
+
+// ---------------------------------------------------------------------------
+// usage (task 01a1b851, REQ-USG-09): the SAME numbers the window shows
+// ---------------------------------------------------------------------------
+
+/// `devai usage [--task ID] [--day|--week|--month] [--by task|role|model]`.
+///
+/// Two surfaces of ONE read: with `--task` the task card's numbers (spent,
+/// limit, models, runs, unknown), without it the period summary. Both come
+/// from the store through the published read operations — the CLI adds no
+/// arithmetic of its own (REQ-USG-09 AC3).
+fn usage(
+    ctx: &Ctx,
+    task: Option<&str>,
+    day: bool,
+    week: bool,
+    month: bool,
+    by: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    if let Some(id) = task {
+        let v = ctx.api().task_usage(id).map_err(render_api_error)?;
+        if json {
+            outln!("{}", serde_json::to_string_pretty(&v)?);
+            return Ok(());
+        }
+        outln!("{}: {}", short_str(&v.task), v.task_name);
+        outln!(
+            "  {} · модель: {} · прогонов {}",
+            v.line,
+            if v.models.is_empty() {
+                "неизвестна".to_string()
+            } else {
+                v.models.join(", ")
+            },
+            v.runs
+        );
+        if v.unknown > 0 {
+            outln!(
+                "  расход неизвестен у {} из {} прогонов (не ноль)",
+                v.unknown,
+                v.runs
+            );
+        }
+        outln!(
+            "  стоимость: {}{}",
+            if v.cost_usd > 0.0 {
+                format!("${:.2}", v.cost_usd)
+            } else {
+                "неизвестна".to_string()
+            },
+            if v.cost_unknown > 0 {
+                format!(" (у {} прогонов цены нет)", v.cost_unknown)
+            } else {
+                String::new()
+            }
+        );
+        if let Some(raised) = v.raised_to {
+            outln!("  бюджет поднят решением человека до {raised} токенов");
+        }
+        return Ok(());
+    }
+
+    let period = if week {
+        "week"
+    } else if month {
+        "month"
+    } else {
+        let _ = day;
+        "day"
+    };
+    let group = by.unwrap_or("totals");
+    let v = ctx
+        .api()
+        .usage_summary(period, group, None)
+        .map_err(render_api_error)?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    let says = match period {
+        "week" => "с начала недели",
+        "month" => "с начала месяца",
+        _ => "за текущие сутки",
+    };
+    outln!(
+        "{}: {} токенов · прогонов {} · неизвестен расход у {}",
+        says,
+        v.totals.total_tokens,
+        v.totals.runs,
+        v.totals.unknown
+    );
+    outln!(
+        "  вход {} · выход {}{}",
+        v.totals.prompt_tokens,
+        v.totals.completion_tokens,
+        if v.totals.cost_usd > 0.0 {
+            format!(" · стоимость ${:.2}", v.totals.cost_usd)
+        } else if v.totals.measured > 0 {
+            " · стоимость неизвестна (нет цены модели в конфиге)".to_string()
+        } else {
+            String::new()
+        }
+    );
+    if v.totals.runs == 0 {
+        outln!(
+            "  прогонов за период не было — считать нечего (это не «ноль потрачено» от провайдера)"
+        );
+        return Ok(());
+    }
+    for r in &v.rows {
+        let name = r.name.clone().unwrap_or_else(|| r.key.clone());
+        outln!(
+            "  {name}: {} токенов · прогонов {} · неизвестно {}",
+            r.total_tokens,
+            r.runs,
+            r.unknown
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2773,8 +2901,15 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 short_str(&t.execution),
                 t.role,
                 t.status,
-                if t.running { "идёт" } else { "завершён" },
-                t.note.as_deref().map(|n| format!(" · {n}")).unwrap_or_default()
+                if t.running {
+                    "идёт"
+                } else {
+                    "завершён"
+                },
+                t.note
+                    .as_deref()
+                    .map(|n| format!(" · {n}"))
+                    .unwrap_or_default()
             );
             let both = if t.stderr.is_empty() {
                 t.stdout.clone()

@@ -904,6 +904,14 @@ pub fn hermes_usage_path(req: &ExecRequest) -> Option<std::path::PathBuf> {
     req.evidence.as_ref().map(|ev| ev.join(HERMES_USAGE_FILE))
 }
 
+/// The usage report path inside a PLATFORM EVIDENCE DIR (REQ-USG-01): the same
+/// address `--usage-file` is given for the attempt being run, and the address
+/// the engine reads afterwards for every attempt row of the stage — one
+/// spelling of the file name, so the writer and the reader cannot drift.
+pub fn usage_report_path(evidence: &std::path::Path) -> std::path::PathBuf {
+    evidence.join(HERMES_USAGE_FILE)
+}
+
 /// The canonical DRIVER key of this adapter (the second literal of the
 /// quality audit's arch/no-magic item 7, spelled once with its justification):
 /// exactly `"hermes"` because one value has three faces that must stay

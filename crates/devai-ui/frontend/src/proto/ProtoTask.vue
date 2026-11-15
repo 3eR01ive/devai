@@ -112,12 +112,12 @@ const scoreTone = computed(() => {
 
 const tokensByExec = computed(() => {
   const m = new Map<string, number>();
-  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.total);
+  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.total_tokens ?? 0);
   return m;
 });
 const costByExec = computed(() => {
   const m = new Map<string, number>();
-  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.cost);
+  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.cost_usd ?? 0);
   return m;
 });
 /** Сходимость стадии из прогресса: у ревью — объём, у приёмки — балл. */
@@ -1243,10 +1243,14 @@ onMounted(load);
           <div class="l">качество</div>
           <div class="s">{{ verdict ? verdict.toLowerCase() : "оценки нет" }}</div>
         </div>
-        <div class="p-tokens" v-if="usage && usage.measured">
-          <div class="n">{{ tok(usage.total) }}</div>
-          <div class="l">токенов</div>
-          <div class="s">${{ usage.cost.toFixed(2) }} · {{ usage.measured }} из {{ usage.runs }} прогонов</div>
+        <div class="p-tokens" v-if="usage" :title="usage.line">
+          <div class="n">{{ usage.spent ? tok(usage.spent) : "0" }}</div>
+          <div class="l">{{ usage.limit == null ? "без лимита" : "из " + tok(usage.limit) }}</div>
+          <div class="s">
+            {{ usage.models.length ? usage.models.join(", ") : "модель неизвестна" }} ·
+            {{ usage.runs }} прогонов<template v-if="usage.unknown > 0">
+              · расход неизвестен у {{ usage.unknown }}</template>
+          </div>
         </div>
       </header>
 

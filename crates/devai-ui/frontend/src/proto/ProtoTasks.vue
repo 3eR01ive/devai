@@ -4,7 +4,7 @@
 import { computed, nextTick, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api, toUiError } from "../api";
-import type { ProgressView, Project, Task, UiError } from "../types";
+import type { ProgressView, Project, Task, TaskUsageView, UiError } from "../types";
 import "./proto.css";
 
 const router = useRouter();
@@ -50,7 +50,7 @@ async function createTask() {
   }
 }
 const progress = ref<Record<string, ProgressView>>({});
-const usage = ref<Record<string, { total: number; cost: number; runs: number; measured: number }>>({});
+const usage = ref<Record<string, TaskUsageView>>({});
 const error = ref<UiError | null>(null);
 const loading = ref(true);
 // Закрытые показываются по требованию: по умолчанию свернуты, не выброшены.
@@ -282,8 +282,9 @@ onMounted(load);
           <div class="p-name">{{ r.t.display }}</div>
           <div class="p-ident">
             <span>{{ r.id }}</span>
-            <span v-if="r.u && r.u.measured">
-              {{ tok(r.u.total) }} токенов · ${{ r.u.cost.toFixed(2) }}
+            <span v-if="r.u" :title="r.u.line">
+              {{ tok(r.u.spent) }}<template v-if="r.u.limit != null"> из {{ tok(r.u.limit) }}</template>
+              токенов<template v-if="r.u.unknown > 0"> · неизвестно у {{ r.u.unknown }}</template>
             </span>
           </div>
         </div>

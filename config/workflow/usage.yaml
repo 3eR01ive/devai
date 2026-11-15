@@ -1,0 +1,41 @@
+# Token budgets and model prices (task 01a1b851, REQ-USG-04) — platform
+# protocol data, the same merge-scan idiom as `humanize.yaml`: the `usage:`
+# section of any file in `workflow/` is read, the LAST declaration wins, and a
+# home without this file behaves exactly like these factory bytes.
+#
+# A budget value of 0 (or an empty value) means «без лимита» — the read
+# surfaces spell that out, they never print 0. A negative, non-integer or
+# misspelled key is a LOUD config error at `devai init` and on every run —
+# a typo must never degrade into a silently disabled limit.
+#
+# The platform compares a launch against all three levels BEFORE the model is
+# called: if the remaining budget cannot pay the expected cost of the run —
+# the historical average for this task+role, else for the role, else the run
+# budget itself as the conservative upper bound — the run is refused with the
+# numbers and nothing is spent.
+usage:
+  # The factory stance is CONSERVATIVE: one real run of the heaviest role has
+  # cost 5–8M input tokens, so 8M per run, 50M per task and 200M per day stop
+  # the burn well before the provider's 07–08.11 incident (554M in a day).
+  # These are starting points for THIS home: edit them, no rebuild needed.
+  budgets:
+    run: 8000000
+    task: 50000000
+    # Calendar day in the operator's local zone, reset at 00:00.
+    day: 200000000
+  # The platform's own price table (the ratified answer to «откуда брать
+  # стоимость»). Prices are USD per one million tokens. A model that is not
+  # listed here has an UNKNOWN cost — the platform takes the driver's own
+  # reported cost when the usage report carries one, and otherwise says
+  # «стоимость неизвестна». It never invents a number.
+  #
+  # Example (uncomment and correct for your provider):
+  # prices:
+  #   - model: deepseek-v4.1-flash
+  #     input_per_million: 0.27
+  #     output_per_million: 1.10
+  prices: []
+  # «На сколько хватит» is shown only when the period holds at least this
+  # many runs with a known cost; below it the screen says «данных мало» and
+  # names what is missing instead of inventing a horizon.
+  forecast_min_runs: 3

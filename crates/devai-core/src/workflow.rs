@@ -1082,6 +1082,91 @@ pub fn raise_question(
     )
 }
 
+/// The TOKEN BUDGET of a task is exhausted (task 01a1b851, REQ-USG-06): the
+/// platform refuses to start the next run and asks ONE human question —
+/// «поднять бюджет до N» or «остановиться». The question row rides in the
+/// SAME mutation as the parked state (the attempt-limit discipline: a held
+/// task is always answerable), carries the numbers the refusal used, and its
+/// two options are the stored vocabulary of [`usage_budget_answer`]. The
+/// platform never raises a budget by itself — only the stored answer can.
+pub fn park_usage_budget(
+    process: &Process,
+    task: &Task,
+    question_id: Id,
+    role_slug: &str,
+    spent: u64,
+    limit: u64,
+    expected: u64,
+    raise_to: u64,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &ACTIVE_STATES,
+        "park-usage-budget",
+        CoreError::hint("only an active stage can be stopped by a token budget"),
+    )?;
+    let payload = json!({
+        (json_field::QUESTION_ID): question_id.to_string(),
+        "blocking": true,
+        (json_field::GATE): USAGE_BUDGET_GATE,
+        (json_field::ROLE): role_slug,
+        (json_field::SPENT): spent,
+        (json_field::LIMIT): limit,
+        (json_field::EXPECTED): expected,
+        (json_field::TOKEN_BUDGET): raise_to,
+    });
+    let mut m = hold(
+        process,
+        task,
+        HoldKind::Question,
+        event_kind::QUESTION_RAISED,
+        actor,
+        now,
+        payload,
+    )?;
+    m.events.push(EventDraft {
+        kind: event_kind::USAGE_BUDGET_REFUSED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::ROLE): role_slug,
+            (json_field::LEVEL): "task",
+            (json_field::SPENT): spent,
+            (json_field::LIMIT): limit,
+            (json_field::EXPECTED): expected,
+            (json_field::QUESTION_ID): question_id.to_string(),
+        }),
+    });
+    m.questions.push(QuestionDraft {
+        id: question_id,
+        text: format!(
+            "Что случилось: бюджет задачи по токенам исчерпан — израсходовано {spent} из {limit}, \
+             следующий прогон роли `{role_slug}` стоит ~{expected}. Прогон НЕ начат: платформа \
+             остановилась до вызова модели, деньги не списаны.\n\
+             Почему важно: продолжать вслепую — это снова узнать предел из отказа провайдера. \
+             Платформа не поднимает бюджет сама и не меняет модель.\n\
+             Что сделать: ответьте `{raise}` — бюджет задачи поднимется до {raise_to} токенов \
+             (решение будет записано: кто, на сколько, почему), и задача продолжится; или \
+             `{stop}` — задача останется у человека, новых прогонов не будет.",
+            raise = usage_budget_answer::raise_option(raise_to),
+            stop = usage_budget_answer::STOP,
+        ),
+        context: Some(format!(
+            "gate={USAGE_BUDGET_GATE} role={role_slug} spent={spent} limit={limit} \
+             expected={expected} raise_to={raise_to}"
+        )),
+        options: usage_budget_answer::options(raise_to),
+        blocking: true,
+    });
+    Ok(m)
+}
+
+/// The gate token a usage-budget question carries in its context (the
+/// `gate=…` vocabulary the answer path reads back). One literal for the
+/// producer and the reader.
+pub const USAGE_BUDGET_GATE: &str = "usage-budget";
+
 pub fn answer_question(
     process: &Process,
     task: &Task,

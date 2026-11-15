@@ -123,7 +123,7 @@ pub struct OpDescriptor {
 /// stamp says so.
 /// @17: `source.slice` отдаёт `candidates`, когда сокращённый путь совпал с
 /// несколькими файлами — выбор вместо догадки. Только чтение.
-pub const SURFACE_VERSION: &str = "api-surface@18";
+pub const SURFACE_VERSION: &str = "api-surface@19";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -257,8 +257,22 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.usage",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "TaskUsageView{task,total,cost,runs,measured,rows}",
-            description: "Расход токенов задачи по прогонам: драйвер пишет usage.json в каталог улик каждого прогона, операция читает эти файлы и агрегирует. Честно отдаёт runs/measured — прогоны без отчёта считаются, но в сумму не входят.",
+            output: "TaskUsageView{task,task_name,spent,limit,limit_text,raised_to,line,models,cost_usd,cost_unknown,runs,measured,unknown,rows",
+            description: "Расход токенов задачи из СТОРА (execution_usage), без разбора логов: «израсходовано X из Y» одной строкой, эффективный лимит задачи (объявленный в конфиге плюс поднятый решением человека), модели прогонов, число прогонов, число прогонов с НЕИЗВЕСТНЫМ расходом (не ноль) и стоимость с числом прогонов без цены. Без лимита отдаёт «без лимита». Прогоны, закрытые без отчёта, присутствуют с measured=false и причиной.",
+        },
+        OpDescriptor {
+            name: "usage.summary",
+            class: OpClass::Read,
+            input: "period (day|week|month|all), group_by (task|role|model|totals), task (optional id prefix)",
+            output: "UsageSummaryView{period,from,to,group_by,rows,UsageBucketView,totals:UsageBucketView,limits:BudgetLimits}",
+            description: "Расход токенов по задаче / роли / модели за сутки, неделю, месяц или всё время: суммы входных и выходных токенов, стоимость известных прогонов, число прогонов, число прогонов с неизвестным расходом и число прогонов без цены, плюс та же выборка одной строкой totals. Только чтение: операция ничего не запускает, не меняет бюджеты и не пишет строк — суммы считаются из строк расхода стора, число прогонов из role_executions, поэтому сумма всегда сходится с числом прогонов.",
+        },
+        OpDescriptor {
+            name: "usage.overview",
+            class: OpClass::Read,
+            input: "—",
+            output: "UsageOverviewView{day,month,top_tasks,forecast,day_gate,limits}",
+            description: "Один снимок экрана расхода: сутки и месяц, топ-задачи по расходу за месяц, прогноз «на сколько хватит» по суточному бюджету (с честной пометкой оценки и «данных мало», когда прогонов с известным расходом меньше объявленного порога) и строка суточного гейта с цифрами, когда суточный бюджет исчерпан. Только чтение.",
         },
         OpDescriptor {
             name: "exec.transcript",
@@ -932,7 +946,7 @@ mod tests {
         // @16: ещё одно ЧТЕНИЕ — diff того же диапазона с полным контекстом
         // файла, чтобы окно разворачивало скрытые строки без второго чтения.
         // Ни одна версия не пишет: мутации @14 остаются как были.
-        assert_eq!(SURFACE_VERSION, "api-surface@18");
+        assert_eq!(SURFACE_VERSION, "api-surface@19");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

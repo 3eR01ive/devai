@@ -150,6 +150,9 @@ fn runtime_code(e: &RuntimeError) -> ErrorCode {
         RuntimeError::ReportShape(..) => ErrorCode("report_shape"),
         RuntimeError::NoActiveBundle => ErrorCode("no_active_bundle"),
         RuntimeError::IncompleteBundle => ErrorCode("incomplete_bundle"),
+        // REQ-USG-05: the budget refusal is its own code — a consumer branches
+        // on «budget» without parsing the sentence.
+        RuntimeError::BudgetRefused(..) => ErrorCode("usage_budget_refused"),
     }
 }
 

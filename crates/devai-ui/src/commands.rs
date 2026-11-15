@@ -457,6 +457,8 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("task_report", "task.report"),
     ("evaluation_rules", "eval.rules"),
     ("task_usage", "task.usage"),
+    ("usage_summary", "usage.summary"),
+    ("usage_overview", "usage.overview"),
     ("exec_transcript", "exec.transcript"),
     ("source_slice", "source.slice"),
     ("task_events", "task.events"),
@@ -1390,13 +1392,35 @@ pub fn evaluation_rules(state: State<AppState>) -> Result<devai_api::RulebookVie
     Ok(state.api().evaluation_rules()?)
 }
 
-/// Расход токенов задачи по прогонам (файлы улик драйвера).
+/// Расход токенов задачи из СТОРА (REQ-USG-07): «израсходовано X из Y»,
+/// лимит задачи, модели, число прогонов и число прогонов с неизвестным
+/// расходом. Окно ничего не пересчитывает.
 #[tauri::command(rename_all = "snake_case")]
 pub fn task_usage(
     state: State<AppState>,
     id_prefix: String,
 ) -> Result<devai_api::TaskUsageView, UiError> {
     Ok(state.api().task_usage(&id_prefix)?)
+}
+
+/// Расход по задаче / роли / модели за сутки, неделю, месяц (REQ-USG-03).
+#[tauri::command(rename_all = "snake_case")]
+pub fn usage_summary(
+    state: State<AppState>,
+    period: String,
+    group_by: String,
+    task: Option<String>,
+) -> Result<devai_api::UsageSummaryView, UiError> {
+    Ok(state
+        .api()
+        .usage_summary(&period, &group_by, task.as_deref())?)
+}
+
+/// Экран расхода: сутки и месяц, топ-задачи, прогноз и суточный гейт
+/// (REQ-USG-08). Один снимок — окно ничего не складывает само.
+#[tauri::command(rename_all = "snake_case")]
+pub fn usage_overview(state: State<AppState>) -> Result<devai_api::UsageOverviewView, UiError> {
+    Ok(state.api().usage_overview()?)
 }
 
 /// Консоль прогона: потоки роли как они есть на диске, хвостом.

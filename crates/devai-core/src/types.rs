@@ -1566,6 +1566,14 @@ pub mod decision_kind {
     /// stored decision because resetting the counter is a HUMAN act — no
     /// edit of the declaration, re-run or restart may do it.
     pub const ATTEMPT_LIMIT_ANSWER: &str = "attempt_limit_answer";
+    /// The human answer to a TOKEN-BUDGET stop question (task 01a1b851,
+    /// REQ-USG-06): «поднять до N» or «остановиться». The row is the ONLY
+    /// source of a task's raised budget — the platform never raises a budget
+    /// by itself, and `payload` carries the answer, the amount the budget was
+    /// raised to, what was already spent, the declared limit it replaces, the
+    /// question id and the run that was refused. `rationale` keeps the
+    /// human's words verbatim; `actor`/`created_at` are the who and when.
+    pub const USAGE_BUDGET: &str = "usage_budget";
     /// Полный перечень видов решений — та же дисциплина, что у `event_kind::ALL`:
     /// читатель, который перечисляет виды (например отбор подписи), сверяется с
     /// ним, а не с собственной памятью.
@@ -1578,6 +1586,7 @@ pub mod decision_kind {
         REQUIREMENTS_REJECTION,
         QUALITY_RETURN,
         ATTEMPT_LIMIT_ANSWER,
+        USAGE_BUDGET,
     ];
 }
 
@@ -1599,6 +1608,56 @@ pub mod attempt_limit_answer {
     pub fn parse(text: &str) -> Option<&'static str> {
         let asked = text.trim().to_lowercase();
         ALL.into_iter().find(|option| *option == asked)
+    }
+}
+
+/// The answer vocabulary of the TOKEN-BUDGET stop question (task 01a1b851,
+/// REQ-USG-06): «поднять до N» or «остановиться». The options STORED on the
+/// question and the reply the answer path accepts are ONE dictionary — the
+/// same discipline as `attempt_limit_answer`, so a human never reads an
+/// option the platform no longer takes. «Поднять до N» is an ABSOLUTE new
+/// limit (not a delta): the number is proposed by the platform from declared
+/// data and the human may type any larger one.
+pub mod usage_budget_answer {
+    /// The raise option's leading words; the amount follows, separated by a
+    /// space: `поднять до 40000000`.
+    pub const RAISE_PREFIX: &str = "поднять до";
+    pub const STOP: &str = "остановиться";
+
+    /// One stored/typed answer of the budget question.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Answer {
+        /// Raise the task budget to this ABSOLUTE number of tokens.
+        Raise(u64),
+        /// Stop: the task stays where the human put it, nothing is raised.
+        Stop,
+    }
+
+    /// The raise option for a concrete amount — the string the question
+    /// carries as an option and the answer path parses.
+    pub fn raise_option(tokens: u64) -> String {
+        format!("{RAISE_PREFIX} {tokens}")
+    }
+
+    /// The two options a question carries, in the order the human reads them.
+    pub fn options(raise_to: u64) -> Vec<String> {
+        vec![raise_option(raise_to), STOP.to_string()]
+    }
+
+    /// Parse an answer against the question's own proposed amount: `None`
+    /// when the text is neither the stored stop word nor a raise. Matching is
+    /// on the stored words only (trim + lowercase) — free phrasing is not
+    /// guessed at, because guessing a budget is exactly what must not happen.
+    pub fn parse(text: &str) -> Option<Answer> {
+        let asked = text.trim().to_lowercase();
+        if asked == STOP {
+            return Some(Answer::Stop);
+        }
+        let rest = asked.strip_prefix(RAISE_PREFIX)?.trim();
+        rest.parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(Answer::Raise)
     }
 }
 
@@ -1724,6 +1783,21 @@ pub mod event_kind {
     /// is cost as a witnessed field of the execution. Payload: execution
     /// id, provider, the expected `usage_file` path.
     pub const EXECUTION_USAGE_MISSING: &str = "execution.usage_missing";
+    /// The platform REFUSED to start a run because a declared token budget
+    /// could not pay for the expected cost of the run (task 01a1b851,
+    /// REQ-USG-05). Written BEFORE any model call: no execution row, no
+    /// spend, no money. Payload: the exhausted `level` (run|task|day), the
+    /// `spent`/`limit` numbers of that level, the `expected` cost of the run,
+    /// the `basis` the expectation came from (task_role|role|run_budget), the
+    /// ONE operator sentence `line`, the role and — when the task budget is
+    /// the exhausted level — the human `question_id` that parks the task.
+    pub const USAGE_BUDGET_REFUSED: &str = "usage.budget_refused";
+    /// The provider answered «квота исчерпана» (429 / quota) for a run
+    /// (REQ-USG-02 AC2): an ОТДЕЛЬНЫЙ fact of the run's history. It is not
+    /// «потрачено ноль» — the run's own usage row keeps whatever the report
+    /// said, and a run with no report stays UNKNOWN. Payload: execution id,
+    /// role, provider, model and the matched evidence text.
+    pub const USAGE_QUOTA_EXHAUSTED: &str = "usage.quota_exhausted";
     pub const ARTIFACT_PUBLISHED: &str = "artifact.published";
     /// Publishing a new artifact version supersedes the previous CURRENT
     /// row(s) of the same (task_id, kind) group: the status column flips,
@@ -1854,6 +1928,8 @@ pub mod event_kind {
         EXECUTION_CANCELLED,
         EXECUTION_SINGLE_WRITER_REPAIR,
         EXECUTION_USAGE_MISSING,
+        USAGE_BUDGET_REFUSED,
+        USAGE_QUOTA_EXHAUSTED,
         AGENT_FAILED,
         ARTIFACT_PUBLISHED,
         ARTIFACT_SUPERSEDED,
@@ -2040,6 +2116,16 @@ pub mod json_field {
     // LIMIT уже объявлен выше (предел попыток) — здесь он тот же токен.
     pub const PARKED: &str = "parked";
     pub const CONSECUTIVE: &str = "consecutive";
+    // Token budgets (task 01a1b851, REQ-USG-05/06): the token counters of the
+    // refusal event and of the stored budget decision. `SPENT`/`LIMIT`/
+    // `EXPECTED` are the SAME numbers the operator reads in the refusal
+    // sentence, so a reader never recomputes them from other fields.
+    pub const SPENT: &str = "spent";
+    pub const EXPECTED: &str = "expected";
+    /// The budget LEVEL that was exhausted: `run` / `task` / `day`.
+    pub const LEVEL: &str = "level";
+    /// The ABSOLUTE task budget a human raised the limit to.
+    pub const TOKEN_BUDGET: &str = "token_budget";
 
     /// The COMPLETE enumerable vocabulary of payload field names the platform
     /// itself mints. Load-time policy validation checks user-authored field
@@ -2132,6 +2218,10 @@ pub mod json_field {
         LIMIT,
         ANSWER,
         AT,
+        SPENT,
+        EXPECTED,
+        LEVEL,
+        TOKEN_BUDGET,
     ];
 }
 

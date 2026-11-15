@@ -239,23 +239,78 @@ export interface RulebookView {
   blocked_max: number | null;
   groups: RuleGroupView[];
 }
-export interface UsageRowView {
+/** Один прогон с расходом: null = расход НЕИЗВЕСТЕН (не ноль). */
+export interface RunUsageView {
   execution: string;
-  input: number | null;
-  output: number | null;
-  cached: number | null;
-  total: number;
-  cost: number;
-  calls: number | null;
+  role: string;
+  started_at: string;
+  status: string;
   model: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  cost_usd: number | null;
+  duration_ms: number | null;
+  measured: boolean;
+  unknown_reason: string | null;
 }
+/** Карточка задачи: «израсходовано X из Y» и честная доля неизвестных. */
 export interface TaskUsageView {
   task: string;
-  total: number;
-  cost: number;
+  task_name: string;
+  spent: number;
+  limit: number | null;
+  limit_text: string;
+  raised_to: number | null;
+  line: string;
+  models: string[];
+  cost_usd: number;
+  cost_unknown: number;
   runs: number;
   measured: number;
-  rows: UsageRowView[];
+  unknown: number;
+  rows: RunUsageView[];
+}
+export interface UsageBucketView {
+  key: string;
+  name: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  runs: number;
+  measured: number;
+  unknown: number;
+  cost_unknown: number;
+}
+export interface BudgetLimits {
+  run: number | null;
+  task: number | null;
+  day: number | null;
+  raised_to: number | null;
+}
+export interface UsageSummaryView {
+  period: string;
+  from: string | null;
+  to: string | null;
+  group_by: string;
+  rows: UsageBucketView[];
+  totals: UsageBucketView;
+  limits: BudgetLimits;
+}
+export interface UsageForecastView {
+  available: boolean;
+  line: string;
+  runs_used: number;
+  needed_runs: number;
+}
+export interface UsageOverviewView {
+  day: UsageSummaryView;
+  month: UsageSummaryView;
+  top_tasks: UsageBucketView[];
+  forecast: UsageForecastView;
+  day_gate: string | null;
+  limits: BudgetLimits;
 }
 export interface SourceSliceView {
   path: string;

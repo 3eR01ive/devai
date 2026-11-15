@@ -11,6 +11,8 @@ import type {
   ExecTranscriptView,
   RulebookView,
   TaskUsageView,
+  UsageOverviewView,
+  UsageSummaryView,
   SourceSliceView,
   ActiveSnapshot,
   AgentStatusView,
@@ -217,6 +219,11 @@ export const api = {
   execTranscript: (id_prefix: string, execution: string) =>
     invoke<ExecTranscriptView>("exec_transcript", { id_prefix, execution }),
   taskUsage: (id_prefix: string) => invoke<TaskUsageView>("task_usage", { id_prefix }),
+  // Экран расхода (REQ-USG-08): один снимок — сутки, месяц, топ-задачи, прогноз.
+  usageOverview: () => invoke<UsageOverviewView>("usage_overview"),
+  // Расход по разрезу за период (REQ-USG-03): те же цифры, что у CLI.
+  usageSummary: (period: string, group_by: string, task: string | null) =>
+    invoke<UsageSummaryView>("usage_summary", { period, group_by, task }),
   // Кусок исходника на коммите по ссылке «путь:строки».
   sourceSlice: (id_prefix: string, rev: string, path: string, from: number, to: number) =>
     invoke<SourceSliceView>("source_slice", { id_prefix, rev, path, from, to }),

@@ -31,6 +31,7 @@ mod quality_gate;
 mod registry;
 mod signature;
 mod stop;
+mod usage;
 
 /// Machine codes of the homes vocabulary — one dictionary, referenced by
 /// producers here and by the UI bootstrap (R3 quality return).
@@ -300,7 +301,10 @@ pub mod ui_reads;
 
 pub use ui_reads::{
     ExecTranscriptView, RuleDetectView, RuleGroupView, RuleView, RulebookView, SourceSliceView,
-    TaskUsageView, UsageRowView,
+};
+pub use usage::{
+    BudgetLimits, RunUsageView, TaskUsageView, UsageBucketView, UsageForecastView,
+    UsageOverviewView, UsageSummaryView,
 };
 
 pub struct Api {
