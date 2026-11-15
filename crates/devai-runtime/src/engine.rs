@@ -60,6 +60,38 @@ const AUDITOR_PROMPT_FILE: &str = "auditor_prompt.txt";
 /// human wrote. An empty table yields one explicit marker line, so the QA
 /// prompt keeps a constant section structure across runs (OQ-E) and the
 /// auditor can see the ABSENCE of decisions as a fact, not a silent omission.
+/// Ответы человека на вопросы прошлых кругов — дословно, в порядке записи.
+/// Платформа уже однажды спрашивала это, человек уже ответил: роль не вправе
+/// спрашивать то же снова (иначе круги идут по одному сценарию, пока не
+/// упрётся предел попыток).
+fn answers_prompt_text(questions: &[devai_core::types::Question]) -> String {
+    let answered: Vec<_> = questions
+        .iter()
+        .filter(|q| q.status == devai_core::types::QuestionStatus::Answered)
+        .filter(|q| q.answer.as_deref().is_some_and(|a| !a.trim().is_empty()))
+        .collect();
+    if answered.is_empty() {
+        return "(no answered questions yet)\n".to_string();
+    }
+    let mut out = String::new();
+    for q in answered {
+        out.push_str(&format!(
+            "- asked_at: {}\n  answered_by: {}\n  question: {}\n",
+            q.created_at.to_rfc3339(),
+            q.answered_by.as_deref().unwrap_or("(unknown)"),
+            q.text.lines().collect::<Vec<_>>().join(" "),
+        ));
+        for (i, line) in q.answer.as_deref().unwrap_or_default().lines().enumerate() {
+            if i == 0 {
+                out.push_str(&format!("  answer: {line}\n"));
+            } else {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+    }
+    out
+}
+
 fn decisions_prompt_text(decisions: &[Decision]) -> String {
     if decisions.is_empty() {
         return "(no decisions recorded for this task)\n".to_string();
@@ -1239,6 +1271,19 @@ impl<'a> Engine<'a> {
             "APPROVED_DECISIONS (all stored human decisions for this task, reproduced verbatim; approve rationales are the ratified resolutions of the spec's open questions)".to_string(),
             decisions_prompt_text(&self.store.list_decisions(task.id)?),
         ));
+        // Ответы человека из прошлых кругов — ТОЖЕ данные, а не контекст круга:
+        // без них роль спрашивает заново то, на что уже ответили, и задача
+        // упирается в предел попыток вместо движения вперёд.
+        let answered = self.store.list_questions(task.id)?;
+        if answered
+            .iter()
+            .any(|q| q.status == devai_core::types::QuestionStatus::Answered)
+        {
+            inputs.push((
+                "HUMAN_ANSWERS (questions answered by the operator in earlier rounds, reproduced verbatim; these are SETTLED and count as part of the statement — judge them together with it, build on them, and never ask the same thing again)".to_string(),
+                answers_prompt_text(&answered),
+            ));
+        }
         // REWORK CONTEXT (R-001..R-008): the platform assembles the quoted
         // rejection context for this role from the append-only record,
         // following the declarative table — role YAML never learns it.
@@ -2232,6 +2277,48 @@ mod decisions_render_tests {
         let d = decision("acceptance", Verdict::Approved, None);
         let text = decisions_prompt_text(&[d]);
         assert!(text.contains("  rationale: (none stored)\n"), "{text}");
+    }
+
+    fn question(answer: Option<&str>) -> devai_core::types::Question {
+        devai_core::types::Question {
+            id: devai_core::types::new_id(),
+            task_id: devai_core::types::new_id(),
+            execution_id: None,
+            text: "Пункт user: кто получит результат?\nПункт volume: какой объём?".to_string(),
+            context: None,
+            options: vec![],
+            blocking: true,
+            status: match answer {
+                Some(_) => devai_core::types::QuestionStatus::Answered,
+                None => devai_core::types::QuestionStatus::Open,
+            },
+            answer: answer.map(str::to_string),
+            answered_by: answer.map(|_| "guerrero".to_string()),
+            answered_at: answer.map(|_| chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Ответы прошлых кругов обязаны попадать в роль: иначе она спрашивает то
+    /// же снова и круг повторяется до предела попыток (прецедент 01a1df87).
+    #[test]
+    fn answered_questions_reach_the_role_verbatim() {
+        let text = answers_prompt_text(&[
+            question(Some("оператор интерфейса devai\nлюбой, не только автор")),
+            question(None),
+        ]);
+        assert!(text.contains("question: Пункт user: кто получит результат? Пункт volume"), "{text}");
+        assert!(text.contains("  answer: оператор интерфейса devai\n  любой, не только автор\n"), "{text}");
+        assert!(text.contains("answered_by: guerrero"), "{text}");
+    }
+
+    /// Пустых ответов нет — секция не добавляется, первый прогон байт-в-байт тот же.
+    #[test]
+    fn no_answers_means_no_section_text() {
+        assert_eq!(
+            answers_prompt_text(&[question(None)]),
+            "(no answered questions yet)\n"
+        );
     }
 
     #[test]
