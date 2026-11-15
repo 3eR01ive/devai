@@ -4,7 +4,7 @@
 // а не по формулировке: слово в тексте — текст, адрес перехода — данные.
 import { computed, ref, watch } from "vue";
 import type { Question, WorkflowEvent } from "../types";
-import { GATE_REVIEW_RETURN, gateOf } from "./questions";
+import { attemptTrip, GATE_ATTEMPT_LIMIT, GATE_REVIEW_RETURN, gateOf } from "./questions";
 import { itemWord, type StatementReview } from "./statementReview";
 
 const props = defineProps<{
@@ -81,8 +81,22 @@ function send(q: Question, text: string) {
       <div v-if="!protocol" class="atext">{{ q.text }}</div>
       <div v-if="q.context && !protocol" class="actx">{{ q.context }}</div>
 
+      <!-- предел попыток: платформа принимает ровно два слова из своего
+           словаря — свободный текст тут гарантированный отказ -->
+      <div v-if="gate(q.id) === GATE_ATTEMPT_LIMIT" class="abtns">
+        <button class="a go" :disabled="busy === q.id" @click="send(q, 'продолжить')">Продолжить</button>
+        <button class="a no" :disabled="busy === q.id" @click="send(q, 'остановить')">Остановить</button>
+        <span class="ahint">
+          <template v-if="attemptTrip(events, q.id)">
+            {{ attemptTrip(events, q.id)!.role }} остановлен: {{ attemptTrip(events, q.id)!.attempt }}
+            попыток из {{ attemptTrip(events, q.id)!.limit }} без прогресса ·
+          </template>
+          продолжить — дать ещё круг; остановить — дело остаётся у тебя
+        </span>
+      </div>
+
       <!-- вопрос гейта «ревью вернуло спеку»: два хода, оба — слово человека -->
-      <div v-if="gate(q.id) === GATE_REVIEW_RETURN" class="abtns">
+      <div v-else-if="gate(q.id) === GATE_REVIEW_RETURN" class="abtns">
         <button class="a go" :disabled="busy === q.id" @click="send(q, 'продолжить')">Продолжить круг</button>
         <button class="a no" :disabled="busy === q.id" @click="send(q, 'остановить')">Остановить</button>
         <span class="ahint">продолжить — спека уйдёт аналитику; остановить — дело останется у тебя</span>

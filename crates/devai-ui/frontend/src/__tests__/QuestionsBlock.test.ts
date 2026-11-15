@@ -110,4 +110,37 @@ describe("QuestionsBlock", () => {
     expect(w.findAll(".abtns")).toHaveLength(0);
     expect(w.find(".afree").exists()).toBe(true);
   });
+
+  it("вопрос предела попыток: только два слова платформы, не свободный текст", async () => {
+    const w = mount(QuestionsBlock, {
+      props: {
+        questions: [q({ text: "Предел попыток: role stopped without progress" })],
+        events: [
+          ev({ question_id: "q1", gate: "attempt-limit" }),
+          { ...ev({ question_id: "q1", role: "requirements-analyst", attempt: 6, limit: 5 }),
+            kind: "attempt.limit_tripped" },
+        ],
+        protocol: {
+          verdict: "QUESTIONS",
+          human_paragraph: "не хватает границ",
+          checklist: [],
+          questions: ["Где границы?"],
+        },
+      },
+    });
+    // полей свободного ответа нет — платформа их отвергнет
+    expect(w.findAll(".pq textarea")).toHaveLength(0);
+    expect(w.find(".afree").exists()).toBe(false);
+
+    const buttons = w.findAll(".abtns .a");
+    expect(buttons.map((b) => b.text())).toEqual(["Продолжить", "Остановить"]);
+    expect(w.find(".ahint").text()).toContain("requirements-analyst");
+    expect(w.find(".ahint").text()).toContain("6");
+    expect(w.find(".ahint").text()).toContain("5");
+
+    await buttons[0].trigger("click");
+    expect((w.emitted("answer")![0] as [unknown, string])[1]).toBe("продолжить");
+    await buttons[1].trigger("click");
+    expect((w.emitted("answer")![1] as [unknown, string])[1]).toBe("остановить");
+  });
 });
