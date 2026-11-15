@@ -2,7 +2,7 @@
 // Платформа спрашивает человека — блок над шагами, потому что без ответа
 // работа не двинется. Гейт вопроса читается по событию `question.raised`,
 // а не по формулировке: слово в тексте — текст, адрес перехода — данные.
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import type { Question, WorkflowEvent } from "../types";
 import { GATE_REVIEW_RETURN, gateOf } from "./questions";
 import { itemWord, type StatementReview } from "./statementReview";
@@ -18,6 +18,34 @@ const emit = defineEmits<{ (e: "answer", q: Question, text: string): void }>();
 
 const open = computed(() => props.questions.filter((q) => q.status === "OPEN"));
 const freeText = ref<Record<string, string>>({});
+// Ответы по КАЖДОМУ вопросу протокола: платформа получает один текст, но
+// человек отвечает по пунктам — «одно поле на всё» заставляло его самого
+// нумеровать вопросы и следить, на что он не ответил.
+const answers = ref<string[]>([]);
+watch(
+  () => props.protocol?.questions.length ?? 0,
+  (n) => {
+    answers.value = Array.from({ length: n }, (_, i) => answers.value[i] ?? "");
+  },
+  { immediate: true },
+);
+const answeredCount = computed(() => answers.value.filter((a) => a.trim()).length);
+const canSendProtocol = computed(() => answeredCount.value > 0);
+
+/** Склейка ответов: вопрос остаётся рядом с ответом, чтобы читалось без сверки. */
+function composeAnswers(p: StatementReview): string {
+  return p.questions
+    .map((q, i) => ({ q, a: (answers.value[i] ?? "").trim() }))
+    .filter((x) => x.a.length)
+    .map((x, k) => `${k + 1}) ${x.q}\nОтвет: ${x.a}`)
+    .join("\n\n");
+}
+
+function sendProtocol(q: Question) {
+  if (!props.protocol || !canSendProtocol.value) return;
+  const text = composeAnswers(props.protocol);
+  if (text) emit("answer", q, text);
+}
 const gate = (id: string) => gateOf(props.events, id);
 
 function send(q: Question, text: string) {
@@ -43,11 +71,8 @@ function send(q: Question, text: string) {
           <span v-if="c.note" class="nt">{{ c.note }}</span>
         </div>
       </div>
-      <div v-if="protocol.questions.length" class="pqs">
-        <div class="pqs-h">что нужно решить · {{ protocol.questions.length }}</div>
-        <ol>
-          <li v-for="(q, i) in protocol.questions" :key="i">{{ q }}</li>
-        </ol>
+      <div v-if="protocol.questions.length" class="pqs-h">
+        что нужно решить · {{ protocol.questions.length }}
       </div>
     </div>
     <div v-for="q in open" :key="q.id" class="acard">
@@ -62,6 +87,21 @@ function send(q: Question, text: string) {
         <button class="a no" :disabled="busy === q.id" @click="send(q, 'остановить')">Остановить</button>
         <span class="ahint">продолжить — спека уйдёт аналитику; остановить — дело останется у тебя</span>
       </div>
+
+      <!-- протокол: свой ответ на КАЖДЫЙ вопрос, отправка одним актом -->
+      <template v-else-if="protocol && protocol.questions.length">
+        <div v-for="(pq, i) in protocol.questions" :key="i" class="pq">
+          <div class="pq-t"><span class="pq-n">{{ i + 1 }}</span>{{ pq }}</div>
+          <textarea v-model="answers[i]" rows="2" spellcheck="false"
+                    placeholder="твой ответ на этот вопрос" />
+        </div>
+        <div class="abtns">
+          <button class="a go" :disabled="busy === q.id || !canSendProtocol" @click="sendProtocol(q)">
+            Ответить
+          </button>
+          <span class="ahint">{{ answeredCount }} из {{ protocol.questions.length }} с ответом</span>
+        </div>
+      </template>
 
       <!-- прочие вопросы: свободный ответ -->
       <div v-else class="afree">
@@ -113,4 +153,14 @@ function send(q: Question, text: string) {
 .pqs li{margin-bottom:3px}
 .araw summary{cursor:pointer;font-size:10.5px;color:var(--p-dim2);margin-bottom:4px}
 .araw[open] summary{color:var(--p-dim)}
+
+/* Ответ по каждому вопросу протокола: вопрос с номером, под ним поле. */
+.pq{margin-bottom:8px}
+.pq-t{display:flex;gap:7px;font-size:12.5px;line-height:1.5;color:#e2e9f1;margin-bottom:4px}
+.pq-n{flex:none;width:16px;color:#93a1b1;font-family:var(--mono);font-size:11px;padding-top:2px}
+.pq textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:44px;
+  border:1px solid var(--p-line);border-radius:6px;background:#16202b;color:#f0f5fa;
+  font-family:var(--sans);font-size:12.5px;line-height:1.5;padding:7px 9px}
+.pq textarea::placeholder{color:#63707f}
+.pq textarea:focus{outline:none;border-color:var(--p-human);background:#18242f}
 </style>

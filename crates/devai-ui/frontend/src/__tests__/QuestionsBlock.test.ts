@@ -52,7 +52,7 @@ describe("QuestionsBlock", () => {
     expect(w.emitted("answer")![0][1]).toBe("в строке шага");
   });
 
-  it("протокол проверки раскладывается по пунктам, а не склеенным текстом", () => {
+  it("протокол раскладывается по пунктам, и ответ даётся на КАЖДЫЙ вопрос", async () => {
     const w = mount(QuestionsBlock, {
       props: {
         questions: [q()],
@@ -64,18 +64,34 @@ describe("QuestionsBlock", () => {
             { item: "user", ok: true, note: null },
             { item: "boundaries", ok: false, note: "не указаны" },
           ],
-          questions: ["Где границы задачи?"],
+          questions: ["Где границы задачи?", "Что считается сделанным?"],
         },
       },
     });
+    // чек-лист — строки, а не текстом
     expect(w.find(".pverdict").text()).toContain("есть вопросы");
-    expect(w.find(".ppar").text()).toContain("не хватает границ");
     const rows = w.findAll(".pcheck");
     expect(rows).toHaveLength(2);
     expect(rows[0].text()).toContain("пользователь");
     expect(rows[1].classes()).toContain("bad");
-    expect(rows[1].text()).toContain("границы");
-    expect(w.find(".pqs").text()).toContain("Где границы задачи?");
+
+    // по полю на каждый вопрос; пока пусто — отправлять нечего
+    const areas = w.findAll(".pq textarea");
+    expect(areas).toHaveLength(2);
+    expect(w.find(".abtns .a.go").attributes("disabled")).toBeDefined();
+    expect(w.text()).toContain("0 из 2 с ответом");
+
+    await areas[0].setValue("границы: только наш дом");
+    await areas[1].setValue("сделанным считается запуск без ошибок");
+    expect(w.text()).toContain("2 из 2 с ответом");
+    await w.find(".abtns .a.go").trigger("click");
+
+    const sent = (w.emitted("answer")![0] as [unknown, string])[1];
+    expect(sent).toContain("1) Где границы задачи?");
+    expect(sent).toContain("Ответ: границы: только наш дом");
+    expect(sent).toContain("2) Что считается сделанным?");
+    expect(sent).toContain("Ответ: сделанным считается запуск без ошибок");
+
     // склеенный текст вопроса не дублируется, когда протокол разложен
     expect(w.find(".atext").exists()).toBe(false);
   });
