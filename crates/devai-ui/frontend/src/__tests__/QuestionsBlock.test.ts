@@ -52,6 +52,34 @@ describe("QuestionsBlock", () => {
     expect(w.emitted("answer")![0][1]).toBe("в строке шага");
   });
 
+  it("протокол проверки раскладывается по пунктам, а не склеенным текстом", () => {
+    const w = mount(QuestionsBlock, {
+      props: {
+        questions: [q()],
+        events: [],
+        protocol: {
+          verdict: "QUESTIONS",
+          human_paragraph: "не хватает границ и критерия",
+          checklist: [
+            { item: "user", ok: true, note: null },
+            { item: "boundaries", ok: false, note: "не указаны" },
+          ],
+          questions: ["Где границы задачи?"],
+        },
+      },
+    });
+    expect(w.find(".pverdict").text()).toContain("есть вопросы");
+    expect(w.find(".ppar").text()).toContain("не хватает границ");
+    const rows = w.findAll(".pcheck");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].text()).toContain("пользователь");
+    expect(rows[1].classes()).toContain("bad");
+    expect(rows[1].text()).toContain("границы");
+    expect(w.find(".pqs").text()).toContain("Где границы задачи?");
+    // склеенный текст вопроса не дублируется, когда протокол разложен
+    expect(w.find(".atext").exists()).toBe(false);
+  });
+
   it("отвеченные вопросы не висят в блоке", () => {
     const w = mount(QuestionsBlock, {
       props: { questions: [q({ status: "ANSWERED" })], events: [] },

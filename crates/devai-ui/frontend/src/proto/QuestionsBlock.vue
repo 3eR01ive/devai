@@ -5,11 +5,14 @@
 import { computed, ref } from "vue";
 import type { Question, WorkflowEvent } from "../types";
 import { GATE_REVIEW_RETURN, gateOf } from "./questions";
+import { itemWord, type StatementReview } from "./statementReview";
 
 const props = defineProps<{
   questions: Question[];
   events: WorkflowEvent[];
   busy?: string | null;
+  /** Протокол проверки постановки: чек-лист и вопросы — поля, а не текст. */
+  protocol?: StatementReview | null;
 }>();
 const emit = defineEmits<{ (e: "answer", q: Question, text: string): void }>();
 
@@ -26,9 +29,32 @@ function send(q: Question, text: string) {
 <template>
   <div v-if="open.length" class="ask">
     <div class="ahead">платформа спрашивает · {{ open.length }}</div>
+
+    <!-- протокол проверки: вердикт, чек-лист по пунктам, вопросы отдельно -->
+    <div v-if="protocol" class="proto">
+      <div class="pverdict" :class="protocol.verdict === 'APPROVED' ? 'ok' : 'no'">
+        проверка постановки · {{ protocol.verdict === "APPROVED" ? "принята" : "есть вопросы" }}
+      </div>
+      <div v-if="protocol.human_paragraph" class="ppar">{{ protocol.human_paragraph }}</div>
+      <div v-if="protocol.checklist.length" class="pchecks">
+        <div v-for="c in protocol.checklist" :key="c.item" class="pcheck" :class="{ bad: !c.ok }">
+          <span class="mk">{{ c.ok ? "✓" : "✗" }}</span>
+          <span class="nm">{{ itemWord(c.item) }}</span>
+          <span v-if="c.note" class="nt">{{ c.note }}</span>
+        </div>
+      </div>
+      <div v-if="protocol.questions.length" class="pqs">
+        <div class="pqs-h">что нужно решить · {{ protocol.questions.length }}</div>
+        <ol>
+          <li v-for="(q, i) in protocol.questions" :key="i">{{ q }}</li>
+        </ol>
+      </div>
+    </div>
     <div v-for="q in open" :key="q.id" class="acard">
-      <div class="atext">{{ q.text }}</div>
-      <div v-if="q.context" class="actx">{{ q.context }}</div>
+      <!-- если протокол разложен — сырой склеенный текст не дублируем:
+           вердикт, чек-лист и вопросы уже выше -->
+      <div v-if="!protocol" class="atext">{{ q.text }}</div>
+      <div v-if="q.context && !protocol" class="actx">{{ q.context }}</div>
 
       <!-- вопрос гейта «ревью вернуло спеку»: два хода, оба — слово человека -->
       <div v-if="gate(q.id) === GATE_REVIEW_RETURN" class="abtns">
@@ -67,4 +93,24 @@ function send(q: Question, text: string) {
 .a.no{border-color:rgba(240,97,109,.75);background:rgba(240,97,109,.16);color:#f6bcc2}
 .a:disabled{opacity:.45;cursor:not-allowed}
 .ahint{font-size:10.5px;color:#93a1b1}
+
+/* Протокол проверки постановки: поля, а не свободный текст. */
+.proto{margin:2px 0 10px;border:1px solid var(--p-line);border-radius:9px;
+  background:#0f141a;padding:10px 12px}
+.pverdict{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;margin-bottom:7px}
+.pverdict.ok{color:var(--p-pass)}
+.pverdict.no{color:#ffa972}
+.ppar{font-size:12.5px;line-height:1.55;color:#d7e0ea;margin-bottom:8px;white-space:pre-wrap}
+.pchecks{display:flex;flex-direction:column;gap:3px;margin-bottom:8px}
+.pcheck{display:flex;gap:8px;align-items:baseline;font-size:12px;color:#cfd9e4}
+.pcheck .mk{flex:none;width:12px;color:var(--p-pass)}
+.pcheck.bad .mk{color:var(--p-stop)}
+.pcheck.bad .nm{color:#f2bcc2}
+.pcheck .nm{flex:none;min-width:150px}
+.pcheck .nt{color:var(--p-dim);font-size:11.5px}
+.pqs-h{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:#93a1b1;margin-bottom:4px}
+.pqs ol{margin:0;padding-left:18px;font-size:12.5px;line-height:1.55;color:#e2e9f1}
+.pqs li{margin-bottom:3px}
+.araw summary{cursor:pointer;font-size:10.5px;color:var(--p-dim2);margin-bottom:4px}
+.araw[open] summary{color:var(--p-dim)}
 </style>

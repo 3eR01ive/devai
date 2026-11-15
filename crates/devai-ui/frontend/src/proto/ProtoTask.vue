@@ -14,6 +14,7 @@ import type {
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
+import { parseStatementReview, type StatementReview } from "./statementReview";
 import "./proto.css";
 
 const route = useRoute();
@@ -719,6 +720,9 @@ const signBusy = ref(false);
 // из события `question.raised` по этому question_id. Гадать по формулировке
 // нельзя: слово в тексте — это текст, а не адрес перехода.
 const questions = ref<Question[]>([]);
+// Протокол проверки постановки: чек-лист и вопросы — поля контракта, поэтому
+// блок вопросов показывает их по местам, а не склейкой текста.
+const stmtReview = ref<StatementReview | null>(null);
 const events = ref<WorkflowEvent[]>([]);
 const answerBusy = ref<string | null>(null);
 
@@ -784,6 +788,13 @@ async function load() {
       await ensureBody(impl);
       const b = (runBodies.value as Record<string, any>)[impl.id];
       if (b?.commit) implCommit.value = String(b.commit);
+    }
+    const stmt = (arts as ArtifactView[])
+      .filter((a) => a.kind === "STATEMENT_REVIEW")
+      .sort((a, b) => b.seq - a.seq)[0];
+    if (stmt) {
+      await ensureBody(stmt);
+      stmtReview.value = parseStatementReview((runBodies.value as Record<string, any>)[stmt.id]);
     }
   } catch (e) {
     error.value = toUiError(e);
@@ -1034,6 +1045,7 @@ onMounted(load);
         :questions="questions"
         :events="events"
         :busy="answerBusy"
+        :protocol="stmtReview"
         @answer="doAnswer"
       />
 
