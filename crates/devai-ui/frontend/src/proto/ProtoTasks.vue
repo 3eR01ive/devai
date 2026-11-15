@@ -136,14 +136,19 @@ const rowOf = (t: Task) => {
 // Кто идёт ПРЯМО СЕЙЧАС — отдельной группой сверху: это вопрос «что работает»,
 // а не «в какой стадии». Из стадийных групп такие строки убраны, иначе одно
 // дело стояло бы дважды.
+// «Идёт сейчас» — по снимку платформы (`task.active`), а не по догадке из
+// карточек: снимок знает и живость владельца, и СВОЙ вердикт «живой прогон у
+// закрытой задачи» (stale_terminal_task). Иначе закрытая задача выпадала из
+// «Закрытых», не появляясь в работе, — и счётчики расходились со строками.
+const active = ref<{ task_id: string; stale_terminal_task: boolean }[]>([]);
 const runningIds = computed(
   () =>
     new Set(
-      Object.entries(progress.value)
-        .filter(([, p]) => (p.running_executions ?? []).length > 0)
-        .map(([id]) => id),
+      active.value.filter((r) => !r.stale_terminal_task).map((r) => r.task_id),
     ),
 );
+/** Закрытые задачи, у которых всё ещё живёт прогон: показываем это отдельно. */
+const strayRuns = computed(() => active.value.filter((r) => r.stale_terminal_task).length);
 
 const groups = computed(() => {
   const run = {
@@ -202,7 +207,14 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    tasks.value = await api.tasksList();
+    // Один снимок списка и один снимок идущего: «идёт сейчас» — это вердикт
+    // платформы (кто правда жив), а не пересчёт карточек.
+    const [list, snap] = await Promise.all([
+      api.tasksList(),
+      api.taskActive().catch(() => null),
+    ]);
+    tasks.value = list;
+    active.value = (snap?.rows ?? []) as { task_id: string; stale_terminal_task: boolean }[];
   } catch (e) {
     error.value = toUiError(e);
   } finally {
@@ -227,6 +239,9 @@ onMounted(load);
           {{ g.title }} · {{ g.items.length }}
         </span>
         <!-- закрытые дела не выброшены: они здесь, одной кнопкой -->
+        <span v-if="strayRuns" class="p-runchip stop" title="у закрытых задач остались живые прогоны — их стоит остановить">
+          живой прогон у закрытых · {{ strayRuns }}
+        </span>
         <button class="p-runchip p-toggle" :class="{ on: showClosed }" @click="toggleClosed">
           {{ showClosed ? 'скрыть закрытые' : 'закрытые' }} · {{ closedCount }}
         </button>
@@ -280,6 +295,9 @@ onMounted(load);
       >
         <div>
           <div class="p-name">{{ r.t.display }}</div>
+          <!-- У черновика подпись — первое предложение постановки, а имя, данное
+               человеком, иначе не найти: показываем его второй строкой. -->
+          <div v-if="r.t.state === 'DRAFT' && r.t.title && r.t.title !== r.t.display" class="p-sub">{{ r.t.title }}</div>
           <div class="p-ident">
             <span>{{ r.id }}</span>
             <span v-if="r.u && r.u.measured">

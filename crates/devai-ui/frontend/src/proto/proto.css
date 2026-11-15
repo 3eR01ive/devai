@@ -146,3 +146,8 @@
 .p-newform .p-create:hover:not(:disabled){background:rgba(62,207,142,.28)}
 .p-newform .p-create:disabled{opacity:.45;cursor:not-allowed}
 .p-newform .hint{font-size:10.5px;color:var(--p-dim2)}
+
+/* Вторая строка имени: у черновика подпись — первое предложение постановки,
+   а имя, данное человеком, иначе в списке не найти. */
+.p-sub{font-size:11px;color:var(--p-dim2);margin-top:1px;max-width:52ch;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
