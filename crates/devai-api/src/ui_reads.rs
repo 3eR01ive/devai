@@ -89,8 +89,9 @@ impl Api {
                 });
             }
         };
-        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
-            .map_err(|e| crate::ApiError::refused("bad_request", format!("профиль оценки нечитаем: {e}")))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text).map_err(|e| {
+            crate::ApiError::refused("bad_request", format!("профиль оценки нечитаем: {e}"))
+        })?;
 
         let mut severities: BTreeMap<String, Option<String>> = BTreeMap::new();
         if let Some(map) = doc.get("error_types").and_then(|v| v.as_mapping()) {
@@ -161,10 +162,8 @@ impl Api {
                             for t in d {
                                 if let Some(name) = yaml_str(t) {
                                     let sev = severities.get(&name).cloned().flatten();
-                                    if let Some(f) = sev
-                                        .as_ref()
-                                        .and_then(|s| floors.get(s))
-                                        .and_then(|v| *v)
+                                    if let Some(f) =
+                                        sev.as_ref().and_then(|s| floors.get(s)).and_then(|v| *v)
                                     {
                                         floor = Some(floor.map_or(f, |cur: f64| cur.max(f)));
                                     }
@@ -191,7 +190,11 @@ impl Api {
                         .then_with(|| a.id.cmp(&b.id))
                 });
                 let sum: f64 = items.iter().map(|i| i.weight.unwrap_or(0.0)).sum();
-                groups.push(RuleGroupView { group: title, weight: sum, items });
+                groups.push(RuleGroupView {
+                    group: title,
+                    weight: sum,
+                    items,
+                });
             }
         }
         groups.sort_by(|a, b| {
@@ -266,7 +269,10 @@ impl Api {
                 continue;
             };
             let t = num(&v, "total_tokens").unwrap_or(0);
-            let c = v.get("estimated_cost_usd").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let c = v
+                .get("estimated_cost_usd")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
             total += t;
             cost += c;
             measured += 1;
@@ -428,13 +434,13 @@ impl Api {
                     text: String::new(),
                     candidates,
                     rev_note,
-                })
+                });
             }
             Resolved::Missing => {
                 return Err(crate::ApiError::refused(
                     "no_source",
                     format!("в коммите {rev} нет файла {path}"),
-                ))
+                ));
             }
         };
         let out = std::process::Command::new("git")
@@ -448,7 +454,7 @@ impl Api {
                 return Err(crate::ApiError::refused(
                     "no_source",
                     format!("в коммите {rev} нет файла {path}"),
-                ))
+                ));
             }
         };
         let lines: Vec<&str> = text.split('\n').collect();
@@ -463,7 +469,11 @@ impl Api {
         }
         // Разбор по переводу строки даёт пустой хвост у файла, который
         // заканчивается переводом строки: строкой он не считается.
-        let total = if text.ends_with('\n') { lines.len().saturating_sub(1) } else { lines.len() };
+        let total = if text.ends_with('\n') {
+            lines.len().saturating_sub(1)
+        } else {
+            lines.len()
+        };
         Ok(SourceSliceView {
             path: path.to_string(),
             rev: rev.to_string(),
@@ -491,7 +501,7 @@ impl HomePath for Api {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_path, Resolved};
+    use super::{Resolved, resolve_path};
     use std::path::Path;
     use std::process::Command;
 
@@ -510,15 +520,32 @@ mod tests {
         };
         sh(&["init", "-q"]);
         std::fs::create_dir_all(dir.path().join("crates/api/src/signature")).unwrap();
-        std::fs::write(dir.path().join("crates/api/src/signature/types.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("crates/api/src/signature/types.rs"),
+            "fn a() {}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("crates/api/src/lib.rs"), "fn b() {}\n").unwrap();
         sh(&["add", "-A"]);
-        sh(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+        sh(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
         dir
     }
 
     fn head(dir: &Path) -> String {
-        let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output().unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -569,10 +596,26 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("crates/core/src")).unwrap();
         std::fs::write(dir.path().join("crates/core/src/types.rs"), "fn c() {}\n").unwrap();
         let sh = |args: &[&str]| {
-            assert!(Command::new("git").arg("-C").arg(dir.path()).args(args).status().unwrap().success());
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         };
         sh(&["add", "-A"]);
-        sh(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "two"]);
+        sh(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "two",
+        ]);
         let rev = head(dir.path());
         match resolve_path(dir.path(), &rev, "types.rs").unwrap() {
             Resolved::Ambiguous(c) => {

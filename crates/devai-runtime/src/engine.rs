@@ -2307,8 +2307,14 @@ mod decisions_render_tests {
             question(Some("оператор интерфейса devai\nлюбой, не только автор")),
             question(None),
         ]);
-        assert!(text.contains("question: Пункт user: кто получит результат? Пункт volume"), "{text}");
-        assert!(text.contains("  answer: оператор интерфейса devai\n  любой, не только автор\n"), "{text}");
+        assert!(
+            text.contains("question: Пункт user: кто получит результат? Пункт volume"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  answer: оператор интерфейса devai\n  любой, не только автор\n"),
+            "{text}"
+        );
         assert!(text.contains("answered_by: guerrero"), "{text}");
     }
 

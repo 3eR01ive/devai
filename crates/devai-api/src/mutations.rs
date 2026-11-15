@@ -797,25 +797,26 @@ impl Api {
                 workflow::return_to_rework(p, t, a, rationale.as_deref(), &self.actor, Utc::now())
             }),
             WorkflowOp::Rewind { to, reason } => self.run_op(id, move |t, a| {
-                let target = TaskState::parse(&to).map_err(|_| {
-                    devai_core::CoreError::guard(format!("unknown stage `{to}`"))
-                })?;
+                let target = TaskState::parse(&to)
+                    .map_err(|_| devai_core::CoreError::guard(format!("unknown stage `{to}`")))?;
                 workflow::rewind(p, t, target, &reason, a, &self.actor, Utc::now())
             }),
-            WorkflowOp::Restate { title, description, reason } => {
-                self.run_op(id, move |t, a| {
-                    workflow::restate(
-                        p,
-                        t,
-                        title.as_deref(),
-                        description.as_deref(),
-                        &reason,
-                        a,
-                        &self.actor,
-                        Utc::now(),
-                    )
-                })
-            }
+            WorkflowOp::Restate {
+                title,
+                description,
+                reason,
+            } => self.run_op(id, move |t, a| {
+                workflow::restate(
+                    p,
+                    t,
+                    title.as_deref(),
+                    description.as_deref(),
+                    &reason,
+                    a,
+                    &self.actor,
+                    Utc::now(),
+                )
+            }),
             WorkflowOp::Pause { reason } => self.run_op(id, move |t, _a| {
                 workflow::pause(p, t, reason.as_deref(), &self.actor, Utc::now())
             }),
@@ -1552,13 +1553,9 @@ impl Api {
     /// is published exactly as written (nothing is invented). A body that is
     /// not one JSON object is refused rather than silently left unstamped.
     fn stamp_review_spec(&self, task_id: Id, content: Vec<u8>) -> ApiResult<Vec<u8>> {
-        let spec = self
-            .store
-            .artifacts(task_id)?
-            .into_iter()
-            .find(|a| {
-                a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
-            });
+        let spec = self.store.artifacts(task_id)?.into_iter().find(|a| {
+            a.kind == ArtifactKind::RequirementsSpec && a.status == ArtifactStatus::Current
+        });
         let Some(spec) = spec else {
             return Ok(content);
         };
@@ -1664,7 +1661,8 @@ impl Api {
         if task.state != TaskState::Statement {
             return Ok(());
         }
-        let body = r#"{"verdict":"APPROVED","human_paragraph":"statement checked (test fixture)"}"#.as_bytes();
+        let body = r#"{"verdict":"APPROVED","human_paragraph":"statement checked (test fixture)"}"#
+            .as_bytes();
         let published = self.artifact_publish(PublishReq {
             id: task.id.to_string(),
             kind: ArtifactKind::StatementReview,
@@ -1721,8 +1719,7 @@ impl Api {
             };
             self.store.create_question(&q)?;
             let process = self.process_policy()?;
-            let m =
-                workflow::raise_question(&process, task, q.id, true, &self.actor, Utc::now())?;
+            let m = workflow::raise_question(&process, task, q.id, true, &self.actor, Utc::now())?;
             self.store.commit(task.lock_version, &m)?;
             return Ok(AdvanceOutcome {
                 from: task.state,
@@ -2452,7 +2449,8 @@ impl Api {
                     &self.actor,
                     Utc::now(),
                 )?;
-                self.store.answer_question(q.id, text, &self.actor, Utc::now())?;
+                self.store
+                    .answer_question(q.id, text, &self.actor, Utc::now())?;
                 self.store.commit(task.lock_version, &m)?;
                 return Ok(AnsweredOutcome {
                     question_id: q.id,
@@ -2521,10 +2519,7 @@ impl Api {
             .rev()
             .any(|ev| {
                 ev.kind == event_kind::QUESTION_RAISED
-                    && ev
-                        .payload
-                        .get(json_field::GATE)
-                        .and_then(|v| v.as_str())
+                    && ev.payload.get(json_field::GATE).and_then(|v| v.as_str())
                         == Some(workflow::GATE_REVIEW_RETURN)
                     && ev
                         .payload
@@ -3660,7 +3655,10 @@ mod tests {
             .unwrap();
 
         let out = api
-            .question_answer(&asked.question.id.to_string(), "любой оператор интерфейса devai")
+            .question_answer(
+                &asked.question.id.to_string(),
+                "любой оператор интерфейса devai",
+            )
             .unwrap();
         assert_eq!(out.to_state, TaskState::Statement);
 
@@ -3670,9 +3668,11 @@ mod tests {
             "постановка должна нести вписанный ответ: {}",
             after.business_description
         );
-        assert!(after
-            .business_description
-            .contains("любой оператор интерфейса devai"));
+        assert!(
+            after
+                .business_description
+                .contains("любой оператор интерфейса devai")
+        );
     }
 
     // --- REQ-API-01 / REQ-API-02 (QA artifact 01a1acab-18b1, ratified
@@ -5080,7 +5080,11 @@ scoring:
         // The drive also publishes the statement checker's verdict, so the
         // steps are "checker + analyst + reviewer" — at least the two the
         // gate presents must be there.
-        assert!(arts.len() >= 2, "analyst + reviewer ran, got {}", arts.len());
+        assert!(
+            arts.len() >= 2,
+            "analyst + reviewer ran, got {}",
+            arts.len()
+        );
         for (label, text) in &o.gate_human_paragraphs {
             let kind = if label.starts_with("requirements") {
                 ArtifactKind::RequirementsSpec

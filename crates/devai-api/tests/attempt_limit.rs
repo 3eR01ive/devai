@@ -51,7 +51,7 @@ fn task(api: &Api) -> String {
         .to_string();
     // DRAFT -> ANALYSIS (no role ran yet: the row count stays ours).
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     id
 }
 

@@ -710,9 +710,7 @@ impl Api {
             let Ok(version) = version.parse::<u32>() else {
                 continue;
             };
-            let Some((_, _, schema)) = stored
-                .iter()
-                .find(|(n, v, _)| n == name && *v == version)
+            let Some((_, _, schema)) = stored.iter().find(|(n, v, _)| n == name && *v == version)
             else {
                 continue;
             };
@@ -1295,13 +1293,11 @@ impl Api {
             view.note = Some("modified, binary content — raw bytes are not rendered".into());
             return Ok(());
         }
-        view.diff = Some(
-            if full {
-                worktree::diff_text_full(repo, baseline, tip, path).map_err(git_err)?
-            } else {
-                worktree::diff_text(repo, baseline, tip, path).map_err(git_err)?
-            },
-        );
+        view.diff = Some(if full {
+            worktree::diff_text_full(repo, baseline, tip, path).map_err(git_err)?
+        } else {
+            worktree::diff_text(repo, baseline, tip, path).map_err(git_err)?
+        });
         Ok(())
     }
 

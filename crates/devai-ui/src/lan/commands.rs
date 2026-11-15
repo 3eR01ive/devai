@@ -998,8 +998,18 @@ fn source_slice_rpc(
     let rev = param_str(params, "rev")?;
     let path = param_str(params, "path")?;
     let from = params.get("from").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-    let to = params.get("to").and_then(|v| v.as_u64()).unwrap_or(from as u64 + 12) as u32;
-    to_json(crate::commands::source_slice(state(app), id_prefix, rev, path, from, to)?)
+    let to = params
+        .get("to")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(from as u64 + 12) as u32;
+    to_json(crate::commands::source_slice(
+        state(app),
+        id_prefix,
+        rev,
+        path,
+        from,
+        to,
+    )?)
 }
 
 fn execution_cancel_rpc(

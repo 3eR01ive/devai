@@ -3,21 +3,39 @@
 // независимы, а при неопределённости экран открывается сверху.
 //
 // jsdom раскладки не считает, поэтому высоты содержимого и окна задаются у
-// подставного контейнера явно, а кадры восстановления прогоняются вручную —
-// проверка не зависит от таймингов браузера.
-import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { beforeEach, describe, expect, it } from "vitest";
-import { createMemoryHistory, createRouter } from "vue-router";
-import { installScrollMemory, rememberedOffset, resetScrollMemory } from "../scrollMemory";
+// контейнера явно, а кадры восстановления прогоняются вручную — проверка не
+// зависит от таймингов браузера. Два последних кейса идут дальше подставного
+// объекта: монтируется настоящая оболочка окна и настоящий RouterView, так что
+// порядок «маршрут сменился → DOM перерисован» проверяется на живой разметке.
+import { flushPromises, mount } from "@vue/test-utils";
+import { defineComponent, h, nextTick } from "vue";
+import { createMemoryHistory, createRouter, RouterView } from "vue-router";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import App from "../App.vue";
+import { installScrollMemory, installScrollMemoryInDocument, rememberedOffset, resetScrollMemory } from "../scrollMemory";
 
-const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const mocks = vi.hoisted(() => ({
+  sessionInfo: vi.fn(),
+  inboxView: vi.fn(),
+  taskActive: vi.fn(),
+}));
+
+vi.mock("../api", () => ({
+  api: {
+    sessionInfo: mocks.sessionInfo,
+    inboxView: mocks.inboxView,
+    taskActive: mocks.taskActive,
+  },
+  toUiError: (e: unknown) => e,
+  // Окно оператора: приглашение проводит своя страница, но в этом кейсе его нет.
+  pageWatchesPairing: false,
+  pairingShell: false,
+}));
+
 const VIEWPORT = 400;
 
-/// Подставной прокручиваемый контейнер: своя высота содержимого и место.
-function scrollHost(contentHeight: number) {
-  const el = document.createElement("div");
+/// Прокручиваемый контейнер без раскладки: своя высота содержимого и место.
+function layout(el: HTMLElement, contentHeight: number) {
   let height = contentHeight;
   let top = 0;
   Object.defineProperty(el, "scrollHeight", { configurable: true, get: () => height });
@@ -30,7 +48,6 @@ function scrollHost(contentHeight: number) {
     },
   });
   return {
-    el,
     /// Содержимое экрана дорисовалось до такой высоты.
     setContent(h: number) {
       height = h;
@@ -42,6 +59,12 @@ function scrollHost(contentHeight: number) {
     },
     top: () => top,
   };
+}
+
+/// Подставной контейнер: тот же layout на отдельном элементе.
+function scrollHost(contentHeight: number) {
+  const el = document.createElement("div");
+  return { el, ...layout(el, contentHeight) };
 }
 
 /// Кадры восстановления: копим и прогоняем по шагу — тест сам решает, когда.
@@ -61,7 +84,7 @@ function frameQueue() {
   };
 }
 
-const Blank = { template: "<div />" };
+const Blank = { render: () => h("div") };
 
 function makeRouter() {
   return createRouter({
@@ -97,7 +120,16 @@ function harness(contentHeight = 5000) {
   };
 }
 
-beforeEach(() => resetScrollMemory());
+beforeEach(() => {
+  resetScrollMemory();
+  mocks.sessionInfo.mockResolvedValue({ home: "/home/test", actor: "tester", opened_at: "2026-11-15T10:00:00Z" });
+  mocks.inboxView.mockResolvedValue({ badge: 0, tasks: [], stopped: [], notes: [] });
+  mocks.taskActive.mockResolvedValue({ snapshot_at: "", rows: [] });
+});
+
+afterEach(() => {
+  document.body.innerHTML = "";
+});
 
 describe("место экрана помнится само", () => {
   it("список, промотанный вниз, не переносит место в открытую задачу", async () => {
@@ -249,13 +281,106 @@ describe("прокрутка одного экрана не влияет на д
 });
 
 describe("окно подключает память к своему контейнеру", () => {
-  it("оболочка помечает контейнер, а запуск окна ставит на него память", () => {
-    const app = readFileSync(join(SRC, "App.vue"), "utf8");
-    const main = readFileSync(join(SRC, "main.ts"), "utf8");
-    // Разметка оболочки: тот самый единственный прокручиваемый контейнер.
-    expect(app).toContain('<main class="content" data-scroll-host>');
-    // Запуск окна: находит его по этой метке и подключает память.
-    expect(main).toContain('querySelector<HTMLElement>("[data-scroll-host]")');
-    expect(main).toContain("installScrollMemory(scrollHost, router)");
+  it("оболочка отдаёт единственный прокручиваемый контейнер, и память ставится на него", async () => {
+    const wrapper = mount(App, {
+      attachTo: document.body,
+      global: { stubs: { RouterLink: { template: "<a><slot /></a>" }, RouterView: { template: "<div />" } } },
+    });
+    await flushPromises();
+    // Разметка оболочки: ровно один прокручиваемый контейнер, помеченный для
+    // памяти. Метка проверяется на смонтированном окне, а не строкой шаблона.
+    const root = wrapper.element as HTMLElement;
+    const host = root.querySelector("[data-scroll-host]");
+    expect(host).not.toBeNull();
+    expect(root.querySelectorAll("[data-scroll-host]").length).toBe(1);
+
+    const view = layout(host as HTMLElement, 5000);
+    const router = makeRouter();
+    const frames = frameQueue();
+    const dispose = installScrollMemoryInDocument(router, {
+      frame: frames.frame,
+      now: () => 0,
+      budgetMs: 100,
+    });
+    // Контейнер найден по метке — окно действительно получает память.
+    expect(dispose).toBeTypeOf("function");
+
+    await router.push("/proto/tasks");
+    await nextTick();
+    frames.run();
+    view.scrollTo(1200);
+    expect(rememberedOffset("/proto/tasks")).toBe(1200);
+
+    dispose?.();
+    wrapper.unmount();
+  });
+
+  it("без помеченного контейнера память не ставится и не падает", () => {
+    expect(installScrollMemoryInDocument(makeRouter())).toBeNull();
+  });
+});
+
+describe("на живой разметке: уход с экрана запоминается до перерисовки", () => {
+  const screen = (cls: string) =>
+    defineComponent({
+      setup() {
+        return () => h("section", { class: cls }, cls);
+      },
+    });
+
+  /// Настоящая оболочка: тот же контейнер, но внутри живой RouterView —
+  /// смена маршрута действительно заменяет DOM-содержимое.
+  function mountShell() {
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: "/", component: screen("list") },
+        { path: "/proto/tasks", component: screen("list") },
+        { path: "/proto/task/:id", component: screen("card") },
+      ],
+    });
+    const Shell = defineComponent({
+      setup() {
+        return () => h("div", { class: "content", "data-scroll-host": "" }, [h(RouterView)]);
+      },
+    });
+    const wrapper = mount(Shell, { global: { plugins: [router] }, attachTo: document.body });
+    const view = layout(wrapper.element as HTMLElement, 5000);
+    const frames = frameQueue();
+    const dispose = installScrollMemoryInDocument(router, {
+      frame: frames.frame,
+      now: () => 0,
+      budgetMs: 100,
+    });
+    return { wrapper, router, view, frames, dispose };
+  }
+
+  it("место списка снято со старого экрана, а карточка уже сверху", async () => {
+    const { wrapper, router, view, frames, dispose } = mountShell();
+    await router.push("/proto/tasks");
+    await nextTick();
+    frames.run();
+    expect(wrapper.element.querySelector(".list")).not.toBeNull();
+
+    view.scrollTo(1200);
+    await router.push("/proto/task/a");
+    await nextTick();
+    frames.run();
+
+    // DOM действительно сменился: в окне карточка, а не список.
+    expect(wrapper.element.querySelector(".card")).not.toBeNull();
+    expect(wrapper.element.querySelector(".list")).toBeNull();
+    // Уходящий экран запомнил своё место ДО перерисовки (иначе здесь был бы 0).
+    expect(rememberedOffset("/proto/tasks")).toBe(1200);
+    expect(view.top()).toBe(0);
+
+    // И возврат ставит живой список на прежнее место.
+    await router.push("/proto/tasks");
+    await nextTick();
+    frames.run();
+    expect(view.top()).toBe(1200);
+
+    dispose?.();
+    wrapper.unmount();
   });
 });

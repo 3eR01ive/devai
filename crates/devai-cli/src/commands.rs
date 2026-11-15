@@ -830,9 +830,14 @@ fn task_state_ops(ctx: &Ctx, cmd: TaskCmd) -> Result<()> {
             render_mutation(&op(ctx.api().task_cancel(&id, reason))?)?
         }
         TaskCmd::Rewind { id, to, reason } => {
-            render_mutation(&op(ctx.api().task_rewind(&id, &to, &reason))?)? 
+            render_mutation(&op(ctx.api().task_rewind(&id, &to, &reason))?)?
         }
-        TaskCmd::Restate { id, title, description, reason } => {
+        TaskCmd::Restate {
+            id,
+            title,
+            description,
+            reason,
+        } => {
             // «-» = постановка целиком из stdin: длинный текст не должен
             // зависеть от экранирования кавычек в оболочке.
             let description = match description.as_deref() {
@@ -844,7 +849,12 @@ fn task_state_ops(ctx: &Ctx, cmd: TaskCmd) -> Result<()> {
                 }
                 other => other.map(str::to_string),
             };
-            render_mutation(&op(ctx.api().task_restate(&id, title, description, &reason))?)?
+            render_mutation(&op(ctx.api().task_restate(
+                &id,
+                title,
+                description,
+                &reason,
+            ))?)?
         }
         TaskCmd::Fail { id, reason } => render_mutation(&op(ctx.api().task_fail(&id, reason))?)?,
         _ => unreachable!("the dispatcher routes only state arms here"),

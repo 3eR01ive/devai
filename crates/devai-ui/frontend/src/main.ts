@@ -1,7 +1,7 @@
 import { createApp } from "vue";
 import App from "./App.vue";
 import { router } from "./router";
-import { installScrollMemory } from "./scrollMemory";
+import { installScrollMemoryInDocument } from "./scrollMemory";
 import "./styles.css";
 // Подсветка кода: тема и нумерация строк (вставки кода в карточке задачи).
 import "prismjs/themes/prism-tomorrow.css";
@@ -20,7 +20,6 @@ if (landing.searchParams.has("token")) {
 createApp(App).use(router).mount("#app");
 
 // Прокрутка окна одна на все экраны (styles.css:110-117). Память по экранам
-// подключается здесь, где известны и маршрутизатор, и сам контейнер: без неё
-// место списка задач «переезжало» в открытую карточку.
-const scrollHost = document.querySelector<HTMLElement>("[data-scroll-host]");
-if (scrollHost) installScrollMemory(scrollHost, router);
+// подключается после первой отрисовки оболочки — к контейнеру, помеченному в
+// разметке: без неё место списка задач «переезжало» в открытую карточку.
+installScrollMemoryInDocument(router);

@@ -55,7 +55,7 @@ fn the_supervisor_opens_the_row_hands_a_handle_and_drives_the_chain() {
     let (dir, api) = home();
     let id = task(&api, "supervised");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap(); // DRAFT -> ANALYSIS (no role ran yet)
+    api.statement_approve_for_tests(&id).unwrap(); // DRAFT -> ANALYSIS (no role ran yet)
     let ack = dir.path().join("ack");
     let run = new_id().to_string();
     let report = api
@@ -106,7 +106,7 @@ fn a_second_launch_is_a_typed_refusal_naming_the_owner_and_touches_nothing() {
     let (dir, api) = home();
     let id = task(&api, "busy");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let first = api
         .exec_start(devai_api::ExecStartReq {
             id: id.clone(),
@@ -212,7 +212,7 @@ fn task_run_returns_the_typed_already_running_outcome_with_the_owner_id() {
     let (dir, api) = home();
     let id = task(&api, "already running");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let script = stub_runner(dir.path(), "busy");
     let api = api.with_runner(Some(script));
     let o = api
@@ -241,7 +241,7 @@ fn repeated_launch_failures_are_counted_events_and_the_threshold_parks_the_task(
     let (dir, api) = home();
     let id = task(&api, "no runner");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     // `Api::open` never auto-launches, so all attempts are explicit ones.
     // Point the runner resolution at a path that cannot exist: a spawn-class
     // launch failure, deterministic on every host.
@@ -307,7 +307,7 @@ fn entering_a_role_state_after_a_human_act_starts_the_run_itself() {
     // `task start` enters ANALYSIS, a ROLE state: the platform must start the
     // run without a second command (REQ-AR-11/12).
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
 
     let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap_or_default();
     assert!(
@@ -329,7 +329,7 @@ fn answering_a_blocking_question_starts_the_resumed_stage_itself() {
     let api = api.with_runner(Some(script));
     let id = task(&api, "answer resumes");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap(); // enters ANALYSIS, launches (1)
+    api.statement_approve_for_tests(&id).unwrap(); // enters ANALYSIS, launches (1)
     let asked = api
         .question_ask(AskReq {
             id: id.clone(),
@@ -364,7 +364,7 @@ fn revising_the_spec_starts_the_reviewer_itself() {
     let api = api.with_runner(Some(script));
     let id = task(&api, "revise launches review");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap(); // launches (1)
+    api.statement_approve_for_tests(&id).unwrap(); // launches (1)
     let marker = dir.path().join("argv");
     std::fs::write(&marker, "").unwrap();
     api.task_revise(ReviseReq {
@@ -398,7 +398,7 @@ fn signing_the_gate_from_the_window_starts_the_implementation_itself() {
     let api = api.with_runner(Some(script));
     let id = task(&api, "window signature");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap(); // DRAFT -> ANALYSIS (launch 1)
+    api.statement_approve_for_tests(&id).unwrap(); // DRAFT -> ANALYSIS (launch 1)
     api.task_revise(ReviseReq {
         id: id.clone(),
         name: "spec.md".into(),
@@ -436,7 +436,7 @@ fn an_outcome_that_cannot_be_written_leaves_a_trace_in_the_store() {
     let (dir, api) = home();
     let id = task(&api, "unwritable outcome");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     // The run's evidence directory is deliberately never created, so the
     // outcome file cannot land (a real runner creates it; here it cannot).
     let run = new_id().to_string();

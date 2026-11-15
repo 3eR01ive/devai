@@ -1898,7 +1898,15 @@ pub fn restate(
 
     let replay = !matches!(task.state, TaskState::Draft | TaskState::Statement);
     let mut m = if replay {
-        rewind(process, task, TaskState::Statement, reason, artifacts, actor, now)?
+        rewind(
+            process,
+            task,
+            TaskState::Statement,
+            reason,
+            artifacts,
+            actor,
+            now,
+        )?
     } else {
         note(
             task,

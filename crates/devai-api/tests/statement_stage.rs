@@ -129,7 +129,11 @@ fn questions_hold_the_task_and_read_like_a_list_for_the_human() {
     .unwrap();
 
     let task = api.task_get(&id).unwrap();
-    assert_eq!(task.state, TaskState::WaitingForInput, "the human owes answers");
+    assert_eq!(
+        task.state,
+        TaskState::WaitingForInput,
+        "the human owes answers"
+    );
     assert_eq!(task.return_state, Some(TaskState::Statement));
 
     let q = store.list_questions(task.id).unwrap();
@@ -195,7 +199,10 @@ fn answering_the_checker_returns_the_task_to_him_not_to_the_analysis() {
     let task = api.task_get(&id).unwrap();
     let q = store.list_questions(task.id).unwrap();
     let answered = api
-        .question_answer(&q[0].id.to_string(), "Пользуется дежурный оператор; видно по списку.")
+        .question_answer(
+            &q[0].id.to_string(),
+            "Пользуется дежурный оператор; видно по списку.",
+        )
         .unwrap();
     assert_eq!(answered.to_state, TaskState::Statement);
 }

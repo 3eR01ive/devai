@@ -29,6 +29,7 @@ export interface ScrollHost {
   removeEventListener(type: string, listener: EventListener, options?: EventListenerOptions | boolean): void;
 }
 
+/// Планировщик кадров и часы — швы для проверки без таймингов браузера.
 export interface ScrollMemoryOptions {
   /// Планировщик кадров: по умолчанию requestAnimationFrame.
   frame?: (step: () => void) => () => void;
@@ -41,6 +42,14 @@ export interface ScrollMemoryOptions {
 /// Сколько ждём растущее содержимое, прежде чем считать место потерянным.
 /// Срок ограничен: лучше открыть сверху, чем оставить человека в середине.
 const RESTORE_BUDGET_MS = 1200;
+
+/// Допуск на округление: браузер отдаёт scrollTop целым числом пикселей,
+/// поэтому «попали точно в место» — это расхождение не больше одного пикселя.
+const SETTLE_TOLERANCE_PX = 1;
+
+/// Жесты, которыми человек управляет прокруткой сам: его место важнее
+/// отложенного восстановления.
+const USER_SCROLL_INTENTS = ["wheel", "touchstart", "touchmove", "keydown"];
 
 /// Место каждого экрана: ключ — адрес экрана. Память живёт в окне: после
 /// перезапуска её нет, и это честный «не определить — в начало».
@@ -56,6 +65,21 @@ export function resetScrollMemory(): void {
   offsets.clear();
 }
 
+/// Запомнить место экрана. Отрицательное значение — не место, а верх.
+function remember(screen: string, top: number): void {
+  offsets.set(screen, Math.max(0, top));
+}
+
+/// Насколько всего может уехать прокрутка: содержимое минус высота окна.
+function offsetLimit(host: ScrollHost): number {
+  return Math.max(0, host.scrollHeight - host.clientHeight);
+}
+
+/// Окно стоит ровно там, куда его просили (с точностью до округления).
+function reached(host: ScrollHost, want: number): boolean {
+  return Math.abs(host.scrollTop - want) <= SETTLE_TOLERANCE_PX;
+}
+
 const defaultFrame = (step: () => void): (() => void) => {
   if (typeof requestAnimationFrame === "function") {
     const id = requestAnimationFrame(() => step());
@@ -68,6 +92,111 @@ const defaultFrame = (step: () => void): (() => void) => {
 const defaultNow = (): number =>
   typeof performance !== "undefined" ? performance.now() : Date.now();
 
+/// Восстановление места одного экрана: помнит, какой экран сейчас открыт и
+/// идёт ли ещё отложенное восстановление (его промежуточные движения не
+/// записываются как место человека).
+class ScreenRestorer {
+  private activeKey: string | null = null;
+  private cancelFrame: (() => void) | null = null;
+  private restoring = false;
+  private startedAt = 0;
+  private readonly host: ScrollHost;
+  private readonly frame: (step: () => void) => () => void;
+  private readonly now: () => number;
+  private readonly budget: number;
+
+  constructor(
+    host: ScrollHost,
+    frame: (step: () => void) => () => void,
+    now: () => number,
+    budget: number,
+  ) {
+    this.host = host;
+    this.frame = frame;
+    this.now = now;
+    this.budget = budget;
+  }
+
+  /// Какой экран считается открытым (для первого запуска окна).
+  get active(): string | null {
+    return this.activeKey;
+  }
+
+  /// Движение прокрутки: пока идёт восстановление, оно промежуточное и в
+  /// память не попадает.
+  observe(top: number): void {
+    if (this.restoring || !this.activeKey) return;
+    remember(this.activeKey, top);
+  }
+
+  /// Уход с экрана: запоминаем ровно то, что видит человек. Маршрутизатор
+  /// зовёт afterEach до перерисовки экрана (vue-router: finalizeNavigation →
+  /// triggerAfterEach одним блоком), поэтому контейнер ещё держит место
+  /// уходящего экрана. Прерванное восстановление оставляет прежнее место.
+  leave(screen: string, top: number): void {
+    if (!this.restoring) remember(screen, top);
+  }
+
+  /// Человек сам взялся крутить — его место важнее отложенного восстановления.
+  stopOnUserIntent(): void {
+    if (this.restoring) this.stop();
+  }
+
+  stop(): void {
+    this.cancelFrame?.();
+    this.cancelFrame = null;
+    this.restoring = false;
+  }
+
+  /// Экран переключается на место памяти ДО любых движений: чужая позиция
+  /// не должна попасть в слот нового экрана.
+  restore(key: string): void {
+    this.stop();
+    this.activeKey = key;
+    const want = offsets.get(key) ?? 0;
+    if (!want) {
+      // Нечего помнить — экран открывается сверху, и это его место.
+      this.settle(key, 0);
+      return;
+    }
+    this.startedAt = this.now();
+    this.restoring = true;
+    this.schedule(key, want);
+  }
+
+  /// Восстановление закончилось: экран стоит там, где стоит сейчас.
+  private settle(key: string, top: number): void {
+    this.host.scrollTop = top;
+    remember(key, this.host.scrollTop);
+    this.stop();
+  }
+
+  /// Один кадр: применить место, как только содержимое доросло до него;
+  /// иначе ждать (и сдаться на верх, когда срок вышел).
+  private step(key: string, want: number): void {
+    this.cancelFrame = null;
+    if (!this.restoring || this.activeKey !== key) return;
+    const fits = want <= offsetLimit(this.host);
+    if (fits) {
+      this.host.scrollTop = want;
+      if (reached(this.host, want)) {
+        this.stop();
+        return;
+      }
+    }
+    if (this.now() - this.startedAt >= this.budget) {
+      // Место мимо содержимого (экран стал короче или не дорос) — сверху.
+      this.settle(key, fits ? want : 0);
+      return;
+    }
+    this.schedule(key, want);
+  }
+
+  private schedule(key: string, want: number): void {
+    this.cancelFrame = this.frame(() => this.step(key, want));
+  }
+}
+
 /// Подключить память к прокручиваемому контейнеру окна и маршрутизатору.
 /// Возвращает отписку — окно снимает её при размонтировании корня.
 export function installScrollMemory(
@@ -75,99 +204,45 @@ export function installScrollMemory(
   router: Router,
   options: ScrollMemoryOptions = {},
 ): () => void {
-  const frame = options.frame ?? defaultFrame;
-  const now = options.now ?? defaultNow;
-  const budget = options.budgetMs ?? RESTORE_BUDGET_MS;
+  const restorer = new ScreenRestorer(
+    host,
+    options.frame ?? defaultFrame,
+    options.now ?? defaultNow,
+    options.budgetMs ?? RESTORE_BUDGET_MS,
+  );
 
-  let activeKey: string | null = null;
-  let cancelFrame: (() => void) | null = null;
-  let restoring = false;
-
-  function stopRestore(): void {
-    cancelFrame?.();
-    cancelFrame = null;
-    restoring = false;
-  }
-
-  function remember(screen: string, top: number): void {
-    offsets.set(screen, Math.max(0, top));
-  }
-
-  // Живое место экрана: пишем каждое движение, чтобы возврат был точным.
-  // Пока идёт восстановление, движения промежуточные — их не запоминаем.
-  const onScroll: EventListener = () => {
-    if (restoring || !activeKey) return;
-    remember(activeKey, host.scrollTop);
-  };
-
-  // Человек сам взялся крутить — его место важнее отложенного восстановления.
-  const onUserScroll: EventListener = () => {
-    if (restoring) stopRestore();
-  };
-
-  /// Восстановить место экрана `key` (или открыть его сверху).
-  function restore(key: string): void {
-    stopRestore();
-    activeKey = key;
-    // Экран переключается на место памяти ДО любых движений: чужая позиция
-    // не должна попасть в слот нового экрана.
-    const want = offsets.get(key) ?? 0;
-    if (!want) {
-      host.scrollTop = 0;
-      remember(key, 0);
-      return;
-    }
-    const startedAt = now();
-    restoring = true;
-    const step = () => {
-      cancelFrame = null;
-      if (!restoring || activeKey !== key) return;
-      const max = Math.max(0, host.scrollHeight - host.clientHeight);
-      if (want <= max) {
-        host.scrollTop = want;
-        if (Math.abs(host.scrollTop - want) <= 1) {
-          stopRestore();
-          return;
-        }
-      }
-      if (now() - startedAt >= budget) {
-        // Место мимо содержимого (экран стал короче или не дорос) — сверху.
-        host.scrollTop = want <= max ? want : 0;
-        // Экран открыт сверху — это и есть его место, старое забыто.
-        remember(key, host.scrollTop);
-        stopRestore();
-        return;
-      }
-      cancelFrame = frame(step);
-    };
-    cancelFrame = frame(step);
-  }
-
+  const onScroll: EventListener = () => restorer.observe(host.scrollTop);
+  const onUserScroll: EventListener = () => restorer.stopOnUserIntent();
   host.addEventListener("scroll", onScroll);
-  const userIntents = ["wheel", "touchstart", "touchmove", "keydown"];
-  for (const type of userIntents) host.addEventListener(type, onUserScroll);
+  for (const type of USER_SCROLL_INTENTS) host.addEventListener(type, onUserScroll);
 
   const offRoute = router.afterEach((to, from, failure) => {
     // Переход не состоялся (страж отменил) — экран тот же, память не трогаем.
     if (failure) return;
-    // Уходящий экран: запоминаем ровно то, что видит человек. Маршрутизатор
-    // зовёт afterEach до перерисовки экрана (vue-router: finalizeNavigation →
-    // triggerAfterEach одним блоком), поэтому контейнер ещё держит место
-    // уходящего экрана. Пока шло восстановление, scrollTop промежуточный —
-    // оставляем прежнее место.
-    if (!restoring) remember(from.path, host.scrollTop);
-    restore(to.path);
+    restorer.leave(from.path, host.scrollTop);
+    restorer.restore(to.path);
   });
 
   // Первый экран: `afterEach` мог пройти до установки памяти.
   void router.isReady().then(() => {
-    if (activeKey === null) restore(router.currentRoute.value.path);
+    if (restorer.active === null) restorer.restore(router.currentRoute.value.path);
   });
 
   return () => {
-    stopRestore();
+    restorer.stop();
     host.removeEventListener("scroll", onScroll);
-    for (const type of userIntents) host.removeEventListener(type, onUserScroll);
+    for (const type of USER_SCROLL_INTENTS) host.removeEventListener(type, onUserScroll);
     offRoute();
   };
+}
+
+/// Подключить память к контейнеру, который оболочка окна помечает в разметке
+/// (`data-scroll-host`). Так запуск окна и проверка пользуются одним путём:
+/// поиск контейнера не дублируется в коде и в тесте строкой.
+export function installScrollMemoryInDocument(
+  router: Router,
+  options: ScrollMemoryOptions = {},
+): (() => void) | null {
+  const host = document.querySelector<HTMLElement>("[data-scroll-host]");
+  return host ? installScrollMemory(host, router, options) : null;
 }

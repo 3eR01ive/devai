@@ -1008,7 +1008,15 @@ pub fn task_new(
     parent: Option<Vec<String>>,
     blocked_by: Option<Vec<String>>,
 ) -> Result<devai_core::types::Task, UiError> {
-    task_new_as(state, title, description, project_id, parent, blocked_by, None)
+    task_new_as(
+        state,
+        title,
+        description,
+        project_id,
+        parent,
+        blocked_by,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1075,7 +1083,9 @@ pub fn task_rewind_as(
     reason: String,
     actor: Option<String>,
 ) -> Result<StatusView, UiError> {
-    with_actor_write(&state, actor, |api| api.task_rewind(&id_prefix, &to, &reason))?;
+    with_actor_write(&state, actor, |api| {
+        api.task_rewind(&id_prefix, &to, &reason)
+    })?;
     Ok(state.api().task_status(&id_prefix)?)
 }
 
@@ -1150,7 +1160,9 @@ pub fn question_answer_as(
     text: String,
     actor: Option<String>,
 ) -> Result<StatusView, UiError> {
-    with_actor_write(&state, actor, |api| api.question_answer(&question_id, &text))?;
+    with_actor_write(&state, actor, |api| {
+        api.question_answer(&question_id, &text)
+    })?;
     Ok(state.api().task_status(&id_prefix)?)
 }
 
@@ -1396,7 +1408,9 @@ pub fn source_slice(
     from: u32,
     to: u32,
 ) -> Result<devai_api::SourceSliceView, UiError> {
-    Ok(state.api().source_slice(&id_prefix, &rev, &path, from, to)?)
+    Ok(state
+        .api()
+        .source_slice(&id_prefix, &rev, &path, from, to)?)
 }
 
 #[tauri::command(rename_all = "snake_case")]

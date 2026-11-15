@@ -368,7 +368,10 @@ pub fn diff_text(repo: &Path, from: &str, to: &str, path: &str) -> WorktreeResul
 /// hides between hunks without a second read and without recomputing git.
 /// Same baseline..tip range — the diff stays consistent with the list.
 pub fn diff_text_full(repo: &Path, from: &str, to: &str, path: &str) -> WorktreeResult<String> {
-    git(repo, &["diff", "-U100000", &format!("{from}..{to}"), "--", path])
+    git(
+        repo,
+        &["diff", "-U100000", &format!("{from}..{to}"), "--", path],
+    )
 }
 
 /// True when the range changes `path` with binary content: `git diff

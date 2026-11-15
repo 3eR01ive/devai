@@ -773,38 +773,107 @@ fn rewind_goes_back_by_the_declaration_and_marks_downstream_stale() {
     // а результаты анализа и ниже перестают быть свежими — не удаляются.
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);
-    let m = workflow::rewind(&proc(), &t, TaskState::Statement, "постановка была кривая", &artifacts, "u", now())
-        .unwrap();
+    let m = workflow::rewind(
+        &proc(),
+        &t,
+        TaskState::Statement,
+        "постановка была кривая",
+        &artifacts,
+        "u",
+        now(),
+    )
+    .unwrap();
     assert_eq!(m.task.state, TaskState::Statement);
     // спека анализа помечена STALE — история остаётся, свежесть нет
-    let staled: Vec<_> = m.artifact_status.iter().map(|(id, st)| (*id, *st)).collect();
+    let staled: Vec<_> = m
+        .artifact_status
+        .iter()
+        .map(|(id, st)| (*id, *st))
+        .collect();
     assert!(
-        staled.iter().any(|(id, st)| artifacts.iter().any(|a| a.id == *id && a.kind == ArtifactKind::RequirementsSpec) && *st == ArtifactStatus::Stale),
+        staled.iter().any(|(id, st)| artifacts
+            .iter()
+            .any(|a| a.id == *id && a.kind == ArtifactKind::RequirementsSpec)
+            && *st == ArtifactStatus::Stale),
         "{staled:?}"
     );
-    assert!(m.events.iter().any(|e| e.kind == devai_core::types::event_kind::TASK_REWOUND));
-    assert!(m.events.iter().any(|e| e.kind == devai_core::types::event_kind::ARTIFACTS_STALED));
+    assert!(
+        m.events
+            .iter()
+            .any(|e| e.kind == devai_core::types::event_kind::TASK_REWOUND)
+    );
+    assert!(
+        m.events
+            .iter()
+            .any(|e| e.kind == devai_core::types::event_kind::ARTIFACTS_STALED)
+    );
 }
 
 #[test]
 fn rewind_needs_a_reason_and_a_real_stage() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Review, &mut artifacts);
-    assert!(workflow::rewind(&proc(), &t, TaskState::Analysis, "  ", &artifacts, "u", now()).is_err());
-    assert!(workflow::rewind(&proc(), &t, TaskState::Draft, "назад", &artifacts, "u", now()).is_err());
-    assert!(workflow::rewind(&proc(), &t, TaskState::Review, "туда же", &artifacts, "u", now()).is_err());
+    assert!(
+        workflow::rewind(
+            &proc(),
+            &t,
+            TaskState::Analysis,
+            "  ",
+            &artifacts,
+            "u",
+            now()
+        )
+        .is_err()
+    );
+    assert!(
+        workflow::rewind(
+            &proc(),
+            &t,
+            TaskState::Draft,
+            "назад",
+            &artifacts,
+            "u",
+            now()
+        )
+        .is_err()
+    );
+    assert!(
+        workflow::rewind(
+            &proc(),
+            &t,
+            TaskState::Review,
+            "туда же",
+            &artifacts,
+            "u",
+            now()
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn restate_rewrites_the_statement_and_replays_from_it() {
     let mut artifacts = vec![];
     let t = in_state(&draft_task(), TaskState::Implementation, &mut artifacts);
-    let m = workflow::restate(&proc(), &t, Some("новое имя"), Some("новая постановка"), "ошиблись в постановке", &artifacts, "u", now())
-        .unwrap();
+    let m = workflow::restate(
+        &proc(),
+        &t,
+        Some("новое имя"),
+        Some("новая постановка"),
+        "ошиблись в постановке",
+        &artifacts,
+        "u",
+        now(),
+    )
+    .unwrap();
     assert_eq!(m.task.state, TaskState::Statement);
     assert_eq!(m.task.title, "новое имя");
     assert_eq!(m.task.business_description, "новая постановка");
-    assert!(m.events.iter().any(|e| e.kind == devai_core::types::event_kind::TASK_RESTATED));
+    assert!(
+        m.events
+            .iter()
+            .any(|e| e.kind == devai_core::types::event_kind::TASK_RESTATED)
+    );
 }
 
 #[test]

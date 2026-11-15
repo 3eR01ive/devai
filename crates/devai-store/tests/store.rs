@@ -102,7 +102,11 @@ fn create_resolve_commit_and_locking() {
     let m = workflow::start(&proc(), &by_prefix, "u", now()).unwrap();
     commit(&store, &by_prefix, m);
     let after_start = store.get_task(&t.id.to_string()).unwrap();
-    assert_eq!(after_start.state, TaskState::Statement, "the checker goes first");
+    assert_eq!(
+        after_start.state,
+        TaskState::Statement,
+        "the checker goes first"
+    );
     let m = workflow::statement_approved(&proc(), &after_start, "checker", now()).unwrap();
     commit(&store, &after_start, m);
     let reloaded = store.get_task(&t.id.to_string()).unwrap();

@@ -500,7 +500,14 @@ fn statement_ok(home: &std::path::Path, id: &str) {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_devai"))
         .arg("--home")
         .arg(home)
-        .args(["artifact", "publish", id, "--kind", "STATEMENT_REVIEW", "--file"])
+        .args([
+            "artifact",
+            "publish",
+            id,
+            "--kind",
+            "STATEMENT_REVIEW",
+            "--file",
+        ])
         .arg(&p)
         .output()
         .expect("the devai binary is runnable");

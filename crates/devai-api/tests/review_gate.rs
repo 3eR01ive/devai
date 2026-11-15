@@ -11,7 +11,7 @@
 
 use devai_api::{Api, PublishReq, TaskCreateReq};
 use devai_core::types::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn home() -> (TempDir, Api, devai_store::Store) {
@@ -119,7 +119,13 @@ fn rejection_hands_control_to_the_human_and_names_the_reviewed_spec() {
         .find(|a| a.kind == ArtifactKind::RequirementsSpec)
         .unwrap();
 
-    let review_id = publish(&api, &id, ArtifactKind::ReviewReport, rejection(), Some("needs_revision"));
+    let review_id = publish(
+        &api,
+        &id,
+        ArtifactKind::ReviewReport,
+        rejection(),
+        Some("needs_revision"),
+    );
 
     // 1. Задача паркуется у человека, а не уезжает в следующий круг сама.
     let task = api.task_get(&id).unwrap();
@@ -150,14 +156,26 @@ fn rejection_hands_control_to_the_human_and_names_the_reviewed_spec() {
 fn continue_opens_a_new_round_and_stop_keeps_the_task_with_the_human() {
     let (_d, api, store) = home();
     let id = to_review(&api, "ответ на вопрос о новом круге");
-    publish(&api, &id, ArtifactKind::ReviewReport, rejection(), Some("needs_revision"));
+    publish(
+        &api,
+        &id,
+        ArtifactKind::ReviewReport,
+        rejection(),
+        Some("needs_revision"),
+    );
     let q = store
         .list_questions(api.task_get(&id).unwrap().id)
         .unwrap()
         .remove(0);
 
-    let out = api.question_answer(&q.id.to_string(), attempt_limit_answer::CONTINUE).unwrap();
-    assert_eq!(out.to_state, TaskState::Analysis, "«продолжить» opens the round");
+    let out = api
+        .question_answer(&q.id.to_string(), attempt_limit_answer::CONTINUE)
+        .unwrap();
+    assert_eq!(
+        out.to_state,
+        TaskState::Analysis,
+        "«продолжить» opens the round"
+    );
     assert_eq!(api.task_get(&id).unwrap().return_state, None);
 
     // Второй круг: новая спека → снова отказ → «остановить».
@@ -171,15 +189,27 @@ fn continue_opens_a_new_round_and_stop_keeps_the_task_with_the_human() {
         }),
         None,
     );
-    publish(&api, &id, ArtifactKind::ReviewReport, rejection(), Some("needs_revision"));
+    publish(
+        &api,
+        &id,
+        ArtifactKind::ReviewReport,
+        rejection(),
+        Some("needs_revision"),
+    );
     let q2 = store
         .list_questions(api.task_get(&id).unwrap().id)
         .unwrap()
         .into_iter()
         .find(|q| q.status == QuestionStatus::Open)
         .expect("second rejection asks again");
-    let out = api.question_answer(&q2.id.to_string(), attempt_limit_answer::STOP).unwrap();
-    assert_eq!(out.to_state, TaskState::Blocked, "«остановить» keeps it with the human");
+    let out = api
+        .question_answer(&q2.id.to_string(), attempt_limit_answer::STOP)
+        .unwrap();
+    assert_eq!(
+        out.to_state,
+        TaskState::Blocked,
+        "«остановить» keeps it with the human"
+    );
     let task = api.task_get(&id).unwrap();
     assert_eq!(task.state, TaskState::Blocked);
     assert_eq!(task.return_state, Some(TaskState::Analysis));

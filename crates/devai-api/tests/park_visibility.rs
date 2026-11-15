@@ -86,7 +86,7 @@ fn agent_failure_park_is_presented_with_counter_words_and_verbatim_reason() {
     let (dir, api) = home();
     let id = task(&api, "парковка по отказу агента");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let question_text = park_by_agent_failure(&store, &api, &id);
 
@@ -182,7 +182,7 @@ fn park_immediately_and_manual_stops_are_worded_as_themselves() {
     // A class declared to park immediately: counter and limit are 1/1.
     let id = task(&api, "парковка сразу");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let t = store.get_task(&id).unwrap();
     let now = Utc::now();
     let reason = "failure class `platform` is declared to park immediately — another round cannot \
@@ -216,7 +216,7 @@ fn park_immediately_and_manual_stops_are_worded_as_themselves() {
     // reason is the person's own words.
     let manual = task(&api, "остановка рукой");
     api.task_start(&manual).unwrap();
-        api.statement_approve_for_tests(&manual).unwrap();
+    api.statement_approve_for_tests(&manual).unwrap();
     let t = store.get_task(&manual).unwrap();
     let m = workflow::block(
         Process::factory(),
@@ -248,7 +248,7 @@ fn an_undeclared_stop_token_is_a_loud_error_naming_it() {
     let (dir, api) = home();
     let id = task(&api, "неизвестный тормоз");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let t = store.get_task(&id).unwrap();
     let m = workflow::park(
@@ -286,7 +286,7 @@ fn a_failed_launch_does_not_claim_a_held_task_is_running() {
     let (dir, api) = home();
     let id = task(&api, "отказ запуска, потом блокировка");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let t = store.get_task(&id).unwrap();
     store
@@ -332,7 +332,7 @@ fn a_failed_launch_is_visible_without_parking_the_task() {
     let (dir, api) = home();
     let id = task(&api, "запуск не состоялся");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     // The runner THIS handle launches with: a path that cannot exist — a
     // spawn-class launch failure, deterministic on every host.
     let api = api.with_runner(Some(dir.path().join("no-such-runner")));
@@ -395,7 +395,7 @@ fn the_parked_launch_failure_carries_both_facts_with_matching_counters() {
     let (dir, api) = home();
     let id = task(&api, "порог запусков");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let api = api.with_runner(Some(dir.path().join("no-such-runner")));
     for _ in 0..3 {
         let _ = api.task_run(RunReq {
@@ -430,7 +430,7 @@ fn a_plain_question_hold_is_worded_as_a_question() {
     let (_dir, api) = home();
     let id = task(&api, "вопрос ждёт ответа");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let asked = api
         .question_ask(AskReq {
             id: id.clone(),
@@ -467,7 +467,7 @@ fn a_finished_task_is_not_reported_as_going() {
     let (dir, api) = home();
     let id = task(&api, "отказ запуска, потом отмена");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let t = store.get_task(&id).unwrap();
     store
@@ -512,7 +512,7 @@ fn a_corrupt_question_payload_is_a_loud_error_naming_the_event() {
     let (dir, api) = home();
     let id = task(&api, "битый вопрос");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let t = store.get_task(&id).unwrap();
     let m = workflow::raise_question(
@@ -546,7 +546,7 @@ fn a_failed_launch_without_a_class_is_a_loud_error() {
     let (dir, api) = home();
     let id = task(&api, "отказ без класса");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let store = Store::open(dir.path()).unwrap();
     store
         .insert_event(
@@ -570,7 +570,7 @@ fn a_brake_without_a_counter_states_the_absence() {
     let store = Store::open(dir.path()).unwrap();
     let id = task(&api, "тормоз без счётчика");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let t = store.get_task(&id).unwrap();
     let m = workflow::park(
         Process::factory(),
@@ -609,7 +609,7 @@ fn a_launch_failure_without_details_states_the_absence() {
     let store = Store::open(dir.path()).unwrap();
     let id = task(&api, "отказ без подробностей");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     store
         .insert_event(
             Some(id.parse().unwrap()),
@@ -647,7 +647,7 @@ fn wrong_typed_stop_payloads_are_loud_not_absent() {
 
     let typed = task(&api, "счётчик строкой");
     api.task_start(&typed).unwrap();
-        api.statement_approve_for_tests(&typed).unwrap();
+    api.statement_approve_for_tests(&typed).unwrap();
     let t = store.get_task(&typed).unwrap();
     let m = workflow::park(
         Process::factory(),
@@ -677,7 +677,7 @@ fn wrong_typed_stop_payloads_are_loud_not_absent() {
 
     let nameless = task(&api, "тормоз без имени");
     api.task_start(&nameless).unwrap();
-        api.statement_approve_for_tests(&nameless).unwrap();
+    api.statement_approve_for_tests(&nameless).unwrap();
     let t = store.get_task(&nameless).unwrap();
     let m = workflow::park(
         Process::factory(),
@@ -712,7 +712,7 @@ fn a_wrong_typed_parked_flag_is_a_loud_error() {
     let (_dir, api) = home();
     let id = task(&api, "parked строкой");
     api.task_start(&id).unwrap();
-        api.statement_approve_for_tests(&id).unwrap();
+    api.statement_approve_for_tests(&id).unwrap();
     let store = Store::open(_dir.path()).unwrap();
     store
         .insert_event(
