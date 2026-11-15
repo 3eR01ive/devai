@@ -55,6 +55,12 @@ const USER_SCROLL_INTENTS = ["wheel", "touchstart", "touchmove", "keydown"];
 /// перезапуска её нет, и это честный «не определить — в начало».
 const offsets = new Map<string, number>();
 
+/// У контейнера ровно один экземпляр памяти. Повторная установка возвращает
+/// тот же сброс, а не второй обработчик маршрута: второй `afterEach` прочитал
+/// бы место, уже переставленное первым, и записал бы его УХОДЯЩЕМУ экрану —
+/// то есть повтор команды испортил бы память списка.
+const installed = new WeakMap<ScrollHost, () => void>();
+
 /// Что помнится про экран (для проверок и отчёта).
 export function rememberedOffset(screen: string): number | undefined {
   return offsets.get(screen);
@@ -198,12 +204,16 @@ class ScreenRestorer {
 }
 
 /// Подключить память к прокручиваемому контейнеру окна и маршрутизатору.
-/// Возвращает отписку — окно снимает её при размонтировании корня.
+/// Возвращает отписку — окно снимает её при размонтировании корня. Повторный
+/// вызов с тем же контейнером память не удваивает: он отдаёт тот же сброс.
 export function installScrollMemory(
   host: ScrollHost,
   router: Router,
   options: ScrollMemoryOptions = {},
 ): () => void {
+  const already = installed.get(host);
+  if (already) return already;
+
   const restorer = new ScreenRestorer(
     host,
     options.frame ?? defaultFrame,
@@ -228,12 +238,15 @@ export function installScrollMemory(
     if (restorer.active === null) restorer.restore(router.currentRoute.value.path);
   });
 
-  return () => {
+  const dispose = (): void => {
     restorer.stop();
     host.removeEventListener("scroll", onScroll);
     for (const type of USER_SCROLL_INTENTS) host.removeEventListener(type, onUserScroll);
     offRoute();
+    installed.delete(host);
   };
+  installed.set(host, dispose);
+  return dispose;
 }
 
 /// Подключить память к контейнеру, который оболочка окна помечает в разметке

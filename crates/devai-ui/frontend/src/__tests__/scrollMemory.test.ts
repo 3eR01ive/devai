@@ -280,6 +280,106 @@ describe("прокрутка одного экрана не влияет на д
   });
 });
 
+describe("повтор не имеет побочных эффектов", () => {
+  it("повторная установка памяти на тот же контейнер не теряет место списка", async () => {
+    const host = scrollHost(5000);
+    const router = makeRouter();
+    const frames = frameQueue();
+    const options = { frame: frames.frame, now: () => 0, budgetMs: 100 };
+    const first = installScrollMemory(host.el, router, options);
+    const second = installScrollMemory(host.el, router, options);
+    // Второго экземпляра не появилось: повтор отдаёт тот же сброс.
+    expect(second).toBe(first);
+
+    await router.push("/proto/tasks");
+    frames.run();
+    host.scrollTo(1200);
+    await router.push("/proto/task/a");
+    frames.run();
+    await router.push("/proto/tasks");
+    frames.run();
+    // Без защиты второй обработчик записал бы уходящему списку 0.
+    expect(host.top()).toBe(1200);
+    expect(rememberedOffset("/proto/tasks")).toBe(1200);
+
+    // Повтор того же движения и повторный сброс ничего не меняют.
+    host.scrollTo(1200);
+    expect(rememberedOffset("/proto/tasks")).toBe(1200);
+    second();
+    first();
+    host.scrollTo(900);
+    expect(rememberedOffset("/proto/tasks")).toBe(1200);
+  });
+
+  it("повторный переход на тот же экран не сбрасывает его место", async () => {
+    const { host, router, frames, dispose } = harness();
+    await router.push("/proto/tasks");
+    frames.run();
+    host.scrollTo(1500);
+
+    // Тот же адрес второй раз: навигация отклонена как дубликат, экран тот же.
+    const duplicate = await router.push("/proto/tasks");
+    expect(duplicate).toBeTruthy();
+    frames.run();
+    expect(host.top()).toBe(1500);
+    expect(rememberedOffset("/proto/tasks")).toBe(1500);
+    dispose();
+  });
+});
+
+describe("жест человека прерывает отложенное восстановление", () => {
+  for (const intent of ["wheel", "touchstart", "keydown"]) {
+    it(`«${intent}» не даёт восстановлению двигать экран`, async () => {
+      const { host, router, frames, dispose } = harness(600);
+      await router.push("/proto/task/a");
+      frames.run();
+      host.scrollTo(3000);
+      await router.push("/proto/tasks");
+      frames.run();
+
+      // Возврат в задачу: содержимое ещё короткое, восстановление ждёт роста.
+      await router.push("/proto/task/a");
+      frames.run();
+      expect(host.top()).toBe(0);
+
+      host.el.dispatchEvent(new Event(intent)); // человек взялся крутить сам
+      host.setContent(5000);
+      frames.run();
+      // Отложенное восстановление снято — экран больше не двигается.
+      expect(host.top()).toBe(0);
+
+      // Дальше задача помнит то место, куда человек сам пришёл.
+      host.scrollTo(700);
+      expect(rememberedOffset("/proto/task/a")).toBe(700);
+      dispose();
+    });
+  }
+
+  it("уход во время восстановления оставляет экрану его прежнее место", async () => {
+    const { host, router, frames, dispose } = harness(600);
+    await router.push("/proto/task/a");
+    frames.run();
+    host.scrollTo(3000);
+    await router.push("/proto/tasks");
+    frames.run();
+
+    // Возврат в задачу: восстановление ждёт, пока содержимое дорастёт.
+    await router.push("/proto/task/a");
+    frames.run();
+    // Уходим, не дождавшись: промежуточный 0 не должен стать местом задачи.
+    await router.push("/proto/tasks");
+    frames.run();
+    expect(rememberedOffset("/proto/task/a")).toBe(3000);
+
+    // Вернувшись, когда содержимое доросло, человек попадает на своё место.
+    host.setContent(5000);
+    await router.push("/proto/task/a");
+    frames.run();
+    expect(host.top()).toBe(3000);
+    dispose();
+  });
+});
+
 describe("окно подключает память к своему контейнеру", () => {
   it("оболочка отдаёт единственный прокручиваемый контейнер, и память ставится на него", async () => {
     const wrapper = mount(App, {
