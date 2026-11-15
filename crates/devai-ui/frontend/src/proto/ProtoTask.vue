@@ -15,6 +15,7 @@ import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
 import { parseStatementReview, type StatementReview } from "./statementReview";
+import StatementVerdict from "./StatementVerdict.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -591,8 +592,13 @@ function foldAll(path: string, open: boolean) {
 }
 
 const tabsFor = (s: any) => {
-  // Постановка показывает текст постановки, подпись — документ.
-  if (s.state === "STATEMENT") return [] as [string, string][];
+  // Постановка: сам текст и отдельной вкладкой — выводы проверяющего
+  // (вердикт, чек-лист, его вопросы), а не только текст.
+  if (s.state === "STATEMENT")
+    return [
+      ["stmt", "постановка"],
+      ["verdict", "оценка проверяющего"],
+    ] as [string, string][];
   if (s.state === "APPROVAL") return [["sign", "что подписываешь"]] as [string, string][];
 
   const execs = s.execs ?? [];
@@ -1167,7 +1173,21 @@ onMounted(load);
               </div>
 
               <!-- постановка: исходный текст задачи, без служебных вкладок -->
-              <div v-if="s.state === 'STATEMENT'" class="p-panel">
+              <div v-if="tabsFor(s).length" class="p-tabs">
+                <button
+                  v-for="t in tabsFor(s)"
+                  :key="t[0]"
+                  class="p-tab"
+                  :class="{ on: openTab === t[0] }"
+                  @click="openTab = t[0]"
+                >{{ t[1] }}</button>
+              </div>
+
+              <div v-if="s.state === 'STATEMENT' && openTab === 'verdict'" class="p-panel">
+                <StatementVerdict :review="stmtReview" />
+              </div>
+
+              <div v-if="s.state === 'STATEMENT' && openTab === 'stmt'" class="p-panel">
                 <div class="p-briefh">
                   {{ editOpen ? "новая редакция постановки" : "постановка задачи" }}
                   · создана {{ new Date(prog.task.created_at).toLocaleDateString("ru-RU") }}
@@ -1198,15 +1218,7 @@ onMounted(load);
                 </template>
               </div>
 
-              <div v-if="tabsFor(s).length" class="p-tabs">
-                <button
-                  v-for="t in tabsFor(s)"
-                  :key="t[0]"
-                  class="p-tab"
-                  :class="{ on: openTab === t[0] }"
-                  @click="openTab = t[0]"
-                >{{ t[1] }}</button>
-              </div>
+
 
               <!-- реализация: только факты платформы -->
               <div v-if="openTab === 'impl'" class="p-panel">

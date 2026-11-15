@@ -10,12 +10,13 @@ const mocks = vi.hoisted(() => ({
   taskUsage: vi.fn(async () => null),
   evaluationRules: vi.fn(async () => null),
   taskSignature: vi.fn(async () => null),
-  artifactsList: vi.fn(async () => []),
+  artifactsList: vi.fn(async (): Promise<any[]> => []),
   questionsList: vi.fn(async () => []),
   taskEvents: vi.fn(async () => []),
   taskRestate: vi.fn(async () => ({})),
   taskRewind: vi.fn(async () => ({})),
   taskStart: vi.fn(async () => ({})),
+  artifactContent: vi.fn(async () => ({ shape: "text", artifact_id: "a1", text: "{}" })),
   taskRun: vi.fn(async () => ({})),
   execCancel: vi.fn(async () => ({})),
 }));
@@ -147,5 +148,42 @@ describe("ProtoTask / живое обновление", () => {
     // один опрос — одно чтение хода, без полного набора чтений
     expect(mocks.taskProgress.mock.calls.length).toBe(before + 1);
     expect(mocks.artifactsList.mock.calls.length).toBe(artsBefore);
+  });
+
+  it("оценка проверяющего — отдельная вкладка шага постановки", async () => {
+    const review = {
+      id: "stmt-1", task_id: task.id, kind: "STATEMENT_REVIEW", name: "statement-review",
+      seq: 1, category: "artifact", status: "CURRENT", sha256: "x", size: 10,
+      media_type: "application/json", contract: null, created_by: "role",
+      created_at: "2026-11-15T10:00:00Z",
+    };
+    mocks.taskProgress.mockResolvedValue(progress);
+    mocks.artifactsList.mockResolvedValue([review]);
+    mocks.artifactContent.mockResolvedValue({
+      shape: "text",
+      artifact_id: "stmt-1",
+      text: JSON.stringify({
+        verdict: "QUESTIONS",
+        human_paragraph: "не хватает границ",
+        checklist: [
+          { item: "user", ok: true },
+          { item: "boundaries", ok: false, note: "не указаны" },
+        ],
+        questions: ["Где границы?"],
+      }),
+    });
+    const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
+    await flushPromises();
+    await flushPromises();
+
+    const step = w.findAll(".p-vstep").find((s) => s.text().includes("постановка"))!;
+    await step.find(".p-vhead").trigger("click");
+    const tabs = w.findAll(".p-tab").map((t) => t.text());
+    expect(tabs).toContain("оценка проверяющего");
+
+    await w.findAll(".p-tab").find((t) => t.text() === "оценка проверяющего")!.trigger("click");
+    expect(w.find(".sv .vb").text()).toBe("есть вопросы");
+    expect(w.findAll(".sv .chk")).toHaveLength(2);
+    expect(w.find(".sv .qs").text()).toContain("Где границы?");
   });
 });
