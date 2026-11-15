@@ -237,6 +237,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_resume_rpc,
     },
     RpcCommand {
+        name: "task_new",
+        handler: task_new_rpc,
+    },
+    RpcCommand {
         name: "task_rewind",
         handler: task_rewind_rpc,
     },
@@ -638,6 +642,23 @@ fn task_accept_rpc(
 }
 
 /// The QA gate's return from the phone: same operation, same one-event record.
+/// Постановка задачи с телефона: тот же акт, что в окне и в консоли.
+fn task_new_rpc(
+    app: &tauri::AppHandle,
+    device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::task_new_as(
+        state(app),
+        param_str(params, "title")?,
+        param_opt_str(params, "description").unwrap_or_default(),
+        param_opt_str(params, "project_id"),
+        None,
+        None,
+        Some(actor_for(app, device)),
+    )?)
+}
+
 /// Перепройти с шага с телефона: тот же акт, что в окне и в консоли.
 fn task_rewind_rpc(
     app: &tauri::AppHandle,

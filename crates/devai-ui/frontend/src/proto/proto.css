@@ -121,3 +121,28 @@
 
 /* Группа «идёт сейчас»: тот же зелёный, что у живого прогона. */
 .p-grp.run .t { color: var(--p-pass); }
+/* Постановка задачи из списка: своя строка в шапке и форма без модальных окон. */
+.p-new{cursor:pointer;border:1px solid rgba(62,207,142,.55);border-radius:999px;
+  background:rgba(62,207,142,.12);color:#8ee7bc;font-family:var(--sans);font-size:10.5px;
+  padding:2px 10px;margin-left:4px}
+.p-new:hover{background:rgba(62,207,142,.22)}
+.p-new.on{border-color:rgba(240,97,109,.55);background:rgba(240,97,109,.12);color:#f6bcc2}
+.p-newform{border:1px solid var(--p-line);border-radius:10px;background:var(--p-card2);
+  padding:11px 13px 12px;margin-bottom:12px}
+.p-newform .p-line{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.p-newform .p-line.top{align-items:flex-start}
+.p-newform .lab{flex:none;width:92px;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--p-dim)}
+.p-newform input,.p-newform textarea,.p-newform select{flex:1;min-width:0;box-sizing:border-box;
+  border:1px solid var(--p-line);border-radius:7px;background:#0b0e12;color:var(--p-ink);
+  font-family:var(--sans);font-size:12.5px;padding:7px 10px}
+.p-newform textarea{resize:vertical;line-height:1.5}
+.p-newform input:focus,.p-newform textarea:focus,.p-newform select:focus{outline:none;
+  border-color:var(--p-human)}
+.p-newform .p-formacts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
+.p-newform .p-create{border:1px solid rgba(62,207,142,.6);border-radius:7px;
+  background:rgba(62,207,142,.16);color:#b6f2d5;font-family:var(--sans);font-size:12.5px;
+  font-weight:600;padding:7px 16px;cursor:pointer}
+.p-newform .p-create:hover:not(:disabled){background:rgba(62,207,142,.28)}
+.p-newform .p-create:disabled{opacity:.45;cursor:not-allowed}
+.p-newform .hint{font-size:10.5px;color:var(--p-dim2)}

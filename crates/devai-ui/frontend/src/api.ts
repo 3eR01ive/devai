@@ -128,6 +128,10 @@ export const api = {
     invoke<Project | null>("projects_get", { id_or_name }),
 
   tasksList: () => invoke<Task[]>("tasks_list"),
+  // Постановка задачи из окна — та же операция, что `devai task new`:
+  // задача рождается в DRAFT, платформа владеет ею с рождения.
+  taskNew: (title: string, description: string, project_id: string | null) =>
+    invoke<Task>("task_new", { title, description, project_id }),
   taskGet: (id_prefix: string) => invoke<Task>("task_get", { id_prefix }),
   taskStatus: (id_prefix: string) =>
     invoke<StatusView>("task_status", { id_prefix }),

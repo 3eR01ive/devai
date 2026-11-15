@@ -474,6 +474,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("question_answer", "question.answer"),
     ("task_cancel", "task.cancel"),
     ("task_resume", "task.resume"),
+    ("task_new", "task.create"),
     ("task_rewind", "task.rewind"),
     ("task_restate", "task.restate"),
     // Agent status rows (task 01a1b60c, REQ-AF-07): derived availability,
@@ -564,6 +565,9 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     // Возврат в работу: отменённое, приостановленное и заблокированное дело
     // человек вправе продолжить — платформа помнит, откуда его взяли.
     ("task_resume", "task.resume"),
+    // Постановка задачи человеком: новый черновик из окна — та же операция,
+    // что `devai task new`.
+    ("task_new", "task.create"),
     // Пройти путь заново с шага и переписать постановку: слово человека о том,
     // что шаг был пройден по ошибке. Причина обязательна, результаты — STALE.
     ("task_rewind", "task.rewind"),
@@ -988,6 +992,49 @@ pub fn question_answer(
     text: String,
 ) -> Result<StatusView, UiError> {
     question_answer_as(state, id_prefix, question_id, text, None)
+}
+
+/// `task.new` — человек ставит задачу из окна. Тот же акт, что `devai task
+/// new`: задача рождается в DRAFT и принадлежит платформе с рождения.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_new(
+    state: State<AppState>,
+    title: String,
+    description: String,
+    project_id: Option<String>,
+    parent: Option<Vec<String>>,
+    blocked_by: Option<Vec<String>>,
+) -> Result<devai_core::types::Task, UiError> {
+    task_new_as(state, title, description, project_id, parent, blocked_by, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn task_new_as(
+    state: State<AppState>,
+    title: String,
+    description: String,
+    project_id: Option<String>,
+    parent: Option<Vec<String>>,
+    blocked_by: Option<Vec<String>>,
+    actor: Option<String>,
+) -> Result<devai_core::types::Task, UiError> {
+    let project_id = match project_id {
+        Some(p) if !p.trim().is_empty() => Some(p.parse().map_err(|_| UiError {
+            code: "invalid_input".into(),
+            message: format!("project_id `{p}` is not an id"),
+        })?),
+        _ => None,
+    };
+    let req = devai_api::TaskCreateReq {
+        title,
+        project_id,
+        description,
+        parent: parent.unwrap_or_default(),
+        blocked_by: blocked_by.unwrap_or_default(),
+        idempotency_key: None,
+    };
+    let created = with_actor_write(&state, actor, |api| api.task_create(req))?;
+    Ok(created.task)
 }
 
 /// `task.rewind` — человек проходит путь заново с названной стадии.
@@ -2274,6 +2321,7 @@ mod tests {
             "task_resume",
             "task_rewind",
             "task_restate",
+            "task_new",
         ];
         expected.sort_unstable();
         assert_eq!(

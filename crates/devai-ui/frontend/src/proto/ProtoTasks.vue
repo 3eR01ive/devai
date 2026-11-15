@@ -2,11 +2,53 @@
 // Новый список задач (по макету): путь ролей в строке, группы по смыслу,
 // состояние раннера и расход токенов. Старый список остаётся рядом.
 import { computed, nextTick, onMounted, ref } from "vue";
+import { useRouter } from "vue-router";
 import { api, toUiError } from "../api";
-import type { ProgressView, Task, UiError } from "../types";
+import type { ProgressView, Project, Task, UiError } from "../types";
 import "./proto.css";
 
+const router = useRouter();
 const tasks = ref<Task[]>([]);
+
+// ── постановка новой задачи прямо из списка ──────────────────────────────
+// Форма живёт в самой вкладке, без модальных окон: название, постановка и
+// проект (если проектов несколько). Созданная задача открывается карточкой —
+// человек сразу видит, что поставил.
+const creating = ref(false);
+const newTitle = ref("");
+const newBody = ref("");
+const newProject = ref<string>("");
+const createBusy = ref(false);
+const projects = ref<Project[]>([]);
+const canCreate = computed(() => newTitle.value.trim().length > 0 && !createBusy.value);
+
+function openCreate() {
+  creating.value = true;
+  newTitle.value = "";
+  newBody.value = "";
+  newProject.value = projects.value.length === 1 ? projects.value[0].id : "";
+  if (!projects.value.length) {
+    void api.projectsList().then((p) => {
+      projects.value = p;
+      if (p.length === 1) newProject.value = p[0].id;
+    }).catch(() => undefined);
+  }
+}
+
+async function createTask() {
+  if (!canCreate.value) return;
+  createBusy.value = true;
+  error.value = null;
+  try {
+    const t = await api.taskNew(newTitle.value.trim(), newBody.value, newProject.value || null);
+    creating.value = false;
+    await router.push(`/proto/task/${t.id}`);
+  } catch (e) {
+    error.value = toUiError(e);
+  } finally {
+    createBusy.value = false;
+  }
+}
 const progress = ref<Record<string, ProgressView>>({});
 const usage = ref<Record<string, { total: number; cost: number; runs: number; measured: number }>>({});
 const error = ref<UiError | null>(null);
@@ -188,8 +230,38 @@ onMounted(load);
         <button class="p-runchip p-toggle" :class="{ on: showClosed }" @click="toggleClosed">
           {{ showClosed ? 'скрыть закрытые' : 'закрытые' }} · {{ closedCount }}
         </button>
+        <button class="p-new" :class="{ on: creating }" @click="creating ? (creating = false) : openCreate()">
+          {{ creating ? 'отменить' : '+ задача' }}
+        </button>
       </div>
     </header>
+
+    <!-- постановка: название, сама постановка, проект — без модальных окон -->
+    <div v-if="creating" class="p-newform">
+      <div class="p-line">
+        <span class="lab">название</span>
+        <input v-model="newTitle" class="t" placeholder="что нужно сделать" spellcheck="false"
+               @keydown.enter="createTask" />
+      </div>
+      <div class="p-line top">
+        <span class="lab">постановка</span>
+        <textarea v-model="newBody" rows="5" spellcheck="false"
+                  placeholder="постановка: потребность, что считается сделанным, границы" />
+      </div>
+      <div v-if="projects.length > 1" class="p-line">
+        <span class="lab">проект</span>
+        <select v-model="newProject" class="t">
+          <option value="">без проекта</option>
+          <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
+      </div>
+      <div class="p-formacts">
+        <button class="p-create" :disabled="!canCreate" @click="createTask">
+          {{ createBusy ? 'создаю…' : 'Поставить задачу' }}
+        </button>
+        <span class="hint">после создания откроется карточка; путь начнётся с постановщика</span>
+      </div>
+    </div>
 
     <div v-if="error" class="p-err">{{ error.code }} — {{ error.message }}</div>
     <div v-else-if="loading" class="p-empty">читаю задачи…</div>
