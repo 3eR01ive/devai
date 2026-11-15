@@ -17,6 +17,7 @@ import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
 import { parseStatementReview, type StatementReview } from "./statementReview";
 import StatementVerdict from "./StatementVerdict.vue";
+import RunConsole from "./RunConsole.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -1290,7 +1291,7 @@ onMounted(load);
                       {{ termFollow ? "следовать" : "не следовать" }}
                     </button>
                   </div>
-                  <pre ref="termEl" class="p-term">{{ termText }}</pre>
+                  <div ref="termEl" class="p-term"><RunConsole :text="termText" /></div>
                 </template>
                 <div v-else class="p-empty" style="padding:4px 0">у этого прогона нет консоли</div>
               </div>
@@ -1730,9 +1731,8 @@ onMounted(load);
 .p-termhead .tdot.done{background:var(--p-pass)}
 .p-termhead .tnote{font-size:10.5px;color:#8b97a6}
 .p-termhead .p-act{margin-left:auto}
-.p-term{font-family:var(--mono);font-size:11.5px;line-height:1.5;color:#cfd9e4;background:#080b0e;
-  border:1px solid var(--p-line);border-radius:7px;padding:9px 11px;margin:0;
-  max-height:380px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.p-term{background:#080b0e;border:1px solid var(--p-line);border-radius:7px;padding:9px 12px;
+  max-height:420px;overflow:auto}
 
 .p-runs{display:flex;align-items:center;gap:3px;flex-wrap:wrap;padding:9px 14px 0}
 .p-rlabel{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--p-dim2);margin-right:6px}
