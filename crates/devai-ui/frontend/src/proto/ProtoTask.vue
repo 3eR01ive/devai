@@ -747,6 +747,52 @@ function evidenceOf(c: any): string {
   return txt(e).slice(0, 1200);
 }
 
+// ── влитие: факт и ход ────────────────────────────────────────────────────
+// Слияние не стадия процесса (задача от него не двигается), поэтому это НЕ шаг
+// графа, а факт на карточке принятой задачи: либо «влито» с коммитом, либо
+// кнопка влития. Акт тот же, что `devai task merge` — окно запускает
+// платформенную команду, а не свою реализацию git.
+const mergeDecision = computed<any | null>(() => {
+  const rows = decisions.value.filter((d: any) => d.kind === "rework_merge");
+  return rows.length ? rows[rows.length - 1] : null;
+});
+const merged = computed(() => !!mergeDecision.value);
+const mergeBusy = ref(false);
+const mergeErr = ref<string | null>(null);
+const mergeDone = ref<{ branch: string; commit: string } | null>(null);
+
+const mergeInfo = computed(() => {
+  const d = mergeDecision.value;
+  if (!d) return null;
+  return {
+    branch: (d.refs ?? [])[0] ?? "",
+    commit: (d.refs ?? [])[1] ?? "",
+    actor: d.actor ?? "",
+    at: d.created_at ?? "",
+    rationale: d.rationale ?? "",
+  };
+});
+
+async function doMerge() {
+  mergeBusy.value = true;
+  mergeErr.value = null;
+  try {
+    const out = await api.taskMerge(id.value, "влито человеком из карточки задачи");
+    mergeDone.value = { branch: out.branch, commit: out.commit };
+    await load();
+  } catch (e) {
+    mergeErr.value = toUiError(e).message;
+  } finally {
+    mergeBusy.value = false;
+  }
+}
+
+const { holding: mergeHolding, progress: mergeProgress, start: mergeStart, move: mergeMove, release: mergeRelease } =
+  useHoldToConfirm(
+    () => !merged.value && !mergeBusy.value,
+    () => void doMerge(),
+  );
+
 // ── консоль прогона: тот же поток, что пишет роль ─────────────────────────
 // Читаем улики прогона (`role_stdout.txt`/`role_stderr.txt`) хвостом: пока роль
 // работает, поток растёт и окно перечитывает его раз в секунду. Ничего не
@@ -822,6 +868,8 @@ const sigError = ref<string | null>(null);
 // из события `question.raised` по этому question_id. Гадать по формулировке
 // нельзя: слово в тексте — это текст, а не адрес перехода.
 const questions = ref<Question[]>([]);
+/** Решения человека: из них читается, влита ли задача (rework_merge). */
+const decisions = ref<any[]>([]);
 // Протокол проверки постановки: чек-лист и вопросы — поля контракта, поэтому
 // блок вопросов показывает их по местам, а не склейкой текста.
 const stmtReview = ref<StatementReview | null>(null);
@@ -864,7 +912,7 @@ async function doSign(approve: boolean, rationale: string | null) {
 async function load() {
   error.value = null;
   try {
-    const [p, r, u, rb, sig, arts, qs, evs] = await Promise.all([
+    const [p, r, u, rb, sig, arts, qs, evs, decs] = await Promise.all([
       api.taskProgress(id.value),
       api.taskReport(id.value).catch(() => null),
       api.taskUsage(id.value).catch(() => null),
@@ -879,6 +927,7 @@ async function load() {
       api.artifactsList(id.value).catch(() => [] as ArtifactView[]),
       api.questionsList(id.value).catch(() => [] as Question[]),
       api.taskEvents(id.value, 200).catch(() => [] as WorkflowEvent[]),
+      api.taskDecisions(id.value).catch(() => [] as any[]),
     ]);
     prog.value = p;
     if (sig) sigError.value = null;
@@ -889,6 +938,7 @@ async function load() {
     artifacts.value = arts as ArtifactView[];
     questions.value = qs as Question[];
     events.value = evs as WorkflowEvent[];
+    decisions.value = decs as any[];
     // Отчёт реализации (последний) называет коммит задачи — по нему и читаем код.
     const impl = (arts as ArtifactView[])
       .filter((a) => a.kind === "IMPLEMENTATION_REPORT")
@@ -1679,6 +1729,36 @@ onMounted(load);
                 </div>
                 <div v-if="qaErr" class="p-qerr">{{ qaErr }}</div>
 
+                <!-- влитие: факт на принятой задаче, а не отдельный шаг -->
+                <div v-if="prog.task.state === 'ACCEPTED'" class="p-merge" :class="{ done: merged }">
+                  <template v-if="merged">
+                    <span class="m-dot" />
+                    <span class="m-h">влито</span>
+                    <span class="m-branch">{{ mergeInfo!.branch }}</span>
+                    <span class="m-commit">→ {{ mergeInfo!.commit.slice(0, 7) }}</span>
+                    <span class="m-by">{{ mergeInfo!.actor }}</span>
+                  </template>
+                  <template v-else>
+                    <span class="m-h">принята, не влита</span>
+                    <span class="m-note">слияние — действие с репозиторием, не стадия процесса</span>
+                    <button
+                      class="p-mergebtn"
+                      :class="{ holding: mergeHolding === 'return' }"
+                      :disabled="mergeBusy"
+                      title="удерживай, чтобы влить ветку задачи в выложенную baseline"
+                      @pointerdown="mergeStart('return', $event)"
+                      @pointermove="mergeMove($event)"
+                      @pointerup="mergeRelease"
+                      @pointerleave="mergeRelease"
+                      @pointercancel="mergeRelease"
+                    >
+                      <i class="fill" :style="{ width: (mergeHolding === 'return' ? mergeProgress * 100 : 0) + '%' }" />
+                      <span>{{ mergeBusy ? 'вливаю…' : 'Влить в baseline' }}</span>
+                    </button>
+                  </template>
+                </div>
+                <div v-if="mergeErr" class="p-qerr">{{ mergeErr }}</div>
+
                 <div class="p-hero" :class="scoreTone">
                   <div class="big">{{ score === null ? "—" : (score * 100).toFixed(1) }}<span>%</span></div>
                   <div class="side">
@@ -1958,6 +2038,24 @@ onMounted(load);
 
 
 /* ── ходы приёмки: принять или вернуть ──────────────────────────────────── */
+
+/* ── влитие: факт, а не шаг ─────────────────────────────────────────────── */
+.p-merge{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:10px;padding:8px 11px;
+  border:1px solid var(--p-line);border-radius:8px;background:#10171f;font-size:12px}
+.p-merge.done{border-color:rgba(62,207,142,.35);background:rgba(62,207,142,.06)}
+.p-merge .m-dot{width:7px;height:7px;border-radius:50%;background:var(--p-pass)}
+.p-merge .m-h{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:#93a1b1}
+.p-merge.done .m-h{color:var(--p-pass)}
+.p-merge .m-branch,.p-merge .m-commit{font-family:var(--mono);font-size:11px;color:#dfe7f0}
+.p-merge .m-by{font-size:11px;color:var(--p-dim2)}
+.p-merge .m-note{font-size:11px;color:var(--p-dim2)}
+.p-mergebtn{position:relative;overflow:hidden;margin-left:auto;font:inherit;font-size:11.5px;padding:5px 12px;
+  border-radius:6px;cursor:pointer;border:1px solid rgba(62,207,142,.45);color:#8fe3ba;background:rgba(62,207,142,.10)}
+.p-mergebtn .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(62,207,142,.22)}
+.p-mergebtn span{position:relative}
+.p-mergebtn.holding{border-color:var(--p-human)}
+.p-mergebtn:disabled{opacity:.55;cursor:default}
+
 .p-qacts{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
 .p-qa{position:relative;overflow:hidden;font:inherit;font-size:12px;padding:7px 14px;border-radius:7px;
   cursor:pointer;border:1px solid var(--p-line);background:#172028;color:#cfd8e2;white-space:nowrap}

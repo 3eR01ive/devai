@@ -26,6 +26,9 @@ serde_json.workspace = true
 dirs.workspace = true
 devai-core.workspace = true
 devai-api.workspace = true
+# Слияние живёт в платформенной команде (REQ-WT-07: единый путь). Окну нужен
+# тот же резолвер раннера, что у лаунчера, — не своя копия правил.
+devai-runtime.workspace = true
 tauri = { version = "2", features = [] }
 # R1 (operator, rework of the homes cycle): the native folder picker for
 # adding a home (REQ-HOME-03 «диалог выбора пути»). Connected by the stock

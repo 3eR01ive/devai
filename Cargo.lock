@@ -838,6 +838,7 @@ dependencies = [
  "chrono",
  "devai-api",
  "devai-core",
+ "devai-runtime",
  "dirs 6.0.0",
  "libc",
  "qrcode",

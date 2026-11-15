@@ -105,6 +105,13 @@ export interface ArtifactView extends Artifact {
  * Консоль прогона: потоки роли как они лежат в уликах прогона.
  * `running` — прогон ещё идёт, поток растёт; окно досматривает его повторно.
  */
+/** Что влито: ветка задачи и коммит слияния (из записи платформы). */
+export interface MergeOutcome {
+  branch: string;
+  commit: string;
+  text: string;
+}
+
 export interface ExecTranscriptView {
   execution: string;
   task: string;

@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   questionsList: vi.fn(async () => []),
   taskEvents: vi.fn(async () => []),
   taskAccept: vi.fn(async () => ({})),
+  taskMerge: vi.fn(async () => ({ branch: "rework/x", commit: "a91779523398b9ac843b91adb8bc74e242a285b7", text: "merged" })),
+  taskDecisions: vi.fn(async (): Promise<any[]> => []),
   taskReturn: vi.fn(async () => ({})),
   execTranscript: vi.fn(),
   artifactContent: vi.fn(async () => ({ shape: "text", artifact_id: "a1", text: "{}" })),
@@ -151,6 +153,48 @@ describe("ходы приёмки", () => {
     flushFrames();
     await flushPromises();
     expect(mocks.taskReturn).not.toHaveBeenCalled();
+    w.unmount();
+  });
+
+  it("принятая задача без влития: кнопка влития удержанием, один акт", async () => {
+    mocks.taskProgress.mockResolvedValue({
+      ...progress,
+      task: { ...task, state: "ACCEPTED" },
+    });
+    const w = await mountQa();
+    const step = w.findAll(".p-vstep")[5];
+    if (!step.classes().includes("open")) await step.find(".p-vhead").trigger("click");
+    await flushPromises();
+
+    expect(w.find(".p-merge").text()).toContain("принята, не влита");
+    const btn = w.find(".p-mergebtn");
+    expect(btn.exists()).toBe(true);
+    await btn.trigger("pointerdown");
+    now = HOLD_MS + 10;
+    flushFrames();
+    await flushPromises();
+    expect(mocks.taskMerge).toHaveBeenCalledTimes(1);
+    w.unmount();
+  });
+
+  it("влитая задача показывает факт: ветку и короткий коммит, кнопки нет", async () => {
+    mocks.taskProgress.mockResolvedValue({ ...progress, task: { ...task, state: "ACCEPTED" } });
+    mocks.taskDecisions.mockResolvedValue([{
+      id: "d1", task_id: task.id, kind: "rework_merge", verdict: "APPROVED", actor: "guerrero",
+      rationale: "принята, влита", refs: ["rework/01a1df87-1bb7-7361-97b1-245281439fa5", "a91779523398b9ac843b91adb8bc74e242a285b7"],
+      created_at: "2026-11-15T18:07:01Z", payload: null,
+    }]);
+    const w = await mountQa();
+    const step = w.findAll(".p-vstep")[5];
+    if (!step.classes().includes("open")) await step.find(".p-vhead").trigger("click");
+    await flushPromises();
+
+    const block = w.find(".p-merge");
+    expect(block.classes()).toContain("done");
+    expect(block.text()).toContain("влито");
+    expect(block.text()).toContain("rework/01a1df87");
+    expect(block.text()).toContain("a917795");
+    expect(w.find(".p-mergebtn").exists()).toBe(false);
     w.unmount();
   });
 });

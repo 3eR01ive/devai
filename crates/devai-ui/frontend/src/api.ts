@@ -9,6 +9,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
   ExecTranscriptView,
+  MergeOutcome,
   RulebookView,
   TaskUsageView,
   SourceSliceView,
@@ -151,6 +152,9 @@ export const api = {
   // ответ — ПЕРЕЧИТАННЫЙ статус с публичным `quality_gate`, локального патча нет.
   taskAccept: (id_prefix: string, rationale: string | null) =>
     invoke<StatusView>("task_accept", { id_prefix, rationale }),
+  /** Влитие ветки задачи в выложенную baseline — тот же акт, что `task merge`. */
+  taskMerge: (id_prefix: string, rationale: string | null) =>
+    invoke<MergeOutcome>("task_merge", { id_prefix, rationale }),
   taskReturn: (id_prefix: string, rationale: string | null) =>
     invoke<StatusView>("task_return", { id_prefix, rationale }),
   taskProgress: (id_prefix: string) =>

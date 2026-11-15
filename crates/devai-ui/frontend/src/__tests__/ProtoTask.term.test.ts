@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   artifactsList: vi.fn(async (): Promise<any[]> => []),
   questionsList: vi.fn(async () => []),
   taskEvents: vi.fn(async () => []),
+  taskDecisions: vi.fn(async (): Promise<any[]> => []),
   execTranscript: vi.fn(),
   artifactContent: vi.fn(async () => ({ shape: "text", artifact_id: "a1", text: "{}" })),
   taskRestate: vi.fn(async () => ({})),

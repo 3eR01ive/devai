@@ -452,6 +452,9 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // one `devai task run` calls — the person decides to restart a proven-dead
     // execution, the platform reaps it and launches by the ordinary rules.
     ("task_run", "task.run"),
+    // Влитие ветки задачи — Mutation-класс: это акт человека, а не чтение
+    // (окно исполняет его платформенной командой, своей реализации git нет).
+    ("task_merge", "task.merge"),
     ("task_progress", "task.progress"),
     ("task_dependencies", "task.dependencies"),
     ("task_report", "task.report"),
@@ -557,6 +560,11 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_accept", "task.accept"),
     ("task_return", "task.return"),
     ("task_run", "task.run"),
+    // Влитие ветки задачи: слияние с репозиторием — человеческое решение, и
+    // окно исполняет его ПЛАТФОРМЕННОЙ командой (`devai task merge`), а не
+    // своей реализацией git. Акт пишет решение rework_merge и ничего не
+    // двигает в процессе задачи.
+    ("task_merge", "task.merge"),
     // Ответ человека на вопрос платформы: вопрос поднят ЗА ЧЕЛОВЕКОМ и без его
     // слова работа стоит. Это тот же человеческий акт, что подпись и приёмка,
     // и он открыт окну именно поэтому — `question.answer` снимает удержание.
@@ -1397,6 +1405,68 @@ pub fn task_usage(
     id_prefix: String,
 ) -> Result<devai_api::TaskUsageView, UiError> {
     Ok(state.api().task_usage(&id_prefix)?)
+}
+
+/// Что влито: ветка задачи и коммит слияния — из записи самой платформы.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct MergeOutcome {
+    pub branch: String,
+    pub commit: String,
+    /// Вывод платформенной команды как есть: окно не пересказывает чужой текст.
+    pub text: String,
+}
+
+/// Влитие ветки задачи в выложенную baseline — ТЕМ ЖЕ актом, что
+/// `devai task merge`. Окно не несёт своей реализации git: слияние по решению
+/// платформы (REQ-WT-07) живёт в одной команде, и окно лишь запускает её —
+/// человек нажал, платформа исполнила.
+#[tauri::command(rename_all = "snake_case")]
+pub fn task_merge(
+    state: State<AppState>,
+    id_prefix: String,
+    rationale: Option<String>,
+) -> Result<MergeOutcome, UiError> {
+    let runner = devai_runtime::launch::runner_exe().ok_or_else(|| UiError {
+        code: "no_runner".to_string(),
+        message: "окно не нашло `devai` для влития — задайте DEVAI_RUNNER: слияние \
+                  живёт в платформенной команде, а не в окне"
+            .to_string(),
+    })?;
+    let (home, actor) = {
+        let info = state.session();
+        (info.home.clone(), info.actor.clone())
+    };
+    let mut cmd = std::process::Command::new(&runner);
+    cmd.arg("--home").arg(&home).arg("--actor").arg(&actor);
+    cmd.arg("task").arg("merge").arg(&id_prefix);
+    if let Some(r) = rationale.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        cmd.arg("--rationale").arg(r);
+    }
+    let out = cmd.output().map_err(|e| UiError {
+        code: "merge_spawn".to_string(),
+        message: format!("не удалось запустить {}: {e}", runner.display()),
+    })?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        return Err(UiError {
+            code: "merge_failed".to_string(),
+            message: text.trim().to_string(),
+        });
+    }
+    let decisions = state.api().task_decisions(&id_prefix)?;
+    let last = decisions
+        .iter()
+        .rev()
+        .find(|d| d.kind == devai_core::types::decision_kind::REWORK_MERGE);
+    Ok(MergeOutcome {
+        branch: last.and_then(|d| d.refs.first().cloned()).unwrap_or_default(),
+        commit: last.and_then(|d| d.refs.get(1).cloned()).unwrap_or_default(),
+        text: text.trim().to_string(),
+    })
 }
 
 /// Консоль прогона: потоки роли как они есть на диске, хвостом.
@@ -2361,6 +2431,7 @@ mod tests {
             "task_reject",
             "task_return",
             "task_run",
+            "task_merge",
             "question_answer",
             "task_cancel",
             "task_resume",
