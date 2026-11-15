@@ -131,7 +131,10 @@ onUnmounted(() => {
         </span>
       </div>
     </header>
-    <main class="content">
+    <!-- `data-scroll-host` — единственный прокручиваемый контейнер окна:
+         его находит память прокрутки при запуске окна (main.ts), чтобы
+         каждый экран помнил своё место сам. -->
+    <main class="content" data-scroll-host>
       <div v-if="shownError" class="errorbox">
         <span class="code">{{ shownError.code }}</span>{{ shownError.message }}
       </div>
