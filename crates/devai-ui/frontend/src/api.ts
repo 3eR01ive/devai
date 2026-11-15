@@ -8,6 +8,8 @@
 // получает отдельного набора прав и отдельной реализации чтения/записи.
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
+  LiveDiffView,
+  LiveWorktreeView,
   ExecRow,
   ExecTranscriptView,
   MergeOutcome,
@@ -218,6 +220,12 @@ export const api = {
   // Правила оценки дома: то, чем судит качество (профиль оценки как данные).
   evaluationRules: () => invoke<RulebookView>("evaluation_rules"),
   // Расход токенов задачи по прогонам (файлы улик драйвера).
+  /** Дифф одного файла живого дерева (незакоммиченные правки). */
+  workspaceLiveDiff: (id_prefix: string, path: string) =>
+    invoke<LiveDiffView>("workspace_live_diff", { id_prefix, path }),
+  /** Живое рабочее дерево задачи: изменённые файлы прямо сейчас. */
+  workspaceLive: (id_prefix: string) =>
+    invoke<LiveWorktreeView>("workspace_live", { id_prefix }),
   /** Одна строка исполнения: статус, класс и текст отказа. */
   execGet: (exec_id: string) => invoke<ExecRow>("execution_get", { exec_id }),
   /** Консоль прогона: то, что роль пишет в свои потоки. */

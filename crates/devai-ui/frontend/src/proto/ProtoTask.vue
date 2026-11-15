@@ -11,7 +11,7 @@ import type {
   SignatureView, TaskUsageView, UiError, WorkflowEvent,
   WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
-import type { ExecRow, ExecTranscriptView } from "../types";
+import type { ExecRow, ExecTranscriptView, LiveDiffView, LiveWorktreeView } from "../types";
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
@@ -691,11 +691,15 @@ const tabsFor = (s: any) => {
   // данные соседнего прогона было бы враньём.
   // Прогон ничего не отдал: либо он упал (тогда у отказа своя вкладка), либо
   // просто не оставил данных — во втором случае остаётся только консоль.
-  if (execs.length && !art)
-    return (isFailed(s) ? [["fail", "отказ"], ["term", "консоль"]] : [["term", "консоль"]]) as [
-      string,
-      string,
-    ][];
+  if (execs.length && !art) {
+    // У идущего прогона отчёта ещё нет — но именно тогда и нужны консоль и
+    // ЖИВОЕ дерево: правки роли видны, пока она работает.
+    const t: [string, string][] = [];
+    if (isFailed(s)) t.push(["fail", "отказ"]);
+    t.push(["term", "консоль"]);
+    if (s.state === "IMPLEMENTATION") t.push(["wt", "worktree"]);
+    return t;
+  }
 
   const t: [string, string][] = [];
   if (art?.kind === "REQUIREMENTS_SPEC") t.push(["spec", "спецификация"]);
@@ -874,6 +878,48 @@ const { holding: mergeHolding, progress: mergeProgress, start: mergeStart, move:
     () => void doMerge(),
   );
 
+// ── живое рабочее дерево: что роль правит прямо сейчас ────────────────────
+// Отчёты и диффы показывают ЗАКОММИЧЕННОЕ (baseline..tip). Пока роль работает,
+// её правки ещё не в коммите — и окно показывало пустой worktree у идущего
+// прогона. Здесь фактическое состояние каталога задачи: файлы, строки, ветка.
+const live = ref<LiveWorktreeView | null>(null);
+const liveErr = ref<string | null>(null);
+let liveTimer: number | null = null;
+
+async function liveOnce() {
+  try {
+    live.value = await api.workspaceLive(id.value);
+    liveErr.value = null;
+  } catch (e) {
+    liveErr.value = toUiError(e).message;
+  }
+}
+
+/** Открыть файл живого дерева: незакоммиченный дифф как он есть. */
+const liveOpen = ref<string | null>(null);
+const liveDiff = ref<LiveDiffView | null>(null);
+
+async function openLiveFile(path: string) {
+  if (liveOpen.value === path) { liveOpen.value = null; liveDiff.value = null; return; }
+  liveOpen.value = path;
+  liveDiff.value = null;
+  try {
+    liveDiff.value = await api.workspaceLiveDiff(id.value, path);
+  } catch (e) {
+    liveDiff.value = { path, diff: "", note: toUiError(e).message };
+  }
+}
+
+function startLive() {
+  if (liveTimer !== null) return;
+  void liveOnce();
+  liveTimer = window.setInterval(() => void liveOnce(), 2000);
+}
+
+function stopLive() {
+  if (liveTimer !== null) { window.clearInterval(liveTimer); liveTimer = null; }
+}
+
 // ── консоль прогона: тот же поток, что пишет роль ─────────────────────────
 // Читаем улики прогона (`role_stdout.txt`/`role_stderr.txt`) хвостом: пока роль
 // работает, поток растёт и окно перечитывает его раз в секунду. Ничего не
@@ -935,6 +981,8 @@ function selectTab(_s: any, key: string) {
   openTab.value = key;
   if (key === "term") startTerm();
   else stopTerm();
+  if (key === "wt") startLive();
+  else stopLive();
 }
 
 // ── подпись спеки: два акта гейта ─────────────────────────────────────────
@@ -1324,6 +1372,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   stopTerm();
+  stopLive();
   if (pollTimer) window.clearInterval(pollTimer);
   window.removeEventListener("focus", onFocus);
 });
@@ -1608,7 +1657,38 @@ onMounted(load);
 
               <!-- worktree: настоящий diff против базы -->
               <div v-if="openTab === 'wt'" class="p-panel">
-                <div v-if="!changes" class="p-empty" style="padding: 4px 0">изменений платформа не записала</div>
+                <!-- ЖИВОЕ дерево: то, что роль правит прямо сейчас -->
+                <div class="p-live">
+                  <div class="lv-h">
+                    <span class="lv-dot" :class="{ run: live?.running }" />
+                    <b>рабочее дерево</b>
+                    <span class="mono">{{ live?.branch ?? "—" }}</span>
+                    <span class="mono lv-dim">{{ (live?.head ?? "").slice(0, 8) }}</span>
+                    <span class="lv-cnt">правок {{ live?.dirty ?? 0 }}</span>
+                    <span v-if="live?.running" class="lv-run">живой · обновляется</span>
+                    <span v-if="live?.running" class="lv-dim" title="драйвер отдаёт расход токенов файлом по завершении прогона">расход — после прогона</span>
+                  </div>
+                  <div v-if="liveErr" class="p-empty" style="color:#ffa972;padding:2px 0">дерево не прочиталось: {{ liveErr }}</div>
+                  <div v-else-if="live?.note" class="p-empty" style="padding:2px 0">{{ live.note }}</div>
+                  <div v-for="f in (live?.files ?? [])" :key="f.path" class="p-lvitem">
+                    <div class="p-lvfile" @click="openLiveFile(f.path)">
+                      <span class="p-wtst" :class="f.status === '??' ? 'A' : f.status">{{ f.status === "??" ? "A" : f.status }}</span>
+                      <span class="p-wtpath mono">{{ f.path }}</span>
+                      <span class="lv-num"><i class="add">+{{ f.added }}</i><i class="del">−{{ f.removed }}</i></span>
+                    </div>
+                    <template v-if="liveOpen === f.path">
+                      <div v-if="!liveDiff" class="p-empty" style="padding:4px 10px">читаю…</div>
+                      <div v-else-if="!liveDiff.diff" class="p-empty" style="padding:4px 10px">{{ liveDiff.note }}</div>
+                      <pre v-else class="p-diff">{{ liveDiff.diff }}</pre>
+                    </template>
+                  </div>
+                  <div v-if="live?.truncated" class="p-empty" style="padding:2px 0">
+                    показаны первые {{ live!.files.length }} из {{ live!.dirty }}
+                  </div>
+                </div>
+
+                <div v-if="changes" class="p-sec">закоммичено · {{ changes.files.length }} файлов</div>
+                <div v-if="!changes" class="p-empty" style="padding: 4px 0">в коммите изменений ещё нет — у идущего прогона правки выше, в рабочем дереве</div>
                 <template v-else>
                   <div class="p-wthead">
                     <span class="mono">{{ changes.branch ?? "—" }}</span>
@@ -2047,6 +2127,22 @@ onMounted(load);
 .p-mstats b{color:var(--p-dim);font-weight:500}
 .p-mstats .lim{color:#5a6877}
 
+
+
+/* ── живое рабочее дерево ───────────────────────────────────────────────── */
+.p-live{border:1px solid var(--p-line);border-radius:8px;padding:8px 10px;margin-bottom:10px;background:#0f151c}
+.p-live .lv-h{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:11.5px;color:#dfe7f0;margin-bottom:5px}
+.p-live .lv-dot{width:7px;height:7px;border-radius:50%;background:#3a4654;align-self:center}
+.p-live .lv-dot.run{background:var(--p-now);box-shadow:0 0 6px rgba(243,106,22,.7)}
+.p-live .lv-dim{color:var(--p-dim2);font-size:10.5px}
+.p-live .lv-cnt{color:var(--p-dim2);font-size:10.5px}
+.p-live .lv-run{color:var(--p-now);font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+.p-lvitem .p-lvfile{cursor:pointer}
+.p-lvitem .p-lvfile:hover{background:#141c25}
+.p-lvfile{display:flex;gap:9px;align-items:baseline;font-size:11.5px;padding:1px 0}
+.p-lvfile .lv-num{margin-left:auto;font-family:var(--mono);font-size:10.5px;display:flex;gap:7px}
+.p-lvfile .lv-num .add{color:var(--p-pass);font-style:normal}
+.p-lvfile .lv-num .del{color:var(--p-stop);font-style:normal}
 
 /* ── отказ прогона: вкладка внутри шага ─────────────────────────────────── */
 .p-runmemo.bad{color:#f0a2a9}

@@ -105,6 +105,31 @@ export interface ArtifactView extends Artifact {
  * Консоль прогона: потоки роли как они лежат в уликах прогона.
  * `running` — прогон ещё идёт, поток растёт; окно досматривает его повторно.
  */
+/** Живое рабочее дерево задачи: то, что роль правит прямо сейчас. */
+export interface LiveFileView {
+  path: string;
+  status: string;
+  added: number;
+  removed: number;
+}
+export interface LiveDiffView {
+  path: string;
+  diff: string;
+  note: string | null;
+}
+
+export interface LiveWorktreeView {
+  task: string;
+  worktree: string | null;
+  branch: string | null;
+  head: string | null;
+  files: LiveFileView[];
+  dirty: number;
+  truncated: boolean;
+  running: boolean;
+  note: string | null;
+}
+
 /** Строка исполнения как она записана платформой (хвост от exec.get). */
 export interface ExecRow {
   id: string;

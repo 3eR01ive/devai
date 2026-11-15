@@ -226,6 +226,20 @@ pub fn operations() -> Vec<OpDescriptor> {
             description: "The committed changeset of the task's isolated workspace: file list with A/M/D status markers between the stored bound baseline (the bound_head of the first worktree.prepared) and the branch tip — or, once the branch is gone, between the baseline and the last stored worktree.committed stamp when those shas still resolve (state 'historical', partial marker). Verdicts in data: no_isolation / live / historical / unavailable; a zero-change run is an empty list with the zero_changes marker, never an error. Read-only git plumbing over stored facts; nothing is written. Mirrors `task workspace`.",
         },
         OpDescriptor {
+            name: "task.workspace_live",
+            class: OpClass::Read,
+            input: "id_prefix",
+            output: "LiveWorktreeView{task,worktree,branch,head,files,dirty,truncated,running,note}",
+            description: "Живое рабочее дерево задачи: ветка, HEAD и изменённые файлы с числом строк, как их видит git ПРЯМО СЕЙЧАС (рабочее + индекс). `task.workspace_changes` показывает закоммиченный changeset, а у идущего прогона он ещё пуст, хотя роль уже правит файлы. Ничего не пишет; отсутствие дерева и чистое дерево названы (note).",
+        },
+        OpDescriptor {
+            name: "task.workspace_live_diff",
+            class: OpClass::Read,
+            input: "id_prefix, path",
+            output: "LiveDiffView{path,diff,note}",
+            description: "Дифф одного файла ЖИВОГО рабочего дерева задачи: правки, которых ещё нет в коммите. Существует потому, что `task.workspace_diff` читает baseline..tip, а у идущего прогона там пусто, хотя файл уже меняется. Пустой дифф назван (note), отсутствие дерева — типизированный отказ.",
+        },
+        OpDescriptor {
             name: "task.workspace_diff",
             class: OpClass::Read,
             input: "id_prefix, path",

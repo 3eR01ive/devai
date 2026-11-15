@@ -100,6 +100,8 @@ fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
         commands::task_usage,
         commands::exec_transcript,
         commands::execution_get,
+        commands::workspace_live,
+        commands::workspace_live_diff,
         commands::task_merge,
         commands::source_slice,
         commands::execution_liveness,

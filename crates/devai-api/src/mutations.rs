@@ -3643,6 +3643,43 @@ mod tests {
         .id
     }
 
+    /// Живое дерево показывает НЕЗАКОММИЧЕННЫЕ правки: именно их окно не
+    /// видело, пока роль работает (закоммиченный changeset у идущего прогона пуст).
+    #[test]
+    fn workspace_live_reads_the_worktree_as_it_is_now() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let api = api(dir.path());
+        let id = fresh_task(&api, "живое дерево");
+
+        // рабочий каталог задачи в доме
+        let wt = dir.path().join("worktrees").join(id.to_string());
+        std::fs::create_dir_all(&wt).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        };
+        git(&["init", "-q"]);
+        std::fs::write(wt.join("a.txt"), "первая строка\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+        // роль правила файл, но ещё не закоммитила
+        std::fs::write(wt.join("a.txt"), "первая строка\nвторая строка\n").unwrap();
+
+        let live = api.workspace_live(&id.to_string()).unwrap();
+        assert_eq!(live.dirty, 1, "{live:?}");
+        assert_eq!(live.files[0].path, "a.txt");
+        assert_eq!(live.files[0].status, "M");
+        assert_eq!(live.files[0].added, 1);
+
+        let d = api.workspace_live_diff(&id.to_string(), "a.txt").unwrap();
+        assert!(d.diff.contains("+вторая строка"), "{}", d.diff);
+    }
+
     /// Остановка прогона человеком ПИШЕТ причину в строку: раньше строка
     /// закрывалась пустой, и карточка могла показать только статус.
     #[test]

@@ -301,6 +301,46 @@ fn tail_text(p: &std::path::Path) -> (String, u64, bool) {
     (text, size, skip > 0)
 }
 
+/// Один файл рабочего дерева прогона: как git его видит ПРЯМО СЕЙЧАС.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveFileView {
+    pub path: String,
+    /// Буква состояния из `git status --porcelain` (M/A/D/R/??).
+    pub status: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// Что происходит в рабочем дереве задачи во время прогона. Отчёты и диффы
+/// показывают КОММИТНУТОЕ (baseline..tip), а пока роль работает, её правки ещё
+/// не закоммичены — и окно их не видело вовсе. Здесь — фактическое состояние
+/// `worktrees/<задача>`: ветка, HEAD, изменённые файлы с числом строк.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveWorktreeView {
+    pub task: String,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub files: Vec<LiveFileView>,
+    pub dirty: usize,
+    /// Список обрезан: правок больше, чем окно показывает.
+    pub truncated: bool,
+    /// Прогон задачи идёт прямо сейчас — значит дерево ещё будет меняться.
+    pub running: bool,
+    pub note: Option<String>,
+}
+
+/// Дифф одного файла живого дерева (незакоммиченные правки).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveDiffView {
+    pub path: String,
+    pub diff: String,
+    pub note: Option<String>,
+}
+
+/// Потолок списка файлов: остальное — счётчиком, а не молчанием.
+const LIVE_FILES_MAX: usize = 200;
+
 fn num(v: &serde_json::Value, key: &str) -> Option<i64> {
     v.get(key).and_then(|x| x.as_i64())
 }
@@ -351,6 +391,132 @@ impl Api {
             runs: runs.len(),
             measured,
             rows,
+        })
+    }
+
+    /// Живое рабочее дерево задачи: то, что роль правит ПРЯМО СЕЙЧАС.
+    /// `workspace_changes` показывает закоммиченный changeset baseline..tip —
+    /// у идущего прогона он ещё пуст, хотя файлы уже меняются.
+    pub fn workspace_live(&self, id_prefix: &str) -> ApiResult<LiveWorktreeView> {
+        let task = self.store.resolve_task(id_prefix)?;
+        let dir = self.home_path().join("worktrees").join(task.id.to_string());
+        let runs = self.store.list_executions(Some(task.id))?;
+        let running = runs.iter().any(|e| e.finished_at.is_none());
+        if !dir.is_dir() {
+            return Ok(LiveWorktreeView {
+                task: task.id.to_string(),
+                worktree: None,
+                branch: None,
+                head: None,
+                files: vec![],
+                dirty: 0,
+                truncated: false,
+                running,
+                note: Some(format!(
+                    "изолированного дерева у задачи нет ({} не существует) — роль правила выложенное",
+                    dir.display()
+                )),
+            });
+        }
+        let git = |args: &[&str]| -> Option<String> {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        };
+        let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).map(|s| s.trim().to_string());
+        let head = git(&["rev-parse", "HEAD"]).map(|s| s.trim().to_string());
+        // Счётчики строк по файлам: рабочее (unstaged) + индекс (staged).
+        let mut counts: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
+        for args in [
+            vec!["diff", "--numstat", "HEAD"],
+            vec!["diff", "--cached", "--numstat"],
+        ] {
+            if let Some(out) = git(&args) {
+                for line in out.lines() {
+                    let mut it = line.split('\t');
+                    let (Some(a), Some(r), Some(p)) = (it.next(), it.next(), it.next()) else {
+                        continue;
+                    };
+                    let entry = counts.entry(p.to_string()).or_default();
+                    entry.0 += a.parse::<u32>().unwrap_or(0);
+                    entry.1 += r.parse::<u32>().unwrap_or(0);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        if let Some(out) = git(&["status", "--porcelain"]) {
+            for line in out.lines() {
+                if line.len() < 4 {
+                    continue;
+                }
+                let code = line[..2].trim().to_string();
+                let path = line[3..].trim().to_string();
+                let (added, removed) = counts.get(&path).copied().unwrap_or((0, 0));
+                files.push(LiveFileView {
+                    status: if code == "??" { "??".to_string() } else { code },
+                    path,
+                    added,
+                    removed,
+                });
+            }
+        }
+        let dirty = files.len();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let truncated = dirty > LIVE_FILES_MAX;
+        files.truncate(LIVE_FILES_MAX);
+        Ok(LiveWorktreeView {
+            task: task.id.to_string(),
+            worktree: Some(dir.display().to_string()),
+            branch,
+            head,
+            files,
+            dirty,
+            truncated,
+            running,
+            note: if dirty == 0 {
+                Some("в рабочем дереве чисто: роль ещё ничего не поменяла (или уже закоммитила)".to_string())
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Дифф ОДНОГО файла живого дерева: правки, которых ещё нет в коммите.
+    /// Тем же `git diff` по рабочему каталогу задачи, что и список.
+    pub fn workspace_live_diff(
+        &self,
+        id_prefix: &str,
+        path: &str,
+    ) -> ApiResult<LiveDiffView> {
+        let task = self.store.resolve_task(id_prefix)?;
+        let dir = self.home_path().join("worktrees").join(task.id.to_string());
+        if !dir.is_dir() {
+            return Err(crate::ApiError::refused(
+                "no_worktree",
+                "у задачи нет изолированного рабочего дерева",
+            ));
+        }
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["diff", "HEAD", "--", path])
+            .output()
+            .map_err(|e| crate::ApiError::refused("git_failed", format!("git: {e}")))?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let note = if text.trim().is_empty() {
+            Some("в этом файле нет незакоммиченных правок (или он не менялся)".to_string())
+        } else {
+            None
+        };
+        Ok(LiveDiffView {
+            path: path.to_string(),
+            diff: text,
+            note,
         })
     }
 

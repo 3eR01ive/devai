@@ -461,6 +461,8 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("evaluation_rules", "eval.rules"),
     ("task_usage", "task.usage"),
     ("exec_transcript", "exec.transcript"),
+    ("workspace_live", "task.workspace_live"),
+    ("workspace_live_diff", "task.workspace_live_diff"),
     ("execution_get", "exec.get"),
     ("source_slice", "source.slice"),
     ("task_events", "task.events"),
@@ -1471,6 +1473,25 @@ pub fn task_merge(
         commit: last.and_then(|d| d.refs.get(1).cloned()).unwrap_or_default(),
         text: text.trim().to_string(),
     })
+}
+
+/// Живое рабочее дерево задачи: что роль правит прямо сейчас.
+#[tauri::command(rename_all = "snake_case")]
+pub fn workspace_live(
+    state: State<AppState>,
+    id_prefix: String,
+) -> Result<devai_api::LiveWorktreeView, UiError> {
+    Ok(state.api().workspace_live(&id_prefix)?)
+}
+
+/// Дифф одного файла живого дерева: незакоммиченные правки роли.
+#[tauri::command(rename_all = "snake_case")]
+pub fn workspace_live_diff(
+    state: State<AppState>,
+    id_prefix: String,
+    path: String,
+) -> Result<devai_api::LiveDiffView, UiError> {
+    Ok(state.api().workspace_live_diff(&id_prefix, &path)?)
 }
 
 /// Одна строка исполнения как она записана: статус, класс отказа, текст отказа.

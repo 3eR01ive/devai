@@ -277,6 +277,14 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: execution_get_rpc,
     },
     RpcCommand {
+        name: "workspace_live",
+        handler: workspace_live_rpc,
+    },
+    RpcCommand {
+        name: "workspace_live_diff",
+        handler: workspace_live_diff_rpc,
+    },
+    RpcCommand {
         name: "task_merge",
         handler: task_merge_rpc,
     },
@@ -1009,6 +1017,25 @@ fn task_merge_rpc(
     let id_prefix = param_str(params, "id_prefix")?;
     let rationale = params.get("rationale").and_then(|v| v.as_str()).map(str::to_string);
     to_json(crate::commands::task_merge(state(app), id_prefix, rationale)?)
+}
+
+fn workspace_live_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let id_prefix = param_str(params, "id_prefix")?;
+    to_json(crate::commands::workspace_live(state(app), id_prefix)?)
+}
+
+fn workspace_live_diff_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let id_prefix = param_str(params, "id_prefix")?;
+    let path = param_str(params, "path")?;
+    to_json(crate::commands::workspace_live_diff(state(app), id_prefix, path)?)
 }
 
 fn execution_get_rpc(
