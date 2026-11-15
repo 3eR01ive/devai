@@ -675,8 +675,8 @@ impl Store {
     pub fn commit(&self, base_lock: u64, m: &Mutation) -> StoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         let affected = tx.execute(
-            "UPDATE tasks SET state=?1, return_state=?2, requirements_seq=?3, lock_version=?4, updated_at=?5, human_name=?6
-             WHERE id=?7 AND lock_version=?8",
+            "UPDATE tasks SET state=?1, return_state=?2, requirements_seq=?3, lock_version=?4, updated_at=?5, human_name=?6, title=?7, business_description=?8
+             WHERE id=?9 AND lock_version=?10",
             params![
                 m.task.state.as_str(),
                 m.task.return_state.map(|s| s.as_str()),
@@ -689,6 +689,12 @@ impl Store {
                 // transition carries the stored value back unchanged (the
                 // task it clones came out of this same read plane).
                 m.task.human_name,
+                // Постановка тоже едет с мутацией: человек правит её и из
+                // карточки (`task.restate`), и ответом на вопрос постановки.
+                // Без этих двух полей правка оставалась только в памяти
+                // перехода и терялась на записи.
+                m.task.title,
+                m.task.business_description,
                 m.task.id.to_string(),
                 base_lock as i64,
             ],

@@ -2464,7 +2464,11 @@ impl Api {
         self.store
             .answer_question(q.id, text, &self.actor, Utc::now())?;
         let process = self.process_policy()?;
-        let m = workflow::answer_question(&process, &task, q.id, &self.actor, Utc::now())?;
+        let mut m = workflow::answer_question(&process, &task, q.id, &self.actor, Utc::now())?;
+        // Ответ на вопрос ПОСТАНОВКИ становится частью постановки: иначе
+        // проверяющий снова видит тот же текст и спрашивает то же самое
+        // (прецедент 01a1df87 — пять одинаковых кругов по одному сценарию).
+        Self::absorb_answer_into_statement(&mut m, &task, &q, text);
         self.store.commit(task.lock_version, &m)?;
         // REQ-AR-11: the answer releases the hold and returns the task to the
         // stage that asked — a role state, so the platform starts that run
@@ -2475,6 +2479,35 @@ impl Api {
             from_state: task.state,
             to_state: m.task.state,
         })
+    }
+
+    /// Ответ человека на вопрос, поднятый из постановки, ДОПИСЫВАЕТСЯ в текст
+    /// постановки: вопрос задан про этот текст, ответ на него — уточнение этого
+    /// текста. Так следующий круг судит полную постановку, а не ту же самую
+    /// с пропущенными ответами. Повтор того же ответа не дублируется.
+    fn absorb_answer_into_statement(m: &mut Mutation, task: &Task, q: &Question, text: &str) {
+        if task.return_state != Some(TaskState::Statement) {
+            return;
+        }
+        let answer = text.trim();
+        if answer.is_empty() || m.task.business_description.contains(answer) {
+            return;
+        }
+        const HEAD: &str = "\n\n— уточнения человека (ответы на вопросы постановки):\n";
+        let mut body = m.task.business_description.clone();
+        if !body.contains(HEAD.trim()) {
+            body.push_str(HEAD);
+        }
+        body.push_str(&format!("• {answer}\n"));
+        m.task.business_description = body;
+        m.events.push(EventDraft {
+            kind: devai_core::types::event_kind::TASK_RESTATED,
+            actor: "platform".to_string(),
+            payload: serde_json::json!({
+                "reason": "ответ человека на вопрос постановки вписан в постановку",
+                "question_id": q.id.to_string(),
+            }),
+        });
     }
 
     /// Поднят ли `question_id` гейтом «ревью вернуло спеку» — по СОБЫТИЮ, а не
@@ -3602,6 +3635,44 @@ mod tests {
         .expect("create")
         .task
         .id
+    }
+
+    /// Ответ на вопрос постановки ДОПИСЫВАЕТСЯ в постановку: следующий круг
+    /// судит полный текст, а не тот же самый (прецедент 01a1df87 — пять
+    /// одинаковых кругов, потому что ответы никуда не попадали).
+    #[test]
+    fn answer_to_statement_question_is_written_into_the_statement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let api = api(dir.path());
+        let id = fresh_task(&api, "промотка списка");
+        let task = api.task_start(&id.to_string()).unwrap().task;
+        assert_eq!(task.state, TaskState::Statement);
+
+        let asked = api
+            .question_ask(crate::mutations::AskReq {
+                id: id.to_string(),
+                text: "кто получит результат?".into(),
+                context: None,
+                options: vec![],
+                blocking: true,
+                execution: None,
+            })
+            .unwrap();
+
+        let out = api
+            .question_answer(&asked.question.id.to_string(), "любой оператор интерфейса devai")
+            .unwrap();
+        assert_eq!(out.to_state, TaskState::Statement);
+
+        let after = api.task_get(&id.to_string()).unwrap();
+        assert!(
+            after.business_description.contains("уточнения человека"),
+            "постановка должна нести вписанный ответ: {}",
+            after.business_description
+        );
+        assert!(after
+            .business_description
+            .contains("любой оператор интерфейса devai"));
     }
 
     // --- REQ-API-01 / REQ-API-02 (QA artifact 01a1acab-18b1, ratified
