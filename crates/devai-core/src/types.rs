@@ -1566,6 +1566,19 @@ pub mod decision_kind {
     /// stored decision because resetting the counter is a HUMAN act — no
     /// edit of the declaration, re-run or restart may do it.
     pub const ATTEMPT_LIMIT_ANSWER: &str = "attempt_limit_answer";
+    /// Полный перечень видов решений — та же дисциплина, что у `event_kind::ALL`:
+    /// читатель, который перечисляет виды (например отбор подписи), сверяется с
+    /// ним, а не с собственной памятью.
+    pub const ALL: &[&str] = &[
+        REWORK_MERGE,
+        REQUIREMENTS_APPROVAL,
+        PROFILE_RATIFICATION,
+        REWORK_NOOP_RATIFIED,
+        DEPENDENCY_OVERRIDE,
+        REQUIREMENTS_REJECTION,
+        QUALITY_RETURN,
+        ATTEMPT_LIMIT_ANSWER,
+    ];
 }
 
 /// The answer vocabulary of the attempt-limit question (REQ-AL-05/06): the

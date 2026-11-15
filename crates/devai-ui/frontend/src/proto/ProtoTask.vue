@@ -405,6 +405,14 @@ function ensureLoaded(s: any) {
   if (art) void ensureBody(art);
 }
 
+/// Выводы проверяющего ДЛЯ ВЫБРАННОГО прогона шага: вкладка обязана меняться
+/// от прогона к прогону, а не показывать всегда самый свежий вердикт.
+function reviewOf(s: any): StatementReview | null {
+  const art = artOf(s);
+  const body = art ? (runBodies.value as Record<string, any>)[art.id] : null;
+  return parseStatementReview(body) ?? (art ? null : stmtReview.value);
+}
+
 function durationOf(execs: any[]): string {
   let ms = 0;
   for (const e of execs) {
@@ -720,6 +728,8 @@ function evidenceOf(c: any): string {
 // Разбор вопросов и сборка решения живут в SignPanel/signText; карточка только
 // отправляет акт платформы и перечитывает себя.
 const signBusy = ref(false);
+/** Почему подпись не прочиталась — показываем причину, а не «подписывать нечего». */
+const sigError = ref<string | null>(null);
 
 // ── вопросы платформы: слово человека снимает удержание ──────────────────
 // Вопрос и гейт берутся из ДАННЫХ: текст вопроса — из чтения вопросов, гейт —
@@ -773,12 +783,19 @@ async function load() {
       api.taskReport(id.value).catch(() => null),
       api.taskUsage(id.value).catch(() => null),
       api.evaluationRules().catch(() => null),
-      api.taskSignature(id.value).catch(() => null),
+      api.taskSignature(id.value).catch((e) => {
+        // Отказ чтения подписи — это REASON, а не пустота: иначе карточка
+        // врёт «спеки нет», хотя спека есть, а сломался отбор (прецедент
+        // 01a1df87: неизвестный вид решения ронял весь отбор подписи).
+        sigError.value = String(toUiError(e).message);
+        return null;
+      }),
       api.artifactsList(id.value).catch(() => [] as ArtifactView[]),
       api.questionsList(id.value).catch(() => [] as Question[]),
       api.taskEvents(id.value, 200).catch(() => [] as WorkflowEvent[]),
     ]);
     prog.value = p;
+    if (sig) sigError.value = null;
     report.value = r;
     usage.value = u;
     rules.value = rb;
@@ -1184,7 +1201,7 @@ onMounted(load);
               </div>
 
               <div v-if="s.state === 'STATEMENT' && openTab === 'verdict'" class="p-panel">
-                <StatementVerdict :review="stmtReview" />
+                <StatementVerdict :review="reviewOf(s)" />
               </div>
 
               <div v-if="s.state === 'STATEMENT' && openTab === 'stmt'" class="p-panel">
@@ -1446,8 +1463,11 @@ onMounted(load);
               </div>
 
               <!-- что подписываешь -->
+              <div v-if="openTab === 'sign' && sigError && !signature" class="p-empty" style="color:#ffa972">
+                подпись не прочиталась: {{ sigError }}
+              </div>
               <SignPanel
-                v-if="openTab === 'sign'"
+                v-else-if="openTab === 'sign'"
                 :signature="signature"
                 :busy="signBusy"
                 @sign="doSign"
