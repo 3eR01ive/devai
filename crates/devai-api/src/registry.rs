@@ -257,7 +257,7 @@ pub fn operations() -> Vec<OpDescriptor> {
             name: "task.usage",
             class: OpClass::Read,
             input: "id_prefix",
-            output: "TaskUsageView{task,task_name,spent,limit,limit_text,raised_to,line,models,cost_usd,cost_unknown,runs,measured,unknown,rows",
+            output: "TaskUsageView{task,task_name,spent,limit,limit_text,raised_to,line,models,cost_usd,cost_unknown,runs,measured,unknown,rows}",
             description: "Расход токенов задачи из СТОРА (execution_usage), без разбора логов: «израсходовано X из Y» одной строкой, эффективный лимит задачи (объявленный в конфиге плюс поднятый решением человека), модели прогонов, число прогонов, число прогонов с НЕИЗВЕСТНЫМ расходом (не ноль) и стоимость с числом прогонов без цены. Без лимита отдаёт «без лимита». Прогоны, закрытые без отчёта, присутствуют с measured=false и причиной.",
         },
         OpDescriptor {

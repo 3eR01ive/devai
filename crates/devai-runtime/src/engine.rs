@@ -18,7 +18,7 @@ use devai_store::config::{
     AgentFailurePolicy, HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
     UsagePolicy,
 };
-use devai_store::{ArtifactDraft, Store, StoreError};
+use devai_store::{ArtifactDraft, Store, StoreError, UsageRecord};
 
 use crate::adapters::{
     self, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
@@ -192,6 +192,17 @@ pub enum RuntimeError {
     /// numbers (`usage::BudgetRefusal::line`), so the caller re-words nothing.
     #[error("{0}")]
     BudgetRefused(String),
+    /// The run was refused by a budget AND the runner-opened row could not be
+    /// closed afterwards (task 01a1b851, REQ-USG-05 AC5). Both facts are kept:
+    /// the refusal sentence, which the operator acted on, and the store error
+    /// that left a RUNNING row behind — a cleanup failure is never swallowed
+    /// into silence, and never replaces the refusal text either.
+    #[error("{refusal} — the refused run's row did not close: {source}")]
+    RefusalCleanup {
+        refusal: String,
+        #[source]
+        source: StoreError,
+    },
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -1449,14 +1460,19 @@ impl<'a> Engine<'a> {
             // A runner-opened row for this stage must not survive as RUNNING
             // once its run is refused.
             if let Some(row) = self.adopted.borrow_mut().take() {
-                let _ = self.store.finish_execution_classified(
-                    &row,
-                    ExecutionStatus::Failed,
-                    None,
-                    Some(&refusal.line),
-                    Some(failure_class::PLATFORM),
-                    Utc::now(),
-                );
+                self.store
+                    .finish_execution_classified(
+                        &row,
+                        ExecutionStatus::Failed,
+                        None,
+                        Some(&refusal.line),
+                        Some(failure_class::PLATFORM),
+                        Utc::now(),
+                    )
+                    .map_err(|source| RuntimeError::RefusalCleanup {
+                        refusal: refusal.line.clone(),
+                        source,
+                    })?;
             }
             return Err(RuntimeError::BudgetRefused(refusal.line));
         }
@@ -2158,45 +2174,66 @@ impl<'a> Engine<'a> {
         else {
             return Ok(None);
         };
-        // The parking rule itself lives in `usage` — the API admission gate
-        // calls the very same function, so both doors park identically.
-        let parked = usage::park_task_exhaustion(
+        // The parking/recording rule itself lives in `usage` — the API
+        // admission gate calls the very same function, so both doors behave
+        // identically.
+        usage::stop_task(
             self.store,
             &self.process,
             task,
-            role,
             &refusal,
             self.usage.budgets.task,
             PLATFORM_ACTOR,
             Utc::now(),
         )?;
-        // The event is written once per refusal; when the task was parked the
-        // park mutation already carries it with the question id.
-        if !parked {
-            usage::record_refusal(self.store, task.id, role, &refusal, PLATFORM_ACTOR)?;
-        }
         Ok(Some(refusal))
     }
 
     /// Write the spend row of every execution of the stage just run
     /// (REQ-USG-01/02). The driver's report is read from that execution's own
-    /// evidence dir; when it is absent or unreadable the row is the honest
-    /// «расход неизвестен» record — tokens stay NULL, never zero.
+    /// evidence dir; the row is MEASURED when it parses, and the honest
+    /// «расход неизвестен» row otherwise — tokens stay NULL, never zero.
     fn record_stage_usage(&self, executions: &[RoleExecution]) -> RuntimeResult<()> {
         let end = Utc::now();
         for e in executions {
             let path = adapters::usage_report_path(&self.evidence_dir(e.task_id, e.id));
-            let report = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| usage::parse_usage_report(&text).ok());
-            let provider = e.bundle.as_ref().map(|b| b.llm_provider.clone());
-            let model = e.bundle.as_ref().map(|b| b.model.clone());
-            let duration = usage::duration_ms(e.started_at, Some(end));
-            let record =
-                usage::usage_record(e, provider, model, duration, report.as_ref(), &self.usage);
+            let record = self.stage_usage_record(e, &path, end);
             self.store.record_execution_usage(&record)?;
         }
         Ok(())
+    }
+
+    /// The spend record of ONE execution of the stage. Three distinct facts,
+    /// three distinct reasons: a report that parses (MEASURED), no report at
+    /// all (the driver wrote none), and a report that is THERE but unreadable
+    /// — the last one keeps its own reason, so a corrupt file is never read as
+    /// «отчёта не было» (rl/error-handling). Durations come from the
+    /// execution's own start and finish; only a row that never closed falls
+    /// back to the stage end.
+    fn stage_usage_record(
+        &self,
+        e: &RoleExecution,
+        path: &std::path::Path,
+        end: Timestamp,
+    ) -> UsageRecord {
+        let provider = e.bundle.as_ref().map(|b| b.llm_provider.clone());
+        let model = e.bundle.as_ref().map(|b| b.model.clone());
+        let duration = usage::duration_ms(e.started_at, e.finished_at.or(Some(end)));
+        match usage::read_usage_report(path) {
+            Ok(found) => {
+                usage::usage_record(e, provider, model, duration, found.as_ref(), &self.usage)
+            }
+            Err(reason) => UsageRecord::unknown(
+                e.id,
+                e.task_id,
+                &e.role_slug,
+                e.run_id.map(|r| r.to_string()),
+                provider,
+                model,
+                duration,
+                reason,
+            ),
+        }
     }
 
     /// REQ-FG-06 / ratified OQ-FG-07: complete the requirements-spec echo

@@ -251,55 +251,46 @@ impl Store {
     /// a run — a run without a usage row (or with `measured = 0`) is counted
     /// as unknown, never dropped and never zeroed (REQ-USG-02 AC3/AC4).
     pub fn usage_rollup(&self, q: &UsageQuery) -> StoreResult<Vec<UsageBucket>> {
-        let key = match q.group {
-            UsageGroup::Totals => "''".to_string(),
-            UsageGroup::Task => "e.task_id".to_string(),
-            UsageGroup::Role => "e.role_slug".to_string(),
-            // The model stamp of the execution is the run's own identity
-            // (REQ-MS-05). A run written before the stamp has no model — it
-            // is grouped under the EMPTY key and the reader words it, rather
-            // than being folded into another model's row.
-            UsageGroup::Model => "COALESCE(u.model, e.model, '')".to_string(),
-        };
-        let sql = format!(
-            "SELECT {key} AS k, \
-             COALESCE(SUM(CASE WHEN u.measured=1 THEN u.prompt_tokens ELSE 0 END),0), \
-             COALESCE(SUM(CASE WHEN u.measured=1 THEN u.completion_tokens ELSE 0 END),0), \
-             COALESCE(SUM(CASE WHEN u.measured=1 THEN u.total_tokens ELSE 0 END),0), \
-             COALESCE(SUM(CASE WHEN u.measured=1 THEN u.cost_usd END),0.0), \
-             COUNT(*), \
-             COALESCE(SUM(CASE WHEN u.measured=1 THEN 1 ELSE 0 END),0), \
-             COALESCE(SUM(CASE WHEN u.measured=1 THEN 0 ELSE 1 END),0), \
-             COALESCE(SUM(CASE WHEN u.measured=1 AND u.cost_usd IS NULL THEN 1 ELSE 0 END),0) \
-             FROM role_executions e LEFT JOIN execution_usage u ON u.execution_id=e.id \
-             WHERE (?1 IS NULL OR e.started_at >= ?1) \
-               AND (?2 IS NULL OR e.started_at < ?2) \
-               AND (?3 IS NULL OR e.task_id = ?3) \
-             GROUP BY k"
-        );
+        let sql = rollup_sql(q.group);
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows_out = stmt.query(params![
+        let mut rows_in = stmt.query(params![
             q.from.as_ref().map(rows::ts),
             q.to.as_ref().map(rows::ts),
             q.task_id.map(|t| t.to_string()),
         ])?;
         let mut out = Vec::new();
-        while let Some(r) = rows_out.next()? {
-            let raw: String = rows::get(r, 0)?;
-            out.push(UsageBucket {
-                key: match q.group {
-                    UsageGroup::Totals => None,
-                    _ => Some(raw),
-                },
-                prompt_tokens: rows::get(r, 1)?,
-                completion_tokens: rows::get(r, 2)?,
-                total_tokens: rows::get(r, 3)?,
-                cost_usd: rows::get(r, 4)?,
-                runs: rows::get(r, 5)?,
-                measured: rows::get(r, 6)?,
-                unknown: rows::get(r, 7)?,
-                cost_unknown: rows::get(r, 8)?,
-            });
+        while let Some(r) = rows_in.next()? {
+            out.push(usage_bucket_from_row(r, q.group)?);
+        }
+        Ok(out)
+    }
+
+    /// The signboard name of every given task, in ONE query — the batch read
+    /// that names the buckets of a task rollup, so a summary over N tasks
+    /// costs one statement instead of N (pf/io-churn). The name is the
+    /// platform's ONE signboard rule [`Task::display_sign`], not a second
+    /// reading of `human_name`/`title`; a task missing from the answer is
+    /// simply absent and the caller falls back to the id it already has.
+    pub fn task_display_names(&self, task_ids: &[String]) -> StoreResult<Vec<(String, String)>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=task_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Same projection as every other task read: a home this build observes
+        // may be behind it (v8 has no `tasks.human_name`).
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE id IN ({placeholders})",
+            self.task_projection()?
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows_in = stmt.query(rusqlite::params_from_iter(task_ids.iter()))?;
+        let mut out = Vec::new();
+        while let Some(r) = rows_in.next()? {
+            let t = rows::task_from_row(r)?;
+            out.push((t.id.to_string(), t.display_sign()));
         }
         Ok(out)
     }
@@ -337,10 +328,11 @@ impl Store {
         Ok(out)
     }
 
-    /// The historical average spend of completed MEASURED runs of one
-    /// (task, role) pair, else of the role alone (ratified OQ-8 answer), with
-    /// the number of runs the average rests on. `None` = no history at all —
-    /// the caller falls back to the run budget (REQ-USG-05 AC2).
+    /// The historical average spend of MEASURED runs of one (task, role) pair,
+    /// else of the role alone (ratified OQ-8 answer), with the number of runs
+    /// the average rests on. Failed runs count too: they spent the tokens all
+    /// the same. `None` = no history at all — the caller falls back to the run
+    /// budget (REQ-USG-05 AC2).
     pub fn usage_average(
         &self,
         task_id: Option<Id>,
@@ -405,6 +397,59 @@ impl Store {
             |r| r.get::<usize, i64>(0),
         )? > 0)
     }
+}
+
+/// The ONE rollup statement: the group key, the sums of the MEASURED rows,
+/// and — beside them — the counts of runs and of runs with unknown spend. The
+/// join starts from `role_executions`, so a run without a usage row is a run
+/// with unknown spend rather than a missing run (REQ-USG-02 AC3/AC4).
+fn rollup_sql(group: UsageGroup) -> String {
+    let key = match group {
+        UsageGroup::Totals => "''".to_string(),
+        UsageGroup::Task => "e.task_id".to_string(),
+        UsageGroup::Role => "e.role_slug".to_string(),
+        // The model stamp of the execution is the run's own identity
+        // (REQ-MS-05). A run written before the stamp has no model — it is
+        // grouped under the EMPTY key and the reader words it, rather than
+        // being folded into another model's row.
+        UsageGroup::Model => "COALESCE(u.model, e.model, '')".to_string(),
+    };
+    format!(
+        "SELECT {key} AS k, \
+         COALESCE(SUM(CASE WHEN u.measured=1 THEN u.prompt_tokens ELSE 0 END),0), \
+         COALESCE(SUM(CASE WHEN u.measured=1 THEN u.completion_tokens ELSE 0 END),0), \
+         COALESCE(SUM(CASE WHEN u.measured=1 THEN u.total_tokens ELSE 0 END),0), \
+         COALESCE(SUM(CASE WHEN u.measured=1 THEN u.cost_usd END),0.0), \
+         COUNT(*), \
+         COALESCE(SUM(CASE WHEN u.measured=1 THEN 1 ELSE 0 END),0), \
+         COALESCE(SUM(CASE WHEN u.measured=1 THEN 0 ELSE 1 END),0), \
+         COALESCE(SUM(CASE WHEN u.measured=1 AND u.cost_usd IS NULL THEN 1 ELSE 0 END),0) \
+         FROM role_executions e LEFT JOIN execution_usage u ON u.execution_id=e.id \
+         WHERE (?1 IS NULL OR e.started_at >= ?1) \
+           AND (?2 IS NULL OR e.started_at < ?2) \
+           AND (?3 IS NULL OR e.task_id = ?3) \
+         GROUP BY k"
+    )
+}
+
+/// One aggregation row of [`rollup_sql`]. `key` is `None` only for the
+/// totals bucket: the totals row IS the whole window, never one key.
+fn usage_bucket_from_row(r: &rusqlite::Row<'_>, group: UsageGroup) -> StoreResult<UsageBucket> {
+    let raw: String = rows::get(r, 0)?;
+    Ok(UsageBucket {
+        key: match group {
+            UsageGroup::Totals => None,
+            _ => Some(raw),
+        },
+        prompt_tokens: rows::get(r, 1)?,
+        completion_tokens: rows::get(r, 2)?,
+        total_tokens: rows::get(r, 3)?,
+        cost_usd: rows::get(r, 4)?,
+        runs: rows::get(r, 5)?,
+        measured: rows::get(r, 6)?,
+        unknown: rows::get(r, 7)?,
+        cost_unknown: rows::get(r, 8)?,
+    })
 }
 
 fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionUsage> {

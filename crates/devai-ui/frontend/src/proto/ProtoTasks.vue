@@ -99,6 +99,16 @@ function tok(n: number): string {
   return String(n);
 }
 
+/**
+ * Расход строки списка: сумма известных прогонов, «—» когда известных нет, а
+ * НЕИЗВЕСТНЫЕ есть (их число стоит рядом) — неизвестный расход не выдаётся за
+ * ноль (REQ-USG-02 AC1).
+ */
+function spentText(spent: number, unknown: number): string {
+  if (spent === 0 && unknown > 0) return "—";
+  return tok(spent);
+}
+
 const rowOf = (t: Task) => {
   const p = progress.value[t.id];
   const stages = (p?.graph?.stages ?? []).map((s) => ({
@@ -283,7 +293,7 @@ onMounted(load);
           <div class="p-ident">
             <span>{{ r.id }}</span>
             <span v-if="r.u" :title="r.u.line">
-              {{ tok(r.u.spent) }}<template v-if="r.u.limit != null"> из {{ tok(r.u.limit) }}</template>
+              {{ spentText(r.u.spent, r.u.unknown) }}<template v-if="r.u.limit != null"> из {{ tok(r.u.limit) }}</template>
               токенов<template v-if="r.u.unknown > 0"> · неизвестно у {{ r.u.unknown }}</template>
             </span>
           </div>

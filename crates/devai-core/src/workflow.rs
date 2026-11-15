@@ -1082,22 +1082,117 @@ pub fn raise_question(
     )
 }
 
+/// The numbers of ONE token-budget stop (task 01a1b851, REQ-USG-05/06): what
+/// the task spent, the limit it hit, what the refused run would have cost and
+/// the absolute budget the human is offered. ONE value, so the question text,
+/// the refusal event, the stored decision and the operator's card cannot drift
+/// apart — and no surface re-derives a number from another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageStop {
+    pub role_slug: String,
+    pub spent: u64,
+    pub limit: u64,
+    pub expected: u64,
+    pub raise_to: u64,
+}
+
+impl UsageStop {
+    pub fn new(role_slug: &str, spent: u64, limit: u64, expected: u64, raise_to: u64) -> Self {
+        Self {
+            role_slug: role_slug.to_string(),
+            spent,
+            limit,
+            expected,
+            raise_to,
+        }
+    }
+
+    /// The refusal facts as a payload — the `usage.budget_refused` event, the
+    /// question's context and the stored decision all read these keys.
+    fn payload(&self) -> serde_json::Value {
+        json!({
+            (json_field::ROLE): self.role_slug,
+            (json_field::LEVEL): budget_level::TASK,
+            (json_field::SPENT): self.spent,
+            (json_field::LIMIT): self.limit,
+            (json_field::EXPECTED): self.expected,
+            (json_field::TOKEN_BUDGET): self.raise_to,
+        })
+    }
+
+    /// The refusal event of the stop, tied to its question.
+    fn refused_event(&self, question_id: Id, actor: &str) -> EventDraft {
+        let mut payload = self.payload();
+        payload[json_field::QUESTION_ID] = json!(question_id.to_string());
+        EventDraft {
+            kind: event_kind::USAGE_BUDGET_REFUSED,
+            actor: actor.to_string(),
+            payload,
+        }
+    }
+
+    /// The ONE question the human answers: «поднять до N» or «остановиться»,
+    /// with the numbers the refusal used and what each answer will do.
+    fn question(&self, question_id: Id) -> QuestionDraft {
+        let stop = &self;
+        QuestionDraft {
+            id: question_id,
+            text: format!(
+                "Что случилось: бюджет задачи по токенам исчерпан — израсходовано {spent} из \
+                 {limit}, следующий прогон роли `{role}` стоит ~{expected}. Прогон НЕ начат: \
+                 платформа остановилась до вызова модели, деньги не списаны.\n\
+                 Почему важно: продолжать вслепую — это снова узнать предел из отказа \
+                 провайдера. Платформа не поднимает бюджет сама и не меняет модель.\n\
+                 Что сделать: ответьте `{raise}` — бюджет задачи поднимется до {raise_to} \
+                 токенов (решение будет записано: кто, на сколько, почему), и задача \
+                 продолжится; или `{stop_word}` — задача останется у человека, новых прогонов \
+                 не будет.",
+                spent = stop.spent,
+                limit = stop.limit,
+                role = stop.role_slug,
+                expected = stop.expected,
+                raise = usage_budget_answer::raise_option(stop.raise_to),
+                raise_to = stop.raise_to,
+                stop_word = usage_budget_answer::STOP,
+            ),
+            context: Some(stop.context()),
+            options: usage_budget_answer::options(stop.raise_to),
+            blocking: true,
+        }
+    }
+
+    /// The `gate=…` line the answer path reads back — one spelling for the
+    /// producer and the reader.
+    pub fn context(&self) -> String {
+        format!(
+            "gate={USAGE_BUDGET_GATE} role={} spent={} limit={} expected={} raise_to={}",
+            self.role_slug, self.spent, self.limit, self.expected, self.raise_to
+        )
+    }
+}
+
+/// The token every budget-stop question carries in its context.
+pub const USAGE_BUDGET_GATE: &str = "usage-budget";
+
+/// The `level` words of a budget stop in stored payloads (REQ-USG-05). One
+/// vocabulary for the producer here and every reader of the refusal event.
+pub mod budget_level {
+    pub const RUN: &str = "run";
+    pub const TASK: &str = "task";
+    pub const DAY: &str = "day";
+}
+
 /// The TOKEN BUDGET of a task is exhausted (task 01a1b851, REQ-USG-06): the
 /// platform refuses to start the next run and asks ONE human question —
 /// «поднять бюджет до N» or «остановиться». The question row rides in the
 /// SAME mutation as the parked state (the attempt-limit discipline: a held
-/// task is always answerable), carries the numbers the refusal used, and its
-/// two options are the stored vocabulary of [`usage_budget_answer`]. The
-/// platform never raises a budget by itself — only the stored answer can.
+/// task is always answerable), and the platform never raises a budget by
+/// itself — only the stored answer can.
 pub fn park_usage_budget(
     process: &Process,
     task: &Task,
     question_id: Id,
-    role_slug: &str,
-    spent: u64,
-    limit: u64,
-    expected: u64,
-    raise_to: u64,
+    stop: &UsageStop,
     actor: &str,
     now: Timestamp,
 ) -> CoreResult<Mutation> {
@@ -1107,16 +1202,8 @@ pub fn park_usage_budget(
         "park-usage-budget",
         CoreError::hint("only an active stage can be stopped by a token budget"),
     )?;
-    let payload = json!({
-        (json_field::QUESTION_ID): question_id.to_string(),
-        "blocking": true,
-        (json_field::GATE): USAGE_BUDGET_GATE,
-        (json_field::ROLE): role_slug,
-        (json_field::SPENT): spent,
-        (json_field::LIMIT): limit,
-        (json_field::EXPECTED): expected,
-        (json_field::TOKEN_BUDGET): raise_to,
-    });
+    let mut payload = stop.payload();
+    payload[json_field::QUESTION_ID] = json!(question_id.to_string());
     let mut m = hold(
         process,
         task,
@@ -1126,46 +1213,89 @@ pub fn park_usage_budget(
         now,
         payload,
     )?;
-    m.events.push(EventDraft {
-        kind: event_kind::USAGE_BUDGET_REFUSED,
-        actor: actor.to_string(),
-        payload: json!({
-            (json_field::ROLE): role_slug,
-            (json_field::LEVEL): "task",
-            (json_field::SPENT): spent,
-            (json_field::LIMIT): limit,
-            (json_field::EXPECTED): expected,
-            (json_field::QUESTION_ID): question_id.to_string(),
-        }),
-    });
-    m.questions.push(QuestionDraft {
-        id: question_id,
-        text: format!(
-            "Что случилось: бюджет задачи по токенам исчерпан — израсходовано {spent} из {limit}, \
-             следующий прогон роли `{role_slug}` стоит ~{expected}. Прогон НЕ начат: платформа \
-             остановилась до вызова модели, деньги не списаны.\n\
-             Почему важно: продолжать вслепую — это снова узнать предел из отказа провайдера. \
-             Платформа не поднимает бюджет сама и не меняет модель.\n\
-             Что сделать: ответьте `{raise}` — бюджет задачи поднимется до {raise_to} токенов \
-             (решение будет записано: кто, на сколько, почему), и задача продолжится; или \
-             `{stop}` — задача останется у человека, новых прогонов не будет.",
-            raise = usage_budget_answer::raise_option(raise_to),
-            stop = usage_budget_answer::STOP,
-        ),
-        context: Some(format!(
-            "gate={USAGE_BUDGET_GATE} role={role_slug} spent={spent} limit={limit} \
-             expected={expected} raise_to={raise_to}"
-        )),
-        options: usage_budget_answer::options(raise_to),
-        blocking: true,
-    });
+    m.events.push(stop.refused_event(question_id, actor));
+    m.questions.push(stop.question(question_id));
     Ok(m)
 }
 
-/// The gate token a usage-budget question carries in its context (the
-/// `gate=…` vocabulary the answer path reads back). One literal for the
-/// producer and the reader.
-pub const USAGE_BUDGET_GATE: &str = "usage-budget";
+/// The human answered «остановиться» to the token-budget stop (REQ-USG-06
+/// AC5): the question is answered and the task moves to its DECLARED
+/// human-custody hold, remembering the stage it was stopped in. The platform
+/// never resumes it by itself — the same shape as the attempt-limit stop, so a
+/// stopped task is never left in a «waiting for input» hold nobody asked.
+pub fn answer_usage_budget_stop(
+    process: &Process,
+    task: &Task,
+    question_id: Id,
+    stop: &UsageStop,
+    actor: &str,
+    now: Timestamp,
+) -> CoreResult<Mutation> {
+    require_state(
+        task,
+        &[TaskState::WaitingForInput],
+        "stop-on-usage-budget",
+        CoreError::hint("the task is not waiting for the token-budget answer"),
+    )?;
+    let from = task.state;
+    let to = process.hold_target(HoldKind::Block)?;
+    let mut next = task.clone();
+    next.state = to;
+    next.updated_at = now;
+    next.lock_version += 1;
+    // The remembered WORKING stage carries over: a later human release returns
+    // to it, not to this hold.
+    next.return_state = task.return_state.or(Some(from));
+    Ok(Mutation {
+        task: next,
+        events: vec![
+            stop_answered_event(question_id, from, to, actor),
+            stop_recorded_event(question_id, stop, from, to, actor),
+        ],
+        artifact_status: Vec::new(),
+        questions: Vec::new(),
+    })
+}
+
+/// The plain `question.answered` row of the stop — the same event every other
+/// answer writes, so the question's history needs no second vocabulary.
+fn stop_answered_event(question_id: Id, from: TaskState, to: TaskState, actor: &str) -> EventDraft {
+    EventDraft {
+        kind: event_kind::QUESTION_ANSWERED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::QUESTION_ID): question_id.to_string(),
+            (json_field::ANSWER): usage_budget_answer::STOP,
+            (json_field::FROM): from.as_str(),
+            (json_field::TO): to.as_str(),
+        }),
+    }
+}
+
+/// The stop as its OWN fact of the history, with the numbers the human
+/// answered: `usage.budget_stopped`.
+fn stop_recorded_event(
+    question_id: Id,
+    stop: &UsageStop,
+    from: TaskState,
+    to: TaskState,
+    actor: &str,
+) -> EventDraft {
+    EventDraft {
+        kind: event_kind::USAGE_BUDGET_STOPPED,
+        actor: actor.to_string(),
+        payload: json!({
+            (json_field::QUESTION_ID): question_id.to_string(),
+            (json_field::ROLE): stop.role_slug,
+            (json_field::SPENT): stop.spent,
+            (json_field::LIMIT): stop.limit,
+            (json_field::EXPECTED): stop.expected,
+            (json_field::ANSWER): usage_budget_answer::STOP,
+            (json_field::FROM): from.as_str(),
+            (json_field::TO): to.as_str(),
+        }),
+    }
+}
 
 pub fn answer_question(
     process: &Process,

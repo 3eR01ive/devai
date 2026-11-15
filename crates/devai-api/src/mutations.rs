@@ -75,12 +75,48 @@ impl AttemptTrip {
     }
 }
 
+/// The stored facts of ONE token-budget stop, parsed STRICTLY by the same
+/// discipline as [`AttemptTrip`]: the answer writes these numbers into a
+/// decision and a state mutation, so a corrupt trip refuses loudly instead of
+/// replaying «0 из 0» as if that were what the human answered.
+struct UsageTrip;
+
+impl UsageTrip {
+    fn parse(trip: &serde_json::Value) -> ApiResult<workflow::UsageStop> {
+        Ok(workflow::UsageStop::new(
+            &Self::text(trip, json_field::ROLE)?,
+            Self::amount(trip, json_field::SPENT)?,
+            Self::amount(trip, json_field::LIMIT)?,
+            Self::amount(trip, json_field::EXPECTED)?,
+            Self::amount(trip, json_field::TOKEN_BUDGET)?,
+        ))
+    }
+
+    fn text(trip: &serde_json::Value, key: &'static str) -> ApiResult<String> {
+        trip.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| corrupt_stop_fact(key))
+    }
+
+    /// A token amount of the stop. The refused run's numbers are stored as
+    /// signed integers by the refusal event, so a negative value is corrupt
+    /// too — a budget fact is never negative.
+    fn amount(trip: &serde_json::Value, key: &'static str) -> ApiResult<u64> {
+        trip.get(key)
+            .and_then(|v| v.as_i64())
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| corrupt_stop_fact(key))
+    }
+}
+
 /// A trip event missing one of its facts is refused by name: the decision and
-/// the reset event stay truthful or are not written at all.
+/// the state mutation stay truthful or are not written at all.
 fn corrupt_stop_fact(key: &str) -> ApiError {
     ApiError::refused(
         "corrupt_stop_fact",
-        format!("attempt-limit trip event has no usable `{key}` — the stop fact cannot be trusted"),
+        format!("a stop event has no usable `{key}` — the stop fact cannot be trusted"),
     )
 }
 
@@ -2707,7 +2743,8 @@ impl Api {
     /// Apply the human answer to the token-budget stop (REQ-USG-06 AC3/AC4/AC5).
     /// Both answers leave a DECISION row (who, when, to how much, the numbers
     /// of the refusal, the human's own words); only «поднять до N» raises the
-    /// budget, and only it resumes the task. Nothing here retries by itself.
+    /// budget and resumes the task, «остановиться» releases it to its declared
+    /// human-custody hold. Nothing here retries by itself.
     fn answer_usage_budget(
         &self,
         q: &Question,
@@ -2715,72 +2752,96 @@ impl Api {
         text: &str,
         trip: &serde_json::Value,
     ) -> ApiResult<AnsweredOutcome> {
-        let Some(choice) = usage_budget_answer::parse(text) else {
+        let choice = usage_budget_answer::parse(text).ok_or_else(|| {
             let stored = q.options.join("` or `");
-            return Err(ApiError::refused(
+            ApiError::refused(
                 "bad_request",
                 format!(
                     "question {} takes one of its stored options: `{stored}` (got `{}`)",
                     q.id, text
                 ),
-            ));
-        };
-        let role = trip.get(json_field::ROLE).and_then(|v| v.as_str());
-        let spent = trip.get(json_field::SPENT).and_then(|v| v.as_i64());
-        let limit = trip.get(json_field::LIMIT).and_then(|v| v.as_u64());
-        let expected = trip.get(json_field::EXPECTED).and_then(|v| v.as_i64());
+            )
+        })?;
+        // A corrupt trip must NOT be replayed as «0 из 0» in the decision row:
+        // the numbers the human answered are read back typed (the attempt-limit
+        // `AttemptTrip` discipline).
+        let stop = UsageTrip::parse(trip)?;
         let now = Utc::now();
+        let decision = self.usage_budget_decision(q, task, &stop, choice, text, now);
+        self.store.answer_question(q.id, text, &self.actor, now)?;
+        self.store.record_decision(&decision)?;
+        let m = self.usage_budget_mutation(q, task, &stop, choice, now)?;
+        self.store.commit(task.lock_version, &m)?;
+        if matches!(choice, usage_budget_answer::Answer::Raise(_)) {
+            // The raised budget is in force from the NEXT check on (the
+            // decision row is read by `effective_task_budget`), so the resumed
+            // stage passes admission and the task moves again.
+            self.autostart_if_role_state(&m.task);
+        }
+        Ok(AnsweredOutcome {
+            question_id: q.id,
+            from_state: task.state,
+            to_state: m.task.state,
+        })
+    }
+
+    /// The state mutation ONE answer produces: «поднять до N» releases the
+    /// question hold and the remembered stage resumes; «остановиться» moves the
+    /// task to its declared human-custody hold. Neither is an automatic retry.
+    fn usage_budget_mutation(
+        &self,
+        q: &Question,
+        task: &Task,
+        stop: &workflow::UsageStop,
+        choice: usage_budget_answer::Answer,
+        now: DateTime<Utc>,
+    ) -> ApiResult<Mutation> {
+        let process = self.process_policy()?;
+        Ok(match choice {
+            usage_budget_answer::Answer::Stop => {
+                workflow::answer_usage_budget_stop(&process, task, q.id, stop, &self.actor, now)?
+            }
+            usage_budget_answer::Answer::Raise(_) => {
+                workflow::answer_question(&process, task, q.id, &self.actor, now)?
+            }
+        })
+    }
+
+    /// The decision row ONE answer leaves behind: who, when, the absolute
+    /// budget raised to (or nothing, on a stop), the numbers of the refusal and
+    /// the human's own words verbatim (REQ-USG-06 AC4).
+    fn usage_budget_decision(
+        &self,
+        q: &Question,
+        task: &Task,
+        stop: &workflow::UsageStop,
+        choice: usage_budget_answer::Answer,
+        text: &str,
+        now: DateTime<Utc>,
+    ) -> Decision {
         let (verdict, raised_to, word) = match choice {
             usage_budget_answer::Answer::Raise(n) => (Verdict::Approved, Some(n), "raise"),
             usage_budget_answer::Answer::Stop => (Verdict::Rejected, None, "stop"),
         };
-        let decision = Decision {
+        Decision {
             id: new_id(),
             task_id: task.id,
             kind: decision_kind::USAGE_BUDGET.to_string(),
             verdict,
             actor: self.actor.clone(),
-            // The human's words verbatim — «почему» is theirs, not the
-            // platform's invention.
+            // «Почему» is the human's, not the platform's invention.
             rationale: Some(text.to_string()),
             refs: vec![q.id.to_string()],
             created_at: now,
             payload: serde_json::json!({
                 (json_field::QUESTION_ID): q.id.to_string(),
-                (json_field::ROLE): role,
-                (json_field::SPENT): spent,
-                (json_field::LIMIT): limit,
-                (json_field::EXPECTED): expected,
+                (json_field::ROLE): stop.role_slug.as_str(),
+                (json_field::SPENT): stop.spent,
+                (json_field::LIMIT): stop.limit,
+                (json_field::EXPECTED): stop.expected,
                 (json_field::TOKEN_BUDGET): raised_to,
                 (json_field::ANSWER): word,
             }),
-        };
-        self.store.answer_question(q.id, text, &self.actor, now)?;
-        self.store.record_decision(&decision)?;
-        match choice {
-            usage_budget_answer::Answer::Stop => {
-                // «Остановиться»: the task stays exactly where the human
-                // stopped it — no transition, no resume, no retry.
-                Ok(AnsweredOutcome {
-                    question_id: q.id,
-                    from_state: task.state,
-                    to_state: task.state,
-                })
-            }
-            usage_budget_answer::Answer::Raise(_) => {
-                let process = self.process_policy()?;
-                let m = workflow::answer_question(&process, task, q.id, &self.actor, now)?;
-                self.store.commit(task.lock_version, &m)?;
-                // The raised budget is in force from the NEXT check on (the
-                // decision row is read by `effective_task_budget`), so the
-                // resumed stage passes admission and the task moves again.
-                self.autostart_if_role_state(&m.task);
-                Ok(AnsweredOutcome {
-                    question_id: q.id,
-                    from_state: task.state,
-                    to_state: m.task.state,
-                })
-            }
         }
     }
 

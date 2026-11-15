@@ -157,6 +157,16 @@ function tok(n: number | undefined) {
   return String(n);
 }
 
+/**
+ * Расход карточки: сумма известных прогонов. Когда известных нет, а прогоны с
+ * НЕИЗВЕСТНЫМ расходом есть, печатается «—», а не «0»: отсутствие цифр — это
+ * не бесплатный прогон (REQ-USG-02 AC1). Число таких прогонов стоит рядом.
+ */
+function spentText(spent: number, unknown: number) {
+  if (spent === 0 && unknown > 0) return "—";
+  return tok(spent) || "0";
+}
+
 function age(iso: string) {
   const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
   if (s < 60) return `${s} с`;
@@ -1244,7 +1254,7 @@ onMounted(load);
           <div class="s">{{ verdict ? verdict.toLowerCase() : "оценки нет" }}</div>
         </div>
         <div class="p-tokens" v-if="usage" :title="usage.line">
-          <div class="n">{{ usage.spent ? tok(usage.spent) : "0" }}</div>
+          <div class="n">{{ spentText(usage.spent, usage.unknown) }}</div>
           <div class="l">{{ usage.limit == null ? "без лимита" : "из " + tok(usage.limit) }}</div>
           <div class="s">
             {{ usage.models.length ? usage.models.join(", ") : "модель неизвестна" }} ·

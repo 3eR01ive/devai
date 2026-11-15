@@ -452,9 +452,11 @@ fn the_quota_fact_is_stored_beside_the_spend_not_instead_of_it() {
     );
 }
 
-/// REQ-USG-10: the spend row carries no credentials — the shape has no field
-/// for a key, and the stored row of a real run holds only the identity of the
-/// model, never the secret.
+/// REQ-USG-10: the spend row carries no credentials. Two proofs, both
+/// structural rather than a keyword list: the serialized row has EXACTLY the
+/// declared field set (there is no free-form field a secret could ride in),
+/// and the values of a real run carry neither a bearer header nor a key
+/// prefix.
 #[test]
 fn the_spend_row_stores_no_credentials() {
     let (_d, store) = open();
@@ -463,10 +465,41 @@ fn the_spend_row_stores_no_credentials() {
     measured(&store, &e, 1, 1);
     let row = store.execution_usage(e.id).unwrap().unwrap();
     let text = serde_json::to_string(&row).unwrap();
-    for secret in ["api_key", "apikey", "authorization", "sk-"] {
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let mut fields: Vec<&str> = value
+        .as_object()
+        .expect("the row serializes as an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    // The declared shape of `ExecutionUsage` — one entry per field, no more.
+    assert_eq!(
+        fields,
+        [
+            "completion_tokens",
+            "cost_usd",
+            "created_at",
+            "duration_ms",
+            "execution_id",
+            "measured",
+            "model",
+            "prompt_tokens",
+            "provider",
+            "role_slug",
+            "run_id",
+            "task_id",
+            "total_tokens",
+            "unknown_reason",
+        ],
+        "the row's field set is fixed — no field can hold a credential"
+    );
+    // A credential shape would have to appear INSIDE a value: neither a bearer
+    // header name nor a provider key prefix may do so.
+    for credential_shape in ["bearer ", "authorization", "sk-"] {
         assert!(
-            !text.to_lowercase().contains(secret),
-            "the row must not carry `{secret}`: {text}"
+            !text.to_lowercase().contains(credential_shape),
+            "the row must not carry `{credential_shape}`: {text}"
         );
     }
 }

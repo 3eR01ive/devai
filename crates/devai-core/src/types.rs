@@ -1792,6 +1792,11 @@ pub mod event_kind {
     /// ONE operator sentence `line`, the role and — when the task budget is
     /// the exhausted level — the human `question_id` that parks the task.
     pub const USAGE_BUDGET_REFUSED: &str = "usage.budget_refused";
+    /// The human answered «остановиться» to the token-budget stop (REQ-USG-06
+    /// AC5): the task is released to its declared human-custody hold and stays
+    /// there — the platform never resumes it by itself. Payload: question id,
+    /// role, spent/limit/expected, the answer and the from/to states.
+    pub const USAGE_BUDGET_STOPPED: &str = "usage.budget_stopped";
     /// The provider answered «квота исчерпана» (429 / quota) for a run
     /// (REQ-USG-02 AC2): an ОТДЕЛЬНЫЙ fact of the run's history. It is not
     /// «потрачено ноль» — the run's own usage row keeps whatever the report
@@ -1929,6 +1934,7 @@ pub mod event_kind {
         EXECUTION_SINGLE_WRITER_REPAIR,
         EXECUTION_USAGE_MISSING,
         USAGE_BUDGET_REFUSED,
+        USAGE_BUDGET_STOPPED,
         USAGE_QUOTA_EXHAUSTED,
         AGENT_FAILED,
         ARTIFACT_PUBLISHED,

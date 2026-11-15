@@ -84,6 +84,32 @@ pub fn parse_usage_report(text: &str) -> Result<UsageReport, UsageReportError> {
     })
 }
 
+/// Read the driver's usage report of ONE execution at `path`.
+///
+/// Three answers, three facts: `Ok(Some(_))` — a report is there and parses;
+/// `Ok(None)` — there is no report at all (the driver wrote none, the caller's
+/// decision is an UNKNOWN record); `Err(_)` — the file EXISTS but cannot be
+/// read or parsed, which is a DIFFERENT fact and keeps its own reason, so a
+/// corrupt report is never silently reported as «отчёта не было».
+pub fn read_usage_report(path: &std::path::Path) -> Result<Option<UsageReport>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "the usage report at {} cannot be read: {e} — spend unknown, not zero",
+                path.display()
+            ));
+        }
+    };
+    parse_usage_report(&text).map(Some).map_err(|e| {
+        format!(
+            "the usage report at {} does not parse: {e} — spend unknown, not zero",
+            path.display()
+        )
+    })
+}
+
 /// The cost of a run (ratified OQ-3 answer): the CONFIG price table first —
 /// dollars per million tokens, split into prompt and completion. With no
 /// declared price the driver's own estimate is the measured fact; with
@@ -94,11 +120,16 @@ pub fn cost_of(report: &UsageReport, model: Option<&str>, policy: &UsagePolicy) 
         let completion = report.completion_tokens.unwrap_or(0) as f64;
         return Some(
             (prompt * price.input_per_million + completion * price.output_per_million)
-                / 1_000_000.0,
+                / TOKENS_PER_PRICE_UNIT,
         );
     }
     report.cost_usd.filter(|c| c.is_finite() && *c >= 0.0)
 }
+
+/// The denominator the config price table is declared in: USD per ONE MILLION
+/// tokens (`config/workflow/usage.yaml`). Named here because the same divisor
+/// decides every computed cost — a changed unit must change one number.
+const TOKENS_PER_PRICE_UNIT: f64 = 1_000_000.0;
 
 /// The spend record of one execution — measured when a report was read, the
 /// honest unknown record when it was not.
@@ -200,10 +231,14 @@ impl ExpectationBasis {
 }
 
 /// A refusal to start a run: the numbers, the level and the ONE sentence the
-/// operator reads on every surface (ack, event payload, report).
+/// operator reads on every surface (ack, event payload, report). The refusing
+/// ROLE travels with it — the park question and the event both name it, and no
+/// caller has to carry the same fact beside the refusal.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BudgetRefusal {
     pub level: BudgetLevel,
+    /// The role whose run was refused.
+    pub role: String,
     /// What this level already spent (0 for the run level — nothing ran yet).
     pub spent: i64,
     pub limit: u64,
@@ -301,89 +336,139 @@ pub fn check_budget(
     policy: &UsagePolicy,
     now: Timestamp,
 ) -> StoreResult<Option<BudgetRefusal>> {
-    // No history and no run budget: there is nothing to estimate from, so the
-    // check stays inert — the platform never invents an expectation.
     let (expected, basis) = expected_run_cost(store, task_id, role, policy)?;
-    let _ = now;
-
-    if let Some(run_budget) = policy.budgets.run {
-        if expected > run_budget as i64 {
-            return Ok(Some(BudgetRefusal {
-                level: BudgetLevel::Run,
-                spent: 0,
-                limit: run_budget,
-                expected,
-                basis,
-                line: BudgetRefusal::sentence(BudgetLevel::Run, 0, run_budget, expected, basis),
-            }));
-        }
+    if let Some(refusal) = run_level_refusal(policy, role, expected, basis) {
+        return Ok(Some(refusal));
     }
-
-    if let Some(task_budget) = effective_task_budget(store, task_id, policy)? {
-        let spent = task_spent(store, task_id)?;
-        if spent.saturating_add(expected) > task_budget as i64 {
-            return Ok(Some(BudgetRefusal {
-                level: BudgetLevel::Task,
-                spent,
-                limit: task_budget,
-                expected,
-                basis,
-                line: BudgetRefusal::sentence(
-                    BudgetLevel::Task,
-                    spent,
-                    task_budget,
-                    expected,
-                    basis,
-                ),
-            }));
-        }
+    if let Some(refusal) = task_level_refusal(store, task_id, role, policy, expected, basis)? {
+        return Ok(Some(refusal));
     }
+    Ok(day_level_refusal(
+        store, policy, role, expected, basis, now,
+    )?)
+}
 
-    if let Some(day_budget) = policy.budgets.day {
-        let spent = day_spent(store, now)?;
-        if spent.saturating_add(expected) > day_budget as i64 {
-            return Ok(Some(BudgetRefusal {
-                level: BudgetLevel::Day,
-                spent,
-                limit: day_budget,
-                expected,
-                basis,
-                line: BudgetRefusal::sentence(BudgetLevel::Day, spent, day_budget, expected, basis),
-            }));
-        }
+/// The RUN level: this one run cannot pay for itself.
+fn run_level_refusal(
+    policy: &UsagePolicy,
+    role: &str,
+    expected: i64,
+    basis: ExpectationBasis,
+) -> Option<BudgetRefusal> {
+    let limit = policy.budgets.run?;
+    if expected <= limit as i64 {
+        return None;
     }
+    Some(BudgetRefusal {
+        level: BudgetLevel::Run,
+        role: role.to_string(),
+        spent: 0,
+        limit,
+        expected,
+        basis,
+        line: BudgetRefusal::sentence(BudgetLevel::Run, 0, limit, expected, basis),
+    })
+}
 
-    Ok(None)
+/// The TASK level: what the task already spent plus one more run does not fit
+/// in its budget. `spent >= limit` also refuses when the expected cost is
+/// unknown (zero) — an exhausted budget never re-opens the door.
+fn task_level_refusal(
+    store: &Store,
+    task_id: Id,
+    role: &str,
+    policy: &UsagePolicy,
+    expected: i64,
+    basis: ExpectationBasis,
+) -> StoreResult<Option<BudgetRefusal>> {
+    let Some(limit) = effective_task_budget(store, task_id, policy)? else {
+        return Ok(None);
+    };
+    let spent = task_spent(store, task_id)?;
+    if !budget_cannot_pay(spent, limit, expected) {
+        return Ok(None);
+    }
+    Ok(Some(BudgetRefusal {
+        level: BudgetLevel::Task,
+        role: role.to_string(),
+        spent,
+        limit,
+        expected,
+        basis,
+        line: BudgetRefusal::sentence(BudgetLevel::Task, spent, limit, expected, basis),
+    }))
+}
+
+/// The DAY level: the rest of today cannot pay for one more run; already
+/// started runs are not killed (ratified OQ-1/OQ-2).
+fn day_level_refusal(
+    store: &Store,
+    policy: &UsagePolicy,
+    role: &str,
+    expected: i64,
+    basis: ExpectationBasis,
+    now: Timestamp,
+) -> StoreResult<Option<BudgetRefusal>> {
+    let Some(limit) = policy.budgets.day else {
+        return Ok(None);
+    };
+    let spent = day_spent(store, now)?;
+    if !budget_cannot_pay(spent, limit, expected) {
+        return Ok(None);
+    }
+    Ok(Some(BudgetRefusal {
+        level: BudgetLevel::Day,
+        role: role.to_string(),
+        spent,
+        limit,
+        expected,
+        basis,
+        line: BudgetRefusal::sentence(BudgetLevel::Day, spent, limit, expected, basis),
+    }))
+}
+
+/// The ONE comparison every level makes: the remaining budget against the
+/// expected cost of the run. An expected cost of zero (no history and no run
+/// budget declared) means «неизвестно», so only an ALREADY exhausted budget
+/// stops the run — a spend that reached the limit is never «room for one more».
+fn budget_cannot_pay(spent: i64, limit: u64, expected: i64) -> bool {
+    spent >= limit as i64 || spent.saturating_add(expected.max(0)) > limit as i64
 }
 
 /// The task's measured spend over its whole life, from the store (never from
 /// the filesystem): the sum of the known token counts of its runs.
 pub fn task_spent(store: &Store, task_id: Id) -> StoreResult<i64> {
-    let q = UsageQuery {
-        from: None,
-        to: None,
-        task_id: Some(task_id),
-        group: UsageGroup::Totals,
-    };
-    Ok(store
-        .usage_rollup(&q)?
-        .first()
-        .map(|b| b.total_tokens)
-        .unwrap_or(0))
+    rollup_spent(
+        store,
+        &UsageQuery {
+            from: None,
+            to: None,
+            task_id: Some(task_id),
+            group: UsageGroup::Totals,
+        },
+    )
 }
 
 /// Today's spend in the operator's LOCAL calendar day (ratified OQ-4).
 pub fn day_spent(store: &Store, now: Timestamp) -> StoreResult<i64> {
     let (from, to) = devai_store::calendar_window("day", now)
         .unwrap_or((now, now + chrono::Duration::seconds(1)));
-    let q = UsageQuery {
-        from: Some(from),
-        to: Some(to),
-        task_id: None,
-        group: UsageGroup::Totals,
-    };
+    rollup_spent(
+        store,
+        &UsageQuery {
+            from: Some(from),
+            to: Some(to),
+            task_id: None,
+            group: UsageGroup::Totals,
+        },
+    )
+}
+
+/// The total tokens of ONE totals rollup — the read the budget check and the
+/// card both rest on, so «израсходовано» has a single arithmetic home.
+pub(crate) fn rollup_spent(store: &Store, q: &UsageQuery) -> StoreResult<i64> {
     Ok(store
-        .usage_rollup(&q)?
+        .usage_rollup(q)?
         .first()
         .map(|b| b.total_tokens)
         .unwrap_or(0))
@@ -422,53 +507,100 @@ pub fn now() -> Timestamp {
     Utc::now()
 }
 
-/// The task's budget is exhausted: park it with ONE human question and record
-/// the refusal (REQ-USG-06). This is the SINGLE implementation of that rule —
-/// the API admission gate and the engine's pre-stage gate both call it, so the
-/// two doors cannot drift apart in wording, numbers or parking behaviour.
+/// The TASK-level stop a refusal describes, with the absolute budget the human
+/// is offered: the amount already spent plus the DECLARED task budget, so the
+/// raise covers the next run and keeps the same room the task was given.
+/// `None` when the refusal is not the task level — the run and day levels never
+/// park a task (ratified OQ-1: the day gate stops NEW runs only).
+pub fn task_stop(
+    refusal: &BudgetRefusal,
+    declared: Option<u64>,
+) -> Option<devai_core::workflow::UsageStop> {
+    if refusal.level != BudgetLevel::Task {
+        return None;
+    }
+    let declared = declared.unwrap_or(refusal.limit);
+    let raise_to = (refusal.spent.max(0) as u64).saturating_add(declared);
+    Some(devai_core::workflow::UsageStop::new(
+        &refusal.role,
+        refusal.spent.max(0) as u64,
+        refusal.limit,
+        refusal.expected.max(0) as u64,
+        raise_to,
+    ))
+}
+
+/// The ONE door both budget gates go through (REQ-USG-05/06): a TASK-level
+/// refusal parks the task with its ONE human question, every other refusal is
+/// recorded as its own event with the same numbers. The API admission gate and
+/// the engine's pre-stage gate call THIS, so the two doors cannot drift apart
+/// in wording, numbers or parking behaviour.
 ///
 /// Parking happens only when it is answerable (the state has a role) and no
 /// human question is already open: one question per exhaustion FACT, never a
-/// stack of them (ratified assumption). `declared` is the DECLARED task budget
-/// the raise is proposed from — data, never a code literal. Returns `true`
-/// when this call parked the task.
-#[allow(clippy::too_many_arguments)]
-pub fn park_task_exhaustion(
+/// stack of them (ratified assumption). Returns `true` when the task was
+/// parked.
+pub fn stop_task(
     store: &Store,
     process: &devai_core::process::Process,
     task: &devai_core::types::Task,
-    role: &str,
     refusal: &BudgetRefusal,
     declared: Option<u64>,
     actor: &str,
     at: Timestamp,
 ) -> crate::RuntimeResult<bool> {
-    if refusal.level != BudgetLevel::Task
-        || process.role_for(task.state.as_str()).is_none()
-        || task.state.is_hold()
-        || store
-            .list_questions(task.id)?
-            .iter()
-            .any(|q| q.status == devai_core::types::QuestionStatus::Open)
-    {
+    let parked = match task_stop(refusal, declared) {
+        Some(stop) => answerable_park(store, process, task, &stop, actor, at)?,
+        None => false,
+    };
+    // The event is written once per refusal; when the task was parked the park
+    // mutation already carries it with the question id.
+    if !parked {
+        record_refusal(store, task.id, refusal, actor)?;
+    }
+    Ok(parked)
+}
+
+/// Park the task with its budget question when it is answerable — one
+/// mutation, one commit — and answer `false` when it is not (the caller then
+/// records the refusal as its own event instead).
+fn answerable_park(
+    store: &Store,
+    process: &devai_core::process::Process,
+    task: &devai_core::types::Task,
+    stop: &devai_core::workflow::UsageStop,
+    actor: &str,
+    at: Timestamp,
+) -> crate::RuntimeResult<bool> {
+    if !parking_is_answerable(store, process, task)? {
         return Ok(false);
     }
-    let declared = declared.unwrap_or(refusal.limit);
-    let raise_to = (refusal.spent.max(0) as u64).saturating_add(declared);
     let m = devai_core::workflow::park_usage_budget(
         process,
         task,
         devai_core::types::new_id(),
-        role,
-        refusal.spent.max(0) as u64,
-        refusal.limit,
-        refusal.expected.max(0) as u64,
-        raise_to,
+        stop,
         actor,
         at,
     )?;
     store.commit(task.lock_version, &m)?;
     Ok(true)
+}
+
+/// A task is answerable when its state names a role, it is not already held,
+/// and no human question is open — one question per exhaustion fact.
+fn parking_is_answerable(
+    store: &Store,
+    process: &devai_core::process::Process,
+    task: &devai_core::types::Task,
+) -> StoreResult<bool> {
+    if process.role_for(task.state.as_str()).is_none() || task.state.is_hold() {
+        return Ok(false);
+    }
+    Ok(!store
+        .list_questions(task.id)?
+        .iter()
+        .any(|q| q.status == devai_core::types::QuestionStatus::Open))
 }
 
 /// Record a refusal that did NOT park the task (the run and day levels, or a
@@ -477,7 +609,6 @@ pub fn park_task_exhaustion(
 pub fn record_refusal(
     store: &Store,
     task_id: Id,
-    role: &str,
     refusal: &BudgetRefusal,
     actor: &str,
 ) -> StoreResult<()> {
@@ -486,7 +617,7 @@ pub fn record_refusal(
         devai_core::types::event_kind::USAGE_BUDGET_REFUSED,
         actor,
         serde_json::json!({
-            (devai_core::types::json_field::ROLE): role,
+            (devai_core::types::json_field::ROLE): refusal.role,
             (devai_core::types::json_field::LEVEL): refusal.level.as_str(),
             (devai_core::types::json_field::SPENT): refusal.spent,
             (devai_core::types::json_field::LIMIT): refusal.limit,
@@ -619,89 +750,70 @@ mod tests {
         assert!(quota_exhausted_evidence("exit code 1: syntax error").is_none());
     }
 
-    /// The expectation walks the ratified ladder: the pair's history, then the
-    /// role's, then the declared run budget; and the budget check refuses
-    /// BEFORE any spend, naming the level (REQ-USG-05).
+    /// REQ-USG-02 AC1/AC5: no report, an unreadable report and a good report
+    /// are THREE facts. A corrupt file must not be reported as «отчёта не
+    /// было» — its own reason says what happened.
     #[test]
-    fn expectation_falls_back_from_history_to_the_run_budget_and_the_check_refuses() {
-        let dir = std::env::temp_dir().join(format!("devai-usage-x-{}", uuid::Uuid::now_v7()));
-        let store = Store::open(&dir).unwrap();
+    fn a_missing_report_and_a_corrupt_one_are_different_facts() {
+        let dir = std::env::temp_dir().join(format!("devai-usage-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.json");
+
+        // No file: the driver wrote none — the caller records its own UNKNOWN.
+        assert_eq!(read_usage_report(&path), Ok(None));
+
+        // A file that does not parse: a DIFFERENT fact with a stated reason.
+        std::fs::write(&path, "not a report").unwrap();
+        let err = read_usage_report(&path).expect_err("corrupt is not absent");
+        assert!(err.contains("does not parse"), "{err}");
+        assert!(
+            err.contains("not zero"),
+            "the reason names the honesty: {err}"
+        );
+
+        // A readable report: the numbers, and nothing invented.
+        std::fs::write(
+            &path,
+            r#"{"input_tokens":10,"output_tokens":5,"model":"m"}"#,
+        )
+        .unwrap();
+        let report = read_usage_report(&path)
+            .unwrap()
+            .expect("a report was there");
+        assert_eq!(report.total_tokens, Some(15));
+        assert_eq!(report.model.as_deref(), Some("m"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The expectation walks the ratified ladder: the pair's history, then the
+    /// role's, then the declared run budget (REQ-USG-05 AC2).
+    #[test]
+    fn the_expectation_falls_back_from_the_pair_to_the_role_to_the_run_budget() {
+        let (store, task) = store_with_task("ladder");
         let policy = UsagePolicy::default();
-        let task = devai_core::types::Task {
-            id: devai_core::types::new_id(),
-            project_id: None,
-            title: "t".into(),
-            business_description: String::new(),
-            human_name: None,
-            state: devai_core::types::TaskState::Draft,
-            return_state: None,
-            requirements_seq: 0,
-            lock_version: 1,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        store.create_task(&task).unwrap();
 
         // No history at all: the run budget is the conservative expectation.
         let (expected, basis) = expected_run_cost(&store, task.id, "role-a", &policy).unwrap();
         assert_eq!(basis, ExpectationBasis::RunBudget);
         assert_eq!(expected, policy.budgets.run.unwrap() as i64);
 
-        // One MEASURED run of the role gives that role a history.
-        let exec = devai_core::types::RoleExecution {
-            id: devai_core::types::new_id(),
-            task_id: task.id,
-            role_slug: "role-a".into(),
-            role_version: 1,
-            agent_name: None,
-            status: devai_core::types::ExecutionStatus::Running,
-            inputs: Vec::new(),
-            summary: None,
-            error: None,
-            started_at: Utc::now(),
-            finished_at: None,
-            workspace_revision: None,
-            attempt: 1,
-            parent_execution: None,
-            failure_class: None,
-            owner_pid: None,
-            owner_host: None,
-            owner_process_start: None,
-            bundle: None,
-            run_id: None,
-        };
-        store.start_execution(&exec).unwrap();
-        store
-            .finish_execution(
-                &exec,
-                devai_core::types::ExecutionStatus::Completed,
-                None,
-                None,
-                Utc::now(),
-            )
-            .unwrap();
-        store
-            .record_execution_usage(&UsageRecord {
-                execution_id: exec.id,
-                task_id: task.id,
-                role_slug: "role-a".into(),
-                run_id: None,
-                provider: Some("hermes".into()),
-                model: Some("m".into()),
-                prompt_tokens: Some(900),
-                completion_tokens: Some(100),
-                total_tokens: Some(1_000),
-                duration_ms: Some(5),
-                cost_usd: None,
-                measured: true,
-                unknown_reason: None,
-            })
-            .unwrap();
+        // One MEASURED run: the pair (task+role) now has a history.
+        measured_run(&store, task.id, "role-a", 900, 100);
         let (expected, basis) = expected_run_cost(&store, task.id, "role-a", &policy).unwrap();
         assert_eq!((expected, basis), (1_000, ExpectationBasis::TaskRole));
+    }
+
+    /// The check refuses BEFORE any spend and names the level with its numbers
+    /// (REQ-USG-05 AC3/AC4) — the task level first, because it is the narrowest
+    /// limit that is already spent.
+    #[test]
+    fn the_task_level_refuses_before_any_spend_with_its_numbers() {
+        let (store, task) = store_with_task("refuse-task");
+        let policy = UsagePolicy::default();
+        measured_run(&store, task.id, "role-a", 900, 100);
 
         // The declared task budget (50M in the factory policy) is far above
-        // 1M: nothing is refused.
+        // 1k: nothing is refused.
         assert_eq!(
             check_budget(&store, task.id, "role-a", &policy, Utc::now()).unwrap(),
             None
@@ -721,10 +833,21 @@ mod tests {
             .unwrap()
             .expect("refused");
         assert_eq!(refusal.level, BudgetLevel::Task);
+        assert_eq!(refusal.role, "role-a", "the refusal names the role");
         assert_eq!(refusal.spent, 1_000);
         assert_eq!(refusal.limit, 1_500);
         assert_eq!(refusal.expected, 1_000);
         assert!(refusal.line.contains("бюджет задачи исчерпан"));
+    }
+
+    /// The run and day levels refuse with their own words, and a budget that is
+    /// ALREADY reached refuses even when the expected cost is unknown (zero) —
+    /// an exhausted budget never re-opens the door.
+    #[test]
+    fn the_run_day_and_already_spent_limits_name_themselves() {
+        let (store, task) = store_with_task("refuse-levels");
+        let policy = UsagePolicy::default();
+        measured_run(&store, task.id, "role-a", 900, 100);
 
         // The run level refuses a run whose expectation exceeds the run limit.
         let run_tight = UsagePolicy {
@@ -739,9 +862,10 @@ mod tests {
             .unwrap()
             .expect("refused");
         assert_eq!(refusal.level, BudgetLevel::Run);
+        assert_eq!(refusal.spent, 0, "nothing ran at the run level");
 
         // The day level refuses new runs when today's spend cannot cover one
-        // more run, and only names the day.
+        // more run, and names the day.
         let day_tight = UsagePolicy {
             budgets: TokenBudgets {
                 run: Some(10_000),
@@ -755,13 +879,136 @@ mod tests {
             .expect("refused");
         assert_eq!(refusal.level, BudgetLevel::Day);
         assert!(refusal.line.contains("до новых суток"));
+    }
 
-        // The honest row of a run that closed without a report is UNKNOWN, and
-        // it is never summed into the spend (REQ-USG-02 AC1).
-        let bare = devai_core::types::RoleExecution {
+    /// A budget that is ALREADY reached refuses even when the expected cost is
+    /// unknown (zero): an exhausted budget never re-opens the door.
+    #[test]
+    fn an_already_spent_task_budget_refuses_even_with_no_expectation() {
+        let (store, task) = store_with_task("refuse-spent");
+        let policy = UsagePolicy::default();
+        measured_run(&store, task.id, "role-a", 900, 100);
+
+        // No history for the role and no run budget: the expectation is zero,
+        // and a task budget already reached still refuses.
+        let spent_out = UsagePolicy {
+            budgets: TokenBudgets {
+                run: None,
+                task: Some(1_000),
+                day: None,
+            },
+            ..policy.clone()
+        };
+        let refusal = check_budget(&store, task.id, "role-b", &spent_out, Utc::now())
+            .unwrap()
+            .expect("refused on an exhausted task budget");
+        assert_eq!(refusal.level, BudgetLevel::Task);
+        assert_eq!(refusal.expected, 0, "no history and no run budget");
+    }
+
+    /// REQ-USG-02 AC1: the honest row of a run that closed without a report is
+    /// UNKNOWN, and it is never summed into the spend.
+    #[test]
+    fn a_run_that_closed_without_a_report_is_unknown_and_never_summed() {
+        let (store, task) = store_with_task("unknown");
+        measured_run(&store, task.id, "role-a", 900, 100);
+        let bare = bare_run(&store, task.id, "role-b");
+        let row = store.execution_usage(bare.id).unwrap().expect("row exists");
+        assert!(!row.measured);
+        assert_eq!(row.total_tokens, None);
+        assert_eq!(row.cost_usd, None);
+        assert_eq!(task_spent(&store, task.id).unwrap(), 1_000);
+    }
+
+    /// A store with one draft task on it — the fixture the three checks above
+    /// share, so each test states only what it is about.
+    fn store_with_task(title: &str) -> (Store, devai_core::types::Task) {
+        let dir = std::env::temp_dir().join(format!("devai-usage-x-{}", uuid::Uuid::now_v7()));
+        let store = Store::open(&dir).unwrap();
+        let task = devai_core::types::Task {
             id: devai_core::types::new_id(),
-            task_id: task.id,
-            role_slug: "role-b".into(),
+            project_id: None,
+            title: title.into(),
+            business_description: String::new(),
+            human_name: None,
+            state: devai_core::types::TaskState::Draft,
+            return_state: None,
+            requirements_seq: 0,
+            lock_version: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.create_task(&task).unwrap();
+        (store, task)
+    }
+
+    /// One completed MEASURED run of `role` with the given token counts.
+    fn measured_run(
+        store: &Store,
+        task_id: devai_core::types::Id,
+        role: &str,
+        prompt: i64,
+        completion: i64,
+    ) -> devai_core::types::RoleExecution {
+        let e = open_run(store, task_id, role);
+        store
+            .finish_execution(
+                &e,
+                devai_core::types::ExecutionStatus::Completed,
+                None,
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .record_execution_usage(&UsageRecord {
+                execution_id: e.id,
+                task_id,
+                role_slug: role.into(),
+                run_id: None,
+                provider: Some("hermes".into()),
+                model: Some("m".into()),
+                prompt_tokens: Some(prompt),
+                completion_tokens: Some(completion),
+                total_tokens: Some(prompt + completion),
+                duration_ms: Some(5),
+                cost_usd: None,
+                measured: true,
+                unknown_reason: None,
+            })
+            .unwrap();
+        e
+    }
+
+    /// One FAILED run that closed with no report at all.
+    fn bare_run(
+        store: &Store,
+        task_id: devai_core::types::Id,
+        role: &str,
+    ) -> devai_core::types::RoleExecution {
+        let e = open_run(store, task_id, role);
+        store
+            .finish_execution(
+                &e,
+                devai_core::types::ExecutionStatus::Failed,
+                None,
+                Some("boom"),
+                Utc::now(),
+            )
+            .unwrap();
+        e
+    }
+
+    /// Start a RUNNING execution row of `role` on `task_id`.
+    fn open_run(
+        store: &Store,
+        task_id: devai_core::types::Id,
+        role: &str,
+    ) -> devai_core::types::RoleExecution {
+        let e = devai_core::types::RoleExecution {
+            id: devai_core::types::new_id(),
+            task_id,
+            role_slug: role.into(),
             role_version: 1,
             agent_name: None,
             status: devai_core::types::ExecutionStatus::Running,
@@ -780,20 +1027,7 @@ mod tests {
             bundle: None,
             run_id: None,
         };
-        store.start_execution(&bare).unwrap();
-        store
-            .finish_execution(
-                &bare,
-                devai_core::types::ExecutionStatus::Failed,
-                None,
-                Some("boom"),
-                Utc::now(),
-            )
-            .unwrap();
-        let row = store.execution_usage(bare.id).unwrap().expect("row exists");
-        assert!(!row.measured);
-        assert_eq!(row.total_tokens, None);
-        assert_eq!(row.cost_usd, None);
-        assert_eq!(task_spent(&store, task.id).unwrap(), 1_000);
+        store.start_execution(&e).unwrap();
+        e
     }
 }

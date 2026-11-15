@@ -151,8 +151,10 @@ fn runtime_code(e: &RuntimeError) -> ErrorCode {
         RuntimeError::NoActiveBundle => ErrorCode("no_active_bundle"),
         RuntimeError::IncompleteBundle => ErrorCode("incomplete_bundle"),
         // REQ-USG-05: the budget refusal is its own code — a consumer branches
-        // on «budget» without parsing the sentence.
+        // on «budget» without parsing the sentence. A refusal whose cleanup
+        // failed keeps the same code: the operator's fact is still the budget.
         RuntimeError::BudgetRefused(..) => ErrorCode("usage_budget_refused"),
+        RuntimeError::RefusalCleanup { .. } => ErrorCode("usage_budget_refused"),
     }
 }
 
