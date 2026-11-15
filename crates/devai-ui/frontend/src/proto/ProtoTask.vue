@@ -2,7 +2,7 @@
 // Новая карточка задачи (по макету): вертикальный путь, один открытый шаг,
 // «вход/выход» у ролей, «качество» и «правила приёмки» у гейтов; расход
 // токенов по шагам, вклад каждого пункта приёмки и вставки кода.
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch, watchEffect } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useHoldToConfirm } from "../components/signature/useHoldToConfirm";
 import { api, toUiError } from "../api";
@@ -432,11 +432,12 @@ async function loadRunRow(s: any) {
   }
 }
 
-/** Выбранный прогон упал и отчёта не отдал — показываем отказ, не пустоту. */
-const runFailed = computed(() => {
-  const e = runOf(steps.value.find((x: any) => x.state === openState.value));
+/** Прогон шага упал — это состояние ШАГА, а не всей задачи: у отказа своя
+ *  вкладка внутри шага, и баннеров поверх карточки он не заводит. */
+function isFailed(s: any): boolean {
+  const e = runOf(s);
   return !!e && String(e.status) === "FAILED";
-});
+}
 
 /** Класс отказа человеческими словами (платформа называет его машинно). */
 const FAIL_WORD: Record<string, string> = {
@@ -451,8 +452,6 @@ const failClassWord = computed(() => {
   return FAIL_WORD[c] ?? c;
 });
 
-/** Провал агента по данным платформы: чем объясняется остановка задачи. */
-const agentFail = computed<any | null>(() => (prog.value as any)?.agent_failure ?? null);
 
 /// Выводы проверяющего ДЛЯ ВЫБРАННОГО прогона шага: вкладка обязана меняться
 /// от прогона к прогону, а не показывать всегда самый свежий вердикт.
@@ -657,6 +656,7 @@ const tabsFor = (s: any) => {
       ["stmt", "постановка"],
       ["verdict", "оценка проверяющего"],
     ];
+    if (isFailed(s)) t.unshift(["fail", "отказ"]);
     if (execs0.length) t.push(["term", "консоль"]);
     return t;
   }
@@ -666,7 +666,13 @@ const tabsFor = (s: any) => {
   const art = artOf(s);
   // Прогоны есть, но выбранный ничего не отдал — вкладок нет: подсовывать
   // данные соседнего прогона было бы враньём.
-  if (execs.length && !art) return [["term", "консоль"]] as [string, string][];
+  // Прогон ничего не отдал: либо он упал (тогда у отказа своя вкладка), либо
+  // просто не оставил данных — во втором случае остаётся только консоль.
+  if (execs.length && !art)
+    return (isFailed(s) ? [["fail", "отказ"], ["term", "консоль"]] : [["term", "консоль"]]) as [
+      string,
+      string,
+    ][];
 
   const t: [string, string][] = [];
   if (art?.kind === "REQUIREMENTS_SPEC") t.push(["spec", "спецификация"]);
@@ -686,11 +692,22 @@ const tabsFor = (s: any) => {
       t.push(["rules", "правила приёмки"]);
     }
   }
+  if (isFailed(s)) t.unshift(["fail", "отказ"]);
   // Консоль есть у любого шага с прогонами: человек видит, что агент делает
   // ПРЯМО СЕЙЧАС, а не догадывается по артефактам.
   if (execs.length) t.push(["term", "консоль"]);
   return t;
 };
+
+// Открытая вкладка обязана существовать в СВОЁМ шаге: если выбран другой
+// прогон (или шаг открылся сам), и прежней вкладки там нет — встаём на первую.
+// Без этого шаг показывал пустую панель: вкладки есть, ничего не выбрано.
+watchEffect(() => {
+  const s = steps.value.find((x: any) => x.state === openState.value);
+  if (!s) return;
+  const keys = tabsFor(s).map((t) => t[0]);
+  if (!keys.includes(openTab.value)) openTab.value = keys[0] ?? "";
+});
 
 function openStep(s: any) {
   if (openState.value === s.state) { openState.value = null; return; }
@@ -987,7 +1004,15 @@ async function load() {
     const cur =
       steps.value.find((x: any) => x.state === (prog.value as any)?.task?.state) ??
       steps.value.filter((x: any) => (x.execs ?? []).length).pop();
-    if (cur) void loadRunRow(cur);
+    if (cur) {
+      void loadRunRow(cur);
+      // Открытый по умолчанию шаг должен открыться на СВОЁМ первом действии:
+      // упавший прогон — на «отказе», а не на пустой панели.
+      if (!openTab.value) {
+        const t = tabsFor(cur);
+        openTab.value = t.length ? t[0][0] : "";
+      }
+    }
     // Отчёт реализации (последний) называет коммит задачи — по нему и читаем код.
     const impl = (arts as ArtifactView[])
       .filter((a) => a.kind === "IMPLEMENTATION_REPORT")
@@ -1320,26 +1345,6 @@ onMounted(load);
         </div>
       </div>
 
-      <!-- почему задача стоит: провал агента — факт платформы, не догадка -->
-      <div v-if="agentFail" class="p-alert">
-        <span class="a-dot" />
-        <div class="a-body">
-          <div class="a-h">
-            остановлено: {{ agentFail.class_word || FAIL_WORD[agentFail.class] || agentFail.class }}
-            <span v-if="agentFail.agent" class="a-agent">{{ agentFail.agent }}</span>
-            <span v-if="agentFail.exit_code !== null && agentFail.exit_code !== undefined" class="a-code">exit {{ agentFail.exit_code }}</span>
-          </div>
-          <div class="a-sub">
-            подряд {{ agentFail.window_count }} из {{ agentFail.threshold }} · всего отказов {{ agentFail.total_failures }}
-            <template v-if="agentFail.action"> · что делать: {{ agentFail.action }}</template>
-          </div>
-          <pre v-if="agentFail.tail" class="a-tail">{{ agentFail.tail }}</pre>
-        </div>
-        <button v-if="canResume" class="a-resume" :disabled="resumeBusy" @click="doResume">
-          {{ resumeBusy ? 'возвращаю…' : '↩ Вернуть в работу' }}
-        </button>
-      </div>
-
       <header class="p-dhead">
         <div class="p-dtitle">
           <h1>{{ prog.task.display }}</h1>
@@ -1395,6 +1400,7 @@ onMounted(load);
                 <span v-if="convSpark(s.state).length" class="p-spark" :title="'сходимость: ' + convMode(s.state)">
                   <i v-for="(b, k) in convSpark(s.state)" :key="k" :class="b.cls" :style="{ height: b.h + 'px' }" />
                 </span>
+                <span v-if="isFailed(s)" class="p-failchip" title="выбранный прогон шага упал — причина во вкладке «отказ»">упал</span>
                 <span v-if="s.score !== null" class="p-scorechip" :class="scoreTone">
                   {{ (s.score * 100).toFixed(1) }}%<i>качество</i>
                 </span>
@@ -1446,23 +1452,36 @@ onMounted(load);
                 /></button>
                 <span class="p-rsel">выбран {{ s.execs.findIndex((e: any) => e.id === runOf(s)?.id) + 1 }} из {{ s.execs.length }}</span>
               </div>
-              <div v-if="s.execs.length" class="p-runmemo" :class="{ bad: runFailed && !artOf(s) }">
+              <div v-if="s.execs.length" class="p-runmemo" :class="{ bad: isFailed(s) && !artOf(s) }">
                 <template v-if="artOf(s)">вкладки ниже — данные этого прогона · {{ artOf(s)!.display }}</template>
-                <template v-else-if="runFailed">
-                  прогон упал{{ failClassWord ? " · " + failClassWord : "" }} — отчёта нет, причина ниже
+                <template v-else-if="isFailed(s)">
+                  прогон упал{{ failClassWord ? " · " + failClassWord : "" }} — отчёта нет, причина во вкладке «отказ»
                 </template>
                 <template v-else>этот прогон ничего не отдал — вкладок нет</template>
               </div>
 
-              <!-- отказ прогона: текст как он записан платформой -->
-              <div v-if="runFailed && runRow?.error" class="p-runfail">
-                <div class="rf-h">
-                  <b>{{ runRow.role_slug }}</b>
-                  <span class="rf-cls">{{ failClassWord || "отказ" }}</span>
-                  <span v-if="runRow.attempt && runRow.attempt > 1" class="rf-att">попытка {{ runRow.attempt }}</span>
-                </div>
-                <pre class="rf-t">{{ runRow.error }}</pre>
-                <button class="p-act" @click="selectTab(s, 'term')">открыть консоль прогона</button>
+              <!-- отказ прогона: своя вкладка шага, а не баннер поверх задачи -->
+              <div v-if="openTab === 'fail'" class="p-panel">
+                <div v-if="!runRow" class="p-empty" style="padding:4px 0">строка прогона не прочиталась</div>
+                <template v-else>
+                  <div class="rf-h">
+                    <span class="rf-dot" />
+                    <b>{{ runRow.role_slug }}</b>
+                    <span class="rf-cls">{{ failClassWord || "отказ" }}</span>
+                    <span v-if="runRow.status" class="rf-st">{{ runRow.status }}</span>
+                    <span v-if="runRow.attempt && runRow.attempt > 1" class="rf-att">попытка {{ runRow.attempt }}</span>
+                  </div>
+                  <div v-if="runRow.error" class="rf-t">{{ runRow.error }}</div>
+                  <div v-else class="p-empty" style="padding:4px 0">
+                    платформа не записала текст отказа — есть только статус
+                  </div>
+                  <div class="rf-acts">
+                    <button class="p-act" @click="selectTab(s, 'term')">открыть консоль прогона</button>
+                    <button v-if="canResume" class="p-act run" :disabled="resumeBusy" @click="doResume">
+                      {{ resumeBusy ? "возвращаю…" : "↩ Вернуть в работу" }}
+                    </button>
+                  </div>
+                </template>
               </div>
 
               <!-- постановка: исходный текст задачи, без служебных вкладок -->
@@ -1989,34 +2008,24 @@ onMounted(load);
 .p-spark i.ok{background:var(--p-pass)} .p-spark i.bad{background:var(--p-stop)}
 .p-spark i.mid{background:#4a6b86} .p-spark i.un{background:#2b3440}
 .p-human{display:inline-flex;align-items:center;color:var(--p-human);opacity:.85;cursor:help}
+.p-failchip{font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:5px;
+  color:#ffb3bb;background:rgba(240,97,109,.12);border:1px solid rgba(240,97,109,.38)}
 .p-mstats{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--p-dim2)}
 .p-mstats b{color:var(--p-dim);font-weight:500}
 .p-mstats .lim{color:#5a6877}
 
 
-/* ── остановка задачи: провал агента ────────────────────────────────────── */
-.p-alert{display:flex;gap:11px;align-items:flex-start;margin:10px 0 0;padding:11px 13px;
-  border:1px solid rgba(240,97,109,.38);border-radius:9px;background:rgba(240,97,109,.07)}
-.p-alert .a-dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--p-stop);margin-top:5px}
-.p-alert .a-body{flex:1;min-width:0}
-.p-alert .a-h{font-size:12.5px;color:#ffd3d7;display:flex;gap:9px;align-items:baseline;flex-wrap:wrap}
-.p-alert .a-agent,.p-alert .a-code{font-family:var(--mono);font-size:10.5px;color:#f0a2a9}
-.p-alert .a-sub{font-size:11px;color:var(--p-dim);margin-top:3px}
-.p-alert .a-tail{font-family:var(--mono);font-size:10.5px;line-height:1.45;color:#c9b6ba;margin:6px 0 0;
-  max-height:96px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-.p-alert .a-resume{flex:none;font:inherit;font-size:11.5px;padding:5px 11px;border-radius:6px;cursor:pointer;
-  border:1px solid rgba(122,167,255,.45);color:#a9c4ff;background:rgba(122,167,255,.10)}
-.p-alert .a-resume:disabled{opacity:.55;cursor:default}
-
-/* ── отказ прогона ──────────────────────────────────────────────────────── */
+/* ── отказ прогона: вкладка внутри шага ─────────────────────────────────── */
 .p-runmemo.bad{color:#f0a2a9}
-.p-runfail{margin:8px 14px 0;padding:9px 11px;border:1px solid rgba(240,97,109,.32);border-radius:8px;
-  background:rgba(240,97,109,.05)}
-.p-runfail .rf-h{display:flex;gap:9px;align-items:baseline;font-size:11.5px;color:#e9eef4;margin-bottom:5px}
-.p-runfail .rf-cls{color:#f0a2a9}
-.p-runfail .rf-att{color:var(--p-dim2);font-family:var(--mono);font-size:10.5px}
-.p-runfail .rf-t{font-family:var(--mono);font-size:10.5px;line-height:1.45;color:#cfd9e4;margin:0 0 7px;
-  max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.rf-h{display:flex;gap:9px;align-items:baseline;flex-wrap:wrap;font-size:12px;color:#e9eef4;margin-bottom:8px}
+.rf-h .rf-dot{width:7px;height:7px;border-radius:50%;background:var(--p-stop);align-self:center}
+.rf-h .rf-cls{color:#f0a2a9}
+.rf-h .rf-st{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2)}
+.rf-h .rf-att{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2)}
+.rf-t{font-family:var(--mono);font-size:11px;line-height:1.5;color:#cfd9e4;background:#080b0e;
+  border:1px solid var(--p-line);border-radius:7px;padding:9px 11px;max-height:320px;overflow:auto;
+  white-space:pre-wrap;word-break:break-word}
+.rf-acts{display:flex;gap:8px;margin-top:9px}
 
 /* ── консоль прогона ─────────────────────────────────────────────────────── */
 .p-termhead{display:flex;align-items:center;gap:9px;font-size:11.5px;color:var(--p-dim);margin-bottom:6px;flex-wrap:wrap}

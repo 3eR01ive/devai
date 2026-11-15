@@ -92,25 +92,36 @@ describe("упавший прогон виден", () => {
     });
   });
 
-  it("шапка карточки говорит, почему задача стоит, и словами платформы", async () => {
+  it("отказ — вкладка ВНУТРИ шага, без баннера поверх карточки", async () => {
     const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
     await flushPromises();
     await flushPromises();
 
-    const alert = w.find(".p-alert");
-    expect(alert.exists()).toBe(true);
-    expect(alert.text()).toContain("провайдер ограничил темп или квоту");
-    expect(alert.text()).toContain("exit 2");
-    expect(alert.text()).toContain("снизить темп");
-    // вернуть в работу можно прямо из баннера, если платформа позволяет
-    expect(alert.find(".a-resume").exists()).toBe(true);
+    // задачи-wide баннера нет: провал принадлежит шагу
+    expect(w.find(".p-alert").exists()).toBe(false);
+
+    const step = w.findAll(".p-vstep")[4];
+    if (!step.classes().includes("open")) await step.find(".p-vhead").trigger("click");
+    await flushPromises();
+    await flushPromises();
+
+    // на самом шаге видно, что он упал
+    expect(w.findAll(".p-failchip").length).toBeGreaterThan(0);
+    const tabs = w.findAll(".p-tab").map((t) => t.text());
+    expect(tabs[0]).toBe("отказ");
+    expect(tabs).toContain("консоль");
+
+    // и во вкладке — причина словами платформы
+    const fail = w.find(".rf-t");
+    expect(fail.exists()).toBe(true);
+    expect(fail.text()).toContain("out of iteration budget");
+    expect(w.find(".rf-h").text()).toContain("провайдер");
   });
 
-  it("в шаге виден отказ прогона, а не «ничего не отдал»", async () => {
+  it("мемо прогона не врёт «ничего не отдал», когда прогон упал", async () => {
     const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
     await flushPromises();
     await flushPromises();
-
     const step = w.findAll(".p-vstep")[4];
     if (!step.classes().includes("open")) await step.find(".p-vhead").trigger("click");
     await flushPromises();
@@ -119,10 +130,5 @@ describe("упавший прогон виден", () => {
     const memo = w.find(".p-runmemo");
     expect(memo.text()).toContain("прогон упал");
     expect(memo.text()).not.toContain("ничего не отдал");
-
-    const fail = w.find(".p-runfail");
-    expect(fail.exists()).toBe(true);
-    expect(fail.text()).toContain("провайдер");
-    expect(fail.find(".rf-t").text()).toContain("out of iteration budget");
   });
 });
