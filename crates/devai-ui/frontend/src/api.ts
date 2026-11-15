@@ -8,6 +8,7 @@
 // получает отдельного набора прав и отдельной реализации чтения/записи.
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
+  ExecRow,
   ExecTranscriptView,
   MergeOutcome,
   RulebookView,
@@ -217,6 +218,8 @@ export const api = {
   // Правила оценки дома: то, чем судит качество (профиль оценки как данные).
   evaluationRules: () => invoke<RulebookView>("evaluation_rules"),
   // Расход токенов задачи по прогонам (файлы улик драйвера).
+  /** Одна строка исполнения: статус, класс и текст отказа. */
+  execGet: (exec_id: string) => invoke<ExecRow>("execution_get", { exec_id }),
   /** Консоль прогона: то, что роль пишет в свои потоки. */
   execTranscript: (id_prefix: string, execution: string) =>
     invoke<ExecTranscriptView>("exec_transcript", { id_prefix, execution }),

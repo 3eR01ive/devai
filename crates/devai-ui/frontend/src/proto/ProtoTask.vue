@@ -11,7 +11,7 @@ import type {
   SignatureView, TaskUsageView, UiError, WorkflowEvent,
   WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
-import type { ExecTranscriptView } from "../types";
+import type { ExecRow, ExecTranscriptView } from "../types";
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
@@ -193,7 +193,8 @@ async function pickRun(s: any, execId: string) {
   selRunId.value = { ...selRunId.value, [s.state]: execId };
   const art = artByExec.value.get(execId);
   if (!art) { if (s.state === "QA") qaRaw.value = null; return; }
-  await ensureBody(art);
+  await  await ensureBody(art);
+  void loadRunRow(s);
   // Тело могло быть УЖЕ прочитано (кэш), и тогда ensureBody ничего не делает —
   // раньше из-за этого приёмка продолжала показывать прошлый отчёт: засечка
   // переключалась, а число нет. Привязываем отчёт к ВЫБРАННОМУ прогону явно.
@@ -411,7 +412,47 @@ async function toggleCompare(s: any) {
 function ensureLoaded(s: any) {
   const art = artOf(s);
   if (art) void ensureBody(art);
+  void loadRunRow(s);
 }
+
+// ── строка прогона: почему он встал ──────────────────────────────────────
+// Отчёт роли НЕ всегда есть: прогон может упасть, и тогда «ничего не отдал» —
+// правда без причины. Причина записана платформой (exec.get): статус, класс
+// отказа, текст отказа. Показываем её, а не пустоту.
+const runRow = ref<ExecRow | null>(null);
+
+async function loadRunRow(s: any) {
+  const e = runOf(s);
+  if (!e) { runRow.value = null; return; }
+  if (runRow.value?.id === e.id) return;
+  try {
+    runRow.value = await api.execGet(e.id);
+  } catch {
+    runRow.value = null;
+  }
+}
+
+/** Выбранный прогон упал и отчёта не отдал — показываем отказ, не пустоту. */
+const runFailed = computed(() => {
+  const e = runOf(steps.value.find((x: any) => x.state === openState.value));
+  return !!e && String(e.status) === "FAILED";
+});
+
+/** Класс отказа человеческими словами (платформа называет его машинно). */
+const FAIL_WORD: Record<string, string> = {
+  provider: "провайдер",
+  provider_rate: "провайдер ограничил темп или квоту",
+  provider_quota: "квота провайдера исчерпана",
+  form: "ответ роли не прошёл форму",
+  platform: "ошибка платформы",
+};
+const failClassWord = computed(() => {
+  const c = runRow.value?.failure_class ?? "";
+  return FAIL_WORD[c] ?? c;
+});
+
+/** Провал агента по данным платформы: чем объясняется остановка задачи. */
+const agentFail = computed<any | null>(() => (prog.value as any)?.agent_failure ?? null);
 
 /// Выводы проверяющего ДЛЯ ВЫБРАННОГО прогона шага: вкладка обязана меняться
 /// от прогона к прогону, а не показывать всегда самый свежий вердикт.
@@ -939,6 +980,14 @@ async function load() {
     questions.value = qs as Question[];
     events.value = evs as WorkflowEvent[];
     decisions.value = decs as any[];
+    // Текущий шаг открыт по умолчанию — его строку прогона читаем сразу, иначе
+    // причина отказа появлялась бы только после клика по шагу.
+    // Задача может стоять ВНЕ стадии (BLOCKED/PAUSED): тогда берём шаг с
+    // самыми свежими прогонами — именно там и лежит причина остановки.
+    const cur =
+      steps.value.find((x: any) => x.state === (prog.value as any)?.task?.state) ??
+      steps.value.filter((x: any) => (x.execs ?? []).length).pop();
+    if (cur) void loadRunRow(cur);
     // Отчёт реализации (последний) называет коммит задачи — по нему и читаем код.
     const impl = (arts as ArtifactView[])
       .filter((a) => a.kind === "IMPLEMENTATION_REPORT")
@@ -1271,6 +1320,26 @@ onMounted(load);
         </div>
       </div>
 
+      <!-- почему задача стоит: провал агента — факт платформы, не догадка -->
+      <div v-if="agentFail" class="p-alert">
+        <span class="a-dot" />
+        <div class="a-body">
+          <div class="a-h">
+            остановлено: {{ agentFail.class_word || FAIL_WORD[agentFail.class] || agentFail.class }}
+            <span v-if="agentFail.agent" class="a-agent">{{ agentFail.agent }}</span>
+            <span v-if="agentFail.exit_code !== null && agentFail.exit_code !== undefined" class="a-code">exit {{ agentFail.exit_code }}</span>
+          </div>
+          <div class="a-sub">
+            подряд {{ agentFail.window_count }} из {{ agentFail.threshold }} · всего отказов {{ agentFail.total_failures }}
+            <template v-if="agentFail.action"> · что делать: {{ agentFail.action }}</template>
+          </div>
+          <pre v-if="agentFail.tail" class="a-tail">{{ agentFail.tail }}</pre>
+        </div>
+        <button v-if="canResume" class="a-resume" :disabled="resumeBusy" @click="doResume">
+          {{ resumeBusy ? 'возвращаю…' : '↩ Вернуть в работу' }}
+        </button>
+      </div>
+
       <header class="p-dhead">
         <div class="p-dtitle">
           <h1>{{ prog.task.display }}</h1>
@@ -1377,9 +1446,23 @@ onMounted(load);
                 /></button>
                 <span class="p-rsel">выбран {{ s.execs.findIndex((e: any) => e.id === runOf(s)?.id) + 1 }} из {{ s.execs.length }}</span>
               </div>
-              <div v-if="s.execs.length" class="p-runmemo">
+              <div v-if="s.execs.length" class="p-runmemo" :class="{ bad: runFailed && !artOf(s) }">
                 <template v-if="artOf(s)">вкладки ниже — данные этого прогона · {{ artOf(s)!.display }}</template>
+                <template v-else-if="runFailed">
+                  прогон упал{{ failClassWord ? " · " + failClassWord : "" }} — отчёта нет, причина ниже
+                </template>
                 <template v-else>этот прогон ничего не отдал — вкладок нет</template>
+              </div>
+
+              <!-- отказ прогона: текст как он записан платформой -->
+              <div v-if="runFailed && runRow?.error" class="p-runfail">
+                <div class="rf-h">
+                  <b>{{ runRow.role_slug }}</b>
+                  <span class="rf-cls">{{ failClassWord || "отказ" }}</span>
+                  <span v-if="runRow.attempt && runRow.attempt > 1" class="rf-att">попытка {{ runRow.attempt }}</span>
+                </div>
+                <pre class="rf-t">{{ runRow.error }}</pre>
+                <button class="p-act" @click="selectTab(s, 'term')">открыть консоль прогона</button>
               </div>
 
               <!-- постановка: исходный текст задачи, без служебных вкладок -->
@@ -1909,6 +1992,31 @@ onMounted(load);
 .p-mstats{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--p-dim2)}
 .p-mstats b{color:var(--p-dim);font-weight:500}
 .p-mstats .lim{color:#5a6877}
+
+
+/* ── остановка задачи: провал агента ────────────────────────────────────── */
+.p-alert{display:flex;gap:11px;align-items:flex-start;margin:10px 0 0;padding:11px 13px;
+  border:1px solid rgba(240,97,109,.38);border-radius:9px;background:rgba(240,97,109,.07)}
+.p-alert .a-dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--p-stop);margin-top:5px}
+.p-alert .a-body{flex:1;min-width:0}
+.p-alert .a-h{font-size:12.5px;color:#ffd3d7;display:flex;gap:9px;align-items:baseline;flex-wrap:wrap}
+.p-alert .a-agent,.p-alert .a-code{font-family:var(--mono);font-size:10.5px;color:#f0a2a9}
+.p-alert .a-sub{font-size:11px;color:var(--p-dim);margin-top:3px}
+.p-alert .a-tail{font-family:var(--mono);font-size:10.5px;line-height:1.45;color:#c9b6ba;margin:6px 0 0;
+  max-height:96px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.p-alert .a-resume{flex:none;font:inherit;font-size:11.5px;padding:5px 11px;border-radius:6px;cursor:pointer;
+  border:1px solid rgba(122,167,255,.45);color:#a9c4ff;background:rgba(122,167,255,.10)}
+.p-alert .a-resume:disabled{opacity:.55;cursor:default}
+
+/* ── отказ прогона ──────────────────────────────────────────────────────── */
+.p-runmemo.bad{color:#f0a2a9}
+.p-runfail{margin:8px 14px 0;padding:9px 11px;border:1px solid rgba(240,97,109,.32);border-radius:8px;
+  background:rgba(240,97,109,.05)}
+.p-runfail .rf-h{display:flex;gap:9px;align-items:baseline;font-size:11.5px;color:#e9eef4;margin-bottom:5px}
+.p-runfail .rf-cls{color:#f0a2a9}
+.p-runfail .rf-att{color:var(--p-dim2);font-family:var(--mono);font-size:10.5px}
+.p-runfail .rf-t{font-family:var(--mono);font-size:10.5px;line-height:1.45;color:#cfd9e4;margin:0 0 7px;
+  max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 
 /* ── консоль прогона ─────────────────────────────────────────────────────── */
 .p-termhead{display:flex;align-items:center;gap:9px;font-size:11.5px;color:var(--p-dim);margin-bottom:6px;flex-wrap:wrap}

@@ -461,6 +461,7 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     ("evaluation_rules", "eval.rules"),
     ("task_usage", "task.usage"),
     ("exec_transcript", "exec.transcript"),
+    ("execution_get", "exec.get"),
     ("source_slice", "source.slice"),
     ("task_events", "task.events"),
     ("task_decisions", "task.decisions"),
@@ -1467,6 +1468,16 @@ pub fn task_merge(
         commit: last.and_then(|d| d.refs.get(1).cloned()).unwrap_or_default(),
         text: text.trim().to_string(),
     })
+}
+
+/// Одна строка исполнения как она записана: статус, класс отказа, текст отказа.
+/// Нужна карточке, чтобы показать ПОЧЕМУ прогон встал, а не «ничего не отдал».
+#[tauri::command(rename_all = "snake_case")]
+pub fn execution_get(
+    state: State<AppState>,
+    exec_id: String,
+) -> Result<devai_core::types::RoleExecution, UiError> {
+    Ok(state.api().exec_get(&exec_id)?)
 }
 
 /// Консоль прогона: потоки роли как они есть на диске, хвостом.

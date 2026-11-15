@@ -273,6 +273,10 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: exec_transcript_rpc,
     },
     RpcCommand {
+        name: "execution_get",
+        handler: execution_get_rpc,
+    },
+    RpcCommand {
         name: "task_merge",
         handler: task_merge_rpc,
     },
@@ -1005,6 +1009,15 @@ fn task_merge_rpc(
     let id_prefix = param_str(params, "id_prefix")?;
     let rationale = params.get("rationale").and_then(|v| v.as_str()).map(str::to_string);
     to_json(crate::commands::task_merge(state(app), id_prefix, rationale)?)
+}
+
+fn execution_get_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let exec_id = param_str(params, "exec_id")?;
+    to_json(crate::commands::execution_get(state(app), exec_id)?)
 }
 
 fn exec_transcript_rpc(
