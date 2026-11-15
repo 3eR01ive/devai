@@ -299,8 +299,8 @@ pub enum SessionKind {
 pub mod ui_reads;
 
 pub use ui_reads::{
-    RuleDetectView, RuleGroupView, RuleView, RulebookView, SourceSliceView, TaskUsageView,
-    UsageRowView,
+    ExecTranscriptView, RuleDetectView, RuleGroupView, RuleView, RulebookView, SourceSliceView,
+    TaskUsageView, UsageRowView,
 };
 
 pub struct Api {

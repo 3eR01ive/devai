@@ -244,6 +244,63 @@ pub struct TaskUsageView {
     pub rows: Vec<UsageRowView>,
 }
 
+/// Поток прогона как он есть: то, что роль пишет в свои потоки, пока работает.
+/// Улики платформы лежат в `<home>/evidence/<task>/<execution>/role_stdout.txt`;
+/// читаем ХВОСТ с потолком байт, поэтому окно показывает тот же текст, что на
+/// диске, и не пересказывает его.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecTranscriptView {
+    pub execution: String,
+    pub task: String,
+    pub role: String,
+    pub status: String,
+    pub running: bool,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    /// Показан только хвост (потолок чтения) — говорим прямо, а не молчим.
+    pub truncated: bool,
+    /// Почему потока нет / он обрезан. `None` = поток прочитан целиком.
+    pub note: Option<String>,
+}
+
+/// Потолок чтения одного потока: хвост последних 128 КиБ. Больше в окно не
+/// едет — терминал всё равно не покажет, а память окна конечна.
+const TRANSCRIPT_TAIL_BYTES: u64 = 128 * 1024;
+
+/// Хвост текстового потока: (текст, полный размер файла, обрезано ли).
+fn tail_text(p: &std::path::Path) -> (String, u64, bool) {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return (String::new(), 0, false);
+    };
+    let size = meta.len();
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return (String::new(), size, false);
+    };
+    let skip = size.saturating_sub(TRANSCRIPT_TAIL_BYTES);
+    if skip > 0 {
+        use std::io::Seek;
+        let _ = f.seek(std::io::SeekFrom::Start(skip));
+    }
+    let mut buf = Vec::new();
+    {
+        use std::io::Read;
+        let _ = f.read_to_end(&mut buf);
+    }
+    let mut text = String::from_utf8_lossy(&buf).to_string();
+    if skip > 0 {
+        // Срез с середины строки — отдаём с целой строки, чтобы терминал не
+        // начинался огрызком.
+        if let Some(i) = text.find('\n') {
+            text = text[i + 1..].to_string();
+        }
+    }
+    (text, size, skip > 0)
+}
+
 fn num(v: &serde_json::Value, key: &str) -> Option<i64> {
     v.get(key).and_then(|x| x.as_i64())
 }
@@ -294,6 +351,63 @@ impl Api {
             runs: runs.len(),
             measured,
             rows,
+        })
+    }
+
+    /// Консоль прогона: потоки роли прямо сейчас. Читаются те же улики, что
+    /// пишет исполнение (`role_stdout.txt` / `role_stderr.txt` в каталоге
+    /// прогона), поэтому живой прогон виден по мере записи, а завершённый —
+    /// своим хвостом. Пустой поток и обрезка названы, а не выданы за тишину.
+    pub fn exec_transcript(
+        &self,
+        id_prefix: &str,
+        execution: &str,
+    ) -> ApiResult<ExecTranscriptView> {
+        let task = self.store.resolve_task(id_prefix)?;
+        let runs = self.store.list_executions(Some(task.id))?;
+        let e = runs
+            .into_iter()
+            .find(|r| r.id.to_string() == execution || r.id.to_string().starts_with(execution))
+            .ok_or_else(|| {
+                crate::ApiError::refused(
+                    "unknown_execution",
+                    format!("у задачи нет прогона `{execution}`"),
+                )
+            })?;
+        let dir = self
+            .home_path()
+            .join("evidence")
+            .join(task.id.to_string())
+            .join(e.id.to_string());
+        let (stdout, stdout_bytes, so_cut) = tail_text(&dir.join("role_stdout.txt"));
+        let (stderr, stderr_bytes, se_cut) = tail_text(&dir.join("role_stderr.txt"));
+        let note = if stdout_bytes == 0 && stderr_bytes == 0 {
+            Some(
+                "роль ничего не написала в свои потоки (или прогон шёл без файла улик)"
+                    .to_string(),
+            )
+        } else if so_cut || se_cut {
+            Some(format!(
+                "показан хвост: потолок {} КиБ на поток",
+                TRANSCRIPT_TAIL_BYTES / 1024
+            ))
+        } else {
+            None
+        };
+        Ok(ExecTranscriptView {
+            execution: e.id.to_string(),
+            task: task.id.to_string(),
+            role: e.role_slug.clone(),
+            status: e.status.as_str().to_string(),
+            running: e.finished_at.is_none(),
+            started_at: e.started_at.to_rfc3339(),
+            finished_at: e.finished_at.map(|t| t.to_rfc3339()),
+            stdout,
+            stderr,
+            stdout_bytes,
+            stderr_bytes,
+            truncated: so_cut || se_cut,
+            note,
         })
     }
 }

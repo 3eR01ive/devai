@@ -123,7 +123,7 @@ pub struct OpDescriptor {
 /// stamp says so.
 /// @17: `source.slice` отдаёт `candidates`, когда сокращённый путь совпал с
 /// несколькими файлами — выбор вместо догадки. Только чтение.
-pub const SURFACE_VERSION: &str = "api-surface@17";
+pub const SURFACE_VERSION: &str = "api-surface@18";
 
 /// The published registry as ONE machine-readable artifact: the surface
 /// version beside the full operation table. `devai api registry --json`
@@ -259,6 +259,13 @@ pub fn operations() -> Vec<OpDescriptor> {
             input: "id_prefix",
             output: "TaskUsageView{task,total,cost,runs,measured,rows}",
             description: "Расход токенов задачи по прогонам: драйвер пишет usage.json в каталог улик каждого прогона, операция читает эти файлы и агрегирует. Честно отдаёт runs/measured — прогоны без отчёта считаются, но в сумму не входят.",
+        },
+        OpDescriptor {
+            name: "exec.transcript",
+            class: OpClass::Read,
+            input: "id_prefix,execution",
+            output: "ExecTranscriptView{execution,task,role,status,running,started_at,finished_at,stdout,stderr,stdout_bytes,stderr_bytes,truncated,note}",
+            description: "Консоль прогона: что роль пишет в свои потоки прямо сейчас. Читаются те же улики, что пишет исполнение (`role_stdout.txt`/`role_stderr.txt` в каталоге прогона), поэтому живой прогон виден по мере записи. Хвост с потолком 128 КиБ на поток; обрезка и отсутствие потока названы (truncated/note), а не выданы за пустоту.",
         },
         OpDescriptor {
             name: "eval.rules",
@@ -925,7 +932,7 @@ mod tests {
         // @16: ещё одно ЧТЕНИЕ — diff того же диапазона с полным контекстом
         // файла, чтобы окно разворачивало скрытые строки без второго чтения.
         // Ни одна версия не пишет: мутации @14 остаются как были.
-        assert_eq!(SURFACE_VERSION, "api-surface@17");
+        assert_eq!(SURFACE_VERSION, "api-surface@18");
         let rename = operations()
             .into_iter()
             .find(|o| o.name == "task.rename")

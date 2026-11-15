@@ -29,7 +29,29 @@ const NON_SIGNATURE_DECISION_KINDS: &[&str] = &[
     decision_kind::REWORK_NOOP_RATIFIED,
     decision_kind::DEPENDENCY_OVERRIDE,
     decision_kind::QUALITY_RETURN,
+    // Ответ на вопрос предела попыток: слово человека о круге роли, а не акт
+    // подписи спеки. Без этой строки ВЕСЬ отбор подписи падал (`signature_unknown_kind`)
+    // и гейт APPROVAL показывал «спеки нет — подписывать нечего» (прецедент
+    // 01a1df87: задача стояла на подписи с целой спекой).
+    decision_kind::ATTEMPT_LIMIT_ANSWER,
 ];
+
+/// Каждый вид решения обязан быть либо актом подписи, либо ЯВНО перечислен
+/// как не-подпись: полнота проверяется тестом, поэтому новый вид не может
+/// тихо ни потерять подпись, ни уронить весь отбор.
+#[cfg(test)]
+fn non_signature_is_complete() -> Vec<&'static str> {
+    let signature = [
+        decision_kind::REQUIREMENTS_APPROVAL,
+        decision_kind::REQUIREMENTS_REJECTION,
+    ];
+    decision_kind::ALL
+        .iter()
+        .copied()
+        .filter(|k| !signature.contains(k))
+        .filter(|k| !NON_SIGNATURE_DECISION_KINDS.contains(k))
+        .collect()
+}
 
 fn unknown_kind(what: &str, kind: &str) -> ApiError {
     ApiError::refused(
@@ -117,4 +139,27 @@ fn seq_of_refs(refs: &[String], arts: &[Artifact]) -> Option<u32> {
             .find(|a| a.kind == ArtifactKind::RequirementsSpec && a.id.to_string() == *r)
             .map(|a| a.seq)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Новый вид решения не может ни потерять подпись молча, ни уронить весь
+    /// отбор: он обязан быть актом подписи или явно перечислен как не-подпись.
+    #[test]
+    fn every_decision_kind_is_classified() {
+        let unclassified = super::non_signature_is_complete();
+        assert!(
+            unclassified.is_empty(),
+            "виды решений без классификации (добавь в NON_SIGNATURE_DECISION_KINDS): {unclassified:?}"
+        );
+    }
+
+    /// Ответ на вопрос предела попыток — не подпись: на задаче 01a1df87 он
+    /// ронял весь отбор, и гейт APPROVAL показывал «спеки нет».
+    #[test]
+    fn attempt_limit_answer_is_not_a_signature_act() {
+        assert!(NON_SIGNATURE_DECISION_KINDS.contains(&decision_kind::ATTEMPT_LIMIT_ANSWER));
+    }
 }

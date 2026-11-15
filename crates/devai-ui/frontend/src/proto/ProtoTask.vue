@@ -2,7 +2,7 @@
 // Новая карточка задачи (по макету): вертикальный путь, один открытый шаг,
 // «вход/выход» у ролей, «качество» и «правила приёмки» у гейтов; расход
 // токенов по шагам, вклад каждого пункта приёмки и вставки кода.
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useHoldToConfirm } from "../components/signature/useHoldToConfirm";
 import { api, toUiError } from "../api";
@@ -11,11 +11,13 @@ import type {
   SignatureView, TaskUsageView, UiError, WorkflowEvent,
   WorkspaceChangesView, WorkspaceDiffView,
 } from "../types";
+import type { ExecTranscriptView } from "../types";
 import CodeRefText from "./CodeRefText.vue";
 import SignPanel from "./SignPanel.vue";
 import QuestionsBlock from "./QuestionsBlock.vue";
 import { parseStatementReview, type StatementReview } from "./statementReview";
 import StatementVerdict from "./StatementVerdict.vue";
+import RunConsole from "./RunConsole.vue";
 import "./proto.css";
 
 const route = useRoute();
@@ -192,6 +194,12 @@ async function pickRun(s: any, execId: string) {
   const art = artByExec.value.get(execId);
   if (!art) { if (s.state === "QA") qaRaw.value = null; return; }
   await ensureBody(art);
+  // Тело могло быть УЖЕ прочитано (кэш), и тогда ensureBody ничего не делает —
+  // раньше из-за этого приёмка продолжала показывать прошлый отчёт: засечка
+  // переключалась, а число нет. Привязываем отчёт к ВЫБРАННОМУ прогону явно.
+  if (art.kind === "QUALITY_REPORT") {
+    qaRaw.value = (runBodies.value as Record<string, any>)[art.id] ?? null;
+  }
 }
 
 async function ensureBody(art: ArtifactView) {
@@ -405,6 +413,14 @@ function ensureLoaded(s: any) {
   if (art) void ensureBody(art);
 }
 
+/// Выводы проверяющего ДЛЯ ВЫБРАННОГО прогона шага: вкладка обязана меняться
+/// от прогона к прогону, а не показывать всегда самый свежий вердикт.
+function reviewOf(s: any): StatementReview | null {
+  const art = artOf(s);
+  const body = art ? (runBodies.value as Record<string, any>)[art.id] : null;
+  return parseStatementReview(body) ?? (art ? null : stmtReview.value);
+}
+
 function durationOf(execs: any[]): string {
   let ms = 0;
   for (const e of execs) {
@@ -594,18 +610,22 @@ function foldAll(path: string, open: boolean) {
 const tabsFor = (s: any) => {
   // Постановка: сам текст и отдельной вкладкой — выводы проверяющего
   // (вердикт, чек-лист, его вопросы), а не только текст.
-  if (s.state === "STATEMENT")
-    return [
+  const execs0: any[] = s.execs ?? [];
+  if (s.state === "STATEMENT") {
+    const t: [string, string][] = [
       ["stmt", "постановка"],
       ["verdict", "оценка проверяющего"],
-    ] as [string, string][];
+    ];
+    if (execs0.length) t.push(["term", "консоль"]);
+    return t;
+  }
   if (s.state === "APPROVAL") return [["sign", "что подписываешь"]] as [string, string][];
 
-  const execs = s.execs ?? [];
+  const execs = execs0;
   const art = artOf(s);
   // Прогоны есть, но выбранный ничего не отдал — вкладок нет: подсовывать
   // данные соседнего прогона было бы враньём.
-  if (execs.length && !art) return [] as [string, string][];
+  if (execs.length && !art) return [["term", "консоль"]] as [string, string][];
 
   const t: [string, string][] = [];
   if (art?.kind === "REQUIREMENTS_SPEC") t.push(["spec", "спецификация"]);
@@ -625,6 +645,9 @@ const tabsFor = (s: any) => {
       t.push(["rules", "правила приёмки"]);
     }
   }
+  // Консоль есть у любого шага с прогонами: человек видит, что агент делает
+  // ПРЯМО СЕЙЧАС, а не догадывается по артефактам.
+  if (execs.length) t.push(["term", "консоль"]);
   return t;
 };
 
@@ -637,6 +660,8 @@ function openStep(s: any) {
   }
   ensureLoaded(s);
   const t = tabsFor(s);
+  stopTerm();
+  term.value = null;
   openTab.value = t.length ? t[0][0] : "";
 }
 
@@ -669,8 +694,14 @@ const contribSum = computed(() => checks.value.reduce((s, c) => s + (c.score ?? 
 const lossSum = computed(() => checks.value.reduce((s, c) => s + (c.score === null ? 0 : (1 - c.score) * (c.weight ?? 0)), 0));
 const losses = computed(() => checks.value.filter((c) => c.score === null || c.score < 1).length);
 
+// По умолчанию «на доработку» отмечено то, что НЕ дотягивает до 1.0 (и то,
+// что вовсе не оценено): пункт с полным баллом чинить нечего, и держать его в
+// списке возврата — шум, из-за которого причина обрастает лишними строками.
+// Слово оператора: всё ниже 1.0 правится без исключений, «якорей» нет.
 watch(checks, (list) => {
-  if (list.length && picked.value.size === 0) picked.value = new Set(list.map((c) => c.id));
+  if (!list.length || picked.value.size > 0) return;
+  const weak = list.filter((c: any) => c.score === null || c.score < 1);
+  picked.value = new Set(weak.map((c: any) => c.id));
 }, { immediate: true });
 
 function togglePick(c: any, ev: Event) {
@@ -716,10 +747,75 @@ function evidenceOf(c: any): string {
   return txt(e).slice(0, 1200);
 }
 
+// ── консоль прогона: тот же поток, что пишет роль ─────────────────────────
+// Читаем улики прогона (`role_stdout.txt`/`role_stderr.txt`) хвостом: пока роль
+// работает, поток растёт и окно перечитывает его раз в секунду. Ничего не
+// пересказываем и не буферизуем «своё» — на экране ровно то, что на диске.
+const term = ref<ExecTranscriptView | null>(null);
+const termErr = ref<string | null>(null);
+const termFollow = ref(true);
+const termEl = ref<HTMLElement | null>(null);
+let termTimer: number | null = null;
+let termExec = "";
+
+const termText = computed(() => {
+  const t = term.value;
+  if (!t) return "";
+  return t.stderr ? `${t.stdout}\n— stderr —\n${t.stderr}` : t.stdout;
+});
+
+function termStep(): any | null {
+  return steps.value.find((s: any) => s.state === openState.value) ?? null;
+}
+
+async function termOnce() {
+  const s = termStep();
+  if (!s) return;
+  const e = runOf(s);
+  if (!e) { term.value = null; return; }
+  if (e.id !== termExec) { term.value = null; termExec = e.id; }
+  try {
+    const t = await api.execTranscript(id.value, e.id);
+    term.value = t;
+    termErr.value = null;
+    if (termFollow.value) {
+      await nextTick();
+      const el = termEl.value;
+      if (el) el.scrollTop = el.scrollHeight;
+    }
+    // Прогон закончился — досматривать нечего: опрос прекращается сам, а не
+    // молотит улики вечно.
+    if (!t.running) stopTerm();
+  } catch (err) {
+    termErr.value = toUiError(err).message;
+    stopTerm();
+  }
+}
+
+function startTerm() {
+  if (termTimer !== null) return;
+  void termOnce();
+  termTimer = window.setInterval(() => void termOnce(), 1200);
+}
+
+function stopTerm() {
+  if (termTimer !== null) { window.clearInterval(termTimer); termTimer = null; }
+}
+
+/** Смена вкладки включает и выключает наблюдение: консоль живёт, только пока
+ *  она открыта. */
+function selectTab(_s: any, key: string) {
+  openTab.value = key;
+  if (key === "term") startTerm();
+  else stopTerm();
+}
+
 // ── подпись спеки: два акта гейта ─────────────────────────────────────────
 // Разбор вопросов и сборка решения живут в SignPanel/signText; карточка только
 // отправляет акт платформы и перечитывает себя.
 const signBusy = ref(false);
+/** Почему подпись не прочиталась — показываем причину, а не «подписывать нечего». */
+const sigError = ref<string | null>(null);
 
 // ── вопросы платформы: слово человека снимает удержание ──────────────────
 // Вопрос и гейт берутся из ДАННЫХ: текст вопроса — из чтения вопросов, гейт —
@@ -773,12 +869,19 @@ async function load() {
       api.taskReport(id.value).catch(() => null),
       api.taskUsage(id.value).catch(() => null),
       api.evaluationRules().catch(() => null),
-      api.taskSignature(id.value).catch(() => null),
+      api.taskSignature(id.value).catch((e) => {
+        // Отказ чтения подписи — это REASON, а не пустота: иначе карточка
+        // врёт «спеки нет», хотя спека есть, а сломался отбор (прецедент
+        // 01a1df87: неизвестный вид решения ронял весь отбор подписи).
+        sigError.value = String(toUiError(e).message);
+        return null;
+      }),
       api.artifactsList(id.value).catch(() => [] as ArtifactView[]),
       api.questionsList(id.value).catch(() => [] as Question[]),
       api.taskEvents(id.value, 200).catch(() => [] as WorkflowEvent[]),
     ]);
     prog.value = p;
+    if (sig) sigError.value = null;
     report.value = r;
     usage.value = u;
     rules.value = rb;
@@ -857,6 +960,60 @@ const { holding, progress, start, move, release } = useHoldToConfirm(
   () => canCancel.value && !cancelBusy.value,
   () => void doCancel(),
 );
+
+// ── приёмка: два хода гейта — принять или вернуть на доработку ────────────
+// Оба — удержанием на самой кнопке (решение человека, а не случайный клик), и
+// живут они ВНУТРИ шага приёмки, рядом с тем, что человек видит.
+const qaBusy = ref<"accept" | "return" | null>(null);
+const qaErr = ref<string | null>(null);
+/** Словами, что чинить: уходят в причину возврата вместе с выбранными пунктами. */
+const returnNote = ref("");
+
+const qaOpen = computed(() => prog.value?.task.state === "QA");
+
+const { holding: qaHolding, progress: qaProgress, start: qaStart, move: qaMove, release: qaRelease } =
+  useHoldToConfirm(
+    () => qaOpen.value && qaBusy.value === null,
+    (kind) => {
+      if (kind === "accept") void doAccept();
+      if (kind === "return") void doReturn();
+    },
+  );
+
+async function doAccept() {
+  qaBusy.value = "accept";
+  qaErr.value = null;
+  try {
+    await api.taskAccept(id.value, null);
+    await load();
+  } catch (e) {
+    qaErr.value = toUiError(e).message;
+  } finally {
+    qaBusy.value = null;
+  }
+}
+
+/// Возврат на доработку: причина — слова человека плюс ПУНКТЫ, которые он
+/// оставил «на доработку» в таблице. Пустая причина не притворяется пустой
+/// фразой: платформа получит перечень пунктов.
+async function doReturn() {
+  qaBusy.value = "return";
+  qaErr.value = null;
+  const names = checks.value
+    .filter((c: any) => picked.value.has(c.id))
+    .map((c: any) => c.id)
+    .join(", ");
+  const parts = [returnNote.value.trim(), names ? `пункты: ${names}` : ""].filter(Boolean);
+  try {
+    await api.taskReturn(id.value, parts.length ? parts.join("\n") : null);
+    returnNote.value = "";
+    await load();
+  } catch (e) {
+    qaErr.value = toUiError(e).message;
+  } finally {
+    qaBusy.value = null;
+  }
+}
 
 // ── перепройти шаг и переписать постановку ───────────────────────────────
 // Оба хода живут ТАМ, ГДЕ ОНИ НУЖНЫ: перезапуск — кнопкой в самом шаге,
@@ -1016,6 +1173,7 @@ onMounted(() => {
   window.addEventListener("focus", onFocus);
 });
 onUnmounted(() => {
+  stopTerm();
   if (pollTimer) window.clearInterval(pollTimer);
   window.removeEventListener("focus", onFocus);
 });
@@ -1156,15 +1314,17 @@ onMounted(load);
               <!-- прогоны шага: засечка = прогон, по умолчанию выбран последний -->
               <div v-if="s.execs.length" class="p-runs">
                 <span class="p-rlabel">прогоны</span>
-                <span
+                <button
                   v-for="(e, k) in s.execs"
                   :key="e.id"
+                  class="p-rdhit"
+                  :title="'прогон ' + (k + 1) + ' · ' + e.status"
+                  @click.stop="pickRun(s, e.id)"
+                ><i
                   class="p-rd"
                   :class="[String(e.status) === 'COMPLETED' ? 'ok' : String(e.status) === 'FAILED' ? 'bad' : 'run',
                            runOf(s)?.id === e.id ? 'sel' : '']"
-                  :title="'прогон ' + (k + 1) + ' · ' + e.status"
-                  @click.stop="pickRun(s, e.id)"
-                />
+                /></button>
                 <span class="p-rsel">выбран {{ s.execs.findIndex((e: any) => e.id === runOf(s)?.id) + 1 }} из {{ s.execs.length }}</span>
               </div>
               <div v-if="s.execs.length" class="p-runmemo">
@@ -1179,12 +1339,33 @@ onMounted(load);
                   :key="t[0]"
                   class="p-tab"
                   :class="{ on: openTab === t[0] }"
-                  @click="openTab = t[0]"
+                  @click="selectTab(s, t[0])"
                 >{{ t[1] }}</button>
               </div>
 
+              <!-- консоль прогона: терминал как он есть -->
+              <div v-if="openTab === 'term'" class="p-panel">
+                <div v-if="termErr" class="p-empty" style="color:#ffa972">
+                  консоль не прочиталась: {{ termErr }}
+                </div>
+                <template v-else-if="term">
+                  <div class="p-termhead">
+                    <span class="tdot" :class="term.running ? 'run' : 'done'"></span>
+                    <b>{{ term.role }}</b>
+                    <span class="mono">{{ term.status }}</span>
+                    <span class="mono">{{ term.stdout_bytes }} Б</span>
+                    <span v-if="term.note" class="tnote">{{ term.note }}</span>
+                    <button class="p-act" :class="{ on: termFollow }" @click="termFollow = !termFollow">
+                      {{ termFollow ? "следовать" : "не следовать" }}
+                    </button>
+                  </div>
+                  <div ref="termEl" class="p-term"><RunConsole :text="termText" /></div>
+                </template>
+                <div v-else class="p-empty" style="padding:4px 0">у этого прогона нет консоли</div>
+              </div>
+
               <div v-if="s.state === 'STATEMENT' && openTab === 'verdict'" class="p-panel">
-                <StatementVerdict :review="stmtReview" />
+                <StatementVerdict :review="reviewOf(s)" />
               </div>
 
               <div v-if="s.state === 'STATEMENT' && openTab === 'stmt'" class="p-panel">
@@ -1446,15 +1627,58 @@ onMounted(load);
               </div>
 
               <!-- что подписываешь -->
+              <div v-if="openTab === 'sign' && sigError && !signature" class="p-empty" style="color:#ffa972">
+                подпись не прочиталась: {{ sigError }}
+              </div>
               <SignPanel
-                v-if="openTab === 'sign'"
+                v-else-if="openTab === 'sign'"
                 :signature="signature"
                 :busy="signBusy"
                 @sign="doSign"
               />
 
-              <!-- качество -->
+              <!-- качество: сперва ходы человека, ниже — чем он их обосновывает -->
               <div v-if="openTab === 'qa'" class="p-panel">
+                <div v-if="qaOpen" class="p-qacts">
+                  <button
+                    class="p-qa accept"
+                    :class="{ holding: qaHolding === 'accept', busy: qaBusy === 'accept' }"
+                    :disabled="qaBusy !== null"
+                    title="удерживай, чтобы принять задачу"
+                    @pointerdown="qaStart('accept', $event)"
+                    @pointermove="qaMove($event)"
+                    @pointerup="qaRelease"
+                    @pointerleave="qaRelease"
+                    @pointercancel="qaRelease"
+                  >
+                    <i class="fill" :style="{ width: (qaHolding === 'accept' ? qaProgress * 100 : 0) + '%' }" />
+                    <span>{{ qaBusy === 'accept' ? 'принимаю…' : 'Принять задачу' }}</span>
+                  </button>
+
+                  <input
+                    v-model="returnNote"
+                    class="p-qanote"
+                    spellcheck="false"
+                    placeholder="что чинить — словами (необязательно; выбранные пункты уйдут сами)"
+                  />
+
+                  <button
+                    class="p-qa back"
+                    :class="{ holding: qaHolding === 'return', busy: qaBusy === 'return' }"
+                    :disabled="qaBusy !== null"
+                    title="удерживай, чтобы вернуть на доработку"
+                    @pointerdown="qaStart('return', $event)"
+                    @pointermove="qaMove($event)"
+                    @pointerup="qaRelease"
+                    @pointerleave="qaRelease"
+                    @pointercancel="qaRelease"
+                  >
+                    <i class="fill" :style="{ width: (qaHolding === 'return' ? qaProgress * 100 : 0) + '%' }" />
+                    <span>{{ qaBusy === 'return' ? 'возвращаю…' : `На доработку · ${picked.size}` }}</span>
+                  </button>
+                </div>
+                <div v-if="qaErr" class="p-qerr">{{ qaErr }}</div>
+
                 <div class="p-hero" :class="scoreTone">
                   <div class="big">{{ score === null ? "—" : (score * 100).toFixed(1) }}<span>%</span></div>
                   <div class="side">
@@ -1605,9 +1829,28 @@ onMounted(load);
 .p-mstats{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11px;color:var(--p-dim2)}
 .p-mstats b{color:var(--p-dim);font-weight:500}
 .p-mstats .lim{color:#5a6877}
+
+/* ── консоль прогона ─────────────────────────────────────────────────────── */
+.p-termhead{display:flex;align-items:center;gap:9px;font-size:11.5px;color:var(--p-dim);margin-bottom:6px;flex-wrap:wrap}
+.p-termhead b{color:#e6edf5;font-weight:600;font-size:12px}
+.p-termhead .mono{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2)}
+.p-termhead .tdot{width:7px;height:7px;border-radius:50%;background:#3a4654}
+.p-termhead .tdot.run{background:var(--p-now);box-shadow:0 0 6px rgba(243,106,22,.7)}
+.p-termhead .tdot.done{background:var(--p-pass)}
+.p-termhead .tnote{font-size:10.5px;color:#8b97a6}
+.p-termhead .p-act{margin-left:auto}
+.p-term{background:#080b0e;border:1px solid var(--p-line);border-radius:7px;padding:9px 12px;
+  max-height:420px;overflow:auto}
+
 .p-runs{display:flex;align-items:center;gap:3px;flex-wrap:wrap;padding:9px 14px 0}
 .p-rlabel{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--p-dim2);margin-right:6px}
-.p-rd{width:7px;height:14px;border-radius:2px;background:#2b3440;cursor:pointer}
+/* Засечка — кнопка с НАСТОЯЩЕЙ областью нажатия: сам штрих узкий (7×14), но
+   `padding` даёт палец-размер целиком, иначе по прогонам не попасть. */
+.p-rdhit{display:inline-flex;align-items:center;padding:5px 3px;margin:0;background:none;
+  border:0;cursor:pointer;line-height:0}
+.p-rdhit:hover .p-rd{filter:brightness(1.35)}
+.p-rd{display:block;width:7px;height:14px;border-radius:2px;background:#2b3440;
+  transition:filter .1s,outline-color .1s}
 .p-rd.ok{background:var(--p-pass)} .p-rd.bad{background:var(--p-stop)} .p-rd.run{background:var(--p-now)}
 .p-rd.sel{outline:2px solid var(--p-human);outline-offset:1px}
 .p-rsel{font-family:var(--mono);font-size:10.5px;color:var(--p-dim2);margin-left:8px}
@@ -1712,6 +1955,24 @@ onMounted(load);
 .p-kv .v{color:#d3dce6}
 .p-sec{margin-top:12px;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--p-dim2)}
 .p-exec{display:flex;gap:12px;font-size:11.5px;color:#c3ccd6;padding:2px 0;font-variant-numeric:tabular-nums}
+
+
+/* ── ходы приёмки: принять или вернуть ──────────────────────────────────── */
+.p-qacts{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.p-qa{position:relative;overflow:hidden;font:inherit;font-size:12px;padding:7px 14px;border-radius:7px;
+  cursor:pointer;border:1px solid var(--p-line);background:#172028;color:#cfd8e2;white-space:nowrap}
+.p-qa .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.10);transition:width .05s linear}
+.p-qa span{position:relative}
+.p-qa.accept{border-color:rgba(62,207,142,.45);color:#8fe3ba;background:rgba(62,207,142,.10)}
+.p-qa.accept .fill{background:rgba(62,207,142,.22)}
+.p-qa.back{border-color:rgba(243,106,22,.45);color:#ffb98c;background:rgba(243,106,22,.10)}
+.p-qa.back .fill{background:rgba(243,106,22,.22)}
+.p-qa.holding{border-color:var(--p-human)}
+.p-qa:disabled{opacity:.55;cursor:default}
+.p-qanote{flex:1;min-width:220px;font:inherit;font-size:12px;padding:7px 10px;border-radius:7px;
+  border:1px solid var(--p-line);background:#0f151c;color:#e9eef4}
+.p-qanote:focus{outline:none;border-color:#3a4756}
+.p-qerr{font-size:11.5px;color:#ffb3bb;margin-bottom:8px}
 
 .p-hero{display:flex;align-items:center;gap:22px;border:1px solid var(--p-line);border-radius:10px;
   padding:12px 16px;background:linear-gradient(90deg, rgba(243,106,22,.06), transparent 70%)}
