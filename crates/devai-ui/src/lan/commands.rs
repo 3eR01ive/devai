@@ -1057,13 +1057,10 @@ fn source_slice_rpc(
     )?)
 }
 
-fn execution_cancel_rpc(
-    app: &tauri::AppHandle,
-    _device: &DeviceClaim,
-    params: &serde_json::Value,
-) -> Result<serde_json::Value, UiError> {
+fn execution_cancel_rpc(app: &tauri::AppHandle, _device: &DeviceClaim, params: &serde_json::Value) -> Result<serde_json::Value, UiError> {
     let exec_id = param_str(params, "exec_id")?;
-    to_json(crate::commands::execution_cancel(state(app), exec_id)?)
+    let reason = params.get("reason").and_then(|v| v.as_str()).map(str::to_string);
+    to_json(crate::commands::execution_cancel(state(app), exec_id, reason)?)
 }
 
 fn executions_list_rpc(

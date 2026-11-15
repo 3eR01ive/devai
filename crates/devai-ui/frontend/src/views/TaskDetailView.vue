@@ -146,7 +146,7 @@ async function onStepRun(_slug: string) {
 async function onStepStop(execId: string) {
   restartError.value = null;
   try {
-    await api.execCancel(execId);
+    await api.execCancel(execId, "остановлено человеком из карточки задачи");
     await loadAll();
   } catch (e) {
     restartError.value = toUiError(e);

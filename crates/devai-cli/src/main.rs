@@ -670,6 +670,9 @@ enum ExecCmd {
     },
     Cancel {
         exec_id: String,
+        /// Почему остановили — причина записывается в строку прогона.
+        #[arg(long)]
+        reason: Option<String>,
     },
     List {
         #[arg(long)]

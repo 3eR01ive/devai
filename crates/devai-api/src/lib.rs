@@ -1611,8 +1611,12 @@ impl Api {
     /// carries no mark (AC4).
     /// Остановить живой прогон и вернуть строку в ТОМ ЖЕ виде, что `exec.list`
     /// (роль «имя · версия», наблюдение живости) — окно не собирает свою форму.
-    pub fn exec_cancel_view(&self, exec_id: &str) -> ApiResult<ExecutionView> {
-        let row = self.exec_cancel(exec_id)?;
+    pub fn exec_cancel_view(
+        &self,
+        exec_id: &str,
+        reason: Option<&str>,
+    ) -> ApiResult<ExecutionView> {
+        let row = self.exec_cancel(exec_id, reason)?;
         let mut roles: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
         for r in self.store.list_roles()? {

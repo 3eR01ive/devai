@@ -1274,7 +1274,10 @@ function backToList() {
 
 async function doStop(execId: string) {
   busy.value = true;
-  try { await api.execCancel(execId); await load(); }
+  try {
+    await api.execCancel(execId, "остановлено человеком из карточки задачи");
+    await load();
+  }
   catch (e) { error.value = toUiError(e); }
   finally { busy.value = false; }
 }
@@ -1495,6 +1498,7 @@ onMounted(load);
                     <span v-if="runRow.attempt && runRow.attempt > 1" class="rf-att">попытка {{ runRow.attempt }}</span>
                   </div>
                   <div v-if="runRow.error" class="rf-t">{{ runRow.error }}</div>
+                  <div v-else-if="runRow.summary" class="rf-t">{{ runRow.summary }}</div>
                   <template v-else-if="runTail">
                     <div class="rf-note">
                       строку отказа платформа не заполнила — ниже поток прогона, как он записан на диске

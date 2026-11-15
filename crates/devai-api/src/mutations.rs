@@ -2848,8 +2848,17 @@ impl Api {
         self.exec_close(exec_id, ExecutionStatus::Failed, None, Some(error))
     }
 
-    pub fn exec_cancel(&self, exec_id: &str) -> ApiResult<RoleExecution> {
-        self.exec_close(exec_id, ExecutionStatus::Cancelled, None, None)
+    /// Остановка прогона человеком. Строка закрывается с ПРИЧИНОЙ: кто и что
+    /// сказал. Раньше она закрывалась пустой (`summary` и `error` — None), и
+    /// карточка честно не могла показать ничего, кроме статуса (прецедент
+    /// «только статус, а в консоли есть текст»).
+    pub fn exec_cancel(&self, exec_id: &str, reason: Option<&str>) -> ApiResult<RoleExecution> {
+        let why = reason.map(str::trim).filter(|r| !r.is_empty());
+        let summary = match why {
+            Some(r) => format!("остановлено человеком ({}) · причина: {r}", self.actor),
+            None => format!("остановлено человеком ({}) · без причины", self.actor),
+        };
+        self.exec_close(exec_id, ExecutionStatus::Cancelled, Some(&summary), None)
     }
 
     fn exec_close(
@@ -2868,7 +2877,9 @@ impl Api {
         }
         self.store
             .finish_execution(&e, status, summary, error, Utc::now())?;
-        Ok(e)
+        // Возвращаем строку КАК ОНА ЗАПИСАНА, а не снимок до записи: иначе
+        // вызывающий видел старый статус и пустую причину.
+        Ok(self.store.get_execution(&e.id.to_string())?)
     }
 
     // ---- export / import ----------------------------------------------------
@@ -3630,6 +3641,40 @@ mod tests {
         .expect("create")
         .task
         .id
+    }
+
+    /// Остановка прогона человеком ПИШЕТ причину в строку: раньше строка
+    /// закрывалась пустой, и карточка могла показать только статус.
+    #[test]
+    fn cancelled_execution_records_who_and_why() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let api = api(dir.path());
+        let id = fresh_task(&api, "остановить прогон");
+        let task = api.task_start(&id.to_string()).unwrap().task;
+        assert_eq!(task.state, TaskState::Statement);
+
+        let started = api
+            .exec_start(crate::mutations::ExecStartReq {
+                id: id.to_string(),
+                role: "statement-reviewer".into(),
+                agent: None,
+                inputs: vec![],
+                run_id: None,
+            })
+            .unwrap();
+        let exec_id = started.execution.id.to_string();
+        let row = api.exec_cancel(&exec_id, Some("проверяю вручную")).unwrap();
+        assert!(row
+            .summary
+            .as_deref()
+            .unwrap_or("")
+            .contains("проверяю вручную"));
+
+        let read = api.exec_get(&exec_id).unwrap();
+        let summary = read.summary.unwrap_or_default();
+        assert!(summary.contains("остановлено человеком"), "{summary}");
+        assert!(summary.contains("проверяю вручную"), "{summary}");
+        assert!(summary.contains("api-tester"), "{summary}");
     }
 
     /// Ответ на вопрос постановки ДОПИСЫВАЕТСЯ в постановку: следующий круг

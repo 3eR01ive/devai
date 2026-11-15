@@ -1388,9 +1388,12 @@ pub fn agent_statuses(state: State<AppState>) -> Result<Vec<devai_api::AgentStat
 pub fn execution_cancel(
     state: State<AppState>,
     exec_id: String,
+    reason: Option<String>,
 ) -> Result<devai_api::ExecutionView, UiError> {
     // Тот же вид строки, что у exec.list — карточка не собирает свою форму.
-    Ok(state.api().exec_cancel_view(&exec_id)?)
+    // Причина остановки идёт в НАДПИСЬ строки: иначе в карточке остаётся
+    // «только статус» (человек остановил — а почему, нигде не сказано).
+    Ok(state.api().exec_cancel_view(&exec_id, reason.as_deref())?)
 }
 
 /// Правила оценки дома для карточки: что именно проверяет каждый пункт.

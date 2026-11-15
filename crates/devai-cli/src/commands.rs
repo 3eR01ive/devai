@@ -2795,8 +2795,11 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 short(&e.id)
             );
         }
-        ExecCmd::Cancel { exec_id } => {
-            let e = ctx.api().exec_cancel(&exec_id).map_err(render_api_error)?;
+        ExecCmd::Cancel { exec_id, reason } => {
+            let e = ctx
+                .api()
+                .exec_cancel(&exec_id, reason.as_deref())
+                .map_err(render_api_error)?;
             outln!(
                 "execution {} cancelled (cooperative stop acknowledged)",
                 short(&e.id)

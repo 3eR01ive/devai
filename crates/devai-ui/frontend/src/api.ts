@@ -227,8 +227,8 @@ export const api = {
   // Кусок исходника на коммите по ссылке «путь:строки».
   sourceSlice: (id_prefix: string, rev: string, path: string, from: number, to: number) =>
     invoke<SourceSliceView>("source_slice", { id_prefix, rev, path, from, to }),
-  execCancel: (exec_id: string) =>
-    invoke<ExecutionView>("execution_cancel", { exec_id }),
+  execCancel: (exec_id: string, reason: string | null) =>
+    invoke<ExecutionView>("execution_cancel", { exec_id, reason }),
   executionLiveness: (exec_id: string) =>
     invoke<LivenessView>("execution_liveness", { exec_id }),
 
