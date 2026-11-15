@@ -949,6 +949,60 @@ const { holding, progress, start, move, release } = useHoldToConfirm(
   () => void doCancel(),
 );
 
+// ── приёмка: два хода гейта — принять или вернуть на доработку ────────────
+// Оба — удержанием на самой кнопке (решение человека, а не случайный клик), и
+// живут они ВНУТРИ шага приёмки, рядом с тем, что человек видит.
+const qaBusy = ref<"accept" | "return" | null>(null);
+const qaErr = ref<string | null>(null);
+/** Словами, что чинить: уходят в причину возврата вместе с выбранными пунктами. */
+const returnNote = ref("");
+
+const qaOpen = computed(() => prog.value?.task.state === "QA");
+
+const { holding: qaHolding, progress: qaProgress, start: qaStart, move: qaMove, release: qaRelease } =
+  useHoldToConfirm(
+    () => qaOpen.value && qaBusy.value === null,
+    (kind) => {
+      if (kind === "accept") void doAccept();
+      if (kind === "return") void doReturn();
+    },
+  );
+
+async function doAccept() {
+  qaBusy.value = "accept";
+  qaErr.value = null;
+  try {
+    await api.taskAccept(id.value, null);
+    await load();
+  } catch (e) {
+    qaErr.value = toUiError(e).message;
+  } finally {
+    qaBusy.value = null;
+  }
+}
+
+/// Возврат на доработку: причина — слова человека плюс ПУНКТЫ, которые он
+/// оставил «на доработку» в таблице. Пустая причина не притворяется пустой
+/// фразой: платформа получит перечень пунктов.
+async function doReturn() {
+  qaBusy.value = "return";
+  qaErr.value = null;
+  const names = checks.value
+    .filter((c: any) => picked.value.has(c.id))
+    .map((c: any) => c.id)
+    .join(", ");
+  const parts = [returnNote.value.trim(), names ? `пункты: ${names}` : ""].filter(Boolean);
+  try {
+    await api.taskReturn(id.value, parts.length ? parts.join("\n") : null);
+    returnNote.value = "";
+    await load();
+  } catch (e) {
+    qaErr.value = toUiError(e).message;
+  } finally {
+    qaBusy.value = null;
+  }
+}
+
 // ── перепройти шаг и переписать постановку ───────────────────────────────
 // Оба хода живут ТАМ, ГДЕ ОНИ НУЖНЫ: перезапуск — кнопкой в самом шаге,
 // новая редакция постановки — правкой текста в шаге постановки. Отдельной
@@ -1569,8 +1623,48 @@ onMounted(load);
                 @sign="doSign"
               />
 
-              <!-- качество -->
+              <!-- качество: сперва ходы человека, ниже — чем он их обосновывает -->
               <div v-if="openTab === 'qa'" class="p-panel">
+                <div v-if="qaOpen" class="p-qacts">
+                  <button
+                    class="p-qa accept"
+                    :class="{ holding: qaHolding === 'accept', busy: qaBusy === 'accept' }"
+                    :disabled="qaBusy !== null"
+                    title="удерживай, чтобы принять задачу"
+                    @pointerdown="qaStart('accept', $event)"
+                    @pointermove="qaMove($event)"
+                    @pointerup="qaRelease"
+                    @pointerleave="qaRelease"
+                    @pointercancel="qaRelease"
+                  >
+                    <i class="fill" :style="{ width: (qaHolding === 'accept' ? qaProgress * 100 : 0) + '%' }" />
+                    <span>{{ qaBusy === 'accept' ? 'принимаю…' : 'Принять задачу' }}</span>
+                  </button>
+
+                  <input
+                    v-model="returnNote"
+                    class="p-qanote"
+                    spellcheck="false"
+                    placeholder="что чинить — словами (необязательно; выбранные пункты уйдут сами)"
+                  />
+
+                  <button
+                    class="p-qa back"
+                    :class="{ holding: qaHolding === 'return', busy: qaBusy === 'return' }"
+                    :disabled="qaBusy !== null"
+                    title="удерживай, чтобы вернуть на доработку"
+                    @pointerdown="qaStart('return', $event)"
+                    @pointermove="qaMove($event)"
+                    @pointerup="qaRelease"
+                    @pointerleave="qaRelease"
+                    @pointercancel="qaRelease"
+                  >
+                    <i class="fill" :style="{ width: (qaHolding === 'return' ? qaProgress * 100 : 0) + '%' }" />
+                    <span>{{ qaBusy === 'return' ? 'возвращаю…' : `На доработку · ${picked.size}` }}</span>
+                  </button>
+                </div>
+                <div v-if="qaErr" class="p-qerr">{{ qaErr }}</div>
+
                 <div class="p-hero" :class="scoreTone">
                   <div class="big">{{ score === null ? "—" : (score * 100).toFixed(1) }}<span>%</span></div>
                   <div class="side">
@@ -1841,6 +1935,24 @@ onMounted(load);
 .p-kv .v{color:#d3dce6}
 .p-sec{margin-top:12px;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--p-dim2)}
 .p-exec{display:flex;gap:12px;font-size:11.5px;color:#c3ccd6;padding:2px 0;font-variant-numeric:tabular-nums}
+
+
+/* ── ходы приёмки: принять или вернуть ──────────────────────────────────── */
+.p-qacts{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.p-qa{position:relative;overflow:hidden;font:inherit;font-size:12px;padding:7px 14px;border-radius:7px;
+  cursor:pointer;border:1px solid var(--p-line);background:#172028;color:#cfd8e2;white-space:nowrap}
+.p-qa .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.10);transition:width .05s linear}
+.p-qa span{position:relative}
+.p-qa.accept{border-color:rgba(62,207,142,.45);color:#8fe3ba;background:rgba(62,207,142,.10)}
+.p-qa.accept .fill{background:rgba(62,207,142,.22)}
+.p-qa.back{border-color:rgba(243,106,22,.45);color:#ffb98c;background:rgba(243,106,22,.10)}
+.p-qa.back .fill{background:rgba(243,106,22,.22)}
+.p-qa.holding{border-color:var(--p-human)}
+.p-qa:disabled{opacity:.55;cursor:default}
+.p-qanote{flex:1;min-width:220px;font:inherit;font-size:12px;padding:7px 10px;border-radius:7px;
+  border:1px solid var(--p-line);background:#0f151c;color:#e9eef4}
+.p-qanote:focus{outline:none;border-color:#3a4756}
+.p-qerr{font-size:11.5px;color:#ffb3bb;margin-bottom:8px}
 
 .p-hero{display:flex;align-items:center;gap:22px;border:1px solid var(--p-line);border-radius:10px;
   padding:12px 16px;background:linear-gradient(90deg, rgba(243,106,22,.06), transparent 70%)}
