@@ -156,6 +156,26 @@ pub fn usage_record(
         Some(r) => {
             let model = model.or_else(|| r.model.clone());
             let provider = provider.or_else(|| r.provider.clone());
+            // A report that PARSES but carries no token numbers is not a
+            // measured run: «отчёт есть, цифр нет» must read as the honest
+            // unknown, otherwise the row would be summed as zero tokens while
+            // the unknown counter — which counts `measured = 0` — would never
+            // mention it (rl/edge-cases, REQ-USG-02 AC1/AC3).
+            if r.prompt_tokens.is_none()
+                && r.completion_tokens.is_none()
+                && r.total_tokens.is_none()
+            {
+                return UsageRecord::unknown(
+                    execution.id,
+                    execution.task_id,
+                    &execution.role_slug,
+                    execution.run_id.map(|r| r.to_string()),
+                    provider,
+                    model,
+                    duration_ms,
+                    "the usage report carried no token numbers — spend unknown, not zero",
+                );
+            }
             UsageRecord {
                 execution_id: execution.id,
                 task_id: execution.task_id,
@@ -210,6 +230,9 @@ pub enum ExpectationBasis {
     TaskRole,
     Role,
     RunBudget,
+    /// The day screen's expectation: today's own average run. Used by
+    /// [`day_gate`], the screen's reading of the very same day rule.
+    DayAverage,
 }
 
 impl ExpectationBasis {
@@ -218,6 +241,7 @@ impl ExpectationBasis {
             Self::TaskRole => "task_role",
             Self::Role => "role",
             Self::RunBudget => "run_budget",
+            Self::DayAverage => "day_average",
         }
     }
 
@@ -226,6 +250,7 @@ impl ExpectationBasis {
             Self::TaskRole => "историческое среднее по паре задача+роль",
             Self::Role => "историческое среднее по роли (по паре история не набралась)",
             Self::RunBudget => "бюджет прогона как оценка сверху (истории нет)",
+            Self::DayAverage => "средний прогон за сутки",
         }
     }
 }
@@ -435,6 +460,80 @@ fn budget_cannot_pay(spent: i64, limit: u64, expected: i64) -> bool {
     spent >= limit as i64 || spent.saturating_add(expected.max(0)) > limit as i64
 }
 
+/// The DAY LEVEL as the SCREEN reads it — the very same predicate, arithmetic
+/// and words as the launch gate ([`check_budget`]), over the day's own typical
+/// run instead of one role's expectation. `Some(sentence)` = the day cannot pay
+/// for one more run; the overview screen shows that sentence (ratified OQ-1:
+/// ONE line with the numbers, no per-task questions). Split apart, the two
+/// doors drifted: the screen said «исчерпан» only once the spend had REACHED
+/// the limit, while the launch already refused a run the remainder could not
+/// pay for, so the operator met a blocked launch with a quiet screen.
+pub fn day_gate(
+    store: &Store,
+    policy: &UsagePolicy,
+    now: Timestamp,
+) -> StoreResult<Option<String>> {
+    let Some(limit) = policy.budgets.day else {
+        return Ok(None);
+    };
+    let (expected, basis) = typical_day_run_cost(store, policy, now)?;
+    let spent = day_spent(store, now)?;
+    if !budget_cannot_pay(spent, limit, expected) {
+        return Ok(None);
+    }
+    Ok(Some(BudgetRefusal::sentence(
+        BudgetLevel::Day,
+        spent,
+        limit,
+        expected,
+        basis,
+    )))
+}
+
+/// What one more run typically costs TODAY: the average of today's MEASURED
+/// runs. With no measured run yet the declared run budget is the conservative
+/// bound — the same fallback the launch ladder uses for a role without history.
+pub fn typical_day_run_cost(
+    store: &Store,
+    policy: &UsagePolicy,
+    now: Timestamp,
+) -> StoreResult<(i64, ExpectationBasis)> {
+    let (from, to) = devai_store::calendar_window("day", now)
+        .unwrap_or((now, now + chrono::Duration::seconds(1)));
+    let bucket = rollup_bucket(
+        store,
+        &UsageQuery {
+            from: Some(from),
+            to: Some(to),
+            task_id: None,
+            group: UsageGroup::Totals,
+        },
+    )?;
+    if bucket.measured > 0 {
+        return Ok((
+            bucket.total_tokens / bucket.measured,
+            ExpectationBasis::DayAverage,
+        ));
+    }
+    Ok((
+        policy.budgets.run.unwrap_or(0) as i64,
+        ExpectationBasis::RunBudget,
+    ))
+}
+
+/// The ONE totals rollup of a window — the read the budget checks, the day
+/// gate and the card all rest on.
+pub(crate) fn rollup_bucket(
+    store: &Store,
+    q: &UsageQuery,
+) -> StoreResult<devai_store::UsageBucket> {
+    Ok(store
+        .usage_rollup(q)?
+        .into_iter()
+        .next()
+        .unwrap_or_default())
+}
+
 /// The task's measured spend over its whole life, from the store (never from
 /// the filesystem): the sum of the known token counts of its runs.
 pub fn task_spent(store: &Store, task_id: Id) -> StoreResult<i64> {
@@ -467,11 +566,7 @@ pub fn day_spent(store: &Store, now: Timestamp) -> StoreResult<i64> {
 /// The total tokens of ONE totals rollup — the read the budget check and the
 /// card both rest on, so «израсходовано» has a single arithmetic home.
 pub(crate) fn rollup_spent(store: &Store, q: &UsageQuery) -> StoreResult<i64> {
-    Ok(store
-        .usage_rollup(q)?
-        .first()
-        .map(|b| b.total_tokens)
-        .unwrap_or(0))
+    Ok(rollup_bucket(store, q)?.total_tokens)
 }
 
 /// The provider's «квота исчерпана» answer, as EVIDENCE (REQ-USG-02 AC2): the
@@ -920,6 +1015,116 @@ mod tests {
         assert_eq!(task_spent(&store, task.id).unwrap(), 1_000);
     }
 
+    /// REQ-USG-02 AC1/AC3 + rl/edge-cases: «отчёт есть, цифр нет» is the honest
+    /// unknown — not a measured zero. The row must be counted among the unknown
+    /// runs, otherwise the aggregate would sum it as 0 and never mention it.
+    #[test]
+    fn a_report_without_numbers_is_unknown_not_a_measured_zero() {
+        let task_id = devai_core::types::new_id();
+        let e = closed_execution(task_id, "role-a");
+        let policy = UsagePolicy::default();
+
+        let empty = UsageReport {
+            model: Some("m".into()),
+            provider: Some("hermes".into()),
+            ..UsageReport::default()
+        };
+        let rec = usage_record(&e, None, None, Some(7), Some(&empty), &policy);
+        assert!(!rec.measured, "a report with no numbers is not a measure");
+        assert_eq!(rec.total_tokens, None, "unknown stays NULL, never 0");
+        assert_eq!(rec.cost_usd, None);
+        assert!(
+            rec.unknown_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no token numbers")),
+            "the row says WHY it is unknown: {:?}",
+            rec.unknown_reason
+        );
+        assert_eq!(rec.model.as_deref(), Some("m"));
+
+        // One number is enough to be measured: the halves are arithmetic.
+        let halves = UsageReport {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            ..UsageReport::default()
+        };
+        let rec = usage_record(&e, None, None, Some(7), Some(&halves), &policy);
+        assert!(rec.measured);
+        assert_eq!(rec.total_tokens, Some(15));
+        assert_eq!(rec.unknown_reason, None);
+    }
+
+    /// The SCREEN's day gate and the LAUNCH gate are one rule (mt/dry): a day
+    /// whose remainder cannot pay for one more typical run is exhausted on both
+    /// doors, even though the spend has NOT yet reached the limit.
+    #[test]
+    fn the_day_gate_and_the_launch_gate_agree_before_the_limit_is_reached() {
+        let (store, task) = store_with_task("day-gate");
+        let policy = UsagePolicy::default();
+        // One run of 1_100 tokens today: the pair's history says the next run
+        // costs ~1_100.
+        measured_run(&store, task.id, "role-a", 1_000, 100);
+
+        let limit = 2_000;
+        let day_policy = UsagePolicy {
+            budgets: TokenBudgets {
+                run: None,
+                task: None,
+                day: Some(limit),
+            },
+            ..policy.clone()
+        };
+        // The launch refuses: 1_100 spent + 1_100 expected > 2_000.
+        let refusal = check_budget(&store, task.id, "role-a", &day_policy, Utc::now())
+            .unwrap()
+            .expect("the launch is refused before the limit is reached");
+        assert_eq!(refusal.level, BudgetLevel::Day);
+        // The screen says the same thing, with the same arithmetic.
+        let gate = day_gate(&store, &day_policy, Utc::now())
+            .unwrap()
+            .expect("the screen paints the day the launch refuses");
+        assert!(
+            gate.contains("1100") && gate.contains("2000"),
+            "the gate names the numbers: {gate}"
+        );
+        // Same numbers, same predicate, one sentence builder. The only word that
+        // differs is the BASIS: the launch reads the pair's history, the screen
+        // has no role and reads today's own average run — both are 1_100 here,
+        // and both doors refuse on exactly this comparison.
+        let (screen_expected, screen_basis) =
+            typical_day_run_cost(&store, &day_policy, Utc::now()).unwrap();
+        assert_eq!(screen_expected, refusal.expected);
+        assert_eq!(screen_basis, ExpectationBasis::DayAverage);
+        assert_eq!(
+            gate,
+            BudgetRefusal::sentence(
+                BudgetLevel::Day,
+                refusal.spent,
+                limit,
+                screen_expected,
+                screen_basis
+            ),
+            "one sentence, one arithmetic"
+        );
+        // A day with room has NO gate on either door.
+        let roomy = UsagePolicy {
+            budgets: TokenBudgets {
+                run: None,
+                task: None,
+                day: Some(1_000_000),
+            },
+            ..policy.clone()
+        };
+        assert_eq!(
+            check_budget(&store, task.id, "role-a", &roomy, Utc::now()).unwrap(),
+            None
+        );
+        assert_eq!(day_gate(&store, &roomy, Utc::now()).unwrap(), None);
+        // No declared day budget: nothing to exhaust, no gate.
+        assert_eq!(day_gate(&store, &policy, Utc::now()).unwrap(), None);
+    }
+
     /// A store with one draft task on it — the fixture the three checks above
     /// share, so each test states only what it is about.
     fn store_with_task(title: &str) -> (Store, devai_core::types::Task) {
@@ -997,6 +1202,36 @@ mod tests {
             )
             .unwrap();
         e
+    }
+
+    /// A closed (completed) execution value without touching a store — the
+    /// identity a spend record is built from.
+    fn closed_execution(
+        task_id: devai_core::types::Id,
+        role: &str,
+    ) -> devai_core::types::RoleExecution {
+        devai_core::types::RoleExecution {
+            id: devai_core::types::new_id(),
+            task_id,
+            role_slug: role.into(),
+            role_version: 1,
+            agent_name: None,
+            status: devai_core::types::ExecutionStatus::Completed,
+            inputs: Vec::new(),
+            summary: None,
+            error: None,
+            started_at: Utc::now() - chrono::Duration::seconds(5),
+            finished_at: Some(Utc::now()),
+            workspace_revision: None,
+            attempt: 1,
+            parent_execution: None,
+            failure_class: None,
+            owner_pid: None,
+            owner_host: None,
+            owner_process_start: None,
+            bundle: None,
+            run_id: None,
+        }
     }
 
     /// Start a RUNNING execution row of `role` on `task_id`.

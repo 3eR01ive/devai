@@ -5,6 +5,7 @@ import { computed, nextTick, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api, toUiError } from "../api";
 import type { ProgressView, Project, Task, TaskUsageView, UiError } from "../types";
+import { taskSpendLine } from "../usage-format";
 import "./proto.css";
 
 const router = useRouter();
@@ -89,24 +90,6 @@ function age(iso: string): string {
   if (m < 60) return `${m} мин`;
   const h = Math.floor(m / 60);
   return h < 24 ? `${h} ч ${m % 60} мин` : `${Math.floor(h / 24)} д ${h % 24} ч`;
-}
-
-function tok(n: number): string {
-  if (!n) return "0";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " млрд";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + " млн";
-  if (n >= 1e3) return Math.round(n / 1e3) + " тыс";
-  return String(n);
-}
-
-/**
- * Расход строки списка: сумма известных прогонов, «—» когда известных нет, а
- * НЕИЗВЕСТНЫЕ есть (их число стоит рядом) — неизвестный расход не выдаётся за
- * ноль (REQ-USG-02 AC1).
- */
-function spentText(spent: number, unknown: number): string {
-  if (spent === 0 && unknown > 0) return "—";
-  return tok(spent);
 }
 
 const rowOf = (t: Task) => {
@@ -293,8 +276,7 @@ onMounted(load);
           <div class="p-ident">
             <span>{{ r.id }}</span>
             <span v-if="r.u" :title="r.u.line">
-              {{ spentText(r.u.spent, r.u.unknown) }}<template v-if="r.u.limit != null"> из {{ tok(r.u.limit) }}</template>
-              токенов<template v-if="r.u.unknown > 0"> · неизвестно у {{ r.u.unknown }}</template>
+              {{ taskSpendLine(r.u) }}<template v-if="r.u.limit != null"> токенов</template><template v-if="r.u.unknown > 0"> · неизвестно у {{ r.u.unknown }}</template>
             </span>
           </div>
         </div>

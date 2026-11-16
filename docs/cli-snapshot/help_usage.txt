@@ -1,0 +1,14 @@
+Токены: сколько израсходовано и сколько осталось (task 01a1b851). Читает СТОР (`usage.summary` / `task.usage`) — те же цифры, что окно
+
+Usage: devai usage [OPTIONS]
+
+Options:
+      --home <HOME>    Data directory (default: $DEVAI_HOME or ~/.devai) [env: DEVAI_HOME=]
+      --task <TASK>    Расход одной задачи (id или префикс) вместо общих суток
+      --actor <ACTOR>  Actor identity recorded in events/decisions (default: $DEVAI_USER or $USER) [env: DEVAI_USER=]
+      --day            Расход за текущие сутки в локальной зоне оператора
+      --json           Machine-readable JSON output where supported
+      --week           Расход с понедельника текущей недели
+      --month          Расход с первого числа текущего месяца
+      --by <BY>        Разрез общей выборки: task | role | model | totals (по умолчанию totals)
+  -h, --help           Print help

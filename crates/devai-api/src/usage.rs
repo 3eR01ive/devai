@@ -75,20 +75,42 @@ pub fn token_text(n: i64) -> String {
 /// The LOCAL calendar boundaries of a read period (ratified OQ-4: calendar
 /// days in the operator's zone, reset at 00:00), as UTC instants because the
 /// stored timestamps are UTC.
+///
+/// The period vocabulary has ONE home — [`devai_store::PERIODS`] and the store's
+/// window mapping — and this function only forwards the answer. A period the
+/// store does not know is a typed refusal, never a silent widening to «all
+/// time»: an accepted-but-unmapped period used to fall back to the whole
+/// history, which would show the operator a wider window than they asked for.
 pub fn period_bounds(
     period: &str,
     now: chrono::DateTime<Utc>,
-) -> (Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>) {
+) -> ApiResult<(Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>)> {
+    if !devai_store::PERIODS.contains(&period) {
+        return Err(crate::ApiError::refused(
+            "bad_request",
+            format!(
+                "unknown usage period `{period}` — one of: {}",
+                devai_store::PERIODS.join(", ")
+            ),
+        ));
+    }
     if period == "all" {
-        return (None, Some(now));
+        return Ok((None, Some(now)));
     }
     match devai_store::calendar_window(period, now) {
-        Some((from, to)) => (Some(from), Some(to)),
-        None => (None, Some(now)),
+        Some((from, to)) => Ok((Some(from), Some(to))),
+        None => Err(crate::ApiError::refused(
+            "bad_request",
+            format!(
+                "usage period `{period}` has no calendar window — the period list and the \
+                 window mapping disagree"
+            ),
+        )),
     }
 }
 
-/// Midnight of today and the moment now, in the operator's local zone.
+/// Midnight of today and the moment now, in the operator's local zone — the
+/// same window the day read and the forecast use.
 fn day_bounds(now: chrono::DateTime<Utc>) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
     match devai_store::calendar_window("day", now) {
         Some(bounds) => bounds,
@@ -240,24 +262,6 @@ fn group_of(name: &str) -> ApiResult<(UsageGroup, &'static str)> {
     }
 }
 
-/// The periods the read accepts. One list for the check and the refusal text.
-const PERIODS: &[&str] = &["day", "week", "month", "all"];
-
-/// Reject an unknown period instead of silently reading «all time» — a typo
-/// must never widen the window the operator asked about.
-fn parse_period(period: &str) -> ApiResult<()> {
-    if PERIODS.contains(&period) {
-        return Ok(());
-    }
-    Err(crate::ApiError::refused(
-        "bad_request",
-        format!(
-            "unknown usage period `{period}` — one of: {}",
-            PERIODS.join(", ")
-        ),
-    ))
-}
-
 /// The effective task budgets, the ONE place the card and the admission check
 /// read them from: the declared config value raised ONLY by a stored human
 /// decision (REQ-USG-06 AC3).
@@ -338,12 +342,11 @@ impl Api {
     ) -> ApiResult<UsageSummaryView> {
         let policy = self.usage_policy()?;
         let (group, group_name) = group_of(group_by)?;
-        parse_period(period)?;
         let task_id = match task_ref {
             Some(r) => Some(self.store.resolve_task(r)?.id),
             None => None,
         };
-        let (from, to) = period_bounds(period, Utc::now());
+        let (from, to) = period_bounds(period, Utc::now())?;
         let q = UsageQuery {
             from,
             to,
@@ -414,7 +417,10 @@ impl Api {
         let forecast = self.usage_forecast(&policy, &day.totals, now);
         Ok(UsageOverviewView {
             top_tasks: top.rows.into_iter().take(TOP_TASKS).collect(),
-            day_gate: day_gate(&limits, day.totals.total_tokens),
+            // The day gate is the ENGINE's rule, called here — not a second
+            // comparison: a day the launch gate refuses and a day the screen
+            // paints must never disagree (mt/dry).
+            day_gate: devai_runtime::usage::day_gate(&self.store, &policy, now)?,
             day,
             month,
             forecast,
@@ -492,20 +498,6 @@ fn forecast_inputs(
         // second is the smallest pace the estimate admits, never an infinity.
         elapsed: (now - start).num_seconds().max(1) as f64,
     }
-}
-
-/// The ONE sentence of the day budget's gate (ratified OQ-1: an exhausted DAY
-/// budget stops NEW runs until tomorrow and is shown as ONE line with the
-/// numbers — the tasks themselves are not parked one by one).
-fn day_gate(limits: &BudgetLimits, spent: i64) -> Option<String> {
-    let limit = limits.day?;
-    if spent < limit as i64 {
-        return None;
-    }
-    Some(format!(
-        "суточный бюджет исчерпан: за сутки израсходовано {spent} из {limit} — новые прогоны не \
-         запускаются до новых суток (уже начатые досчитают)"
-    ))
 }
 
 /// The card's ONE sentence: «израсходовано X из Y» or «израсходовано X — без

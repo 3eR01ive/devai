@@ -23,7 +23,11 @@ use tempfile::TempDir;
 
 fn home() -> (TempDir, Api) {
     let dir = TempDir::new().unwrap();
-    let api = Api::open(dir.path(), "usage-tester").unwrap();
+    // The handle reads THIS home's config tree, so the budget edits below land
+    // on the next read whatever `DEVAI_CONFIG` the host exports.
+    let api = Api::open(dir.path(), "usage-tester")
+        .unwrap()
+        .with_config_dir(dir.path().join("config"));
     api.seed_config(None).unwrap();
     (dir, api)
 }

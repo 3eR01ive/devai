@@ -2044,11 +2044,8 @@ impl Api {
     /// file refuses LOUD — the manual paths never silently fall back to
     /// the factory while the YAML claims otherwise.
     fn task_name_policy(&self) -> ApiResult<devai_store::config::TaskNamePolicy> {
-        let cfg_dir = std::env::var_os("DEVAI_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.store.root().join("config"));
         Ok(devai_store::config::load_task_name_policy(
-            &cfg_dir.join("workflow"),
+            &self.config_dir().join("workflow"),
         )?)
     }
 
@@ -3128,11 +3125,8 @@ impl Api {
     /// and a broken file refuses LOUD — the manual publish path never
     /// silently falls back to the factory while the YAML claims otherwise.
     fn humanize_policy(&self) -> ApiResult<devai_store::config::HumanizePolicy> {
-        let cfg_dir = std::env::var_os("DEVAI_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.store.root().join("config"));
         Ok(devai_store::config::load_humanize_policy(
-            &cfg_dir.join("workflow"),
+            &self.config_dir().join("workflow"),
         )?)
     }
 
@@ -3788,7 +3782,12 @@ mod tests {
     use crate::error::ErrorCode;
 
     fn api(dir: &Path) -> Api {
-        Api::open(dir, "api-tester").expect("open api")
+        // The config tree is the TEMP home's own, never the machine's ambient
+        // `DEVAI_CONFIG` window: a test must not change behaviour because the
+        // host running it exports a config dir (ts/test-independence).
+        Api::open(dir, "api-tester")
+            .expect("open api")
+            .with_config_dir(dir.join("config"))
     }
 
     fn fresh_task(api: &Api, title: &str) -> Id {

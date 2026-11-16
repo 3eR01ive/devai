@@ -6,6 +6,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useHoldToConfirm } from "../components/signature/useHoldToConfirm";
 import { api, toUiError } from "../api";
+import { limitText, spentText, tok } from "../usage-format";
 import type {
   ArtifactView, ProgressView, QualityReportView, Question, RulebookView,
   SignatureView, TaskUsageView, UiError, WorkflowEvent,
@@ -147,24 +148,6 @@ function convMode(state: string): string {
   const last = st?.series?.[st.series.length - 1];
   const map: Record<string, string> = { CONVERGING: "рост", DIVERGING: "расхождение", PLATEAU: "застой", STUCK: "стоит", UNKNOWN: "нет данных" };
   return last ? map[last.mode] ?? "нет данных" : "";
-}
-
-function tok(n: number | undefined) {
-  if (!n) return "";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " млрд";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + " млн";
-  if (n >= 1e3) return Math.round(n / 1e3) + " тыс";
-  return String(n);
-}
-
-/**
- * Расход карточки: сумма известных прогонов. Когда известных нет, а прогоны с
- * НЕИЗВЕСТНЫМ расходом есть, печатается «—», а не «0»: отсутствие цифр — это
- * не бесплатный прогон (REQ-USG-02 AC1). Число таких прогонов стоит рядом.
- */
-function spentText(spent: number, unknown: number) {
-  if (spent === 0 && unknown > 0) return "—";
-  return tok(spent) || "0";
 }
 
 function age(iso: string) {
@@ -1255,7 +1238,7 @@ onMounted(load);
         </div>
         <div class="p-tokens" v-if="usage" :title="usage.line">
           <div class="n">{{ spentText(usage.spent, usage.unknown) }}</div>
-          <div class="l">{{ usage.limit == null ? "без лимита" : "из " + tok(usage.limit) }}</div>
+          <div class="l">{{ limitText(usage) }}</div>
           <div class="s">
             {{ usage.models.length ? usage.models.join(", ") : "модель неизвестна" }} ·
             {{ usage.runs }} прогонов<template v-if="usage.unknown > 0">

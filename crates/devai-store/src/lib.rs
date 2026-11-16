@@ -21,7 +21,8 @@ pub use models::{
     load_catalog, probe_keys, restore_catalog_text, write_catalog, write_catalog_with_previous,
 };
 pub use usage::{
-    ExecutionUsage, RunUsage, UsageBucket, UsageGroup, UsageQuery, UsageRecord, calendar_window,
+    ExecutionUsage, PERIODS, RunUsage, UsageBucket, UsageGroup, UsageQuery, UsageRecord,
+    calendar_window,
 };
 
 /// The ONE name of the home's store file (arch/no-magic: the homes cycle

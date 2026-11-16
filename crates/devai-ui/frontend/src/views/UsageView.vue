@@ -7,6 +7,7 @@
 import { onMounted, ref } from "vue";
 import { api, toUiError } from "../api";
 import type { UiError, UsageBucketView, UsageOverviewView } from "../types";
+import { money, tok } from "../usage-format";
 
 const snap = ref<UsageOverviewView | null>(null);
 const error = ref<UiError | null>(null);
@@ -22,20 +23,6 @@ async function load() {
   } finally {
     busy.value = false;
   }
-}
-
-/** Компактная запись числа токенов — ТОЛЬКО для чтения глазами. */
-function tok(n: number | null | undefined) {
-  if (n == null) return "—";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " млрд";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + " млн";
-  if (n >= 1e3) return Math.round(n / 1e3) + " тыс";
-  return String(n);
-}
-
-function money(v: number, measured: number) {
-  if (v > 0) return "$" + v.toFixed(2);
-  return measured > 0 ? "неизвестна" : "—";
 }
 
 function nameOf(b: UsageBucketView) {

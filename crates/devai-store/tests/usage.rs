@@ -352,6 +352,20 @@ fn the_day_window_starts_at_local_midnight() {
         "an unknown period is None, not a silently widened window"
     );
 
+    // ONE vocabulary (mt/change-isolation): every period the read accepts has a
+    // calendar window, so a period can never pass the request check and then be
+    // silently widened to «all time» by the mapping. `all` is the one period
+    // that deliberately has no lower bound and is handled by the caller.
+    for p in devai_store::PERIODS {
+        if *p == "all" {
+            continue;
+        }
+        assert!(
+            devai_store::calendar_window(p, now).is_some(),
+            "the accepted period `{p}` must have a window"
+        );
+    }
+
     // A store row inside today's window is counted; one just before local
     // midnight is not.
     let (_d, store) = open();

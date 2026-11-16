@@ -473,9 +473,15 @@ fn usage_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionUsage> {
     })())
 }
 
+/// The periods the spend reads accept. ONE list for the request check and the
+/// window mapping: a period the reader accepts can never be silently widened
+/// to «all time» by a mapping that never heard of it (mt/change-isolation).
+pub const PERIODS: &[&str] = &["day", "week", "month", "all"];
+
 /// The LOCAL calendar boundaries of the read periods (ratified OQ-4 answer:
 /// calendar days in the operator's zone, reset at 00:00). Returned as UTC
-/// instants, because the store's timestamps are UTC.
+/// instants, because the store's timestamps are UTC. `None` = this reader does
+/// not know the period — the caller refuses, never widens.
 pub fn calendar_window(period: &str, now: DateTime<Utc>) -> Option<(Timestamp, Timestamp)> {
     use chrono::{Datelike, Local, TimeZone};
     let local = now.with_timezone(&Local);
