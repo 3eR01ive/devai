@@ -34,11 +34,36 @@ anything merges.
 curl -fsSL https://raw.githubusercontent.com/3eR01ive/devai/main/install.sh | sh
 ```
 
-It fetches the latest linux-x86_64 release, verifies its sha256 and installs
-`devai` (and `devai-ui`, the desktop window, when the archive carries it) into
-`~/.local/bin`. Overrides: `DEVAI_VERSION` (pin a tag),
-`DEVAI_INSTALL_DIR` (target directory). If `~/.local/bin` is not already on
-your `PATH`, the script will tell you the one line to add to your shell profile.
+It fetches the latest linux-x86_64 release, verifies its sha256, and installs
+**both** binaries — `devai` (CLI) and `devai-ui` (window) — into `~/.local/bin`.
+Then it finishes the parts a release archive cannot do by itself:
+
+- **creates the home** (`$DEVAI_HOME`, default `~/.devai`) by running `devai init`
+  — config tree, roles, evaluation profiles and the store — unless a home
+  already exists. An existing home is never touched: that is your data;
+- **adds an application-menu entry** with the icon
+  (`~/.local/share/applications/devai-ui.desktop`), so the window is launchable
+  without a terminal;
+- **checks the window's system libraries** (webkit2gtk 4.1, gtk3, rsvg) and
+  names what is missing together with the package hint for your distribution —
+  the CLI keeps working without them;
+- prints the one `PATH` line you need; with `--add-path` it appends it to your
+  shell profile once (guarded against duplicates).
+
+Nothing is written outside `$HOME` and no sudo is used.
+
+Flags (after `sh -s --` when piping):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/3eR01ive/devai/main/install.sh | sh -s -- --no-init
+```
+
+- `--no-init` — do not create the home (run `devai init` yourself later)
+- `--no-desktop` — do not add the menu entry
+- `--add-path` — append the `PATH` line to your shell profile
+
+Overrides: `DEVAI_VERSION` (pin a tag), `DEVAI_INSTALL_DIR` (binaries
+directory), `DEVAI_HOME` (which home to create).
 
 ### From source
 

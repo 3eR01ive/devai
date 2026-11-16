@@ -39,6 +39,9 @@ jobs:
           # продукта. APK в этот релиз не входит.
           cp target/release/devai-ui "dist/$pkg/"
           cp run-ui.sh "dist/$pkg/"
+          # Иконка для ярлыка в меню: установщик кладёт её в пользовательские
+          # данные и ссылается на неё из .desktop.
+          cp crates/devai-ui/icons/icon.png "dist/$pkg/devai-ui.png"
           cp README.md "dist/$pkg/"
           if [ -f LICENSE ]; then cp LICENSE "dist/$pkg/"; fi
           tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
