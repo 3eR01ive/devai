@@ -269,6 +269,14 @@ pub const RPC_COMMANDS: &[RpcCommand] = &[
         handler: task_usage_rpc,
     },
     RpcCommand {
+        name: "usage_summary",
+        handler: usage_summary_rpc,
+    },
+    RpcCommand {
+        name: "usage_overview",
+        handler: usage_overview_rpc,
+    },
+    RpcCommand {
         name: "exec_transcript",
         handler: exec_transcript_rpc,
     },
@@ -1009,14 +1017,40 @@ fn task_usage_rpc(
     to_json(crate::commands::task_usage(state(app), id_prefix)?)
 }
 
-fn task_merge_rpc(
+fn usage_summary_rpc(
     app: &tauri::AppHandle,
     _device: &DeviceClaim,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, UiError> {
-    let id_prefix = param_str(params, "id_prefix")?;
-    let rationale = params.get("rationale").and_then(|v| v.as_str()).map(str::to_string);
-    to_json(crate::commands::task_merge(state(app), id_prefix, rationale)?)
+    let period = param_str(params, "period")?;
+    let group_by = param_str(params, "group_by")?;
+    let task = params
+        .get("task")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    to_json(crate::commands::usage_summary(
+        state(app),
+        period,
+        group_by,
+        task,
+    )?)
+}
+
+fn usage_overview_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    _params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    to_json(crate::commands::usage_overview(state(app))?)
+}
+
+fn execution_get_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
+    let exec_id = param_str(params, "exec_id")?;
+    to_json(crate::commands::execution_get(state(app), exec_id)?)
 }
 
 fn workspace_live_rpc(
@@ -1038,13 +1072,14 @@ fn workspace_live_diff_rpc(
     to_json(crate::commands::workspace_live_diff(state(app), id_prefix, path)?)
 }
 
-fn execution_get_rpc(
+fn task_merge_rpc(
     app: &tauri::AppHandle,
     _device: &DeviceClaim,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, UiError> {
-    let exec_id = param_str(params, "exec_id")?;
-    to_json(crate::commands::execution_get(state(app), exec_id)?)
+    let id_prefix = param_str(params, "id_prefix")?;
+    let rationale = params.get("rationale").and_then(|v| v.as_str()).map(str::to_string);
+    to_json(crate::commands::task_merge(state(app), id_prefix, rationale)?)
 }
 
 fn exec_transcript_rpc(
@@ -1084,7 +1119,11 @@ fn source_slice_rpc(
     )?)
 }
 
-fn execution_cancel_rpc(app: &tauri::AppHandle, _device: &DeviceClaim, params: &serde_json::Value) -> Result<serde_json::Value, UiError> {
+fn execution_cancel_rpc(
+    app: &tauri::AppHandle,
+    _device: &DeviceClaim,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, UiError> {
     let exec_id = param_str(params, "exec_id")?;
     let reason = params.get("reason").and_then(|v| v.as_str()).map(str::to_string);
     to_json(crate::commands::execution_cancel(state(app), exec_id, reason)?)

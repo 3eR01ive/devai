@@ -71,6 +71,25 @@ enum Cmd {
     /// (CLI first) is built on. Read-only, machine-complete.
     #[command(subcommand)]
     Api(ApiCmd),
+    /// Токены: сколько израсходовано и сколько осталось (task 01a1b851).
+    /// Читает СТОР (`usage.summary` / `task.usage`) — те же цифры, что окно.
+    Usage {
+        /// Расход одной задачи (id или префикс) вместо общих суток
+        #[arg(long)]
+        task: Option<String>,
+        /// Расход за текущие сутки в локальной зоне оператора
+        #[arg(long)]
+        day: bool,
+        /// Расход с понедельника текущей недели
+        #[arg(long)]
+        week: bool,
+        /// Расход с первого числа текущего месяца
+        #[arg(long)]
+        month: bool,
+        /// Разрез общей выборки: task | role | model | totals (по умолчанию totals)
+        #[arg(long)]
+        by: Option<String>,
+    },
     /// PLATFORM INTERNAL: one detached role runner (REQ-AR-01/03). Started by
     /// `task run` in its own session; it opens the execution row, writes the
     /// handshake the caller waits for, drives the chain and records the exit

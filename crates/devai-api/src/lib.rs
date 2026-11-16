@@ -31,6 +31,7 @@ mod quality_gate;
 mod registry;
 mod signature;
 mod stop;
+mod usage;
 
 /// Machine codes of the homes vocabulary — one dictionary, referenced by
 /// producers here and by the UI bootstrap (R3 quality return).
@@ -299,8 +300,12 @@ pub enum SessionKind {
 pub mod ui_reads;
 
 pub use ui_reads::{
-    ExecTranscriptView, LiveDiffView, LiveFileView, LiveWorktreeView, RuleDetectView, RuleGroupView, RuleView, RulebookView, SourceSliceView,
-    TaskUsageView, UsageRowView,
+    ExecTranscriptView, LiveDiffView, LiveFileView, LiveWorktreeView, RuleDetectView, RuleGroupView,
+    RuleView, RulebookView, SourceSliceView,
+};
+pub use usage::{
+    BudgetLimits, RunUsageView, TaskUsageView, UsageBucketView, UsageForecastView,
+    UsageOverviewView, UsageSummaryView,
 };
 
 pub struct Api {
@@ -323,6 +328,15 @@ pub struct Api {
     /// [`Api::with_probe_runner`] — a test points ONE handle at a stub instead
     /// of rewriting process-global state.
     runner: Option<PathBuf>,
+    /// The config tree this handle resolves policies from, fixed ONCE at open:
+    /// the ambient `DEVAI_CONFIG` window when the process was pointed at one,
+    /// else the home's own `config/`. A handle that re-read the process-global
+    /// variable on every call made a test's result depend on the machine it ran
+    /// on (ts/test-independence: on a host that exports `DEVAI_CONFIG` a test
+    /// seeding its own home read the operator's tree instead). The FILES under
+    /// the directory are still re-read per call, so a window edit lands on the
+    /// next read without a rebuild (REQ-HP-04/REQ-USG-04).
+    config_dir: PathBuf,
 }
 
 /// One probe call as the surface invokes it. The default is
@@ -376,7 +390,26 @@ impl Api {
             autolaunch: true,
             // Resolved by `runner_exe` unless the handle is pointed at one.
             runner: None,
+            config_dir: Api::ambient_config_dir(home),
         })
+    }
+
+    /// The config tree a handle resolves policies from: the ambient
+    /// `DEVAI_CONFIG` window when this process was pointed at one, else the
+    /// home's own `config/`. Called ONCE per handle — see the field's note.
+    fn ambient_config_dir(home: &Path) -> PathBuf {
+        std::env::var_os("DEVAI_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("config"))
+    }
+
+    /// Point THIS handle's policy reads at an explicit config tree — the same
+    /// seam idea as [`Api::with_probe_runner`]. Tests that seed their own home
+    /// use it, so their result does not depend on the ambient `DEVAI_CONFIG` of
+    /// the machine running them (ts/test-independence).
+    pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config_dir = dir.into();
+        self
     }
 
     /// Turn the state-driven auto-launch on/off for THIS handle. The default
@@ -424,6 +457,7 @@ impl Api {
             probe_runner: std::sync::Arc::new(devai_runtime::probe::probe),
             autolaunch: false,
             runner: None,
+            config_dir: Api::ambient_config_dir(home),
         })
     }
 
@@ -1074,12 +1108,12 @@ impl Api {
         }))
     }
 
-    /// The home's config directory, resolved like the engine's humanize
-    /// policy (REQ-HP-04): `DEVAI_CONFIG` when set, else `<home>/config`.
-    fn config_dir(&self) -> PathBuf {
-        std::env::var_os("DEVAI_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.store.root().join("config"))
+    /// The home's config directory, fixed at open (REQ-HP-04/REQ-USG-04):
+    /// `DEVAI_CONFIG` when the process was pointed at one, else `<home>/config`.
+    /// The FILES under it are re-read per call; the DIRECTORY is not re-derived
+    /// from process-global state on every read.
+    fn config_dir(&self) -> &Path {
+        &self.config_dir
     }
 
     /// REQ-NM-01: the declarative artifact-kind titles, loaded once per read.
@@ -1094,7 +1128,7 @@ impl Api {
     /// `pub(crate)`: a consumer reads bundles through the snapshot, never by
     /// walking the home itself (REQ-MS-07: the window does not compose).
     pub(crate) fn model_config_dir(&self) -> PathBuf {
-        self.config_dir()
+        self.config_dir().to_path_buf()
     }
 
     pub fn task_events(

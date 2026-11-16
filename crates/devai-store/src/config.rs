@@ -110,6 +110,10 @@ const DEFAULT_FILES: &[(&str, &str)] = &[
         "workflow/process.yaml",
         include_str!("../../../config/workflow/process.yaml"),
     ),
+    (
+        "workflow/usage.yaml",
+        include_str!("../../../config/workflow/usage.yaml"),
+    ),
     ("models.yaml", include_str!("../../../config/models.yaml")),
 ];
 
@@ -2626,6 +2630,199 @@ pub fn load_task_name_policy(dir: &Path) -> StoreResult<TaskNamePolicy> {
             policy = serde_yaml::from_value::<TaskNamePolicy>(section.clone()).map_err(|e| {
                 cfg_err(format!(
                     "{}: task_name section is invalid (keys: field, min_chars, max_chars, single_line): {e}",
+                    p.display()
+                ))
+            })?;
+            policy.validate(&p.display().to_string())?;
+        }
+    }
+    Ok(policy)
+}
+
+// ---------------------------------------------------------------------------
+// TOKEN BUDGETS AND MODEL PRICES (task 01a1b851, REQ-USG-04) — declarative
+// platform policy.
+// ---------------------------------------------------------------------------
+
+/// One declared model price (REQ-USG-04 AC1/AC2; ratified OQ-3 answer): the
+/// price lives in the platform CONFIG, not in code and not in the report, so
+/// changing it needs no rebuild. `input_per_million` / `output_per_million`
+/// are USD per one million tokens.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ModelPrice {
+    pub model: String,
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+}
+
+impl Default for ModelPrice {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            input_per_million: 0.0,
+            output_per_million: 0.0,
+        }
+    }
+}
+
+/// The three DECLARATIVE token budgets (REQ-USG-04): per run, per task, per
+/// calendar day. `None` = «без лимита» — the config's zero or an empty value
+/// means exactly that (REQ-USG-04 AC3), never «stop at once».
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct TokenBudgets {
+    /// Tokens one run may spend.
+    #[serde(default, deserialize_with = "budget_or_none")]
+    pub run: Option<u64>,
+    /// Tokens one task may spend in total.
+    #[serde(default, deserialize_with = "budget_or_none")]
+    pub task: Option<u64>,
+    /// Tokens all runs may spend in one calendar day (local zone, reset 00:00
+    /// — ratified OQ-4 answer).
+    #[serde(default, deserialize_with = "budget_or_none")]
+    pub day: Option<u64>,
+}
+
+/// A declared budget of `0` (or an empty value) is NO limit: the reader must
+/// say «лимита нет», not «0» (REQ-USG-04 AC3). A negative or non-integer
+/// value is a LOUD parse error — `u64` cannot carry one.
+fn budget_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let raw = Option::<u64>::deserialize(d)?;
+    Ok(raw.filter(|n| *n > 0))
+}
+
+/// The token-control policy of the home (REQ-USG-04/05/08): budgets, the
+/// price table (ratified OQ-3 answer) and the «данных мало» threshold of the
+/// forecast (REQ-USG-08 AC4 — an open number the home owns, so it is data).
+///
+/// Lives in `config/workflow/usage.yaml` (the `usage:` section), loaded by the
+/// merge-scan every workflow policy uses: the LAST declared section wins, a
+/// malformed one is a LOUD error naming the file and the key, and a home
+/// without the file behaves exactly like the factory bytes
+/// (`UsagePolicy::default()`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct UsagePolicy {
+    pub budgets: TokenBudgets,
+    /// The model price table (ratified OQ-3). A model absent from it has an
+    /// UNKNOWN cost — never a silently invented one.
+    #[serde(default)]
+    pub prices: Vec<ModelPrice>,
+    /// How many runs with a KNOWN cost a period needs before the «на сколько
+    /// хватит» forecast is shown; below it the screen says «данных мало»
+    /// (REQ-USG-08 AC4) instead of inventing a horizon.
+    #[serde(default = "default_forecast_min_runs")]
+    pub forecast_min_runs: u32,
+}
+
+fn default_forecast_min_runs() -> u32 {
+    3
+}
+
+impl Default for UsagePolicy {
+    /// The factory values are CONSERVATIVE (REQ-USG-04 AC2): a single run may
+    /// spend 8M tokens (the observed upper end of one real run), a task 50M
+    /// (a handful of runs), a day 200M — well under the 554M of the 07–08.11
+    /// incident, so the platform stops the burn long before the provider
+    /// does. No price is invented: an empty table means «стоимость
+    /// неизвестна» until the home declares its models.
+    fn default() -> Self {
+        Self {
+            budgets: TokenBudgets {
+                run: Some(8_000_000),
+                task: Some(50_000_000),
+                day: Some(200_000_000),
+            },
+            prices: Vec::new(),
+            forecast_min_runs: default_forecast_min_runs(),
+        }
+    }
+}
+
+impl UsagePolicy {
+    /// Reject a half-declared table. Names the file and the offending entry —
+    /// a typo'd budget or price is a loud config error, never a silent
+    /// «без лимита» (REQ-USG-04 AC5).
+    fn validate(&self, where_: &str) -> StoreResult<()> {
+        if self.forecast_min_runs == 0 {
+            return Err(cfg_err(format!(
+                "{where_}: usage.forecast_min_runs must be >= 1 — a zero threshold would show a \
+                 forecast built on no data at all"
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, price) in self.prices.iter().enumerate() {
+            if price.model.trim().is_empty() {
+                return Err(cfg_err(format!(
+                    "{where_}: usage.prices[{i}].model is empty — a price without a model names \
+                     nothing"
+                )));
+            }
+            for (key, value) in [
+                ("input_per_million", price.input_per_million),
+                ("output_per_million", price.output_per_million),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(cfg_err(format!(
+                        "{where_}: usage.prices[{i}].{key} must be a finite non-negative number, \
+                         got {value}"
+                    )));
+                }
+            }
+            if !seen.insert(price.model.trim().to_string()) {
+                return Err(cfg_err(format!(
+                    "{where_}: usage.prices declares model `{}` twice — one model, one price",
+                    price.model
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The declared price of one model, if the home declares it.
+    pub fn price_of(&self, model: &str) -> Option<&ModelPrice> {
+        let wanted = model.trim();
+        self.prices
+            .iter()
+            .find(|p| p.model.trim().eq_ignore_ascii_case(wanted))
+    }
+
+    /// The human words for one level's limit — «без лимита» is spelled out
+    /// (REQ-USG-04 AC3), never printed as 0.
+    pub fn budget_text(budget: Option<u64>) -> String {
+        match budget {
+            Some(n) => n.to_string(),
+            None => "без лимита".to_string(),
+        }
+    }
+}
+
+/// Merge-scan `workflow/*.yaml` for the `usage:` key — the `load_humanize_policy`
+/// idiom, one loader for init, the engine and the read surfaces, so a home
+/// without the file and a home at factory values agree by construction.
+pub fn load_usage_policy(dir: &Path) -> StoreResult<UsagePolicy> {
+    let mut policy = UsagePolicy::default();
+    if !dir.is_dir() {
+        return Ok(policy);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .collect();
+    paths.sort();
+    for p in &paths {
+        let text =
+            fs::read_to_string(p).map_err(|e| cfg_err(format!("read {}: {e}", p.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text)
+            .map_err(|e| cfg_err(format!("parse {}: {e}", p.display())))?;
+        if let Some(section) = doc.get("usage") {
+            // deny_unknown_fields: a typo'd key names itself here.
+            policy = serde_yaml::from_value::<UsagePolicy>(section.clone()).map_err(|e| {
+                cfg_err(format!(
+                    "{}: usage section is invalid (keys: budgets {{run, task, day}}, prices \
+                     [{{model, input_per_million, output_per_million}}], forecast_min_runs): {e}",
                     p.display()
                 ))
             })?;

@@ -80,6 +80,10 @@ pub fn seed_from(store: &Store, dir: &Path, now: Timestamp) -> StoreResult<usize
     // a missing phrase for a brake kind or failure class, a typo'd key or an
     // empty phrase fails `devai init`, never a silent machine-token fallback.
     config::load_park_reasons(&dir.join("workflow"))?;
+    // REQ-USG-04 AC5: the token budgets and the price table are validated with
+    // the same loudness — a negative price, a duplicated model or a zero
+    // forecast threshold fails `devai init`, it is never a silent «без лимита».
+    config::load_usage_policy(&dir.join("workflow"))?;
     // REQ-NM-01 AC5: the artifact-kind label table is COMPLETE or init fails —
     // a missing declared kind is a loud config refusal, never a heading made
     // of a technical token.

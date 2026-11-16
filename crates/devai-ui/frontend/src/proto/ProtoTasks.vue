@@ -4,7 +4,8 @@
 import { computed, nextTick, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api, toUiError } from "../api";
-import type { ProgressView, Project, Task, UiError } from "../types";
+import type { ProgressView, Project, Task, TaskUsageView, UiError } from "../types";
+import { taskSpendLine } from "../usage-format";
 import "./proto.css";
 
 const router = useRouter();
@@ -50,7 +51,7 @@ async function createTask() {
   }
 }
 const progress = ref<Record<string, ProgressView>>({});
-const usage = ref<Record<string, { total: number; cost: number; runs: number; measured: number }>>({});
+const usage = ref<Record<string, TaskUsageView>>({});
 const error = ref<UiError | null>(null);
 const loading = ref(true);
 // Закрытые показываются по требованию: по умолчанию свернуты, не выброшены.
@@ -89,14 +90,6 @@ function age(iso: string): string {
   if (m < 60) return `${m} мин`;
   const h = Math.floor(m / 60);
   return h < 24 ? `${h} ч ${m % 60} мин` : `${Math.floor(h / 24)} д ${h % 24} ч`;
-}
-
-function tok(n: number): string {
-  if (!n) return "0";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " млрд";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + " млн";
-  if (n >= 1e3) return Math.round(n / 1e3) + " тыс";
-  return String(n);
 }
 
 const rowOf = (t: Task) => {
@@ -300,8 +293,8 @@ onMounted(load);
           <div v-if="r.t.state === 'DRAFT' && r.t.title && r.t.title !== r.t.display" class="p-sub">{{ r.t.title }}</div>
           <div class="p-ident">
             <span>{{ r.id }}</span>
-            <span v-if="r.u && r.u.measured">
-              {{ tok(r.u.total) }} токенов · ${{ r.u.cost.toFixed(2) }}
+            <span v-if="r.u" :title="r.u.line">
+              {{ taskSpendLine(r.u) }}<template v-if="r.u.limit != null"> токенов</template><template v-if="r.u.unknown > 0"> · неизвестно у {{ r.u.unknown }}</template>
             </span>
           </div>
         </div>

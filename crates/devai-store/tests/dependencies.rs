@@ -264,8 +264,8 @@ fn v3_database_gains_the_graph_additively() {
     );
     assert_eq!(
         devai_store::SCHEMA_VERSION,
-        15,
-        "the ladder top is now v15 (rung 014 agent-failures + rung 015 run-identity)"
+        16,
+        "the ladder top is now v16 (rung 014 agent-failures + rung 015 run-identity + rung 016 execution-usage)"
     );
 
     let t = store.get_task(&t_id.to_string()).unwrap();

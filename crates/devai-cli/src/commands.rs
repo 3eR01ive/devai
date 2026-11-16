@@ -113,9 +113,156 @@ pub fn run(ctx: &Ctx, cmd: Cmd, json: bool) -> Result<()> {
             force_reaudit,
         } => supervise(ctx, task, run, ack, agent, workspace, force_reaudit, json),
         Cmd::Api(c) => api_registry(ctx, c, json),
+        Cmd::Usage {
+            task,
+            day,
+            week,
+            month,
+            by,
+        } => usage(ctx, task.as_deref(), day, week, month, by.as_deref(), json),
         Cmd::Export { task, out } => export(ctx, &task, &out, json),
         Cmd::Import { dir } => import(ctx, &dir, json),
     }
+}
+
+// ---------------------------------------------------------------------------
+// usage (task 01a1b851, REQ-USG-09): the SAME numbers the window shows
+// ---------------------------------------------------------------------------
+
+/// `devai usage [--task ID] [--day|--week|--month] [--by task|role|model]`.
+///
+/// Two surfaces of ONE read: with `--task` the task card's numbers (spent,
+/// limit, models, runs, unknown), without it the period summary. Both come
+/// from the store through the published read operations — the CLI adds no
+/// arithmetic of its own (REQ-USG-09 AC3).
+fn usage(
+    ctx: &Ctx,
+    task: Option<&str>,
+    day: bool,
+    week: bool,
+    month: bool,
+    by: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    if let Some(id) = task {
+        let v = ctx.api().task_usage(id).map_err(render_api_error)?;
+        return print_task_usage(&v, json);
+    }
+    let v = ctx
+        .api()
+        .usage_summary(period_of(day, week, month), by.unwrap_or("totals"), None)
+        .map_err(render_api_error)?;
+    print_period_usage(&v, json)
+}
+
+/// The period the flags name. `--day` is explicit so the flag is not a silent
+/// no-op; with no flag at all the command reads today (REQ-USG-09 AC2).
+fn period_of(day: bool, week: bool, month: bool) -> &'static str {
+    match (month, week, day) {
+        (true, _, _) => "month",
+        (_, true, _) => "week",
+        _ => "day",
+    }
+}
+
+/// The task's card numbers on the terminal: «израсходовано X из Y», the
+/// models, the runs and — honestly — how many runs have no spend at all.
+fn print_task_usage(v: &devai_api::TaskUsageView, json: bool) -> Result<()> {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(v)?);
+        return Ok(());
+    }
+    outln!("{}: {}", short_str(&v.task), v.task_name);
+    outln!(
+        "  {} · модель: {} · прогонов {}",
+        v.line,
+        if v.models.is_empty() {
+            "неизвестна".to_string()
+        } else {
+            v.models.join(", ")
+        },
+        v.runs
+    );
+    if v.unknown > 0 {
+        outln!(
+            "  расход неизвестен у {} из {} прогонов (не ноль)",
+            v.unknown,
+            v.runs
+        );
+    }
+    outln!("  стоимость: {}", cost_text(v.cost_usd, v.cost_unknown));
+    if let Some(raised) = v.raised_to {
+        outln!("  бюджет поднят решением человека до {raised} токенов");
+    }
+    Ok(())
+}
+
+/// The period summary on the terminal: totals first, then the rows of the
+/// requested grouping. An empty period says so instead of printing an empty
+/// table (REQ-USG-09 AC4).
+fn print_period_usage(v: &devai_api::UsageSummaryView, json: bool) -> Result<()> {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(v)?);
+        return Ok(());
+    }
+    let says = match v.period.as_str() {
+        "week" => "с начала недели",
+        "month" => "с начала месяца",
+        "all" => "за всё время",
+        _ => "за текущие сутки",
+    };
+    outln!(
+        "{}: {} токенов · прогонов {} · неизвестен расход у {}",
+        says,
+        v.totals.total_tokens,
+        v.totals.runs,
+        v.totals.unknown
+    );
+    outln!(
+        "  вход {} · выход {} · стоимость {}",
+        v.totals.prompt_tokens,
+        v.totals.completion_tokens,
+        cost_text(v.totals.cost_usd, v.totals.cost_unknown)
+    );
+    if v.totals.runs == 0 {
+        outln!(
+            "  прогонов за период не было — считать нечего (это не «ноль потрачено» от \
+             провайдера)"
+        );
+        return Ok(());
+    }
+    print_bucket_rows(&v.rows);
+    Ok(())
+}
+
+/// One line per bucket of the requested grouping: the key (named for a task),
+/// its tokens, its runs and — beside the sum — the runs with no spend at all.
+fn print_bucket_rows(rows: &[devai_api::UsageBucketView]) {
+    for r in rows {
+        let name = r.name.clone().unwrap_or_else(|| r.key.clone());
+        outln!(
+            "  {name}: {} токенов · прогонов {} · неизвестно {}",
+            r.total_tokens,
+            r.runs,
+            r.unknown
+        );
+    }
+}
+
+/// The money of a read: the known sum, or «неизвестна» when the runs carried
+/// no price — never "$0.00" standing in for an unknown (REQ-USG-02 AC1).
+fn cost_text(sum_usd: f64, cost_unknown: i64) -> String {
+    let mut text = if sum_usd > 0.0 {
+        format!("${sum_usd:.2}")
+    } else if cost_unknown > 0 {
+        "неизвестна (нет цены модели в конфиге)".to_string()
+    } else {
+        "—".to_string()
+    };
+    if sum_usd > 0.0 && cost_unknown > 0 {
+        text.push_str(&format!(" (у {cost_unknown} прогонов цены нет)"));
+    }
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -2773,8 +2920,15 @@ fn exec(ctx: &Ctx, cmd: ExecCmd, json: bool) -> Result<()> {
                 short_str(&t.execution),
                 t.role,
                 t.status,
-                if t.running { "идёт" } else { "завершён" },
-                t.note.as_deref().map(|n| format!(" · {n}")).unwrap_or_default()
+                if t.running {
+                    "идёт"
+                } else {
+                    "завершён"
+                },
+                t.note
+                    .as_deref()
+                    .map(|n| format!(" · {n}"))
+                    .unwrap_or_default()
             );
             let both = if t.stderr.is_empty() {
                 t.stdout.clone()

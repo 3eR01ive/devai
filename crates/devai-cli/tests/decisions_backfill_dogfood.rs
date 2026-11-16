@@ -188,12 +188,13 @@ fn backfill_runs_on_open_lands_deterministic_rows_and_progress_stays_clean() {
 
     // Any command opens the store — the rung lands here.
     devai(home.path(), &["task", "events", &id]);
-    // v15: rung 014 (agent failures, task 01a1b60c) + rung 015 (run identity,
-    // task 01a1b7dc) — the top moves with both.
+    // v16: rung 014 (agent failures, task 01a1b60c) + rung 015 (run identity,
+    // task 01a1b7dc) + rung 016 (execution usage, task 01a1b851) — the top
+    // moves with all three.
     assert_eq!(
         version_of(home.path()),
-        15,
-        "fresh install lands at the ladder top (v15)"
+        16,
+        "fresh install lands at the ladder top (v16)"
     );
 
     // The human view stays exactly as it was (ratified OQ1 variant (б)):
@@ -465,8 +466,8 @@ fn backfilled_legacy_rationale_reaches_the_auditor_prompt() {
     );
     assert_eq!(
         version_of(home.path()),
-        15,
-        "the walked ladder ends at the v15 top"
+        16,
+        "the walked ladder ends at the v16 top"
     );
     println!("──── dogfood evidence: APPROVED_DECISIONS with backfilled rows ────\n{section}");
 }

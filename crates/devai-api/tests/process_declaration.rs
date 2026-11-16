@@ -32,7 +32,9 @@ fn home_dir_with(declaration: &str) -> TempDir {
 /// seeded.
 fn home_with(declaration: &str) -> (TempDir, Api) {
     let dir = home_dir_with(declaration);
-    let api = Api::open(dir.path(), "declaration-tester").unwrap();
+    let api = Api::open(dir.path(), "declaration-tester")
+        .unwrap()
+        .with_config_dir(dir.path().join("config"));
     api.seed_config(None).unwrap();
     (dir, api)
 }
@@ -43,7 +45,9 @@ fn init_refusal(declaration: &str) -> String {
     let dir = home_dir_with(declaration);
     // `devai init` = open the home, seed the configuration: the PROCESS
     // declaration is validated there (REQ-AR-16), before any stage can run.
-    let api = Api::open(dir.path(), "declaration-tester").unwrap();
+    let api = Api::open(dir.path(), "declaration-tester")
+        .unwrap()
+        .with_config_dir(dir.path().join("config"));
     let open = match api.seed_config(None) {
         Ok(_) => panic!("a diverging declaration must not pass initialisation"),
         Err(e) => e.to_string(),

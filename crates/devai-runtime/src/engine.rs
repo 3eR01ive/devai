@@ -16,8 +16,9 @@ use devai_core::types::*;
 use devai_core::workflow;
 use devai_store::config::{
     AgentFailurePolicy, HumanizePolicy, Profile, ResponseFormPolicy, ReworkPolicy, TaskNamePolicy,
+    UsagePolicy,
 };
-use devai_store::{ArtifactDraft, Store, StoreError};
+use devai_store::{ArtifactDraft, Store, StoreError, UsageRecord};
 
 use crate::adapters::{
     self, AdapterError, AgentRuntime, ExecOutput, ExecRequest, FormLoopHost, RunOutcome,
@@ -25,6 +26,7 @@ use crate::adapters::{
 use crate::evaluation;
 use crate::gate;
 use crate::prompt::build_user_prompt;
+use crate::usage;
 use crate::worktree;
 
 // The quality-report contract version is pinned in CODE (`devai_core`), so
@@ -184,6 +186,23 @@ pub enum RuntimeError {
         "active model bundle is incomplete — its agent record names no reasoning level; the level is chosen together with the LLM-provider and the model: `devai model switch <id>`"
     )]
     IncompleteBundle,
+    /// The declared token budget cannot pay for the expected cost of the run
+    /// (task 01a1b851, REQ-USG-05): the run did NOT start — no execution row,
+    /// no prompt, no spend. The message IS the operator sentence with the
+    /// numbers (`usage::BudgetRefusal::line`), so the caller re-words nothing.
+    #[error("{0}")]
+    BudgetRefused(String),
+    /// The run was refused by a budget AND the runner-opened row could not be
+    /// closed afterwards (task 01a1b851, REQ-USG-05 AC5). Both facts are kept:
+    /// the refusal sentence, which the operator acted on, and the store error
+    /// that left a RUNNING row behind — a cleanup failure is never swallowed
+    /// into silence, and never replaces the refusal text either.
+    #[error("{refusal} — the refused run's row did not close: {source}")]
+    RefusalCleanup {
+        refusal: String,
+        #[source]
+        source: StoreError,
+    },
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
@@ -260,6 +279,10 @@ struct StageAttempts<'a> {
     template: RoleExecution,
     /// The row of the attempt currently RUNNING.
     open: RoleExecution,
+    /// Every attempt row the host CLOSED (a form rejection or a provider
+    /// failure). The engine reads their spend rows after the loop, so each
+    /// attempt of a stage leaves its own usage fact (REQ-USG-01).
+    closed: Vec<RoleExecution>,
     /// A store failure inside a callback cannot abort the provider loop from
     /// the inside; it is surfaced to the engine right after the loop ends.
     store_err: Option<StoreError>,
@@ -318,6 +341,7 @@ impl FormLoopHost for StageAttempts<'_> {
         if let Err(e) = err {
             self.store_err.get_or_insert(e);
         }
+        self.closed.push(self.open.clone());
     }
 
     fn attempt_failed(&mut self, _attempt: u32, class: &'static str, error: &str) {
@@ -332,6 +356,7 @@ impl FormLoopHost for StageAttempts<'_> {
         if let Err(e) = err {
             self.store_err.get_or_insert(e);
         }
+        self.closed.push(self.open.clone());
     }
 }
 
@@ -535,6 +560,16 @@ pub struct Engine<'a> {
     /// A present-but-broken/foreign-version declaration is LOUD at the next
     /// advance (REQ-AR-16: never silent work under unknown rules).
     process_config_error: Option<String>,
+    /// The TOKEN CONTROL policy (task 01a1b851, REQ-USG-04/05): the three
+    /// declarative budgets and the model price table —
+    /// `config/workflow/usage.yaml`, loaded once per run. The budget check
+    /// before a stage and the cost of a spend row read THIS one value, so the
+    /// numbers the operator edits are the numbers the platform enforces.
+    usage: UsagePolicy,
+    /// A present-but-broken budget/price declaration is LOUD at the next
+    /// stage: a typo must never degrade into a silently disabled limit
+    /// (REQ-USG-04 AC5).
+    usage_config_error: Option<String>,
     /// The execution row a DETACHED runner already opened (REQ-AR-08): the
     /// engine adopts it instead of opening a second RUNNING row, so the
     /// caller's handle points at the very row this process drives. Consumed
@@ -629,6 +664,18 @@ impl<'a> Engine<'a> {
                 ),
             };
         let workspace = std::env::current_dir().unwrap_or_else(|_| store.root().to_path_buf());
+        // TOKEN CONTROL (REQ-USG-04/05). Absent file/dir => the factory
+        // budgets and an empty price table; present-but-broken => the error is
+        // HELD and raised before the next stage — a typo'd budget never
+        // becomes a silently disabled limit.
+        let mut usage_config_error = None;
+        let usage = match devai_store::config::load_usage_policy(&cfg_dir.join("workflow")) {
+            Ok(policy) => policy,
+            Err(e) => {
+                usage_config_error = Some(e.to_string());
+                UsagePolicy::default()
+            }
+        };
         Engine {
             store,
             max_steps: DEFAULT_MAX_STEPS,
@@ -648,6 +695,8 @@ impl<'a> Engine<'a> {
             rework_config_error,
             process,
             process_config_error,
+            usage,
+            usage_config_error,
             adopted: std::cell::RefCell::new(None),
             run_id: None,
         }
@@ -721,6 +770,33 @@ impl<'a> Engine<'a> {
             Err(e) => {
                 self.humanize = HumanizePolicy::default();
                 self.humanize_config_error = Some(e.to_string());
+            }
+        }
+        self
+    }
+
+    /// Provide the token-control policy explicitly (tests; the production
+    /// value comes from `config/workflow/usage.yaml`, falling back to the
+    /// factory budgets). Replacing it clears any held load error.
+    pub fn with_usage_policy(mut self, usage: UsagePolicy) -> Self {
+        self.usage = usage;
+        self.usage_config_error = None;
+        self
+    }
+
+    /// Re-read the token-control policy from an explicit `workflow/`
+    /// directory, applying the exact resolution of `new`. Deterministic test
+    /// seam for the config-resolution proof (REQ-USG-04 AC4: an edited budget
+    /// applies to the NEXT check without a rebuild).
+    pub fn with_usage_config_dir(mut self, dir: &std::path::Path) -> Self {
+        match devai_store::config::load_usage_policy(dir) {
+            Ok(policy) => {
+                self.usage = policy;
+                self.usage_config_error = None;
+            }
+            Err(e) => {
+                self.usage = UsagePolicy::default();
+                self.usage_config_error = Some(e.to_string());
             }
         }
         self
@@ -1308,6 +1384,11 @@ impl<'a> Engine<'a> {
         if let Some(err) = &self.task_name_config_error {
             return Err(RuntimeError::Store(StoreError::Config(err.clone())));
         }
+        // REQ-USG-04 AC5: a broken budget/price declaration stops the stage
+        // LOUDLY — a typo never degrades into a silently disabled limit.
+        if let Some(err) = &self.usage_config_error {
+            return Err(RuntimeError::Store(StoreError::Config(err.clone())));
+        }
         if let Some(section) =
             crate::context::rework_context(self.store, task, role_slug, &self.rework)?
         {
@@ -1369,6 +1450,32 @@ impl<'a> Engine<'a> {
                 None => None,
             }
         };
+
+        // REQ-USG-05 — THE STOP BEFORE THE SPEND: the declared budgets are
+        // compared with the expected cost of THIS run before anything is
+        // created or called. A refusal leaves no execution row (no RUNNING
+        // orphan to cancel by hand), no prompt and no money spent; the
+        // message carries the numbers (see `usage::BudgetRefusal::sentence`).
+        if let Some(refusal) = self.budget_gate(task, &role.slug)? {
+            // A runner-opened row for this stage must not survive as RUNNING
+            // once its run is refused.
+            if let Some(row) = self.adopted.borrow_mut().take() {
+                self.store
+                    .finish_execution_classified(
+                        &row,
+                        ExecutionStatus::Failed,
+                        None,
+                        Some(&refusal.line),
+                        Some(failure_class::PLATFORM),
+                        Utc::now(),
+                    )
+                    .map_err(|source| RuntimeError::RefusalCleanup {
+                        refusal: refusal.line.clone(),
+                        source,
+                    })?;
+            }
+            return Err(RuntimeError::BudgetRefused(refusal.line));
+        }
 
         let now = Utc::now();
         // Capture the workspace revision at execution START (A-004): the
@@ -1664,6 +1771,7 @@ impl<'a> Engine<'a> {
             store: self.store,
             template: execution.clone(),
             open: execution.clone(),
+            closed: Vec::new(),
             store_err: None,
         };
         let outcome = AgentRuntime::run_with_form_loop(&req, max_repairs, &mut hook);
@@ -1690,6 +1798,14 @@ impl<'a> Engine<'a> {
                 )?;
             }
         }
+        // REQ-USG-01: the SPEND ROW of every execution this stage produced —
+        // the accepted attempt and every attempt the loop closed on the way.
+        // The row is read from the driver's report when the file exists and is
+        // the honest «расход неизвестен» row otherwise; one row per
+        // execution, re-appliable without ever doubling a sum.
+        let mut spent_rows: Vec<RoleExecution> = hook.closed.clone();
+        spent_rows.push(hook.open.clone());
+        self.record_stage_usage(&spent_rows)?;
         let out = match outcome {
             RunOutcome::Output(o) => o,
             RunOutcome::Failed(e) => {
@@ -1704,6 +1820,24 @@ impl<'a> Engine<'a> {
                 // (REQ-AF-01 AC5).
                 if e.failure_class() == failure_class::PROVIDER {
                     self.note_agent_failure(task, &agent, &hook.open, &e, actor)?;
+                }
+                // REQ-USG-02 AC2: «квота исчерпана» (429 / quota) is its OWN
+                // fact of the run's history — never «потрачено ноль». The
+                // spend row written above keeps whatever the report said (or
+                // stays UNKNOWN); this event tells WHY the run died.
+                if let Some(evidence) = usage::quota_exhausted_evidence(&format!("{e}")) {
+                    self.store.insert_event(
+                        Some(task.id),
+                        event_kind::USAGE_QUOTA_EXHAUSTED,
+                        &hook.open.role_slug,
+                        serde_json::json!({
+                            (json_field::ROLE): hook.open.role_slug,
+                            (json_field::DRIVER): req.provider,
+                            (json_field::MODEL): req.model,
+                            (json_field::MESSAGE): evidence,
+                            "execution": hook.open.id.to_string(),
+                        }),
+                    )?;
                 }
                 // The failing attempt's row was closed by the host with its
                 // class; the task state is untouched — history says what
@@ -2021,6 +2155,85 @@ impl<'a> Engine<'a> {
             artifact_kind: kind,
             summary: exec_summary,
         }))
+    }
+
+    /// REQ-USG-05 — «стоп до траты». Called BEFORE the execution row of a
+    /// stage is opened, so a refusal leaves no RUNNING orphan, no prompt and
+    /// no money spent. The numbers come from the store (the declared budgets
+    /// and the historical average), never from the caller.
+    ///
+    /// An exhausted TASK budget is a HUMAN GATE (REQ-USG-06): the task is
+    /// parked with ONE blocking question («поднять до N» / «остановиться»)
+    /// and the refusal is recorded as its own event. The day level refuses
+    /// new runs for the rest of the day without touching the task's state
+    /// (ratified OQ-1: already-started runs finish). The platform raises no
+    /// budget by itself, ever.
+    fn budget_gate(&self, task: &Task, role: &str) -> RuntimeResult<Option<usage::BudgetRefusal>> {
+        let Some(refusal) =
+            usage::check_budget(self.store, task.id, role, &self.usage, Utc::now())?
+        else {
+            return Ok(None);
+        };
+        // The parking/recording rule itself lives in `usage` — the API
+        // admission gate calls the very same function, so both doors behave
+        // identically.
+        usage::stop_task(
+            self.store,
+            &self.process,
+            task,
+            &refusal,
+            self.usage.budgets.task,
+            PLATFORM_ACTOR,
+            Utc::now(),
+        )?;
+        Ok(Some(refusal))
+    }
+
+    /// Write the spend row of every execution of the stage just run
+    /// (REQ-USG-01/02). The driver's report is read from that execution's own
+    /// evidence dir; the row is MEASURED when it parses, and the honest
+    /// «расход неизвестен» row otherwise — tokens stay NULL, never zero.
+    fn record_stage_usage(&self, executions: &[RoleExecution]) -> RuntimeResult<()> {
+        let end = Utc::now();
+        for e in executions {
+            let path = adapters::usage_report_path(&self.evidence_dir(e.task_id, e.id));
+            let record = self.stage_usage_record(e, &path, end);
+            self.store.record_execution_usage(&record)?;
+        }
+        Ok(())
+    }
+
+    /// The spend record of ONE execution of the stage. Three distinct facts,
+    /// three distinct reasons: a report that parses (MEASURED), no report at
+    /// all (the driver wrote none), and a report that is THERE but unreadable
+    /// — the last one keeps its own reason, so a corrupt file is never read as
+    /// «отчёта не было» (rl/error-handling). Durations come from the
+    /// execution's own start and finish; only a row that never closed falls
+    /// back to the stage end.
+    fn stage_usage_record(
+        &self,
+        e: &RoleExecution,
+        path: &std::path::Path,
+        end: Timestamp,
+    ) -> UsageRecord {
+        let provider = e.bundle.as_ref().map(|b| b.llm_provider.clone());
+        let model = e.bundle.as_ref().map(|b| b.model.clone());
+        let duration = usage::duration_ms(e.started_at, e.finished_at.or(Some(end)));
+        match usage::read_usage_report(path) {
+            Ok(found) => {
+                usage::usage_record(e, provider, model, duration, found.as_ref(), &self.usage)
+            }
+            Err(reason) => UsageRecord::unknown(
+                e.id,
+                e.task_id,
+                &e.role_slug,
+                e.run_id.map(|r| r.to_string()),
+                provider,
+                model,
+                duration,
+                reason,
+            ),
+        }
     }
 
     /// REQ-FG-06 / ratified OQ-FG-07: complete the requirements-spec echo

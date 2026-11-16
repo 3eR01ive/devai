@@ -383,3 +383,32 @@ CREATE TRIGGER wf_events_no_update BEFORE UPDATE ON workflow_events
 BEGIN SELECT RAISE(ABORT, 'workflow_events is append-only'); END;
 CREATE TRIGGER wf_events_no_delete BEFORE DELETE ON workflow_events
 BEGIN SELECT RAISE(ABORT, 'workflow_events is append-only'); END;
+
+-- v16 (task 01a1b851, REQ-USG-01/02): the token-spend record of a run. ONE
+-- row per execution, pinned by the PRIMARY KEY — a re-application of the same
+-- run can never double the sum. The row is written by the PLATFORM and its
+-- shape is provider-agnostic: the driver's report format never reaches the
+-- store. `measured` is the honesty bit: 1 = numbers from a real usage report;
+-- 0 = «расход неизвестен», tokens and cost stay NULL — never zero. Runs
+-- written before v16 keep no row and are counted by the reader as UNKNOWN
+-- runs (history is never reconstructed from logs — ratified OQ-7). Existing
+-- v15 databases gain the same shape additively via
+-- migrations/016_execution_usage.sql.
+CREATE TABLE execution_usage(
+  execution_id      TEXT PRIMARY KEY REFERENCES role_executions(id) ON DELETE CASCADE,
+  task_id           TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  role_slug         TEXT NOT NULL,
+  run_id            TEXT NULL,
+  provider          TEXT NULL,
+  model             TEXT NULL,
+  prompt_tokens     INTEGER NULL,
+  completion_tokens INTEGER NULL,
+  total_tokens      INTEGER NULL,
+  duration_ms       INTEGER NULL,
+  cost_usd          REAL NULL,
+  measured          INTEGER NOT NULL,
+  unknown_reason    TEXT NULL,
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX execution_usage_task ON execution_usage(task_id, created_at);
+CREATE INDEX execution_usage_created ON execution_usage(created_at);

@@ -6,6 +6,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch, watchEffect } f
 import { useRoute, useRouter } from "vue-router";
 import { useHoldToConfirm } from "../components/signature/useHoldToConfirm";
 import { api, toUiError } from "../api";
+import { limitText, spentText, tok } from "../usage-format";
 import type {
   ArtifactView, ProgressView, QualityReportView, Question, RulebookView,
   SignatureView, TaskUsageView, UiError, WorkflowEvent,
@@ -112,12 +113,12 @@ const scoreTone = computed(() => {
 
 const tokensByExec = computed(() => {
   const m = new Map<string, number>();
-  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.total);
+  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.total_tokens ?? 0);
   return m;
 });
 const costByExec = computed(() => {
   const m = new Map<string, number>();
-  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.cost);
+  for (const r of usage.value?.rows ?? []) m.set(r.execution, r.cost_usd ?? 0);
   return m;
 });
 /** Сходимость стадии из прогресса: у ревью — объём, у приёмки — балл. */
@@ -147,14 +148,6 @@ function convMode(state: string): string {
   const last = st?.series?.[st.series.length - 1];
   const map: Record<string, string> = { CONVERGING: "рост", DIVERGING: "расхождение", PLATEAU: "застой", STUCK: "стоит", UNKNOWN: "нет данных" };
   return last ? map[last.mode] ?? "нет данных" : "";
-}
-
-function tok(n: number | undefined) {
-  if (!n) return "";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " млрд";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + " млн";
-  if (n >= 1e3) return Math.round(n / 1e3) + " тыс";
-  return String(n);
 }
 
 function age(iso: string) {
@@ -1471,10 +1464,14 @@ onMounted(load);
           <div class="l">качество</div>
           <div class="s">{{ verdict ? verdict.toLowerCase() : "оценки нет" }}</div>
         </div>
-        <div class="p-tokens" v-if="usage && usage.measured">
-          <div class="n">{{ tok(usage.total) }}</div>
-          <div class="l">токенов</div>
-          <div class="s">${{ usage.cost.toFixed(2) }} · {{ usage.measured }} из {{ usage.runs }} прогонов</div>
+        <div class="p-tokens" v-if="usage" :title="usage.line">
+          <div class="n">{{ spentText(usage.spent, usage.unknown) }}</div>
+          <div class="l">{{ limitText(usage) }}</div>
+          <div class="s">
+            {{ usage.models.length ? usage.models.join(", ") : "модель неизвестна" }} ·
+            {{ usage.runs }} прогонов<template v-if="usage.unknown > 0">
+              · расход неизвестен у {{ usage.unknown }}</template>
+          </div>
         </div>
       </header>
 

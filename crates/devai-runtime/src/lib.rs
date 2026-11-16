@@ -23,6 +23,7 @@ pub mod revision;
 pub mod tail;
 pub mod taskname;
 pub mod trace;
+pub mod usage;
 pub mod worktree;
 
 pub use adapters::{

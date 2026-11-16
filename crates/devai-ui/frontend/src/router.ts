@@ -4,6 +4,7 @@ import OpsView from "./views/OpsView.vue";
 import HomesView from "./views/HomesView.vue";
 import ModelsView from "./views/ModelsView.vue";
 import LanView from "./views/LanView.vue";
+import UsageView from "./views/UsageView.vue";
 import PairView from "./views/PairView.vue";
 import ProtoTasks from "./proto/ProtoTasks.vue";
 import ProtoTask from "./proto/ProtoTask.vue";
@@ -31,5 +32,7 @@ export const router = createRouter({
     // приложения по `#/pair?reason=…`; на десктопе маршрут никому не показан.
     { path: "/pair", name: "pair", component: PairView },
     { path: "/ops", name: "ops", component: OpsView },
+    // Экран расхода токенов (REQ-USG-08): сутки/месяц, топ-задачи, прогноз.
+    { path: "/usage", name: "usage", component: UsageView },
   ],
 });

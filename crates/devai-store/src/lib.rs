@@ -11,6 +11,7 @@ mod error;
 pub mod models;
 mod rows;
 pub mod seed;
+pub mod usage;
 
 pub use bundle::{BundleManifest, ImportOutcome};
 pub use error::{StoreError, StoreResult};
@@ -18,6 +19,10 @@ pub use models::{
     CatalogEdit, MODEL_CONFIG_FILE, ModelBundle, ModelCatalog, PROBEABLE_DRIVERS, ProbePolicy,
     SELF_PROVIDER_DRIVER, bundle_id_from_label, bundle_keys, catalog_edition, catalog_revision,
     load_catalog, probe_keys, restore_catalog_text, write_catalog, write_catalog_with_previous,
+};
+pub use usage::{
+    ExecutionUsage, PERIODS, RunUsage, UsageBucket, UsageGroup, UsageQuery, UsageRecord,
+    calendar_window,
 };
 
 /// The ONE name of the home's store file (arch/no-magic: the homes cycle
@@ -1952,6 +1957,13 @@ impl Store {
             ExecutionStatus::Failed => event_kind::EXECUTION_FAILED,
             _ => event_kind::EXECUTION_CANCELLED,
         };
+        // REQ-USG-01 AC1 / REQ-USG-02 AC1: EVERY close of an execution leaves
+        // a spend row — measured when the runtime recorded the report,
+        // otherwise the honest «расход неизвестен» row inserted here. It is
+        // `INSERT OR IGNORE` inside the SAME transaction, so the close and
+        // its usage fact can never disagree, and a measured row written
+        // before the close is never overwritten.
+        Store::ensure_usage_row_in(&tx, e, now)?;
         tx.execute(
             "INSERT INTO workflow_events(id,task_id,kind,actor,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![

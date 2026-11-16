@@ -452,18 +452,20 @@ pub const COMMAND_OPERATIONS: &[(&str, &str)] = &[
     // one `devai task run` calls — the person decides to restart a proven-dead
     // execution, the platform reaps it and launches by the ordinary rules.
     ("task_run", "task.run"),
-    // Влитие ветки задачи — Mutation-класс: это акт человека, а не чтение
-    // (окно исполняет его платформенной командой, своей реализации git нет).
+    // Влитие ветки задачи — Mutation-класс: акт человека, исполняемый
+    // платформенной командой (окно не несёт своей реализации git).
     ("task_merge", "task.merge"),
     ("task_progress", "task.progress"),
     ("task_dependencies", "task.dependencies"),
     ("task_report", "task.report"),
     ("evaluation_rules", "eval.rules"),
     ("task_usage", "task.usage"),
+    ("usage_summary", "usage.summary"),
+    ("usage_overview", "usage.overview"),
     ("exec_transcript", "exec.transcript"),
+    ("execution_get", "exec.get"),
     ("workspace_live", "task.workspace_live"),
     ("workspace_live_diff", "task.workspace_live_diff"),
-    ("execution_get", "exec.get"),
     ("source_slice", "source.slice"),
     ("task_events", "task.events"),
     ("task_decisions", "task.decisions"),
@@ -563,10 +565,8 @@ pub const WINDOW_MUTATION_COMMANDS: &[(&str, &str)] = &[
     ("task_accept", "task.accept"),
     ("task_return", "task.return"),
     ("task_run", "task.run"),
-    // Влитие ветки задачи: слияние с репозиторием — человеческое решение, и
-    // окно исполняет его ПЛАТФОРМЕННОЙ командой (`devai task merge`), а не
-    // своей реализацией git. Акт пишет решение rework_merge и ничего не
-    // двигает в процессе задачи.
+    // Влитие ветки задачи: слияние с репозиторием — человеческое решение;
+    // окно исполняет его ПЛАТФОРМЕННОЙ командой, а не своей реализацией git.
     ("task_merge", "task.merge"),
     // Ответ человека на вопрос платформы: вопрос поднят ЗА ЧЕЛОВЕКОМ и без его
     // слова работа стоит. Это тот же человеческий акт, что подпись и приёмка,
@@ -1393,8 +1393,7 @@ pub fn execution_cancel(
     reason: Option<String>,
 ) -> Result<devai_api::ExecutionView, UiError> {
     // Тот же вид строки, что у exec.list — карточка не собирает свою форму.
-    // Причина остановки идёт в НАДПИСЬ строки: иначе в карточке остаётся
-    // «только статус» (человек остановил — а почему, нигде не сказано).
+    // Причина остановки идёт в надпись строки: иначе в карточке «только статус».
     Ok(state.api().exec_cancel_view(&exec_id, reason.as_deref())?)
 }
 
@@ -1404,7 +1403,9 @@ pub fn evaluation_rules(state: State<AppState>) -> Result<devai_api::RulebookVie
     Ok(state.api().evaluation_rules()?)
 }
 
-/// Расход токенов задачи по прогонам (файлы улик драйвера).
+/// Расход токенов задачи из СТОРА (REQ-USG-07): «израсходовано X из Y»,
+/// лимит задачи, модели, число прогонов и число прогонов с неизвестным
+/// расходом. Окно ничего не пересчитывает.
 #[tauri::command(rename_all = "snake_case")]
 pub fn task_usage(
     state: State<AppState>,
@@ -1413,19 +1414,36 @@ pub fn task_usage(
     Ok(state.api().task_usage(&id_prefix)?)
 }
 
+/// Расход по задаче / роли / модели за сутки, неделю, месяц (REQ-USG-03).
+#[tauri::command(rename_all = "snake_case")]
+pub fn usage_summary(
+    state: State<AppState>,
+    period: String,
+    group_by: String,
+    task: Option<String>,
+) -> Result<devai_api::UsageSummaryView, UiError> {
+    Ok(state
+        .api()
+        .usage_summary(&period, &group_by, task.as_deref())?)
+}
+
+/// Экран расхода: сутки и месяц, топ-задачи, прогноз и суточный гейт
+/// (REQ-USG-08). Один снимок — окно ничего не складывает само.
+#[tauri::command(rename_all = "snake_case")]
+pub fn usage_overview(state: State<AppState>) -> Result<devai_api::UsageOverviewView, UiError> {
+    Ok(state.api().usage_overview()?)
+}
+
 /// Что влито: ветка задачи и коммит слияния — из записи самой платформы.
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct MergeOutcome {
     pub branch: String,
     pub commit: String,
-    /// Вывод платформенной команды как есть: окно не пересказывает чужой текст.
     pub text: String,
 }
 
 /// Влитие ветки задачи в выложенную baseline — ТЕМ ЖЕ актом, что
-/// `devai task merge`. Окно не несёт своей реализации git: слияние по решению
-/// платформы (REQ-WT-07) живёт в одной команде, и окно лишь запускает её —
-/// человек нажал, платформа исполнила.
+/// `devai task merge`: окно не несёт своей реализации git.
 #[tauri::command(rename_all = "snake_case")]
 pub fn task_merge(
     state: State<AppState>,
@@ -1434,9 +1452,7 @@ pub fn task_merge(
 ) -> Result<MergeOutcome, UiError> {
     let runner = devai_runtime::launch::runner_exe().ok_or_else(|| UiError {
         code: "no_runner".to_string(),
-        message: "окно не нашло `devai` для влития — задайте DEVAI_RUNNER: слияние \
-                  живёт в платформенной команде, а не в окне"
-            .to_string(),
+        message: "окно не нашло devai для влития — задайте DEVAI_RUNNER".to_string(),
     })?;
     let (home, actor) = {
         let info = state.session();
@@ -1475,6 +1491,15 @@ pub fn task_merge(
     })
 }
 
+/// Одна строка исполнения: статус, класс и текст отказа.
+#[tauri::command(rename_all = "snake_case")]
+pub fn execution_get(
+    state: State<AppState>,
+    exec_id: String,
+) -> Result<devai_core::types::RoleExecution, UiError> {
+    Ok(state.api().exec_get(&exec_id)?)
+}
+
 /// Живое рабочее дерево задачи: что роль правит прямо сейчас.
 #[tauri::command(rename_all = "snake_case")]
 pub fn workspace_live(
@@ -1492,16 +1517,6 @@ pub fn workspace_live_diff(
     path: String,
 ) -> Result<devai_api::LiveDiffView, UiError> {
     Ok(state.api().workspace_live_diff(&id_prefix, &path)?)
-}
-
-/// Одна строка исполнения как она записана: статус, класс отказа, текст отказа.
-/// Нужна карточке, чтобы показать ПОЧЕМУ прогон встал, а не «ничего не отдал».
-#[tauri::command(rename_all = "snake_case")]
-pub fn execution_get(
-    state: State<AppState>,
-    exec_id: String,
-) -> Result<devai_core::types::RoleExecution, UiError> {
-    Ok(state.api().exec_get(&exec_id)?)
 }
 
 /// Консоль прогона: потоки роли как они есть на диске, хвостом.
@@ -2466,9 +2481,9 @@ mod tests {
             "task_reject",
             "task_return",
             "task_run",
-            "task_merge",
             "question_answer",
             "task_cancel",
+            "task_merge",
             "task_resume",
             "task_rewind",
             "task_restate",

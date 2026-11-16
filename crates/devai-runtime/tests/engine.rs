@@ -3480,6 +3480,190 @@ fn agent_failures_are_recorded_and_park_at_the_threshold() {
     );
 }
 
+/// REQ-USG-05/06 — «стоп до траты» on the ENGINE's own door: an exhausted task
+/// budget refuses the stage BEFORE any execution row exists, and the task is
+/// parked with ONE question that carries the numbers and the two options.
+#[test]
+fn an_exhausted_task_budget_refuses_the_stage_and_parks_with_one_question() {
+    let (_d, store) = store();
+    let t = Task::new("token budget", "stop before the spend", None, Utc::now());
+    store.create_task(&t).unwrap();
+    let tight = devai_store::config::UsagePolicy {
+        budgets: devai_store::config::TokenBudgets {
+            run: Some(1_000),
+            task: Some(10),
+            day: None,
+        },
+        ..Default::default()
+    };
+    let engine = mk_engine(&store).with_usage_policy(tight);
+
+    let err = engine
+        .advance(&t.id.to_string(), "mock", "tester")
+        .expect_err("the budget cannot pay for this run");
+    match &err {
+        RuntimeError::BudgetRefused(line) => {
+            assert!(line.contains("бюджет задачи"), "{line}");
+            assert!(line.contains("~1000"), "the expected cost is named: {line}");
+            assert!(
+                line.contains("модель не вызывалась"),
+                "the refusal says the model was never called: {line}"
+            );
+        }
+        other => panic!("expected a budget refusal, got {other:?}"),
+    }
+
+    // REQ-USG-05 AC5: no RUNNING orphan — no execution row at all.
+    assert!(
+        store.list_executions(Some(t.id)).unwrap().is_empty(),
+        "a refused run leaves nothing to cancel by hand"
+    );
+    // REQ-USG-06: the task is parked and asking exactly ONE question.
+    let parked = store.get_task(&t.id.to_string()).unwrap();
+    assert!(parked.state.is_hold(), "state is {:?}", parked.state);
+    let questions = store.list_questions(t.id).unwrap();
+    assert_eq!(questions.len(), 1, "one question per exhaustion fact");
+    let q = &questions[0];
+    assert_eq!(q.status, QuestionStatus::Open);
+    assert!(
+        q.options.iter().any(|o| o.starts_with("поднять до ")),
+        "the raise option is offered: {:?}",
+        q.options
+    );
+    assert!(
+        q.options.iter().any(|o| o == "остановиться"),
+        "the stop option is offered: {:?}",
+        q.options
+    );
+    assert!(q.text.contains("израсходовано 0 из 10"), "{}", q.text);
+    assert!(q.blocking, "the task waits for a human answer");
+    // The refusal is its own fact of the history, with the numbers.
+    let events = store.events(t.id, None).unwrap();
+    let refused = events
+        .iter()
+        .find(|e| e.kind == event_kind::USAGE_BUDGET_REFUSED)
+        .expect("the refusal is recorded");
+    assert_eq!(refused.payload[json_field::LEVEL], "task");
+    assert_eq!(refused.payload[json_field::LIMIT], 10_i64);
+}
+
+/// REQ-USG-05 + ratified OQ-1: an exhausted DAY budget refuses NEW runs until
+/// tomorrow, names the numbers, and does NOT park the task one by one.
+#[test]
+fn an_exhausted_day_budget_refuses_without_parking_the_task() {
+    let (_d, store) = store();
+    let t = Task::new("day budget", "stop new runs today", None, Utc::now());
+    store.create_task(&t).unwrap();
+    let tight = devai_store::config::UsagePolicy {
+        budgets: devai_store::config::TokenBudgets {
+            run: Some(1_000),
+            task: None,
+            day: Some(500),
+        },
+        ..Default::default()
+    };
+    let engine = mk_engine(&store).with_usage_policy(tight);
+
+    let err = engine
+        .advance(&t.id.to_string(), "mock", "tester")
+        .expect_err("the day budget cannot pay for this run");
+    match &err {
+        RuntimeError::BudgetRefused(line) => {
+            assert!(line.contains("суточный бюджет"), "{line}");
+            assert!(line.contains("до новых суток"), "{line}");
+            assert!(line.contains("~1000"), "{line}");
+        }
+        other => panic!("expected a budget refusal, got {other:?}"),
+    }
+    assert!(store.list_executions(Some(t.id)).unwrap().is_empty());
+    assert_eq!(
+        store.list_questions(t.id).unwrap().len(),
+        0,
+        "the day level asks ONE home-wide question, it does not park tasks"
+    );
+    assert!(
+        !store.get_task(&t.id.to_string()).unwrap().state.is_hold(),
+        "the task itself is never parked by the day level"
+    );
+    let refused = store
+        .events(t.id, None)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == event_kind::USAGE_BUDGET_REFUSED)
+        .expect("the refusal is recorded");
+    assert_eq!(refused.payload[json_field::LEVEL], "day");
+}
+
+/// REQ-USG-06 AC3/AC4 + REQ-USG-04 AC4: the human's raise is what lets the next
+/// run through — no rebuild, and nothing raises itself.
+#[test]
+fn a_human_raise_is_what_unblocks_the_next_run() {
+    let (_d, store) = store();
+    let t = Task::new("raise", "the human raises the budget", None, Utc::now());
+    store.create_task(&t).unwrap();
+    let tight = devai_store::config::UsagePolicy {
+        budgets: devai_store::config::TokenBudgets {
+            run: Some(1_000),
+            task: Some(10),
+            day: None,
+        },
+        ..Default::default()
+    };
+    let engine = mk_engine(&store).with_usage_policy(tight.clone());
+    engine
+        .advance(&t.id.to_string(), "mock", "tester")
+        .expect_err("refused first");
+
+    // The human answers «поднять до 5000000»: the decision is the raise.
+    let parked = store.get_task(&t.id.to_string()).unwrap();
+    let q = store.list_questions(t.id).unwrap().remove(0);
+    store
+        .record_decision(&Decision {
+            id: new_id(),
+            task_id: t.id,
+            kind: decision_kind::USAGE_BUDGET.to_string(),
+            verdict: Verdict::Approved,
+            actor: "guerrero".into(),
+            rationale: Some("need this task finished".into()),
+            refs: vec![q.id.to_string()],
+            created_at: Utc::now(),
+            payload: serde_json::json!({ (json_field::TOKEN_BUDGET): 5_000_000_u64 }),
+        })
+        .unwrap();
+    let m = workflow::answer_question(proc(), &parked, q.id, "guerrero", Utc::now()).unwrap();
+    store.commit(parked.lock_version, &m).unwrap();
+
+    // The SAME engine value now lets the run through, and every execution of
+    // the stage carries a spend row of its own (REQ-USG-01 AC1).
+    let r = engine
+        .advance(&t.id.to_string(), "mock", "tester")
+        .expect("the raised budget pays for the run");
+    assert_eq!(r.gate, Gate::WaitingApproval);
+    let execs = store.list_executions(Some(t.id)).unwrap();
+    assert!(!execs.is_empty(), "the run really happened");
+    for e in &execs {
+        let row = store
+            .execution_usage(e.id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{} has no spend row", e.role_slug));
+        assert!(
+            row.measured || row.unknown_reason.is_some(),
+            "{}: either numbers or a stated «неизвестно»",
+            e.role_slug
+        );
+    }
+    // And the money was never doubled: one row per execution.
+    let rolls = store
+        .usage_rollup(&devai_store::UsageQuery {
+            from: None,
+            to: None,
+            task_id: Some(t.id),
+            group: devai_store::UsageGroup::Totals,
+        })
+        .unwrap();
+    assert_eq!(rolls[0].runs as usize, execs.len());
+}
+
 /// The process declaration every workflow command resolves its target from
 /// (REQ-AR-09): the factory bytes, parsed once. A test that changes the
 /// declaration changes the walk — that is the point of the data.

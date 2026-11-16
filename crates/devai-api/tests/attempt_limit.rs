@@ -30,7 +30,9 @@ use tempfile::TempDir;
 
 fn home() -> (TempDir, Api) {
     let dir = TempDir::new().unwrap();
-    let api = Api::open(dir.path(), "attempt-tester").unwrap();
+    let api = Api::open(dir.path(), "attempt-tester")
+        .unwrap()
+        .with_config_dir(dir.path().join("config"));
     api.seed_config(None).unwrap();
     (dir, api)
 }

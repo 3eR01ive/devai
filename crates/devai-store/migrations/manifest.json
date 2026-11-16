@@ -109,6 +109,13 @@
       "to": 15,
       "script": "migrations/015_execution_run_id.sql",
       "apply": "additive_run_id_column"
+    },
+    {
+      "id": "016_execution_usage",
+      "from": 15,
+      "to": 16,
+      "script": "migrations/016_execution_usage.sql",
+      "apply": "script"
     }
   ]
 }

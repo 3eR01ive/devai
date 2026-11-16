@@ -18,6 +18,8 @@ const used = [
   "artifact.list", "artifact.cat", "artifact.cat_text",
   "question.list",
   "exec.list", "exec.liveness",
+  // Токены: карточка задачи, разрез по периоду и экран расхода (REQ-USG-*).
+  "task.usage", "usage.summary", "usage.overview",
   "home.list", "home.projects_all", "home.tasks_all",
   // Раздел связок модели: один read-снимок и две записи (REQ-MS-07).
   "model.snapshot", "model.probe", "model.switch",
