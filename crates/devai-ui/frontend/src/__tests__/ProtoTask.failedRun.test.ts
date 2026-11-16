@@ -166,4 +166,21 @@ describe("упавший прогон виден", () => {
     await flushPromises();
     expect(w.find(".p-failchip").text()).toBe("остановлен");
   });
+
+  it("стоящее дело помечает СВОЮ стадию, а не все подряд", async () => {
+    // Прецедент: задача в BLOCKED, все пройденные узлы зелёные — и не видно,
+    // где именно она стоит. Метка «сейчас» должна стоять на стадии возврата.
+    mocks.taskProgress.mockResolvedValue({
+      ...progress,
+      task: { ...task, state: "BLOCKED", return_state: "IMPLEMENTATION" },
+    });
+    const w = mount(ProtoTask, { global: { stubs: { RouterLink: { template: "<a><slot /></a>" } } } });
+    await flushPromises();
+    await flushPromises();
+
+    const marked = w.findAll(".p-vstep.now");
+    expect(marked).toHaveLength(1);
+    expect(marked[0].text()).toContain("реализация");
+    expect(marked[0].find(".p-nowchip").text()).toBe("стоит здесь");
+  });
 });

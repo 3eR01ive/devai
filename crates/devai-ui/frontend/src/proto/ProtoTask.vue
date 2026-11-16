@@ -878,6 +878,35 @@ const { holding: mergeHolding, progress: mergeProgress, start: mergeStart, move:
     () => void doMerge(),
   );
 
+// ── где мы СЕЙЧАС ─────────────────────────────────────────────────────────
+// Платформа помечает стадию «current», только пока по ней что-то идёт. Стоит
+// задача (BLOCKED/PAUSED/FAILED, ждёт ответа) — и метка исчезает: все узлы
+// зелёные, и на втором круге не понять, где именно ты стоишь. Поэтому «сейчас»
+// считаем сами: идущий прогон → его стадия; стоящее дело → стадия, на которую
+// оно вернётся; иначе само состояние (стадия или гейт).
+const nowState = computed<string | null>(() => {
+  const p = prog.value as any;
+  if (!p) return null;
+  const run = (p.running_executions ?? [])[0];
+  if (run?.state) return String(run.state);
+  const t = p.task ?? {};
+  const held = ["WAITING_FOR_INPUT", "BLOCKED", "PAUSED", "FAILED"].includes(String(t.state));
+  if (held) return t.return_state ? String(t.return_state) : String(t.state);
+  return String(t.state);
+});
+const isNow = (s: any) => s.state === nowState.value;
+
+/** Слово на метке: дело идёт, стоит или ждёт человека — это разные «сейчас». */
+const heldWord = computed(() => {
+  const st = String((prog.value as any)?.task?.state ?? "");
+  if ((prog.value as any)?.running_executions?.length) return "идёт";
+  if (st === "WAITING_FOR_INPUT") return "ждёт ответа";
+  if (["BLOCKED", "PAUSED", "FAILED"].includes(st)) return "стоит здесь";
+  if (st === "APPROVAL") return "ждёт подписи";
+  if (st === "QA") return "ждёт приёмки";
+  return "сейчас";
+});
+
 // ── живое рабочее дерево: что роль правит прямо сейчас ────────────────────
 // Отчёты и диффы показывают ЗАКОММИЧЕННОЕ (baseline..tip). Пока роль работает,
 // её правки ещё не в коммите — и окно показывало пустой worktree у идущего
@@ -1462,7 +1491,7 @@ onMounted(load);
           v-for="(s, i) in steps"
           :key="s.state"
           class="p-vstep"
-          :class="[s.status, { gate: s.gate, open: openState === s.state }]"
+          :class="[s.status, { gate: s.gate, open: openState === s.state, now: isNow(s) }]"
         >
           <div class="p-nodebox">
             <div class="p-vnode">{{ s.status === "passed" ? "✓" : "" }}</div>
@@ -1472,6 +1501,7 @@ onMounted(load);
             <div class="p-vhead" @click="openStep(s)">
               <div class="t1">
                 <span class="role">{{ s.title }}</span>
+                <span v-if="isNow(s)" class="p-nowchip">{{ heldWord }}</span>
                 <span v-if="convSpark(s.state).length" class="p-spark" :title="'сходимость: ' + convMode(s.state)">
                   <i v-for="(b, k) in convSpark(s.state)" :key="k" :class="b.cls" :style="{ height: b.h + 'px' }" />
                 </span>
@@ -2110,6 +2140,14 @@ onMounted(load);
 .p-vstep.gate .p-vnode span{transform:rotate(-45deg)}
 .p-vstep .rail{position:absolute;top:32px;bottom:-2px;width:2px;background:#1f2833}
 .p-vstep.passed .rail{background:linear-gradient(#2f9d6e,#1f4f3c)}
+/* «Где я сейчас»: узел остаётся оранжевым, даже если стадия уже пройдена —
+   на втором круге все узлы зелёные, и без этого не понять, где стоишь. */
+.p-vstep.now .p-vnode{width:22px;height:22px;margin-top:-3px;background:var(--p-now);
+  border-color:#ffb98c;box-shadow:0 0 0 5px rgba(243,106,22,.16);color:#0c0f13}
+.p-vstep.now.gate .p-vnode{border-radius:5px}
+.p-vstep.now .p-vcard{border-color:rgba(243,106,22,.45)}
+.p-nowchip{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:5px;
+  color:#ffb98c;background:rgba(243,106,22,.14);border:1px solid rgba(243,106,22,.4)}
 .p-vcard{background:var(--p-card);border:1px solid var(--p-line);border-radius:10px;margin-bottom:8px;overflow:hidden;min-width:0}
 .p-vhead{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;padding:9px 14px;cursor:pointer;user-select:none}
 .p-vhead:hover{background:#172028}
