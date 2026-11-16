@@ -1069,7 +1069,11 @@ fn workspace_live_diff_rpc(
 ) -> Result<serde_json::Value, UiError> {
     let id_prefix = param_str(params, "id_prefix")?;
     let path = param_str(params, "path")?;
-    to_json(crate::commands::workspace_live_diff(state(app), id_prefix, path)?)
+    to_json(crate::commands::workspace_live_diff(
+        state(app),
+        id_prefix,
+        path,
+    )?)
 }
 
 fn task_merge_rpc(
@@ -1078,8 +1082,15 @@ fn task_merge_rpc(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, UiError> {
     let id_prefix = param_str(params, "id_prefix")?;
-    let rationale = params.get("rationale").and_then(|v| v.as_str()).map(str::to_string);
-    to_json(crate::commands::task_merge(state(app), id_prefix, rationale)?)
+    let rationale = params
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    to_json(crate::commands::task_merge(
+        state(app),
+        id_prefix,
+        rationale,
+    )?)
 }
 
 fn exec_transcript_rpc(
@@ -1125,8 +1136,15 @@ fn execution_cancel_rpc(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, UiError> {
     let exec_id = param_str(params, "exec_id")?;
-    let reason = params.get("reason").and_then(|v| v.as_str()).map(str::to_string);
-    to_json(crate::commands::execution_cancel(state(app), exec_id, reason)?)
+    let reason = params
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    to_json(crate::commands::execution_cancel(
+        state(app),
+        exec_id,
+        reason,
+    )?)
 }
 
 fn executions_list_rpc(

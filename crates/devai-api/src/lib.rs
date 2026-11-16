@@ -300,8 +300,8 @@ pub enum SessionKind {
 pub mod ui_reads;
 
 pub use ui_reads::{
-    ExecTranscriptView, LiveDiffView, LiveFileView, LiveWorktreeView, RuleDetectView, RuleGroupView,
-    RuleView, RulebookView, SourceSliceView,
+    ExecTranscriptView, LiveDiffView, LiveFileView, LiveWorktreeView, RuleDetectView,
+    RuleGroupView, RuleView, RulebookView, SourceSliceView,
 };
 pub use usage::{
     BudgetLimits, RunUsageView, TaskUsageView, UsageBucketView, UsageForecastView,

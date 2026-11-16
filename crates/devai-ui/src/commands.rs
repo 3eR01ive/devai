@@ -1461,7 +1461,11 @@ pub fn task_merge(
     let mut cmd = std::process::Command::new(&runner);
     cmd.arg("--home").arg(&home).arg("--actor").arg(&actor);
     cmd.arg("task").arg("merge").arg(&id_prefix);
-    if let Some(r) = rationale.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    if let Some(r) = rationale
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         cmd.arg("--rationale").arg(r);
     }
     let out = cmd.output().map_err(|e| UiError {
@@ -1485,8 +1489,12 @@ pub fn task_merge(
         .rev()
         .find(|d| d.kind == devai_core::types::decision_kind::REWORK_MERGE);
     Ok(MergeOutcome {
-        branch: last.and_then(|d| d.refs.first().cloned()).unwrap_or_default(),
-        commit: last.and_then(|d| d.refs.get(1).cloned()).unwrap_or_default(),
+        branch: last
+            .and_then(|d| d.refs.first().cloned())
+            .unwrap_or_default(),
+        commit: last
+            .and_then(|d| d.refs.get(1).cloned())
+            .unwrap_or_default(),
         text: text.trim().to_string(),
     })
 }

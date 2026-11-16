@@ -413,10 +413,7 @@ fn task_active_lifecycle_through_the_real_binary() {
         got.contains("CANCELLED"),
         "строка прогона закрыта отменой дела:\n{got}"
     );
-    assert!(
-        got.contains("дело отменено"),
-        "и причина названа:\n{got}"
-    );
+    assert!(got.contains("дело отменено"), "и причина названа:\n{got}");
     // Отмена задачи закрыла и её прогон — активных строк у закрытого дела нет.
     let j = devai_json(h, &["task", "active"]);
     let rows = j["rows"].as_array().unwrap();

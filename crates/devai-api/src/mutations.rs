@@ -3905,7 +3905,15 @@ mod tests {
         git(&["init", "-q"]);
         std::fs::write(wt.join("a.txt"), "первая строка\n").unwrap();
         git(&["add", "."]);
-        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
         // роль правила файл, но ещё не закоммитила
         std::fs::write(wt.join("a.txt"), "первая строка\nвторая строка\n").unwrap();
 
@@ -3981,7 +3989,10 @@ mod tests {
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        assert!(!err.contains("terminal"), "активная задача отменяема: {err}");
+        assert!(
+            !err.contains("terminal"),
+            "активная задача отменяема: {err}"
+        );
     }
 
     /// Остановка прогона человеком ПИШЕТ причину в строку: раньше строка
@@ -4005,11 +4016,12 @@ mod tests {
             .unwrap();
         let exec_id = started.execution.id.to_string();
         let row = api.exec_cancel(&exec_id, Some("проверяю вручную")).unwrap();
-        assert!(row
-            .summary
-            .as_deref()
-            .unwrap_or("")
-            .contains("проверяю вручную"));
+        assert!(
+            row.summary
+                .as_deref()
+                .unwrap_or("")
+                .contains("проверяю вручную")
+        );
 
         let read = api.exec_get(&exec_id).unwrap();
         let summary = read.summary.unwrap_or_default();

@@ -710,16 +710,12 @@ enum ExecCmd {
     },
     /// One execution row by id/prefix — observable without the launching
     /// terminal (REQ-API-07, via the API exec.get operation)
-    Get {
-        exec_id: String,
-    },
+    Get { exec_id: String },
     /// Liveness of the recorded owner of an execution: alive | dead |
     /// unknown — orphans distinguishable by stored data, not pgrep
     /// (REQ-API-07 AC3, via the API exec.liveness operation; read-only,
     /// never signals the process)
-    Liveness {
-        exec_id: String,
-    },
+    Liveness { exec_id: String },
 }
 
 #[derive(Subcommand)]
