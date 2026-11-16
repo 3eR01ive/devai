@@ -129,41 +129,75 @@ fn run_argv(argv: &[String], timeout_ms: u64) -> RunOutcome {
     }
 }
 
-/// Start the child with piped output and no stdin. A binary that cannot be
-/// launched at all is a LOCAL fact: the outcome carries it as `spawn_error`.
+/// Start the child with piped output and no stdin, leading its OWN process
+/// group. A binary that cannot be launched at all is a LOCAL fact: the outcome
+/// carries it as `spawn_error`.
+///
+/// The group matters for the deadline: a driver that forks a helper (a shell
+/// running one command, a wrapper around a model client) leaves a descendant
+/// holding the inherited pipes. Killing only the direct child would let that
+/// descendant keep the pipes open, and the readers would wait for it instead
+/// of honouring the deadline.
 fn spawn_argv(argv: &[String]) -> Result<Child, RunOutcome> {
     let started = Instant::now();
-    Command::new(&argv[0])
-        .args(&argv[1..])
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| RunOutcome {
-            exit_code: None,
-            timed_out: false,
-            combined: bounded(&format!("cannot launch `{}`: {e}", argv[0])),
-            latency_ms: started.elapsed().as_millis() as u64,
-            spawn_error: Some(e.to_string()),
-        })
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // setpgid(0, 0): the child becomes the leader of a fresh group, so
+            // `kill(-pid, …)` reaches everything it starts.
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().map_err(|e| RunOutcome {
+        exit_code: None,
+        timed_out: false,
+        combined: bounded(&format!("cannot launch `{}`: {e}", argv[0])),
+        latency_ms: started.elapsed().as_millis() as u64,
+        spawn_error: Some(e.to_string()),
+    })
+}
+
+/// Take down the child AND everything it started, then reap it. The spawn put
+/// the child at the head of its own process group, so a negative pid signals
+/// the whole group: descendants die with it and the pipes close at once.
+fn kill_and_reap(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // SAFETY: plain syscall with a pid this process owns; a group that is
+        // already gone just fails, which is why the result is ignored.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Poll the child until it exits or the deadline passes. At the deadline the
-/// child is killed AND reaped before this returns (REQ-MS-03 AC1).
+/// child is killed AND reaped before this returns (REQ-MS-03 AC1), together
+/// with any descendant that would otherwise hold its pipes open.
 fn wait_child(child: &mut Child, timeout_ms: u64) -> (Option<ExitStatus>, bool) {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return (Some(status), false),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(child);
                 return (None, true);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(child);
                 return (None, true);
             }
         }
@@ -389,6 +423,26 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the deadline must return promptly"
+        );
+    }
+
+    #[test]
+    fn the_deadline_takes_down_the_children_of_a_driver() {
+        // A driver that forks a helper: the helper inherits the pipes, so
+        // killing only the direct child leaves the readers waiting for it and
+        // the deadline silently becomes "whenever the helper ends" (CI caught
+        // exactly that: 30 s instead of 200 ms).
+        let started = Instant::now();
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 30 & sleep 30".to_string(),
+        ];
+        let run = run_argv(&argv, 200);
+        assert!(run.timed_out, "the child must be killed at the deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "descendants must die with the child, not outlive the deadline"
         );
     }
 
