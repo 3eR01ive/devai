@@ -35,7 +35,8 @@ curl -fsSL https://raw.githubusercontent.com/3eR01ive/devai/main/install.sh | sh
 ```
 
 It fetches the latest linux-x86_64 release, verifies its sha256 and installs
-`devai` into `~/.local/bin`. Overrides: `DEVAI_VERSION` (pin a tag),
+`devai` (and `devai-ui`, the desktop window, when the archive carries it) into
+`~/.local/bin`. Overrides: `DEVAI_VERSION` (pin a tag),
 `DEVAI_INSTALL_DIR` (target directory). If `~/.local/bin` is not already on
 your `PATH`, the script will tell you the one line to add to your shell profile.
 
@@ -47,8 +48,89 @@ Requires a stable Rust toolchain (edition 2021) and `git`:
 git clone https://github.com/3eR01ive/devai.git
 cd devai
 cargo build --release --workspace
-# binary at target/release/devai
+# binaries at target/release/devai and target/release/devai-ui
 ```
+
+The repository's own helper puts them where the launchers expect them and builds
+the frontend first (the window embeds it at compile time):
+
+```sh
+./build.sh            # debug build  -> ./bin/devai, ./bin/devai-ui
+./build.sh --release  # release build
+```
+
+`build.sh` installs the frontend dependencies when `node_modules` is missing or
+older than `package.json`, runs `vite build` **before** cargo (a stale `dist`
+gives a window without assets), and copies the binaries into `./bin/` so a stale
+`target/` binary can never masquerade as fresh after a schema bump.
+
+## The desktop window (devai-ui)
+
+The window is a Tauri app; its frontend is a Vue/Vite SPA in
+`crates/devai-ui/frontend`. It talks to the same platform API as the CLI — every
+click is a published operation, and the window keeps a mutation allowlist that is
+enforced by tests.
+
+### Run it (development)
+
+```sh
+devai init                 # once: materialize $DEVAI_HOME (config tree + store)
+./run-ui.sh                # ~/.devai
+./run-ui.sh --home /path   # another home
+```
+
+Why a launcher: the **debug** binary loads the SPA from `http://127.0.0.1:1420`,
+so the window needs Vite running. `run-ui.sh` starts Vite, waits for the port,
+launches the window and stops the server when the window closes.
+
+Equivalent by hand:
+
+```sh
+# terminal 1 — frontend dev server
+cd crates/devai-ui/frontend && npx vite --host 127.0.0.1 --port 1420 --strictPort
+
+# terminal 2 — the window
+DEVAI_HOME="$HOME/.devai" \
+DEVAI_RUNNER="$PWD/bin/devai" \
+WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+./bin/devai-ui
+```
+
+Environment the window honours:
+
+- `DEVAI_HOME` — which home to show (default `~/.devai`).
+- `DEVAI_RUNNER` — the `devai` binary the window calls to launch role runs. Without
+  it the card honestly reports `no platform runner binary — set DEVAI_RUNNER`;
+  the window never runs a role inside its own process.
+- `WEBKIT_DISABLE_COMPOSITING_MODE=1` — turns compositing off; without it some
+  compositors render a blank/black window.
+
+### Run it (release build)
+
+```sh
+./build.sh --release
+./run-ui.sh --release
+```
+
+Known upstream limitation: with webkit2gtk ≥ 2.46 the standalone (release) window
+can come up blank because of the custom-scheme handling (wry#1725). The
+debug + Vite path above is the one that works today.
+
+### From the phone
+
+The window itself serves LAN access (`Телефон` tab): it shows a QR invite, and the
+phone then calls the same command plane — the same operations, the same
+allowlist, recorded under the operator with a device suffix.
+
+### What a release archive contains
+
+`devai-<tag>-linux-x86_64.tar.gz` holds `devai` (CLI), `devai-ui` (window),
+`run-ui.sh` and this README, plus a `.sha256` next to it. `install.sh` installs
+both binaries into `~/.local/bin`.
+
+**No APK in the release artifacts yet**: the Android build is
+`./build.sh --android` (needs JDK 21 + Android SDK/NDK, see
+`scripts/android-env.sh`) and is not published with the linux-x86_64 archive.
 
 ## Getting started
 

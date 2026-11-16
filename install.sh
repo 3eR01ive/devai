@@ -58,6 +58,16 @@ rm -f "$DEST/devai"
 install -m 0755 "$TMP/$ASSET/devai" "$DEST/devai"
 echo "devai installer: installed $DEST/devai ($VERSION)"
 
+# Окно лежит рядом в том же архиве; старые релизы его не содержат — тогда
+# честно говорим, что окна нет, а не делаем вид, что поставили.
+if [ -f "$TMP/$ASSET/devai-ui" ]; then
+    rm -f "$DEST/devai-ui"
+    install -m 0755 "$TMP/$ASSET/devai-ui" "$DEST/devai-ui"
+    echo "devai installer: installed $DEST/devai-ui ($VERSION) — окно (Tauri)"
+else
+    echo "devai installer: этот релиз без окна (в архиве нет devai-ui)"
+fi
+
 if ! echo ":$PATH:" | tr '[:space:]' ':' | grep -qs ":$DEST:"; then
     echo
     echo "  NOTE: $DEST is not in your PATH. Add to your shell profile:"

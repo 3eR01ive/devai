@@ -35,6 +35,10 @@ jobs:
           pkg="devai-${GITHUB_REF_NAME}-linux-x86_64"
           mkdir -p "dist/$pkg"
           cp target/release/devai "dist/$pkg/"
+          # Окно — часть релиза (16.11): без него релиз описывает половину
+          # продукта. APK в этот релиз не входит.
+          cp target/release/devai-ui "dist/$pkg/"
+          cp run-ui.sh "dist/$pkg/"
           cp README.md "dist/$pkg/"
           if [ -f LICENSE ]; then cp LICENSE "dist/$pkg/"; fi
           tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
